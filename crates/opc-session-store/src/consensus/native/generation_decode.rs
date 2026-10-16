@@ -427,7 +427,7 @@ pub(super) fn inspect_key_format(
     let _memory = VerificationMemory::reserve(key_scratch(bytes)?)?;
     let (key, row): (SessionKey, Option<NativeKeyState>) = binary::decode(bytes)?;
     if let Some(row) = &row {
-        if row.reserved && format < Format::V4 {
+        if row.reserved && format.vocabulary < Format::V4.vocabulary {
             return Err(invalid(
                 "native legacy generation cannot contain roster reservations",
             ));
@@ -473,7 +473,7 @@ pub(super) fn owned_key(
     let memory = VerificationMemory::reserve(key_scratch(bytes)?)?;
     let (decoded_key, decoded): (SessionKey, Option<NativeKeyState>) = binary::decode(bytes)?;
     let decoded = decoded.ok_or_else(|| invalid("native resident key selected a tombstone"))?;
-    if decoded.reserved && expected.facts.format < Format::V4 {
+    if decoded.reserved && expected.facts.format.vocabulary < Format::V4.vocabulary {
         return Err(invalid(
             "native legacy generation cannot contain roster reservations",
         ));
@@ -608,6 +608,7 @@ pub(super) fn verify_generic(
 
 // Full images omit the generation's optional-row marker. Share the same
 // borrowed shape check and reservation before decoding either binary version.
+#[cfg(test)]
 pub(in crate::consensus::native) fn full_generic(
     bytes: &[u8],
     format: Format,

@@ -30,23 +30,28 @@ pub(super) fn fingerprint(index: u64, encoded: &[u8]) -> [u8; 32] {
 
 pub(crate) const MAX_RETAINED_LOG_ENTRIES: usize = 1_048_576;
 
-/// A logical purge may advance while its physical rows remain necessary for
-/// replay from the installed origin. Only that authenticated full LogId or
-/// the exact purge boundary can witness a non-genesis physical prefix.
+/// The physical log starts immediately after its selected purge frontier.
+/// An installed origin can witness a prefix before the first local purge.
 pub(super) fn validate_retained_prefix(
     first: LogId<SessionConsensusNodeId>,
     purged: Option<LogId<SessionConsensusNodeId>>,
     origin: Option<&NativeSnapshotAuthority>,
 ) -> io::Result<()> {
-    if first.index == 0 {
+    if first.index == 0 && purged.is_none() {
         return Ok(());
+    }
+    if purged.is_some_and(|purged| first.index <= purged.index) {
+        return Err(invalid(
+            "native retained log extends below its purge frontier",
+        ));
     }
     let adjacent =
         |cut: &LogId<SessionConsensusNodeId>| cut.index.checked_add(1) == Some(first.index);
-    let predecessor = purged
-        .filter(adjacent)
-        .or_else(|| origin.and_then(|origin| origin.candidate().0.last_log_id.filter(adjacent)))
-        .ok_or_else(|| invalid("native retained log lacks its prefix"))?;
+    let predecessor = match purged {
+        Some(purged) => Some(purged).filter(adjacent),
+        None => origin.and_then(|origin| origin.candidate().0.last_log_id.filter(adjacent)),
+    }
+    .ok_or_else(|| invalid("native retained log lacks its prefix"))?;
     sql::ensure_log_id_not_after(
         &predecessor,
         &first,
@@ -66,7 +71,7 @@ pub(crate) struct NativeLog {
     pub(super) slot_projections: OrdMap<u64, SharedRow<NativeLogEntry>>,
     // Process-local admission proofs never authorize business application or
     // survive decoding. A clone shares immutable rows but starts no journal.
-    proof: Option<std::sync::Arc<changes::LogProof>>,
+    proof: Option<changes::LogProof>,
     changes: Option<changes::LogChanges>,
 }
 

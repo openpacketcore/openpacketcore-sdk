@@ -2,16 +2,18 @@
 
 The workflow keeps `Root-cgroup egress fence` as the required check. Its
 `root-cgroup-egress` job waits for `changes`, `sources`, `oracles`, `installer`,
-`host-proofs` and the complete `host-tests` matrix. Every workload must succeed. A failed,
+`host-proofs` and the complete `host-tests` and `host-native-log-proofs` matrices. Every workload must succeed. A failed,
 cancelled, missing or unexpectedly skipped workload fails the aggregate.
 The only accepted skip is the original successful `changes` decision with
 `run == 'false'`, in which case every workload must be skipped.
 
-All five workload definitions retain the original fail-closed changes
-condition. The test matrix has `fail-fast: false`, so one failing shard does
+All workload definitions retain the original fail-closed changes
+condition. Both test matrices have `fail-fast: false`, so one failing shard does
 not cancel the others. No branch-protection context needs renaming: each new
-workload blocks the same existing required check. The workload time limit is
-45 minutes; the decision and aggregate jobs have 10-minute limits.
+workload blocks the same existing required check. Existing workloads retain their
+45-minute limit. The full-bound leader proof on shard 4 has a 120-minute
+compilation/run budget; the Durable and Async proofs on shards 5 and 6 retain
+75 minutes. The decision and aggregate jobs retain their 10-minute limits.
 
 ## Original step ownership
 
@@ -25,7 +27,7 @@ the split requires them; each privileged runner verifies its own cleanup.
 | Install pinned eBPF Rust | `sources` |
 | Install pinned kernel build tools: apt packages, bpftool install/version | Each workload's own runner, through `egress-fence-tools.sh` |
 | Install pinned kernel build tools: bpf-linker 0.10.3 | `sources` |
-| Prepare fs-verity snapshot storage | Each `host-tests` shard and `host-proofs`, on their own runners |
+| Prepare fs-verity snapshot storage | Each `host-tests` shard, `host-proofs` and each `host-native-log-proofs` shard |
 | Gate host sources: workspace fmt, whitespace, six-package all-target/all-feature Clippy | `sources` |
 | Gate host sources: six-package all-feature ordinary lib/bin/integration tests | `host-tests`, exact-name partition described below |
 | Gate host sources: examples compiled by the original unfiltered Cargo test | `host-tests (1)` |
@@ -35,6 +37,7 @@ the split requires them; each privileged runner verifies its own cleanup.
 | Gate host sources: complete `qualification_profile` suite | `host-tests (1)` |
 | Gate host sources: warnings-denied six-package all-feature rustdoc | `sources` |
 | Gate host sources: eight isolated O1 SQLite proofs | `host-proofs` |
+| Full-bound native leader, Durable and Async log proofs | `host-native-log-proofs (4, 5, 6)`, one proof per runner at O1 |
 | Gate every eBPF feature surface: pinned fmt and all four Clippy commands | `sources` |
 | Rebuild production and test-only objects: all four independent double builds and production byte comparison | `sources` |
 | Build and gate independent host oracles: all bin tests, build, Clippy and redaction check | `oracles` |
@@ -50,11 +53,13 @@ workspace's `target/` directory. Only `sources` builds eBPF objects; `oracles`
 downloads the five outputs from the same workflow run. Cache mappings name the
 actual build directories, relative to each workspace. Each ordinary test shard
 has its own `egress-fence-tests-N` cache key; `host-proofs` uses the separate
-`egress-fence-proofs` key and target directory. Source and installer compilation
-retains the `egress-fence-host` key. Each hosted runner has its own writable
+`egress-fence-proofs` key and target directory. Full-bound proof runners use
+the shared `egress-fence-native-log` key and the `egress-fence-native-log` target
+directory because their compilation profiles and selections are identical.
+Source and installer compilation retains the `egress-fence-host` key. Each hosted runner has its own writable
 copy. The eBPF Clippy and oracle profiles have separate cache keys. Independent
 object reproducibility builds retain their separate clean target directories.
-Both artifact uploads set `overwrite: true` so reruns replace their artifacts.
+All artifact uploads set `overwrite: true` so reruns replace their artifacts.
 
 ## Exact test-name ownership
 
@@ -72,7 +77,17 @@ their identities, then runs only the six ordinary-profile and eight O1 proof
 commands, unchanged. Its compilation and execution time is independent of
 the three ordinary test shards.
 
-Each shard runs the original Cargo package/feature selection with four test
+The two serial scope-payload/child-read contracts retain owner 1 and run in
+fresh processes before its ordinary suite. The three full-bound native log
+proofs instead have owners 4 (leader), 5 (Durable) and 6 (Async). They run at O1
+with the original six-package selection, one exact proof and one test thread
+per dedicated runner. Their live O1 precheck rejects missing, ignored or
+ambiguous names; they need no ordinary-profile build. All ordinary inventories
+verify their ownership and exclusions. Million-entry inputs, three-cycle
+companions, assertions and test deadlines are preserved. See [CI sizing](README.md)
+for the hosted timing evidence behind the new job budgets.
+
+Each ordinary shard runs the original Cargo package/feature selection with four test
 threads, adding `--tests` and exact-name exclusions for the other shards.
 Cargo retains its working-directory and environment setup. Newly added tests
 are assigned automatically; prefix siblings cannot be excluded accidentally.
@@ -81,7 +96,10 @@ general-CI real-time exclusion list.
 
 Each ordinary shard uploads `egress-fence-test-map-N`, containing
 `egress-fence-test-map.json`: revision, every harness test name, ignored status,
-owner (0–2 for ordinary shards or 3 for `host-proofs`) and all four plans.
+owner (0–2 for ordinary shards, 3 for `host-proofs`, or 4–6 for full-bound
+proofs) and all seven plans. Each full-bound runner uploads its own exact
+command map. Console output names the current invocation; the artifacts retain
+the complete exclusion arguments without emitting a single oversized log line.
 Generate the same map locally without executing tests with:
 
 ```sh

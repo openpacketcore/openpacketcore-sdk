@@ -93,6 +93,19 @@
       "kind": "required-ci-removed",
       "reason": "Split the ordinary i686 lane by Cargo test binary to avoid its 30-minute job timeout. The ordinary slice retains the library and its existing ten exact exclusions, which still run in contracts. The ordinary-integration slice runs every registered integration target via --test *, all session-net doctests, and the unchanged opc-protocol/opc-proto-gtpv2c command. Both ordinary slices and contracts remain required by the same i686 aggregate. The named inventory partitions exactly as 807 + 572 = 1379, with no missing, extra or duplicate tests; all three doctest targets, features, profiles and test-thread limits are retained.",
       "issue": 1172
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::install::native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_export_and_cold_catalog",
+      "kind": "removed",
+      "reason": "Rename the snapshot-origin purge regression to describe physical prefix reclamation. The test now requires covered rows to be absent through export and cold catalog reopen, while preserving its payload, membership, snapshot, and lineage assertions.",
+      "issue": 1249,
+      "renamed_to": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::install::native_snapshot_origin_purge_removes_covered_prefix_through_export_and_cold_catalog"
+    },
+    {
+      "job": "ci:.github/workflows/ci.yml::rust-tests",
+      "kind": "required-ci-removed",
+      "issue": 1249,
+      "reason": "Transfer misc library execution to the required rust-libraries matrix using the explicit --split-libraries precheck/plan mode. The logical coverage plan still owns every original command; live compiled-library inventories partition exact names across two required runners with identical workspace packages, features, profiles, ignored status and test-thread counts. Scope-payload and child-read contracts remain fresh serial processes before ordinary execution on library shard 0. Binary unit tests, examples, doctests and the heavy remainder stay on misc. The three full-bound proofs move to dedicated required native-log shards with unchanged O1 commands, input sizes and assertions. Planner regressions cover total/disjoint identity ownership, future siblings, wrong-profile and overlap mutations, real Cargo execution including test=false libraries, and missing workflow dependencies. Existing job budgets and all test deadlines are unchanged."
     }
   ]
 }

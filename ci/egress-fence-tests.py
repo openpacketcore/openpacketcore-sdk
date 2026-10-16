@@ -16,11 +16,11 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import subprocess
 import sys
 
 import cargo_test_selection
+import native_log_bound
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,8 +32,8 @@ SELECTION = ["--locked", *[arg for name in PACKAGES for arg in ("-p", name)],
              "--all-features"]
 ORDINARY_SHARDS = (0, 1, 2)
 PROOF_SHARD = 3
-SHARDS = (*ORDINARY_SHARDS, PROOF_SHARD)
-REQUIRED_JOBS = ("sources", "oracles", "installer", "host-tests", "host-proofs")
+SHARDS = (*ORDINARY_SHARDS, PROOF_SHARD, *native_log_bound.EGRESS_SHARDS)
+REQUIRED_JOBS = ("sources", "oracles", "installer", "host-tests", "host-proofs", "host-native-log-proofs")
 ISOLATED_LIB = (
     "consensus::storage::tests::promoted_mismatch_never_unlinks_a_same_name_replacement",
     "consensus::raft_adapter::tests::raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family",
@@ -61,7 +61,7 @@ SERIAL_LIB_TESTS = (
     "consensus::store::sequential_wal_sdk_tests::scope_child_read::"
     "scope_child_read_three_large_children_refuse_the_whole_observation",
 )
-ISOLATED_TESTS = (*SPECIAL, *SERIAL_LIB_TESTS)
+ISOLATED_TESTS = (*SPECIAL, *SERIAL_LIB_TESTS, *native_log_bound.TESTS)
 
 
 def owner(name: str) -> int:
@@ -70,6 +70,8 @@ def owner(name: str) -> int:
         return 1
     if name in SPECIAL:
         return PROOF_SHARD
+    if name in native_log_bound.TESTS:
+        return native_log_bound.EGRESS_SHARDS[native_log_bound.TESTS.index(name)]
     return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big") % len(ORDINARY_SHARDS)
 
 
@@ -85,9 +87,9 @@ def listing(output: str) -> list[str]:
     return names
 
 
-def capture(command: list[str], cwd: Path = ROOT) -> str:
+def capture(command: list[str], cwd: Path = ROOT, *, env: dict | None = None) -> str:
     return subprocess.run(command, cwd=cwd, check=True, text=True,
-                          stdout=subprocess.PIPE).stdout
+                          stdout=subprocess.PIPE, env=env).stdout
 
 
 def inventory() -> list[dict]:
@@ -160,6 +162,26 @@ def serial_lib_command(name: str) -> dict:
     ]}
 
 
+def native_log_bound_command(name: str) -> dict:
+    command = serial_lib_command(name)
+    command["env"] = {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"}
+    return command
+
+
+def precheck_native_log_bound(commands: list[dict]) -> None:
+    """Prove each full-bound name resolves and stays enabled at test O1."""
+    for command in commands:
+        name = command["name"]
+        if name not in native_log_bound.TESTS:
+            continue
+        argv = [*command["argv"], "--list"]
+        env = dict(os.environ, **command["env"])
+        if listing(capture(argv, env=env)) != [name]:
+            raise ValueError("full native log proof must resolve exactly once at O1: " + name)
+        if listing(capture([*argv, "--ignored"], env=env)):
+            raise ValueError("full native log proof must remain enabled at O1: " + name)
+
+
 def plans(rows: list[dict], shard: int) -> list[dict]:
     if shard not in SHARDS:
         raise ValueError("unknown shard")
@@ -173,6 +195,8 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
             "cargo", "test", *SELECTION, "--quiet", "--tests", "--", "--test-threads=4",
             "--exact", *[arg for name in skipped for arg in ("--skip", name)],
         ]})
+    if shard in native_log_bound.EGRESS_SHARDS:
+        commands.append(native_log_bound_command(native_log_bound.TESTS[native_log_bound.EGRESS_SHARDS.index(shard)]))
     if shard == PROOF_SHARD:
         for name in (*ISOLATED_INTEGRATION, *ISOLATED_LIB):
             target = ["--test", "consensus_openraft"] if name in ISOLATED_INTEGRATION else ["--lib"]
@@ -212,6 +236,11 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
     expected = [(1, index, serial_lib_command(name)) for index, name in enumerate(SERIAL_LIB_TESTS)]
     if isolated != expected:
         raise ValueError("serial library tests must each run exactly once, first on shard 1")
+    native_locations = {}
+    for shard, name in zip(native_log_bound.EGRESS_SHARDS, native_log_bound.TESTS):
+        if planned[shard] != [native_log_bound_command(name)]:
+            raise ValueError("each full native log proof must run alone at O1 on its dedicated shard")
+        native_locations[name] = (shard, 0)
     metadata = cargo_test_selection.workspace_metadata(ROOT)
     resolved = {
         (shard, index): cargo_test_selection.resolve(command["argv"], metadata)
@@ -224,14 +253,21 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
         ]
         if selections != [(1, serial_index)]:
             raise ValueError("serial library test selections are missing or overlapping: " + name)
+    for name, expected_location in native_locations.items():
+        selections = [
+            location for location, selection in resolved.items()
+            if selection.selects("opc-session-store", "opc_session_store", ("lib",), name)
+        ]
+        if selections != [expected_location]:
+            raise ValueError("full native log proof selections are missing or overlapping: " + name)
     for shard in ORDINARY_SHARDS:
         ordinary = [c for c in planned[shard] if c["name"] == "ordinary"]
         if len(ordinary) != 1:
             raise ValueError("ordinary test command must run exactly once per shard")
         argv = ordinary[0]["argv"]
         skips = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--skip"]
-        if "--exact" not in argv or any(skips.count(name) != 1 for name in SERIAL_LIB_TESTS):
-            raise ValueError("ordinary tests must exclude exactly the serial library tests")
+        if "--exact" not in argv or any(skips.count(name) != 1 for name in (*SERIAL_LIB_TESTS, *native_log_bound.TESTS)):
+            raise ValueError("ordinary tests must exclude exactly the serial library and full native log tests")
 
 
 def require_jobs(needs: dict) -> None:
@@ -258,6 +294,21 @@ def main() -> int:
         return 0
     if args.output is None or (not args.inventory_only and args.shard is None):
         parser.error("--output and either --shard or --inventory-only are required")
+    if not args.inventory_only and args.shard in native_log_bound.EGRESS_SHARDS:
+        # These runners need only O1. The ordinary runners still inventory all
+        # names and verify their ownership, while this live O1 precheck rejects
+        # a missing, ignored or ambiguous proof before it can pass as a no-op.
+        name = native_log_bound.TESTS[native_log_bound.EGRESS_SHARDS.index(args.shard)]
+        commands = [native_log_bound_command(name)]
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps({
+            "head": capture(["git", "rev-parse", "HEAD"]).strip(),
+            "plans": {str(args.shard): commands},
+        }, indent=2) + "\n")
+        print("Precheck O1 full native log proof:", name, flush=True)
+        precheck_native_log_bound(commands)
+        run_commands(commands)
+        return 0
     rows = inventory()
     plan = {str(shard): plans(rows, shard) for shard in SHARDS}
     verify_plans({int(shard): commands for shard, commands in plan.items()})
@@ -269,10 +320,19 @@ def main() -> int:
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print("Exact test-name partition:", dict(sorted(Counter(r["shard"] for r in rows).items())), flush=True)
     if not args.inventory_only:
-        for command in plan[str(args.shard)]:
-            print("egress-fence:", command["name"], shlex.join(command["argv"]), flush=True)
-            subprocess.run(command["argv"], cwd=ROOT, env=dict(os.environ, **command["env"]), check=True)
+        precheck_native_log_bound(plan[str(args.shard)])
+        run_commands(plan[str(args.shard)])
     return 0
+
+
+def run_commands(commands: list[dict]) -> None:
+    for command in commands:
+        # Exact argv is retained in the mapping artifact. Printing hundreds of
+        # kilobytes of exclusions as one line truncated `gh run view --log`.
+        print("egress-fence:", command["name"], flush=True)
+        result = subprocess.run(command["argv"], cwd=ROOT, env=dict(os.environ, **command["env"]))
+        if result.returncode:
+            raise ValueError(f"{command['name']}: exit {result.returncode}; see the test mapping for exact argv")
 
 
 if __name__ == "__main__":

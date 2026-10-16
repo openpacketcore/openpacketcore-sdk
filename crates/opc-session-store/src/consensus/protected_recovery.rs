@@ -689,3 +689,8 @@ redacted!(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn maximum_proof_for_native_frontier_test() -> ProtectedRecoveryProof {
+    tests::maximum_proof()
+}

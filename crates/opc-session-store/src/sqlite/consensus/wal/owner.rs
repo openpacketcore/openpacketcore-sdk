@@ -17,12 +17,10 @@ use crate::consensus::SessionPersistenceMode;
 use crate::sqlite::consensus::{self, SqliteConsensusCore};
 
 pub(super) const ROOT_BYTES: u64 = 168;
-const ROOT_MAGIC: &[u8; 8] = b"OPCNR001";
-const ASYNC_ROOT_MAGIC: &[u8; 8] = b"OPCNA001";
-// V1 readers must fail before participating: they do not consume a closed
-// incarnation proof and could otherwise leave it beside new volatile work.
-const ASYNC_CLOSED_ROOT_MAGIC: &[u8; 8] = b"OPCNA002";
-const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA003";
+// Readers predating frontier-implied log removal must fail before reading
+// CURRENT. Both formats retain the existing selector and root record layout.
+const ROOT_MAGIC: &[u8; 8] = b"OPCNR002";
+const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA004";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
 #[cfg(any(test, feature = "test-control"))]
@@ -30,6 +28,9 @@ type GenerationHookForTest = Arc<dyn Fn(&'static str) -> io::Result<()> + Send +
 
 #[cfg(test)]
 pub(crate) type IoHookForTest = Arc<dyn Fn(super::Point) -> io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+type PreflightHookForTest = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +63,17 @@ fn read_selection(database: &File) -> io::Result<Option<[u8; ROOT_BYTES as usize
 
 fn identity(metadata: &fs::Metadata) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
+}
+
+fn check_open_cancelled(cancellation: &AtomicBool) -> io::Result<()> {
+    if cancellation.load(Ordering::Acquire) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "native generation admission cancelled",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn open_directory(path: &Path) -> io::Result<Arc<File>> {
@@ -106,6 +118,8 @@ pub(crate) struct NativeOwner {
     root_hook: Mutex<Option<RootHookForTest>>,
     #[cfg(test)]
     io_hook: Mutex<Option<IoHookForTest>>,
+    #[cfg(test)]
+    preflight_hook: Mutex<Option<PreflightHookForTest>>,
 }
 
 impl NativeOwner {
@@ -150,6 +164,8 @@ impl NativeOwner {
             root_hook: Mutex::new(None),
             #[cfg(test)]
             io_hook: Mutex::new(None),
+            #[cfg(test)]
+            preflight_hook: Mutex::new(None),
         })
     }
 
@@ -202,6 +218,12 @@ impl NativeOwner {
     pub(crate) fn set_io_hook_for_test(&self, hook: IoHookForTest) {
         assert!(self.current.lock().unwrap().upgrade().is_none());
         *self.io_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_preflight_hook_for_test(&self, hook: PreflightHookForTest) {
+        assert!(self.current.lock().unwrap().upgrade().is_none());
+        *self.preflight_hook.lock().unwrap() = Some(hook);
     }
 
     #[cfg(test)]
@@ -307,6 +329,92 @@ impl NativeOwner {
             .ok_or_else(|| invalid_data("native owner unavailable"))
     }
 
+    /// Refuse unknown generation vocabularies before initialization can write.
+    /// This compatibility pass does not admit rows or replace the later full
+    /// catalog, WAL suffix and strict snapshot verification during attachment.
+    pub(crate) fn preflight_formats(
+        &self,
+        identity_expected: consensus::SessionConsensusIdentity,
+        cancellation: &AtomicBool,
+    ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
+        let pin = pin_directory(&directory_path(&self.parent).join(&self.native_name))?;
+        let binding = self.read_root(&pin, identity_expected)?;
+        let directory = directory_path(&pin);
+        let anchor = super::checkpoint::read(&directory, binding, Limits::default())?
+            .ok_or_else(|| invalid_data("native selected generation is missing"))?;
+        self.preflight_generation_format(&directory, &anchor, cancellation)
+    }
+
+    /// Compatibility inspection precedes even the SQLite query that classifies
+    /// a caller identity mismatch. ROOT's checksum, selection and inode binding
+    /// are checked here; its scope binding remains the ordinary opener's job.
+    pub(crate) fn preflight_formats_before_scope_lookup(
+        &self,
+        cancellation: &AtomicBool,
+    ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
+        let pin = pin_directory(&directory_path(&self.parent).join(&self.native_name))?;
+        let (bytes, persistence) = self.read_root_record(&pin)?;
+        let mut root = [0; 32];
+        root.copy_from_slice(&bytes[104..136]);
+        let directory = directory_path(&pin);
+        let anchor = super::checkpoint::read_for_native_format_preflight(
+            &directory,
+            root,
+            persistence,
+            Limits::default(),
+        )?
+        .ok_or_else(|| invalid_data("native selected generation is missing"))?;
+        self.preflight_generation_format(&directory, &anchor, cancellation)
+    }
+
+    fn preflight_generation_format(
+        &self,
+        directory: &Path,
+        anchor: &super::checkpoint::Anchor,
+        cancellation: &AtomicBool,
+    ) -> io::Result<Vec<super::super::CurrentSnapshot>> {
+        #[cfg(test)]
+        let hook = self.preflight_hook.lock().unwrap().clone();
+        let prefix = anchor
+            .native_prefix()?
+            .ok_or_else(|| invalid_data("native generation discriminator differs"))?;
+        let current = crate::consensus::native::generation::preflight_format(
+            &anchor.basis_path(directory),
+            prefix,
+            super::MAX_BASIS,
+            anchor.native_cut_binding()?,
+            &|| {
+                if cancellation.load(Ordering::Acquire) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "native generation preflight cancelled",
+                    ));
+                }
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    hook()?;
+                    if cancellation.load(Ordering::Acquire) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "native generation preflight cancelled",
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let mut snapshots = anchor
+            .native_snapshots
+            .as_ref()
+            .map_or_else(Vec::new, |snapshots| snapshots.retained());
+        if let Some(current) = current {
+            if !snapshots.contains(&current) {
+                snapshots.push(current);
+            }
+        }
+        Ok(snapshots)
+    }
+
     fn verify_database(&self, core: &SqliteConsensusCore) -> io::Result<()> {
         let database = core
             .database_file
@@ -324,15 +432,16 @@ impl NativeOwner {
     }
 
     pub(crate) async fn attach_with_descriptors<V, F>(
-        &self,
+        self: &Arc<Self>,
         core: &mut SqliteConsensusCore,
         persistence: SessionPersistenceMode,
         validate: impl FnOnce(Vec<consensus::CurrentSnapshot>, Option<consensus::CurrentSnapshot>) -> F,
-        verify: impl FnOnce(&V) -> io::Result<()>,
-        install_source: impl FnOnce(&V) -> Option<&super::snapshot::InstallSource>,
+        verify: impl FnOnce(&V) -> io::Result<()> + Send + 'static,
+        install_source: impl FnOnce(&V) -> Option<&super::snapshot::InstallSource> + Send + 'static,
     ) -> io::Result<()>
     where
         F: std::future::Future<Output = io::Result<V>>,
+        V: Send + 'static,
     {
         if !self.selected()
             || core.private_wal.is_some()
@@ -341,29 +450,50 @@ impl NativeOwner {
             return Err(invalid_data("native fixed owner admission differs"));
         }
         self.verify_database(core)?;
-        let conn = core.conn.lock().await;
+        let conn = Arc::clone(&core.conn).lock_owned().await;
         let path = directory_path(&self.parent).join(&self.native_name);
         let existing = match fs::symlink_metadata(&path) {
             Ok(_) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
-        let wal = if existing {
+        let (wal, _conn) = if existing {
             let pin = pin_directory(&path)?;
             let binding = self.read_root(&pin, core.storage_identity)?;
             if binding.persistence != persistence {
                 return Err(invalid_data("native persistence mode differs"));
             }
-            let opening = super::native::Opening::new(
-                &directory_path(&pin),
-                binding,
-                core.configured_roster_root.clone(),
-                Limits::default(),
-                self.io_control(),
-            )?;
+            let owner = Arc::clone(self);
+            let roster_root = core.configured_roster_root.clone();
+            // The worker owns the connection guard as well as the descriptor
+            // owner. Cancelling an open must not release either underneath a
+            // running scan; queued captures are retired by the shared guard.
+            let (opening, conn, owner) =
+                crate::sqlite::SqliteSessionBackend::run_native_open_blocking(move |cancel| {
+                    let opening = super::native::Opening::new_with_check(
+                        &directory_path(&pin),
+                        binding,
+                        roster_root,
+                        Limits::default(),
+                        owner.io_control(),
+                        &|| check_open_cancelled(cancel),
+                    )?;
+                    Ok((opening, conn, owner))
+                })
+                .await
+                .map_err(io::Error::other)?;
             let descriptors = validate(opening.snapshots(), opening.install_candidate()).await?;
-            opening
-                .finish_with_install_source(install_source(&descriptors), || verify(&descriptors))?
+            crate::sqlite::SqliteSessionBackend::run_native_open_blocking(move |cancel| {
+                let _owner = owner;
+                let wal = opening.finish_with_install_source_checked(
+                    install_source(&descriptors),
+                    || verify(&descriptors),
+                    &|| check_open_cancelled(cancel),
+                )?;
+                Ok((wal, conn))
+            })
+            .await
+            .map_err(io::Error::other)?
         } else {
             if !core.fresh_native_basis || read_selection(&self.database)?.is_some() {
                 return Err(invalid_data(
@@ -386,7 +516,7 @@ impl NativeOwner {
                 persistence,
             )?;
             self.write_root(&wal)?;
-            wal
+            (wal, conn)
         };
         self.verify_database(core)?;
         let placement = core
@@ -425,13 +555,14 @@ impl NativeOwner {
         let mut bytes = [0; ROOT_BYTES as usize];
         bytes[..8].copy_from_slice(match wal.binding.persistence {
             SessionPersistenceMode::Durable => ROOT_MAGIC,
-            SessionPersistenceMode::Async if wal.binding.async_recovery_format => {
+            SessionPersistenceMode::Async
+                if wal.binding.async_recovery_format && wal.binding.async_closed_format =>
+            {
                 ASYNC_RECOVERY_ROOT_MAGIC
             }
-            SessionPersistenceMode::Async if wal.binding.async_closed_format => {
-                ASYNC_CLOSED_ROOT_MAGIC
+            SessionPersistenceMode::Async => {
+                return Err(invalid_data("asynchronous recovery root format differs"));
             }
-            SessionPersistenceMode::Async => ASYNC_ROOT_MAGIC,
         });
         for (chunk, value) in bytes[8..40].as_chunks_mut::<8>().0.iter_mut().zip([
             self.database_identity.0,
@@ -481,11 +612,10 @@ impl NativeOwner {
         Ok(())
     }
 
-    fn read_root(
+    fn read_root_record(
         &self,
         directory: &File,
-        identity_expected: consensus::SessionConsensusIdentity,
-    ) -> io::Result<Binding> {
+    ) -> io::Result<([u8; ROOT_BYTES as usize], SessionPersistenceMode)> {
         let mut file = super::file_read(&directory_path(directory).join("ROOT"))?;
         let metadata = file.metadata()?;
         if metadata.len() != ROOT_BYTES
@@ -509,10 +639,13 @@ impl NativeOwner {
         }
         let persistence = match &bytes[..8] {
             magic if magic == ROOT_MAGIC => SessionPersistenceMode::Durable,
-            magic if magic == ASYNC_ROOT_MAGIC => SessionPersistenceMode::Async,
-            magic if magic == ASYNC_CLOSED_ROOT_MAGIC => SessionPersistenceMode::Async,
             magic if magic == ASYNC_RECOVERY_ROOT_MAGIC => SessionPersistenceMode::Async,
-            _ => return Err(invalid_data("native root persistence format differs")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    crate::consensus::storage::SessionConsensusStorageError::PersistenceFormatMismatch,
+                ));
+            }
         };
         let directory_identity = identity(&directory.metadata()?);
         for (chunk, expected) in bytes[8..40].as_chunks::<8>().0.iter().zip([
@@ -525,6 +658,15 @@ impl NativeOwner {
                 return Err(invalid_data("native root namespace identity differs"));
             }
         }
+        Ok((bytes, persistence))
+    }
+
+    fn read_root(
+        &self,
+        directory: &File,
+        identity_expected: consensus::SessionConsensusIdentity,
+    ) -> io::Result<Binding> {
+        let (bytes, persistence) = self.read_root_record(directory)?;
         let mut generation = [0; 32];
         let mut basis = [0; 32];
         generation.copy_from_slice(&bytes[40..72]);
@@ -535,8 +677,7 @@ impl NativeOwner {
             basis,
             native: true,
             persistence,
-            async_closed_format: &bytes[..8] == ASYNC_CLOSED_ROOT_MAGIC
-                || &bytes[..8] == ASYNC_RECOVERY_ROOT_MAGIC,
+            async_closed_format: &bytes[..8] == ASYNC_RECOVERY_ROOT_MAGIC,
             async_recovery_format: &bytes[..8] == ASYNC_RECOVERY_ROOT_MAGIC,
         };
         if binding.digest()? != bytes[104..136] {
@@ -545,3 +686,7 @@ impl NativeOwner {
         Ok(binding)
     }
 }
+
+#[cfg(test)]
+#[path = "owner_format_tests.rs"]
+mod format_tests;

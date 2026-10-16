@@ -505,6 +505,12 @@ impl NativeSnapshotAuthority {
         {
             return false;
         }
+        self.matches_local_snapshot_binding(candidate)
+    }
+
+    /// Checks only the local generation prefix. Snapshot metadata, cut and
+    /// membership still require their separate admission checks.
+    pub(crate) fn matches_local_snapshot_binding(&self, candidate: &CurrentSnapshot) -> bool {
         let Some(suffix) = candidate.0.snapshot_id.as_bytes().strip_prefix(b"native-") else {
             return false;
         };

@@ -87,8 +87,10 @@ Native snapshot export writes the portable SQLite business projection directly
 into the staging inode that will be sealed and published. It does not write
 local Raft log payloads and then allocate a second database to compact them
 away. The immutable native capture still validates local Raft frontiers and
-reads/authenticates the covered selected log bytes. Portable state retains all
-required records, leases, receipts, watch history, roster state, and the exact
+reads/authenticates retained selected log bytes above the purge frontier.
+Purged rows are absent; the selected snapshot and context supply their coverage.
+Portable state retains all required records, leases, receipts, watch history,
+roster state, and the exact
 applied/membership cut. Finalization rotates restore metadata and validates the
 synced output before the existing seal, publication, and reclamation sequence.
 Install-base export separately retains the complete local predecessor required
@@ -127,6 +129,138 @@ state. The backing retains native-selection knowledge independently of the
 native directory, so missing selected state is an error. Existing populated
 legacy state is not silently converted. No legacy or cross-mode migration is
 included in this feature.
+
+## Physical log reclamation and the native format boundary
+
+Native purge removes every resident log row at or below its full purge LogId P,
+including voter-slot projections held by those rows. The selected context
+already binds P, applied cut A, current snapshot cut S and applied membership;
+no extra witness record is introduced. Admission requires P <= A of the
+selected generation and P <= S of its selected snapshot, using full LogId
+lineage checks. The snapshot selection is durable before purge is admitted in
+both persistence modes. A missing membership row is valid only under the
+existing installed-origin authority or when its full LogId is covered by P
+and the selected snapshot's whole membership equals applied membership.
+The snapshot's own row may be absent at P == S, in addition to the existing
+installed-origin case.
+
+The retained log starts at P.index + 1, or is empty. Index zero is accepted
+only before any purge. The checkpoint journal carries one coalesced prefix
+cut and constant serialized metadata, with no tombstone per removed row.
+Purge uses admitted row facts and shared proof scope; it performs no payload
+I/O and acquires no additional verification-budget reservation. Persistent
+map updates still cost CPU and allocation proportional to the smaller retained
+or removed side, while removed-row aggregate checks scan the removed prefix.
+Detached captures keep their original rows and are audited outside the owner.
+
+Cold delta admission checks the new P against the exact predecessor row
+before deleting any index. It subtracts that prefix from count/content
+summaries, rejects changed rows at or below P, then validates the complete
+resulting context. The existing rule against changing protected log history
+otherwise stays intact. A base has no predecessor; its purge frontier, like
+its business rows, is covered by the selected digest. Durable WAL replay
+recomputes the same removal from the unchanged purge operation. Async recovery
+uses only the selected generation. Retained-owner committed coverage still
+compares exact local rows when present; below P, where rows are now absent,
+it uses the existing ordering rule against the full purge LogId. At P itself,
+an equal index still requires the exact LogId.
+
+This boundary creates Durable `OPCNR002` and Async `OPCNA004` roots with distinct
+binding hash domains. `OPCNR001` and `OPCNA001` through `OPCNA003` are refused
+with typed `PersistenceFormatMismatch`, exposed by the public store as
+`FreshInstallationRequired`. No in-place migration or silent legacy behavior
+is supported. A pre-boundary reader also refuses the new root discriminator.
+Root markers are written only at creation. Generation magic is an eight-byte
+record: the six ASCII bytes `OPCNJB` for a base or `OPCNJD` for a delta, followed
+by a vocabulary byte and an independent voter-profile byte. The current
+vocabulary is `0x06`; profile `0x00` is fixed membership and profile `0x01`
+carries voter slots. Readers compare only the vocabulary level for monotonic
+format order and validate the profile separately against each context.
+Unknown levels and profiles are refused. A new root refuses older generation
+vocabularies and full-image fallbacks. Portable snapshots, the Raft wire and
+WAL operation records retain their existing formats.
+
+The root contract reserves future generation vocabularies in place. A later
+format may be appended monotonically within a file; a new state-machine
+vocabulary requires committed activation and supported optional frontier
+fields. A later vocabulary may add optional command fields, intents and image
+tables; each arrives by a committed activation. A reader refuses an unknown
+discriminator, frontier field, undecodable log command or image schema before
+SQL initialization, snapshot-directory probes, recovery repair or other writes.
+Unknown generation vocabulary returns typed `CorruptState`; an unknown image
+schema returns typed `SchemaVersionMismatch`. Read-only schema inspection
+uses pinned snapshot descriptors and immutable SQLite readers.
+Format preflight does not grant storage or consensus authority: full selected
+state, scope, membership and snapshot admission still run afterward. Later
+log-file rollover and sibling-table retirement need no second fresh-install
+boundary under this contract.
+
+Both compatibility preflight paths and full generation admission run on
+blocking workers. Full admission includes selected-state reconstruction,
+installed-origin reconstruction, recovery replay and finalization. Snapshot
+descriptors are admitted and rechecked before recovery can repair files or
+stabilize a selector. Cancelling an opener releases queued captures immediately
+and stops running scans at their next cancellation check; a running admission
+keeps its connection guard and descriptor owner until it stops. Ordinary-open
+tests over large selected and installed generations verify runtime progress in
+both persistence modes.
+
+The public reopen regressions
+`native_unknown_frontier_public_reopen_refuses_before_backend_or_snapshot_writes`,
+`native_unknown_command_public_reopen_refuses_before_backend_or_snapshot_writes`
+and `native_unknown_image_schema_public_reopen_refuses_before_backend_or_snapshot_writes`
+exercise both persistence modes. They require the exact typed error twice,
+compare the complete database and snapshot namespaces before and after refusal,
+and admit a corresponding supported fixture. The image fixture has a valid
+envelope checksum, fs-verity seal and selected metadata, so only its schema
+version explains refusal.
+
+The 64 KiB JSON header budget includes **both** contexts in every delta:
+
+| Encoded component | Budget |
+| --- | ---: |
+| Current frontier vocabulary, per context | 20 KiB |
+| Future optional frontier fields, per context | 4 KiB |
+| Complete frontier, per context | 24 KiB |
+| Identity, membership set, table summaries and log metadata, per context | 4 KiB |
+| Complete context | 28 KiB |
+| Previous selection, cut binding and other outer delta metadata | 8 KiB |
+| Complete delta header: two contexts plus outer metadata | 64 KiB |
+
+The 4 KiB future allowance is an aggregate reservation for later optional
+frontiers, including receipt and notification retirement. Each later vocabulary
+must demonstrate that its complete frontier and context stay within these
+budgets in both copies; the existing header ceiling does not increase.
+Generation headers use padded base64 for the slot tables' existing canonical
+binary bytes. With nine slots, all terminal results and a complete active
+replacement, the genesis/current tables occupy at most 916/8,072 binary bytes;
+their combined JSON carrier fits in 12 KiB. The generation-only Async recovery
+carrier uses padded base64 over canonical postcard, bounded at 8 KiB before
+base64. This includes the complete 32-owner proof. Slot and Async profiles are
+mutually exclusive. Command and SQLite image encodings retain their existing
+named fields. The budget regression
+`native_delta_header_budgets_both_maximum_frontiers_and_future_fields` includes
+both profiles, maximum memberships, escaped snapshot strings, all activation
+metadata, wide counters and the reserved future bytes in both contexts.
+
+A generation file may be replaced by another file epoch carrying the same context. Bindings inside a file are historical and only the last is compared.
+
+A rowless delta may preserve the same context and operation sequence. A higher
+checkpoint epoch may reselect the same logical cut in another file. Recovery
+admits the selected generation before removing one unselected next file and
+up to two previous native generation files. This namespace capacity reserves
+the rollover/install handoff; it does not itself switch generation files.
+
+Physical row reclamation removes the accumulated-row lifetime limit. The
+1,048,576-row cap remains a last defense against an unbounded live suffix.
+File extent still grows until generation-file rollover (SDK #1253): current
+ceilings are 32 GiB Durable and 8 GiB Async. A Durable ceiling failure fences
+the writer. An Async ceiling failure latches a failed background writer; the
+next snapshot publication fails and stops the engine, within one snapshot
+interval. A restart does not make additional file space available. Stalled
+snapshot work and failed local builds are different cases; any failed local
+build still stops the engine (SDK #1254). Separate key, ordinary-receipt and
+notification caps are unchanged.
 
 ## Async writer and local observations
 
@@ -255,13 +389,12 @@ Async can lose acknowledged results if the live volatile quorum is lost.
 
 ### Completed consensus shutdown
 
-Completed-shutdown evidence was introduced with `OPCNA002`; new Async roots
-use `OPCNA003`, with an additional durable authority reservation and a distinct
-root-binding hash domain. Old
-readers reject this format before participating: a reader that did not consume
-the one-use proof could otherwise retain it while acknowledging new volatile
-work. Legacy `OPCNA001` roots retain their original admission rules; there is
-no implicit format migration or retrospective certification.
+Completed-shutdown evidence was introduced with `OPCNA002`; the durable
+authority reservation followed in `OPCNA003`. Current `OPCNA004` roots retain
+both contracts and add physical log reclamation under a new binding hash
+domain. Readers without this vocabulary reject the root before participating.
+Old roots are refused by this binary; there is no implicit migration or
+retrospective certification.
 
 The clone-wide shutdown coordinator first joins maintenance lanes, Raft and
 every actual storage/snapshot owner. Only an incarnation that was Active and
@@ -296,7 +429,7 @@ acknowledgements retain their resident replication/application boundary.
 
 ### Reserved authority and replicated retirement
 
-An `OPCNA003` owner syncs its root-bound `ASYNC-AUTHORITY` reservation before
+An `OPCNA004` owner syncs its root-bound `ASYNC-AUTHORITY` reservation before
 starting volatile consensus. Its finite range bounds terms, indices and
 authority allocators independently of completed session generations. Ordinary
 operations compare resident counters against the reservation without writing
@@ -313,7 +446,7 @@ roots and retained protected authority are outside this retirement vocabulary.
 
 ### Unanimous retained-owner recovery (SDK #908)
 
-Normal Async acknowledgements remain independent of disk. An `OPCNA003` root
+Normal Async acknowledgements remain independent of disk. An `OPCNA004` root
 reserves a finite range **before** any volatile issuance. The initial ceiling
 is `2^40 - 1`; each recovery era advances by `2^40`. Eras and all reserved
 frontiers are bounded below the signed-counter limit. Exhaustion rejects work;
@@ -392,14 +525,13 @@ readiness or a subsequent operation's own checks.
 
 ### Compatibility and unsupported authority
 
-`OPCNA001`/`OPCNA002` roots lack a pre-loss allocation ceiling. Their live-quorum
-and completed-shutdown paths remain available as applicable, but this protocol
-cannot retroactively bound a lost tail. An already-fenced legacy installation
-needs independent authority that can durably retire its lost scope and finish
-or revoke accepted effects at every affected consumer, then authorize one
-exact successor state. Neither data-loss acceptance nor the existing product
-Recovery object supplies those facts. The existing operator-recovery API itself
-requires a live quorum. No migration/reset recipe is provided as a substitute.
+All pre-reclamation roots (`OPCNA001` through `OPCNA003`) are refused with the
+fresh-install boundary above. Earlier roots without a pre-loss allocation
+ceiling cannot be retrospectively certified. The refusal grants no authority
+to retire external effects or choose a replacement history. Neither data-loss
+acceptance nor the existing product Recovery object supplies that authority;
+the existing operator-recovery API itself requires a live quorum. No implicit
+migration or reset is provided as a substitute.
 
 All participants must retain applied exact fixed membership. If loss predates
 its first persisted generation, this protocol does not synthesize membership
@@ -410,7 +542,7 @@ provider inventory reports `ProtectedAuthorityRequired`, including when its
 volatile activation was lost.
 These are availability limits, never successful fence-only recovery outcomes.
 
-This requirement also applies to newly provisioned `OPCNA003` roots;
+This requirement also applies to newly provisioned `OPCNA004` roots;
 it is independent of older deployment migration. The member provider contract fences
 one immutable admission/member binding. Issuing a larger consensus fence for
 a different admission does not advance that old provider row. A local permit

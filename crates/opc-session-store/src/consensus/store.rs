@@ -495,7 +495,7 @@ pub enum ConsensusSessionStoreOpenError {
     /// workflow before this member may join.
     #[error("session consensus durable recovery is required")]
     RecoveryRequired,
-    /// The retained scope format belongs to the previous profile. Start with
+    /// The retained scope or native root format belongs to another profile. Start with
     /// fresh storage; this error does not authorize migrating or deleting it.
     #[error("session consensus scope format changed; fresh installation required")]
     FreshInstallationRequired,
@@ -564,7 +564,8 @@ impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
     fn from(error: SessionConsensusStorageError) -> Self {
         match error {
             SessionConsensusStorageError::PersistenceModeMismatch => Self::PersistenceModeMismatch,
-            SessionConsensusStorageError::FreshInstallationRequired => {
+            SessionConsensusStorageError::FreshInstallationRequired
+            | SessionConsensusStorageError::PersistenceFormatMismatch => {
                 Self::FreshInstallationRequired
             }
             SessionConsensusStorageError::SnapshotIntegrityUnavailable => {
@@ -3651,7 +3652,16 @@ impl ConsensusSessionStore {
                 .as_ref()
                 .ok_or(ConsensusSessionStoreOpenError::StorageUnavailable)?
                 .persistence_mode(identity)
-                .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?
+                .map_err(|error| {
+                    if matches!(
+                        SessionConsensusStorageError::from_validation_error(error),
+                        SessionConsensusStorageError::PersistenceFormatMismatch
+                    ) {
+                        ConsensusSessionStoreOpenError::FreshInstallationRequired
+                    } else {
+                        ConsensusSessionStoreOpenError::StorageUnavailable
+                    }
+                })?
                 .is_some();
         #[cfg(not(target_os = "linux"))]
         let reopened_async = false;

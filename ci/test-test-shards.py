@@ -700,6 +700,15 @@ class QuiescentShardPlanTests(unittest.TestCase):
 
 
 class LibraryGroupPlanTests(unittest.TestCase):
+    NATIVE_FULL_BOUND = (
+        "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
+        "native_leader_full_bound_reproposes_one_idempotent_request_and_reopens",
+        "consensus::storage::tests::native_log_retained_bound::"
+        "native_log_retained_bound_survives_snapshot_purge_and_restart",
+        "consensus::storage::tests::native_log_retained_bound::"
+        "native_log_retained_bound_survives_snapshot_purge_and_restart_async",
+    )
+
     def setUp(self) -> None:
         self.plan = TEST_SHARDS.load_plan()
         self.targets = [
@@ -741,6 +750,76 @@ class LibraryGroupPlanTests(unittest.TestCase):
         binary = [command for command in commands if "--bins" in command]
         self.assertEqual(binary, [TEST_SHARDS.SELECTION + ["--bins", "--", *TEST_SHARDS.HARNESS]])
 
+    def test_full_native_bounds_have_dedicated_owners_and_optimized_serial_execution(self) -> None:
+        invocations = [(shard, command)
+                       for shard in TEST_SHARDS.shard_ids(self.plan)
+                       for command in TEST_SHARDS.commands(self.plan, shard, self.targets)
+                       if "--lib" in command]
+        for name in self.NATIVE_FULL_BOUND:
+            selected = [(shard, command) for shard, command in invocations
+                        if self.selected(command, name)]
+            with self.subTest(name=name):
+                self.assertEqual(len(selected), 1)
+                shard, command = selected[0]
+                self.assertEqual(shard, f"native-log-{self.NATIVE_FULL_BOUND.index(name)}")
+                self.assertEqual(command[:2], ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"])
+                self.assertEqual(command[2:2 + len(TEST_SHARDS.SELECTION)], TEST_SHARDS.SELECTION)
+                self.assertIn("--test-threads=1", command)
+                self.assertIn("--nocapture", command)
+                self.assertNotIn("--ignored", command)
+                siblings = [(owner, invocation) for owner, invocation in invocations
+                            if self.selected(invocation, name + "_future")]
+                self.assertEqual([owner for owner, _ in siblings], ["misc"])
+                self.assertNotIn("CARGO_PROFILE_TEST_OPT_LEVEL=1", siblings[0][1])
+
+    def test_full_native_bounds_cannot_disappear_move_or_change_an_ordinary_group_profile(self) -> None:
+        for mutation in ("missing", "owner", "mixed"):
+            plan = copy.deepcopy(self.plan)
+            group = next(group for group in plan["lib_groups"]
+                         if self.NATIVE_FULL_BOUND[0] in TEST_SHARDS.lib_group_names(group))
+            if mutation == "missing":
+                plan["lib_groups"].remove(group)
+            elif mutation == "owner":
+                group["shard"] = "it-1"
+            else:
+                group["tests"].append("an_ordinary_future_sibling")
+            with self.subTest(mutation=mutation), self.assertRaises(SystemExit):
+                TEST_SHARDS.verify_lib_plan(plan)
+
+    def test_full_native_precheck_resolves_the_enabled_names_in_the_execution_profile(self) -> None:
+        calls = []
+
+        def listed(command, **kwargs):
+            calls.append(command)
+            names = command[command.index("--exact") + 1:]
+            if "--ignored" in command:
+                names = []
+            return subprocess.CompletedProcess(command, 0,
+                stdout="\n".join(f"{name}: test" for name in names))
+
+        with (
+            patch.object(TEST_SHARDS, "integration_targets", return_value=self.targets),
+            patch.object(TEST_SHARDS, "verify"),
+            patch.object(TEST_SHARDS, "quiescent_lib_tests_for_shard", return_value=()),
+            patch.object(TEST_SHARDS, "list_heavy_tests", return_value=self.plan["heavy"]["shards"][1]),
+            patch.object(TEST_SHARDS.subprocess, "run", side_effect=listed),
+        ):
+            TEST_SHARDS.precheck(self.plan, "heavy-1")
+            for shard in TEST_SHARDS.native_log_bound.CORE_SHARDS:
+                TEST_SHARDS.precheck(self.plan, shard)
+        for name in self.NATIVE_FULL_BOUND:
+            selected = [command for command in calls if name in command]
+            with self.subTest(name=name):
+                self.assertEqual(len(selected), 2)
+                self.assertTrue(all(command[:2] == ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
+                                    for command in selected))
+                self.assertEqual(sum("--ignored" in command for command in selected), 1)
+        ordinary = [command for command in calls
+                    if not any(name in command for name in self.NATIVE_FULL_BOUND)]
+        self.assertTrue(ordinary)
+        self.assertTrue(all(command[:len(TEST_SHARDS.SELECTION)] == TEST_SHARDS.SELECTION
+                            for command in ordinary))
+
     def test_empty_duplicate_unknown_and_optimized_groups_are_rejected(self) -> None:
         invalid = []
         empty = copy.deepcopy(self.plan)
@@ -757,6 +836,21 @@ class LibraryGroupPlanTests(unittest.TestCase):
             with self.subTest(plan=plan["lib_groups"][0]):
                 with self.assertRaises(SystemExit):
                     TEST_SHARDS.verify_lib_plan(plan)
+
+    def test_child_parent_declarations_must_name_distinct_members_of_one_group(self) -> None:
+        for mutation in ("unknown-child", "unknown-parent", "self-parent", "child-parent-chain", "not-a-map"):
+            plan = copy.deepcopy(self.plan)
+            group = plan["lib_groups"][0]
+            child, parent = group["tests"][:2]
+            group["child_parents"] = {
+                "unknown-child": {"missing": parent},
+                "unknown-parent": {child: "missing"},
+                "self-parent": {child: child},
+                "child-parent-chain": {child: parent, parent: child},
+                "not-a-map": [child],
+            }[mutation]
+            with self.subTest(mutation=mutation), self.assertRaises(SystemExit):
+                TEST_SHARDS.verify_lib_plan(plan)
 
     def test_timing_contract_cannot_join_an_ordinary_group(self) -> None:
         self.plan["lib_groups"].append({
@@ -891,6 +985,94 @@ class RealtimeQualificationPartitionTests(unittest.TestCase):
         self.plan["qualification"] = [{"name": self.plan["heavy"]["shards"][0][0]}]
         with self.assertRaisesRegex(SystemExit, "required shard"):
             TEST_SHARDS.verify_commands(self.plan, self.targets)
+
+
+
+class HostedLibraryTransferTests(unittest.TestCase):
+    def setUp(self):
+        self.plan = TEST_SHARDS.load_plan()
+        self.targets = [self.plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))]
+
+    def test_hosted_misc_preserves_every_non_library_command_and_transfers_the_complete_library_phase(self):
+        logical = TEST_SHARDS.commands(self.plan, "misc", self.targets)
+        support = TEST_SHARDS.hosted_commands(self.plan, "misc", self.targets)
+        self.assertEqual(support, logical[len(TEST_SHARDS.SERIAL_LIB_TESTS) + 1:])
+        self.assertEqual(len(support), 4)
+        self.assertFalse(any("--lib" in command for command in support))
+        for shard in TEST_SHARDS.shard_ids(self.plan):
+            if shard != "misc":
+                self.assertEqual(TEST_SHARDS.hosted_commands(self.plan, shard, self.targets),
+                                 TEST_SHARDS.commands(self.plan, shard, self.targets))
+
+    def test_hosted_misc_precheck_leaves_serial_resolution_to_library_inventory(self):
+        with (
+            patch.object(TEST_SHARDS, "integration_targets", return_value=self.targets),
+            patch.object(TEST_SHARDS, "verify"),
+            patch.object(TEST_SHARDS, "verify_heavy") as heavy,
+            patch.object(TEST_SHARDS, "verify_serial_lib_tests") as serial,
+            patch.object(TEST_SHARDS, "list_quiescent_lib_test") as isolated,
+        ):
+            TEST_SHARDS.precheck(self.plan, "misc", split_libraries=True)
+        heavy.assert_called_once_with(self.plan)
+        serial.assert_not_called()
+        isolated.assert_not_called()
+
+    def test_missing_matrix_execution_or_required_dependency_cannot_strand_the_transfer(self):
+        text = TEST_SHARDS.WORKFLOW.read_text()
+        replacements = (
+            ("shard: [0, 1]", "shard: [0]"),
+            ("shard: [native-log-0, native-log-1, native-log-2]", "shard: [native-log-0, native-log-1]"),
+            ("      - rust-libraries\n", ""),
+            ("      - rust-native-log-proofs\n", ""),
+            ("test-shards.py run-libraries --shard", "test-shards.py verify --shard"),
+            ("precheck --shard '${{ matrix.shard }}' --split-libraries", "precheck --shard '${{ matrix.shard }}'"),
+            ("plan --shard '${{ matrix.shard }}' --split-libraries", "plan --shard '${{ matrix.shard }}'"),
+        )
+        for old, new in replacements:
+            self.assertIn(old, text)
+            with self.subTest(mutation=old), tempfile.TemporaryDirectory() as directory:
+                workflow = Path(directory) / "ci.yml"
+                workflow.write_text(text.replace(old, new))
+                with patch.object(TEST_SHARDS, "WORKFLOW", workflow), self.assertRaises(SystemExit):
+                    TEST_SHARDS.verify_workflow(self.plan)
+
+    def test_dedicated_proof_cannot_inherit_an_ordinary_timing_contract(self):
+        plan = copy.deepcopy(self.plan)
+        name = next(iter(plan["quiescent_lib_shards"]))
+        plan["quiescent_lib_shards"][name] = "native-log-0"
+        with self.assertRaises(SystemExit):
+            TEST_SHARDS.verify_lib_plan(plan)
+
+    def test_library_entrypoint_executes_the_verified_serial_and_ordinary_commands(self):
+        metadata = TEST_SHARDS.cargo_test_selection.workspace_metadata(TEST_SHARDS.ROOT)
+        module = "fenced_transition_journal::recovery::void_ownership_tests"
+        children = {
+            f"{module}::owned_journal_creation_child": f"{module}::owned_journal_creation_is_crash_atomic",
+            f"{module}::owned_journal_process_child": f"{module}::owned_journal_void_excludes_another_process_and_recovers_after_crash",
+        }
+        names = [*TEST_SHARDS.moved_lib_names(self.plan), *(f"new_module::future_{i}" for i in range(120))]
+        rows = [{"package": "opc-session-store", "target": "opc_session_store", "kind": ["lib"],
+                 "name": name, "ignored": name in children} for name in names]
+        for shard in TEST_SHARDS.library_partition.SHARDS:
+            with self.subTest(shard=shard), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "mapping.json"
+                with (
+                    patch.object(TEST_SHARDS, "integration_targets", return_value=self.targets),
+                    patch.object(TEST_SHARDS, "verify"),
+                    patch.object(TEST_SHARDS.library_partition, "inventory", return_value=(rows, metadata)),
+                    patch.object(TEST_SHARDS.subprocess, "check_output", return_value="f" * 40),
+                    patch.object(TEST_SHARDS.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as execute,
+                ):
+                    TEST_SHARDS.run_libraries(self.plan, shard, output)
+                import json
+                report = json.loads(output.read_text())
+                self.assertEqual(report["child_parents"], children)
+                self.assertTrue(all(report["named_test_owners"][child] == "it-1" for child in children))
+                self.assertEqual([call.args[0] for call in execute.call_args_list], report["plans"][str(shard)])
+                self.assertEqual(execute.call_count, 3 if shard == 0 else 1)
+                if shard == 0:
+                    self.assertEqual(report["plans"]["0"][:2],
+                                     [TEST_SHARDS.serial_lib_command(name) for name in TEST_SHARDS.SERIAL_LIB_TESTS])
 
 
 if __name__ == "__main__":

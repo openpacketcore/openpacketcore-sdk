@@ -3,6 +3,7 @@
 //! Both are covered by the WAL operation and selected-generation commitments.
 
 use super::*;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use opc_consensus::voter_slots::*;
 
 pub(crate) const COMMAND_VERSION: u16 = crate::sqlite::consensus::voter_slots::COMMAND_VERSION;
@@ -16,15 +17,17 @@ pub(super) struct Table {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TableWire {
-    genesis: Vec<u8>,
-    current: Vec<u8>,
+    genesis: String,
+    current: String,
 }
 
 impl Serialize for Table {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         TableWire {
-            genesis: encode_voter_slot_table(&self.genesis).map_err(serde::ser::Error::custom)?,
-            current: encode_voter_slot_table(&self.current).map_err(serde::ser::Error::custom)?,
+            genesis: BASE64
+                .encode(encode_voter_slot_table(&self.genesis).map_err(serde::ser::Error::custom)?),
+            current: BASE64
+                .encode(encode_voter_slot_table(&self.current).map_err(serde::ser::Error::custom)?),
         }
         .serialize(serializer)
     }
@@ -33,8 +36,17 @@ impl Serialize for Table {
 impl<'de> Deserialize<'de> for Table {
     fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
         let wire = TableWire::deserialize(decoder)?;
-        let genesis = decode_voter_slot_table(&wire.genesis).map_err(serde::de::Error::custom)?;
-        let current = decode_voter_slot_table(&wire.current).map_err(serde::de::Error::custom)?;
+        let decode = |value: &str| -> Result<VoterSlotTable, D::Error> {
+            if value.len() > 4 * MAX_VOTER_SLOT_TABLE_BYTES.div_ceil(3) {
+                return Err(serde::de::Error::custom(
+                    "native slot table exceeds encoding bound",
+                ));
+            }
+            let bytes = BASE64.decode(value).map_err(serde::de::Error::custom)?;
+            decode_voter_slot_table(&bytes).map_err(serde::de::Error::custom)
+        };
+        let genesis = decode(&wire.genesis)?;
+        let current = decode(&wire.current)?;
         current
             .validate_successor_of(&genesis)
             .map_err(serde::de::Error::custom)?;

@@ -254,9 +254,11 @@ impl NativeStorage {
         } else {
             frontiers.applied
         };
-        let preserve_origin =
-            !portable && (purpose == Purpose::InstallBase || state.snapshot_origin.is_some());
-        let purged = if preserve_origin {
+        let preserve_snapshot = !portable
+            && (purpose == Purpose::InstallBase
+                || state.snapshot_origin.is_some()
+                || self.log.purged.is_some());
+        let purged = if preserve_snapshot {
             self.log.purged
         } else {
             None
@@ -287,7 +289,7 @@ impl NativeStorage {
             },
         )?;
         drop(ordered_logs);
-        if preserve_origin {
+        if preserve_snapshot {
             if let Some((meta, name, checksum, length)) = &frontiers.current_snapshot {
                 tx.execute("INSERT INTO consensus_snapshot (singleton,configuration_epoch,meta_json,file_name,checksum,byte_length) VALUES (1,?1,?2,?3,?4,?5)",params![epoch,json(meta)?,name,checksum.as_slice(),length]).map_err(|error| db!(error))?;
             }

@@ -1,27 +1,37 @@
-//! Bounded native image, including every retained log payload. The enclosing
-//! WAL selector binds the file digest before this decoder is entered. Every
-//! count and item length is checked before allocating its corresponding data.
+//! Native validation and bounded legacy full-image codecs. New native roots
+//! accept generation files only; full-image codecs remain for their regression
+//! fixtures. Every count and item length is checked before allocating its data.
 
 use super::*;
-use opc_consensus::engine::Vote;
-use std::io::Read;
 #[cfg(test)]
-use std::io::Write;
+use opc_consensus::engine::Vote;
+#[cfg(test)]
+use std::io::{Read, Write};
 
 pub(super) mod binary;
+#[cfg(test)]
 mod legacy;
 
+#[cfg(test)]
 const LEGACY_MAGIC: &[u8; 8] = b"OPCNAT01";
+#[cfg(test)]
 const V2_MAGIC: &[u8; 8] = b"OPCNAT02";
 // This version freezes the postcard field/variant order of the native rows.
 // Changing that layout requires another discriminator and explicit reader.
+#[cfg(test)]
 const V3_MAGIC: &[u8; 8] = b"OPCNAT03";
+#[cfg(test)]
 const MAGIC: &[u8; 8] = b"OPCNAT04";
+#[cfg(test)]
 const SLOT_MAGIC: &[u8; 8] = b"OPCNAT05";
+#[cfg(test)]
 const MAX_ITEMS: usize = 1_048_576;
+#[cfg(test)]
 const MAX_HEADER: usize = 64 * 1024;
+#[cfg(test)]
 const MAX_ITEM: usize = 2 * crate::sqlite::consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES;
 
+#[cfg(test)]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Header {
@@ -59,6 +69,7 @@ fn write_bytes(writer: &mut impl Write, bytes: &[u8], limit: usize) -> io::Resul
     writer.write_all(bytes)
 }
 
+#[cfg(test)]
 fn read_bytes(reader: &mut impl Read, limit: usize) -> io::Result<Vec<u8>> {
     let mut length = [0; 4];
     reader.read_exact(&mut length)?;
@@ -71,6 +82,7 @@ fn read_bytes(reader: &mut impl Read, limit: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn read_item<T: serde::de::DeserializeOwned>(
     reader: &mut impl Read,
     limit: usize,
@@ -89,6 +101,7 @@ fn write_row(writer: &mut impl Write, item: &impl Serialize, legacy: bool) -> io
     write_bytes(writer, &bytes, MAX_ITEM)
 }
 
+#[cfg(test)]
 fn read_row<T: serde::de::DeserializeOwned + Serialize>(
     reader: &mut impl Read,
     legacy: bool,
@@ -249,6 +262,7 @@ impl NativeStorage {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn read_image(
         reader: &mut impl Read,
         root: [u8; 32],
@@ -403,18 +417,20 @@ impl NativeStorage {
         };
         // A later local envelope can cover the same installed cut. Its
         // filename/checksum are distinct, while the original source still
-        // supplies the exact missing LogId and membership witnesses.
+        // supplies the exact missing LogId and membership witnesses. At a
+        // purged cut, an installed origin still requires this local binding
+        // or its exact incoming envelope, never altered foreign metadata.
+        let origin = self.business.snapshot_origin.as_deref();
         if self
             .log
             .entries
             .get(&applied.index)
             .is_none_or(|entry| entry.id() != applied)
             && !(self.log.entries.get(&applied.index).is_none()
-                && self
-                    .business
-                    .snapshot_origin
-                    .as_ref()
-                    .is_some_and(|origin| origin.matches_snapshot_lineage(snapshot)))
+                && ((self.log.purged == Some(applied)
+                    && origin
+                        .is_none_or(|origin| origin.matches_local_snapshot_binding(snapshot)))
+                    || origin.is_some_and(|origin| origin.matches_snapshot_lineage(snapshot))))
         {
             return Err(invalid(
                 "native snapshot applied lineage differs from retained log",
@@ -450,6 +466,7 @@ pub(crate) fn snapshot_prefix(root: [u8; 32]) -> String {
     format!("native-{digest}-")
 }
 
+#[cfg(test)]
 pub(super) fn validate_snapshot_root(
     snapshot: Option<&crate::sqlite::consensus::CurrentSnapshot>,
     root: [u8; 32],

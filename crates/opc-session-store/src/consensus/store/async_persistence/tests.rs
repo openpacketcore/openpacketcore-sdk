@@ -806,6 +806,7 @@ async fn async_persistence_public_reopen_requires_live_cut_and_local_application
             .metrics()
             .borrow()
             .last_log_index;
+        let initialize_started = std::time::Instant::now();
         let initialized = {
             let cold = cold.clone();
             tokio::spawn(async move { clock::initialize(&cold).await })
@@ -839,7 +840,10 @@ async fn async_persistence_public_reopen_requires_live_cut_and_local_application
             fleet.store(leader).inner.raft.metrics().borrow().vote
         );
         drop(held_apply);
-        initialized.await.unwrap().unwrap();
+        initialized.await.unwrap().unwrap_or_else(|error| {
+            panic!("cold initialization failed: {error:?}; elapsed={:?}; health={:?}; metrics={:?}; cut={}",
+                initialize_started.elapsed(), cold.persistence_health(), *cold.inner.raft.metrics().borrow(), serde_json::to_string(&cut).unwrap());
+        });
         assert_eq!(
             cold.persistence_health().recovery,
             Some(SessionAsyncRecoveryState::Active)

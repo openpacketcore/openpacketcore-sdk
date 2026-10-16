@@ -2364,6 +2364,10 @@ pub enum SessionConsensusStorageError {
     /// This boundary requires new storage, never an in-place migration.
     #[error("session consensus scope format changed; fresh installation required")]
     FreshInstallationRequired,
+    /// The native root predates physical log reclamation or names an unknown
+    /// persistence format. Reopening requires a fresh installation.
+    #[error("native root persistence format differs")]
+    PersistenceFormatMismatch,
     /// A required row, constraint, or typed high-water mark is invalid.
     #[error("session consensus durable state is corrupt")]
     CorruptState,
@@ -2382,6 +2386,8 @@ impl SessionConsensusStorageError {
             .and_then(|source| source.downcast_ref::<Self>())
         {
             Some(Self::FreshInstallationRequired) => Self::FreshInstallationRequired,
+            Some(Self::PersistenceFormatMismatch) => Self::PersistenceFormatMismatch,
+            Some(Self::BackendUnavailable) => Self::BackendUnavailable,
             _ => Self::CorruptState,
         }
     }
@@ -2656,20 +2662,21 @@ async fn attach_private_wal_before_snapshot_cleanup(
 #[cfg(target_os = "linux")]
 async fn attach_native_wal_before_snapshot_cleanup(
     core: &mut SqliteConsensusCore,
-    owner: &consensus::wal::owner::NativeOwner,
+    owner: &Arc<consensus::wal::owner::NativeOwner>,
     lease: Arc<SnapshotDirectoryLease>,
     persistence: SessionPersistenceMode,
 ) -> io::Result<()> {
     let policy = core.snapshot_integrity;
-    owner
-        .attach_with_descriptors(
-            core,
-            persistence,
-            |snapshots, install| admit_wal_snapshots(snapshots, install, lease, policy),
-            WalSnapshotAdmissions::verify,
-            WalSnapshotAdmissions::install_source,
-        )
-        .await
+    // Keep the large admission state out of parent open futures, which may
+    // be nested on an ordinary runtime thread's stack.
+    Box::pin(owner.attach_with_descriptors(
+        core,
+        persistence,
+        |snapshots, install| admit_wal_snapshots(snapshots, install, lease, policy),
+        WalSnapshotAdmissions::verify,
+        WalSnapshotAdmissions::install_source,
+    ))
+    .await
 }
 
 #[cfg(target_os = "linux")]
@@ -3525,6 +3532,63 @@ async fn preflight_fs_verity(
     .map_err(|_| SessionConsensusStorageError::SnapshotIntegrityUnavailable)
 }
 
+/// Inspect selected image vocabulary before SQL setup, directory creation or
+/// fs-verity probes. Retain the caller's directory capability, open children
+/// without following symlinks, and use only immutable read connections.
+/// These pins grant no recovery authority; full admission still runs later.
+#[cfg(target_os = "linux")]
+async fn preflight_native_snapshot_schemas(
+    source: &SnapshotDirectory,
+    snapshots: Vec<consensus::CurrentSnapshot>,
+    policy: SnapshotIntegrityPolicy,
+) -> Result<(), SessionConsensusStorageError> {
+    use std::os::fd::AsRawFd as _;
+
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let directory = match &source.0 {
+        SnapshotDirectorySource::Path(path) => open_snapshot_directory(path),
+        SnapshotDirectorySource::Pinned { directory, .. } => directory.try_clone(),
+    }
+    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    tokio::task::spawn_blocking(move || {
+        for (_, name, _, length) in snapshots {
+            let mut components = Path::new(&name).components();
+            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+                || components.next().is_some()
+                || length > SNAPSHOT_ENVELOPE_MAX_BYTES
+            {
+                return Err(SessionConsensusStorageError::CorruptState);
+            }
+            let file = nix::fcntl::openat(
+                &directory,
+                Path::new(&name),
+                nix::fcntl::OFlag::O_RDONLY
+                    | nix::fcntl::OFlag::O_NOFOLLOW
+                    | nix::fcntl::OFlag::O_CLOEXEC
+                    | nix::fcntl::OFlag::O_NONBLOCK,
+                nix::sys::stat::Mode::empty(),
+            )
+            .map(std::fs::File::from)
+            .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+            if !metadata.is_file() || metadata.len() != length {
+                return Err(SessionConsensusStorageError::CorruptState);
+            }
+            let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+            let pin = PinnedSqliteFile::from_file_and_verify(file, path, policy)
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+            consensus::preflight_snapshot_schema(&pin)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_with_member_bindings_for_profile(
     backend: &SqliteSessionBackend,
@@ -3551,19 +3615,29 @@ async fn open_with_member_bindings_for_profile(
     {
         return Err(SessionConsensusStorageError::PersistenceModeMismatch);
     }
+    // Reject an existing mode mismatch before initialization, filesystem
+    // probes, or cleanup can mutate either storage namespace.
+    #[cfg(target_os = "linux")]
+    if let Some(selected) = backend
+        .native_persistence_preflight(identity, |snapshots| {
+            preflight_native_snapshot_schemas(&snapshot_dir, snapshots, snapshot_integrity)
+        })
+        .await?
+    {
+        if selected != persistence {
+            return Err(SessionConsensusStorageError::PersistenceModeMismatch);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    backend
+        .finish_native_reopen_after_preflight()
+        .await
+        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
     if backend.voter_profile_preflight().await?
         && (authority_profile != ConsensusAuthorityProfile::FixedImmutable
             || persistence != SessionPersistenceMode::Durable)
     {
         return Err(SessionConsensusStorageError::PersistenceModeMismatch);
-    }
-    // Reject an existing mode mismatch before initialization, filesystem
-    // probes, or cleanup can mutate either storage namespace.
-    #[cfg(target_os = "linux")]
-    if let Some(selected) = backend.native_persistence_preflight(identity).await? {
-        if selected != persistence {
-            return Err(SessionConsensusStorageError::PersistenceModeMismatch);
-        }
     }
     let snapshot_directory_lease = acquire_snapshot_directory(backend, snapshot_dir)
         .await
@@ -8520,6 +8594,10 @@ fn reject_indeterminate_snapshot_publication(core: &SqliteConsensusCore) -> io::
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod native_log_retained_bound;
+    #[cfg(target_os = "linux")]
+    mod native_reopen_formats;
     #[cfg(all(target_os = "linux", feature = "test-control"))]
     mod scope_scans;
     #[cfg(all(target_os = "linux", feature = "test-control"))]

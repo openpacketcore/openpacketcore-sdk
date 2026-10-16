@@ -412,6 +412,62 @@ jobs:
         if: always()
         run: bash ci/egress-fence-cleanup.sh
 
+  # Each full-bound proof runs whole on its own runner. The leader's build
+  # plus conservative proposal projection is 93 minutes; its 120-minute
+  # budget includes setup, reopen and variation. Other proof jobs retain 75.
+  host-native-log-proofs:
+    name: Egress fence full native log proof (${{ matrix.shard }})
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.shard == 4 && 120 || 75 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [4, 5, 6]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: egress-fence-native-log
+          workspaces: . -> target/egress-fence-native-log
+
+      - name: Install kernel inspection tools
+        run: |
+          bash ci/egress-fence-tools.sh
+
+      - name: Prepare fs-verity snapshot storage
+        run: ci/setup-fsverity-tmp.sh
+
+      - name: Run one exact full native log proof
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-native-log"
+          python3 ci/egress-fence-tests.py \
+            --shard '${{ matrix.shard }}' \
+            --output "${RUNNER_TEMP}/egress-fence-test-map.json"
+
+      - name: Archive the complete test-name mapping
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: egress-fence-native-log-map-${{ matrix.shard }}
+          overwrite: true
+          path: ${{ runner.temp }}/egress-fence-test-map.json
+          if-no-files-found: error
+
+      - name: Require complete privileged cleanup
+        if: always()
+        run: bash ci/egress-fence-cleanup.sh
+
   host-proofs:
     name: Egress fence isolated and O1 proofs
     needs: changes
@@ -458,7 +514,7 @@ jobs:
   root-cgroup-egress:
     name: Root-cgroup egress fence
     if: always()
-    needs: [changes, sources, oracles, installer, host-tests, host-proofs]
+    needs: [changes, sources, oracles, installer, host-tests, host-proofs, host-native-log-proofs]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:

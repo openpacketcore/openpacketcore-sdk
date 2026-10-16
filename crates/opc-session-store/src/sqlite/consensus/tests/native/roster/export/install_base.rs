@@ -149,7 +149,9 @@ fn native_roster_install_base_preserves_complete_cold_predecessor_and_exact_raft
             save_vote_sync(&conn, signed.identity, &vote).unwrap();
             append_logs_sync(&conn, signed.identity, &suffix).unwrap();
             save_committed_sync(&conn, signed.identity, Some(log_id(5))).unwrap();
-            purge_logs_with_authority_sync(
+            // The in-memory oracle has no prune worker; perform its supported
+            // physical purge before comparing the complete exported database.
+            purge_logs_without_prune_lane_with_authority_sync(
                 &conn,
                 signed.identity,
                 ConsensusAuthorityProfile::FixedImmutable,
@@ -173,8 +175,12 @@ fn native_roster_install_base_preserves_complete_cold_predecessor_and_exact_raft
             }
             let storage = storage.as_ref().unwrap();
             if cold {
-                assert_eq!(storage.cold_counts_for_test()[2], 7);
+                assert_eq!(storage.cold_counts_for_test()[2], 4);
             }
+            assert_eq!(
+                storage.log.entries.keys().copied().collect::<Vec<_>>(),
+                [3, 4, 5, 6]
+            );
             let output = copy(&template);
             storage
                 .export_cold_install_base_checked(&output, &|| Ok(()))
@@ -206,8 +212,8 @@ fn native_roster_install_base_preserves_complete_cold_predecessor_and_exact_raft
             );
             assert_eq!(
                 count(&output, "consensus_log"),
-                7,
-                "covered, applied, committed-unapplied and uncommitted rows all survive"
+                4,
+                "only rows above the purge frontier survive, including the unapplied suffix"
             );
             validate_fixed_durable_state_sync(&output, signed.identity, &fixed_members()).unwrap();
             validate_protected_roster_recovery_state_sync(&output, signed.identity).unwrap();
@@ -220,13 +226,15 @@ fn native_roster_install_base_preserves_complete_cold_predecessor_and_exact_raft
                 read_committed_sync(&portable, signed.identity).unwrap(),
                 Some(log_id(4))
             );
-            assert_eq!(count(&portable, "consensus_log"), 5);
-            assert!(read_purged_sync(&portable, signed.identity)
-                .unwrap()
-                .is_none());
-            assert!(read_current_snapshot_sync(&portable, signed.identity)
-                .unwrap()
-                .is_none());
+            assert_eq!(count(&portable, "consensus_log"), 2);
+            assert_eq!(
+                read_purged_sync(&portable, signed.identity).unwrap(),
+                Some(log_id(2))
+            );
+            assert_eq!(
+                read_current_snapshot_sync(&portable, signed.identity).unwrap(),
+                Some(candidate.clone())
+            );
             assert_eq!(storage.business.applied(), Some(log_id(4)));
             assert_eq!(storage.log.committed, Some(log_id(5)));
         }

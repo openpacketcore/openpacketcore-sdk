@@ -77,6 +77,8 @@
   "_lib_groups_comment": [
     "Exact names keep moved groups disjoint from misc and from isolated timing contracts.",
     "New unlisted tests still run on misc. Precheck rejects missing or ambiguous names.",
+    "Ignored subprocess helpers declare one enabled parent in their group; the parent owns their crash scenarios.",
+    "Each full-bound native log proof has a dedicated native-log shard and uses serial test O1 with debug checks enabled.",
     "The full-journal opt-in proof stays ignored; do not turn it into a hosted qualification."
   ],
   "lib_groups": [
@@ -138,6 +140,10 @@
     {
       "module": "fenced_transition_journal::recovery::void_ownership_tests",
       "shard": "it-1",
+      "child_parents": {
+        "owned_journal_creation_child": "owned_journal_creation_is_crash_atomic",
+        "owned_journal_process_child": "owned_journal_void_excludes_another_process_and_recovers_after_crash"
+      },
       "tests": [
         "baseline_journal_concurrent_creation_ignores_other_directory_owners",
         "baseline_journal_open_does_not_require_directory_lock_support",
@@ -296,6 +302,34 @@
         "publication_authority_review_partitioned_alternate_cannot_serve_stale_current",
         "publication_authority_review_tls_alpn_and_io_alternates_are_retryable",
         "publication_authority_review_attestation_root_mismatch_is_rejected"
+      ]
+    },
+    {
+      "module": "consensus::store::sequential_wal_sdk_tests::native_log_bound",
+      "shard": "native-log-0",
+      "tests": [
+        "native_leader_full_bound_reproposes_one_idempotent_request_and_reopens"
+      ]
+    },
+    {
+      "module": "consensus::native::log::changes::tests::purge_journal_tests",
+      "shard": "heavy-1",
+      "tests": [
+        "native_purge_large_prefix_bounds_owner_allocations_at_window_and_cap"
+      ]
+    },
+    {
+      "module": "consensus::storage::tests::native_log_retained_bound",
+      "shard": "native-log-1",
+      "tests": [
+        "native_log_retained_bound_survives_snapshot_purge_and_restart"
+      ]
+    },
+    {
+      "module": "consensus::storage::tests::native_log_retained_bound",
+      "shard": "native-log-2",
+      "tests": [
+        "native_log_retained_bound_survives_snapshot_purge_and_restart_async"
       ]
     }
   ],

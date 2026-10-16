@@ -308,7 +308,7 @@ fn native_roster_generation_signed_v1_v2_reopen_and_compacted_base_match_sql() {
                 sql_rows(&storage, &path, &signed);
             }
             let (compacted, base) = Files::new(&storage);
-            assert_eq!(&compacted.bytes()[..8], b"OPCNJ004");
+            assert_eq!(&compacted.bytes()[..8], b"OPCNJB\x06\x00");
             exact_rosters(&base.into_storage(&|| Ok(())).unwrap(), &storage);
             let replay = entry(
                 &signed,

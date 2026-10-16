@@ -27,14 +27,14 @@ impl NativeLog {
         state: &NativeState,
     ) -> io::Result<(Arc<BusinessProof>, GenerationLogVersion)> {
         let (business, log) = self.require_proofs(state)?;
-        Ok((Arc::clone(business), GenerationLogVersion(Arc::clone(log))))
+        Ok((Arc::clone(business), GenerationLogVersion(log.clone())))
     }
 
     pub(in crate::consensus::native) fn generation_version(
         &self,
         state: &NativeState,
     ) -> io::Result<GenerationLogVersion> {
-        Ok(GenerationLogVersion(Arc::clone(self.require_proof(state)?)))
+        Ok(GenerationLogVersion(self.require_proof(state)?.clone()))
     }
 }
 
@@ -51,11 +51,11 @@ impl CapturedLog {
         &self,
         version: &GenerationLogVersion,
     ) -> bool {
-        Arc::ptr_eq(&self.changes.base, &version.0)
+        self.changes.base.same(&version.0)
     }
 
     pub(in crate::consensus::native) fn generation_target(&self) -> GenerationLogVersion {
-        GenerationLogVersion(Arc::clone(&self.changes.target))
+        GenerationLogVersion(self.changes.target.clone())
     }
 
     pub(in crate::consensus::native) fn generation_count(&self) -> usize {

@@ -17,6 +17,48 @@ const MAXIMUM: u64 = crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES;
 const BLOCK: usize = 64 * 1024;
 const CUT: [u8; 32] = [0xEA; 32];
 
+#[test]
+fn native_origin_cannot_override_nonadjacent_purge() {
+    let (directory, producer, signed, wal) = fresh(Phase::Established);
+    parity(
+        &wal,
+        &producer,
+        &signed,
+        &[admission(&signed), terminal(&signed, 4)],
+    );
+    let incoming = IncomingSnapshot::with_identity(&producer.conn.blocking_lock(), signed.identity);
+    let local = empty(&signed);
+    let mut installed = copy(&local.conn.blocking_lock());
+    let origin = install(&incoming, &installed, wal.binding(), &signed);
+    assert!(origin.matches_cut(log_id(4)));
+    let path = directory.path().join("installed-origin.native");
+    let prefix = written(
+        &mut installed,
+        &path,
+        wal.binding(),
+        Arc::clone(&origin),
+        &signed,
+    );
+    let mut storage = admitted(&path, prefix, Arc::clone(&origin), &signed);
+    let suffix =
+        [5, 6].map(|index| ordinary(&signed, index, SessionMutationIntent::AdvanceLogicalTime));
+    storage
+        .log
+        .project(&append(&suffix), &storage.business, Some(log_id(4)))
+        .unwrap();
+    storage.log.validate(&storage.business).unwrap();
+    assert_eq!(storage.log.entries.get_min().unwrap().0, 5);
+    storage.log.purged = Some(log_id(2));
+    assert_eq!(
+        storage
+            .log
+            .validate(&storage.business)
+            .unwrap_err()
+            .to_string(),
+        "native retained log lacks its prefix"
+    );
+}
+
 fn empty(signed: &RosterV2PersistenceFixture) -> SqliteSessionBackend {
     let backend = SqliteSessionBackend::in_memory().unwrap();
     initialize(&backend, signed);
@@ -215,18 +257,55 @@ fn native_snapshot_origin_original_install_preserves_local_vote_suffix_and_every
                 serde_json::to_vec(&storage.business).is_err(),
                 "legacy images cannot silently drop installed authority"
             );
+            storage.validate_snapshot(&incoming.candidate).unwrap();
+            for field in 0..4 {
+                let mut changed = incoming.candidate.clone();
+                match field {
+                    0 => changed.0.snapshot_id.push_str("-substituted"),
+                    1 => changed.1 = format!("snapshot-{}.opc", uuid::Uuid::new_v4()),
+                    2 => changed.2[0] ^= 1,
+                    _ => changed.3 -= 1,
+                }
+                let mut contextual = storage.clone();
+                contextual
+                    .business
+                    .set_current_snapshot(changed.clone())
+                    .unwrap();
+                let direct = storage.validate_snapshot(&changed);
+                let context = contextual.log.validate(&contextual.business);
+                for (route, result) in [("direct", direct), ("context", context)] {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "native snapshot applied lineage differs from retained log",
+                        "same cut with different metadata is not the admitted incoming snapshot: field {field}, route {route}"
+                    );
+                }
+            }
             let mut changed = incoming.candidate.clone();
-            changed.0.snapshot_id.push_str("-substituted");
-            assert!(
-                storage.validate_snapshot(&changed).is_err(),
-                "same cut with different metadata is not the admitted incoming snapshot"
-            );
-            changed = incoming.candidate.clone();
             changed.0.last_log_id.as_mut().unwrap().leader_id.term += 1;
-            assert!(
-                storage.validate_snapshot(&changed).is_err(),
+            assert_eq!(
+                storage.validate_snapshot(&changed).unwrap_err().to_string(),
+                "native snapshot is ahead of applied state",
                 "the complete LogId remains exact"
             );
+            let mut local_export = incoming.candidate.clone();
+            local_export.0.snapshot_id = format!(
+                "{}{}",
+                crate::consensus::native::snapshot_prefix(wal.binding().digest().unwrap()),
+                uuid::Uuid::new_v4()
+            );
+            local_export.1 = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
+            let mut reexported = storage.clone();
+            reexported.begin_changes().unwrap();
+            let (capture, selected) = reexported
+                .take_checkpoint_changes(Some(local_export))
+                .unwrap();
+            capture.validate(&|| Ok(())).unwrap();
+            reexported
+                .business
+                .publish_checkpoint_snapshot(selected.unwrap())
+                .unwrap();
+            reexported.validate_image().unwrap();
             if retained {
                 storage.begin_changes().unwrap();
                 storage
@@ -686,8 +765,7 @@ fn native_snapshot_origin_empty_source_repeated_install_cold_reopen_and_first_me
 }
 
 #[test]
-fn native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_export_and_cold_catalog(
-) {
+fn native_snapshot_origin_purge_removes_covered_prefix_through_export_and_cold_catalog() {
     let (directory, producer, signed, wal) = fresh(Phase::Established);
     parity(
         &wal,
@@ -742,18 +820,23 @@ fn native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_expo
     storage.replay_committed().unwrap();
     // Purge admission must be backed by a genuinely selected applied basis,
     // not merely by a later live applied value supplied to the projector.
-    let prepared = PreparedDelta::prepare(
-        owner.current(),
-        &version,
-        2,
-        2,
-        CUT,
-        storage.take_changes().unwrap(),
-        &|| Ok(()),
-    )
-    .unwrap();
+    let mut snapshot = storage.business.current_snapshot().unwrap();
+    snapshot.0.last_log_id = Some(log_id(7));
+    snapshot.0.snapshot_id = format!(
+        "{}{}",
+        crate::consensus::native::snapshot_prefix(wal.binding().digest().unwrap()),
+        uuid::Uuid::new_v4()
+    );
+    snapshot.1 = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
+    let (capture, selected) = storage.take_checkpoint_changes(Some(snapshot)).unwrap();
+    let prepared =
+        PreparedDelta::prepare(owner.current(), &version, 2, 2, CUT, capture, &|| Ok(())).unwrap();
     prepared.append(&mut owner, &|| Ok(())).unwrap();
     let version = prepared.target_version();
+    storage
+        .business
+        .publish_checkpoint_snapshot(selected.unwrap())
+        .unwrap();
     let applied_basis = owner.current().identity();
     drop(prepared);
     assert_eq!(
@@ -772,18 +855,16 @@ fn native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_expo
         )
         .unwrap();
     assert_eq!(storage.log.purged, Some(log_id(6)));
-    assert_eq!(
-        storage.log.entries.keys().copied().collect::<Vec<_>>(),
-        [5, 6, 7]
-    );
-    storage.validate_image().expect(
-        "a logical purge preserves the physical suffix of the authenticated install origin",
-    );
+    assert_eq!(storage.log.entries.keys().copied().collect::<Vec<_>>(), [7]);
+    storage
+        .validate_image()
+        .expect("the selected snapshot covers the removed prefix after an install");
     let mut hole = storage.clone();
-    hole.log.entries.remove(&5);
-    assert!(
-        hole.validate_image().is_err(),
-        "an origin cannot authorize a missing first physical suffix row"
+    hole.log.entries.remove(&7);
+    assert_eq!(
+        hole.validate_image().unwrap_err().to_string(),
+        "native log pointer lacks exact retained lineage",
+        "the installed origin cannot authorize a missing retained applied row"
     );
     let target = empty(&signed);
     storage
@@ -810,18 +891,44 @@ fn native_snapshot_origin_logical_purge_keeps_exact_physical_prefix_through_expo
     drop(prepared);
     drop(storage);
     drop(owner);
-    let storage = admitted(&path, selected, Arc::clone(&origin), &signed);
+    let mut storage = admitted(&path, selected, Arc::clone(&origin), &signed);
     assert_eq!(storage.log.purged, Some(log_id(6)));
     assert_eq!(storage.business.applied(), Some(log_id(7)));
-    assert_eq!(
-        storage.log.entries.keys().copied().collect::<Vec<_>>(),
-        [5, 6, 7]
-    );
+    assert_eq!(storage.log.entries.keys().copied().collect::<Vec<_>>(), [7]);
     let cold = empty(&signed);
     storage
         .export_cold_install_base_checked(&cold.conn.blocking_lock(), &|| Ok(()))
         .unwrap();
     assert_eq!(database(&cold.conn.blocking_lock()), exported);
+    storage.begin_changes().unwrap();
+    storage
+        .log
+        .project(
+            &Operation::Purge(log_id(7)),
+            &storage.business,
+            Some(log_id(7)),
+        )
+        .unwrap();
+    assert!(storage.log.entries.is_empty());
+    storage.validate_image().unwrap();
+    let mut reexport = storage.business.current_snapshot().unwrap();
+    reexport.0.snapshot_id = format!(
+        "{}{}",
+        crate::consensus::native::snapshot_prefix(wal.binding().digest().unwrap()),
+        uuid::Uuid::new_v4()
+    );
+    reexport.1 = format!("snapshot-{}.opc", uuid::Uuid::new_v4());
+    assert!(
+        !origin.matches_cut(reexport.0.last_log_id.unwrap()),
+        "a later local purged cut is independent of the original installed cut"
+    );
+    let (capture, selected) = storage.take_checkpoint_changes(Some(reexport)).unwrap();
+    capture.validate(&|| Ok(())).unwrap();
+    storage
+        .business
+        .publish_checkpoint_snapshot(selected.unwrap())
+        .unwrap();
+    storage.validate_image().unwrap();
     origin.verify().unwrap();
     wal.shutdown().unwrap();
 }
@@ -876,98 +983,105 @@ fn native_snapshot_origin_cold_catalog_rejects_present_wrong_log_id_and_membersh
     );
     // Give each forged image correct framing, row/content/context hashes and
     // descriptor identity. Rejection must come from complete lineage, not a
-    // stale checksum or count. Case zero is the retained-witness control.
-    for case in 0..3 {
-        let mut entry = formation();
-        if case == 1 {
-            entry.log_id.leader_id.term += 1;
-        }
-        if case == 2 {
-            entry.payload = EntryPayload::Blank;
-        }
-        let encoded = encode_json(&entry).unwrap();
-        let mut row_hash = Sha256::new();
-        row_hash.update(b"OPC-native-log-row-v1\0");
-        row_hash.update(0u64.to_le_bytes());
-        row_hash.update((encoded.len() as u64).to_le_bytes());
-        row_hash.update(&encoded);
-        let log = LogContext {
-            vote: None,
-            committed: Some(log_id(0)),
-            purged: Some(log_id(0)),
-            count: 1,
-            content: row_hash.finalize().into(),
-            first: Some(entry.log_id),
-            last: Some(entry.log_id),
-        };
-        let mut next_header = header[..header.rfind(",\"log\":").unwrap() + 7].to_owned();
-        next_header.push_str(&serde_json::to_string(&log).unwrap());
-        next_header.push_str("}}");
-        let context =
-            &next_header[next_header.find("\"context\":").unwrap() + 10..next_header.len() - 1];
-        let mut context_hash = Sha256::new();
-        context_hash.update(b"OPC-native-generation-context-v1\0");
-        context_hash.update(context.as_bytes());
-        let mut bytes = original[..8].to_vec();
-        bytes.extend_from_slice(&(next_header.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(next_header.as_bytes());
-        bytes.push(4);
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&[0, 1]);
-        bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&encoded);
-        bytes.extend_from_slice(b"OPCNJEND");
-        bytes.resize(BLOCK, 0);
-        let expected = PrefixIdentity {
-            frontiers: context_hash.finalize().into(),
-            digest: Sha256::digest(&bytes).into(),
-            ..prefix
-        };
-        let path = directory.path().join(format!("retained-{case}.native"));
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        file.write_all(&bytes).unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-        let result = Catalog::open_with_origin(
-            &path,
-            expected,
-            MAXIMUM,
-            crate::consensus::native::generation::CatalogScope {
-                identity: signed.identity,
-                members: &fixed_members(),
-                roster_root: Some(Arc::new(signed.root.clone())),
-            },
-            Some(Arc::clone(&origin)),
-            CUT,
-            &|| Ok(()),
-        );
-        if case == 0 {
-            result
-                .unwrap()
-                .1
-                .into_storage(&|| Ok(()))
-                .unwrap()
-                .validate_image()
-                .unwrap();
-        } else {
-            let error = match result {
-                Err(error) => error,
-                Ok(_) => panic!("admitted a conflicting retained witness"),
+    // stale checksum or count. Without a purge, case zero is the retained-
+    // witness control. With a purge, every row at that frontier is forbidden.
+    for purged in [None, Some(log_id(0))] {
+        for case in 0..3 {
+            let mut entry = formation();
+            if case == 1 {
+                entry.log_id.leader_id.term += 1;
+            }
+            if case == 2 {
+                entry.payload = EntryPayload::Blank;
+            }
+            let encoded = encode_json(&entry).unwrap();
+            let mut row_hash = Sha256::new();
+            row_hash.update(b"OPC-native-log-row-v1\0");
+            row_hash.update(0u64.to_le_bytes());
+            row_hash.update((encoded.len() as u64).to_le_bytes());
+            row_hash.update(&encoded);
+            let log = LogContext {
+                vote: None,
+                committed: Some(log_id(0)),
+                purged,
+                count: 1,
+                content: row_hash.finalize().into(),
+                first: Some(entry.log_id),
+                last: Some(entry.log_id),
             };
-            assert_eq!(
-                error.to_string(),
-                if case == 1 {
-                    "native log pointer lacks exact retained lineage"
-                } else {
-                    "native membership payload differs from exact log witness"
-                }
+            let mut next_header = header[..header.rfind(",\"log\":").unwrap() + 7].to_owned();
+            next_header.push_str(&serde_json::to_string(&log).unwrap());
+            next_header.push_str("}}");
+            let context =
+                &next_header[next_header.find("\"context\":").unwrap() + 10..next_header.len() - 1];
+            let mut context_hash = Sha256::new();
+            context_hash.update(b"OPC-native-generation-context-v1\0");
+            context_hash.update(context.as_bytes());
+            let mut bytes = original[..8].to_vec();
+            bytes.extend_from_slice(&(next_header.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(next_header.as_bytes());
+            bytes.push(4);
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+            bytes.extend_from_slice(&[0, 1]);
+            bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&encoded);
+            bytes.extend_from_slice(b"OPCNJEND");
+            bytes.resize(BLOCK, 0);
+            let expected = PrefixIdentity {
+                frontiers: context_hash.finalize().into(),
+                digest: Sha256::digest(&bytes).into(),
+                ..prefix
+            };
+            let path = directory
+                .path()
+                .join(format!("retained-{}-{case}.native", purged.is_some()));
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let result = Catalog::open_with_origin(
+                &path,
+                expected,
+                MAXIMUM,
+                crate::consensus::native::generation::CatalogScope {
+                    identity: signed.identity,
+                    members: &fixed_members(),
+                    roster_root: Some(Arc::new(signed.root.clone())),
+                },
+                Some(Arc::clone(&origin)),
+                CUT,
+                &|| Ok(()),
             );
+            if purged.is_none() && case == 0 {
+                result
+                    .unwrap()
+                    .1
+                    .into_storage(&|| Ok(()))
+                    .unwrap()
+                    .validate_image()
+                    .unwrap();
+            } else {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("admitted a conflicting retained witness"),
+                };
+                assert_eq!(
+                    error.to_string(),
+                    if purged.is_some() {
+                        "native retained log extends below its purge frontier"
+                    } else if case == 1 {
+                        "native log pointer lacks exact retained lineage"
+                    } else {
+                        "native membership payload differs from exact log witness"
+                    }
+                );
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes);
         }
-        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
     wal.shutdown().unwrap();
 }

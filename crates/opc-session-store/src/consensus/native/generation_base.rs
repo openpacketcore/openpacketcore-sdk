@@ -1,12 +1,14 @@
-//! Streaming complete V4 bases. This borrows an immutable full capture;
+//! Streaming complete bases. This borrows an immutable full capture;
 //! the caller must prepare/encode it outside State and own its output file.
 //! It writes no selector, grants no writer authority, and reclaims nothing.
 //! Admission requires Catalog::open to read and validate the entire result.
 
 use super::*;
 
-pub(super) const MAGIC: &[u8; 8] = b"OPCNJ004";
-pub(super) const SLOT_MAGIC: &[u8; 8] = b"OPCNJ005";
+pub(super) const MAGIC: &[u8; 8] = b"OPCNJB\x06\x00";
+pub(super) const SLOT_MAGIC: &[u8; 8] = b"OPCNJB\x06\x01";
+pub(super) const V4_MAGIC: &[u8; 8] = b"OPCNJ004";
+pub(super) const V5_MAGIC: &[u8; 8] = b"OPCNJ005";
 pub(super) const V3_MAGIC: &[u8; 8] = b"OPCNJ003";
 pub(super) const LEGACY_MAGIC: &[u8; 8] = b"OPCNJ002";
 
@@ -95,9 +97,9 @@ impl<'a> PreparedBase<'a> {
             context,
         };
         let format = if header.context.business.frontiers.voter_slots.is_some() {
-            Format::V5
+            Format::V6_SLOTS
         } else {
-            Format::V4
+            Format::V6
         };
         let mut value = Self {
             storage,
@@ -143,8 +145,11 @@ impl<'a> PreparedBase<'a> {
         writer.write_all(match self.format {
             Format::V2 => LEGACY_MAGIC,
             Format::V3 => V3_MAGIC,
-            Format::V4 => MAGIC,
-            Format::V5 => SLOT_MAGIC,
+            Format::V4 => V4_MAGIC,
+            Format::V5 => V5_MAGIC,
+            Format::V6 => MAGIC,
+            Format::V6_SLOTS => SLOT_MAGIC,
+            _ => return Err(invalid("native generation discriminator differs")),
         })?;
         let header = encode_header(&self.header)?;
         write_bytes(writer, &header, MAX_HEADER)?;
@@ -214,7 +219,7 @@ impl<'a> PreparedBase<'a> {
                 crate::sqlite::consensus::SQLITE_CONSENSUS_LOG_ENTRY_MAX_BYTES,
             )?;
         }
-        if self.format >= Format::V4 {
+        if self.format.vocabulary >= Format::V4.vocabulary {
             roster::generation::write_base(
                 &self.storage.business.roster,
                 writer,

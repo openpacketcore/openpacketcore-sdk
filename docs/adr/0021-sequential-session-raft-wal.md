@@ -12,6 +12,40 @@ must not be read as the current public configuration or qualification status.
 
 2026-09-08
 
+## Current native log reclamation contract
+
+The current native path in [ADR 0022](0022-native-session-persistence-modes.md)
+physically removes its purged log prefix. The SQLite projection and logical-only
+purge described in the historical body below remain private fixture behavior.
+New native roots use `OPCNR002` (Durable) or `OPCNA004` (Async); old roots require
+a fresh installation and are never migrated implicitly. The native base/delta
+vocabularies advance; the ordered WAL record, portable snapshot and Raft wire
+formats do not change.
+
+The selected context binds the full purge LogId, applied cut, current snapshot
+and membership. Purge requires applied and selected-snapshot coverage. Missing
+membership rows require the existing installed-origin authority or exact
+snapshot membership covering the purge. A native generation carries removal
+through its frontier, with no per-row tombstones. Cold admission checks the
+new purge LogId against the predecessor row before removing that prefix, then
+recomputes the retained summary and rejects rows at or below the frontier.
+
+A generation file may be replaced by another file epoch carrying the same context. Bindings inside a file are historical and only the last is compared.
+
+A higher checkpoint epoch may reselect the same logical position. A rowless
+delta with unchanged context remains valid. Native recovery validates the
+selected state before reclaiming one unselected next file and up to two
+previous files; this reservation does not implement file rollover. Later
+state-machine vocabularies can advance the generation format in place under
+the same root, through committed activation and supported optional frontier
+fields. Unknown discriminators or fields are refused before writes.
+
+Prefix reclamation releases resident log rows and their checkpoint inventory;
+it does not shrink the append-only generation file. Generation-file rollover
+is tracked separately in SDK #1253. Until then, the Durable 32 GiB and Async
+8 GiB file ceilings remain lifetime limits. A failed local snapshot build still
+stops the engine; changing that behavior is separate work (SDK #1254).
+
 ## Decision
 
 The following was the initial private implementation decision. The supported

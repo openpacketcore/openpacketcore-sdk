@@ -29,7 +29,8 @@ impl BaseRestore {
         match (value, origin) {
             (None, None) => Ok(()),
             (Some(value), Some(origin))
-                if format >= Format::V4 && value.0 == origin.incarnation().native_image() =>
+                if format.vocabulary >= Format::V4.vocabulary
+                    && value.0 == origin.incarnation().native_image() =>
             {
                 Ok(())
             }
@@ -94,7 +95,7 @@ impl Catalog {
         let mut choice = None;
         let owner = VerifiedAppendOwner::open(path, expected, maximum, check, |reader| {
             let format = Format::read(reader, true)?;
-            if format < Format::V4 {
+            if format.vocabulary < Format::V4.vocabulary {
                 return Err(invalid(
                     "native restore identity requires a complete V4 base",
                 ));

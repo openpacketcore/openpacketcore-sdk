@@ -1,6 +1,8 @@
 //! Real fixed-quorum SDK calls through the private WAL opt-in. The peer
 //! transport is in-process; this does not qualify remote TLS or snapshots.
 
+mod native_log_bound;
+
 #[path = "sequential_wal_sdk_tests/void_tests.rs"]
 mod void_tests;
 

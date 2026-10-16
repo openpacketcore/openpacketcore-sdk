@@ -12,6 +12,7 @@ mod business;
 mod changes;
 mod expiry;
 mod export;
+mod frontier_encoding;
 mod history_order;
 mod image;
 #[cfg(all(test, target_os = "linux"))]
@@ -337,7 +338,7 @@ struct NativeFrontierValues {
     roster_v1_namespace: bool,
     #[serde(default)]
     roster_v2_activation: Option<NativeActivation>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "frontier_encoding::recovery")]
     async_recovery: Option<async_recovery::Boundary>,
     current_snapshot: Option<crate::sqlite::consensus::CurrentSnapshot>,
 }
@@ -394,7 +395,10 @@ impl Serialize for NativeFrontierValues {
             value.serialize_field("roster_v2_activation", &self.roster_v2_activation)?;
         }
         if include_async_recovery {
-            value.serialize_field("async_recovery", &self.async_recovery)?;
+            value.serialize_field(
+                "async_recovery",
+                &frontier_encoding::Recovery(&self.async_recovery),
+            )?;
         }
         if include_fenced_profile {
             value.serialize_field("fenced_transition_profile", &self.fenced_transition_profile)?;
@@ -565,7 +569,16 @@ impl NativeStorage {
         Ok(Self { business, log })
     }
 
+    #[cfg(test)]
     pub(crate) fn replay_committed(&mut self) -> io::Result<()> {
+        self.replay_committed_with_check(&|| Ok(()))
+    }
+
+    pub(crate) fn replay_committed_with_check(
+        &mut self,
+        check: &impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        check()?;
         // Recovery owns its decoder/application cohort. Transport packaging
         // cannot enlarge preparation, and every durable entry is still
         // audited before any recovery publication or file repair.
@@ -585,12 +598,13 @@ impl NativeStorage {
             .applied()
             .map_or(0, |applied| applied.index + 1);
         while next <= committed.index {
+            check()?;
             let end = (next + REPLAY_ENTRIES as u64).min(committed.index + 1);
             // Recovery holds exclusive NativeStorage ownership before a WAL
             // writer exists. The same detached codec still supplies complete
             // independently owned log and receipt results for cold rows.
             let capture = self.capture_log_read()?;
-            let rows = capture.resolve(next, Some(end), Some(REPLAY_ENTRIES), &|| Ok(()))?;
+            let rows = capture.resolve(next, Some(end), Some(REPLAY_ENTRIES), check)?;
             capture.require_current_authority(self)?;
             let entries = rows.entries();
             if entries.len() != (end - next) as usize {
@@ -598,10 +612,7 @@ impl NativeStorage {
             }
             self.log
                 .require_committed_entries(&self.business, self.log.committed, entries)?;
-            let reads = self
-                .business
-                .capture_apply_reads(entries)?
-                .resolve(&|| Ok(()))?;
+            let reads = self.business.capture_apply_reads(entries)?.resolve(check)?;
             let copies = reads.copy_current(&self.business)?;
             self.business.apply_with_receipts(entries, &copies)?;
             next = end;
