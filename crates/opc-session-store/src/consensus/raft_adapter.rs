@@ -1583,26 +1583,21 @@ impl SessionRaftRpcHandler {
 
     async fn append_admitted_before(
         &self,
-        mut rpc: AppendEntriesRequest<SessionRaftTypeConfig>,
+        rpc: AppendEntriesRequest<SessionRaftTypeConfig>,
         persistence: persistence_protocol::EngineAdmission,
         engine_rpc: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
         deadline: tokio::time::Instant,
     ) -> SessionConsensusWireResponse {
-        let original_last = rpc.entries.last().map(|entry| entry.log_id);
-        let growth = match self.log_admission.admit_append(&mut rpc) {
-            Ok(growth) => growth,
-            Err(error) => return rejected_response(error),
-        };
+        let growth = self.log_admission.track_append(&rpc);
         let matched = rpc
             .entries
             .last()
             .map(|entry| entry.log_id)
             .or(rpc.prev_log_id);
-        let shortened = original_last != rpc.entries.last().map(|entry| entry.log_id);
         let supervise = growth.is_some();
         let raft = self.raft.clone();
         let work = async move {
-            let mut result = raft.append_entries(rpc).await;
+            let result = raft.append_entries(rpc).await;
             if let Some(growth) = growth {
                 match &result {
                     Ok(AppendEntriesResponse::Success) => {
@@ -1621,9 +1616,6 @@ impl SessionRaftRpcHandler {
             }
             if matches!(result, Ok(AppendEntriesResponse::Success)) {
                 persistence.confirm_append(matched);
-                if shortened {
-                    result = Ok(AppendEntriesResponse::PartialSuccess(matched));
-                }
             }
             let result = encode_engine_result(&result);
             drop(engine_rpc);
@@ -5763,7 +5755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn log_admission_follower_rejects_growth_but_keeps_heartbeat_and_repair() {
+    async fn log_admission_follower_applies_growth_and_keeps_heartbeat_and_repair() {
         let fixture =
             fixed_follower_fixture(Duration::from_secs(5), true, FixedAuthorityBackend::Sqlite)
                 .await;
@@ -5845,12 +5837,8 @@ mod tests {
             entries: vec![entry],
         })
         .await;
-        assert_eq!(
-            response.result,
-            Err(SessionConsensusPeerError::Rejected),
-            "growth at the live window must be rejected before entering the engine"
-        );
-        assert_eq!(fixture.raft.metrics().borrow().last_log_index, Some(3));
+        assert_append_success(response);
+        assert_eq!(fixture.raft.metrics().borrow().last_log_index, Some(4));
         let response = send(AppendEntriesRequest {
             vote: Vote::new_committed(3, fixture.leader),
             prev_log_id: Some(log_id(1, 1)),
@@ -5876,10 +5864,10 @@ mod tests {
         > = decode_bounded(&response.result.unwrap()).unwrap();
         assert_eq!(
             result,
-            Ok(AppendEntriesResponse::PartialSuccess(Some(log_id(3, 3)))),
-            "a mixed request repairs its admitted prefix without acknowledging refused growth"
+            Ok(AppendEntriesResponse::Success),
+            "a mixed request repairs its complete prefix and appends all growth"
         );
-        assert_eq!(fixture.raft.metrics().borrow().last_log_index, Some(3));
+        assert_eq!(fixture.raft.metrics().borrow().last_log_index, Some(5));
         assert!(fixture.raft.metrics().borrow().running_state.is_ok());
         fixture.raft.shutdown().await.expect("follower shutdown");
     }

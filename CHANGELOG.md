@@ -227,6 +227,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a fresh install. Native apply and checkpoint replay preserve resolution
   through grouped expiry and retirement, including a reclaimed receipt;
   deletion witnesses remain bound to the immutable profile digest. (#1334)
+- `opc-session-store`: expose `log_pressure_snapshot()`,
+  `ConsensusLogPressureLevel`, `ConsensusLogPressureSnapshot`, and
+  `SESSION_CONSENSUS_LOG_HIGH_WATER_ROWS` for observing current retained-log and
+  snapshot pressure. These gauges clear with progress and impose no lifetime
+  operation budget. (#1249)
 
 - `opc-types`, `opc-proto-ikev2` and `opc-proto-gtpv2c`: add shared checked
   N1-mode wire values, the three TS 24.302 N1 Notify codecs, directional
@@ -1145,11 +1150,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespaces after runtime quiescence. The leader proof's CI budget now follows
   its exact identity across proof-registry reordering. (#1249)
 
-- `opc-session-store`: apply backpressure to live retained log growth at leader
-  proposal and follower RPC admission, with typed pressure gauges and warnings.
-  Accepted work keeps its capacity through cancellation; repair and protocol
-  control remain available. Snapshot stalls recover automatically after progress
-  resumes, including after a build that predates the full window. (#1249)
+- `opc-session-store`: apply retained-log backpressure before ordinary leader
+  proposals. Followers always deliver complete authenticated replicated batches
+  to Raft, preserving heartbeats and trailing control entries. Emergency work
+  and authenticated recovery controls use reserved headroom; demotion wakes
+  queued proposals to reroute within their original deadline. Accepted work
+  retains its accounting and authority through cancellation. (#1249)
 
 - `opc-session-store`: read V2 history through its existing fresh quorum
   read-index barrier without proposing an unused logical-time advance. History

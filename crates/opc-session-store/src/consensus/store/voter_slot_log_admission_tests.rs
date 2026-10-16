@@ -1,4 +1,4 @@
-//! The incarnation-authenticated ingress shares the live log growth gate.
+//! Incarnation-authenticated replication passes the complete log-pressure window.
 
 use super::*;
 use futures_util::FutureExt;
@@ -46,7 +46,7 @@ fn success(response: SessionConsensusWireResponse) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn log_admission_voter_slot_ingress_rejects_growth_and_preserves_control() {
+async fn log_admission_voter_slot_ingress_applies_growth_and_preserves_control() {
     let fleet = Fleet::open().await;
     let result = AssertUnwindSafe(async {
         let source = &fleet.nodes[0];
@@ -103,22 +103,25 @@ async fn log_admission_voter_slot_ingress_rejects_growth_and_preserves_control()
             log_id: log_id(previous.index + 1),
             payload: EntryPayload::Normal(command),
         }];
-        assert_eq!(
-            send(&fleet, source, target, rpc.clone()).await.result,
-            Err(SessionConsensusPeerError::Rejected)
-        );
+        success(send(&fleet, source, target, rpc.clone()).await);
         assert_eq!(
             target.inner.raft.metrics().borrow().last_log_index,
-            Some(previous.index)
+            Some(previous.index + 1)
         );
+        rpc.prev_log_id = Some(log_id(previous.index + 1));
+        rpc.entries[0].log_id = log_id(previous.index + 2);
         rpc.entries[0].payload = EntryPayload::Blank;
         success(send(&fleet, source, target, rpc.clone()).await);
-        rpc.prev_log_id = Some(log_id(previous.index + 1));
+        rpc.prev_log_id = Some(log_id(previous.index + 2));
         rpc.entries = vec![Entry {
-            log_id: log_id(previous.index + 2),
+            log_id: log_id(previous.index + 3),
             payload: EntryPayload::Normal(probe_marker(source, 0xD9, 1)),
         }];
         success(send(&fleet, source, target, rpc).await);
+        assert_eq!(
+            target.inner.raft.metrics().borrow().last_log_index,
+            Some(previous.index + 3)
+        );
         assert_eq!(target.log_pressure_snapshot().pending_entries, 0);
         assert!(target.inner.raft.metrics().borrow().running_state.is_ok());
     })

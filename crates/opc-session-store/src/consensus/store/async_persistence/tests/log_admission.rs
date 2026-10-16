@@ -16,6 +16,155 @@ async fn fleet(mode: SessionPersistenceMode) -> Fleet {
     fleet
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_full_follower_keeps_heartbeats_and_leadership() {
+    let mut fleet = fleet(SessionPersistenceMode::Durable).await;
+    let result = AssertUnwindSafe(async {
+        let leader = fleet.leader();
+        let source = fleet.store(leader);
+        let follower = fleet.store((leader + 1) % 3);
+        follower
+            .inner
+            .raft_handler
+            .set_log_admission_window_for_test(1);
+        let vote = source.inner.raft.metrics().borrow().vote;
+        let command = repeated_command(source);
+        let started = tokio::time::Instant::now();
+        // Keep real elections enabled beyond the full leader lease plus the
+        // maximum election timeout (8 + 8 seconds). Data appends carry the
+        // heartbeats throughout this interval; no synthetic empty RPC helps.
+        while started.elapsed() < Duration::from_secs(17) {
+            let reply = propose(
+                source,
+                &command,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await;
+            assert!(
+                matches!(reply, ForwardMutationReply::Applied(ref response)
+                if response.result.is_ok()),
+                "live write must commit: {reply:?}"
+            );
+            assert_eq!(source.inner.raft.metrics().borrow().vote, vote);
+            assert_eq!(
+                follower.inner.raft.metrics().borrow().vote,
+                vote,
+                "a full follower must keep receiving the leader's data heartbeats"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let through = source.inner.raft.metrics().borrow().last_applied.unwrap();
+        follower
+            .inner
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(Some(through.index), "full follower applies all writes")
+            .await
+            .unwrap();
+        assert_eq!(source.inner.raft.metrics().borrow().vote, vote);
+        assert_eq!(follower.inner.raft.metrics().borrow().vote, vote);
+        assert!(follower.log_pressure_snapshot().retained_rows > 1);
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_full_majority_commits_accepted_write() {
+    let mut fleet = fleet(SessionPersistenceMode::Durable).await;
+    let result = AssertUnwindSafe(async {
+        let leader = fleet.leader();
+        let source = fleet.store(leader);
+        for index in 0..3 {
+            if index != leader {
+                fleet
+                    .store(index)
+                    .inner
+                    .raft_handler
+                    .set_log_admission_window_for_test(1);
+            }
+        }
+        let before = source.inner.raft.metrics().borrow().last_applied.unwrap();
+        let reply = propose(
+            source,
+            &repeated_command(source),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            matches!(reply, ForwardMutationReply::Applied(ref response)
+            if response.result.is_ok()),
+            "follower pressure cannot strand an accepted write: {reply:?}"
+        );
+        for index in 0..3 {
+            fleet
+                .store(index)
+                .inner
+                .raft
+                .wait(Some(Duration::from_secs(10)))
+                .applied_index_at_least(Some(before.index + 1), "accepted write on every voter")
+                .await
+                .unwrap();
+            assert!(fleet
+                .store(index)
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .running_state
+                .is_ok());
+        }
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_cold_barrier_uses_reserved_headroom() {
+    let mut fleet = fleet(SessionPersistenceMode::Async).await;
+    let result = AssertUnwindSafe(async {
+        let leader = fleet.leader();
+        let source = fleet.store(leader);
+        source
+            .inner
+            .raft_handler
+            .set_log_admission_window_for_test(1);
+        let sender = fleet.store((leader + 1) % 3).inner.local_node_id;
+        let before = source.inner.raft.metrics().borrow().last_applied.unwrap();
+        let nonce = SessionConsensusRequestId::new();
+        let payload = encode_bounded(&(
+            *persistence_protocol::COLD_BARRIER_WIRE,
+            SessionConsensusRequestId::new(),
+            1_u64,
+            nonce,
+        ))
+        .unwrap();
+        let response = source.handle_async_cold_barrier(sender, &payload).await;
+        let cut: ColdQuorumCut = decode_bounded(
+            &response
+                .result
+                .expect("authenticated cold barrier must pass the full ordinary window"),
+        )
+        .unwrap();
+        assert_eq!(cut.request.nonce, nonce);
+        assert_eq!(cut.requester, sender);
+        assert!(cut.barrier.index > before.index);
+        assert_eq!(cut.vote, source.inner.raft.metrics().borrow().vote);
+        assert!(
+            !source.inner.raft_handler.log_admission.has_capacity(),
+            "the cold barrier does not open ordinary admission"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 fn repeated_command(store: &ConsensusSessionStore) -> SessionConsensusCommand {
     SessionConsensusCommand {
         schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
@@ -35,10 +184,19 @@ async fn propose(
     command: &SessionConsensusCommand,
     deadline: tokio::time::Instant,
 ) -> ForwardMutationReply {
+    propose_class(store, command, deadline, ScopeWorkClass::Normal).await
+}
+
+async fn propose_class(
+    store: &ConsensusSessionStore,
+    command: &SessionConsensusCommand,
+    deadline: tokio::time::Instant,
+    class: ScopeWorkClass,
+) -> ForwardMutationReply {
     let reservation = store
         .inner
         .proposal_admission
-        .reserve_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::Normal)
+        .reserve_for(ScopeSchedulerKey::INTERNAL, class)
         .await
         .unwrap();
     let proposal_permit = match store
@@ -80,6 +238,122 @@ async fn propose(
             deadline,
         )
         .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_emergency_commits_while_ordinary_waits() {
+    let mut fleet = fleet(SessionPersistenceMode::Durable).await;
+    let result = AssertUnwindSafe(async {
+        let source = fleet.store(fleet.leader());
+        for store in fleet.stores.iter().flatten() {
+            store
+                .inner
+                .raft_handler
+                .set_log_admission_window_for_test(1);
+        }
+        let command = repeated_command(source);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut ordinary = Box::pin(propose(source, &command, deadline));
+        assert!(futures_util::poll!(&mut ordinary).is_pending());
+        let before = source.inner.raft.metrics().borrow().last_applied.unwrap();
+        let reply = propose_class(source, &command, deadline, ScopeWorkClass::Emergency).await;
+        assert!(
+            matches!(reply, ForwardMutationReply::Applied(ref response)
+            if response.result.is_ok()),
+            "emergency reaches final proposal and commits: {reply:?}"
+        );
+        assert!(futures_util::poll!(&mut ordinary).is_pending());
+        for store in fleet.stores.iter().flatten() {
+            store
+                .inner
+                .raft
+                .wait(Some(Duration::from_secs(10)))
+                .applied_index_at_least(Some(before.index + 1), "emergency applied by all voters")
+                .await
+                .unwrap();
+        }
+        assert!(!source.inner.raft_handler.log_admission.has_capacity());
+        drop(ordinary);
+        assert_eq!(
+            source.inner.proposal_admission.available_permits(),
+            SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS
+        );
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_demoted_requests_reroute_with_original_deadline() {
+    let mut fleet = fleet(SessionPersistenceMode::Durable).await;
+    let result = AssertUnwindSafe(async {
+        let leader = fleet.leader();
+        let source = fleet.store(leader);
+        let successor = fleet.store((leader + 1) % 3);
+        let other = fleet.store((leader + 2) % 3);
+        source
+            .inner
+            .raft_handler
+            .set_log_admission_window_for_test(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let command = repeated_command(source);
+        let mut waiting = Box::pin(propose(source, &command, deadline));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let request = source
+            .inner
+            .raft
+            .begin_leadership_transfer(successor.inner.local_node_id)
+            .await
+            .unwrap();
+        for target in [other, successor] {
+            let result: Result<
+                (),
+                RaftError<SessionConsensusNodeId, opc_consensus::engine::raft::TransferLeaderError>,
+            > = source
+                .call_peer(
+                    target.inner.local_node_id,
+                    SessionConsensusRpcFamily::LeadershipTransfer,
+                    &request,
+                    deadline,
+                )
+                .await
+                .unwrap();
+            result.unwrap();
+        }
+        let reply = waiting.await;
+        assert!(
+            matches!(reply, ForwardMutationReply::NotLeader { .. }),
+            "parked proposal redirects on demotion: {reply:?}"
+        );
+        successor
+            .inner
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .current_leader(successor.inner.local_node_id, "successor elected")
+            .await
+            .unwrap();
+        assert!(tokio::time::Instant::now() < deadline);
+        let reply = propose(successor, &command, deadline).await;
+        assert!(
+            matches!(reply, ForwardMutationReply::Applied(ref response)
+            if response.result.is_ok()),
+            "rerouted proposal retains its original deadline: {reply:?}"
+        );
+        assert_eq!(
+            source.inner.proposal_admission.available_permits(),
+            SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS
+        );
+        assert!(
+            !source.inner.raft_handler.log_admission.has_capacity(),
+            "redirect did not depend on local reclamation"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 #[cfg(feature = "test-control")]

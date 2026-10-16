@@ -1510,15 +1510,6 @@ pub(super) async fn handle(
                 SessionConsensusRpcFamily::AppendEntries => {
                     let mut rpc = append.ok_or(VoterReplacementError::UnauthorizedReplacement)?;
                     let original_last = rpc.entries.last().map(|entry| entry.log_id);
-                    let log_growth = match store
-                        .inner
-                        .raft_handler
-                        .log_admission
-                        .admit_append(&mut rpc)
-                    {
-                        Ok(growth) => growth,
-                        Err(error) => return Ok(rejected(error)),
-                    };
                     let before = rpc.entries.first().map_or(0, |entry| entry.log_id.index);
                     let AppendAdmissionState {
                         state,
@@ -1607,6 +1598,9 @@ pub(super) async fn handle(
                         .map_err(|_| VoterReplacementError::InvalidTransition)?;
                     }
                     rpc.entries.truncate(prefix);
+                    // Slot-authority projection may split a transition batch.
+                    // Retained-log pressure never truncates replicated data.
+                    let log_growth = store.inner.raft_handler.log_admission.track_append(&rpc);
                     let accepted_last = rpc
                         .entries
                         .last()

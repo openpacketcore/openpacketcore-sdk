@@ -662,12 +662,20 @@ are never admission budgets; progress reuses the same window.
 
 A leader waits before taking an execution credit and keeps the original
 operation deadline. It returns the existing Unavailable outcome if live
-capacity does not recover in time. A follower refuses new ordinary entries
-before submitting them to the engine. Heartbeats, conflict repair, snapshot
-installation and authenticated recovery/membership control remain available.
-A mixed repair/growth append can acknowledge only its admitted prefix using the
-existing PartialSuccess response. Scheduling priority alone does not exempt
-ordinary growth.
+capacity does not recover in time. Losing leadership wakes queued proposals
+with NotLeader so that they can reroute within that same deadline. Followers
+deliver complete authenticated AppendEntries batches to Raft regardless of
+their retained window. Data appends carry heartbeats, and controls behind data
+must remain reachable. Follower accounting observes pressure and retains
+accepted-work ownership; it never truncates or refuses replicated growth.
+Existing authority and membership-transition validation remain mandatory.
+
+Verified Emergency work and authenticated recovery/membership controls use the
+reserved headroom above the ordinary window. They are counted but are never
+refused by this admission window. EmergencyClassification and ordinary
+SafetyControl application growth remain gated. The single-voter Async
+cold-rejoin barrier receives its exemption only after authentication through
+the private cold-cut path; ordinary AdvanceLogicalTime is still gated.
 
 The engine owns snapshot construction, transfer and purge. If an old stalled
 build finishes after ordinary commits have stopped at the window, the SDK

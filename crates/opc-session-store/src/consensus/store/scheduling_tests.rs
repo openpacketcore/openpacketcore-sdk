@@ -137,6 +137,25 @@ async fn log_admission_leader_waits_without_running_credit() {
         SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS,
         "priority growth also waits without consuming a running credit"
     );
+    let emergency = store
+        .inner
+        .proposal_admission
+        .reserve_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::Emergency)
+        .await
+        .expect("verified emergency reservation");
+    let emergency = tokio::time::timeout(
+        Duration::from_millis(100),
+        store.start_proposal_before(
+            emergency,
+            &SessionMutationIntent::AdvanceLogicalTime,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("emergency admission must not wait behind the ordinary log window")
+    .expect("emergency retains reserved admission headroom");
+    assert_eq!(emergency.class(), ScopeWorkClass::Emergency);
+    drop(emergency);
     let control = store
         .inner
         .proposal_admission

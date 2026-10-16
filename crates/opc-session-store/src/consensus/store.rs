@@ -8687,7 +8687,12 @@ impl ConsensusSessionStore {
             ProposalAdmission::ActivationRead(proposal_reservation)
         } else {
             match self
-                .start_proposal_before(proposal_reservation, &request.intent, deadline)
+                .start_proposal_with_headroom_before(
+                    proposal_reservation,
+                    &request.intent,
+                    deadline,
+                    cold_completion.is_some(),
+                )
                 .await
             {
                 Ok(permit) => ProposalAdmission::Running(permit),
@@ -9565,12 +9570,24 @@ impl ConsensusSessionStore {
         } else {
             None
         };
-        let log_growth = if is_log_progress_control(&command.intent) {
-            None
-        } else {
-            match self.inner.raft_handler.log_admission.reserve_proposal() {
-                Ok(reservation) => Some(reservation),
-                Err(()) => return ForwardMutationReply::Unavailable,
+        // The private completion sender is created only after authenticating
+        // the cold-rejoin barrier. It is not wire metadata and does not exempt
+        // ordinary logical-time writes. All reserved growth is still counted.
+        let reserved_headroom = is_log_progress_control(&command.intent)
+            || proposal_permit.class() == ScopeWorkClass::Emergency
+            || cold_completion.is_some();
+        let log_growth = match self
+            .inner
+            .raft_handler
+            .log_admission
+            .reserve_proposal(reserved_headroom)
+        {
+            Ok(reservation) => Some(reservation),
+            Err(super::log_admission::LogAdmissionError::NotLeader(leader)) => {
+                return ForwardMutationReply::NotLeader { leader };
+            }
+            Err(super::log_admission::LogAdmissionError::Unavailable) => {
+                return ForwardMutationReply::Unavailable;
             }
         };
         let response =

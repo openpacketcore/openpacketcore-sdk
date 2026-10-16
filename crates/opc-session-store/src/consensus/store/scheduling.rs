@@ -1,5 +1,6 @@
 //! Volatile class admission at the durable proposal and outbound boundaries.
 //! Class metadata is authenticated forwarding context, never command bytes.
+use super::super::log_admission::LogAdmissionError;
 use super::*;
 #[cfg(test)]
 use crate::scope_scheduler::ScopeSchedulerBudgets;
@@ -252,29 +253,56 @@ impl ConsensusSessionStore {
         intent: &SessionMutationIntent,
         deadline: tokio::time::Instant,
     ) -> Result<ScopeWorkPermit, ForwardMutationReply> {
+        self.start_proposal_with_headroom_before(reservation, intent, deadline, false)
+            .await
+    }
+
+    pub(super) async fn start_proposal_with_headroom_before(
+        &self,
+        reservation: ScopeWorkReservation,
+        intent: &SessionMutationIntent,
+        deadline: tokio::time::Instant,
+        authenticated_cold_barrier: bool,
+    ) -> Result<ScopeWorkPermit, ForwardMutationReply> {
         let start = async {
             let mut reservation = reservation;
+            let reserved_headroom = authenticated_cold_barrier
+                || is_log_progress_control(intent)
+                || reservation.class() == ScopeWorkClass::Emergency;
             loop {
-                let control = is_log_progress_control(intent);
-                if !control {
+                if !reserved_headroom {
                     self.inner
                         .raft_handler
                         .log_admission
                         .ready_before(deadline)
                         .await?;
                 }
-                let permit = reservation.start().await.map_err(|_| ())?;
-                if control || self.inner.raft_handler.log_admission.has_capacity() {
-                    return Ok::<_, ()>(permit);
+                let permit = reservation
+                    .start()
+                    .await
+                    .map_err(|_| LogAdmissionError::Unavailable)?;
+                if reserved_headroom || self.inner.raft_handler.log_admission.has_capacity() {
+                    return Ok::<_, LogAdmissionError>(permit);
                 }
                 // Capacity may change while waiting for a class credit. Keep
                 // the resident reservation, but return the running credit.
                 reservation = permit.finish_unknown();
             }
         };
-        match tokio::time::timeout_at(deadline, start).await {
-            Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) | Err(_) => {
+        match tokio::time::timeout_at(
+            deadline,
+            self.inner.raft_handler.log_admission.while_leader(start),
+        )
+        .await
+        {
+            Ok(Ok(Ok(permit))) => Ok(permit),
+            Ok(Err(LogAdmissionError::NotLeader(leader)))
+            | Ok(Ok(Err(LogAdmissionError::NotLeader(leader)))) => {
+                Err(ForwardMutationReply::NotLeader { leader })
+            }
+            Ok(Err(LogAdmissionError::Unavailable))
+            | Ok(Ok(Err(LogAdmissionError::Unavailable)))
+            | Err(_) => {
                 self.inner
                     .diagnostics
                     .proposal_permit_deadline
