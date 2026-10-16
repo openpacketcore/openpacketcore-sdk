@@ -9,6 +9,8 @@ mod scripted_election;
 #[path = "consensus_openraft/retention_election.rs"]
 mod retention_election;
 
+use quorum_admission::rolling_election;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -74,6 +76,7 @@ struct LoopbackPeer {
     captured_payloads: Arc<StdMutex<Vec<Vec<u8>>>>,
     election_vote: Arc<StdMutex<Option<Arc<scripted_election::FirstVote>>>>,
     retention_vote: Arc<StdMutex<Option<Arc<retention_election::SplitVote>>>>,
+    rolling_vote: Arc<StdMutex<Option<Arc<rolling_election::VoteGate>>>>,
 }
 
 impl LoopbackPeer {
@@ -92,6 +95,7 @@ impl LoopbackPeer {
             captured_payloads: Arc::new(StdMutex::new(Vec::new())),
             election_vote: Arc::new(StdMutex::new(None)),
             retention_vote: Arc::new(StdMutex::new(None)),
+            rolling_vote: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -216,9 +220,20 @@ impl ConsensusPeer for LoopbackPeer {
                 gate.before_delivery(&request).await;
             }
         }
+        let rolling_vote = self.rolling_vote.lock().expect("rolling vote gate").clone();
+        if let Some(gate) = &rolling_vote {
+            if family == ConsensusRpcFamily::Vote {
+                gate.before_delivery(self.target, &request).await;
+            }
+        }
         let response = handler
             .handle_with_compatibility(sender, request, compatibility)
             .await;
+        if let Some(gate) = &rolling_vote {
+            if family == ConsensusRpcFamily::Vote {
+                gate.after_delivery(sender, self.target, &response);
+            }
+        }
         if let Some(gate) = &retention_vote {
             if family == ConsensusRpcFamily::Vote {
                 gate.after_delivery(sender, &response);

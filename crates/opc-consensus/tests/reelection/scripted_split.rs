@@ -27,8 +27,8 @@ async fn one_split_schedule() {
             + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout();
     let scripts = [
         ElectionRngScript::new([sample; 2]),
-        ElectionRngScript::new([sample; 3]),
-        ElectionRngScript::new([sample; 2]),
+        ElectionRngScript::new([sample]),
+        ElectionRngScript::new([sample]),
     ];
     let started = Instant::now();
     let state = Arc::new(NetworkState {
@@ -86,6 +86,10 @@ async fn one_split_schedule() {
             .unwrap();
     }
     let old_term = nodes[0].metrics().borrow().current_term;
+    // Later phases supply future draws without replacing the engine's
+    // timeout already sampled during construction.
+    scripts[1].plan_next([sample; 2]);
+    scripts[2].plan_next([sample]);
     state.nodes.lock().unwrap().remove(&0);
     nodes[0].shutdown().await.unwrap();
     state.votes.send_replace(Vec::new());

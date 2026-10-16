@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "rolling_election.rs"]
+pub(super) mod rolling_election;
+
 #[derive(Clone, Copy)]
 enum Protocol {
     Current,
@@ -353,16 +356,28 @@ async fn incompatible_returning_connection_is_refused_while_the_majority_serves(
     fleet.stop_all().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn mixed_voters_roll_in_both_directions_and_legacy_never_counts_as_verified() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
     let mut fleet = RetainedFleet::start().await;
     fleet.stop_all().await;
-    for index in 0..3 {
-        fleet
-            .open(index, Protocol::Legacy, CLUSTER_TRANSITION_TIMEOUT)
+    let (ticks, tick_observer) = rolling_election::TickDelivery::install();
+    let mut election = rolling_election::RollingElection::new(runtime_origin, ticks).await;
+    tokio::time::pause();
+    scripted_election::schedule::with_frozen_time(async {
+        election.align_empty().await;
+        for index in 0..3 {
+            election
+                .open(&mut fleet, index, Protocol::Legacy, index == 0)
+                .await;
+        }
+        fleet.admit(&[0, 1, 2]).await;
+        election
+            .observe_reopened(&fleet, &[0, 1, 2], fleet.store(0).status().node_id)
             .await;
-    }
-    fleet.admit(&[0, 1, 2]).await;
+    })
+    .await;
     // Each stopping voter leaves a serving quorum, including a leader stop.
     // This visits 1-new/2-old and 2-new/1-old in both directions.
     for (index, protocol) in [
@@ -373,18 +388,18 @@ async fn mixed_voters_roll_in_both_directions_and_legacy_never_counts_as_verifie
         (1, Protocol::Legacy),
         (0, Protocol::Legacy),
     ] {
-        fleet.stop(index).await;
         let live = (0..3).filter(|node| *node != index).collect::<Vec<_>>();
+        election.stop_and_elect(&mut fleet, index, &live).await;
         fleet.append(live[0]).await;
         fleet.assert_reads(&live).await;
-        fleet
-            .open(index, protocol, CLUSTER_TRANSITION_TIMEOUT)
-            .await;
+        election.open(&mut fleet, index, protocol, false).await;
         fleet.admit(&[index]).await;
         fleet.append(index).await;
         fleet.assert_reads(&[0, 1, 2]).await;
     }
     fleet.stop_all().await;
+    election.finish();
+    drop(tick_observer);
     // With only one new and one old voter back, neither has a verified
     // majority; both need the third member for the old all-peer fallback.
     fleet
@@ -406,27 +421,43 @@ async fn mixed_voters_roll_in_both_directions_and_legacy_never_counts_as_verifie
     fleet.admit(&[0, 1, 2]).await;
     fleet.append(2).await;
     fleet.assert_reads(&[0, 1, 2]).await;
+    let retained_leader = fleet.store(0).status().leader_id.expect("serving leader");
     fleet.stop_all().await;
     // Two new voters can recover while an old third member is absent.
-    for index in [0, 1] {
-        fleet
-            .open(index, Protocol::Current, CLUSTER_TRANSITION_TIMEOUT)
+    let (ticks, tick_observer) = rolling_election::TickDelivery::install();
+    let mut election = rolling_election::RollingElection::new(runtime_origin, ticks).await;
+    tokio::time::pause();
+    scripted_election::schedule::with_frozen_time(async {
+        election.align_empty().await;
+        for index in [0, 1] {
+            election
+                .open(
+                    &mut fleet,
+                    index,
+                    Protocol::Current,
+                    index == 0 && retained_leader.get() == 3,
+                )
+                .await;
+        }
+        fleet.admit(&[0, 1]).await;
+        election
+            .observe_reopened(&fleet, &[0, 1], retained_leader)
             .await;
-    }
-    fleet.admit(&[0, 1]).await;
+    })
+    .await;
     fleet.append(0).await;
     fleet.assert_reads(&[0, 1]).await;
-    fleet
-        .open(2, Protocol::Legacy, CLUSTER_TRANSITION_TIMEOUT)
-        .await;
+    election.open(&mut fleet, 2, Protocol::Legacy, false).await;
     fleet.admit(&[2]).await;
     fleet.assert_reads(&[0, 1, 2]).await;
     // After the old voter joins, taking a current voter down must leave the
     // admitted current/legacy majority serving without another all-peer gate.
-    fleet.stop(1).await;
+    election.stop_and_elect(&mut fleet, 1, &[0, 2]).await;
     fleet.append(0).await;
     fleet.assert_reads(&[0, 2]).await;
     fleet.stop_all().await;
+    election.finish();
+    drop(tick_observer);
 }
 
 #[tokio::test]

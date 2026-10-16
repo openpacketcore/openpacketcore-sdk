@@ -744,6 +744,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist` tests: observe a real timer-derived successor before mixed-voter
+  rolling writes. Script one- and two-split elections, retain the original
+  26-second guard as a negative control, and preserve every upgrade, downgrade,
+  legacy admission, retained recovery, and linearizable read/write assertion.
+  Production timers and operation budgets are unchanged. (#1302)
+
 - `opc-session-store`: retry contended native fixed-quorum authority reads with
   an awaited one-millisecond real monotonic backoff instead of a busy yield or
   protocol-clock sleep. A released owner lock can unblock inbound engine traffic
