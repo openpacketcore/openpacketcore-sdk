@@ -408,8 +408,10 @@ two-split write must return `OutcomeUnknown` at exactly 26 seconds with both
 survivors leaderless; after the 33-second successor, the exact same record and
 audit data must replay successfully through the deterministic request ID.
 The final retained-majority recovery and current-voter stop use the same clock
-and vote observations. A separate forced case commits under legacy voter 3,
-reopens only current voters 1 and 2, and requires their real higher-term successor,
+and vote observations. A separate forced case starts voter 2's write at the leader
+stop and requires that same call to reroute to the real legacy-voter-3 successor
+within its original budget. It reopens only current voters 1 and 2 and requires
+their real higher-term successor,
 write/read recovery, legacy rejoin, and continued service after a current voter
 stops. Normal time resumes for the remaining writes, reads, and legacy admission
 refusals. A 30-second wall-clock watchdog bounds each frozen phase; production

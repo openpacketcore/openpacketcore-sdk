@@ -389,7 +389,9 @@ async fn mixed_voters_roll_in_both_directions_and_legacy_never_counts_as_verifie
         (0, Protocol::Legacy),
     ] {
         let live = (0..3).filter(|node| *node != index).collect::<Vec<_>>();
-        election.stop_and_elect(&mut fleet, index, &live).await;
+        election
+            .stop_and_elect(&mut fleet, index, &live, live[0])
+            .await;
         fleet.assert_reads(&live).await;
         election.open(&mut fleet, index, protocol, false).await;
         fleet.admit(&[index]).await;
@@ -451,7 +453,7 @@ async fn mixed_voters_roll_in_both_directions_and_legacy_never_counts_as_verifie
     fleet.assert_reads(&[0, 1, 2]).await;
     // After the old voter joins, taking a current voter down must leave the
     // admitted current/legacy majority serving without another all-peer gate.
-    election.stop_and_elect(&mut fleet, 1, &[0, 2]).await;
+    election.stop_and_elect(&mut fleet, 1, &[0, 2], 0).await;
     fleet.assert_reads(&[0, 2]).await;
     fleet.stop_all().await;
     election.finish();
@@ -481,9 +483,10 @@ async fn current_voters_recover_with_the_legacy_last_leader_absent() {
     })
     .await;
 
-    // Elect legacy voter 3 through real one-split vote delivery and commit the
-    // write that started at the leader stop. Retain that actual committed vote.
-    election.stop_and_elect(&mut fleet, 0, &[2, 1]).await;
+    // Elect legacy voter 3 through real one-split vote delivery. Voter 2's
+    // in-flight write must reroute from the stopped leader to that remote
+    // successor within the same operation deadline. Retain the committed vote.
+    election.stop_and_elect(&mut fleet, 0, &[2, 1], 1).await;
     fleet.assert_reads(&[1, 2]).await;
     election.open(&mut fleet, 0, Protocol::Current, false).await;
     fleet.admit(&[0]).await;
@@ -532,7 +535,7 @@ async fn current_voters_recover_with_the_legacy_last_leader_absent() {
     election.open(&mut fleet, 2, Protocol::Legacy, false).await;
     fleet.admit(&[2]).await;
     fleet.assert_reads(&[0, 1, 2]).await;
-    election.stop_and_elect(&mut fleet, 1, &[0, 2]).await;
+    election.stop_and_elect(&mut fleet, 1, &[0, 2], 0).await;
     fleet.assert_reads(&[0, 2]).await;
     fleet.stop_all().await;
     election.finish();

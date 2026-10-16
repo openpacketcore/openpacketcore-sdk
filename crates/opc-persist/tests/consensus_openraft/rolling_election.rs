@@ -269,12 +269,14 @@ impl RollingElection {
         fleet: &mut RetainedFleet,
         index: usize,
         live: &[usize],
+        writer: usize,
     ) {
+        assert!(live.contains(&writer), "the in-flight writer must survive");
         let state = fleet.store(index).status();
         if state.leader_id != Some(state.node_id) {
             fleet.stop(index).await;
             self.scripts[index].take().unwrap().finish();
-            fleet.append(live[0]).await;
+            fleet.append(writer).await;
             return;
         }
         self.leader_stops += 1;
@@ -337,8 +339,12 @@ impl RollingElection {
             if split_rounds == 1 {
                 let append = async {
                     assert_eq!(Instant::now(), started, "write starts at the leader stop");
-                    fleet.append(live[0]).await;
-                    eprintln!("rolling write: in-flight append committed at {:?}", started.elapsed());
+                    fleet.append(writer).await;
+                    assert_eq!(
+                        fleet.store(writer).status().leader_id,
+                        Some(fleet.store(live[0]).status().node_id),
+                    );
+                    eprintln!("rolling write: voter {} in-flight append committed at {:?}, successor {}", writer + 1, started.elapsed(), live[0] + 1);
                 };
                 tokio::join!(biased;
                     append,
@@ -352,7 +358,7 @@ impl RollingElection {
                 let append = async {
                     assert_eq!(Instant::now(), started, "write starts at the leader stop");
                     let error = fleet
-                        .store(live[0])
+                        .store(writer)
                         .append_attested_commit(attested(record.clone(), records_audit.clone()))
                         .await
                         .expect_err("two real split votes outlast the unchanged write deadline");
@@ -375,7 +381,7 @@ impl RollingElection {
                 // Attestation claims are one-shot, but these exact retained
                 // record/audit inputs reproduce the same deterministic request ID.
                 fleet
-                    .store(live[0])
+                    .store(writer)
                     .append_attested_commit(attested(record, records_audit))
                     .await
                     .expect("same-ID write recovers after the real successor is observed");
