@@ -2450,6 +2450,57 @@ by issue #143.
   audit/readiness latching, terminal idempotency, and exact legacy
   confirmation.
 - Run with: `cargo test -p opc-session-store`.
+- The native void-receipt fixtures script election samples and delivery of
+  crossing votes through the real three-voter engine. Formation and the initial
+  receipt run on normal time with the original operation and readiness bounds.
+  The runtime starts paused only to record its timer-grid origin, then resumes
+  immediately. Automatic campaigns remain disabled during setup so a host stall
+  cannot consume the finite election script; explicit bootstrap still runs.
+  After the initial receipt, the clock pauses just after the successor's ticker
+  re-registers, then settles all three tickers while the leader is healthy.
+  The fixture observes the leader's own committed-vote timestamp and exercises
+  its expired lease before electing away and back through real Vote RPCs.
+  Before the return election, another replay reaches every applied frontier;
+  the remaining voter's committed-vote timestamp must equal that frozen
+  instant while the temporary leader's expired timestamp remains unchanged.
+  Completed tick handlers alone do not establish heartbeat delivery.
+  The resulting committed vote must have the current frozen timestamp.
+  Replaying the already-decided operation through Raft anchors the follower
+  votes at that same instant; all three applied frontiers must include the new
+  entry. Every voter's automatic campaigns are then enabled for the original
+  split and retry. The clock advances only
+  after every affected core handles every sent tick; actual tick sequence
+  observations distinguish the leader's ticker from replication-worker sleeps.
+  A separate `void_tick_observer` test process checks that first use of a tracing
+  callsite on an unobserved test thread cannot disable this observation. It also
+  requires a new core-handler completion for each successive tick.
+  The fixtures verify a forced campaign denied by the leader lease, an automatic
+  split vote, and the designated successor's retry at a bound computed from the
+  configured timers and recorded ticker phases.
+  With the current profile, the split occurs at six seconds and the successor
+  wins at twelve; the former ten-second wait is retained as a negative control.
+  Before the first forced campaign, a blocking worker holds the remaining
+  voter's real native owner lock until authority contention is observed, then
+  for another 200 ms of wall time. Contended authority reads await a one-millisecond
+  real monotonic timer through the I/O reactor, retaining the original absolute
+  RPC deadline. Cancellation closes the timer without a detached retry task.
+  Releasing the lock therefore needs no protocol-clock advance, and both real
+  denials must still arrive at the exact initial instant. Focused authority tests
+  bound retry counts while the owner is held and cover paused-time release,
+  cancellation, and fail-closed deadline rejection.
+  The unchanged 30-second wall-clock watchdog covers only this short frozen
+  phase, whose duration is reported. Resuming normal time preserves the clock
+  offset from ticker settling, lease renewal, and the election. The measured
+  lead is reported before the original
+  receipt, business-state, snapshot, and restart assertions exercise that offset.
+  These two tests use a current-thread Tokio runtime because paused time requires
+  it; previously they used four workers. Their native apply and snapshot writes
+  consequently run inline and no longer cover the multi-thread
+  `block_in_place` write hand-off across these leader-change scenarios. Other
+  native fixtures retain their multi-thread runtimes. The development dependency
+  enables `opc-consensus/dangerous-test-hooks` for session-store tests, including
+  default-feature builds; outside an election-script scope the runtime delegates
+  to ordinary Tokio behavior.
 - Fixed-quorum fault, snapshot, and election qualification requires the existing
   test controls: `cargo test --locked -p opc-session-store --all-features --test fixed_quorum_authority`.
   On Linux, live authority faults execute against both the selected native WAL

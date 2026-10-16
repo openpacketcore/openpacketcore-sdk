@@ -5,6 +5,55 @@ use super::*;
 use consensus::wal::Wal;
 use std::io;
 
+/// A caller-owned, real-monotonic delay for contended authority reads.
+///
+/// A timer descriptor wakes the reactor even when Tokio time is paused. The
+/// caller's existing absolute RPC deadline still bounds the enclosing future;
+/// dropping it closes this descriptor without leaving a worker or retry task.
+pub(super) struct AuthorityBackoff(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>);
+
+impl AuthorityBackoff {
+    pub(super) fn new() -> io::Result<Self> {
+        let timer = rustix::time::timerfd_create(
+            rustix::time::TimerfdClockId::Monotonic,
+            rustix::time::TimerfdFlags::NONBLOCK | rustix::time::TimerfdFlags::CLOEXEC,
+        )?;
+        tokio::io::unix::AsyncFd::with_interest(timer, tokio::io::Interest::READABLE).map(Self)
+    }
+
+    pub(super) async fn wait(&self) -> io::Result<()> {
+        // Rearm a one-shot after each failed acquisition; accumulated timer
+        // intervals must never allow a burst of immediate retries.
+        rustix::time::timerfd_settime(
+            self.0.get_ref(),
+            rustix::time::TimerfdTimerFlags::empty(),
+            &rustix::time::Itimerspec {
+                it_interval: rustix::time::Timespec::default(),
+                it_value: rustix::time::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000,
+                },
+            },
+        )?;
+        loop {
+            let mut ready = self.0.readable().await?;
+            match ready.try_io(|timer| {
+                let mut expirations = [0_u8; 8];
+                rustix::io::read(timer.get_ref(), &mut expirations).map_err(io::Error::from)
+            }) {
+                Ok(Ok(8)) => {
+                    // Reading the one-shot expiration fully drains this fd.
+                    ready.clear_ready();
+                    return Ok(());
+                }
+                Ok(Ok(_)) => return Err(io::Error::other("incomplete authority backoff timer")),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
 pub(super) fn unavailable() -> StoreError {
     StoreError::BackendUnavailable("native session state is unavailable".into())
 }

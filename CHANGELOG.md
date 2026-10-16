@@ -744,6 +744,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: retry contended native fixed-quorum authority reads with
+  an awaited one-millisecond real monotonic backoff instead of a busy yield or
+  protocol-clock sleep. A released owner lock can unblock inbound engine traffic
+  while protocol time is paused; the original absolute RPC deadline,
+  cancellation, and fail-closed authority checks remain unchanged. Cancellation
+  closes the timer without leaving a worker or retry task. Contention regressions
+  bound retry counts while the owner is held.
+  Both void-receipt election tests require real owner contention followed by a
+  200 ms wall-time hold without advancing their election clock. (#1301)
+
+- `opc-session-store` tests: make native void-receipt successor elections
+  deterministic with real lease denials and split votes. Require the designated
+  successor at the retry computed from the configured election timers, retain
+  the former ten-second wait as a negative control, and preserve all receipt,
+  business-state, snapshot, and restart assertions. Keep setup on normal time
+  and freeze only the election, observing real tick sends and completed core
+  handlers before advancing the clock. Pause after the successor ticker
+  re-registers and verify the original tail with the resulting clock lead.
+  Keep tick observations valid when unrelated tests register tracing callsites
+  first. Establish a fresh committed leader lease inside frozen time, exercising
+  the expired bootstrap lease. Observe the remaining voter's fresh denial lease
+  before the return election, while preserving the temporary leader's expired
+  lease. Keep automatic campaigns out of normal-time setup before restoring
+  every voter's original split and retry. Paused time
+  requires current-thread runtimes for these two tests; their native writes run
+  inline, so they no longer exercise the four-worker write hand-off path. (#1301)
+
+- `opc-persist` tests: use a thirty-second budget for the remaining-deadline
+  regression to tolerate short host stalls while preserving its expiration,
+  upper-bound, and positive elapsed-time assertions.
+
 - `opc-persist`: preserve the remaining standard-clock deadline budget when
   waiting for retained configuration admission and consumer-checkpoint I/O or
   encryption. An advanced Tokio clock no longer makes an unexpired operation

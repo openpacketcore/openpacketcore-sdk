@@ -60,7 +60,7 @@ subtle = { workspace = true }
 zeroize = { workspace = true }
 libc = "0.2"
 nix = { workspace = true, features = ["fs", "socket", "user"] }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "time"] }
 aes-gcm-siv = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
@@ -70,6 +70,7 @@ rusqlite = { workspace = true, features = ["backup", "bundled", "hooks", "limits
 opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0" }
 
 [dev-dependencies]
+opc-consensus = { path = "../opc-consensus", version = "0.2.0", features = ["dangerous-test-hooks"] }
 # Measure native owner allocations in focused, single-threaded unit tests.
 # This workspace dependency is never linked into the production store.
 allocation-counter = { workspace = true }

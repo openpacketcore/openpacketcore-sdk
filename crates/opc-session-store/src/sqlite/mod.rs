@@ -685,6 +685,8 @@ pub struct SqliteSessionBackend {
     pub(crate) test_progress: tokio::sync::watch::Sender<()>,
     #[cfg(test)]
     pub(crate) fixed_quorum_durable_check_count: Arc<AtomicUsize>,
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fixed_quorum_native_contention: tokio::sync::watch::Sender<usize>,
     #[cfg(test)]
     pub(crate) fenced_transition_v2_activation_lookup_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -1522,6 +1524,8 @@ impl SqliteSessionBackend {
             test_progress: tokio::sync::watch::Sender::default(),
             #[cfg(test)]
             fixed_quorum_durable_check_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(all(test, target_os = "linux"))]
+            fixed_quorum_native_contention: tokio::sync::watch::Sender::default(),
             #[cfg(test)]
             fenced_transition_v2_activation_lookup_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
@@ -2390,6 +2394,8 @@ impl SqliteSessionBackend {
         #[cfg(test)]
         self.test_progress.send_replace(());
         #[cfg(target_os = "linux")]
+        let mut native_backoff = None;
+        #[cfg(target_os = "linux")]
         while let Some(result) = self.native_read(|wal| {
             wal.native_fixed_try_read(
                 crate::sqlite::consensus::wal::native::FixedReadExpectation {
@@ -2406,7 +2412,22 @@ impl SqliteSessionBackend {
             match result {
                 Ok(Some(exact)) => return exact,
                 Err(_) => return false,
-                Ok(None) => tokio::time::sleep(Duration::from_millis(1)).await,
+                Ok(None) => {
+                    #[cfg(test)]
+                    self.fixed_quorum_native_contention
+                        .send_modify(|attempts| *attempts += 1);
+                    // An OS thread releases the owner lock independently of
+                    // protocol time. Await a real monotonic backoff without
+                    // spinning or resetting the enclosing RPC's deadline.
+                    let Ok(backoff) =
+                        native_backoff.get_or_insert_with(native::AuthorityBackoff::new)
+                    else {
+                        return false;
+                    };
+                    if backoff.wait().await.is_err() {
+                        return false;
+                    }
+                }
             }
         }
         let conn = self.conn.lock().await;

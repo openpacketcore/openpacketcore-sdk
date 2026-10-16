@@ -42,7 +42,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn remaining_budget_still_bounds_pending_work() {
         tokio::time::advance(Duration::from_secs(60)).await;
-        let budget = Duration::from_secs(1);
+        let budget = Duration::from_secs(30);
         let deadline = Instant::now() + budget;
         let started = tokio::time::Instant::now();
         assert!(timeout(deadline, std::future::pending::<()>())

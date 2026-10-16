@@ -6,6 +6,9 @@ mod native_log_bound;
 #[path = "sequential_wal_sdk_tests/void_tests.rs"]
 mod void_tests;
 
+#[path = "sequential_wal_sdk_tests/void_election.rs"]
+mod void_election;
+
 #[path = "sequential_wal_sdk_tests/scoped_reads.rs"]
 mod scoped_reads;
 
@@ -60,6 +63,7 @@ struct Peer {
     handler: tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>,
     profile_probe_behavior: AtomicU8,
     profile_probes: AtomicUsize,
+    election_votes: std::sync::Mutex<Option<Arc<void_election::VoteGate>>>,
 }
 
 impl fmt::Debug for Peer {
@@ -105,6 +109,10 @@ impl SessionConsensusPeer for Peer {
             .await
             .clone()
             .ok_or(SessionConsensusPeerError::Unavailable)?;
+        let election_votes = self.election_votes.lock().unwrap().clone();
+        if let Some(gate) = election_votes {
+            return Ok(gate.deliver(self.node, handler, request).await);
+        }
         Ok(handler.handle(request.sender, request).await)
     }
 }
@@ -120,6 +128,7 @@ struct Fleet {
     tests: Vec<Arc<PrivateWalTest>>,
     peers: Vec<Arc<Peer>>,
     stores: Vec<ConsensusSessionStore>,
+    void_election: Option<void_election::VoidElection>,
 }
 
 impl Fleet {
@@ -179,6 +188,7 @@ impl Fleet {
                     handler: tokio::sync::RwLock::new(None),
                     profile_probe_behavior: AtomicU8::new(0),
                     profile_probes: AtomicUsize::new(0),
+                    election_votes: std::sync::Mutex::new(None),
                 })
             })
             .collect();
@@ -203,6 +213,7 @@ impl Fleet {
             tests,
             peers,
             stores: Vec::new(),
+            void_election: None,
         }
     }
 

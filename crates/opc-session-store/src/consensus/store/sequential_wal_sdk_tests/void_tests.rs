@@ -372,28 +372,29 @@ async fn void_readiness_before_first_activation_needs_every_voters_proof() {
 }
 
 impl Fleet {
-    async fn change_void_leader(&self) {
-        let old = self
-            .stores
-            .iter()
-            .position(|store| store.status().leader_id == Some(store.status().node_id))
-            .unwrap();
-        let successor = &self.stores[(old + 1) % self.stores.len()];
-        successor.inner.raft.trigger().elect().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if self
-                    .stores
-                    .iter()
-                    .all(|store| store.status().leader_id == Some(successor.status().node_id))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("successor leader on every voter");
+    async fn change_void_leader(&mut self, request: &FencedTransitionV2Request, void_first: bool) {
+        let mut election = self
+            .void_election
+            .take()
+            .expect("scripted successor election");
+        election.pause_after_follower_tick().await;
+        let frozen_started = std::time::Instant::now();
+        let result = void_election::schedule::with_frozen_time(Box::pin(
+            AssertUnwindSafe(election.change_leader(self, request, void_first)).catch_unwind(),
+        ))
+        .await;
+        self.void_election = Some(election);
+        eprintln!(
+            "void election frozen phase wall time: {:?}",
+            frozen_started.elapsed()
+        );
+        eprintln!(
+            "void election post-freeze Tokio clock lead: {:?}",
+            tokio::time::Instant::now()
+                .into_std()
+                .saturating_duration_since(std::time::Instant::now())
+        );
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     }
 
     async fn snapshot_void_receipts(&self) {
@@ -452,7 +453,7 @@ impl Fleet {
             } else {
                 SnapshotIntegrityPolicy::PortableVerified
             };
-            let result =
+            let open = Box::pin(
                 ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
                     self.topologies[index].clone(),
                     backend,
@@ -463,10 +464,28 @@ impl Fleet {
                         .unwrap_or_else(|| Arc::new(crate::SystemClock)),
                     crate::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                     snapshot_integrity,
-                )
-                .await;
+                ),
+            );
+            let result = if let Some(election) = &self.void_election {
+                election.scripts[index]
+                    .scope(tracing::Instrument::instrument(
+                        open,
+                        void_election::ticks::node_span(self.peers[index].node.get()),
+                    ))
+                    .await
+            } else {
+                open.await
+            };
             match result {
-                Ok(store) => self.stores.push(store),
+                Ok(store) => {
+                    if self.void_election.is_some() {
+                        // Bootstrap is explicit. Setup on normal time must
+                        // not consume the finite automatic-campaign script
+                        // when the host stalls before the clock is frozen.
+                        store.inner.raft.runtime_config().elect(false);
+                    }
+                    self.stores.push(store);
+                }
                 Err(error) => {
                     self.close().await;
                     panic!("private WAL SDK node {index} open failed: {error:?}");
@@ -576,12 +595,17 @@ async fn recovery_inspection_accepts_real_void_profile_replicas() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn native_three_voter_void_decides_before_original_and_survives_restart() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let (ticks, tick_observer) = void_election::ticks::TickDelivery::install();
     let mut fleet = Fleet::new_native("void-before-original");
     let profiles = [FencedTransitionV2Profile::V2WithVoid; 3];
-    fleet.open_void_profiles(profiles).await;
     let result = AssertUnwindSafe(async {
+        fleet.void_election =
+            Some(void_election::VoidElection::new(&fleet, runtime_origin, ticks).await);
+        fleet.open_void_profiles(profiles).await;
         let request = v2_create_request(
             301,
             FencedTransitionV2HistoryEpoch::new(1).unwrap(),
@@ -605,7 +629,9 @@ async fn native_three_voter_void_decides_before_original_and_survives_restart() 
                 .unwrap(),
             expected
         );
-        fleet.change_void_leader().await;
+        fleet.change_void_leader(&request, true).await;
+        fleet.void_election = None;
+        drop(tick_observer);
         for store in &fleet.stores {
             assert_eq!(
                 store.fenced_transition_v2_status(&request).await.unwrap(),
@@ -638,13 +664,18 @@ async fn native_three_voter_void_decides_before_original_and_survives_restart() 
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn native_three_voter_original_receipt_wins_over_later_void() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let (ticks, tick_observer) = void_election::ticks::TickDelivery::install();
     let mut fleet = Fleet::new_native("original-before-void");
-    fleet
-        .open_void_profiles([FencedTransitionV2Profile::V2WithVoid; 3])
-        .await;
     let result = AssertUnwindSafe(async {
+        fleet.void_election =
+            Some(void_election::VoidElection::new(&fleet, runtime_origin, ticks).await);
+        fleet
+            .open_void_profiles([FencedTransitionV2Profile::V2WithVoid; 3])
+            .await;
         let request = v2_create_request(
             302,
             FencedTransitionV2HistoryEpoch::new(1).unwrap(),
@@ -657,7 +688,9 @@ async fn native_three_voter_original_receipt_wins_over_later_void() {
             .await
             .unwrap();
         let expected = FencedTransitionV2Status::Recorded(Box::new(Ok(outcome)));
-        fleet.change_void_leader().await;
+        fleet.change_void_leader(&request, false).await;
+        fleet.void_election = None;
+        drop(tick_observer);
         for store in &fleet.stores {
             assert_eq!(
                 store.fenced_transition_v2_void(&request).await.unwrap(),
