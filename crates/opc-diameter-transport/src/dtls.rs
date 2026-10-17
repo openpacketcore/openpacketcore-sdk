@@ -2290,6 +2290,7 @@ mod deadline_tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         let (endpoint, _peer, _log) = crate::in_memory_sctp_link(4);
         let mut io: Box<dyn SctpMessageIo> = Box::new(endpoint);
+        assert!(io.begin_direct_dtls().is_ok());
         let started = Instant::now();
         let timer = std::time::Instant::now() + Duration::from_secs(30);
         let event = pump_wait(&mut io, Some(timer), started + Duration::from_secs(60)).await;
