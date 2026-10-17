@@ -148,6 +148,23 @@ fn family_limit_precedes_payload_ownership_even_when_payload_is_first() {
 }
 
 #[test]
+fn member_repair_control_round_trips_with_its_small_request_bound() {
+    let frame = legacy_capture::request(ConsensusRpcFamily::MemberRepair, vec![0; 1024]);
+    assert_eq!(
+        request(&serde_json::to_vec(&frame).unwrap()).unwrap(),
+        frame
+    );
+    // The typed constructor correctly rejects an oversized payload. Build
+    // the raw wire input here so the decoder's own bound is exercised too.
+    let mut oversized = serde_json::to_value(&frame).unwrap();
+    oversized["Call"]["request"]["payload"]
+        .as_array_mut()
+        .unwrap()
+        .push(0.into());
+    assert!(request(&serde_json::to_vec(&oversized).unwrap()).is_err());
+}
+
+#[test]
 fn counting_pass_stops_at_the_payload_bound_without_an_owner() {
     let at = serde_json::to_vec(&vec![0u8; SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES]).unwrap();
     assert_eq!(

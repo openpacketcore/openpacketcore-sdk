@@ -5,6 +5,93 @@ use super::*;
 use tokio::sync::{oneshot, watch};
 use tokio::time::{advance, timeout, Instant};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn normal_qualification_shutdown_hands_off_and_joins_the_store() {
+    let cluster = opc_session_testkit::ConsensusTestCluster::start(3).await;
+    let leader_id = cluster.store(0).status().leader_id.unwrap();
+    let leader = (0..3)
+        .find(|index| cluster.store(*index).status().node_id == leader_id)
+        .unwrap();
+    let survivor = (leader + 1) % 3;
+    let store = Arc::new(cluster.store(leader));
+    let term = store.status().term;
+    let lease = cluster
+        .store(survivor)
+        .acquire(
+            &qualification_traffic_key(survivor).unwrap(),
+            OwnerId::new("qualification-shutdown-owner").unwrap(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let protected = EncryptingSessionBackend::new(
+        Arc::clone(&store),
+        Arc::new(MemoryKeyProvider::new()),
+        "qualification-shutdown-fixture".to_owned(),
+    );
+    let mut node = QualificationNode {
+        store,
+        #[cfg(all(target_os = "linux", feature = "test-control"))]
+        storage_fence_armed_for_test: false,
+        protected,
+        // The real fixture's replication handlers remain installed until the
+        // command finishes, just as the node's listener must remain available.
+        server: None,
+        consumer_server: None,
+        consumer_transport: None,
+        consumer_delayed_response: Arc::new(AtomicBool::new(false)),
+        consumer_response_hold_gate: Arc::new(QualificationConsumerResponseHoldGate::new(4)),
+        consumer_ambiguity_witness_hold_gate: Arc::new(QualificationConsumerResponseHoldGate::new(
+            1,
+        )),
+        transport: QualificationTransportRuntime::FoundationPlaintext,
+        leases: HashMap::new(),
+        next_lease_retention_sequence: 1,
+        node_index: leader,
+        member_count: 3,
+        configured_voter_ids: (0..3)
+            .map(|index| cluster.store(index).status().node_id.get())
+            .collect(),
+        traffic_schedule_bound: false,
+        traffic: None,
+        traffic_acquire_journal: None,
+        concurrent_watches: HashMap::new(),
+        empty_vote_dispatches: Arc::new(AtomicU64::new(0)),
+        rpc_gate: QualificationConsensusRpcGate::available(),
+        roster_attestation_root: qualification_roster_attestation_trust_root(),
+        fixed_consensus_identity: cluster.consensus_identity(),
+        isolated_scale: None,
+        isolated_scale_clock: None,
+    };
+    let reply = node.handle(QualificationNodeCommand::Shutdown).await;
+    let engine_stopped = !node.store.persistence_health().engine_running;
+    let after = cluster.store(survivor).status();
+    cluster.set_node_online(leader, false);
+    let renewal = timeout(
+        Duration::from_secs(5),
+        cluster
+            .store(survivor)
+            .renew(&lease, Duration::from_secs(60)),
+    )
+    .await;
+    node.stop_server().await;
+    drop(node);
+    cluster.shutdown().await;
+
+    assert!(matches!(reply, QualificationNodeReply::ShuttingDown));
+    assert!(
+        engine_stopped,
+        "normal shutdown must join the actual store before replying"
+    );
+    assert_ne!(after.leader_id, Some(leader_id));
+    assert!(after.term > term);
+    let renewed = renewal
+        .expect("survivors retain the five-second caller budget")
+        .expect("survivors retain lease authority");
+    assert_eq!(renewed.fence(), lease.fence());
+    assert_eq!(renewed.owner(), lease.owner());
+}
+
 fn unavailable() -> StoreError {
     StoreError::BackendUnavailable("fixed shutdown observation unavailable".to_owned())
 }

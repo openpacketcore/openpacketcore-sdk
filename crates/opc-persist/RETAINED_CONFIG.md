@@ -31,9 +31,33 @@ After the backend is returned, pass the same topology to
 `ConsensusConfigStore::open`, wire its authenticated consensus transport, and
 call `initialize_cluster`. Returning a backend does not itself establish quorum
 or serving readiness. A repair member never bootstraps a new cluster, including
-when it is the canonical lowest member or after its next restart. It waits for
-the existing membership and history to replicate through the existing Openraft
-path. Repairing every member of a lost quorum cannot mint fresh genesis.
+when it is the canonical lowest member or after its next restart. While its
+storage is empty, it rejects engine RPCs and does not campaign. It pulls bounded
+snapshot chunks from an authenticated leader that proves a fresh surviving
+quorum. The snapshot covers the leader's accepted log prefix, including any
+tail that must finish applying, before Openraft installs the restored state and
+vote. Only then can the replacement participate in ordinary replication. This
+also supports repair after a planned handoff while the successor stays live.
+Repairing every member of a lost quorum cannot mint fresh genesis.
+
+Cancellation or a lost quorum leaves the empty member unadmitted; retry
+`initialize_cluster` on the same store when the quorum is available. A bounded
+attempt retains its verified partial download for the next call, so a large
+snapshot can progress across operation deadlines. If a saved attempt makes no
+progress, the next call rediscovers authenticated sources within its existing
+budget. A fresh response reuses the checkpoint only when its source, committed
+vote, and complete snapshot metadata still match; a successor or changed
+snapshot starts a new download. Snapshot reads share the publication gate so
+replacement cannot remove a selected file before it is verified and opened.
+The source waits for the snapshot cut to cover the accepted prefix within the
+request budget before fetching the snapshot; unrelated engine metrics updates
+do not cause repeated fetches.
+Cancellation and shutdown
+remove that partial download automatically, and ordinary startup removes any
+staging left by a crash. A completed repair persists through the
+ordinary retained reopen path and can rejoin with a compatible majority. This
+does not reset a leader's recorded replication progress, change stored formats,
+or require manual cleanup during restart.
 
 ## SDK-owned local state
 

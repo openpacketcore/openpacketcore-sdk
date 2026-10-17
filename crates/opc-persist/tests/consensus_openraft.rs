@@ -9,6 +9,12 @@ mod scripted_election;
 #[path = "consensus_openraft/retention_election.rs"]
 mod retention_election;
 
+#[path = "consensus_openraft/planned_shutdown.rs"]
+mod planned_shutdown;
+
+#[path = "consensus_openraft/member_repair.rs"]
+mod member_repair;
+
 use quorum_admission::rolling_election;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,6 +67,8 @@ const FORBIDDEN_RAFT_ARTIFACTS: &[(&str, &[u8])] = &[
     ("raw audit key material", RAW_KEY_MATERIAL_CANARY),
 ];
 
+type TransferLagSender = tokio::sync::mpsc::UnboundedSender<(ConfigConsensusNodeId, u64)>;
+
 #[derive(Clone)]
 struct LoopbackPeer {
     target: ConfigConsensusNodeId,
@@ -77,6 +85,8 @@ struct LoopbackPeer {
     election_vote: Arc<StdMutex<Option<Arc<scripted_election::FirstVote>>>>,
     retention_vote: Arc<StdMutex<Option<Arc<retention_election::SplitVote>>>>,
     rolling_vote: Arc<StdMutex<Option<Arc<rolling_election::VoteGate>>>>,
+    transfer_lag: Arc<StdMutex<Option<TransferLagSender>>>,
+    transfer_gate: Arc<StdMutex<Option<Arc<planned_shutdown::TransferGate>>>>,
 }
 
 impl LoopbackPeer {
@@ -96,6 +106,8 @@ impl LoopbackPeer {
             election_vote: Arc::new(StdMutex::new(None)),
             retention_vote: Arc::new(StdMutex::new(None)),
             rolling_vote: Arc::new(StdMutex::new(None)),
+            transfer_lag: Arc::new(StdMutex::new(None)),
+            transfer_gate: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -200,6 +212,12 @@ impl ConsensusPeer for LoopbackPeer {
         if required.is_some() && required != compatibility {
             return Err(ConsensusPeerError::ScopeMismatch);
         }
+        let transfer_gate = self.transfer_gate.lock().unwrap().clone();
+        if family == ConsensusRpcFamily::LeadershipTransfer {
+            if let Some(gate) = transfer_gate {
+                gate.before_delivery(&request).await;
+            }
+        }
         let election_vote = self
             .election_vote
             .lock()
@@ -226,9 +244,46 @@ impl ConsensusPeer for LoopbackPeer {
                 gate.before_delivery(self.target, &request).await;
             }
         }
+        let transfer = (family == ConsensusRpcFamily::LeadershipTransfer).then(|| {
+            opc_consensus::decode_bounded::<(
+                u16,
+                opc_consensus::engine::raft::TransferLeaderRequest<ConfigConsensusNodeId>,
+            )>(&request.payload)
+            .unwrap()
+            .1
+        });
         let response = handler
             .handle_with_compatibility(sender, request, compatibility)
             .await;
+        if family == ConsensusRpcFamily::LeadershipTransfer {
+            let decoded = response.result.as_ref().map(|payload| {
+                opc_consensus::decode_bounded::<(
+                    u16,
+                    Result<
+                        (),
+                        opc_consensus::engine::error::RaftError<
+                            ConfigConsensusNodeId,
+                            opc_consensus::engine::raft::TransferLeaderError,
+                        >,
+                    >,
+                )>(payload)
+            });
+            if matches!(
+                decoded,
+                Ok(Ok((
+                    _,
+                    Err(opc_consensus::engine::error::RaftError::APIError(
+                        opc_consensus::engine::raft::TransferLeaderError::LogNotApplied
+                    ))
+                )))
+            ) {
+                if let Some(sender) = self.transfer_lag.lock().unwrap().as_ref() {
+                    sender
+                        .send((self.target, transfer.unwrap().last_log_id().unwrap().index))
+                        .unwrap();
+                }
+            }
+        }
         if let Some(gate) = &rolling_vote {
             if family == ConsensusRpcFamily::Vote {
                 gate.after_delivery(sender, self.target, &response);
@@ -337,6 +392,27 @@ impl ThreeNodeCluster {
         scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
         third_node_offset: Duration,
     ) -> Self {
+        Self::build_with_operation_timeout(
+            audit_key_material,
+            lifecycle,
+            policy,
+            scripts,
+            third_node_offset,
+            Duration::from_secs(3),
+        )
+        .await
+    }
+
+    async fn build_with_operation_timeout(
+        audit_key_material: [[u8; 32]; 3],
+        lifecycle: FixtureStorage,
+        policy: Option<
+            &dyn Fn() -> opc_persist::audit_authority::continuity::AuditContinuityPolicy,
+        >,
+        scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
+        third_node_offset: Duration,
+        operation_timeout: Duration,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("cluster directory");
         let nodes = [1_u64, 2, 3].map(|value| ConfigConsensusNodeId::new(value).expect("node ID"));
         let members = nodes.into_iter().collect::<BTreeSet<_>>();
@@ -421,7 +497,7 @@ impl ThreeNodeCluster {
                         backend,
                         snapshots,
                         peers,
-                        Duration::from_secs(3),
+                        operation_timeout,
                     )
                     .await
                 }

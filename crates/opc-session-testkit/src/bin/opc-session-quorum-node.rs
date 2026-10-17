@@ -2080,17 +2080,17 @@ impl QualificationNode {
                 QualificationNodeReply::LeaseHandleForgotten
             }
             QualificationNodeCommand::Shutdown => {
-                if self.isolated_scale.is_some() {
-                    let deadline = tokio::time::Instant::now()
-                        + Duration::from_millis(opc_session_testkit::qualification::QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
-                    self.stop_server().await;
-                    if let Err(error) =
-                        join_qualification_shutdown_before(deadline, || self.store.shutdown()).await
-                    {
-                        return QualificationNodeReply::Error {
-                            code: map_store_error(&error),
-                        };
-                    }
+                let deadline = tokio::time::Instant::now()
+                    + Duration::from_millis(opc_session_testkit::qualification::QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS);
+                self.stop_application_tasks().await;
+                // Every node joins its store. Replication must remain available
+                // until the leader hands off and the owned drain completes.
+                if let Err(error) =
+                    join_qualification_shutdown_before(deadline, || self.store.shutdown()).await
+                {
+                    return QualificationNodeReply::Error {
+                        code: map_store_error(&error),
+                    };
                 }
                 QualificationNodeReply::ShuttingDown
             }
@@ -3485,7 +3485,7 @@ impl QualificationNode {
         }
     }
 
-    async fn stop_server(&mut self) {
+    async fn stop_application_tasks(&mut self) {
         self.concurrent_watches.clear();
         if self
             .traffic
@@ -3503,10 +3503,14 @@ impl QualificationNode {
         {
             let _ = self.stop_traffic_watch().await;
         }
-        if let Some(server) = self.server.take() {
+        if let Some(server) = self.consumer_server.take() {
             server.abort_and_wait().await;
         }
-        if let Some(server) = self.consumer_server.take() {
+    }
+
+    async fn stop_server(&mut self) {
+        self.stop_application_tasks().await;
+        if let Some(server) = self.server.take() {
             server.abort_and_wait().await;
         }
     }

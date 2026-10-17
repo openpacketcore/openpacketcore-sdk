@@ -165,6 +165,33 @@ impl RetainedFleet {
         }
     }
 
+    // The scripted split-election scenarios model abrupt loss. Disconnect
+    // before invoking cleanup so no voluntary transfer replaces those votes.
+    // The planned rolling-restart scenario keeps using the connected stop.
+    async fn stop_disconnected(&mut self, index: usize) {
+        for ((source, target), peer) in &self.paths {
+            if *source == index || *target == index {
+                peer.set_enabled(false);
+            }
+        }
+        self.stop(index).await;
+        for ((source, target), peer) in &self.paths {
+            if *source == index || *target == index {
+                peer.set_enabled(true);
+            }
+        }
+    }
+
+    async fn stop_all_disconnected(&mut self) {
+        for peer in self.paths.values() {
+            peer.set_enabled(false);
+        }
+        self.stop_all().await;
+        for peer in self.paths.values() {
+            peer.set_enabled(true);
+        }
+    }
+
     async fn open(&mut self, index: usize, protocol: Protocol, timeout: Duration) {
         assert!(self.stores[index].is_none());
         let backend = SqliteBackend::reopen_config_authority(self.options(index), audit_key())
@@ -271,6 +298,49 @@ async fn retained_majority_reopens_without_the_third_voter() {
 }
 
 #[tokio::test]
+async fn rolling_restart_hands_off_each_current_leader_and_preserves_writes() {
+    let mut fleet = RetainedFleet::start().await;
+    let mut stopped = BTreeSet::new();
+    for _ in 0..3 {
+        let leader = (0..3)
+            .find(|index| {
+                let status = fleet.store(*index).status();
+                status.leader_id == Some(status.node_id)
+            })
+            .expect("current writable leader");
+        let term = fleet.store(leader).status().term;
+        let report = fleet.store(leader).shutdown_with_report().await.unwrap();
+        let opc_consensus::PlannedShutdownOutcome::LeaderTransferred { successor } = report else {
+            panic!("planned leader restart did not hand off: {report:?}");
+        };
+        stopped.insert(leader);
+        fleet.stop(leader).await;
+        let successor = (0..3)
+            .find(|index| *index != leader && fleet.store(*index).status().node_id == successor)
+            .unwrap();
+        assert!(fleet.store(successor).status().term > term);
+        fleet.append(successor).await;
+        fleet
+            .open(
+                leader,
+                Protocol::Current,
+                DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout(),
+            )
+            .await;
+        fleet.admit(&[leader]).await;
+        fleet.assert_reads(&[0, 1, 2]).await;
+        fleet.append(leader).await;
+        fleet.assert_reads(&[0, 1, 2]).await;
+    }
+    assert_eq!(
+        stopped.len(),
+        3,
+        "every voter was restarted while it was leader"
+    );
+    fleet.stop_all().await;
+}
+
+#[tokio::test]
 async fn lone_retained_voter_retries_admission_without_restarting() {
     let mut fleet = RetainedFleet::start().await;
     fleet.stop_all().await;
@@ -361,7 +431,7 @@ async fn mixed_voters_roll_in_both_directions_and_legacy_never_counts_as_verifie
     let runtime_origin = tokio::time::Instant::now();
     tokio::time::resume();
     let mut fleet = RetainedFleet::start().await;
-    fleet.stop_all().await;
+    fleet.stop_all_disconnected().await;
     let (ticks, tick_observer) = rolling_election::TickDelivery::install();
     let mut election = rolling_election::RollingElection::new(runtime_origin, ticks).await;
     tokio::time::pause();
@@ -398,7 +468,7 @@ async fn mixed_voters_roll_in_both_directions_and_legacy_never_counts_as_verifie
         fleet.append(index).await;
         fleet.assert_reads(&[0, 1, 2]).await;
     }
-    fleet.stop_all().await;
+    fleet.stop_all_disconnected().await;
     election.finish();
     drop(tick_observer);
     // With only one new and one old voter back, neither has a verified
@@ -423,7 +493,7 @@ async fn mixed_voters_roll_in_both_directions_and_legacy_never_counts_as_verifie
     fleet.append(2).await;
     fleet.assert_reads(&[0, 1, 2]).await;
     let retained_leader = fleet.store(0).status().leader_id.expect("serving leader");
-    fleet.stop_all().await;
+    fleet.stop_all_disconnected().await;
     // Two new voters can recover while an old third member is absent.
     let (ticks, tick_observer) = rolling_election::TickDelivery::install();
     let mut election = rolling_election::RollingElection::new(runtime_origin, ticks).await;
@@ -455,7 +525,7 @@ async fn mixed_voters_roll_in_both_directions_and_legacy_never_counts_as_verifie
     // admitted current/legacy majority serving without another all-peer gate.
     election.stop_and_elect(&mut fleet, 1, &[0, 2], 0).await;
     fleet.assert_reads(&[0, 2]).await;
-    fleet.stop_all().await;
+    fleet.stop_all_disconnected().await;
     election.finish();
     drop(tick_observer);
 }
@@ -465,7 +535,7 @@ async fn current_voters_recover_with_the_legacy_last_leader_absent() {
     let runtime_origin = tokio::time::Instant::now();
     tokio::time::resume();
     let mut fleet = RetainedFleet::start().await;
-    fleet.stop_all().await;
+    fleet.stop_all_disconnected().await;
     let (ticks, tick_observer) = rolling_election::TickDelivery::install();
     let mut election = rolling_election::RollingElection::new(runtime_origin, ticks).await;
     tokio::time::pause();
@@ -502,7 +572,7 @@ async fn current_voters_recover_with_the_legacy_last_leader_absent() {
         let status = fleet.store(index).status();
         status.leader_id == Some(retained_leader) && status.term == retained_term
     }));
-    fleet.stop_all().await;
+    fleet.stop_all_disconnected().await;
     election.finish();
     drop(tick_observer);
 
@@ -537,7 +607,7 @@ async fn current_voters_recover_with_the_legacy_last_leader_absent() {
     fleet.assert_reads(&[0, 1, 2]).await;
     election.stop_and_elect(&mut fleet, 1, &[0, 2], 0).await;
     fleet.assert_reads(&[0, 2]).await;
-    fleet.stop_all().await;
+    fleet.stop_all_disconnected().await;
     election.finish();
     drop(tick_observer);
 }

@@ -33,7 +33,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
+opc-consensus = { path = "../opc-consensus", version = "0.2.0", features = ["dangerous-test-hooks"] }
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 rcgen = { workspace = true }

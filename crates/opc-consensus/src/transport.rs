@@ -135,6 +135,9 @@ pub enum ConsensusRpcFamily {
     /// voter use the engine's ordinary election. This does not carry commands
     /// or change membership.
     LeadershipTransfer,
+    /// Pull an authoritative snapshot before a repaired config voter can
+    /// participate with its restored durable log and vote.
+    MemberRepair,
 }
 
 impl ConsensusRpcFamily {
@@ -150,6 +153,7 @@ impl ConsensusRpcFamily {
             Self::ReadBarrier => "read_barrier",
             Self::TopologyAdmissionBarrier => "topology_admission_barrier",
             Self::LeadershipTransfer => "leadership_transfer",
+            Self::MemberRepair => "member_repair",
         }
     }
 
@@ -163,7 +167,7 @@ impl ConsensusRpcFamily {
         match self {
             // Exact vote, membership log ID and accepted log prefix, including
             // the persistence envelope, are fixed-size control metadata.
-            Self::LeadershipTransfer => 1_024,
+            Self::LeadershipTransfer | Self::MemberRepair => 1_024,
             Self::ForwardRosterMutation | Self::AppendEntriesRoster => {
                 CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES
             }
@@ -621,6 +625,31 @@ mod tests {
             vec![7]
         );
         assert_eq!(encode_bounded(&family).unwrap(), vec![8]);
+    }
+
+    #[test]
+    fn member_repair_control_is_additive_and_bounded() {
+        let template = request();
+        let family = ConsensusRpcFamily::MemberRepair;
+        assert_eq!(family.max_request_payload_bytes(), 1_024);
+        let exact = ConsensusWireRequest::try_new(
+            template.identity,
+            template.sender,
+            family,
+            vec![0; 1_024],
+        )
+        .unwrap();
+        assert_eq!(exact.validate(), Ok(()));
+        let over = ConsensusWireRequest {
+            payload: vec![0; 1_025],
+            ..exact
+        };
+        assert_eq!(over.validate(), Err(ConsensusPeerError::Protocol));
+        assert_eq!(encode_bounded(&family).unwrap(), vec![9]);
+        assert_eq!(
+            encode_bounded(&ConsensusRpcFamily::LeadershipTransfer).unwrap(),
+            vec![8]
+        );
     }
 
     #[test]

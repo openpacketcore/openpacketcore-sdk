@@ -758,6 +758,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadline. Activated durable quorums can classify history with one delayed or
   unavailable voter without waiting for a new native WAL sync. (#1328)
 
+- `opc-persist` and `opc-session-store`: planned shutdown automatically hands
+  leadership to an up-to-date voter before joining the engine. Preparation is
+  bounded, clone-wide, and retained across caller cancellation; failed handoff
+  still drains and reports a typed reason through `shutdown_with_report()`.
+  Keep consensus transport available until shutdown completes. Config-bus
+  successor tests now use deterministic election inputs and retain both
+  planned and abrupt leader-loss projection checks. Empty retained config
+  replacements restore a snapshot from the surviving quorum before voting or
+  answering replication, preserving a live successor's recorded progress.
+  Cancelled repair can retry without manual cleanup. Stalled saved repairs
+  rediscover a live source and reuse partial bytes only for exactly matching
+  snapshot authority. Snapshot reads remain valid across concurrent snapshot
+  replacement, and repair waits for actual snapshot progress before fetching.
+  (#1315)
+
 - `opc-proto-gtpv2c`: An empty Create Session Response APCO received before any
   retained APCO is discarded as malformed optional outer-IE data at every
   validation level, including under `Reject`, so a later populated APCO can

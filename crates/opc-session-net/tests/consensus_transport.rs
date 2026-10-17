@@ -3930,6 +3930,132 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter_case() {
                 .is_some_and(|index| index >= catchup_index)
     }));
 
+    // A planned stop must also work through the authenticated production
+    // transport. Remove the old listener only after the store confirms its
+    // successor, then require a new committed command on the surviving quorum.
+    let report = stores[leader_index]
+        .shutdown_with_report()
+        .await
+        .expect("planned config leader shutdown over mTLS");
+    let opc_consensus::PlannedShutdownOutcome::LeaderTransferred { successor } = report else {
+        panic!("mTLS handoff did not confirm successor authority: {report:?}");
+    };
+    assert_ne!(successor, leader);
+    servers[leader_index]
+        .take()
+        .expect("retiring leader listener")
+        .abort_and_wait()
+        .await;
+    tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+        let error = stores[follower_index]
+            .mark_confirmed_idempotent(
+                ConfigConsensusRequestId::from_bytes([0xBE; 16]),
+                opc_types::TxId::new(),
+            )
+            .await
+            .expect_err("successor commits the deterministic missing-target result");
+        assert!(matches!(error.kind(), PersistErrorKind::RollbackNotFound));
+        for store in stores
+            .iter()
+            .filter(|store| store.status().node_id != leader)
+        {
+            store
+                .probe_durable_readiness()
+                .await
+                .expect("surviving mTLS quorum is ready after listener removal");
+            let status = store.status();
+            assert_eq!(status.leader_id, Some(successor));
+            assert!(status.term > original_term);
+        }
+    })
+    .await
+    .expect("post-handoff mTLS write retains the original operation budget");
+
+    // Replace the stopped member's backing while the handed-off leader stays
+    // live. Recovery must traverse the authenticated production transport
+    // without exposing an empty log under the retired voter's node ID.
+    let topology =
+        ConfigConsensusTopology::try_new(identity, node_ids[leader_index], members.clone())
+            .expect("repair topology");
+    let options = opc_persist::RetainedConfigOptions::new(
+        directory.path().join("config-repair.sqlite"),
+        opc_persist::RetainedConfigBinding::new(topology.clone(), [0x25; 32], [0x26; 32])
+            .expect("repair binding"),
+        opc_persist::RetainedConfigDurability::Ephemeral,
+        64 * 1024 * 1024,
+        DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    )
+    .expect("repair options");
+    let backend = SqliteBackend::provision_config_member_repair(
+        options,
+        AuditKey::new([0x75; 32]).expect("repair audit key"),
+    )
+    .await
+    .expect("replacement backing");
+    let replica = REPLICAS[leader_index];
+    let local = manifest
+        .bind_local(replica_id(replica))
+        .expect("repair local binding");
+    let peers = REPLICAS
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != leader_index)
+        .map(|(target, remote)| {
+            let peer = RemoteSessionConsensusPeer::new_profiled_with_resolver(
+                local
+                    .clone()
+                    .bind_remote(replica_id(*remote))
+                    .expect("repair remote binding"),
+                delayed_profiled_resolver(
+                    addresses[target].clone(),
+                    path_delay_enabled[&(leader_index, target)].clone(),
+                    path_delayed_completions[&(leader_index, target)].clone(),
+                ),
+                pki.client_config(replica),
+            );
+            (
+                node_ids[target],
+                Arc::new(peer) as Arc<dyn SessionConsensusPeer>,
+            )
+        })
+        .collect();
+    stores[leader_index] = ConsensusConfigStore::open(
+        topology,
+        backend,
+        directory.path().join("repair-snapshots"),
+        peers,
+    )
+    .await
+    .expect("repair store");
+    let (server, address) = SessionConsensusServer::new(
+        stores[leader_index].rpc_handler(),
+        pki.server_config(replica),
+        local,
+    )
+    .listen("127.0.0.1:0".parse().unwrap())
+    .await
+    .expect("repair listener");
+    *addresses[leader_index].write().expect("repair address") = Some(address);
+    servers[leader_index] = Some(server);
+    stores[leader_index]
+        .initialize_cluster()
+        .await
+        .expect("repair recovers from live mTLS quorum");
+    stores[leader_index]
+        .probe_durable_readiness()
+        .await
+        .expect("repaired mTLS voter ready");
+    assert_eq!(stores[leader_index].status().leader_id, Some(successor));
+    assert!(stores[leader_index]
+        .status()
+        .applied_index
+        .is_some_and(|index| index >= catchup_index));
+    assert!(stores[leader_index]
+        .load_latest()
+        .await
+        .expect("repaired mTLS read")
+        .is_none());
+
     let _ = tokio::join!(
         stores[0].shutdown(),
         stores[1].shutdown(),

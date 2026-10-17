@@ -350,6 +350,16 @@ impl ConsensusRpcHandler for ConfigRaftRpcHandler {
                 };
                 encode_engine_result(&self.raft.vote(rpc).await)
             }
+            ConsensusRpcFamily::LeadershipTransfer => {
+                let rpc = match decode_and_bind_sender::<
+                    opc_consensus::engine::raft::TransferLeaderRequest<ConsensusNodeId>,
+                >(&request.payload, request.sender)
+                {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.handle_leadership_transfer(rpc).await)
+            }
             ConsensusRpcFamily::InstallSnapshot => {
                 let rpc = match decode_and_bind_sender::<InstallSnapshotRequest<ConfigRaftTypeConfig>>(
                     &request.payload,
@@ -388,6 +398,12 @@ fn validate_envelope(
 
 pub(crate) trait EngineRequestSender {
     fn vote(&self) -> &Vote<ConsensusNodeId>;
+}
+
+impl EngineRequestSender for opc_consensus::engine::raft::TransferLeaderRequest<ConsensusNodeId> {
+    fn vote(&self) -> &Vote<ConsensusNodeId> {
+        self.from()
+    }
 }
 
 impl EngineRequestSender for AppendEntriesRequest<ConfigRaftTypeConfig> {

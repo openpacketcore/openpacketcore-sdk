@@ -396,8 +396,17 @@ domain. Readers without this vocabulary reject the root before participating.
 Old roots are refused by this binary; there is no implicit migration or
 retrospective certification.
 
-The clone-wide shutdown coordinator first joins maintenance lanes, Raft and
-every actual storage/snapshot owner. Only an incarnation that was Active and
+The clone-wide shutdown coordinator first attempts an engine-owned planned
+handoff while authenticated replication remains available. It closes local
+application admission and cached read-lease reuse before releasing vote leases.
+Automatic preparation receives at most five seconds and half the existing
+operation budget. Failure retains a typed fallback reason and proceeds to the
+same drain; cancellation of an observer never cancels the owned operation.
+An explicit prior preparation retains its original deadline and outcome.
+Handoff neither changes persistence mode nor certifies a storage close.
+
+The coordinator then joins maintenance lanes, Raft and every actual
+storage/snapshot owner. Only an incarnation that was Active and
 whose engine stopped normally can request certification. Openraft shutdown's
 successful join alone does not prove a normal exit; its final running state
 must also be `Fatal::Stopped`. A quarantined incarnation cannot certify a

@@ -27,8 +27,22 @@ use crate::backend::SqliteBackend;
 const SNAPSHOT_FOOTER_MAGIC: &[u8; 8] = b"OPCCFG01";
 const SNAPSHOT_FOOTER_BYTES: u64 = 8 + 2 + 8 + 32;
 pub(crate) const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const SNAPSHOT_MAX_ENVELOPE_BYTES: u64 = SNAPSHOT_MAX_BYTES + SNAPSHOT_FOOTER_BYTES;
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 8_192;
 const SNAPSHOT_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SnapshotTestHooks {
+    pause_verified_read: AtomicBool,
+    read_verified: tokio::sync::Notify,
+    resume_read: tokio::sync::Notify,
+    build_gate_acquired: AtomicBool,
+    pub(crate) pause_build: AtomicBool,
+    pub(crate) build_started: tokio::sync::Notify,
+    pub(crate) resume_build: tokio::sync::Notify,
+    pub(crate) reads_started: AtomicU64,
+}
 
 #[must_use = "staging artifacts must stay guarded until they are durably referenced"]
 struct StagingArtifact {
@@ -1162,13 +1176,42 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ConfigRaftTypeConfig>>, StorageError<ConsensusNodeId>> {
+        #[cfg(test)]
+        self.core
+            .snapshot_test_hooks
+            .reads_started
+            .fetch_add(1, Ordering::AcqRel);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(SNAPSHOT_OPERATION_TIMEOUT)
+            .ok_or_else(|| {
+                storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    sqlite::invalid_data("config consensus snapshot read deadline overflow"),
+                )
+            })?;
         validate_snapshot_binding(&self.core)
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
+        // Publication removes the superseded path. Keep the selected metadata,
+        // envelope verification and final open under the same gate as build
+        // and install; the returned descriptor survives subsequent unlinking.
+        let _guard = tokio::time::timeout_at(deadline, self.core.snapshot_gate.lock())
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    sqlite::invalid_data("config consensus snapshot read timed out"),
+                )
+            })?;
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let current = self
             .core
-            .run_sqlite(move |conn| sqlite::read_current_snapshot_sync(conn, identity, &members))
+            .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                cancellation.check_io()?;
+                sqlite::read_current_snapshot_sync(conn, identity, &members)
+            })
             .await
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
         let Some((meta, file_name, expected_checksum, expected_length)) = current else {
@@ -1176,7 +1219,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         };
         let path = self.core.snapshot_dir.join(file_name);
         let (_, checksum, length) =
-            tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, verify_snapshot_envelope(&path))
+            tokio::time::timeout_at(deadline, verify_snapshot_envelope(&path))
                 .await
                 .map_err(|_| {
                     storage_error(
@@ -1199,13 +1242,32 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 sqlite::invalid_data("config consensus snapshot metadata mismatch"),
             ));
         }
-        let file = ConfigSnapshotFile::open(path).await.map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                error,
-            )
-        })?;
+        #[cfg(test)]
+        if self
+            .core
+            .snapshot_test_hooks
+            .pause_verified_read
+            .load(Ordering::Acquire)
+        {
+            self.core.snapshot_test_hooks.read_verified.notify_one();
+            self.core.snapshot_test_hooks.resume_read.notified().await;
+        }
+        let file = tokio::time::timeout_at(deadline, ConfigSnapshotFile::open(path))
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    sqlite::invalid_data("config consensus snapshot read timed out"),
+                )
+            })?
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
         Ok(Some(Snapshot {
             meta,
             snapshot: Box::new(file),
@@ -1238,6 +1300,21 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     sqlite::invalid_data("config consensus snapshot build timed out"),
                 )
             })?;
+        #[cfg(test)]
+        self.core
+            .snapshot_test_hooks
+            .build_gate_acquired
+            .store(true, Ordering::Release);
+        #[cfg(test)]
+        if self
+            .core
+            .snapshot_test_hooks
+            .pause_build
+            .load(Ordering::Acquire)
+        {
+            self.core.snapshot_test_hooks.build_started.notify_one();
+            self.core.snapshot_test_hooks.resume_build.notified().await;
+        }
         let raw = self
             .core
             .snapshot_dir
@@ -1929,6 +2006,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_snapshot_read_survives_concurrent_snapshot_replacement() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let temp = tempfile::tempdir().expect("snapshot tempdir");
+            let backend = SqliteBackend::open_with_audit_key(
+                temp.path().join("config.sqlite"),
+                true,
+                0,
+                shared_audit_key(),
+            )
+            .await
+            .expect("config backend");
+            let (_, mut machine, _) = open(
+                &backend,
+                temp.path().join("snapshots"),
+                identity(),
+                members(),
+            )
+            .await
+            .expect("config consensus storage");
+            machine
+                .apply([membership_entry(), mutation_entry()])
+                .await
+                .expect("initial snapshot state");
+            let original = machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .expect("original snapshot");
+            let original_meta = original.meta.clone();
+            let original_path = original.snapshot.path().to_path_buf();
+            let original_bytes = tokio::fs::read(&original_path)
+                .await
+                .expect("original snapshot bytes");
+            drop(original);
+            machine
+                .apply([Entry {
+                    log_id: log_id(2),
+                    payload: EntryPayload::Blank,
+                }])
+                .await
+                .expect("replacement snapshot state");
+
+            let hooks = Arc::clone(&machine.core.snapshot_test_hooks);
+            hooks.pause_verified_read.store(true, Ordering::Release);
+            hooks.build_gate_acquired.store(false, Ordering::Release);
+            let mut reader = machine.clone();
+            let read = tokio::spawn(async move { reader.get_current_snapshot().await });
+            hooks.read_verified.notified().await;
+
+            let mut builder = machine.get_snapshot_builder().await;
+            let replacement = builder.build_snapshot();
+            tokio::pin!(replacement);
+            // Poll exactly once to attempt the gate. If the reader does not
+            // hold it, finish publishing and removing its old path before
+            // resuming the verified read. No scheduler delay creates the race.
+            let first_poll = poll_fn(|cx| Poll::Ready(replacement.as_mut().poll(cx))).await;
+            let published_before_read = if hooks.build_gate_acquired.load(Ordering::Acquire) {
+                let result = match first_poll {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => replacement.as_mut().await,
+                };
+                Some(result.expect("concurrent replacement snapshot"))
+            } else {
+                assert!(
+                    first_poll.is_pending(),
+                    "replacement must wait for the read"
+                );
+                None
+            };
+            hooks.pause_verified_read.store(false, Ordering::Release);
+            hooks.resume_read.notify_one();
+            let read = read.await.expect("snapshot reader joined");
+            let replacement = match published_before_read {
+                Some(snapshot) => snapshot,
+                None => replacement.as_mut().await.expect("replacement after read"),
+            };
+            assert_eq!(Some(log_id(2)), replacement.meta.last_log_id);
+            assert_ne!(original_meta.snapshot_id, replacement.meta.snapshot_id);
+            assert!(
+                !original_path.exists(),
+                "superseded snapshot must be removed"
+            );
+
+            let mut read = read
+                .expect("a current snapshot read must survive concurrent replacement")
+                .expect("current snapshot");
+            assert_eq!(
+                original_meta, read.meta,
+                "read must retain its selected cut"
+            );
+            let mut bytes = Vec::new();
+            read.snapshot
+                .read_to_end(&mut bytes)
+                .await
+                .expect("selected snapshot remains readable after path removal");
+            assert_eq!(
+                original_bytes, bytes,
+                "selected envelope must remain intact"
+            );
+        })
+        .await
+        .expect("snapshot replacement race must complete within its bound");
+    }
+
+    #[tokio::test]
     async fn committed_progress_does_not_mirror_unapplied_state() {
         let temp = tempfile::tempdir().expect("snapshot tempdir");
         let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
@@ -2167,6 +2353,67 @@ mod tests {
         .expect("dropped worker releases admission and connection")
         .expect("drop probe count");
         assert_eq!(0, committed, "dropped work must be rolled back");
+    }
+
+    #[tokio::test]
+    async fn cancelled_sqlite_worker_keeps_shutdown_pending_until_connection_release() {
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        let connection = Arc::downgrade(&backend.conn());
+        let (log, _, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("storage");
+        let mut shutdown = log.core.storage_shutdown_observer();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            log.core
+                .run_sqlite_cancellable(move |conn, cancellation| {
+                    let _: i64 = conn
+                        .query_row("SELECT 1", [], |row| row.get(0))
+                        .map_err(|_| sqlite::invalid_data("worker probe failed"))?;
+                    let _ = started.send(());
+                    released
+                        .recv()
+                        .map_err(|_| sqlite::invalid_data("worker release unavailable"))?;
+                    cancellation.check_io()
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("actual SQLite worker starts")
+            .expect("worker start signal");
+        caller.abort();
+        assert!(caller
+            .await
+            .expect_err("cancel awaiting future")
+            .is_cancelled());
+        drop(backend);
+        let shutdown_pending = shutdown.has_changed().is_ok();
+        let connection_retained = connection.strong_count() > 0;
+        release.send(()).expect("release the actual worker");
+        tokio::time::timeout(Duration::from_secs(2), shutdown.changed())
+            .await
+            .expect("worker releases all storage owners")
+            .expect_err("only owner exhaustion closes the completion channel");
+        assert!(
+            shutdown_pending,
+            "caller cancellation cannot complete the drain"
+        );
+        assert!(connection_retained, "the blocked worker still owns SQLite");
+        assert_eq!(
+            connection.strong_count(),
+            0,
+            "connection released before completion"
+        );
     }
 
     #[tokio::test]

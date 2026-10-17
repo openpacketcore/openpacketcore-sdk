@@ -18,6 +18,7 @@ categories = ["network-programming", "data-structures"]
 thiserror = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
+futures-util = "0.3"
 tokio = { workspace = true, features = ["sync", "time", "io-util", "fs", "rt"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
@@ -52,7 +53,6 @@ workspace = true
 
 [dev-dependencies]
 opc-consensus = { path = "../opc-consensus", version = "0.2.0", features = ["dangerous-test-hooks"] }
-futures-util = "0.3"
 p256 = { version = "0.14", features = ["ecdsa"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "test-util"] }
 opc-alarm = { path = "../opc-alarm", version = "0.2.0" }

@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "adapter/election.rs"]
+mod election;
+
 use opc_config_bus::{
     CommitWrite, CommittedRevisionSource, ConfigBus, ConfigSnapshot, EncryptingManagedDatastore,
     ManagedDatastore, SealedConfig, StoreErrorCode, StoredConfig,
@@ -31,6 +34,7 @@ use opc_persist::{
 };
 use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp, TxId};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct TestConfig {
@@ -202,6 +206,13 @@ impl ProjectionCluster {
     async fn start_with_continuity(
         checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
     ) -> Self {
+        Self::start_with_election_scripts(checkpoints, None).await
+    }
+
+    async fn start_with_election_scripts(
+        checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
+        scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("projection cluster directory");
         let nodes = [1_u64, 2, 3]
             .map(|value| ConfigConsensusNodeId::new(value).expect("projection cluster node ID"));
@@ -243,32 +254,39 @@ impl ProjectionCluster {
             let topology = ConfigConsensusTopology::try_new(identity, node, members.clone())
                 .expect("projection cluster topology");
             let snapshots = directory.path().join(format!("snapshots-{index}"));
-            let store = if let Some(checkpoints) = &checkpoints {
-                use opc_persist::audit_authority::continuity::{
-                    AuditContinuityPolicy, AuditKeyRing, AuditSigningKey,
-                };
-                let keys = AuditKeyRing::new(vec![
-                    AuditSigningKey::new(1, [0x91; 32]).expect("separate signing key")
-                ])
-                .expect("key ring");
-                ConsensusConfigStore::open_with_audit_continuity(
-                    topology,
-                    backend,
-                    snapshots,
-                    peers,
-                    AuditContinuityPolicy::new(keys, Arc::clone(checkpoints), 1, 1)
-                        .expect("continuity policy"),
-                )
-                .await
-            } else {
-                ConsensusConfigStore::open_with_operation_timeout(
-                    topology,
-                    backend,
-                    snapshots,
-                    peers,
-                    DURABLE_CONSENSUS_OPERATION_TIMEOUT,
-                )
-                .await
+            let open = async {
+                if let Some(checkpoints) = &checkpoints {
+                    use opc_persist::audit_authority::continuity::{
+                        AuditContinuityPolicy, AuditKeyRing, AuditSigningKey,
+                    };
+                    let keys = AuditKeyRing::new(vec![
+                        AuditSigningKey::new(1, [0x91; 32]).expect("separate signing key")
+                    ])
+                    .expect("key ring");
+                    ConsensusConfigStore::open_with_audit_continuity(
+                        topology,
+                        backend,
+                        snapshots,
+                        peers,
+                        AuditContinuityPolicy::new(keys, Arc::clone(checkpoints), 1, 1)
+                            .expect("continuity policy"),
+                    )
+                    .await
+                } else {
+                    ConsensusConfigStore::open_with_operation_timeout(
+                        topology,
+                        backend,
+                        snapshots,
+                        peers,
+                        DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+                    )
+                    .await
+                }
+            }
+            .instrument(election::delivery::node_span(node.get()));
+            let store = match scripts {
+                Some(scripts) => scripts[index].scope(open).await,
+                None => open.await,
             };
             stores.push(Arc::new(store.expect("projection cluster store")));
         }
@@ -619,9 +637,27 @@ async fn retained_config_bus_replay_precedes_new_operation_base_guard() {
     cluster.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn promoted_follower_reconciles_the_live_bus_before_writing() {
-    let cluster = ProjectionCluster::start().await;
+    election::schedule::with_frozen_time(promoted_follower_projection(false)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn planned_leader_stop_reconciles_the_live_bus_before_writing() {
+    election::schedule::with_frozen_time(promoted_follower_projection(true)).await;
+}
+
+async fn promoted_follower_projection(planned: bool) {
+    let election = if planned {
+        None
+    } else {
+        Some(election::Election::new().await)
+    };
+    let cluster = ProjectionCluster::start_with_election_scripts(
+        None,
+        election.as_ref().map(|election| &election.scripts),
+    )
+    .await;
     let original_leader = cluster.leader();
     let sources = cluster
         .stores
@@ -654,7 +690,7 @@ async fn promoted_follower_reconciles_the_live_bus_before_writing() {
             if caught_up {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await
@@ -724,7 +760,7 @@ async fn promoted_follower_reconciles_the_live_bus_before_writing() {
             if caught_up {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await
@@ -734,43 +770,35 @@ async fn promoted_follower_reconciles_the_live_bus_before_writing() {
         .all(|projection| projection.bus().version() == ConfigVersion::new(1)));
 
     let original_leader_id = cluster.stores[original_leader].status().node_id;
-    cluster.isolate(original_leader);
-    cluster.stores[original_leader]
-        .shutdown()
-        .await
-        .expect("stop original leader before survivor election");
-    let promoted = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let promoted = cluster
-                .stores
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != original_leader)
-                .find(|(_, store)| {
-                    store
-                        .status()
-                        .leader_id
-                        .is_some_and(|leader| leader != original_leader_id)
-                        && store.status().leader_id == Some(store.status().node_id)
-                })
-                .map(|(index, _)| index);
-            if let Some(promoted) = promoted {
-                return promoted;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "surviving quorum failed to elect a new leader: {:?}",
-            cluster
-                .stores
-                .iter()
-                .map(|store| store.status())
-                .collect::<Vec<_>>()
-        )
-    });
+    let promoted = if let Some(election) = election {
+        // Abrupt loss cannot send a handoff. Exercise the ordinary engine's
+        // timers, with deterministic RNG and clock inputs, before reconciling.
+        cluster.isolate(original_leader);
+        cluster.stores[original_leader].shutdown().await.unwrap();
+        election.elect_survivor(&cluster, original_leader).await
+    } else {
+        let report = cluster.stores[original_leader]
+            .shutdown_with_report()
+            .await
+            .unwrap();
+        let opc_consensus::PlannedShutdownOutcome::LeaderTransferred { successor } = report else {
+            panic!("planned shutdown did not confirm a successor: {report:?}");
+        };
+        cluster.isolate(original_leader);
+        cluster
+            .stores
+            .iter()
+            .position(|store| store.status().node_id == successor)
+            .unwrap()
+    };
+    assert_ne!(
+        cluster.stores[promoted].status().node_id,
+        original_leader_id
+    );
+    assert_eq!(
+        cluster.stores[promoted].status().leader_id,
+        Some(cluster.stores[promoted].status().node_id)
+    );
 
     let reconciled = projections[promoted]
         .reconcile_and_open()
