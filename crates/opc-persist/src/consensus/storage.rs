@@ -97,8 +97,7 @@ impl Drop for PublishedSnapshot {
 async fn publish_snapshot(
     core: &sqlite::ConfigConsensusCore,
     published: PublishedSnapshot,
-) -> Result<(), StorageError<ConsensusNodeId>> {
-    let signature = published.meta.signature();
+) -> io::Result<()> {
     let published = Arc::new(published);
     let previous = {
         // The commit may have drained beyond its work deadline. This short
@@ -107,13 +106,7 @@ async fn publish_snapshot(
             tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, core.snapshot_gate.lock())
                 .await
                 .map_err(|_| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(signature)),
-                        ErrorVerb::Write,
-                        sqlite::invalid_data(
-                            "config consensus snapshot publication gate timed out",
-                        ),
-                    )
+                    sqlite::invalid_data("config consensus snapshot publication gate timed out")
                 })?;
         current.replace(published)
     };
@@ -1246,7 +1239,14 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 &self.core,
                 PublishedSnapshot::new(meta.clone(), final_path, checksum, total_length),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    error,
+                )
+            })?;
             Ok(())
         }
         .await;
@@ -1558,7 +1558,14 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             &self.core,
             PublishedSnapshot::new(meta.clone(), final_path, checksum, length),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                error,
+            )
+        })?;
         #[cfg(test)]
         {
             self.core
@@ -3611,7 +3618,10 @@ mod tests {
             .await
             .expect("startup restores the published record")
             .expect("restored snapshot");
-        assert_eq!(published.snapshot.path(), snapshot_dir.join(&current));
+        assert_eq!(
+            std::fs::canonicalize(published.snapshot.path()).expect("published artifact path"),
+            std::fs::canonicalize(snapshot_dir.join(&current)).expect("durable artifact path")
+        );
         assert!(snapshot_dir.join(&current).is_file());
         #[cfg(unix)]
         {
