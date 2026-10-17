@@ -736,15 +736,17 @@ where
 pub(crate) fn provision_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
+    initial_slots: Option<&opc_consensus::voter_slots::VoterSlotTable>,
     audit_key: &AuditKey,
     deadline: std::time::Instant,
 ) -> Result<(), ConfigConsensusStorageError> {
-    initialize_schema(
+    initialize_schema_with_slots(
         conn,
         topology.identity(),
         topology.members(),
         audit_key,
         None,
+        initial_slots,
         &Arc::new(SqliteWorkCancellation::with_deadline(deadline)),
         None,
     )
@@ -754,6 +756,7 @@ pub(crate) fn provision_retained_schema(
 pub(crate) fn validate_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
+    initial_slots: Option<&opc_consensus::voter_slots::VoterSlotTable>,
     audit_key: &AuditKey,
     deadline: std::time::Instant,
 ) -> Result<(), ConfigConsensusStorageError> {
@@ -764,7 +767,8 @@ pub(crate) fn validate_retained_schema(
         audit_key,
         false,
         &SqliteWorkCancellation::with_deadline(deadline),
-    )
+    )?;
+    voter_slots::validate_profile_sync(conn, initial_slots)
 }
 
 fn initialize_schema(

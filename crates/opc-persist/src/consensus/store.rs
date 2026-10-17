@@ -560,11 +560,10 @@ impl ConsensusConfigStore {
         if operation_timeout.is_zero() || operation_timeout > Duration::from_secs(60) {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
         }
-        if backend
-            .retained_binding
-            .as_ref()
-            .is_some_and(|binding| binding.topology() != &topology)
-        {
+        if backend.retained_binding.as_ref().is_some_and(|binding| {
+            binding.topology() != &topology
+                || binding.voter_slots() != voter_setup.as_ref().map(|setup| &setup.initial)
+        }) {
             return Err(ConfigConsensusOpenError::InvalidRuntimeConfiguration);
         }
         let identity = topology.identity();

@@ -58,6 +58,7 @@ enum OpenIntent {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RetainedConfigBinding {
     topology: ConfigConsensusTopology,
+    voter_slots: Option<opc_consensus::voter_slots::VoterSlotTable>,
     backing_identity: [u8; 32],
     key_scope: [u8; 32],
 }
@@ -74,13 +75,36 @@ impl RetainedConfigBinding {
         }
         Ok(Self {
             topology,
+            voter_slots: None,
             backing_identity,
             key_scope,
         })
     }
 
+    /// Bind a retained voter to its independently admitted incarnation table.
+    ///
+    /// A replacement uses the committed Prepare table and its selected new
+    /// identity. Keep this exact initial binding when reopening the same backing;
+    /// the replicated table advances inside the authenticated retained storage.
+    pub fn for_voter_slots(
+        initial: opc_consensus::voter_slots::VoterSlotTable,
+        local_node_id: crate::ConfigConsensusNodeId,
+        backing_identity: [u8; 32],
+        key_scope: [u8; 32],
+    ) -> Result<Self, RetainedConfigError> {
+        let topology = ConfigConsensusTopology::for_voter_slots(&initial, local_node_id)
+            .map_err(|_| RetainedConfigError::InvalidRequest)?;
+        let mut binding = Self::new(topology, backing_identity, key_scope)?;
+        binding.voter_slots = Some(initial);
+        Ok(binding)
+    }
+
     pub(crate) fn topology(&self) -> &ConfigConsensusTopology {
         &self.topology
+    }
+
+    pub(crate) fn voter_slots(&self) -> Option<&opc_consensus::voter_slots::VoterSlotTable> {
+        self.voter_slots.as_ref()
     }
 
     fn digest(&self, key: &AuditKey) -> [u8; 32] {
@@ -99,6 +123,13 @@ impl RetainedConfigBinding {
         digest.update(self.key_scope);
         digest.update(key.epoch().to_be_bytes());
         digest.update(key.fingerprint());
+        if let Some(initial) = &self.voter_slots {
+            let encoded = opc_consensus::voter_slots::encode_voter_slot_table(initial)
+                .expect("retained voter binding was validated at construction");
+            digest.update(b"voter-slots/v1\0");
+            digest.update((encoded.len() as u64).to_be_bytes());
+            digest.update(encoded);
+        }
         digest.finalize().into()
     }
 }
@@ -489,6 +520,7 @@ fn open_authority_sync(
         crate::consensus::provision_retained_schema(
             &conn,
             options.binding.topology(),
+            options.binding.voter_slots(),
             &audit_key,
             work.deadline,
         )
@@ -781,6 +813,7 @@ fn validate_connection(
     crate::consensus::validate_retained_schema(
         conn,
         options.binding.topology(),
+        options.binding.voter_slots(),
         key,
         work.deadline,
     )
