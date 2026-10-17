@@ -493,6 +493,7 @@ fn cancelled_prewarm_outside_runtime_releases_admission_and_expires_survivors() 
 
 #[test]
 fn cancelled_prewarm_after_runtime_shutdown_releases_admission() {
+    let reconnect_backoff = Duration::from_millis(1);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
@@ -504,8 +505,8 @@ fn cancelled_prewarm_after_runtime_shutdown_releases_admission() {
         let lifecycle = ConnectionLifecyclePolicy::try_new(
             Duration::from_secs(60),
             Duration::from_secs(1),
-            Duration::from_millis(1),
-            Duration::from_millis(1),
+            reconnect_backoff,
+            reconnect_backoff,
             Duration::ZERO,
         )
         .expect("bounded lifecycle with a deterministic retry interval");
@@ -546,6 +547,13 @@ fn cancelled_prewarm_after_runtime_shutdown_releases_admission() {
     );
     replacement_runtime.block_on(async {
         fixture.assert_no_retained_capacity().await;
+        assert_eq!(fixture.client.diagnostics().await.setup_attempts, 2);
+        // Cancelling the in-progress setup retains its ordinary reconnect
+        // cooldown. Advance that configured interval before freezing the
+        // replacement runtime for the next real TLS setup.
+        let released_at = tokio::time::Instant::now();
+        tokio::time::advance(reconnect_backoff).await;
+        assert_eq!(released_at.elapsed(), reconnect_backoff);
         let recovered = without_clock_advance(fixture.client.prewarm())
             .await
             .expect("retired runtime leaves no prewarm or transport admission behind");
