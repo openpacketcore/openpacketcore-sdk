@@ -309,7 +309,7 @@ impl SessionConsensusPeer for Peer {
             return Err(SessionConsensusPeerError::Unavailable);
         }
         let family_code = match request.family {
-            SessionConsensusRpcFamily::Vote => 1u8,
+            SessionConsensusRpcFamily::Vote | SessionConsensusRpcFamily::PreVote => 1u8,
             SessionConsensusRpcFamily::AppendEntries => 2u8,
             SessionConsensusRpcFamily::InstallSnapshot => 3u8,
             SessionConsensusRpcFamily::TopologyAdmissionBarrier => 4u8,
@@ -1585,15 +1585,18 @@ async fn vetoed_prepare_recovers_with_elected_leader(winner: u16) {
         .unwrap()
         .intent()
         .is_none());
-    // Only the selected survivor can win the next ordinary election. Exercise
-    // both B's normal recovery and the provisionally fenced target C.
+    // Stop the old leader's traffic so the surviving voters' leases can
+    // expire. Pre-Vote correctly refuses a forced campaign while A can still
+    // renew B's lease. Only the selected survivor may win the automatic retry.
+    // Exercise both B and the provisionally fenced target C as successor.
     {
         let mut blocked = fleet.network.probe_blocked.lock().unwrap();
-        blocked.remove(&(c, a));
-        blocked.remove(&(a, c));
+        for pair in [(a, b), (b, a), (a, c), (c, a)] {
+            blocked.insert(pair);
+        }
     }
     let target = fleet.nodes[usize::from(winner - 1)].clone();
-    target.inner.raft.trigger().elect().await.unwrap();
+    target.inner.raft.runtime_config().elect(true);
     let elected = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             if target.inner.raft.metrics().borrow().current_leader
@@ -1606,6 +1609,12 @@ async fn vetoed_prepare_recovers_with_elected_leader(winner: u16) {
     })
     .await;
     elected.expect("selected survivor wins the next election");
+    {
+        let mut blocked = fleet.network.probe_blocked.lock().unwrap();
+        for pair in [(a, b), (b, a), (a, c), (c, a)] {
+            blocked.remove(&pair);
+        }
+    }
     fleet.network.probe_blocked_family.lock().unwrap().clear();
     let refused_by_b = fleet
         .network

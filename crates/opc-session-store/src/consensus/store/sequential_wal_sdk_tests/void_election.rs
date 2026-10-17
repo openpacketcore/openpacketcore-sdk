@@ -293,10 +293,12 @@ impl VoidElection {
                 .await
                 .expect("original receipt replay anchors follower votes");
         }
+        eprintln!("void election: existing decision replay returned");
         while fleet.stores[self.old].status().applied_index <= before {
             tokio::task::yield_now().await;
         }
         let anchor = fleet.stores[self.old].status().applied_index;
+        eprintln!("void election: local replay applied at {anchor:?}");
         while !fleet
             .stores
             .iter()
@@ -304,6 +306,7 @@ impl VoidElection {
         {
             tokio::task::yield_now().await;
         }
+        eprintln!("void election: all voters applied replay");
     }
 
     async fn advance_all(&self, fleet: &Fleet, at: Instant) {
@@ -322,7 +325,9 @@ impl VoidElection {
         request: &FencedTransitionV2Request,
         void_first: bool,
     ) {
+        eprintln!("void election: aligning healthy ticks");
         let phases = self.settle(fleet).await;
+        eprintln!("void election: healthy ticks aligned");
         let old = &fleet.stores[self.old];
         let successor = &fleet.stores[self.successor];
         let remaining = (0..fleet.stores.len())
@@ -350,6 +355,7 @@ impl VoidElection {
                 .await;
         }
         self.started = Instant::now();
+        eprintln!("void election: bootstrap lease aged; replaying existing decision");
         self.anchor_followers(fleet, request, void_first).await;
         old.inner.raft.ensure_linearizable().await.unwrap();
         assert!(self.started > old_updated + self.early.lease);
@@ -421,13 +427,16 @@ impl VoidElection {
             .expect("hold native authority owner");
         });
         holding.await.expect("actual native owner held");
+        eprintln!("void election: native owner held; starting healthy inquiry");
         successor.inner.raft.trigger().elect().await.unwrap();
         contended
             .changed()
             .await
             .expect("real authority lock contention");
+        eprintln!("void election: native authority contention observed");
         release.send(()).expect("release contended native owner");
         let initial = gate.observed_pre_votes(2).await;
+        eprintln!("void election: both healthy inquiry refusals observed");
         holder.await.expect("join native authority hold");
         assert_eq!(initial.len(), 2);
         for exchange in &initial {
@@ -459,6 +468,7 @@ impl VoidElection {
         }
         assert!(gate.exchanges.borrow().is_empty());
         gate.partitioned.store(true, Ordering::Release);
+        eprintln!("void election: old leader partitioned");
         for store in &fleet.stores {
             store.inner.raft.runtime_config().elect(true);
         }
@@ -512,6 +522,7 @@ impl VoidElection {
                         .all(|store| store.status().leader_id != Some(successor_id)));
                 }
                 if tick == denied_at {
+                    eprintln!("void election: observing denied inquiry at {tick:?}");
                     let queries = gate.observed_pre_votes(3).await;
                     assert_eq!(queries.len(), 3);
                     let exchange = &queries[2];
@@ -527,6 +538,7 @@ impl VoidElection {
                     assert!(gate.exchanges.borrow().is_empty());
                 }
                 if tick == first_grant {
+                    eprintln!("void election: observing held grant at {tick:?}");
                     let queries = gate.observed_pre_votes(4).await;
                     assert_eq!(queries.len(), 4);
                     assert!(queries[3].response.vote_granted);
@@ -545,6 +557,7 @@ impl VoidElection {
                     }
                 }
                 if tick == split_at {
+                    eprintln!("void election: observing crossed real votes at {tick:?}");
                     let queries = gate.observed_pre_votes(5).await;
                     assert_eq!(queries.len(), 5);
                     assert_eq!(queries[4].source, remaining_id);

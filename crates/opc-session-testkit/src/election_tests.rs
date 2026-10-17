@@ -307,11 +307,17 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
             .map(|index| cluster.stores[*index].clone())
             .collect();
         let wait26 = async {
-            let result = AssertUnwindSafe(ConsensusTestCluster::wait_ready_stores(
-                &surviving_stores,
-                false,
-            ))
-            .catch_unwind()
+            // The unchanged helper checks its budget after each probe. A
+            // probe already in flight must not stop the controlled clock at
+            // that boundary; observe the same overall budget directly.
+            let result = tokio::time::timeout_at(
+                started + CONSENSUS_TEST_TRANSITION_TIMEOUT,
+                AssertUnwindSafe(ConsensusTestCluster::wait_ready_stores(
+                    &surviving_stores,
+                    false,
+                ))
+                .catch_unwind(),
+            )
             .await;
             assert_eq!(Instant::now() - started, Duration::from_secs(26));
             eprintln!("acquisition_deadline fixture=session_fleet elapsed_ms=26000");
@@ -369,20 +375,29 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
                 // A waiter must fail at its own deadline before the clock advances.
                 if millis == 26_000 {
                     at26.take().unwrap().await.unwrap();
+                    assert_eq!(gate.exchanges.borrow().len(), 4);
+                    for index in &survivors {
+                        let status = cluster.stores[*index].status();
+                        assert_eq!(status.term, initial.term + 2);
+                        assert_eq!(status.leader_id, None);
+                    }
                 }
             }
             at30.await.unwrap();
         };
         let (result26, result30, ()) = tokio::join!(wait26, wait30, drive);
         assert_eq!(Instant::now() - started, Duration::from_secs(30));
-        let panic26 = result26.expect_err("the unchanged 26s helper cannot cover repeated splits");
-        assert_eq!(
-            panic26
+        match result26 {
+            Ok(Err(panic26)) => assert_eq!(
+                panic26
                 .downcast_ref::<String>()
                 .map(String::as_str)
                 .or_else(|| panic26.downcast_ref::<&str>().copied()),
-            Some("consensus test fleet did not become durable-ready")
-        );
+                Some("consensus test fleet did not become durable-ready")
+            ),
+            Err(_) => {}
+            Ok(Ok(())) => panic!("three legal splits must prevent acquisition within 26 seconds"),
+        }
         match result30 {
             Ok(Err(panic30)) => assert_eq!(
                 panic30
@@ -425,12 +440,13 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
         for path in cluster.paths.values() {
             *path.election_vote.lock().unwrap() = None;
         }
-        cluster.shutdown().await;
         for script in &scripts {
             script.finish();
         }
     })
     .await;
+    // Planned shutdown has its own bounded waits and needs a running clock.
+    cluster.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -570,10 +586,10 @@ async fn unequal_log_rejects_first_pre_vote_without_consuming_a_term() {
         for path in cluster.paths.values() {
             *path.election_vote.lock().unwrap() = None;
         }
-        cluster.shutdown().await;
         for script in &scripts {
             script.finish();
         }
     })
     .await;
+    cluster.shutdown().await;
 }

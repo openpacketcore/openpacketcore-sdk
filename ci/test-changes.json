@@ -117,7 +117,7 @@
     {
       "test": "rust:crates/opc-persist::test=consensus_openraft::history_retention_survives_natural_leader_change_and_member_snapshot_install",
       "kind": "assertions-decreased",
-      "reason": "The precise election timer now recovers from the retained real split vote before the unchanged 26-second transition bound. Remove the obsolete checkpoint that expected both survivors to remain leaderless at that deadline; verify their split terms at the actual split and require recovery before the same bound instead. The history, retention, snapshot, reconciliation and durable-vote assertions remain. Local-helper assertion count changes from 163 to 162.",
+      "reason": "The precise election timer now recovers from the retained real split vote before the unchanged 26-second transition bound. Replace the obsolete leaderless-at-deadline checkpoint with actual split-term checks and recovery before the same bound. Normal-time setup can also collapse 100 ms ticker phases: replace the distinct-phase setup assertions with observed aligned tick registrations and distinct finite RNG samples that order two genuine inquiries, crossed persisted votes, and one automatic retry. The history, retention, snapshot, reconciliation and durable-vote assertions remain. Local-helper assertion count changes from 163 to 160.",
       "issue": 1333
     }
   ]

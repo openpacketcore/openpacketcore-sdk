@@ -215,7 +215,7 @@ async fn leader_loss_under_writes(voters: u64) {
         let in_flight = in_flight.clone();
         async move {
             let mut writes = JoinSet::new();
-            for value in 1_u64.. {
+            for value in 1_u64..=u64::MAX {
                 let leader = leader.clone();
                 let acknowledged = acknowledged.clone();
                 let in_flight = in_flight.clone();

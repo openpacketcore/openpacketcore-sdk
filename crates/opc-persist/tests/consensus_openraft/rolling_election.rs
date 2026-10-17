@@ -64,6 +64,10 @@ impl VoteGate {
             "equal logs permit both inquiries"
         );
         if rpc.vote.leader_id.term < self.first_term + self.split_rounds {
+            eprintln!(
+                "rolling election: genuine Pre-Vote grant for {:?}",
+                rpc.vote
+            );
             self.both_pre_votes.wait().await;
         }
     }
@@ -305,10 +309,12 @@ impl RollingElection {
         let split_rounds = if self.leader_stops == 2 { 2 } else { 1 };
         tokio::time::pause();
         schedule::with_frozen_time(async {
+            eprintln!("rolling election: align healthy ticks before stopping voter {}", index + 1);
             // Delay each healthy ticker by at most one tick to align its next
             // wake. Completion is observed at the core, including the leader.
             self.advance(self.clock_slot(Instant::now() + self.late.tick), &[0, 1, 2])
                 .await;
+            eprintln!("rolling election: healthy ticks aligned");
             // Replay the existing request to give every follower the same
             // committed-vote instant without adding a configuration version.
             let stored = fleet.store(index).load_latest().await.unwrap().unwrap();
@@ -319,15 +325,19 @@ impl RollingElection {
                 .append_attested_commit(attested(stored.record, audit(fleet.head)))
                 .await
                 .expect("head replay anchors retained voter leases");
+            eprintln!("rolling election: head replay returned");
             while fleet.store(index).status().applied_index <= before {
                 tokio::task::yield_now().await;
             }
             let anchor = fleet.store(index).status().applied_index;
+            eprintln!("rolling election: local replay applied at {anchor:?}");
             while !(0..3).all(|node| fleet.store(node).status().applied_index >= anchor) {
                 tokio::task::yield_now().await;
             }
+            eprintln!("rolling election: all voters applied replay");
             let old_term = fleet.store(index).status().term;
             fleet.stop_disconnected(index).await;
+            eprintln!("rolling election: disconnected leader joined");
             self.scripts[index].take().unwrap().finish();
             let gate = Arc::new(VoteGate {
                 first_term: old_term + 1,
