@@ -77,7 +77,14 @@ pub(super) async fn verify_startup(
         },
     )
     .await
-    .map_err(|_| AuditAuthorityError::Unavailable)?;
+    .map_err(|_error| {
+        #[cfg(test)]
+        eprintln!(
+            "AUDIT_STARTUP_DIAGNOSTIC error_kind={:?} error={_error}",
+            _error.kind()
+        );
+        AuditAuthorityError::Unavailable
+    })?;
     let Some(policy) = policy else {
         return if ledger
             .as_ref()
