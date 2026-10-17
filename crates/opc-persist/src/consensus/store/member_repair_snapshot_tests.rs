@@ -315,7 +315,33 @@ async fn repair_source_retriggers_after_a_duplicate_cut_swallows_its_request() {
         .await
         .expect("store");
         store.initialize_cluster().await.expect("singleton leader");
+        // Initialization establishes membership before its applied metrics
+        // necessarily publish. Commit a real prefix before selecting the idle
+        // snapshot, so None cannot accidentally satisfy the publication wait.
+        let initial = store
+            .inner
+            .raft
+            .client_write(super::super::super::ConfigConsensusCommand {
+                schema_version: super::super::super::CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity,
+                request_id: opc_consensus::ConsensusRequestId::from_bytes([0x75; 16]),
+                logical_time: opc_types::Timestamp::now_utc(),
+                intent: ConfigMutationIntent::MarkConfirmed {
+                    tx_id: opc_types::TxId::new(),
+                },
+            })
+            .await
+            .expect("initial snapshot prefix commits and applies")
+            .log_id;
+        store
+            .inner
+            .raft
+            .wait(None)
+            .applied_index_at_least(Some(initial.index), "initial idle snapshot cut")
+            .await
+            .unwrap();
         let old_cut = store.inner.raft.metrics().borrow().last_applied;
+        assert_eq!(old_cut, Some(initial));
         store
             .trigger_snapshot()
             .await
