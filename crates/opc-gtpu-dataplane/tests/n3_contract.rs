@@ -38,10 +38,44 @@ fn insertion(qfi: u8) -> N3UplinkEncapsulation {
 }
 
 #[test]
+fn ppi_receive_uses_ts_38415_high_bits() {
+    // PPP=1, RQI=1, QFI=9; PPI=5 in bits 7..5, with spare bits set.
+    let wire = unhex("34ff000d11223344000000850200c9a300000000aa");
+    let view =
+        N3PacketView::decode(&wire, N3Direction::Downlink, DecodeContext::default()).unwrap();
+    assert_eq!(view.qos().ppi(), Some(5));
+    assert_eq!(view.qos().qfi().get(), 9);
+    assert!(view.qos().rqi());
+    assert_eq!(view.payload(), [0xaa]);
+}
+
+#[test]
+fn qos_monitoring_without_tpdu_has_a_specific_refusal() {
+    // TS 38.415 figures 5.5.2.1-1 and 5.5.2.2-1: QMP is bit 3.
+    // DL carries one eight-octet timestamp; UL carries three. Neither
+    // synthetic packet carries a T-PDU. These bytes use no SDK encoder.
+    for (direction, encoded) in [
+        (
+            N3Direction::Downlink,
+            "34ff00101122334400000085030809000102030405060700",
+        ),
+        (
+            N3Direction::Uplink,
+            "34ff00201122334400000085071809000102030405060708090a0b0c0d0e0f101112131415161700",
+        ),
+    ] {
+        let wire = unhex(encoded);
+        let error = N3PacketView::decode(&wire, direction, DecodeContext::default()).unwrap_err();
+        assert_eq!(error.to_string(), "unsupported N3 QoS monitoring packet");
+        assert_eq!(error, N3PacketError::UnsupportedQosMonitoring);
+    }
+}
+
+#[test]
 fn independent_reference_packets() {
     assert_eq!(
         &Sha256::digest(REFERENCE.as_bytes())[..],
-        unhex("31da0a1658218432817bc181be4233fadd4fd1f36c36f3d29f087bc131b8424a")
+        unhex("87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2")
     );
     let mut counts = [0, 0];
     for row in REFERENCE.lines().filter(|line| !line.starts_with('#')) {
@@ -307,7 +341,7 @@ fn construction_limits_are_atomic_and_exclude_output_prefix() {
 
 #[test]
 fn receive_is_borrowed_and_allocates_nothing() {
-    let wire = unhex("34ff00111122334400000020011234850200c907a1b2c300aa");
+    let wire = unhex("34ff00111122334400000020011234850200c9e0a1b2c300aa");
     let stats = allocation_counter::measure(|| {
         let view =
             N3PacketView::decode(&wire, N3Direction::Downlink, DecodeContext::default()).unwrap();

@@ -176,11 +176,62 @@ fn unknown_extension_header_reject_policy_fails_closed() {
 }
 
 #[test]
+fn ppi_decode_uses_ts_38415_high_bits_and_ignores_spares() {
+    // TS 38.415 V18.2.0, figure 5.5.2.1-1: PPI occupies bits 7..5.
+    // Literal wire octets keep the oracle independent of the encoder.
+    for (ppi, octet) in [
+        (5, 0xa0),
+        (0, 0x00),
+        (1, 0x20),
+        (2, 0x40),
+        (3, 0x60),
+        (4, 0x80),
+        (6, 0xc0),
+        (7, 0xe0),
+    ] {
+        for spare in 0..32 {
+            let content = [0x01, 0xc9, octet | spare, 0xa1, 0xb2, 0xc3];
+            let extension = opc_proto_gtpu::GtpuExtensionHeader {
+                ext_type: GTPU_EXT_PDU_SESSION_CONTAINER,
+                content: &content,
+                next_ext_type: 0,
+            };
+            let decoded = PduSessionContainer::decode(&extension).unwrap();
+            assert_eq!(decoded.ppi, Some(ppi), "wire PPI octet {:#04x}", content[2]);
+            assert_eq!(decoded.qfi, 9);
+            assert!(decoded.rqi);
+        }
+    }
+}
+
+#[test]
+fn ppi_encode_matches_ts_38415_literal_octets() {
+    for (ppi, octet) in [
+        (5, 0xa0),
+        (0, 0x00),
+        (1, 0x20),
+        (2, 0x40),
+        (3, 0x60),
+        (4, 0x80),
+        (6, 0xc0),
+        (7, 0xe0),
+    ] {
+        let model = PduSessionContainer::new_downlink(9, Some(ppi), true).unwrap();
+        assert_eq!(model.encode().unwrap(), [0x00, 0xc9, octet, 0, 0, 0]);
+        let chain = GtpuExtensionChain::from_pdu_session_container(model).unwrap();
+        assert_eq!(
+            chain.raw_headers.as_ref(),
+            [2, 0x00, 0xc9, octet, 0, 0, 0, 0]
+        );
+    }
+}
+
+#[test]
 fn test_pdu_session_container_with_ppi() {
     let ext_content = vec![
         0x00,               // PDU Type = 0 (DL), Spare = 0
         0x80 | 0x40 | 0x0C, // PPP = 1, RQI = 1, QFI = 12
-        0x05,               // PPI = 5
+        0xa0,               // PPI = 5 in bits 7..5; spare bits 4..0 = 0
         0x00,
         0x00,
         0x00, // Padding to 6 content bytes (so total size of ext header is 8 octets)

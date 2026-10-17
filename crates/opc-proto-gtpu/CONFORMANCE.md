@@ -27,7 +27,9 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 
 ### 3. PDU Session Container base subset (§5.2.2.7; TS 38.415 §5.5.2)
 - **5G SA QoS Flow Identifier (QFI)**: Decodes base downlink and uplink PDU Session Container extension headers.
-- **Paging Policy Indicator (PPI)**: Decodes PPI when the PPP flag is set in DL PDU Session Information.
+- **Paging Policy Indicator (PPI)**: Encodes and decodes bits 7..5 when the PPP
+  flag is set in DL PDU Session Information (TS 38.415 figure 5.5.2.1-1).
+  Senders zero the five spare bits; receivers ignore them.
 - **Reflective QoS Indicator (RQI)**: Decodes RQI in DL PDU Session Information.
 - **Fail-closed subset boundary**: PDU types 2–15 are rejected. Presence flags
   for QMP timestamps, QFI sequence numbers, MBS sequence numbers, delay

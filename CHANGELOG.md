@@ -751,6 +751,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-proto-gtpu`: encode and decode the PDU Session Container Paging Policy
+  Indicator in bits 7..5, as specified by TS 38.415. Correct the independent
+  reference corpus, catalog and forwarding fixtures. `opc-gtpu-dataplane`
+  reports `UnsupportedQosMonitoring` for QMP packets, including packets without
+  a T-PDU. (#1310)
+
 - `opc-persist`: snapshot reads pin the last durable publication independently
   of building or installing its successor, including a delayed SQLite commit.
   Publication holds only a brief gate; readers open independent descriptors and

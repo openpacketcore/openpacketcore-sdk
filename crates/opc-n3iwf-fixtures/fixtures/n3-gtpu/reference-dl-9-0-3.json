@@ -12,7 +12,7 @@
     },
     "source_vector": {
       "path": "crates/opc-gtpu-dataplane/tests/n3_reference.tsv",
-      "sha256": "31da0a1658218432817bc181be4233fadd4fd1f36c36f3d29f087bc131b8424a",
+      "sha256": "87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2",
       "case": "dl-9-0-3"
     }
   },
@@ -47,7 +47,7 @@
   ],
   "wire": {
     "path": "wire/reference-dl-9-0-3.hex",
-    "digest_sha256": "dc0f267db827d78e6c126350e381d30387cbb5d44bcb266f95a555ccd88b15b7"
+    "digest_sha256": "94c45a1a4de23794298c659f4c5e6f332195d1a92df61b2bc42c2886908794ec"
   },
   "semantic_assertions": [
     "direction=downlink",

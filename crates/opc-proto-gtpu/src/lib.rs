@@ -641,7 +641,7 @@ pub struct PduSessionContainer {
     pub pdu_type: u8,
     /// 6-bit QoS Flow Identifier.
     pub qfi: u8,
-    /// Paging Policy Indicator (DL only).
+    /// Paging Policy Indicator (DL only), encoded in bits 7..5 of its octet.
     pub ppi: Option<u8>,
     /// Reflective QoS Indicator (DL only).
     pub rqi: bool,
@@ -792,7 +792,7 @@ impl PduSessionContainer {
                         3,
                     ));
                 }
-                Some(content[2] & 0x07)
+                Some(content[2] >> 5)
             } else {
                 if content.len() != 2 {
                     return Err((
@@ -864,7 +864,8 @@ impl PduSessionContainer {
             }
             content.push(octet3);
             if let Some(ppi) = self.ppi {
-                content.push(ppi);
+                // TS 38.415 figure 5.5.2.1-1: PPI precedes five spare bits.
+                content.push(ppi << 5);
             }
         } else {
             content.push(self.qfi);
