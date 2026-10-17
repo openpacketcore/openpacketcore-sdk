@@ -309,3 +309,254 @@ async fn durable_mutation_waits_for_native_sync_and_completes_after_release() {
     fleet.close_all().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_v2_history_read_requires_fresh_quorum_after_cancellation() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let delay = NativeSyncDelay::new();
+    let result = AssertUnwindSafe(async {
+        open_durable(&mut fleet, &delay).await;
+        let expected = activate_and_warm(&fleet).await;
+        let leader = fleet.leader();
+        let held = (0..3)
+            .filter(|voter| *voter != leader)
+            .map(|voter| RequestRelease::new(&fleet.peers[voter]))
+            .collect::<Vec<_>>();
+        let storage_release = delay.arm();
+        let store = fleet.store(leader).clone();
+        let before = store.inner.raft.metrics().borrow().last_log_index;
+        clock::run(async move {
+            {
+                let read = store.fenced_transition_v2_history_state();
+                tokio::pin!(read);
+                assert!(futures_util::poll!(read.as_mut()).is_pending());
+                tokio::time::advance(PHYSICAL_ATTEMPT_CAP).await;
+                assert!(futures_util::poll!(read.as_mut()).is_pending());
+                // Dropping this caller must not preserve a successful warm
+                // quorum proof or start a detached logical-time proposal.
+            }
+            let started = tokio::time::Instant::now();
+            let read = store.fenced_transition_v2_history_state();
+            tokio::pin!(read);
+            assert!(futures_util::poll!(read.as_mut()).is_pending());
+            tokio::time::advance(OPERATION_BOUND).await;
+            assert!(matches!(
+                clock::watchdog(read, "history must respect its original deadline").await,
+                Err(StoreError::BackendUnavailable(_))
+            ));
+            assert_eq!(started.elapsed(), OPERATION_BOUND);
+        })
+        .await;
+        assert_eq!(
+            fleet
+                .store(leader)
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_log_index,
+            before
+        );
+        assert!(delay.entered.borrow().is_empty());
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(
+                PHYSICAL_ATTEMPT_CAP,
+                fleet.store(leader).fenced_transition_v2_history_state()
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            expected
+        );
+        assert!(delay.entered.borrow().is_empty());
+        drop(storage_release);
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_v2_history_read_without_activation_requires_every_voter() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let delay = NativeSyncDelay::new();
+    let result = AssertUnwindSafe(async {
+        open_durable(&mut fleet, &delay).await;
+        let leader = fleet.leader();
+        let minority = (leader + 1) % 3;
+        let store = fleet.store(leader);
+        let (identity, members) = store.current_scope().unwrap();
+        assert!(!store
+            .inner
+            .backend
+            .consensus_fenced_transition_v2_activation_matches_scope(
+                store.inner.storage_identity,
+                identity,
+                members,
+                store.inner.backend.fenced_transition_profile.digest(),
+            )
+            .await
+            .unwrap());
+        for voter in 0..3 {
+            if voter != minority {
+                fleet.set_link(voter, minority, false);
+                fleet.set_link(minority, voter, false);
+            }
+        }
+        // A majority is still available for the read index, but a fresh V2
+        // capability proof cannot replace the missing voter's acknowledgement.
+        assert!(matches!(
+            store.fenced_transition_v2_history_state().await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        for voter in 0..3 {
+            if voter != minority {
+                fleet.set_link(voter, minority, true);
+                fleet.set_link(minority, voter, true);
+            }
+        }
+        let before = store.inner.raft.metrics().borrow().last_log_index;
+        let history = store.fenced_transition_v2_history_state().await.unwrap();
+        assert_eq!(
+            history.active_epoch(),
+            Some(FencedTransitionV2HistoryEpoch::new(1).unwrap())
+        );
+        assert_eq!(history.bound_entries(), 0);
+        assert_eq!(store.inner.raft.metrics().borrow().last_log_index, before);
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_v2_history_read_rechecks_local_and_durable_authority() {
+    use crate::sqlite::consensus::{ensure_operator_recovery_latch_sync, OperatorRecoveryLatch};
+
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let delay = NativeSyncDelay::new();
+    let result = AssertUnwindSafe(async {
+        open_durable(&mut fleet, &delay).await;
+        let expected = activate_and_warm(&fleet).await;
+        let follower = (fleet.leader() + 1) % 3;
+        let store = fleet.store(follower);
+        let before = store.inner.raft.metrics().borrow().last_log_index;
+        store.inner.admitted.store(false, Ordering::Release);
+        let refused = store.fenced_transition_v2_history_state().await;
+        store.inner.admitted.store(true, Ordering::Release);
+        assert!(matches!(refused, Err(StoreError::BackendUnavailable(_))));
+        assert_eq!(
+            store.fenced_transition_v2_history_state().await.unwrap(),
+            expected
+        );
+
+        ensure_operator_recovery_latch_sync(
+            &fleet
+                .directory
+                .path()
+                .join(format!("node-{follower}.sqlite")),
+            OperatorRecoveryLatch {
+                identity: store.inner.storage_identity,
+                recovery_epoch: 1,
+                plan_digest: [0x32; 32],
+                audit_pending: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            store.fenced_transition_v2_history_state().await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert_eq!(store.inner.raft.metrics().borrow().last_log_index, before);
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_v2_history_read_waits_for_the_followers_committed_history() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let delay = NativeSyncDelay::new();
+    let result = AssertUnwindSafe(async {
+        open_durable(&mut fleet, &delay).await;
+        let previous = activate_and_warm(&fleet).await;
+        let leader = fleet.leader();
+        let follower = (leader + 1) % 3;
+        let request = create_request(fleet.store(leader), 3, &provider()).await;
+        let held = RequestRelease::new(&fleet.peers[follower]);
+        create(fleet.store(leader), &request).await;
+        let expected = fleet
+            .store(leader)
+            .fenced_transition_v2_history_state()
+            .await
+            .unwrap();
+        assert_eq!(expected.bound_entries(), previous.bound_entries() + 1);
+        let committed = fleet
+            .store(leader)
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .unwrap()
+            .index;
+        assert!(
+            fleet
+                .store(follower)
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_applied
+                .unwrap()
+                .index
+                < committed
+        );
+        let before = fleet
+            .store(leader)
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index;
+        let read = fleet.store(follower).fenced_transition_v2_history_state();
+        tokio::pin!(read);
+        assert!(
+            tokio::time::timeout(PHYSICAL_ATTEMPT_CAP, read.as_mut())
+                .await
+                .is_err(),
+            "the follower must not expose its older history before applying the read index"
+        );
+        held.wait_entered().await;
+        drop(held);
+        assert_eq!(
+            clock::watchdog(read, "released follower must apply committed history")
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            fleet
+                .store(leader)
+                .inner
+                .raft
+                .metrics()
+                .borrow()
+                .last_log_index,
+            before
+        );
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}

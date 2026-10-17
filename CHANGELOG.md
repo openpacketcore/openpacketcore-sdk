@@ -751,6 +751,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: read V2 history through its existing fresh quorum
+  read-index barrier without proposing an unused logical-time advance. History
+  classification waits for local application and retains exact V2 capability,
+  membership, and application-authority checks within the original operation
+  deadline. Activated durable quorums can classify history with one delayed or
+  unavailable voter without waiting for a new native WAL sync. (#1328)
+
 - `opc-proto-gtpv2c`: An empty Create Session Response APCO received before any
   retained APCO is discarded as malformed optional outer-IE data at every
   validation level, including under `Reject`, so a later populated APCO can
