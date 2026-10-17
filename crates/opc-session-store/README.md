@@ -2484,12 +2484,18 @@ by issue #143.
   for another 200 ms of wall time. Contended authority reads await a one-millisecond
   real monotonic timer through the I/O reactor, retaining the original absolute
   RPC deadline. The native handler creates and registers its timer once, before
-  starting Raft; cloned handlers share that resource. Each wait acquires async
-  admission and rearms the existing descriptor through the I/O reactor, without
-  creating a descriptor or a thread. The same RPC deadline includes this
-  admission wait. Cancellation releases admission without detached work or
-  authority retries; dropping the last handler owner closes the timer. Failure
-  to create the resource rejects engine startup before Raft is started.
+  storage admission can consume an Async clean-restart proof; cloned handlers
+  share that resource. Allocation failure preserves retained state and reports
+  the startup stage and original I/O error/errno. A later ordinary open can
+  consume the preserved proof without a repair step. Concurrent waiters share
+  timer expiries and each enforces its own one-millisecond monotonic minimum.
+  A late joiner may need the following tick, so the timer cadence contributes
+  between one and two milliseconds, independent of waiter count; scheduler
+  delay remains bounded by the caller's original RPC deadline. A short mutex
+  protects only the waiter count and arm/disarm syscalls, never an async wait.
+  The descriptor runs only while callers wait; the last completion or
+  cancellation disarms it. No wait creates a descriptor, thread or driver task,
+  and dropping the last handler owner closes the timer.
   A protocol-clock sleep cannot provide this real-time delay while Tokio time
   is frozen, so the shared timer retains the independent monotonic clock.
   Releasing the lock therefore needs no protocol-clock advance, and both real
@@ -2501,6 +2507,9 @@ by issue #143.
   and the complete-operation deadline. They also cover a saturated blocking
   pool and require no new worker when all startup blocking threads have retired.
   Cancelling a queued shared-timer wait must leave the next waiter able to finish.
+  A 128-waiter cohort must finish within 64 ms, sixteen concurrent waiters each
+  retain the wake bound, and cancelling expired or unexpired active waits must
+  preserve the next caller's fresh one-millisecond minimum.
   The unchanged 30-second wall-clock watchdog covers only this short frozen
   phase, whose duration is reported. Resuming normal time preserves the clock
   offset from ticker settling, lease renewal, and the election. The measured

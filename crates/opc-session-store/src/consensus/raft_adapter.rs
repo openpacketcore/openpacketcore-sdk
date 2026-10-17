@@ -61,6 +61,7 @@ pub(crate) struct FixedQuorumEngineAdmission {
 }
 
 impl FixedQuorumEngineAdmission {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         backend: SqliteSessionBackend,
         storage_identity: SessionConsensusIdentity,
@@ -69,10 +70,9 @@ impl FixedQuorumEngineAdmission {
         placement_policy: PlacementResiliencePolicy,
         admitted: Arc<AtomicBool>,
         operation_timeout: std::time::Duration,
-    ) -> std::io::Result<Self> {
-        #[cfg(target_os = "linux")]
-        let authority_backoff = backend.new_authority_backoff()?;
-        Ok(Self {
+        #[cfg(target_os = "linux")] authority_backoff: Option<Arc<crate::sqlite::AuthorityBackoff>>,
+    ) -> Self {
+        Self {
             backend,
             storage_identity,
             members,
@@ -82,7 +82,7 @@ impl FixedQuorumEngineAdmission {
             operation_timeout,
             #[cfg(target_os = "linux")]
             authority_backoff,
-        })
+        }
     }
 }
 
@@ -2672,6 +2672,10 @@ mod tests {
         .expect("fixed follower network");
         let directory = network.peer_directory();
         let bindings = member_bindings(&members);
+        #[cfg(target_os = "linux")]
+        let authority_backoff = backend
+            .new_authority_backoff()
+            .expect("prepare native authority timer before opening storage");
         let (mut log_store, mut state_machine, storage_identity) =
             storage::open_fixed_with_member_bindings_and_roster_attestation_root(
                 &backend,
@@ -2723,8 +2727,9 @@ mod tests {
             crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains,
             admitted,
             operation_timeout,
-        )
-        .expect("native authority timer is created during startup");
+            #[cfg(target_os = "linux")]
+            authority_backoff,
+        );
         let raft = SessionRaft::new(
             local,
             Arc::new(

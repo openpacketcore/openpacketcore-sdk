@@ -13646,6 +13646,24 @@ mod tests {
                 assert!(machine.applied_state().await.is_ok());
                 let snapshot_files_before = private_snapshot_files(&core.snapshot_dir);
 
+                // This fixture exercises the legacy WAL's physical SQL cache.
+                // Prove that the async authority surface reaches its cache
+                // guard, rather than rejecting an unrelated native contention.
+                assert!(!token.is_native());
+                assert!(!wal.is_native());
+                assert!(!backend.native_owner.as_ref().is_some_and(|owner| owner.selected()));
+                if surface == 7 {
+                    assert!(tokio::time::timeout(
+                        Duration::from_secs(5),
+                        backend.fixed_quorum_authority_record_is_exact(
+                            identity(1), &members, &bindings, placement, false, None,
+                        ),
+                    ).await.expect("healthy authority read must complete"));
+                }
+                let contention_before = *backend.fixed_quorum_native_contention.borrow();
+                let cache_guard_failures_before = wal.integration_cost_snapshot().unwrap()
+                    ["cache_read"]["guard_failures"].as_u64().unwrap();
+
                 let foreign = rusqlite::Connection::open(&database).expect("foreign cache writer");
                 assert!(
                     foreign
@@ -13690,7 +13708,7 @@ mod tests {
                         placement,
                     ),
                     7 => {
-                        !backend
+                        !tokio::time::timeout(Duration::from_secs(5), backend
                             .fixed_quorum_authority_record_is_exact(
                                 identity(1),
                                 &members,
@@ -13698,8 +13716,9 @@ mod tests {
                                 placement,
                                 false,
                                 None,
-                            )
+                            ))
                             .await
+                            .expect("foreign cache admission must not hang behind contention")
                     }
                     8 => machine.begin_receiving_snapshot().await.is_err(),
                     _ => unreachable!(),
@@ -13713,6 +13732,16 @@ mod tests {
                     rejected,
                     "physical cache reader {surface} must reject foreign commit"
                 );
+                if surface == 7 {
+                    assert_eq!(*backend.fixed_quorum_native_contention.borrow(), contention_before);
+                    assert_eq!(
+                        wal.integration_cost_snapshot().unwrap()["cache_read"]["guard_failures"].as_u64().unwrap(),
+                        cache_guard_failures_before + 1,
+                        "the authority read itself must reject the foreign commit through its cache guard"
+                    );
+                    assert_eq!(wal.storage_health().0, crate::SessionStorageState::Failed,
+                        "the named read must fence storage before a subsequent reader runs");
+                }
                 assert!(
                     log.read_vote().await.is_err(),
                     "reader {surface} must fence the shared WAL"

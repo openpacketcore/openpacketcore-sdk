@@ -512,6 +512,15 @@ pub enum ConsensusSessionStoreOpenError {
     /// The fixed SDK Openraft runtime profile was invalid.
     #[error("session consensus runtime configuration is invalid")]
     InvalidRuntimeConfiguration,
+    /// The native authority timer could not be allocated or registered before
+    /// storage admission. Retained storage is untouched by this failure.
+    #[error("session consensus authority backoff timer is unavailable: {}", authority_backoff_io_error(*kind, *raw_os_error))]
+    AuthorityBackoffUnavailable {
+        /// Original I/O error category.
+        kind: std::io::ErrorKind,
+        /// Original operating-system error number, when present.
+        raw_os_error: Option<i32>,
+    },
     /// Openraft could not start or stopped fatally.
     #[error("session consensus engine is unavailable")]
     EngineUnavailable,
@@ -521,6 +530,15 @@ pub enum ConsensusSessionStoreOpenError {
     /// This exact joining-candidate transition was durably cancelled.
     #[error("session consensus candidate transition was cancelled")]
     CandidateTransitionCancelled,
+}
+
+fn authority_backoff_io_error(
+    kind: std::io::ErrorKind,
+    raw_os_error: Option<i32>,
+) -> std::io::Error {
+    raw_os_error
+        .map(std::io::Error::from_raw_os_error)
+        .unwrap_or_else(|| std::io::Error::from(kind))
 }
 
 /// Redaction-safe current Openraft observation for readiness and operations.
@@ -3640,6 +3658,23 @@ impl ConsensusSessionStore {
         {
             return Err(ConsensusSessionStoreOpenError::PeerSetMismatch);
         }
+        // Acquire independent fallible startup resources before storage can
+        // consume a one-use Async clean-restart proof or mutate either root.
+        let mut config = session_raft_config()?;
+        #[cfg(target_os = "linux")]
+        let authority_backoff = backend.new_authority_backoff().map_err(|error| {
+            tracing::error!(
+                stage = "authority_backoff_timer",
+                error = %error,
+                kind = ?error.kind(),
+                errno = ?error.raw_os_error(),
+                "session consensus startup resource allocation failed"
+            );
+            ConsensusSessionStoreOpenError::AuthorityBackoffUnavailable {
+                kind: error.kind(),
+                raw_os_error: error.raw_os_error(),
+            }
+        })?;
         let topology_coordinator = Arc::new(SessionTopologyCoordinatorState::try_from_topology(
             &topology,
         )?);
@@ -3733,15 +3768,14 @@ impl ConsensusSessionStore {
         topology_coordinator
             .load_retained_transitions(&membership_scope)
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
-        let mut config = session_raft_config()?;
         config.enable_elect = persistence_protocol.is_active() && voter_profile.is_none();
         if voter_profile.is_some() {
             config.enable_heartbeat = false;
         }
         let config = Arc::new(config);
         let admitted = Arc::new(AtomicBool::new(false));
-        // Allocate the authority wait resource before starting an engine that
-        // could receive traffic. No contended RPC may create a timer or worker.
+        // Admission consumes the resource already prepared before storage;
+        // it cannot introduce a resource failure after a clean proof is consumed.
         let fixed_admission = FixedQuorumEngineAdmission::new(
             backend.clone(),
             storage_identity,
@@ -3750,8 +3784,9 @@ impl ConsensusSessionStore {
             placement_policy,
             Arc::clone(&admitted),
             operation_timeout,
-        )
-        .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
+            #[cfg(target_os = "linux")]
+            authority_backoff,
+        );
         let raft = SessionRaft::new(local_node_id, config, network, log_store, state_machine)
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;

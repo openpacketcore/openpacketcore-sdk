@@ -5,59 +5,104 @@ use super::*;
 use consensus::wal::Wal;
 use std::io;
 
+#[cfg(test)]
+pub(crate) mod startup_pressure;
+
 /// A startup-owned, real-monotonic delay for contended authority reads.
 ///
 /// A timer descriptor wakes the reactor even when Tokio time is paused. The
 /// caller's existing absolute RPC deadline still bounds the enclosing future;
-/// cancelling a wait releases admission without leaving a worker or retry task.
-/// Handler clones share the descriptor created before their engine starts.
+/// cancelling a wait leaves no worker or retry task. Concurrent callers share
+/// timer expiries but each retains its own real-time minimum. The descriptor
+/// is prepared before storage opens and is disarmed when no caller is waiting.
 pub(crate) struct AuthorityBackoff {
     timer: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
-    waiter: tokio::sync::Mutex<()>,
+    waiters: std::sync::Mutex<usize>,
+}
+
+struct AuthorityWaitGuard<'a>(&'a AuthorityBackoff);
+
+impl Drop for AuthorityWaitGuard<'_> {
+    fn drop(&mut self) {
+        let mut waiters = self
+            .0
+            .waiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *waiters -= 1;
+        if *waiters == 0 {
+            // No background task or idle timer activity survives the last
+            // completed/cancelled waiter. The next caller arms a fresh tick.
+            let _ = self.0.set_active(false);
+        }
+    }
 }
 
 impl AuthorityBackoff {
     pub(super) fn new() -> io::Result<Self> {
+        #[cfg(test)]
+        let _pressure = startup_pressure::take();
         let timer = rustix::time::timerfd_create(
             rustix::time::TimerfdClockId::Monotonic,
             rustix::time::TimerfdFlags::NONBLOCK | rustix::time::TimerfdFlags::CLOEXEC,
         )?;
         Ok(Self {
             timer: tokio::io::unix::AsyncFd::with_interest(timer, tokio::io::Interest::READABLE)?,
-            waiter: tokio::sync::Mutex::new(()),
+            waiters: std::sync::Mutex::new(0),
         })
     }
 
-    pub(super) async fn wait(&self) -> io::Result<()> {
-        let _waiter = self.waiter.lock().await;
-        // Rearm a one-shot after each failed acquisition; accumulated timer
-        // intervals or a cancelled wait must never allow immediate retries.
-        // Neither admission nor rearming creates a descriptor or a thread.
+    fn set_active(&self, active: bool) -> io::Result<()> {
+        let interval = rustix::time::Timespec {
+            tv_sec: 0,
+            tv_nsec: if active { 1_000_000 } else { 0 },
+        };
         rustix::time::timerfd_settime(
             self.timer.get_ref(),
             rustix::time::TimerfdTimerFlags::empty(),
             &rustix::time::Itimerspec {
-                it_interval: rustix::time::Timespec::default(),
-                it_value: rustix::time::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 1_000_000,
-                },
+                it_interval: interval,
+                it_value: interval,
             },
         )?;
+        Ok(())
+    }
+
+    pub(super) async fn wait(&self) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(1);
+        let _waiter = {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .map_err(|_| io::Error::other("authority backoff state unavailable"))?;
+            if *waiters == 0 {
+                self.set_active(true)?;
+            }
+            *waiters += 1;
+            AuthorityWaitGuard(self)
+        };
         loop {
+            // AsyncFd::readable registers each future in the reactor's waiter
+            // list. One tick wakes the cohort, without serial one-ms waits or
+            // any lock held across await. Only the first reader drains the fd.
             let mut ready = self.timer.readable().await?;
             match ready.try_io(|timer| {
                 let mut expirations = [0_u8; 8];
                 rustix::io::read(timer.get_ref(), &mut expirations).map_err(io::Error::from)
             }) {
                 Ok(Ok(8)) => {
-                    // Reading the one-shot expiration fully drains this fd.
                     ready.clear_ready();
-                    return Ok(());
                 }
                 Ok(Ok(_)) => return Err(io::Error::other("incomplete authority backoff timer")),
                 Ok(Err(error)) => return Err(error),
-                Err(_) => continue,
+                // Another notified waiter may have drained this same tick.
+                Err(_) => {}
+            }
+            // A late joiner or stale readiness after cancellation must still
+            // wait its own full interval. The next shared tick serves it;
+            // adding callers does not add one interval per predecessor.
+            if std::time::Instant::now() >= deadline {
+                return Ok(());
             }
         }
     }
@@ -68,9 +113,17 @@ pub(super) fn unavailable() -> StoreError {
 }
 
 impl SqliteSessionBackend {
-    /// Create the native handler's real-time wait resource during startup.
+    /// Prepare fixed-quorum resources before selecting or reopening storage.
     pub(crate) fn new_authority_backoff(&self) -> io::Result<Option<Arc<AuthorityBackoff>>> {
-        self.native_enabled()
+        // A pristine fixed root is selected later by storage admission.
+        // Testing native_enabled here would miss that required allocation.
+        let native = self.native_owner.is_some();
+        #[cfg(test)]
+        let native = self
+            .private_wal_test
+            .as_ref()
+            .map_or(native, |test| test.is_native());
+        native
             .then(|| AuthorityBackoff::new().map(Arc::new))
             .transpose()
     }
@@ -322,10 +375,126 @@ impl SqliteSessionBackend {
 mod authority_backoff_tests {
     use super::*;
 
+    fn assert_idle(backoff: &AuthorityBackoff) {
+        assert_eq!(*backoff.waiters.lock().unwrap(), 0);
+        let timer = rustix::time::timerfd_gettime(backoff.timer.get_ref()).unwrap();
+        assert_eq!(timer.it_interval, rustix::time::Timespec::default());
+        assert_eq!(timer.it_value, rustix::time::Timespec::default());
+    }
+
+    #[derive(Default)]
+    struct WakeCount {
+        parent: futures_util::task::AtomicWaker,
+        wakes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl futures_util::task::ArcWake for WakeCount {
+        fn wake_by_ref(counter: &Arc<Self>) {
+            counter.wakes.fetch_add(1, Ordering::SeqCst);
+            counter.parent.wake();
+        }
+    }
+
+    fn count_wakes<F: std::future::Future>(
+        future: F,
+    ) -> (impl std::future::Future<Output = F::Output>, Arc<WakeCount>) {
+        let counter = Arc::new(WakeCount::default());
+        let observed = Arc::clone(&counter);
+        let mut future = Box::pin(future);
+        let counted = std::future::poll_fn(move |context| {
+            observed.parent.register(context.waker());
+            let waker = futures_util::task::waker_ref(&observed);
+            future
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(&waker))
+        });
+        (counted, counter)
+    }
+
+    #[tokio::test]
+    async fn concurrent_authority_waits_share_an_expiry() {
+        let backoff = AuthorityBackoff::new().expect("startup timer");
+        let mut waits = (0..128)
+            .map(|_| Box::pin(backoff.wait()))
+            .collect::<Vec<_>>();
+        for wait in &mut waits {
+            assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        }
+        let results = tokio::time::timeout(
+            Duration::from_millis(64),
+            futures_util::future::join_all(waits),
+        )
+        .await
+        .expect("128 concurrent waits must not queue 128 one-millisecond intervals");
+        assert_eq!(results.len(), 128);
+        assert!(results.iter().all(Result::is_ok));
+        assert_idle(&backoff);
+    }
+
+    #[tokio::test]
+    async fn concurrent_authority_waiters_do_not_spin() {
+        let backoff = AuthorityBackoff::new().expect("startup timer");
+        let started = std::time::Instant::now();
+        let (waits, counts): (Vec<_>, Vec<_>) = (0..16)
+            .map(|_| {
+                count_wakes(async {
+                    loop {
+                        backoff.wait().await.expect("shared timer wait");
+                        if started.elapsed() >= Duration::from_millis(100) {
+                            break;
+                        }
+                    }
+                })
+            })
+            .unzip();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            futures_util::future::join_all(waits),
+        )
+        .await
+        .expect("all concurrent timer waits finish");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(100));
+        for (index, count) in counts.iter().enumerate() {
+            let wakes = count.wakes.load(Ordering::SeqCst);
+            assert!(wakes > 0, "waiter {index} actually waits for a wake");
+            assert!(
+                wakes as u128 <= elapsed.as_micros() / 250 + 4,
+                "waiter {index} must stay below 4,000 wakes per second: {wakes} in {elapsed:?}"
+            );
+        }
+        assert_idle(&backoff);
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_active_authority_wait_preserves_a_fresh_delay() {
+        let backoff = AuthorityBackoff::new().expect("startup timer");
+        for iteration in 0..32 {
+            let mut cancelled = Box::pin(backoff.wait());
+            assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+            if iteration % 2 == 0 {
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            drop(cancelled);
+            assert_idle(&backoff);
+            let started = std::time::Instant::now();
+            tokio::time::timeout(Duration::from_millis(40), backoff.wait())
+                .await
+                .expect("cancelled holder must not strand the next waiter")
+                .expect("fresh delay after holder cancellation");
+            assert!(
+                started.elapsed() >= Duration::from_millis(1),
+                "expired or stale readiness must not bypass the next waiter's delay"
+            );
+            assert_idle(&backoff);
+        }
+    }
+
     #[tokio::test]
     async fn cancelling_a_queued_authority_wait_preserves_the_next_waiter() {
         let backoff = AuthorityBackoff::new().expect("startup timer");
-        let occupied = backoff.waiter.lock().await;
+        let mut occupied = Box::pin(backoff.wait());
+        assert!(futures_util::poll!(occupied.as_mut()).is_pending());
         let mut cancelled = Box::pin(backoff.wait());
         let mut next = Box::pin(backoff.wait());
         assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
@@ -337,8 +506,9 @@ mod authority_backoff_tests {
             .expect("cancellation cannot strand another caller")
             .expect("remaining caller receives its real timer wake");
         assert!(
-            backoff.waiter.try_lock().is_ok(),
+            backoff.waiters.try_lock().is_ok(),
             "completed wait releases admission"
         );
+        assert_idle(&backoff);
     }
 }

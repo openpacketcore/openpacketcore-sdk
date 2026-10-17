@@ -46,6 +46,8 @@ pub mod audit;
 pub(crate) mod consensus;
 #[cfg(target_os = "linux")]
 mod native;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use native::startup_pressure;
 #[cfg(target_os = "linux")]
 pub(crate) use native::AuthorityBackoff;
 

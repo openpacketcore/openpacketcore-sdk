@@ -777,11 +777,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and operation budgets are unchanged. (#1302)
 
 - `opc-session-store`: create and register the native authority backoff timer
-  before the consensus engine starts, then share it across inbound handlers.
-  Contended reads rearm the existing real-monotonic timer without allocating a
-  descriptor or thread, including under descriptor exhaustion. The original RPC
-  deadline includes admission to the shared timer, and cancellation leaves no
-  detached retry. Regressions bound wake-ups as well as lock attempts and cover
+  before storage opens, preserving retained state and clean Async restart proofs
+  when allocation fails. Startup diagnostics retain the I/O error and errno.
+  Concurrent contended reads share real-monotonic expiries while each retains
+  its own one-millisecond minimum, without allocating a descriptor or thread,
+  including under descriptor exhaustion. The original RPC deadline bounds the
+  wait; cancellation leaves no detached retry and the last waiter disarms the
+  timer. Regressions bound wake-ups as well as lock attempts and cover
   real `RLIMIT_NOFILE` exhaustion, paused time, cancellation and waits without
   an idle blocking worker. (#1313)
 
