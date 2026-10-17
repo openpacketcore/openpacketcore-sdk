@@ -5,6 +5,9 @@
 //! checked the fixed scope and identity; it does not expose a backend,
 //! consensus RPC, or replication operation to the client.
 
+#[path = "persistent_consumer_boundaries/prewarm_batch.rs"]
+mod prewarm_batch;
+
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
