@@ -2116,7 +2116,7 @@ impl ConfigConsensusService {
     ) -> ConsensusWireResponse {
         if self.store.requires_voter_identity_replacement() {
             return ConsensusWireResponse {
-                result: Err(ConsensusPeerError::ScopeMismatch),
+                result: Err(ConsensusPeerError::Unavailable),
             };
         }
         if request.validate().is_err()
