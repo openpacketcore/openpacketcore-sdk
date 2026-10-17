@@ -156,6 +156,11 @@ struct InProcessConsensusPeer {
     scope: Option<SessionConsensusIdentity>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     online: Arc<AtomicBool>,
+    admitted: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    hold_log_entries: Arc<AtomicBool>,
+    #[cfg(test)]
+    election_vote: Arc<std::sync::Mutex<Option<Arc<election_tests::VoteGate>>>>,
     ordinary_read_barrier_online: Arc<AtomicBool>,
     rejected_ordinary_read_barriers: Arc<AtomicUsize>,
     #[cfg(feature = "test-control")]
@@ -169,6 +174,11 @@ impl InProcessConsensusPeer {
             scope: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             online: Arc::new(AtomicBool::new(true)),
+            admitted: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            hold_log_entries: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            election_vote: Arc::default(),
             ordinary_read_barrier_online: Arc::new(AtomicBool::new(true)),
             rejected_ordinary_read_barriers: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "test-control")]
@@ -223,6 +233,7 @@ impl InProcessConsensusPeer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let _admitted = self.admitted.read().await;
         if !self.online.load(Ordering::SeqCst) {
             return Err(SessionConsensusPeerError::Unavailable);
         }
@@ -242,6 +253,19 @@ impl InProcessConsensusPeer {
             .await
             .clone()
             .ok_or(SessionConsensusPeerError::Unavailable)?;
+        #[cfg(test)]
+        {
+            if self.hold_log_entries.load(Ordering::Acquire)
+                && request.family == SessionConsensusRpcFamily::AppendEntries
+                && !ConsensusSessionStore::is_empty_append_entries_for_test(&request)
+            {
+                return Err(SessionConsensusPeerError::Unavailable);
+            }
+            let gate = self.election_vote.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                return Ok(gate.deliver(self.node_id, handler, request).await);
+            }
+        }
         Ok(handler.handle(request.sender, request).await)
     }
 }
@@ -297,6 +321,16 @@ impl ConsensusTestCluster {
         member_count: usize,
         fixed: bool,
         profile: opc_session_store::FencedTransitionV2Profile,
+    ) -> Self {
+        Self::start_controlled(member_count, fixed, profile, None).await
+    }
+
+    async fn start_controlled(
+        member_count: usize,
+        fixed: bool,
+        profile: opc_session_store::FencedTransitionV2Profile,
+        #[cfg(test)] scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript]>,
+        #[cfg(not(test))] _scripts: Option<()>,
     ) -> Self {
         assert!(
             member_count == 1 || member_count >= 3,
@@ -407,28 +441,43 @@ impl ConsensusTestCluster {
                     (node_ids[target], peer)
                 })
                 .collect();
-            let store = if fixed {
-                // This fixture exercises fixed authority, not strict snapshot or
-                // independent physical failure-domain qualification.
-                ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
-                    topologies[index].clone(),
-                    backends[index].clone(),
-                    directory.path().join(format!("snapshots-{index}")),
-                    peers,
-                    opc_session_store::SnapshotIntegrityPolicy::PortableVerified,
-                )
-                .await
-            } else {
-                ConsensusSessionStore::open_with_clock(
-                    topologies[index].clone(),
-                    backends[index].clone(),
-                    directory.path().join(format!("snapshots-{index}")),
-                    peers,
-                    Arc::new(SystemClock),
-                    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-                )
-                .await
+            let opening = async {
+                if fixed {
+                    // This fixture exercises fixed authority, not strict snapshot or
+                    // independent physical failure-domain qualification.
+                    ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+                        topologies[index].clone(),
+                        backends[index].clone(),
+                        directory.path().join(format!("snapshots-{index}")),
+                        peers,
+                        opc_session_store::SnapshotIntegrityPolicy::PortableVerified,
+                    )
+                    .await
+                } else {
+                    ConsensusSessionStore::open_with_clock(
+                        topologies[index].clone(),
+                        backends[index].clone(),
+                        directory.path().join(format!("snapshots-{index}")),
+                        peers,
+                        Arc::new(SystemClock),
+                        DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                    )
+                    .await
+                }
             };
+            #[cfg(test)]
+            let store = if let Some(scripts) = scripts {
+                scripts[index]
+                    .scope(tracing::Instrument::instrument(
+                        opening,
+                        election_tests::delivery::node_span(node_ids[index].get()),
+                    ))
+                    .await
+            } else {
+                opening.await
+            };
+            #[cfg(not(test))]
+            let store = opening.await;
             stores.push(store.expect("open consensus test node"));
         }
 
@@ -553,11 +602,15 @@ impl ConsensusTestCluster {
     }
 
     async fn wait_ready(&self, fixed: bool) {
+        Self::wait_ready_stores(&self.stores, fixed).await;
+    }
+
+    async fn wait_ready_stores(stores: &[ConsensusSessionStore], fixed: bool) {
         // Cluster formation can require one resampled election after a split
         // vote and then one complete profiled readiness operation.
         let deadline = tokio::time::Instant::now() + CONSENSUS_TEST_TRANSITION_TIMEOUT;
         loop {
-            let reports = join_all(self.stores.iter().map(|store| async move {
+            let reports = join_all(stores.iter().map(|store| async move {
                 if fixed {
                     store
                         .probe_fixed_durable_quorum_readiness()
@@ -752,3 +805,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod election_tests;

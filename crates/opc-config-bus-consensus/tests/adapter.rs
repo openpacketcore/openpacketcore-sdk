@@ -317,7 +317,12 @@ impl ProjectionCluster {
                 election::delivery::node_span(node.get()),
             );
             let store = if let Some(scripts) = scripts {
-                scripts[index].scope(opening).await
+                scripts[index]
+                    .scope(tracing::Instrument::instrument(
+                        opening,
+                        election::delivery::node_span(node.get()),
+                    ))
+                    .await
             } else {
                 opening.await
             }
