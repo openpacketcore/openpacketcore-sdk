@@ -31,9 +31,21 @@ After the backend is returned, pass the same topology to
 `ConsensusConfigStore::open`, wire its authenticated consensus transport, and
 call `initialize_cluster`. Returning a backend does not itself establish quorum
 or serving readiness. A repair member never bootstraps a new cluster, including
-when it is the canonical lowest member or after its next restart. It waits for
-the existing membership and history to replicate through the existing Openraft
-path. Repairing every member of a lost quorum cannot mint fresh genesis.
+when it is the canonical lowest member or after its next restart. While its
+storage is empty, it rejects engine RPCs and does not campaign. It pulls bounded
+snapshot chunks from an authenticated leader that proves a fresh surviving
+quorum. The snapshot covers the leader's accepted log prefix, including any
+tail that must finish applying, before Openraft installs the restored state and
+vote. Only then can the replacement participate in ordinary replication. This
+also supports repair after a planned handoff while the successor stays live.
+Repairing every member of a lost quorum cannot mint fresh genesis.
+
+Cancellation or a lost quorum leaves the empty member unadmitted; retry
+`initialize_cluster` on the same store when the quorum is available. Incomplete
+downloads are removed automatically. A completed repair persists through the
+ordinary retained reopen path and can rejoin with a compatible majority. This
+does not reset a leader's recorded replication progress, change stored formats,
+or require manual cleanup during restart.
 
 ## SDK-owned local state
 

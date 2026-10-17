@@ -769,7 +769,10 @@ impl ConsensusConfigStore {
         if self.inner.voter_profile.is_none() {
             self.inner
                 .compatibility
-                .verify(deadline, !initialized)
+                .verify(
+                    deadline,
+                    !initialized && !self.inner.repair_pending.load(Ordering::Acquire),
+                )
                 .await?;
         }
         if self.inner.repair_pending.load(Ordering::Acquire) {

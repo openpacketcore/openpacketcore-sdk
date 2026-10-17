@@ -280,7 +280,9 @@ impl SqliteBackend {
     /// the authenticated existing quorum. Its persisted repair disposition
     /// forbids local genesis, including after reopening. Loss of the complete
     /// quorum therefore requires a separately approved new authority, never
-    /// repeated member repair. Existing artifacts are not overwritten.
+    /// repeated member repair. Existing artifacts are not overwritten. The
+    /// consensus store restores a quorum-authorized snapshot before the empty
+    /// replacement can vote or answer replication requests under its node ID.
     pub async fn provision_config_member_repair(
         options: RetainedConfigOptions,
         audit_key: AuditKey,

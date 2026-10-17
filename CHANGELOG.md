@@ -764,7 +764,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still drains and reports a typed reason through `shutdown_with_report()`.
   Keep consensus transport available until shutdown completes. Config-bus
   successor tests now use deterministic election inputs and retain both
-  planned and abrupt leader-loss projection checks. (#1315)
+  planned and abrupt leader-loss projection checks. Empty retained config
+  replacements restore a snapshot from the surviving quorum before voting or
+  answering replication, preserving a live successor's recorded progress.
+  Cancelled repair can retry without manual cleanup. (#1315)
 
 - `opc-proto-gtpv2c`: An empty Create Session Response APCO received before any
   retained APCO is discarded as malformed optional outer-IE data at every

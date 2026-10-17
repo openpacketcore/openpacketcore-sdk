@@ -12,6 +12,9 @@ mod retention_election;
 #[path = "consensus_openraft/planned_shutdown.rs"]
 mod planned_shutdown;
 
+#[path = "consensus_openraft/member_repair.rs"]
+mod member_repair;
+
 use quorum_admission::rolling_election;
 
 use std::collections::{BTreeMap, BTreeSet};

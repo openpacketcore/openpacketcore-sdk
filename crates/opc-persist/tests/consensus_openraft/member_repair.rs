@@ -1,0 +1,289 @@
+use super::*;
+
+#[derive(Debug, Default)]
+struct RepairControl {
+    pause_after_first_chunk: AtomicBool,
+    chunks: AtomicUsize,
+    calls: AtomicUsize,
+    blocked: tokio::sync::Notify,
+}
+
+#[derive(Debug)]
+struct RepairPeer {
+    peer: Arc<dyn ConsensusPeer>,
+    control: Arc<RepairControl>,
+}
+
+#[async_trait]
+impl ConsensusPeer for RepairPeer {
+    fn node_id(&self) -> ConfigConsensusNodeId {
+        self.peer.node_id()
+    }
+
+    fn with_compatibility(
+        &self,
+        compatibility: opc_consensus::ConsensusCompatibility,
+    ) -> Option<Arc<dyn ConsensusPeer>> {
+        Some(Arc::new(Self {
+            peer: self.peer.with_compatibility(compatibility)?,
+            control: self.control.clone(),
+        }))
+    }
+
+    async fn call(
+        &self,
+        request: ConsensusWireRequest,
+    ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        self.call_with_compatibility(request, None, Duration::from_secs(30))
+            .await
+            .map(|reply| reply.response)
+    }
+
+    async fn call_with_compatibility(
+        &self,
+        request: ConsensusWireRequest,
+        required: Option<opc_consensus::ConsensusCompatibility>,
+        timeout: Duration,
+    ) -> Result<opc_consensus::ConsensusCallResponse, ConsensusPeerError> {
+        let repair = request.family == ConsensusRpcFamily::MemberRepair;
+        if repair {
+            self.control.calls.fetch_add(1, Ordering::SeqCst);
+            if self.control.chunks.load(Ordering::SeqCst) > 0
+                && self.control.pause_after_first_chunk.load(Ordering::SeqCst)
+            {
+                self.control.blocked.notify_one();
+                return std::future::pending().await;
+            }
+        }
+        let reply = self
+            .peer
+            .call_with_compatibility(request, required, timeout)
+            .await?;
+        if repair && reply.response.result.is_ok() {
+            self.control.chunks.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(reply)
+    }
+}
+
+fn large_attested(tx: TxId) -> AttestedConfigCommit {
+    let mut record = commit(tx, None, 1, 0x41);
+    let aad = EnvelopeAad::config(
+        opc_types::TenantId::from_static("tenant-a"),
+        record.version.get(),
+        ConfigAad::new(
+            tx,
+            None,
+            record.committed_at,
+            &record.principal,
+            record.schema_digest,
+            "running",
+        )
+        .unwrap(),
+    );
+    let handle = KeyHandle::new(
+        KeyId::new("repair-snapshot-key").unwrap(),
+        KeyPurpose::Config,
+        opc_types::TenantId::from_static("tenant-a"),
+        Zeroizing::new([0x41; AES_256_GCM_SIV_KEY_LEN]),
+    );
+    let plaintext = vec![0x41; 256 * 1024];
+    let envelope = encrypt_attested_envelope_with_handle_and_nonce(
+        &handle,
+        &aad,
+        &plaintext,
+        [0x41; AES_256_GCM_SIV_NONCE_LEN],
+    )
+    .unwrap();
+    record.plaintext_digest = Sha256::digest(&plaintext).to_vec();
+    record.encrypted_blob = envelope.encoded().to_vec();
+    AttestedConfigCommit::try_new(record, audit(tx), envelope.claim().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn cancelled_repair_requires_fresh_quorum_then_reopens_with_a_majority() {
+    let mut cluster =
+        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew).await;
+    let (a, b, c) = tokio::join!(
+        cluster.stores[0].initialize_cluster(),
+        cluster.stores[1].initialize_cluster(),
+        cluster.stores[2].initialize_cluster()
+    );
+    a.unwrap();
+    b.unwrap();
+    c.unwrap();
+    cluster.wait_ready().await;
+    let first = TxId::new();
+    cluster.stores[cluster.leader()]
+        .append_commit_idempotent(
+            ConfigConsensusRequestId::from_bytes([0x41; 16]),
+            large_attested(first),
+        )
+        .await
+        .unwrap();
+    cluster.stores[0].shutdown().await.unwrap();
+    let leader = cluster.leader();
+    assert_ne!(leader, 0);
+    cluster.stores[leader].trigger_snapshot().await.unwrap();
+
+    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).unwrap());
+    let topology =
+        ConfigConsensusTopology::try_new(cluster.identity, nodes[0], nodes.into_iter().collect())
+            .unwrap();
+    let options = retained_options(
+        &cluster._directory.path().join("repair.sqlite"),
+        topology.clone(),
+        9,
+    );
+    let backend = SqliteBackend::provision_config_member_repair(options.clone(), audit_key())
+        .await
+        .unwrap();
+    let control = Arc::new(RepairControl::default());
+    control
+        .pause_after_first_chunk
+        .store(true, Ordering::SeqCst);
+    let peers = (1..3)
+        .map(|target| {
+            (
+                nodes[target],
+                Arc::new(RepairPeer {
+                    peer: cluster.paths[&(0, target)].clone(),
+                    control: control.clone(),
+                }) as Arc<dyn ConsensusPeer>,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let snapshots = cluster._directory.path().join("repair-snapshots");
+    cluster.stores[0] =
+        ConsensusConfigStore::open(topology.clone(), backend, &snapshots, peers.clone())
+            .await
+            .unwrap();
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            peer.install(cluster.stores[0].rpc_handler()).await;
+        }
+    }
+    let recovering = cluster.stores[0].clone();
+    let attempt = tokio::spawn(async move { recovering.initialize_cluster().await });
+    tokio::time::timeout(
+        opc_consensus::DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+        control.blocked.notified(),
+    )
+    .await
+    .expect("second chunk reached after a real partial download");
+    assert_eq!(control.chunks.load(Ordering::SeqCst), 1);
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+    assert!(!cluster.stores[0].status().admitted);
+    assert!(cluster.stores[0].status().applied_index.is_none());
+    assert!(
+        std::fs::read_dir(&snapshots).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("incoming-")),
+        "cancelled download removes its staging file"
+    );
+
+    let second = TxId::new();
+    let record = commit(second, Some(first), 2, 0x42);
+    let audit = audit(second);
+    let request_id = ConfigConsensusRequestId::from_bytes([0x42; 16]);
+    cluster.stores[leader]
+        .append_commit_idempotent(request_id, attested(record.clone(), audit.clone()))
+        .await
+        .expect("surviving quorum writes while replacement remains gated");
+    let other = (1..3).find(|index| *index != leader).unwrap();
+    cluster.isolate(other);
+    control
+        .pause_after_first_chunk
+        .store(false, Ordering::SeqCst);
+    let chunks_before = control.chunks.load(Ordering::SeqCst);
+    assert!(
+        cluster.stores[0].initialize_cluster().await.is_err(),
+        "an old snapshot and the empty replacement cannot substitute for the surviving quorum"
+    );
+    assert_eq!(
+        control.chunks.load(Ordering::SeqCst),
+        chunks_before,
+        "no chunk is authorized by a stale leader observation"
+    );
+    assert!(!cluster.stores[0].status().admitted);
+    assert!(cluster.stores[0].status().applied_index.is_none());
+    for ((source, target), peer) in &cluster.paths {
+        if *source == other || *target == other {
+            peer.set_enabled(true);
+        }
+    }
+    cluster.stores[0]
+        .initialize_cluster()
+        .await
+        .expect("same-store recovery retry");
+    cluster.wait_ready().await;
+    assert!(
+        control.chunks.load(Ordering::SeqCst) > 2,
+        "restored a multi-chunk snapshot"
+    );
+    assert_eq!(
+        cluster.stores[0]
+            .load_latest()
+            .await
+            .unwrap()
+            .unwrap()
+            .record
+            .tx_id,
+        second,
+        "fresh snapshot covers writes accepted after the cancelled download"
+    );
+    cluster.stores[0]
+        .append_commit_idempotent(request_id, attested(record.clone(), audit.clone()))
+        .await
+        .expect("snapshot preserves exact request replay");
+
+    cluster.stores[0].shutdown().await.unwrap();
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            *peer.handler.write().await = None;
+        }
+    }
+    // Drop the final closed store before reacquiring the retained lock.
+    let old = cluster.stores.remove(0);
+    drop(old);
+    let backend = SqliteBackend::reopen_config_authority(options, audit_key())
+        .await
+        .unwrap();
+    let restored = ConsensusConfigStore::open(topology, backend, snapshots, peers)
+        .await
+        .unwrap();
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            peer.install(restored.rpc_handler()).await;
+        }
+    }
+    cluster.stores.insert(0, restored);
+    let leader = cluster.leader();
+    assert_ne!(leader, 0);
+    let other = (1..3).find(|index| *index != leader).unwrap();
+    cluster.isolate(other);
+    let repair_calls = control.calls.load(Ordering::SeqCst);
+    cluster.stores[0]
+        .initialize_cluster()
+        .await
+        .expect("durably repaired voter rejoins with itself and one survivor");
+    assert_eq!(
+        control.calls.load(Ordering::SeqCst),
+        repair_calls,
+        "ordinary retained restart does not repeat empty-root repair"
+    );
+    assert_eq!(
+        cluster.stores[0]
+            .load_latest()
+            .await
+            .unwrap()
+            .unwrap()
+            .record
+            .tx_id,
+        second
+    );
+    cluster.shutdown().await;
+}
