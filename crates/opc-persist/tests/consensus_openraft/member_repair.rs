@@ -164,7 +164,7 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
             .collect::<BTreeMap<_, _>>()
     };
     let mut stores = Vec::new();
-    for index in 0..5 {
+    for (index, &local_node) in nodes.iter().enumerate() {
         let backend = SqliteBackend::open_with_audit_key(
             directory.path().join(format!("node-{index}.sqlite")),
             true,
@@ -175,7 +175,7 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
         .unwrap();
         stores.push(
             ConsensusConfigStore::open_with_operation_timeout(
-                ConfigConsensusTopology::try_new(identity, nodes[index], members.clone()).unwrap(),
+                ConfigConsensusTopology::try_new(identity, local_node, members.clone()).unwrap(),
                 backend,
                 directory.path().join(format!("snapshots-{index}")),
                 peers_for(index),
