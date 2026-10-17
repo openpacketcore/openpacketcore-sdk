@@ -247,13 +247,23 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
             ))
             .catch_unwind()
             .await;
+            assert_eq!(Instant::now() - started, Duration::from_secs(26));
+            eprintln!("acquisition_deadline fixture=session_fleet elapsed_ms=26000");
             done26.send(()).unwrap();
             result
         };
         let wait30 = async {
-            let result = AssertUnwindSafe(cluster.wait_node_durable_ready(long))
-                .catch_unwind()
-                .await;
+            // The helper checks its deadline after each real readiness probe.
+            // A probe already awaiting its own operation deadline need not
+            // return exactly at 30 s. Observe the original acquisition budget
+            // directly instead of freezing time while waiting for that probe.
+            let result = tokio::time::timeout_at(
+                started + Duration::from_secs(30),
+                AssertUnwindSafe(cluster.wait_node_durable_ready(long)).catch_unwind(),
+            )
+            .await;
+            assert_eq!(Instant::now() - started, Duration::from_secs(30));
+            eprintln!("acquisition_deadline fixture=session_node elapsed_ms=30000");
             done30.send(()).unwrap();
             result
         };
@@ -298,7 +308,6 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
         let (result26, result30, ()) = tokio::join!(wait26, wait30, drive);
         assert_eq!(Instant::now() - started, Duration::from_secs(30));
         let panic26 = result26.expect_err("the unchanged 26s helper cannot cover two splits");
-        let panic30 = result30.expect_err("the unchanged 30s helper cannot cover two splits");
         assert_eq!(
             panic26
                 .downcast_ref::<String>()
@@ -306,13 +315,17 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
                 .or_else(|| panic26.downcast_ref::<&str>().copied()),
             Some("consensus test fleet did not become durable-ready")
         );
-        assert_eq!(
-            panic30
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic30.downcast_ref::<&str>().copied()),
-            Some("consensus test node did not become durable-ready")
-        );
+        match result30 {
+            Ok(Err(panic30)) => assert_eq!(
+                panic30
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic30.downcast_ref::<&str>().copied()),
+                Some("consensus test node did not become durable-ready")
+            ),
+            Err(_) => {}
+            Ok(Ok(())) => panic!("two legal splits must prevent acquisition within 30 seconds"),
+        }
         for (index, prefix) in [(short, short_prefix), (long, long_prefix)] {
             let status = cluster.stores[index].status();
             assert_eq!(status.term, initial.term + 2);
@@ -339,6 +352,8 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
                 .await
                 .is_ready());
         }
+        assert_eq!(Instant::now() - started, success);
+        eprintln!("automatic_recovery fixture=session elapsed_ms=33000 campaign=3");
         for path in cluster.paths.values() {
             *path.election_vote.lock().unwrap() = None;
         }

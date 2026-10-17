@@ -76,6 +76,7 @@ impl VoteGate {
         let (_, vote): (u16, VoteRequest<ConfigConsensusNodeId>) =
             opc_consensus::decode_bounded(&request.payload).expect("real vote request");
         assert!((self.term..=self.term + 2).contains(&vote.vote.leader_id.term));
+        assert_eq!(vote.vote.leader_id.voted_for(), Some(request.sender));
         let split = vote.vote.leader_id.term < self.term + 2;
         self.arrivals.send_modify(|arrivals| {
             assert!(
@@ -295,8 +296,8 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
                     }
                     for (observed_at, request) in &gate.arrivals.borrow()[count - 2..] {
                         assert_eq!(*observed_at, at);
-                        let expected = if request.vote.leader_id.node_id
-                            == ConfigConsensusNodeId::new(2).unwrap()
+                        let expected = if request.vote.leader_id.voted_for()
+                            == Some(ConfigConsensusNodeId::new(2).unwrap())
                         {
                             12
                         } else {
@@ -317,6 +318,7 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
             .downcast_ref::<String>()
             .expect("original helper panic");
         assert!(message.starts_with("surviving quorum failed to elect a new leader:"));
+        eprintln!("acquisition_deadline fixture=config elapsed_ms=30000 failed_campaigns=2");
         for (index, expected) in [(1, 12), (2, 13)] {
             let status = quorum.stores[index].status();
             assert_eq!(status.term, initial.term + 2);
@@ -356,6 +358,8 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
             quorum.stores[2].ensure_local_authority().await,
             ConfigLocalAuthorityOutcome::LocalAuthority
         );
+        assert_eq!(Instant::now() - started, success);
+        eprintln!("automatic_recovery fixture=config elapsed_ms=33000 campaign=3");
         quorum.observe_votes(None);
         quorum.shutdown().await;
         for script in &election.scripts {
