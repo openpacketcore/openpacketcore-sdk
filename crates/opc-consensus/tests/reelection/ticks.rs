@@ -30,6 +30,10 @@ struct Spans {
 pub struct ProcessedTicks {
     spans: Arc<Mutex<Spans>>,
     processed: watch::Sender<HashMap<u64, (Instant, usize)>>,
+    // Match TickDelivery: with one dispatcher, registration on an unobserved
+    // parallel thread can disable our parent span globally. A second live
+    // dispatcher makes tracing consult every subscriber when registering it.
+    _callsite_registration: tracing::Dispatch,
 }
 
 impl ProcessedTicks {
@@ -39,6 +43,9 @@ impl ProcessedTicks {
         let observer = Self {
             spans: Arc::default(),
             processed: watch::channel(HashMap::new()).0,
+            _callsite_registration: tracing::Dispatch::new(
+                tracing::subscriber::NoSubscriber::default(),
+            ),
         };
         let guard = tracing::subscriber::set_default(observer.clone());
         (observer, guard)
@@ -55,6 +62,33 @@ impl ProcessedTicks {
             .await
             .expect("core processed its registered tick");
     }
+}
+
+#[test]
+fn tick_parent_survives_registration_on_an_unobserved_thread() {
+    fn notification() -> tracing::Span {
+        tracing::debug_span!(target: "openraft::core::raft_core", "handle_notify", id = 17_u64)
+    }
+
+    let (observer, _guard) = ProcessedTicks::install();
+    assert!(std::thread::spawn(|| notification().is_disabled())
+        .join()
+        .expect("unobserved registering thread"));
+    let parent = notification();
+    assert!(
+        !parent.is_disabled(),
+        "foreign registration must not disable the local notification span"
+    );
+    parent.in_scope(|| {
+        let tick =
+            tracing::debug_span!(target: "openraft::core::raft_core", "handle_tick_election");
+        assert!(!tick.is_disabled(), "the handled tick remains observable");
+        assert!(!observer.processed.borrow().contains_key(&17));
+        tick.in_scope(|| {
+            assert!(!observer.processed.borrow().contains_key(&17));
+        });
+        assert_eq!(observer.processed.borrow()[&17].1, 1);
+    });
 }
 
 #[derive(Default)]
