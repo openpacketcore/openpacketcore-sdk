@@ -784,6 +784,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seconds and a next eligible campaign at 27 seconds. Production timers and
   operation budgets are unchanged. (#1322)
 
+- `opc-session-net`: start the local idle intervals of fresh unused V1 prewarm
+  lanes together when the batch is published, so sequential setup does not
+  consume an earlier lane's idle budget before exact-width activation. Keep
+  rolling refresh, cancellation cleanup, fixed physical admission, and all
+  lifecycle, authentication, address-generation, shutdown and peer limits.
+  Cancellation cleanup also works outside the polling runtime's context.
+  Stamp cancelled or failed reconnect cooldowns on the admitting runtime's clock,
+  so cancellation outside that runtime cannot strand subsequent setup.
+  Cap unused lanes at their monotonic HelloAck peer-idle bound, accounting for
+  measured transit time and a safety margin. Expose the peer-idle assumption for
+  servers with shorter timeouts without changing the frozen HelloAck wire format.
+  Enforce the bound before every write and flush poll, preserving definite
+  non-transmission when no lower-transport byte was accepted before expiry.
+  Discard staged lanes safely if Tokio's thread-local context is destroyed.
+  Used lanes retain their conservative between-call deadline. (#1319)
+
 - `opc-persist` tests: script real one- and two-split elections during mixed-voter
   rolls while keeping writes in flight across leader loss. Require one-split
   writes to succeed; use the two-split write's exact 26-second `OutcomeUnknown`

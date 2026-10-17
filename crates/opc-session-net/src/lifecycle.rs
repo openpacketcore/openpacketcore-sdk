@@ -383,7 +383,8 @@ impl ReconnectGate {
             gate: Arc::clone(self),
             epoch,
             failure_jitter: failure_jitter.min(self.policy.reconnect_backoff_max()),
-            _permit: permit,
+            runtime: tokio::runtime::Handle::current(),
+            permit: Some(permit),
             finished: false,
         })
     }
@@ -469,7 +470,8 @@ pub(crate) struct ReconnectAttempt {
     gate: Arc<ReconnectGate>,
     epoch: ReconnectEpoch,
     failure_jitter: Duration,
-    _permit: OwnedSemaphorePermit,
+    runtime: tokio::runtime::Handle,
+    permit: Option<OwnedSemaphorePermit>,
     finished: bool,
 }
 
@@ -666,15 +668,39 @@ impl ReconnectAttempt {
     }
 
     pub(crate) fn failed(mut self) {
-        self.gate.finish(self.epoch, false, self.failure_jitter);
+        self.finish_failed();
+    }
+
+    fn finish_failed(&mut self) {
         self.finished = true;
+        if tokio::runtime::Handle::try_current()
+            .is_err_and(|error| error.is_thread_local_destroyed())
+        {
+            // A TLS destructor cannot enter Tokio. Publish on the admitting
+            // runtime instead, holding admission until the cooldown is visible.
+            // A closed runtime discards this task and releases its permit.
+            let gate = Arc::clone(&self.gate);
+            let epoch = self.epoch;
+            let failure_jitter = self.failure_jitter;
+            let permit = self.permit.take();
+            drop(self.runtime.spawn(async move {
+                gate.finish(epoch, false, failure_jitter);
+                drop(permit);
+            }));
+            return;
+        }
+        // Cancellation can run with no runtime or a different one entered.
+        // Stamp the cooldown with the same clock that admitted the attempt
+        // and enforces its reconnect wait, including when that clock is paused.
+        let _runtime = self.runtime.enter();
+        self.gate.finish(self.epoch, false, self.failure_jitter);
     }
 }
 
 impl Drop for ReconnectAttempt {
     fn drop(&mut self) {
         if !self.finished {
-            self.gate.finish(self.epoch, false, self.failure_jitter);
+            self.finish_failed();
         }
     }
 }
@@ -1331,6 +1357,9 @@ pub(crate) fn material_status_matches_admission(
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod reconnect_clock_tests;
 
 #[cfg(test)]
 mod tests {

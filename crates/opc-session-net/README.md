@@ -719,8 +719,40 @@ adapter-local plaintext buffering over zero/Pending/error lower transport
 remains exactly `NotTransmitted`. Each
 prewarm performs a rolling resolver/TCP/TLS/Hello refresh of every configured
 lane and retains already refreshed plus unprocessed healthy capacity on a
-partial failure. Prewarm and readiness establish authenticated transport
-capacity only, not quorum or product readiness. Diagnostics are
+partial failure. Newly authenticated unused replacements form one prewarm
+batch: their local idle intervals start together at publication, after the
+remaining lanes have been set up. Cancellation or failure publishes surviving
+replacements and releases admission; it does not discard healthy unprocessed
+siblings. A pending prewarm future may also be dropped outside its polling
+runtime's context, with the same survivor expiry and admission-release guarantees.
+Cancelled and failed reconnect attempts stamp their cooldown using the runtime
+that admitted them, even when cancellation runs on another thread or inside
+another runtime. This keeps cooldown publication and enforcement on one clock.
+If Tokio's thread-local context has already been destroyed, cancellation instead
+discards the staged lanes and releases their admission without entering a runtime.
+An unfinished reconnect attempt publishes its cooldown on its admitting runtime
+and retains reconnect admission until publication; runtime shutdown discards that
+publication task and releases admission.
+Each unused lane's effective expiry is the earlier of its local publication-based
+idle deadline and its own peer first-Call bound. The latter is measured from the
+monotonic HelloAck receive instant, less the complete measured Hello round trip
+and a safety margin. Near-expiry lanes are retired during staging and before any
+first Call write; readiness never grants them another publication-based interval.
+Every first-Call write and flush poll checks that bound before delegating to the
+transport, so a pending writer cannot resume transmission at or after expiry.
+Buffered TLS plaintext alone does not make a timeout ambiguous; only bytes
+accepted by the lower transport before expiry can do so.
+The frozen HelloAck carries no idle duration. The client therefore defaults to the
+SDK server's five-second idle with a 50 ms margin; deployments with a shorter
+server idle must configure `with_peer_idle_timeout(timeout, safety_margin)` and a
+local idle no greater than that peer timeout. The configured timeout must not
+exceed the server's effective idle, and the positive margin must cover the
+deployment's transit and scheduling delay. No peer wall-clock comparison is used.
+Staging does not extend authentication, lifecycle, address-generation,
+shutdown or peer deadlines, and cannot revive an expired or closed lane. A lane
+that has carried a Call keeps its conservative between-call deadline. Exact-width
+readiness remains mandatory for activation. Prewarm and readiness establish
+authenticated transport capacity only, not quorum or product readiness. Diagnostics are
 fixed and nonidentifying: setup phase, pool wait, active/maximum/idle counts,
 reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They
 never contain endpoints, identities, scopes, credentials, keys, payloads,
