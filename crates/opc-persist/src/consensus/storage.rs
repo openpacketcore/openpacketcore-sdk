@@ -46,6 +46,11 @@ pub(crate) struct SnapshotTestHooks {
     pub(crate) pause_captured_build: AtomicBool,
     pub(crate) build_captured: tokio::sync::Notify,
     pub(crate) resume_captured_build: tokio::sync::Notify,
+    pub(crate) pause_published_build: AtomicBool,
+    pub(crate) build_published: tokio::sync::Notify,
+    pub(crate) builds_returned_ok: AtomicU64,
+    pub(crate) build_returned_ok: tokio::sync::Notify,
+    pub(crate) read_gate_blocked: tokio::sync::Notify,
 }
 
 #[must_use = "staging artifacts must stay guarded until they are durably referenced"]
@@ -1190,6 +1195,10 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         let (meta, expected_checksum, expected_length, mut file) = {
             // Publication may unlink the selected path. Bind the record to an
             // open descriptor under the gate; verification does not need it.
+            #[cfg(test)]
+            if self.core.snapshot_gate.try_lock().is_err() {
+                self.core.snapshot_test_hooks.read_gate_blocked.notify_one();
+            }
             let _guard =
                 tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, self.core.snapshot_gate.lock())
                     .await
@@ -1433,6 +1442,8 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
         let members = self.core.expected_members.clone();
         let meta_for_save = meta.clone();
         let file_name_for_save = file_name.clone();
+        #[cfg(test)]
+        let hooks = self.core.snapshot_test_hooks.clone();
         let previous = self
             .core
             .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
@@ -1447,6 +1458,15 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     checksum,
                     length,
                 )?;
+                #[cfg(test)]
+                if hooks.pause_published_build.load(Ordering::Acquire) {
+                    // Hold only the return after an actual successful commit.
+                    // An authorized SQLite commit remains owned past its deadline.
+                    hooks.build_published.notify_one();
+                    while hooks.pause_published_build.load(Ordering::Acquire) {
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    }
+                }
                 Ok(previous)
             })
             .await
@@ -1463,6 +1483,14 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             remove_old_snapshot(&self.core.snapshot_dir, previous, &file_name),
         )
         .await;
+        #[cfg(test)]
+        {
+            self.core
+                .snapshot_test_hooks
+                .builds_returned_ok
+                .fetch_add(1, Ordering::AcqRel);
+            self.core.snapshot_test_hooks.build_returned_ok.notify_one();
+        }
         Ok(Snapshot {
             meta,
             snapshot: Box::new(snapshot),
