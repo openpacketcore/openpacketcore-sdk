@@ -215,6 +215,124 @@ async fn sequential_activation_prewarm_publishes_unused_lanes_as_one_batch() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn delayed_prewarm_never_counts_a_lane_after_its_peer_idle_deadline() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("peer-idle-batch-server");
+    let client_spiffe = spiffe("peer-idle-batch-client");
+    let (authorizer, _scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let idle_timeout = Duration::from_secs(5);
+    let (server, address) = SessionQuorumConsumerServer::new(
+        Arc::new(ActivationConsumer),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_idle_timeout(idle_timeout)
+    .listen("127.0.0.1:0".parse().expect("listen address"))
+    .await
+    .expect("authenticated consumer listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let second_entered = Arc::new(Notify::new());
+    let second_release = Arc::new(Notify::new());
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        let second_entered = Arc::clone(&second_entered);
+        let second_release = Arc::clone(&second_release);
+        Arc::new(move || {
+            let resolutions = Arc::clone(&resolutions);
+            let second_entered = Arc::clone(&second_entered);
+            let second_release = Arc::clone(&second_release);
+            Box::pin(async move {
+                if resolutions.fetch_add(1, Ordering::SeqCst) == 1 {
+                    second_entered.notify_one();
+                    second_release.notified().await;
+                }
+                Ok(address)
+            })
+        })
+    };
+    let config = PersistentSessionConsumerConfig::try_new(
+        2,
+        4,
+        Duration::from_millis(250),
+        1,
+        Duration::from_millis(600),
+        2,
+        Duration::ZERO,
+        Duration::from_secs(1),
+    )
+    .expect("bounded two-lane configuration");
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            voter_authority,
+            pki.client_config(&client_spiffe),
+        )
+        .with_operation_timeout(Duration::from_millis(250))
+        .with_idle_timeout(idle_timeout),
+        config,
+    )
+    .expect("persistent client");
+    pause_client_clock_at_tick(runtime_origin).await;
+    let first_hello_at = tokio::time::Instant::now();
+    let prewarm = {
+        let client = client.clone();
+        tokio::spawn(async move { client.prewarm().await })
+    };
+    without_clock_advance(second_entered.notified()).await;
+    let staged = client.diagnostics().await;
+    assert_eq!(staged.setup_successes, 1);
+    assert_eq!(staged.setup_attempts, 2);
+    assert_eq!(server.admission_snapshot().active_connections, 1);
+    tokio::time::advance(Duration::from_millis(25)).await;
+    second_release.notify_one();
+    let published = without_clock_advance(prewarm)
+        .await
+        .expect("prewarm task")
+        .expect("both authenticated lanes published");
+    assert!(published.ready);
+    assert_eq!(published.ready_request_connections, 2);
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    assert_eq!(server.admission_snapshot().active_connections, 2);
+    let publication = tokio::time::Instant::now();
+    assert_eq!(publication - first_hello_at, Duration::from_millis(25));
+
+    // Both endpoints share the explicitly driven clock. The real server must
+    // retire the first lane itself; no synthetic EOF or socket close is used.
+    tokio::time::advance(idle_timeout - Duration::from_millis(24)).await;
+    without_clock_advance(async {
+        while server.admission_snapshot().active_connections != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        tokio::time::Instant::now() - first_hello_at,
+        idle_timeout + Duration::from_millis(1)
+    );
+    assert!(tokio::time::Instant::now() < publication + idle_timeout);
+    let peer_live = server.admission_snapshot().active_connections;
+    let readiness = client.readiness().await;
+    eprintln!(
+        "peer_idle elapsed_ms={} peer_live={peer_live} ready={}/{}",
+        first_hello_at.elapsed().as_millis(),
+        readiness.ready_request_connections,
+        readiness.configured_request_connections,
+    );
+    without_clock_advance(client.shutdown()).await;
+    without_clock_advance(server.abort_and_wait()).await;
+    assert_eq!(peer_live, 1);
+    assert!(
+        readiness.ready_request_connections <= peer_live as usize,
+        "a peer-closed unused lane must not count toward exact-width readiness"
+    );
+    assert!(!readiness.ready);
+}
+
 struct InterruptedBatch {
     server: Option<IndependentServer>,
     client: PersistentSessionConsumerClient,

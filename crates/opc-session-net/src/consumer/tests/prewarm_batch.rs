@@ -87,6 +87,89 @@ fn prewarm_batch_drop_reaps_on_its_origin_runtime_without_a_pruning_api() {
     }
 }
 
+#[test]
+fn prewarm_batch_drop_after_tokio_thread_local_teardown_discards_admission() {
+    struct ThreadExitBatch {
+        batch: Option<PersistentPrewarmBatch>,
+        result: std::sync::mpsc::Sender<(bool, bool)>,
+    }
+
+    impl Drop for ThreadExitBatch {
+        fn drop(&mut self) {
+            let context_destroyed = tokio::runtime::Handle::try_current()
+                .is_err_and(|error| error.is_thread_local_destroyed());
+            // Catch the production panic inside the TLS destructor so the
+            // regression reports a normal test failure instead of aborting.
+            let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(self.batch.take());
+            }));
+            let _ = self.result.send((context_destroyed, dropped.is_ok()));
+        }
+    }
+
+    thread_local! {
+        static THREAD_EXIT_BATCH: std::cell::RefCell<Option<ThreadExitBatch>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("live origin runtime");
+    let (client, batch, _peer, _metrics_guard) = runtime.block_on(async {
+        let metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+        let client = PersistentSessionConsumerClient::try_from_stateless(
+            stateless,
+            PersistentSessionConsumerConfig {
+                request_connections: 1,
+                ..PersistentSessionConsumerConfig::default()
+            },
+        )
+        .expect("one physical lane");
+        let (mut connection, peer) = staged_connection(&client);
+        connection._persistent_physical_admission = Some(
+            Arc::clone(&client.pool.physical_lanes)
+                .try_acquire_owned()
+                .expect("staged lane owns physical admission"),
+        );
+        let mut batch = PersistentPrewarmBatch::new(Arc::clone(&client.pool));
+        batch.connections.push(connection);
+        (client, batch, peer, metrics_guard)
+    });
+    assert_eq!(client.pool.physical_lanes.available_permits(), 0);
+    let handle = runtime.handle().clone();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // TLS destructors run in reverse initialization order. Initialize
+        // our owner first, then Tokio's context on this otherwise fresh thread.
+        THREAD_EXIT_BATCH.with(|slot| {
+            *slot.borrow_mut() = Some(ThreadExitBatch {
+                batch: Some(batch),
+                result: result_tx,
+            });
+        });
+        drop(handle.enter());
+    })
+    .join()
+    .expect("thread exits without an uncaught destructor panic");
+    let (context_destroyed, dropped) = result_rx.recv().expect("TLS destructor ran");
+    assert!(
+        context_destroyed,
+        "fixture must run after Tokio TLS teardown"
+    );
+    assert_eq!(client.pool.physical_lanes.available_permits(), 1);
+    assert!(client.pool.idle.lock().expect("raw idle lanes").is_empty());
+    runtime.block_on(client.shutdown());
+    assert!(
+        dropped,
+        "dropping a prewarm batch after Tokio TLS teardown must not panic"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn prewarm_batch_publication_keeps_peer_and_used_lane_deadlines() {
     let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
