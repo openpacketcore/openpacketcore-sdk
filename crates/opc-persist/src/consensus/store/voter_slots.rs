@@ -39,7 +39,6 @@ pub(super) struct ConfigVoterProfile {
 struct ReplacementProgress {
     key: Option<([u8; 32], VoterSlotLogId, Vote<ConsensusNodeId>)>,
     marker: Option<VoterSlotLogId>,
-    snapshot_requested: bool,
     snapshot: Option<SnapshotDelivery>,
     retry_delay: Duration,
 }
@@ -1023,42 +1022,32 @@ impl ConsensusConfigStore {
     ) -> Result<VoterSnapshotEvidence, VoterReplacementError> {
         if progress.snapshot.is_none() {
             let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
-            let snapshot = loop {
-                let mut metrics = self.inner.raft.metrics();
-                if let Some(snapshot) = self
-                    .inner
-                    .raft
-                    .get_snapshot()
-                    .await
-                    .map_err(|_| VoterReplacementError::Unavailable)?
-                {
-                    if snapshot
+            let required = operation.evidence.prepare.index;
+            self.wait_for_snapshot_cut(Some(required), vote, deadline)
+                .await
+                .map_err(|_| {
+                    if tokio::time::Instant::now() >= deadline {
+                        VoterReplacementError::Deadline
+                    } else {
+                        VoterReplacementError::Unavailable
+                    }
+                })?;
+            let mut snapshot = tokio::time::timeout_at(deadline, self.inner.raft.get_snapshot())
+                .await
+                .map_err(|_| VoterReplacementError::Deadline)?
+                .map_err(|_| VoterReplacementError::Unavailable)?
+                .filter(|snapshot| {
+                    snapshot
                         .meta
                         .last_log_id
-                        .is_some_and(|cut| cut.index >= operation.evidence.prepare.index)
-                    {
-                        break snapshot;
-                    }
-                }
-                if !progress.snapshot_requested {
-                    self.inner
-                        .raft
-                        .trigger()
-                        .snapshot()
-                        .await
-                        .map_err(|_| VoterReplacementError::Unavailable)?;
-                    progress.snapshot_requested = true;
-                }
-                tokio::time::timeout_at(deadline, metrics.changed())
-                    .await
-                    .map_err(|_| VoterReplacementError::Deadline)?
-                    .map_err(|_| VoterReplacementError::Unavailable)?;
-            };
+                        .is_some_and(|cut| cut.index >= required)
+                })
+                .ok_or(VoterReplacementError::Unavailable)?;
             let cut = snapshot
                 .meta
                 .last_log_id
                 .ok_or(VoterReplacementError::InvalidTransition)?;
-            let (_, digest, _) = storage::verify_snapshot_envelope(snapshot.snapshot.path())
+            let (_, digest, _) = storage::verify_open_snapshot_envelope(snapshot.snapshot.as_mut())
                 .await
                 .map_err(|_| VoterReplacementError::Unavailable)?;
             let evidence = VoterSnapshotEvidence {
