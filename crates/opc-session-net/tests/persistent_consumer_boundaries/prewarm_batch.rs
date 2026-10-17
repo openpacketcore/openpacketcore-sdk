@@ -79,6 +79,11 @@ impl Drop for IndependentServer {
     }
 }
 
+// A hang guard, not a latency or protocol bound: real TCP/TLS setup on slow
+// debug runners, including i686, can exceed five wall-clock seconds while the
+// protocol clock is paused. Product timing is checked against that clock.
+const LOOPBACK_HANG_GUARD: Duration = Duration::from_secs(60);
+
 // Keep an I/O anchor runnable while real TCP/TLS work completes. Only the
 // explicit advance in the scenario may move the client's protocol clock.
 async fn without_clock_advance<F: std::future::Future>(future: F) -> F::Output {
@@ -88,8 +93,8 @@ async fn without_clock_advance<F: std::future::Future>(future: F) -> F::Output {
     loop {
         assert_eq!(tokio::time::Instant::now(), started);
         assert!(
-            wall_started.elapsed() < Duration::from_secs(5),
-            "authenticated loopback fixture stalled"
+            wall_started.elapsed() < LOOPBACK_HANG_GUARD,
+            "authenticated loopback fixture exceeded its wall-clock hang guard"
         );
         tokio::select! {
             biased;
