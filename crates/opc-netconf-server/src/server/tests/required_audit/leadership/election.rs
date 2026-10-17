@@ -463,9 +463,6 @@ async fn split_vote_reproduces_authority_timeout() {
         for script in scripts {
             script.finish();
         }
-        // RED evidence: preserve the original helper's failure after checking
-        // the exact historical index shape. The final negative control catches it.
-        std::panic::resume_unwind(panic);
     })
     .await;
 }
