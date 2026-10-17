@@ -147,7 +147,8 @@ impl ConsensusSessionStore {
         self.release_surviving_vote_leases(&scope, request, quorum - 1, deadline)
             .await?;
         self.start_successor_election(&scope, request, deadline)
-            .await?;
+            .await
+            .map_err(|_| consensus_unavailable())?;
         self.confirm_surviving_leader(&scope, Some(request), deadline)
             .await
     }
