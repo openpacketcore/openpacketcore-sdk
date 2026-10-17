@@ -354,7 +354,11 @@ async fn consumer_lease_deferral_reuses_one_sealed_binding_across_sixteen_refusa
                     .bound_entries(),
                 2
             );
-            let observed = facade
+            // Inspect committed metadata without decrypting through the
+            // provider whose call count measures the prepared operation.
+            let observed = fixture
+                .cluster
+                .store(0)
                 .observe_fenced_transition(prior.lease().key())
                 .await
                 .unwrap();
@@ -363,6 +367,7 @@ async fn consumer_lease_deferral_reuses_one_sealed_binding_across_sixteen_refusa
                 observed.record().unwrap().generation,
                 prior.committed_generation()
             );
+            assert_eq!(provider.calls(), provider_calls);
             drop(prepared);
             if refusal == 7 {
                 drop(facade);
