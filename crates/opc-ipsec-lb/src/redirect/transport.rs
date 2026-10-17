@@ -1928,7 +1928,7 @@ where
             .checked_add(context.inner.session.profile().receipt_timeout())
             .map(|deadline| deadline.min(context.deadline))
             .unwrap_or(context.deadline);
-        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(slice_deadline));
+        let sleep = opc_types::deadline::sleep_until(slice_deadline);
         tokio::pin!(sleep);
         let datagram = Arc::clone(&context.inner.datagram);
         let metrics = Arc::clone(&context.inner.metrics);

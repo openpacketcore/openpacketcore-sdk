@@ -23,6 +23,7 @@ use tokio::time::Instant;
 use opc_identity::{build_identity_state, IdentityState, TrustBundle, TrustBundleSet, TrustDomain};
 use opc_protocol::{Encode, EncodeContext};
 use opc_tls::TlsMaterialController;
+use opc_types::deadline::sleep_until as raw_engine_timer;
 use opc_types::{SpiffeId, Timestamp};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
@@ -37,10 +38,6 @@ use crate::{
 
 const CLIENT_ID: &str =
     "spiffe://example.test/tenant/tenant-a/ns/core/sa/diameter/nf/smf/instance/client-0";
-
-fn raw_engine_timer(next: std::time::Instant) -> tokio::time::Sleep {
-    tokio::time::sleep_until(Instant::from_std(next))
-}
 
 #[tokio::test(start_paused = true)]
 async fn std_deadline_raw_engine_and_peer_timers_preserve_remaining_budget() {

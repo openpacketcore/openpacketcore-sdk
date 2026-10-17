@@ -1,22 +1,11 @@
 //! Waits bounded by an absolute standard-clock deadline.
 
-use std::future::Future;
-use std::time::Instant;
-
-pub(crate) async fn timeout<F: Future>(
-    deadline: Instant,
-    future: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    // Blocking I/O uses this same standard-clock deadline. Tokio's clock can
-    // advance independently, so carry only the remaining duration across the
-    // boundary, without granting another full operation budget.
-    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), future).await
-}
+pub(crate) use opc_types::deadline::timeout;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[tokio::test(start_paused = true)]
     async fn advanced_tokio_clock_preserves_standard_clock_budget() {

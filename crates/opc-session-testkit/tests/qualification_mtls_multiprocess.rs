@@ -21,9 +21,7 @@ use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-fn wait_for_scheduled_batch(scheduled_at: Instant) -> tokio::time::Sleep {
-    tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled_at))
-}
+use opc_types::deadline::sleep_until as wait_for_scheduled_batch;
 
 #[tokio::test(start_paused = true)]
 async fn std_deadline_batch_pacing_keeps_remaining_budget() {

@@ -20,8 +20,7 @@ fn unavailable(_: impl fmt::Debug) -> ScopeScanError {
 }
 
 fn local_configuration_deadline() -> tokio::time::Instant {
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    tokio::time::Instant::from_std(deadline)
+    tokio::time::Instant::now() + Duration::from_secs(1)
 }
 
 fn view_error(error: ViewError) -> ScopeScanError {

@@ -21,6 +21,9 @@ pass raw strings at trust boundaries.
   `NetworkFunctionKind`, `NfType`, and `NfInstanceId`.
 - Versioning/time types: `ConfigVersion`, `SchemaDigest`, `Timestamp`, and
   `TxId`.
+- `deadline::remaining` preserves the unspent budget of a standard-clock
+  deadline. The optional `async-time` feature adds Tokio sleep and timeout
+  adapters that carry that duration across independently adjusted clocks.
 - Redaction helpers: `Redacted<T>`, `redact(&value)`, `IntoRedacted`, and
   `RedactedDebug`.
 - Errors: `ParseError`.

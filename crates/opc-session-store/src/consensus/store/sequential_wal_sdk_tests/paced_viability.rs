@@ -6,6 +6,7 @@
 use super::*;
 use crate::fenced_transition::FencedTransitionV2Effect;
 use crate::StoreError;
+use opc_types::deadline::sleep_until as wait_for_paced_deadline;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::task::JoinSet;
@@ -16,10 +17,6 @@ const CLIENTS: usize = 8;
 const SESSIONS: usize = 65;
 const WINDOW: Duration = Duration::from_secs(60);
 const DEADLINE: Duration = Duration::from_millis(800);
-
-fn wait_for_paced_deadline(deadline: Instant) -> tokio::time::Sleep {
-    tokio::time::sleep_until(deadline.into())
-}
 
 #[tokio::test(start_paused = true)]
 async fn std_deadline_pacing_and_window_ends_keep_remaining_budget() {
@@ -789,7 +786,7 @@ async fn paced_three_voter_sdk_1000_ops_per_second_for_60s() {
         }
     }
     if let Some(start) = workload_start {
-        tokio::time::sleep_until((start + WINDOW).into()).await;
+        wait_for_paced_deadline(start + WINDOW).await;
     }
     counters.stage.store(3, Ordering::Relaxed);
     let summary = std::panic::catch_unwind(AssertUnwindSafe(|| {

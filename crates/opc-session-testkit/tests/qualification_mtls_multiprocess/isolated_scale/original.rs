@@ -19,6 +19,9 @@ use opc_session_store::{
     FencedTransitionMutationResult, FencedTransitionOutcome,
     FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES, FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES,
 };
+use opc_types::deadline::{
+    sleep_until as wait_for_scheduled_item, timeout as status_observations_before,
+};
 use opc_types::{NetworkFunctionKind, TenantId};
 use requests::*;
 use resources::*;
@@ -32,17 +35,6 @@ const SNAPSHOT_CEILING: u64 = FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_BYTES * 
 const BATCH_BOUND: Duration = Duration::from_millis(800);
 const RETRY_BACKOFF: Duration = Duration::from_millis(25);
 const RETRIES: usize = 16;
-
-async fn status_observations_before<F: std::future::Future>(
-    deadline: Instant,
-    observations: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), observations).await
-}
-
-fn wait_for_scheduled_item(due: Instant) -> tokio::time::Sleep {
-    tokio::time::sleep_until(tokio::time::Instant::from_std(due))
-}
 
 #[tokio::test(start_paused = true)]
 async fn std_deadline_status_observations_keep_unexpired_budget() {

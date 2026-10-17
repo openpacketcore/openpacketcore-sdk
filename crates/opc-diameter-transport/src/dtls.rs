@@ -2276,7 +2276,9 @@ enum PumpEvent {
 }
 
 fn runtime_engine_deadline(next_timer: Option<std::time::Instant>, fallback: Instant) -> Instant {
-    next_timer.map(Instant::from_std).unwrap_or(fallback)
+    next_timer
+        .map(|timer| Instant::now() + opc_types::deadline::remaining(timer))
+        .unwrap_or(fallback)
 }
 
 #[cfg(test)]
@@ -2337,7 +2339,7 @@ async fn pump_wait(
     };
     Ok(tokio::select! {
         () = tokio::time::sleep_until(deadline) => PumpEvent::Deadline,
-        () = tokio::time::sleep_until(Instant::from_std(timer)) => PumpEvent::Timer,
+        () = opc_types::deadline::sleep_until(timer) => PumpEvent::Timer,
         message = io.receive_message() => PumpEvent::Message(message?),
     })
 }
