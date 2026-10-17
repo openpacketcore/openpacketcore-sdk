@@ -458,7 +458,7 @@ advance a floor by advertising a larger number.
 | RPC or direction | Admission and refusal |
 | :--- | :--- |
 | RequestVote and Vote response | Sender and intended recipient must be admitted voting incarnations in the exact engine configuration. Bind the candidate ID in the request to its authenticated source. `Pending`, `CatchingUp`, retired, unknown, or mismatched identities are refused before term/vote updates, timer resets, self-votes, or response tallying. A response's contained vote is not its authenticated responder identity. |
-| PreVote and response | The pinned engine has no PreVote RPC. Unknown wire families fail closed. Any future PreVote implementation must use the same incarnation/voting gates before evaluation and tallying, and cannot mutate durable term/vote or grant voting admission. It is not a retirement or promotion proof. |
+| PreVote and response | The pinned engine's distinct PreVote RPC uses the same incarnation/voting gates before evaluation and tallying. An inquiry cannot mutate the recipient's durable term/vote or grant voting admission. Unknown wire families fail closed. An observed eligible ordinary campaign can permit a real election after a bounded inquiry round; its vote must still be persisted and obtain actual quorum grants. It is not a retirement or promotion proof. |
 | AppendEntries, empty heartbeat, and AppendEntriesRoster | Only a currently admitted leader incarnation may initiate. Start the candidate's replication stream only after out-of-band snapshot installation and learner addition; a retired source or destination is refused. Preserve the existing inner leader-ID binding and roster payload checks. Responses from a retired member or an obsolete channel cannot alter term, match index, or commit progress. |
 | InstallSnapshot, every chunk and final install | Only an admitted leader can send, addressed to an exact admitted voter or selected candidate. Revalidate the sender/receiver and replacement binding for each chunk and at publication. Refuse regressions in slot floors, table revision, membership/transition evidence, format, or activation floors. A new leader starts a freshly authorized transfer; stale chunks cannot finish it. |
 | LeadershipTransfer | Both identities must be admitted voters in the appropriate committed configuration, with the existing exact vote/log checks. No transfer to a learner, retired incarnation, or uncommitted successor. |
@@ -901,8 +901,8 @@ with independent adversarial review of the concrete implementation.
   CatchingUp identities; vary source, destination, inner candidate/leader ID,
   cluster installation, configuration, SVID, incarnation key, and channel.
   Test a reused SVID with both valid old credentials and a forged `k+1` field.
-  Until PreVote exists, its unknown wire form must fail closed; any addition
-  must pass the same voting matrix before use.
+  Exercise PreVote through the same voting matrix; unknown wire forms must
+  still fail closed, and no inquiry may grant actual voting admission.
 - Show that effective-but-uncommitted joint membership never enables the
   candidate's self-vote, automatic campaign, explicit campaign, or Vote reply.
   After committed joint plus local durable application, show normal voting.

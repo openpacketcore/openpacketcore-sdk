@@ -795,15 +795,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-consensus`: the pinned OpenRaft fork uses a distinct authenticated
   Pre-Vote inquiry before ordinary elections and checks election deadlines at
-  intervals of at most 100 ms. A stale or isolated candidate no longer consumes
-  a term before proving a prospective quorum. Inquiries leave the receiver's
+  intervals of at most 100 ms. An isolated candidate's unanswered inquiries do
+  not consume a term. Inquiries leave the receiver's
   vote and durable state unchanged; actual votes still persist through the
   existing election path. Both SDK adapters enforce the existing voting and
   membership admission rules for the new RPC. Automatic failover fixtures keep
   their original helpers and 26 s/30 s limits; three- and five-voter regressions
   kill the leader during sustained writes without first synchronizing survivor
   logs. Repeated failed campaigns remain negative controls for these acceptance
-  SLOs. Planned handoff and operator timing profiles are unchanged. (#1333, #1324)
+  SLOs. A live legacy voter's ordinary campaign permits bounded fallback to real
+  voting during a rolling upgrade or downgrade, retaining durable votes, log
+  checks, joint majorities and peer fences. Real preceding-version engines
+  exercise leader loss with divergent stored logs. Planned handoff and operator
+  timing profiles are unchanged. (#1333, #1324)
 
 - `opc-proto-gtpv2c`: An empty Create Session Response APCO received before any
   retained APCO is discarded as malformed optional outer-IE data at every

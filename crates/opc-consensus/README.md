@@ -175,6 +175,17 @@ membership. The 26-second and 30-second acceptance budgets are unchanged;
 repeated failed campaigns can still exhaust them. Planned exact-vote handoff
 retains its existing election path.
 
+During a mixed-version roll, an eligible legacy voter can send ordinary votes
+while being unable to answer Pre-Vote. When that voter's shorter log is refused,
+the upgraded engine can start an ordinary election after one bounded inquiry
+round, above the observed actual candidate term. It still persists its self-vote
+and obtains real quorum grants. A heartbeat, vote, log or membership change,
+retirement, or a fence for that peer discards the volatile observation. An
+unanswered inquiry alone does not trigger this fallback, and adapters never
+translate Pre-Vote into Vote. Upgrade and downgrade require no separate
+activation setting; compatibility is exercised against the actual preceding
+fork with divergent stored logs and leader loss.
+
 The fork also retains the per-campaign election-timeout fix and preserves a recovering snapshot target's
 required log suffix through successful handoff, while failed targets release
 their ownership before retrying. When a higher vote ends leadership, the core
