@@ -31,6 +31,7 @@ mod authority_reservation;
 mod bootstrap;
 mod clock;
 mod closed;
+mod history_read;
 mod initialization;
 mod majority_authority;
 mod majority_protocol;
@@ -58,6 +59,7 @@ struct Peer {
     blocked_votes: AtomicBool,
     blocked_append_above: Mutex<Option<(SessionConsensusNodeId, u64)>>,
     held_reply: Mutex<Option<Arc<races::ReplyHold>>>,
+    held_requests: Mutex<Option<Arc<history_read::RequestHold>>>,
     cut_mutation: Mutex<Option<admission::CutMutation>>,
 }
 
@@ -92,6 +94,10 @@ impl SessionConsensusPeer for Peer {
             .contains(&request.sender)
         {
             return Err(SessionConsensusPeerError::Unavailable);
+        }
+        let held_requests = self.held_requests.lock().unwrap().clone();
+        if let Some(hold) = held_requests {
+            hold.wait().await;
         }
         let append_limit = *self.blocked_append_above.lock().unwrap();
         if let Some((sender, limit)) = append_limit {
@@ -242,6 +248,7 @@ impl Fleet {
                     blocked_votes: AtomicBool::new(false),
                     blocked_append_above: Mutex::new(None),
                     held_reply: Mutex::new(None),
+                    held_requests: Mutex::new(None),
                     cut_mutation: Mutex::new(None),
                 })
             })
