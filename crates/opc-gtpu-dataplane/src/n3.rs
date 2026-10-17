@@ -90,6 +90,9 @@ pub enum N3PacketError {
     /// The PSC is malformed or outside the shared codec's supported subset.
     #[error("invalid or unsupported N3 PDU Session Container")]
     InvalidPsc,
+    /// The PSC requests QoS monitoring, outside this forwarding subset.
+    #[error("unsupported N3 QoS monitoring packet")]
+    UnsupportedQosMonitoring,
     /// The PSC's direction disagrees with the caller's expected direction.
     #[error("N3 direction mismatch")]
     DirectionMismatch,
@@ -435,6 +438,16 @@ impl<'a> N3PacketView<'a> {
             if extension.ext_type == GTPU_EXT_PDU_SESSION_CONTAINER {
                 if psc.is_some() {
                     return Err(N3PacketError::DuplicatePsc);
+                }
+                // QMP packets may omit the T-PDU. Classify monitoring before
+                // the base-subset codec rejects its conditional fields and
+                // before applying the user-payload requirement.
+                if extension
+                    .content
+                    .first()
+                    .is_some_and(|octet| octet >> 4 <= 1 && octet & 0x08 != 0)
+                {
+                    return Err(N3PacketError::UnsupportedQosMonitoring);
                 }
                 psc = Some(
                     PduSessionContainer::decode(&extension)

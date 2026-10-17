@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = "crates/opc-gtpu-dataplane/tests/n3_reference.tsv"
-DIGEST = "31da0a1658218432817bc181be4233fadd4fd1f36c36f3d29f087bc131b8424a"
+DIGEST = "87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2"
 PREFIX = "opc.n3iwf.n3-gtpu.v1.reference-"
 
 

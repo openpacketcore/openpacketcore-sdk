@@ -341,6 +341,34 @@ class WireRegressions(unittest.TestCase):
                 with self.assertRaisesRegex(key_lifecycle.Invalid, "^" + reason + "$"):
                     key_lifecycle.validate(changed, payload)
 
+    def test_psc_reference_generator_uses_spec_ppi_octets(self):
+        spec = importlib.util.spec_from_file_location(
+            "n3_reference", ROOT / "crates/opc-gtpu-dataplane/tests/n3_reference.py"
+        )
+        reference = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reference)
+        # TS 38.415 V18.2.0 figure 5.5.2.1-1, independent literal octets.
+        for ppi, octet in enumerate((0x00, 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe0)):
+            with self.subTest(ppi=ppi):
+                self.assertEqual(reference.psc("dl", 9, True, ppi),
+                                 bytes([2, 0, 0xc9, octet, 0, 0, 0, 0]))
+
+    def test_psc_reference_and_catalog_match_spec_ppi_octets(self):
+        rows = gtpu_reference.reference_rows()
+        for rqi in (0, 1):
+            for ppi, octet in enumerate((0x00, 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe0)):
+                case = f"dl-9-{rqi}-{ppi}"
+                with self.subTest(case=case, source="reference"):
+                    self.assertEqual(bytes.fromhex(rows[case][7])[15], octet)
+                with self.subTest(case=case, source="catalog"):
+                    self.assertEqual(wire("n3-gtpu", "reference-" + case)[15], octet)
+
+    def test_psc_fuzz_seeds_match_reference_packets(self):
+        rows = gtpu_reference.reference_rows()
+        for path in (ROOT / "crates/opc-gtpu-dataplane/fuzz/corpus/n3_packet").iterdir():
+            with self.subTest(case=path.name):
+                self.assertEqual(path.read_bytes(), bytes.fromhex(rows[path.name][7]))
+
     def test_psc_catalog_cannot_replace_independent_source_evidence(self):
         original = json.loads((FIXTURES / "n3-gtpu/reference-dl-9-1-7.json").read_text())
         data = wire("n3-gtpu", "reference-dl-9-1-7")

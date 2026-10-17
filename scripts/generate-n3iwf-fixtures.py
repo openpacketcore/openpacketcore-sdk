@@ -2280,7 +2280,7 @@ construction argument 64, not a packet with malformed spare bits.
 def n3_psc_references() -> list[tuple[dict, str]]:
     """Reuse exact independently authored packet vectors; never SDK encoding."""
     source = "crates/opc-gtpu-dataplane/tests/n3_reference.tsv"
-    digest = "31da0a1658218432817bc181be4233fadd4fd1f36c36f3d29f087bc131b8424a"
+    digest = "87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2"
     path = ROOT / source
     if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         raise ValueError("n3iwf_psc_reference_digest")

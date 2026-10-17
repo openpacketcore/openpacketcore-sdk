@@ -26,7 +26,8 @@ def psc(direction, qfi, rqi=False, ppi=None):
     qos = qfi + 64 * rqi + 128 * (ppi is not None)
     if ppi is None:
         return bytes([1, 0, qos, 0])
-    return bytes([2, 0, qos, ppi, 0, 0, 0, 0])
+    # Figure 5.5.2.1-1: PPI is the high three bits; spare bits are zero.
+    return bytes([2, 0, qos, 32 * ppi, 0, 0, 0, 0])
 
 
 def packet(extensions, payload=PAYLOAD, flags=0x34, message_type=255):
@@ -103,7 +104,7 @@ def rows():
     add("ppi-missing", "dl", packet([(0x85, bytes([1, 0, 0x89, 0]))]))
     # Spare DL bits and padding are not interpreted by the receiver.
     for spare in range(32):
-        wire = bytes([2, 1, 0xC9, (spare << 3) | 7, 0xA1, 0xB2, 0xC3, 0])
+        wire = bytes([2, 1, 0xC9, 0xE0 | spare, 0xA1, 0xB2, 0xC3, 0])
         add(f"dl-spares-{spare}", "dl", packet([(0x85, wire)]), True, 9, True, 7)
     assert len({row[0] for row in result}) == len(result)
     return result

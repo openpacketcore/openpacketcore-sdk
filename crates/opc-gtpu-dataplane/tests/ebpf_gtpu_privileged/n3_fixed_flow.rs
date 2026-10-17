@@ -300,7 +300,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
             let mut ppi = valid.clone();
             ppi[12] = 2;
             ppi[14] |= 0x80;
-            ppi.splice(15..16, [7, 0, 0, 0, 0]);
+            ppi.splice(15..16, [0xe0, 0, 0, 0, 0]);
             let ppi_length = u16::try_from(ppi.len() - 8).unwrap();
             ppi[2..4].copy_from_slice(&ppi_length.to_be_bytes());
             send_downlink(&net, outer6, &ppi);
