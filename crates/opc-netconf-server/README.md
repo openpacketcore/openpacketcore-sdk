@@ -386,9 +386,14 @@ the next eligible campaign at 27 seconds. These are controlled test schedules,
 not a fixed failover guarantee for randomized production elections. The engine
 configuration and operation deadlines are unchanged.
 
-Paused time requires a current-thread Tokio runtime. The authenticated election
-retains its real mTLS transport, admission refusals and audit-recovery checks,
-but no longer exercises concurrent dispatch across four Tokio workers.
+A four-worker companion runs the complete authenticated setup and recovery
+scenario with real mTLS, admission refusals, outstanding terminal debt, both
+writer fences and the subsequent write. It disables automatic campaigns only
+through a test hook, quiesces admitted traffic from the isolated leader, waits
+for the engine's recorded vote lease to expire, and triggers one designated
+campaign. Actual peer votes and the unchanged fresh-authority check must
+succeed before recovery. The paused fixture separately proves automatic
+election timing; neither fixture changes production timers.
 
 Run:
 

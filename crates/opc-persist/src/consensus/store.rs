@@ -334,6 +334,52 @@ impl fmt::Debug for ConsensusConfigStore {
 }
 
 impl ConsensusConfigStore {
+    /// Disable automatic campaigns for a deterministic concurrent fixture.
+    /// Explicit test campaigns still use the engine's normal voting path.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn disable_automatic_elections_for_test(&self) {
+        self.inner.raft.runtime_config().elect(false);
+    }
+
+    /// Observe expiry of the engine's committed-vote lease without changing it.
+    /// The caller must quiesce old-leader traffic and bound this future.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub async fn wait_for_vote_lease_expiry_for_test(&self) -> Result<(), PersistError> {
+        // Openraft derives its leader lease from election_timeout_max. Read
+        // the actual last vote update inside the core instead of guessing a
+        // delay from when the fixture disabled a transport path.
+        let lease = Duration::from_millis(
+            config_raft_config()
+                .map_err(|_| consensus_unavailable())?
+                .election_timeout_max,
+        );
+        loop {
+            let deadline = self
+                .inner
+                .raft
+                .with_raft_state(move |state| {
+                    if state.vote_ref().is_committed() {
+                        state.vote_last_modified().map(|updated| updated + lease)
+                    } else {
+                        None
+                    }
+                })
+                .await
+                .map_err(|_| consensus_unavailable())?;
+            let Some(deadline) = deadline else {
+                return Ok(());
+            };
+            if tokio::time::Instant::now() > deadline {
+                return Ok(());
+            }
+            // The engine refuses a vote at equality too. This is its exact
+            // expiry boundary, not a new election or operation timeout.
+            tokio::time::sleep_until(deadline + Duration::from_nanos(1)).await;
+        }
+    }
+
     /// Ask Openraft to start one normal campaign for deterministic integration
     /// qualification. Openraft owns vote creation, persistence, and transport.
     #[cfg(feature = "dangerous-test-hooks")]

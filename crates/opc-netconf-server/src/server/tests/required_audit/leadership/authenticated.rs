@@ -20,6 +20,8 @@ use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::RwLock;
 
+mod four_worker;
+
 struct Pki(rcgen::CertifiedIssuer<'static, rcgen::KeyPair>);
 
 impl Pki {
@@ -201,11 +203,14 @@ impl ConsensusPeer for NetworkPath {
     }
 }
 
+type SourceGates = Arc<BTreeMap<ConfigConsensusNodeId, tokio::sync::RwLock<bool>>>;
+
 #[derive(Debug)]
 struct ObservedHandler {
     inner: Arc<dyn ConsensusRpcHandler>,
     admissions: Arc<AtomicU64>,
     activity: Arc<tokio::sync::Notify>,
+    source_gates: SourceGates,
 }
 
 #[async_trait::async_trait]
@@ -220,7 +225,21 @@ impl ConsensusRpcHandler for ObservedHandler {
             "transport admitted a mismatched sender"
         );
         self.admissions.fetch_add(1, Ordering::AcqRel);
+        // A writer both blocks later old-leader requests and waits for every
+        // already-admitted handler to finish, including RPCs whose outbound
+        // caller was cancelled before the server completed the request.
+        let blocked = match self.source_gates.get(&authenticated_sender) {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        };
+        if blocked.as_ref().is_some_and(|blocked| **blocked) {
+            self.activity.notify_one();
+            return ConsensusWireResponse {
+                result: Err(ConsensusPeerError::Unavailable),
+            };
+        }
         let response = self.inner.handle(authenticated_sender, request).await;
+        drop(blocked);
         self.activity.notify_one();
         response
     }
@@ -237,6 +256,7 @@ struct NetworkQuorum {
     checkpoints: Arc<Checkpoints>,
     admissions: Arc<AtomicU64>,
     activity: Arc<tokio::sync::Notify>,
+    source_gates: SourceGates,
 }
 
 impl NetworkQuorum {
@@ -259,6 +279,12 @@ impl NetworkQuorum {
         let nodes = bindings
             .each_ref()
             .map(|binding| binding.local_consensus_node_id());
+        let source_gates: SourceGates = Arc::new(
+            nodes
+                .into_iter()
+                .map(|node| (node, tokio::sync::RwLock::new(false)))
+                .collect(),
+        );
         let identity = bindings[0].consensus_identity();
         let addresses: Vec<_> = (0..3).map(|_| Arc::new(RwLock::new(None))).collect();
         let mut paths = BTreeMap::new();
@@ -338,6 +364,7 @@ impl NetworkQuorum {
                     inner: stores[index].rpc_handler(),
                     admissions: admissions.clone(),
                     activity: activity.clone(),
+                    source_gates: source_gates.clone(),
                 }),
                 pki.server(index as u16 + 1),
                 binding,
@@ -360,6 +387,7 @@ impl NetworkQuorum {
             checkpoints,
             admissions,
             activity,
+            source_gates,
         }
     }
 
@@ -425,6 +453,13 @@ impl NetworkQuorum {
         }
     }
 
+    async fn isolate_and_quiesce(&self, node: usize) {
+        self.isolate(node);
+        *self.source_gates[&self.stores[node].status().node_id]
+            .write()
+            .await = true;
+    }
+
     async fn shutdown(self) {
         for server in self.servers {
             server.abort_and_wait().await;
@@ -484,6 +519,7 @@ async fn assert_authentication_controls(
             inner: handler,
             admissions: admissions.clone(),
             activity: Arc::new(tokio::sync::Notify::new()),
+            source_gates: Arc::default(),
         }),
         pki.server(2),
         accepted.bind_local(replica_id(2)).unwrap(),

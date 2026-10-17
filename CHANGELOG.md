@@ -772,8 +772,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadline, preserving every terminal-debt and stale-owner assertion. Retain a
   real split vote at 18 seconds as a negative control: its next campaign cannot
   begin until 27 seconds. Production timers and operation budgets are unchanged.
-  The authenticated election uses a current-thread Tokio runtime for controlled
-  time; all real mTLS and audit-recovery checks remain. (#1322)
+  A four-worker companion preserves the complete real-mTLS audit-recovery
+  scenario with one explicitly synchronized campaign; the paused fixture
+  independently proves automatic election timing. (#1322)
 
 - `opc-persist` tests: script real one- and two-split elections during mixed-voter
   rolls while keeping writes in flight across leader loss. Require one-split

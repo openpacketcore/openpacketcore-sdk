@@ -45,6 +45,39 @@ pub(super) trait Voters {
 }
 
 impl VoteGate {
+    pub(super) fn observe(term: u64) -> Arc<Self> {
+        Arc::new(Self {
+            term,
+            arrivals: watch::channel(Vec::new()).0,
+            both_candidates: None,
+            replies: watch::channel(Vec::new()).0,
+        })
+    }
+
+    pub(super) async fn assert_one_granted_vote(
+        &self,
+        source: ConfigConsensusNodeId,
+        target: ConfigConsensusNodeId,
+        committed: u64,
+    ) {
+        let replies = self
+            .replies
+            .subscribe()
+            .wait_for(|replies| !replies.is_empty())
+            .await
+            .unwrap()
+            .clone();
+        assert_eq!(replies.len(), 1, "one real peer vote, without a retry");
+        assert_eq!(replies[0].source, source);
+        assert_eq!(replies[0].target, target);
+        assert!(replies[0].response.vote_granted);
+        assert_eq!(replies[0].response.vote, Vote::new(self.term, source));
+        let arrivals = self.arrivals.borrow();
+        assert_eq!(arrivals.len(), 1, "no competing automatic campaign");
+        assert_eq!(arrivals[0].1.vote, replies[0].response.vote);
+        assert!(arrivals[0].1.last_log_id.map(|id| id.index) >= Some(committed));
+    }
+
     pub(super) async fn before_delivery(&self, request: &ConsensusWireRequest) {
         let (_, vote): (u16, VoteRequest<ConfigConsensusNodeId>) =
             opc_consensus::decode_bounded(&request.payload).expect("real vote request");
