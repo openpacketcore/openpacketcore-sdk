@@ -5546,6 +5546,62 @@ mod tests {
     /// retry `select!`; it cannot wedge the test process. If the retry count
     /// diverges from `max_retries + 1`, the send-attempts assertion fails.
     #[tokio::test]
+    async fn std_deadline_redirect_retries_keep_profile_budget_after_clock_advance() {
+        // Offset Tokio before creating lease/cache clocks, retaining their
+        // own unchanged authority and expiry contracts.
+        let paused_time = PausedTimeGuard::new();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        paused_time.resume();
+        let profile = test_profile();
+        let (first_session, second_session) = test_sessions(profile);
+        let (record, namespace, clock) = ownership_record("owner-b").await;
+        let generation = record.generation();
+        let first_cache = ownership_cache(record, namespace, clock);
+        let (first_datagram, _unserved_peer) = InMemoryIngressRedirectDatagram::pair(
+            first_session.local_udp_endpoint(),
+            second_session.local_udp_endpoint(),
+            profile.steering_path_mtu(),
+            profile.queue_packets(),
+        )
+        .unwrap();
+        let (first, _first_rx) = IngressRedirectEndpoint::start(
+            first_session,
+            first_cache,
+            Arc::new(NeverSendDatagram {
+                inner: Arc::new(first_datagram),
+            }),
+            Arc::new(RecordingReporter::default()),
+        )
+        .unwrap();
+        let paused_time = PausedTimeGuard::new();
+        let started = tokio::time::Instant::now();
+        let packet = synthetic_native_esp_packet(128);
+        let mut operation = first
+            .begin_redirect(&packet, ownership_key(), generation)
+            .unwrap();
+        let outcome = within_profile_completion_bound(profile, operation.wait()).await;
+        let elapsed = started.elapsed();
+        let metrics = first.metrics();
+        let shutdown = within_profile_completion_bound(profile, first.shutdown()).await;
+        paused_time.resume();
+        assert_eq!(
+            outcome.unwrap(),
+            IngressRedirectOperationOutcome::DeliveryOutcomeUnknown
+        );
+        let attempts = u64::from(profile.max_retries()) + 1;
+        assert_eq!(metrics.send_attempts, attempts);
+        assert!(
+            elapsed >= profile.receipt_retry_horizon(),
+            "retry budget collapsed to {elapsed:?}"
+        );
+        assert!(
+            elapsed <= profile_completion_bound(profile),
+            "retry budget grew to {elapsed:?}"
+        );
+        shutdown.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn mutation_check_receipt_timeout_drives_retry_completion() {
         let profile = test_profile();
         let (first_session, second_session) = test_sessions(profile);

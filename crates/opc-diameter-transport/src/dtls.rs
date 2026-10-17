@@ -2275,6 +2275,54 @@ enum PumpEvent {
     Deadline,
 }
 
+fn runtime_engine_deadline(next_timer: Option<std::time::Instant>, fallback: Instant) -> Instant {
+    next_timer.map(Instant::from_std).unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn std_deadline_pump_timer_preserves_remaining_engine_budget() {
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let (endpoint, _peer, _log) = crate::in_memory_sctp_link(4);
+        let mut io: Box<dyn SctpMessageIo> = Box::new(endpoint);
+        let started = Instant::now();
+        let timer = std::time::Instant::now() + Duration::from_secs(30);
+        let event = pump_wait(&mut io, Some(timer), started + Duration::from_secs(60)).await;
+        assert!(matches!(event, Ok(PumpEvent::Timer)));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(29),
+            "early engine timer: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(31),
+            "late engine timer: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn std_deadline_runtime_engine_timer_preserves_remaining_budget() {
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let started = Instant::now();
+        let fallback = started + Duration::from_secs(3600);
+        let timer = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = runtime_engine_deadline(Some(timer), fallback);
+        let remaining = deadline.saturating_duration_since(started);
+        assert!(
+            remaining >= Duration::from_secs(29),
+            "early actor timer: {remaining:?}"
+        );
+        assert!(
+            remaining <= Duration::from_secs(30),
+            "late actor timer: {remaining:?}"
+        );
+        assert_eq!(runtime_engine_deadline(None, fallback), fallback);
+    }
+}
+
 async fn pump_wait(
     io: &mut Box<dyn SctpMessageIo>,
     next_timer: Option<std::time::Instant>,
@@ -3693,7 +3741,7 @@ async fn run_dtls_runtime_actor(
                 return Err(DiameterTlsError::DeadlineExceeded);
             }
             let fallback = now.checked_add(Duration::from_secs(60 * 60)).unwrap_or(now);
-            let engine_deadline = next_timer.map(Instant::from_std).unwrap_or(fallback);
+            let engine_deadline = runtime_engine_deadline(next_timer, fallback);
             let receive_deadline = pending_receive
                 .as_ref()
                 .map(|request| request.deadline)

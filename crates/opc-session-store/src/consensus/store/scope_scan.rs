@@ -19,6 +19,11 @@ fn unavailable(_: impl fmt::Debug) -> ScopeScanError {
     ScopeScanError::Unavailable
 }
 
+fn local_configuration_deadline() -> tokio::time::Instant {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    tokio::time::Instant::from_std(deadline)
+}
+
 fn view_error(error: ViewError) -> ScopeScanError {
     match error {
         ViewError::Ended(_) => ScopeScanError::RestartRequired,
@@ -357,12 +362,9 @@ impl ConsensusSessionStore {
                 let local = || {
                     check().map_err(|_| ScopeScanError::RestartRequired)?;
                     configuration()?;
-                    let deadline = std::time::Instant::now() + Duration::from_secs(1);
-                    let authority = handle.block_on(store.scope_scan_local_configuration(
-                        current,
-                        epoch,
-                        tokio::time::Instant::from_std(deadline),
-                    ));
+                    let deadline = local_configuration_deadline();
+                    let authority = handle
+                        .block_on(store.scope_scan_local_configuration(current, epoch, deadline));
                     configuration()?;
                     authority?;
                     let headers =
@@ -523,5 +525,21 @@ impl ConsensusSessionStore {
             .map_err(unavailable)??;
         self.inner.scope_views.observe_wal(capture.wal_bytes().ok());
         Ok((CapturedBackend::Sqlite(Box::new(capture)), applied, headers))
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn std_deadline_local_configuration_retains_one_second_after_clock_advance() {
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let now = tokio::time::Instant::now();
+        let deadline = local_configuration_deadline();
+        assert_eq!(
+            deadline.saturating_duration_since(now),
+            Duration::from_secs(1)
+        );
     }
 }

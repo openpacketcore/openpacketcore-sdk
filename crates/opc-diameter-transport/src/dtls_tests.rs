@@ -37,6 +37,26 @@ use crate::{
 
 const CLIENT_ID: &str =
     "spiffe://example.test/tenant/tenant-a/ns/core/sa/diameter/nf/smf/instance/client-0";
+
+fn raw_engine_timer(next: std::time::Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(Instant::from_std(next))
+}
+
+#[tokio::test(start_paused = true)]
+async fn std_deadline_raw_engine_and_peer_timers_preserve_remaining_budget() {
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let started = Instant::now();
+    raw_engine_timer(std::time::Instant::now() + Duration::from_secs(30)).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(29),
+        "early raw engine timer: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(31),
+        "late raw engine timer: {elapsed:?}"
+    );
+}
 const OTHER_CLIENT_ID: &str =
     "spiffe://example.test/tenant/tenant-a/ns/core/sa/diameter/nf/smf/instance/client-1";
 const SERVER_ID: &str =
@@ -1540,7 +1560,7 @@ async fn drive_raw_engine_with_ppid(
                     for datagram in std::mem::take(&mut outbound) {
                         send_raw_dtls_datagram_with_ppid(&mut io, datagram, ppid).await?;
                     }
-                    let timer = tokio::time::sleep_until(Instant::from_std(next));
+                    let timer = raw_engine_timer(next);
                     tokio::select! {
                         () = tokio::time::sleep_until(deadline) => return Err(()),
                         () = timer => {
@@ -2483,7 +2503,7 @@ fn spawn_raw_dtls12_client(
             }
             let timer_wait = async {
                 if let Some(next) = timer {
-                    tokio::time::sleep_until(Instant::from_std(next)).await;
+                    raw_engine_timer(next).await;
                 } else {
                     std::future::pending::<()>().await;
                 }

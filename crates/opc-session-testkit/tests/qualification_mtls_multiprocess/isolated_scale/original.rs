@@ -33,6 +33,50 @@ const BATCH_BOUND: Duration = Duration::from_millis(800);
 const RETRY_BACKOFF: Duration = Duration::from_millis(25);
 const RETRIES: usize = 16;
 
+async fn status_observations_before<F: std::future::Future>(
+    deadline: Instant,
+    observations: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), observations).await
+}
+
+fn wait_for_scheduled_item(due: Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(tokio::time::Instant::from_std(due))
+}
+
+#[tokio::test(start_paused = true)]
+async fn std_deadline_status_observations_keep_unexpired_budget() {
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let started = tokio::time::Instant::now();
+    let result = status_observations_before(Instant::now() + Duration::from_secs(30), async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        42
+    })
+    .await;
+    assert_eq!(
+        result.ok(),
+        Some(42),
+        "status budget elapsed at {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn std_deadline_isolated_pacing_keeps_remaining_budget() {
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let started = tokio::time::Instant::now();
+    wait_for_scheduled_item(Instant::now() + Duration::from_secs(30)).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(29),
+        "early isolated pacing: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(31),
+        "late isolated pacing: {elapsed:?}"
+    );
+}
+
 #[derive(Default)]
 struct Effects {
     evidence_root: PathBuf,
@@ -255,10 +299,9 @@ async fn execute_batch_inner(
                     .await;
                 (*index, response)
             }));
-            let observations =
-                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), observations)
-                    .await
-                    .expect("immutable status reads retain the original deadline");
+            let observations = status_observations_before(deadline, observations)
+                .await
+                .expect("immutable status reads retain the original deadline");
             for (index, response) in observations {
                 match response {
                     Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
@@ -565,7 +608,7 @@ fn run_original(persistence: QualificationIsolatedPersistence) {
                     for offset in 0..count {
                         let due = started + schedule_offset(submitted + offset, rate);
                         if due > Instant::now() {
-                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                            wait_for_scheduled_item(due).await;
                         }
                         scheduled.push(due);
                         let slot = nonce % SESSIONS;

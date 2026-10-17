@@ -21,6 +21,26 @@ use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+fn wait_for_scheduled_batch(scheduled_at: Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled_at))
+}
+
+#[tokio::test(start_paused = true)]
+async fn std_deadline_batch_pacing_keeps_remaining_budget() {
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let started = tokio::time::Instant::now();
+    wait_for_scheduled_batch(Instant::now() + Duration::from_secs(30)).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(29),
+        "early batch pacing: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(31),
+        "late batch pacing: {elapsed:?}"
+    );
+}
+
 use bytes::Bytes;
 use opc_consensus::DURABLE_CONSENSUS_TIMING_PROFILE;
 use opc_identity::projected_svid::MIN_PROJECTED_SVID_POLL_INTERVAL;
@@ -18542,7 +18562,7 @@ fn run_persistent_consumer_v2_batch_release_gate(
                         .checked_mul(u64::try_from(batch_index).expect("bounded batch index fits u64"))
                         .expect("bounded scheduled batch offset fits u64"),
                 );
-            tokio::time::sleep_until(tokio::time::Instant::from_std(scheduled_at)).await;
+            wait_for_scheduled_batch(scheduled_at).await;
             // Drain global capacity only. A saturated preferred client is
             // skipped below, so one slow four-lane pool cannot induce global
             // head-of-line blocking for other ready producers.
