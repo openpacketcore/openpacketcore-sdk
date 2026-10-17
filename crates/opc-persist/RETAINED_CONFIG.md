@@ -65,7 +65,9 @@ not cancel the accepted replacement. Restart with intact backing resumes the
 same incarnation and durable phase through the SDK-owned coordinator, without
 another replacement request or a manual recovery step. If that backing is
 lost again, the controller must select another new incarnation. Crossing into
-the incarnation stored format requires a fresh installation.
+the incarnation stored format requires a fresh installation. Shutdown joins the
+replacement coordinator and active admission reads, including SQLite work whose
+caller was cancelled, before reporting completion and allowing retained reopen.
 
 Snapshot reads pin the last published record under a brief publication gate,
 then open and verify an independent descriptor outside the gate. The pin keeps

@@ -87,6 +87,7 @@ impl ConfigShutdownCoordinator {
                 .await
                 .map(|()| outcome)
                 .map_err(|_| consensus_unavailable());
+            voter_slots::join_coordinator(&store).await;
             // Raft joins its core and replication tasks, but its state-machine
             // worker and snapshot builders can still own storage afterwards.
             // Keep this drain owned across every caller timeout until all of

@@ -323,20 +323,95 @@ pub(crate) struct ConfigConsensusCore {
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
     // Drop last: channel closure proves that every engine-owned connection
     // and snapshot-directory handle has been released.
-    storage_owner: tokio::sync::watch::Sender<()>,
+    storage_owner: StorageOwnership,
+}
+
+#[derive(Clone)]
+enum StorageOwnership {
+    Engine(Arc<tokio::sync::watch::Sender<()>>),
+    Admission(std::sync::Weak<tokio::sync::watch::Sender<()>>),
+}
+
+impl StorageOwnership {
+    fn observer(&self) -> std::sync::Weak<tokio::sync::watch::Sender<()>> {
+        match self {
+            Self::Engine(owner) => Arc::downgrade(owner),
+            Self::Admission(owner) => owner.clone(),
+        }
+    }
+
+    fn acquire(&self) -> io::Result<Arc<tokio::sync::watch::Sender<()>>> {
+        self.observer()
+            .upgrade()
+            .ok_or_else(|| invalid_data("config consensus storage is closed"))
+    }
+}
+
+// An idle admission runtime must not retain a connection or snapshot-directory
+// lock. Each active read instead joins the engine's existing storage drain.
+pub(crate) struct ConfigConsensusReadHandle {
+    conn: std::sync::Weak<tokio::sync::Mutex<crate::backend::BackendConnection>>,
+    owner: std::sync::Weak<tokio::sync::watch::Sender<()>>,
+    worker_gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl ConfigConsensusReadHandle {
+    pub(crate) async fn run_sqlite<T, F>(&self, operation: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> io::Result<T> + Send + 'static,
+    {
+        // Field order also preserves release order if this future is cancelled
+        // before dispatch: the connection drops before the drain's last owner.
+        struct Access {
+            conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
+            owner: Arc<tokio::sync::watch::Sender<()>>,
+        }
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| invalid_data("config consensus storage is closed"))?;
+        let conn = self
+            .conn
+            .upgrade()
+            .ok_or_else(|| invalid_data("config consensus storage is closed"))?;
+        let access = Access { conn, owner };
+        run_sqlite_worker_until(
+            self.worker_gate.clone(),
+            access.conn.clone(),
+            Some(access.owner.clone()),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            move |conn, cancellation| {
+                cancellation.check_io()?;
+                operation(conn)
+            },
+        )
+        .await
+    }
 }
 
 impl ConfigConsensusCore {
     pub(crate) fn storage_shutdown_observer(&self) -> tokio::sync::watch::Receiver<()> {
-        self.storage_owner.subscribe()
+        self.storage_owner.acquire().map_or_else(
+            |_| tokio::sync::watch::channel(()).1,
+            |owner| owner.subscribe(),
+        )
     }
 
-    /// Store-owned admission readers outlive the engine join. Track them
-    /// separately so they cannot keep the engine's completion channel open.
+    /// The profile itself can outlive the engine. Only its active SQLite work
+    /// retains a drain owner, so neither idle readers nor the profile block it.
     pub(crate) fn clone_for_admission_reader(&self) -> Self {
         Self {
-            storage_owner: tokio::sync::watch::channel(()).0,
+            storage_owner: StorageOwnership::Admission(self.storage_owner.observer()),
             ..self.clone()
+        }
+    }
+
+    pub(crate) fn admission_read_handle(&self) -> ConfigConsensusReadHandle {
+        ConfigConsensusReadHandle {
+            conn: Arc::downgrade(&self.conn),
+            owner: self.storage_owner.observer(),
+            worker_gate: self.sqlite_worker_gate.clone(),
         }
     }
 
@@ -537,7 +612,7 @@ impl ConfigConsensusCore {
             sqlite_worker_gate: worker_gate,
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
-            storage_owner: tokio::sync::watch::channel(()).0,
+            storage_owner: StorageOwnership::Engine(Arc::new(tokio::sync::watch::channel(()).0)),
         })
     }
 
@@ -573,7 +648,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
-            Some(self.storage_owner.clone()),
+            Some(self.storage_owner.acquire()?),
             deadline,
             operation,
         )
@@ -609,7 +684,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
-            Some(self.storage_owner.clone()),
+            Some(self.storage_owner.acquire()?),
             deadline,
             operation,
         )
@@ -647,7 +722,7 @@ where
 async fn run_sqlite_worker_until<T, F>(
     worker_gate: Arc<tokio::sync::Semaphore>,
     conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
-    storage_owner: Option<tokio::sync::watch::Sender<()>>,
+    storage_owner: Option<Arc<tokio::sync::watch::Sender<()>>>,
     deadline: tokio::time::Instant,
     operation: F,
 ) -> io::Result<T>

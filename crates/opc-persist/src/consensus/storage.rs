@@ -2914,6 +2914,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_admission_reader_cannot_retain_closed_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::in_memory_for_test().await.unwrap();
+        let connection = Arc::downgrade(&backend.conn());
+        let (log, _, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .unwrap();
+        let mut shutdown = log.core.storage_shutdown_observer();
+        let reader = log
+            .core
+            .clone_for_admission_reader()
+            .admission_read_handle();
+        let value = reader
+            .run_sqlite(|conn| {
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                    .map_err(|_| sqlite::invalid_data("admission probe failed"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, 1);
+        drop(log);
+        drop(backend);
+        tokio::time::timeout(Duration::from_secs(2), shutdown.changed())
+            .await
+            .expect("idle admission reader cannot keep the engine drain open")
+            .expect_err("all storage owners exited");
+        assert_eq!(
+            connection.strong_count(),
+            0,
+            "idle admission owns no connection"
+        );
+        assert!(
+            reader.run_sqlite(|_| Ok(())).await.is_err(),
+            "closed storage cannot be readmitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_reader_keeps_shutdown_pending_until_worker_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::in_memory_for_test().await.unwrap();
+        let connection = Arc::downgrade(&backend.conn());
+        let (log, _, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .unwrap();
+        let mut shutdown = log.core.storage_shutdown_observer();
+        let reader = log
+            .core
+            .clone_for_admission_reader()
+            .admission_read_handle();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            reader
+                .run_sqlite(move |conn| {
+                    let _: i64 = conn
+                        .query_row("SELECT 1", [], |row| row.get(0))
+                        .map_err(|_| sqlite::invalid_data("admission probe failed"))?;
+                    let _ = started.send(());
+                    released
+                        .recv()
+                        .map_err(|_| sqlite::invalid_data("worker release unavailable"))
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("admission worker starts")
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        drop(log);
+        drop(backend);
+        let shutdown_pending = shutdown.has_changed().is_ok();
+        let connection_retained = connection.strong_count() > 0;
+        release.send(()).expect("release admission worker");
+        tokio::time::timeout(Duration::from_secs(2), shutdown.changed())
+            .await
+            .expect("admission worker drains")
+            .expect_err("all storage owners exited");
+        assert!(
+            shutdown_pending,
+            "cancelled admission remains part of the engine drain"
+        );
+        assert!(connection_retained, "the accepted worker still owns SQLite");
+        assert_eq!(
+            connection.strong_count(),
+            0,
+            "connection released before completion"
+        );
+    }
+
+    #[tokio::test]
     async fn pre_core_probe_timeout_never_queues_late_work_and_reuses_backend() {
         let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
             .await

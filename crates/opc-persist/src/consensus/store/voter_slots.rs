@@ -30,6 +30,7 @@ pub(super) struct ConfigVoterProfile {
     pub(super) transport: Arc<ConfigVoterTransport>,
     core: super::super::sqlite::ConfigConsensusCore,
     incoming: tokio::sync::Mutex<Option<IncomingSnapshot>>,
+    coordinator: std::sync::OnceLock<tokio::sync::watch::Receiver<()>>,
 }
 
 // One coordinator owns accepted work through completion. This cache is keyed
@@ -232,9 +233,10 @@ impl ConfigVoterProfile {
         resolver: Arc<dyn VoterPeerResolver>,
         compatibility: opc_consensus::ConsensusCompatibility,
     ) -> Result<Arc<Self>, ConfigConsensusOpenError> {
-        let admission = ConfigVoterAdmission::new(local, Arc::new(Reader(core.clone())))
-            .await
-            .map_err(|_| ConfigConsensusOpenError::DurableIdentityMismatch)?;
+        let admission =
+            ConfigVoterAdmission::new(local, Arc::new(Reader(core.admission_read_handle())))
+                .await
+                .map_err(|_| ConfigConsensusOpenError::DurableIdentityMismatch)?;
         core.voter_admission
             .set(Arc::downgrade(&admission))
             .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)?;
@@ -251,6 +253,7 @@ impl ConfigVoterProfile {
             transport,
             core,
             incoming: tokio::sync::Mutex::new(None),
+            coordinator: std::sync::OnceLock::new(),
         }))
     }
 
@@ -322,7 +325,9 @@ impl ConfigVoterProfile {
         loop {
             // Never await admission's serial coordinator while holding the
             // incoming request guard; publication has its own independent task.
-            let state = Reader(self.core.clone()).read_voter_slot_state().await?;
+            let state = Reader(self.core.admission_read_handle())
+                .read_voter_slot_state()
+                .await?;
             if state.table().slots.iter().any(|slot| {
                 slot.member.identity.node_id() == local && slot.phase == VoterSlotPhase::Voting
             }) {
@@ -573,7 +578,9 @@ impl ConsensusConfigStore {
             .voter_profile
             .as_ref()
             .ok_or(VoterReplacementError::IncompatibleProfile)?;
-        Reader(profile.core.clone()).read_voter_slot_state().await
+        Reader(profile.core.admission_read_handle())
+            .read_voter_slot_state()
+            .await
     }
 
     /// Resolve an accepted request using current controller authorization and a
@@ -1247,19 +1254,26 @@ impl ConsensusConfigStore {
 }
 
 pub(super) fn start_coordinator(store: &ConsensusConfigStore) {
-    if store.inner.voter_profile.is_none() {
+    let Some(profile) = &store.inner.voter_profile else {
+        return;
+    };
+    let (finished, completion) = tokio::sync::watch::channel(());
+    if profile.coordinator.set(completion).is_err() {
         return;
     }
     let mut applied = store.inner.durable_progress.subscribe_applied();
     let weak = Arc::downgrade(&store.inner);
     let mut metrics = store.inner.raft.metrics();
     tokio::spawn(async move {
+        // Declared first, dropped last: completion cannot precede release of
+        // this coordinator's store, snapshot or accepted-work ownership.
+        let _finished = finished;
         let mut progress = ReplacementProgress::default();
         loop {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            if metrics.borrow().running_state.is_err() {
+            if metrics.borrow().running_state.is_err() || inner.shutdown.is_started() {
                 return;
             }
             let store = ConsensusConfigStore { inner };
@@ -1292,7 +1306,18 @@ pub(super) fn start_coordinator(store: &ConsensusConfigStore) {
             if pending {
                 // Our own apply notifications must not turn an error into a
                 // tight retry loop. Candidate recovery is checked at this cap.
-                tokio::time::sleep(progress.backoff()).await;
+                let retry = tokio::time::sleep(progress.backoff());
+                tokio::pin!(retry);
+                loop {
+                    tokio::select! {
+                        () = &mut retry => break,
+                        changed = metrics.changed() => {
+                            if changed.is_err() || metrics.borrow().running_state.is_err() {
+                                return;
+                            }
+                        },
+                    }
+                }
             } else {
                 tokio::select! {
                     changed = applied.changed() => if changed.is_err() { return; },
@@ -1301,6 +1326,19 @@ pub(super) fn start_coordinator(store: &ConsensusConfigStore) {
             }
         }
     });
+}
+
+pub(super) async fn join_coordinator(store: &ConsensusConfigStore) {
+    let Some(completion) = store
+        .inner
+        .voter_profile
+        .as_ref()
+        .and_then(|profile| profile.coordinator.get())
+    else {
+        return;
+    };
+    let mut completion = completion.clone();
+    while completion.changed().await.is_ok() {}
 }
 
 pub(super) async fn handle(
@@ -1366,7 +1404,9 @@ pub(super) async fn handle(
                 ConsensusRpcFamily::AppendEntries => {
                     let mut rpc = append.ok_or(VoterReplacementError::UnauthorizedReplacement)?;
                     let original_last = rpc.entries.last().map(|entry| entry.log_id);
-                    let state = Reader(profile.core.clone()).read_voter_slot_state().await?;
+                    let state = Reader(profile.core.admission_read_handle())
+                        .read_voter_slot_state()
+                        .await?;
                     if state.table().slots.iter().any(|slot| {
                         slot.member.identity.node_id() == store.inner.local_node_id
                             && slot.phase == VoterSlotPhase::Pending
@@ -1572,7 +1612,7 @@ fn rejected(error: ConsensusPeerError) -> ConsensusWireResponse {
     ConsensusWireResponse { result: Err(error) }
 }
 
-struct Reader(super::super::sqlite::ConfigConsensusCore);
+struct Reader(super::super::sqlite::ConfigConsensusReadHandle);
 impl std::fmt::Debug for Reader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConfigVoterStateReader")
