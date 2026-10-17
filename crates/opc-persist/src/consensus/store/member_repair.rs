@@ -12,6 +12,10 @@ use tokio::time::Instant;
 
 use super::*;
 
+#[cfg(test)]
+#[path = "member_repair_snapshot_tests.rs"]
+mod tests;
+
 const CHUNK_BYTES: usize = 128 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -45,6 +49,29 @@ pub(super) struct RepairDownload {
     offset: u64,
     chunk: Option<RepairChunk>,
     done: bool,
+    rediscover: bool,
+}
+
+fn valid_first_repair_chunk(
+    source: ConsensusNodeId,
+    chunk: &RepairChunk,
+    members: &BTreeSet<ConsensusNodeId>,
+) -> bool {
+    chunk.vote.is_committed()
+        && chunk.vote.leader_id.voted_for() == Some(source)
+        && chunk.meta.last_log_id.is_some()
+        && exact_uniform_voter_membership(&chunk.meta.last_membership, members)
+        && chunk.offset == 0
+        && chunk.bytes.len() <= CHUNK_BYTES
+        && (!chunk.bytes.is_empty() || chunk.done)
+}
+
+fn same_repair_snapshot(
+    download: &RepairDownload,
+    source: ConsensusNodeId,
+    first: &RepairChunk,
+) -> bool {
+    download.source == source && download.vote == first.vote && download.meta == first.meta
 }
 
 pub(super) async fn handle(store: &ConsensusConfigStore, payload: &[u8]) -> ConsensusWireResponse {
@@ -216,6 +243,14 @@ impl ConsensusConfigStore {
         // While an attempt runs, it owns the file locally. External
         // cancellation therefore drops it, including a resumed checkpoint.
         let mut progress = saved.take();
+        let previous = progress.as_ref().map(|download| {
+            (
+                download.source,
+                download.vote,
+                download.meta.clone(),
+                download.offset,
+            )
+        });
         let result = tokio::select! {
             biased;
             _ = self.inner.shutdown.wait_started() => {
@@ -229,6 +264,23 @@ impl ConsensusConfigStore {
         // An ordinary bounded attempt may need several calls for a large
         // snapshot. Preserve its verified cursor without extending this call.
         if Instant::now() >= deadline && !self.inner.shutdown.is_started() {
+            if let Some(download) = progress.as_mut() {
+                if !download.done
+                    && previous
+                        .as_ref()
+                        .is_some_and(|(source, vote, meta, offset)| {
+                            *source == download.source
+                                && *vote == download.vote
+                                && *meta == download.meta
+                                && *offset == download.offset
+                        })
+                {
+                    // A route that consumes the whole deadline must not pin
+                    // every later attempt to a former leader. Keep the bytes
+                    // while requiring fresh authority before using them again.
+                    download.rediscover = true;
+                }
+            }
             *saved = progress;
         }
         result
@@ -254,7 +306,7 @@ impl ConsensusConfigStore {
                 self.inner.raft.runtime_config().heartbeat(true);
                 return Ok(());
             }
-            if progress.is_none() {
+            if progress.as_ref().is_none_or(|download| download.rediscover) {
                 // A follower rejects immediately; an unreachable route must
                 // not delay trying the actual leader.
                 let mut requests = futures_util::stream::FuturesUnordered::new();
@@ -270,16 +322,32 @@ impl ConsensusConfigStore {
                 let mut source = None;
                 while let Some((target, result)) = requests.next().await {
                     if let Ok(chunk) = result {
-                        source = Some((target, chunk));
-                        break;
+                        if valid_first_repair_chunk(target, &chunk, &self.inner.members) {
+                            source = Some((target, chunk));
+                            break;
+                        }
                     }
                 }
                 drop(requests);
                 if let Some((source, first)) = source {
-                    *progress = self.start_repair_snapshot(source, first).await.ok();
+                    if let Some(download) = progress
+                        .as_mut()
+                        .filter(|download| same_repair_snapshot(download, source, &first))
+                    {
+                        // The fresh quorum authenticated exactly the same
+                        // snapshot. Its first chunk is a probe, not new data.
+                        download.rediscover = false;
+                    } else if let Ok(download) = self.start_repair_snapshot(source, first).await {
+                        // Allocate and validate before dropping the old file.
+                        // A new vote or snapshot always starts at offset zero.
+                        *progress = Some(download);
+                    }
                 }
             }
-            if progress.is_some() {
+            if progress
+                .as_ref()
+                .is_some_and(|download| !download.rediscover)
+            {
                 let restored = self.restore_repair_snapshot(progress, deadline).await;
                 if restored.is_ok() {
                     continue;
@@ -288,8 +356,14 @@ impl ConsensusConfigStore {
                     return Err(ConfigConsensusOpenError::ClusterFormationRejected);
                 }
                 // Rejection before the deadline can mean the leader or its
-                // snapshot changed. Rediscover instead of splicing versions.
-                *progress = None;
+                // snapshot changed. Keep verified bytes until fresh discovery
+                // proves whether that exact checkpoint can still be resumed.
+                if let Some(download) = progress.as_mut().filter(|download| !download.done) {
+                    download.rediscover = true;
+                    download.chunk = None;
+                } else {
+                    *progress = None;
+                }
             }
             tokio::time::sleep_until((Instant::now() + ROUTE_RETRY_BACKOFF).min(deadline)).await;
         }
@@ -340,11 +414,7 @@ impl ConsensusConfigStore {
         source: ConsensusNodeId,
         chunk: RepairChunk,
     ) -> Result<RepairDownload, PersistError> {
-        if !chunk.vote.is_committed()
-            || chunk.vote.leader_id.voted_for() != Some(source)
-            || chunk.meta.last_log_id.is_none()
-            || !exact_uniform_voter_membership(&chunk.meta.last_membership, &self.inner.members)
-        {
+        if !valid_first_repair_chunk(source, &chunk, &self.inner.members) {
             return Err(consensus_unavailable());
         }
         let snapshot = self
@@ -361,6 +431,7 @@ impl ConsensusConfigStore {
             offset: 0,
             chunk: Some(chunk),
             done: false,
+            rediscover: false,
         })
     }
 
