@@ -51,7 +51,7 @@ These are code-path constants, not operator tuning knobs and not proof that
 the experimental profile meets #143 under deployed load.
 
 The workspace temporarily exact-pins `openpacketcore/openraft` revision
-`2e1fb7455752455a3505b354d003d6effa55985d`, containing release-0.9 through v0.9.25
+`6e90e9736cc669e10594269108159cc1218f3191`, containing release-0.9 through v0.9.25
 and the fork repairs for bounded apply and joined replication retirement.
 It preserves per-campaign election-timeout sampling without adding an SDK
 leader lease or second election/vote path. Until an official

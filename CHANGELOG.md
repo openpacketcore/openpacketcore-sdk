@@ -732,7 +732,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-egress-fence-common`: remove the unused experimental `scope_time` API
   from the retired timed packet-gate proposal.
 
-- `opc-consensus`: pin Openraft to `0be191c797fd` for serialized peer-response
+- `opc-consensus`: pin Openraft to `6e90e9736cc6` for serialized peer-response
   fences and exact-vote leader resignation. Align the root, example and fuzz
   locks, publishing guard and qualification assertions with the same revision.
 
@@ -1143,6 +1143,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to outlive an RPC budget. Retained repair and voter replacement retry swallowed
   build triggers even when a maintenance build completes at the same cut,
   without polling snapshot contents on unrelated engine updates.
+
+- `opc-consensus`: align every Openraft revision assertion and operator document
+  with `6e90e9736cc6`, including the former-leader purge retry after replication
+  readers retire. The required qualification-profile tests retain exact source
+  and feature assertions. (#1249)
 
 - `opc-session-store` tests: bound native fixture coordination by the existing
   consensus operation budget, observe early operation completion and writer
