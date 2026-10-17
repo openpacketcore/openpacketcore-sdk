@@ -790,6 +790,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rolling refresh, cancellation cleanup, fixed physical admission, and all
   lifecycle, authentication, address-generation, shutdown and peer limits.
   Cancellation cleanup also works outside the polling runtime's context.
+  Cap unused lanes at their monotonic HelloAck peer-idle bound, accounting for
+  measured transit time and a safety margin. Expose the peer-idle assumption for
+  servers with shorter timeouts without changing the frozen HelloAck wire format.
+  Discard staged lanes safely if Tokio's thread-local context is destroyed.
   Used lanes retain their conservative between-call deadline. (#1319)
 
 - `opc-persist` tests: script real one- and two-split elections during mixed-voter

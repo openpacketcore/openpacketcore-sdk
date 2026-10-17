@@ -563,6 +563,7 @@ pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_RECONNECT_JITTER: Duration =
 pub const DEFAULT_PERSISTENT_SESSION_CONSUMER_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 const DEFAULT_CONSUMER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CONSUMER_PEER_IDLE_SAFETY_MARGIN: Duration = Duration::from_millis(50);
 const DEFAULT_CONSUMER_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CONSUMER_MAX_CONNECTIONS: usize = 256;
 const CONSUMER_WATCH_CHANNEL_CAPACITY: usize = 64;
@@ -4700,6 +4701,9 @@ struct ConsumerConnection {
     next_correlation: NonZeroU32,
     calls: usize,
     idle_deadline: tokio::time::Instant,
+    /// First-Call bound captured at HelloAck, including measured transit time
+    /// and a safety margin. Batch publication must never advance this clock.
+    peer_first_call_deadline: tokio::time::Instant,
     /// Exact server-advertised request-frame ceiling for this revision-6 lane.
     request_frame_size: usize,
     /// Concrete resolver result used to establish this physical lane. This is
@@ -5125,7 +5129,8 @@ impl ConsumerConnection {
             return false;
         }
         let now = tokio::time::Instant::now();
-        self.lifecycle.retirement(now).is_none()
+        (self.calls != 0 || now < self.peer_first_call_deadline)
+            && self.lifecycle.retirement(now).is_none()
     }
 
     fn reusable(&mut self) -> bool {
@@ -6916,6 +6921,8 @@ pub struct StatelessSessionConsumerClient {
     voter: ConsumerVoterBinding,
     tls_config: opc_tls::AuthenticatedClientConfig,
     idle_timeout: Duration,
+    peer_idle_timeout: Duration,
+    peer_idle_safety_margin: Duration,
     operation_timeout: Duration,
     pre_request_connection_timeout: Option<Duration>,
     lifecycle_policy: ConnectionLifecyclePolicy,
@@ -7105,6 +7112,8 @@ impl StatelessSessionConsumerClient {
             voter: ConsumerVoterBinding::Authority(voter_authority),
             tls_config,
             idle_timeout: DEFAULT_CONSUMER_IDLE_TIMEOUT,
+            peer_idle_timeout: DEFAULT_CONSUMER_IDLE_TIMEOUT,
+            peer_idle_safety_margin: DEFAULT_CONSUMER_PEER_IDLE_SAFETY_MARGIN,
             operation_timeout: DEFAULT_CONSUMER_OPERATION_TIMEOUT,
             pre_request_connection_timeout: None,
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
@@ -7159,6 +7168,8 @@ impl StatelessSessionConsumerClient {
             },
             tls_config,
             idle_timeout: DEFAULT_CONSUMER_IDLE_TIMEOUT,
+            peer_idle_timeout: DEFAULT_CONSUMER_IDLE_TIMEOUT,
+            peer_idle_safety_margin: DEFAULT_CONSUMER_PEER_IDLE_SAFETY_MARGIN,
             operation_timeout: DEFAULT_CONSUMER_OPERATION_TIMEOUT,
             pre_request_connection_timeout: None,
             lifecycle_policy: ConnectionLifecyclePolicy::default(),
@@ -7227,10 +7238,56 @@ impl StatelessSessionConsumerClient {
     /// larger legacy value; revision 6 applies its five-second active-frame
     /// ceiling internally. Persistent construction rejects values outside its
     /// explicit bounded profile.
+    /// This local bound does not change the configured peer timeout; use
+    /// [`Self::with_peer_idle_timeout`] for a server with a shorter idle.
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
         self
+    }
+
+    /// Set the peer's guaranteed idle timeout and first-Call safety margin.
+    ///
+    /// The frozen HelloAck does not advertise an idle timeout. The default
+    /// assumes the SDK server's five-second idle and reserves 50 milliseconds.
+    /// Configure this explicitly when the server uses a shorter idle timeout:
+    /// `timeout` must not exceed the server's effective timeout, and must be
+    /// positive and at most five seconds. `safety_margin` must be positive and
+    /// smaller than `timeout`; choose it for the deployment's transit and
+    /// scheduling delay. Persistent construction also requires the local idle
+    /// timeout to be no greater than this peer timeout.
+    ///
+    /// Each first-Call deadline uses the monotonic HelloAck receive instant,
+    /// subtracting the complete measured Hello round trip and this margin.
+    /// Prewarm publication can shorten that deadline but cannot extend it.
+    /// No wall-clock comparison or wire-format change is involved.
+    #[must_use]
+    pub fn with_peer_idle_timeout(mut self, timeout: Duration, safety_margin: Duration) -> Self {
+        self.peer_idle_timeout = timeout;
+        self.peer_idle_safety_margin = safety_margin;
+        self
+    }
+
+    fn valid_peer_idle_timeout(&self) -> bool {
+        self.peer_idle_timeout <= DEFAULT_CONSUMER_IDLE_TIMEOUT
+            && !self.peer_idle_safety_margin.is_zero()
+            && self.peer_idle_safety_margin < self.peer_idle_timeout
+    }
+
+    fn peer_first_call_deadline(
+        &self,
+        hello_started: tokio::time::Instant,
+        hello_ack_received: tokio::time::Instant,
+    ) -> Result<tokio::time::Instant, SessionConsumerClientError> {
+        // The full round trip conservatively includes the time an already
+        // written HelloAck could spend in transit or waiting to be read. The
+        // additional margin reserves time for the subsequent Call to arrive.
+        self.peer_idle_timeout
+            .checked_sub(hello_ack_received.saturating_duration_since(hello_started))
+            .and_then(|remaining| remaining.checked_sub(self.peer_idle_safety_margin))
+            .filter(|remaining| !remaining.is_zero())
+            .and_then(|remaining| hello_ack_received.checked_add(remaining))
+            .ok_or(SessionConsumerClientError::Unavailable)
     }
 
     /// Set the complete operation deadline including endpoint resolution,
@@ -7398,6 +7455,7 @@ impl StatelessSessionConsumerClient {
         resolved_address: Option<SocketAddr>,
     ) -> Result<ConsumerConnection, ConsumerSetupError> {
         if self.idle_timeout.is_zero()
+            || !self.valid_peer_idle_timeout()
             || self.operation_timeout.is_zero()
             || self
                 .lifecycle_policy
@@ -7551,8 +7609,9 @@ impl StatelessSessionConsumerClient {
                 .map_err(SessionConsumerClientError::from)?,
             roster_profile: self.transport_capability.roster_profile(),
         });
+        let hello_started = tokio::time::Instant::now();
         let hello_write_deadline = pre_request_deadline.min(lifecycle.retire_at()).min(
-            tokio::time::Instant::now()
+            hello_started
                 .checked_add(effective_consumer_idle_timeout(self.idle_timeout))
                 .ok_or(SessionConsumerClientError::Protocol)?,
         );
@@ -7614,6 +7673,7 @@ impl StatelessSessionConsumerClient {
             };
             result.map_err(bootstrap_protocol_error_to_client_error)?
         };
+        let hello_ack_received = tokio::time::Instant::now();
         // Once an authenticated HelloAck frame has started, preserve its
         // active-frame timeout classification. Only a no-byte setup expiry
         // below is eligible for pre-request Unavailable mapping.
@@ -7669,6 +7729,8 @@ impl StatelessSessionConsumerClient {
                 ));
             }
         };
+        let peer_first_call_deadline =
+            self.peer_first_call_deadline(hello_started, hello_ack_received)?;
         if let Some(profile) = self.transport_capability.roster_profile() {
             if !roster_profile_fits_consumer_frames(
                 profile,
@@ -7709,10 +7771,10 @@ impl StatelessSessionConsumerClient {
             rotation_jitter,
             next_correlation: NonZeroU32::MIN,
             calls: 0,
-            // A fresh lane is not idle yet. `return_idle` stamps the actual
-            // bounded idle deadline at successful publication; direct calls
-            // stamp their active-response deadline before writing.
+            // Publication starts the local idle interval, capped by the
+            // peer's first-Call clock that already began at HelloAck.
             idle_deadline: pre_request_deadline,
+            peer_first_call_deadline,
             request_frame_size,
             resolved_address: address,
             warm_target_generation: 0,
@@ -7722,6 +7784,11 @@ impl StatelessSessionConsumerClient {
             _physical_admission: Some(physical_admission),
             _persistent_physical_admission: persistent_physical_admission,
         };
+        if tokio::time::Instant::now() >= connection.peer_first_call_deadline {
+            return Err(ConsumerSetupError::Client(
+                SessionConsumerClientError::Unavailable,
+            ));
+        }
         if !connection.current(&self.tls_config, &self.reauthentication) {
             return reconnect_setup
                 .reject_connection_lifecycle()
@@ -7798,7 +7865,10 @@ impl StatelessSessionConsumerClient {
         let mut reauthentication_changes = self.reauthentication.subscribe();
         let mut material_changes = Some(self.tls_config.subscribe_material_changes());
         let rotation_jitter = connection.rotation_jitter;
-        if !connection.current(&self.tls_config, &self.reauthentication) {
+        if (connection.calls == 0
+            && tokio::time::Instant::now() >= connection.peer_first_call_deadline)
+            || !connection.current(&self.tls_config, &self.reauthentication)
+        {
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Unavailable,
             ));
@@ -7808,6 +7878,11 @@ impl StatelessSessionConsumerClient {
                 SessionConsumerClientError::Protocol,
             ));
         }
+        let first_call_write_deadline = if connection.calls == 0 {
+            pre_request_deadline.min(connection.peer_first_call_deadline)
+        } else {
+            pre_request_deadline
+        };
         let correlation = connection
             .take_correlation()
             .map_err(SessionConsumerCallError::BeforeCallWrite)?;
@@ -7828,7 +7903,7 @@ impl StatelessSessionConsumerClient {
             let initial_hard_deadline = lifecycle.hard_deadline().map_err(|_| {
                 SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol)
             })?;
-            let write_deadline = pre_request_deadline.min(initial_hard_deadline);
+            let write_deadline = first_call_write_deadline.min(initial_hard_deadline);
             let write = write_frame_bounded_until_classified_with_progress(
                 &mut connection.writer,
                 &outbound,
@@ -9007,12 +9082,20 @@ impl StatelessSessionConsumerClient {
                 SessionConsumerClientError::ShuttingDown,
             ));
         }
-        if !connection.current(&self.tls_config, &self.reauthentication) {
+        if (connection.calls == 0
+            && tokio::time::Instant::now() >= connection.peer_first_call_deadline)
+            || !connection.current(&self.tls_config, &self.reauthentication)
+        {
             return Err(SessionConsumerCallError::BeforeCallWrite(
                 SessionConsumerClientError::Unavailable,
             ));
         }
         let rotation_jitter = connection.rotation_jitter;
+        let first_call_write_deadline = if connection.calls == 0 {
+            pre_request_deadline.min(connection.peer_first_call_deadline)
+        } else {
+            pre_request_deadline
+        };
         let correlation = connection
             .take_correlation()
             .map_err(SessionConsumerCallError::BeforeCallWrite)?;
@@ -9030,7 +9113,7 @@ impl StatelessSessionConsumerClient {
             let initial_hard_deadline = lifecycle.hard_deadline().map_err(|_| {
                 SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Protocol)
             })?;
-            let write_deadline = pre_request_deadline.min(initial_hard_deadline);
+            let write_deadline = first_call_write_deadline.min(initial_hard_deadline);
             let write = write_frame_bounded_until_classified_with_progress(
                 &mut connection.writer,
                 &outbound,
@@ -13218,8 +13301,8 @@ impl PersistentPrewarmBatch {
     }
 
     /// Staging defers only the local unused-lane idle clock. Absolute
-    /// authentication retirement and peer closure still end the batch while a
-    /// subsequent resolver/TCP/TLS/Hello attempt is pending.
+    /// authentication retirement, the peer's first-Call bound and peer closure
+    /// still end the batch while a subsequent setup attempt is pending.
     async fn retire_unusable(&mut self) {
         let mut reauthentication = self.pool.client.reauthentication.subscribe();
         let mut material = Some(self.pool.client.tls_config.subscribe_material_changes());
@@ -13239,7 +13322,12 @@ impl PersistentPrewarmBatch {
             let deadline = self
                 .connections
                 .iter()
-                .map(|connection| connection.lifecycle.retire_at())
+                .map(|connection| {
+                    connection
+                        .lifecycle
+                        .retire_at()
+                        .min(connection.peer_first_call_deadline)
+                })
                 .min()
                 .unwrap_or_else(tokio::time::Instant::now);
             let closed = {
@@ -13275,6 +13363,17 @@ impl PersistentPrewarmBatch {
 
 impl Drop for PersistentPrewarmBatch {
     fn drop(&mut self) {
+        if tokio::runtime::Handle::try_current()
+            .is_err_and(|error| error.is_thread_local_destroyed())
+        {
+            // Tokio cannot be entered during TLS teardown. Release every
+            // staged lane and its physical permit without polling or spawning.
+            for _connection in self.connections.drain(..) {
+                counter_increment(&self.pool.counters.reconnects);
+            }
+            self.pool.drained_notify.notify_waiters();
+            return;
+        }
         // The public prewarm future may be cancelled after its caller leaves
         // the runtime, or while another runtime is entered. Keep the original
         // clock and idle-reaper executor without requiring a current context.
@@ -13914,10 +14013,10 @@ impl PersistentSessionConsumerPool {
             return Some(connection);
         }
         // A returned lane must still be authenticated and within its absolute
-        // lifecycle. A fresh prewarmed connection has not yet established a
-        // peer between-call deadline, so its first publication starts one
-        // bounded idle interval. After any Call, however, the conservative
-        // deadline was stamped before the request write; never widen it from
+        // lifecycle. Publication starts a fresh lane's local idle interval,
+        // capped by the peer's first-Call deadline captured at HelloAck.
+        // After any Call, the conservative deadline was stamped before the
+        // request write; never widen it from
         // the later response/return instant because the peer may already be
         // counting its own (possibly shorter) idle interval.
         if !connection.returnable_after_authenticated_work()
@@ -13930,7 +14029,8 @@ impl PersistentSessionConsumerPool {
             connection.idle_deadline = batch_published_at
                 .unwrap_or_else(tokio::time::Instant::now)
                 .checked_add(effective_consumer_idle_timeout(self.client.idle_timeout))
-                .expect("validated consumer idle timeout has a bounded deadline");
+                .expect("validated consumer idle timeout has a bounded deadline")
+                .min(connection.peer_first_call_deadline);
         }
         // Keep target comparison and idle publication in one critical
         // section. A lane that predates a target update cannot re-enter the
@@ -14626,6 +14726,8 @@ impl PersistentSessionConsumerClient {
         config.validate()?;
         if client.idle_timeout.is_zero()
             || client.idle_timeout > DEFAULT_CONSUMER_IDLE_TIMEOUT
+            || !client.valid_peer_idle_timeout()
+            || client.idle_timeout > client.peer_idle_timeout
             || !valid_consumer_operation_timeout(client.operation_timeout)
             || client
                 .lifecycle_policy
@@ -19089,6 +19191,10 @@ impl SessionQuorumConsumerServer {
     /// Set the active authenticated-frame idle deadline. A larger legacy
     /// stateless value remains source-compatible, while revision 5 applies its
     /// five-second active-frame ceiling internally.
+    /// This also bounds the wait for the first Call after HelloAck. Clients
+    /// using a shorter server timeout must configure
+    /// [`StatelessSessionConsumerClient::with_peer_idle_timeout`] accordingly;
+    /// the frozen HelloAck does not advertise this duration.
     #[must_use]
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
@@ -28190,6 +28296,9 @@ mod tests {
                 next_correlation: NonZeroU32::MIN,
                 calls: 0,
                 idle_deadline,
+                peer_first_call_deadline: client
+                    .peer_first_call_deadline(established_at, established_at)
+                    .expect("synthetic peer idle budget"),
                 request_frame_size: super::MAX_NEGOTIATED_FRAME_SIZE,
                 resolved_address: "127.0.0.1:1".parse().expect("synthetic address"),
                 warm_target_generation: 0,

@@ -379,3 +379,258 @@ async fn prewarm_batch_rechecks_fresh_authentication_after_the_peer_probe() {
     assert!(client.pool.idle.lock().expect("idle lanes").is_empty());
     client.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn peer_idle_bound_accounts_for_ack_transit_and_rejects_exhausted_budgets() {
+    let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+    let client = stateless
+        .clone()
+        .with_idle_timeout(Duration::from_millis(100))
+        .with_peer_idle_timeout(Duration::from_millis(100), Duration::from_millis(10));
+    let hello_started = tokio::time::Instant::now();
+    tokio::time::advance(Duration::from_millis(25)).await;
+    let ack_received = tokio::time::Instant::now();
+    assert_eq!(
+        client.peer_first_call_deadline(hello_started, ack_received),
+        Ok(hello_started + Duration::from_millis(90)),
+        "time spent receiving HelloAck cannot become extra peer idle time"
+    );
+    tokio::time::advance(Duration::from_millis(65)).await;
+    assert_eq!(
+        client.peer_first_call_deadline(hello_started, tokio::time::Instant::now()),
+        Err(SessionConsumerClientError::Unavailable),
+        "an acknowledgement arriving inside the safety margin is unusable"
+    );
+    for (local, peer, margin) in [
+        (100, 0, 10),
+        (100, 100, 0),
+        (100, 100, 100),
+        (100, 100, 101),
+        (100, 5_001, 10),
+        (101, 100, 10),
+    ] {
+        assert!(matches!(
+            PersistentSessionConsumerClient::from_stateless(
+                stateless
+                    .clone()
+                    .with_idle_timeout(Duration::from_millis(local))
+                    .with_peer_idle_timeout(
+                        Duration::from_millis(peer),
+                        Duration::from_millis(margin),
+                    ),
+            ),
+            Err(PersistentSessionConsumerConfigError::Timing)
+        ));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn prewarm_peer_idle_bound_reaps_each_lane_from_its_own_hello() {
+    let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+        .lock()
+        .await;
+    let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        stateless
+            .with_idle_timeout(Duration::from_millis(100))
+            .with_peer_idle_timeout(Duration::from_millis(100), Duration::from_millis(10)),
+        PersistentSessionConsumerConfig {
+            request_connections: 2,
+            ..PersistentSessionConsumerConfig::default()
+        },
+    )
+    .expect("two lanes with an explicit peer bound");
+    let started = tokio::time::Instant::now();
+    let mut peers = Vec::new();
+    let mut batch = PersistentPrewarmBatch::new(Arc::clone(&client.pool));
+    for index in 0..2 {
+        if index == 1 {
+            tokio::time::advance(Duration::from_millis(25)).await;
+        }
+        let (mut connection, peer) = staged_connection(&client);
+        connection._persistent_physical_admission = Some(
+            Arc::clone(&client.pool.physical_lanes)
+                .try_acquire_owned()
+                .expect("physical lane admission"),
+        );
+        batch.connections.push(connection);
+        peers.push(peer);
+    }
+    drop(batch);
+    {
+        let idle = client.pool.idle.lock().expect("published batch");
+        assert_eq!(idle.len(), 2);
+        assert_eq!(idle[0].idle_deadline, started + Duration::from_millis(90));
+        assert_eq!(idle[1].idle_deadline, started + Duration::from_millis(115));
+    }
+    wait_for_idle_reaper_armed_deadline(
+        &client,
+        started + Duration::from_millis(90),
+        "first peer's deadline",
+    )
+    .await;
+    tokio::time::advance(Duration::from_millis(64)).await;
+    wait_for_raw_idle_count(&client, 2).await;
+    assert_eq!(client.pool.physical_lanes.available_permits(), 0);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    wait_for_raw_idle_count(&client, 1).await;
+    assert_eq!(client.pool.physical_lanes.available_permits(), 1);
+    wait_for_idle_reaper_armed_deadline(
+        &client,
+        started + Duration::from_millis(115),
+        "second peer's deadline",
+    )
+    .await;
+    tokio::time::advance(Duration::from_millis(25)).await;
+    wait_for_raw_idle_count(&client, 0).await;
+    assert_eq!(client.pool.physical_lanes.available_permits(), 2);
+    client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn prewarm_peer_idle_bound_ends_staging_before_peer_closure() {
+    let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+        .lock()
+        .await;
+    let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+    let client = PersistentSessionConsumerClient::from_stateless(
+        stateless
+            .with_idle_timeout(Duration::from_millis(100))
+            .with_peer_idle_timeout(Duration::from_millis(100), Duration::from_millis(10)),
+    )
+    .expect("explicit peer bound");
+    let (mut connection, _live_peer) = staged_connection(&client);
+    connection._persistent_physical_admission = Some(
+        Arc::clone(&client.pool.physical_lanes)
+            .try_acquire_owned()
+            .expect("physical lane admission"),
+    );
+    let deadline = connection.peer_first_call_deadline;
+    let mut batch = PersistentPrewarmBatch::new(Arc::clone(&client.pool));
+    batch.connections.push(connection);
+    assert!(batch.retire_unusable().now_or_never().is_none());
+    tokio::time::advance(Duration::from_millis(89)).await;
+    assert!(batch.retire_unusable().now_or_never().is_none());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(batch.retire_unusable().now_or_never().is_some());
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    assert!(batch.connections.is_empty());
+    drop(batch);
+    assert!(client.pool.idle.lock().expect("raw idle lanes").is_empty());
+    assert_eq!(
+        client.pool.physical_lanes.available_permits(),
+        client.pool.config.request_connections
+    );
+    assert!(!client.readiness().await.ready);
+    client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn prewarm_first_call_rechecks_peer_idle_bound_after_checkout() {
+    let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+        .lock()
+        .await;
+    let (stateless, _material) = stateless_test_client(SessionReauthenticationControl::new());
+    let client = PersistentSessionConsumerClient::from_stateless(
+        stateless
+            .with_idle_timeout(Duration::from_millis(100))
+            .with_peer_idle_timeout(Duration::from_millis(100), Duration::from_millis(10)),
+    )
+    .expect("explicit peer bound");
+    let written = Arc::new(AtomicUsize::new(0));
+    let (mut connection, _live_peer) = staged_connection(&client);
+    connection.writer = Box::new(SharedCountingWriter {
+        accepted: Arc::clone(&written),
+    });
+    let peer_deadline = connection.peer_first_call_deadline;
+    let mut batch = PersistentPrewarmBatch::new(Arc::clone(&client.pool));
+    batch.connections.push(connection);
+    drop(batch);
+    let mut checked_out = client.pool.take_idle().expect("lane is initially reusable");
+    tokio::time::advance(Duration::from_millis(90)).await;
+    assert_eq!(tokio::time::Instant::now(), peer_deadline);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    let connection = checked_out.connection_mut().expect("checked-out lane");
+    let request = mutation_request(SessionConsumerRequestId::new());
+    let result = client
+        .pool
+        .client
+        .execute_on_connection(connection, &request, deadline, false, deadline, None)
+        .await;
+    assert_eq!(
+        result,
+        Err(SessionConsumerCallError::BeforeCallWrite(
+            SessionConsumerClientError::Unavailable
+        )),
+        "an expired first Call must remain definitely untransmitted"
+    );
+    assert_eq!(connection.calls, 0);
+    assert_eq!(written.load(Ordering::SeqCst), 0);
+    let request = SessionConsumerRequest::new(
+        scope(),
+        SessionConsumerRequestId::new(),
+        SessionConsumerOperation::Watch { start_sequence: 0 },
+    );
+    let mut reauthentication = client.pool.client.reauthentication.subscribe();
+    let mut material = Some(client.pool.client.tls_config.subscribe_material_changes());
+    assert_eq!(
+        client
+            .pool
+            .client
+            .write_watch_call_on_connection(
+                connection,
+                &request,
+                deadline,
+                false,
+                &mut reauthentication,
+                &mut material,
+            )
+            .await,
+        Err(SessionConsumerClientError::Unavailable)
+    );
+    assert_eq!(connection.calls, 0);
+    assert_eq!(written.load(Ordering::SeqCst), 0);
+    drop(checked_out);
+    client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn prewarm_first_call_write_cannot_wait_past_its_peer_idle_bound() {
+    let (client, _material) = stateless_test_client(SessionReauthenticationControl::new());
+    let client = client
+        .with_idle_timeout(Duration::from_millis(100))
+        .with_peer_idle_timeout(Duration::from_millis(100), Duration::from_millis(10));
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(250);
+    let (mut connection, _) =
+        synthetic_consumer_connection(&client, deadline, Box::new(PendingWriter));
+    let request = mutation_request(SessionConsumerRequestId::new());
+    let result = {
+        let write = client.execute_on_connection(
+            &mut connection,
+            &request,
+            deadline,
+            false,
+            deadline,
+            None,
+        );
+        tokio::pin!(write);
+        assert!(write.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_millis(90)).await;
+        write.await
+    };
+    assert_eq!(
+        result,
+        Err(SessionConsumerCallError::BeforeCallWrite(
+            SessionConsumerClientError::Deadline
+        ))
+    );
+    assert_eq!(
+        tokio::time::Instant::now(),
+        connection.peer_first_call_deadline
+    );
+    assert_eq!(
+        connection.accepted_ciphertext_writes.load(Ordering::SeqCst),
+        0
+    );
+}

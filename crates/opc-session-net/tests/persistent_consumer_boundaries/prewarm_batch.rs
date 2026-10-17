@@ -334,6 +334,87 @@ async fn delayed_prewarm_never_counts_a_lane_after_its_peer_idle_deadline() {
     assert!(!readiness.ready);
 }
 
+#[tokio::test(start_paused = true)]
+async fn first_call_reestablishes_a_lane_after_its_configured_peer_idle_bound() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let pki = TestPki::new();
+    let server_spiffe = spiffe("short-peer-idle-server");
+    let client_spiffe = spiffe("short-peer-idle-client");
+    let (authorizer, _scope, voter_authority) =
+        authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+    let peer_idle = Duration::from_millis(100);
+    let (server, address) = SessionQuorumConsumerServer::new(
+        Arc::new(ActivationConsumer),
+        pki.server_config(&server_spiffe),
+        authorizer,
+    )
+    .with_idle_timeout(peer_idle)
+    .listen("127.0.0.1:0".parse().expect("listen address"))
+    .await
+    .expect("authenticated consumer listener");
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver: RemoteAddrResolver = {
+        let resolutions = Arc::clone(&resolutions);
+        Arc::new(move || {
+            resolutions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(address) })
+        })
+    };
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        StatelessSessionConsumerClient::new_with_resolver(
+            resolver,
+            rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+            voter_authority,
+            pki.client_config(&client_spiffe),
+        )
+        .with_operation_timeout(Duration::from_millis(250))
+        .with_idle_timeout(peer_idle)
+        .with_peer_idle_timeout(peer_idle, Duration::from_millis(10)),
+        PersistentSessionConsumerConfig::try_new(
+            1,
+            4,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(600),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("bounded one-lane configuration"),
+    )
+    .expect("persistent client with explicit peer idle bound");
+    pause_client_clock_at_tick(runtime_origin).await;
+    let published = without_clock_advance(client.prewarm())
+        .await
+        .expect("initial prewarm");
+    assert!(published.ready);
+    assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(90)).await;
+    let near_deadline = client.readiness().await;
+    assert!(!near_deadline.ready);
+    assert_eq!(near_deadline.ready_request_connections, 0);
+    tokio::time::advance(Duration::from_millis(11)).await;
+    without_clock_advance(async {
+        while server.admission_snapshot().active_connections != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        without_clock_advance(client.fenced_transition_capability()).await,
+        Ok(AtomicFencedTransitionCapability::V1),
+        "the first Call uses a fresh lane within the original operation budget"
+    );
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    let diagnostics = client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, 2);
+    assert_eq!(diagnostics.outcome_unknown, 0);
+    assert!(diagnostics.max_active <= 1);
+    without_clock_advance(client.shutdown()).await;
+    without_clock_advance(server.abort_and_wait()).await;
+}
+
 struct InterruptedBatch {
     server: Option<IndependentServer>,
     client: PersistentSessionConsumerClient,
