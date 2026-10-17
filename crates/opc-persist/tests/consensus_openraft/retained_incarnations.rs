@@ -169,7 +169,7 @@ pub(super) async fn call(
     Ok(VoterAuthenticatedResponse { response, proof })
 }
 
-fn verified_request(table: &VoterSlotTable, slot: u16) -> VerifiedVoterReplacement {
+pub(super) fn verified_request(table: &VoterSlotTable, slot: u16) -> VerifiedVoterReplacement {
     let old = &table.slots[usize::from(slot - 1)].member;
     let candidate = member(slot, old.identity.incarnation().get() + 1);
     let controller = member(20, 1);

@@ -51,13 +51,23 @@ Provision its fresh backing with `provision_config_member_repair`, then call
 `open_with_voter_slots` (or `open_with_voter_slots_and_operation_timeout`). Wire
 the new identity's authenticated endpoint and call `initialize_cluster`.
 
-The SDK coordinator transfers the snapshot, catches up the nonvoting learner,
-and commits joint and uniform membership before application admission. The old
+Initialization downloads the snapshot from the surviving leader. Each chunk
+requires a fresh source quorum; the empty candidate never counts toward it.
+The SDK coordinator observes the installed snapshot, catches up the nonvoting
+learner, and commits joint and uniform membership before application admission. The old
 identity remains retired. The candidate cannot vote or bootstrap a new cluster
 while awaiting membership, even when its logical slot was the canonical
 bootstrap slot. Legacy same-identity repair starts with elections and
 heartbeats disabled, rejects consensus RPCs, and returns
 `VoterIdentityReplacementRequired` from `initialize_cluster`.
+
+Each initialization attempt keeps its original complete deadline. An ordinary
+deadline retains the verified download checkpoint for the next attempt; fresh
+discovery reuses it only for the exact same source vote and snapshot metadata.
+A stalled former source triggers rediscovery. Cancelling an active attempt
+removes its partial file, including a checkpoint that attempt had resumed.
+Shutdown removes a saved checkpoint. Once installation is dispatched, the
+admission owner joins its engine effect even if the caller stops waiting.
 
 Keep the exact initial binding when reopening the same candidate backing; the
 replicated table advances inside it. Cancellation of an admission wait does

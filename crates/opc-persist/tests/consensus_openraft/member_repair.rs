@@ -1,4 +1,8 @@
 use super::*;
+use opc_consensus::voter_slots::{
+    VoterAuthenticatedResponse, VoterPeerResolver, VoterPeerRoute, VoterRpcBinding,
+    VoterSlotMember, VoterSlotPhase, VoterSlotRecord,
+};
 
 #[derive(serde::Deserialize)]
 struct ReceivedRepairChunk {
@@ -40,6 +44,39 @@ struct RepairPeer {
     control: Arc<RepairControl>,
 }
 
+impl RepairPeer {
+    async fn before_repair(&self) {
+        self.control.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = self.control.chunks.load(Ordering::SeqCst);
+        let limit = self.control.chunk_limit.load(Ordering::SeqCst);
+        if (chunks > 0 && self.control.pause_after_first_chunk.load(Ordering::SeqCst))
+            || (limit > 0 && chunks >= limit)
+        {
+            self.control.blocked.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+
+    fn observe_repair(&self, response: &ConsensusWireResponse) {
+        if let Ok(bytes) = &response.result {
+            let (_, chunk): (u16, ReceivedRepairChunk) =
+                opc_consensus::decode_bounded(bytes).unwrap();
+            self.control
+                .received
+                .lock()
+                .unwrap()
+                .push(RepairChunkObservation {
+                    vote: chunk.vote,
+                    meta: chunk.meta,
+                    offset: chunk.offset,
+                    length: chunk.bytes.len(),
+                    done: chunk.done,
+                });
+            self.control.chunks.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 #[async_trait]
 impl ConsensusPeer for RepairPeer {
     fn node_id(&self) -> ConfigConsensusNodeId {
@@ -73,40 +110,76 @@ impl ConsensusPeer for RepairPeer {
     ) -> Result<opc_consensus::ConsensusCallResponse, ConsensusPeerError> {
         let repair = request.family == ConsensusRpcFamily::MemberRepair;
         if repair {
-            self.control.calls.fetch_add(1, Ordering::SeqCst);
-            let chunks = self.control.chunks.load(Ordering::SeqCst);
-            let limit = self.control.chunk_limit.load(Ordering::SeqCst);
-            if (chunks > 0 && self.control.pause_after_first_chunk.load(Ordering::SeqCst))
-                || (limit > 0 && chunks >= limit)
-            {
-                self.control.blocked.notify_one();
-                return std::future::pending().await;
-            }
+            self.before_repair().await;
         }
         let reply = self
             .peer
             .call_with_compatibility(request, required, timeout)
             .await?;
         if repair {
-            if let Ok(bytes) = &reply.response.result {
-                let (_, chunk): (u16, ReceivedRepairChunk) =
-                    opc_consensus::decode_bounded(bytes).unwrap();
-                self.control
-                    .received
-                    .lock()
-                    .unwrap()
-                    .push(RepairChunkObservation {
-                        vote: chunk.vote,
-                        meta: chunk.meta,
-                        offset: chunk.offset,
-                        length: chunk.bytes.len(),
-                        done: chunk.done,
-                    });
-                self.control.chunks.fetch_add(1, Ordering::SeqCst);
-            }
+            self.observe_repair(&reply.response);
         }
         Ok(reply)
     }
+
+    async fn call_with_incarnation(
+        &self,
+        request: ConsensusWireRequest,
+        binding: VoterRpcBinding,
+        timeout: Duration,
+    ) -> Result<VoterAuthenticatedResponse, ConsensusPeerError> {
+        let repair = request.family == ConsensusRpcFamily::MemberRepair;
+        if repair {
+            self.before_repair().await;
+        }
+        let reply = self
+            .peer
+            .call_with_incarnation(request, binding, timeout)
+            .await?;
+        if repair {
+            self.observe_repair(&reply.response);
+        }
+        Ok(reply)
+    }
+}
+
+#[derive(Debug)]
+struct RepairResolver {
+    inner: retained_incarnations::Resolver,
+    controls: BTreeMap<usize, Arc<RepairControl>>,
+}
+
+impl VoterPeerResolver for RepairResolver {
+    fn resolve(&self, member: &VoterSlotMember) -> Result<VoterPeerRoute, ConsensusPeerError> {
+        let mut route = self.inner.resolve(member)?;
+        if let Some(control) = self
+            .controls
+            .get(&usize::from(member.identity.slot().get() - 1))
+        {
+            route.peer = Arc::new(RepairPeer {
+                peer: route.peer,
+                control: control.clone(),
+            });
+        }
+        Ok(route)
+    }
+}
+
+fn repair_resolver(
+    cluster: &ThreeNodeCluster,
+    source: usize,
+    control: &Arc<RepairControl>,
+) -> Arc<dyn VoterPeerResolver> {
+    Arc::new(RepairResolver {
+        inner: retained_incarnations::Resolver {
+            source,
+            paths: cluster.paths.clone(),
+        },
+        controls: (0..cluster.stores.len())
+            .filter(|target| *target != source)
+            .map(|target| (target, control.clone()))
+            .collect(),
+    })
 }
 
 fn staged_repair_bytes(path: &std::path::Path) -> Vec<u64> {
@@ -131,12 +204,17 @@ fn staged_repair_files(path: &std::path::Path) -> Vec<(std::ffi::OsString, u64)>
 async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
     let directory = tempfile::tempdir().unwrap();
     let nodes = [1, 2, 3, 4, 5].map(|id| ConfigConsensusNodeId::new(id).unwrap());
-    let members: BTreeSet<_> = nodes.into_iter().collect();
-    let identity = ConfigConsensusIdentity::new(
-        ConfigConsensusClusterId::new("stalled-member-repair").unwrap(),
-        ConfigConsensusConfigurationId::from_bytes([0x71; 32]),
-        ConfigConsensusConfigurationEpoch::new(1).unwrap(),
-    );
+    let mut initial = retained_incarnations::genesis();
+    initial.cluster_instance = ConfigConsensusClusterId::new("stalled-member-repair").unwrap();
+    initial.manifest_digest = [0x71; 32];
+    initial.slots = (1..=5)
+        .map(|slot| VoterSlotRecord {
+            member: retained_incarnations::member(slot, 1),
+            retired_through: 0,
+            phase: VoterSlotPhase::Voting,
+            last_result: None,
+        })
+        .collect();
     let mut paths = BTreeMap::new();
     for source in 0..5 {
         for (target, node) in nodes.iter().enumerate() {
@@ -146,22 +224,22 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
         }
     }
     let controls: [_; 4] = std::array::from_fn(|_| Arc::new(RepairControl::default()));
-    let peers_for = |source| {
-        (0..5)
-            .filter(|target| *target != source)
-            .map(|target| {
-                let peer = paths[&(source, target)].clone() as Arc<dyn ConsensusPeer>;
-                let peer = if source == 4 {
-                    Arc::new(RepairPeer {
-                        peer,
-                        control: controls[target].clone(),
-                    }) as Arc<dyn ConsensusPeer>
-                } else {
-                    peer
-                };
-                (nodes[target], peer)
-            })
-            .collect::<BTreeMap<_, _>>()
+    let resolver_for = |source| -> Arc<dyn VoterPeerResolver> {
+        Arc::new(RepairResolver {
+            inner: retained_incarnations::Resolver {
+                source,
+                paths: paths.clone(),
+            },
+            controls: if source == 4 {
+                controls
+                    .iter()
+                    .enumerate()
+                    .map(|(target, control)| (target, control.clone()))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            },
+        })
     };
     let mut stores = Vec::new();
     for (index, &local_node) in nodes.iter().enumerate() {
@@ -174,11 +252,12 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
         .await
         .unwrap();
         stores.push(
-            ConsensusConfigStore::open_with_operation_timeout(
-                ConfigConsensusTopology::try_new(identity, local_node, members.clone()).unwrap(),
+            ConsensusConfigStore::open_with_voter_slots_and_operation_timeout(
+                initial.clone(),
+                local_node,
                 backend,
                 directory.path().join(format!("snapshots-{index}")),
-                peers_for(index),
+                resolver_for(index),
                 Duration::from_secs(10),
             )
             .await
@@ -186,7 +265,8 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
         );
     }
     for ((_, target), peer) in &paths {
-        peer.install(stores[*target].rpc_handler()).await;
+        peer.install_incarnation(nodes[*target], stores[*target].rpc_handler())
+            .await;
     }
     for result in
         futures_util::future::join_all(stores.iter().map(|s| s.initialize_cluster())).await
@@ -206,11 +286,24 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
         )
         .await
         .unwrap();
-    let topology = ConfigConsensusTopology::try_new(identity, nodes[4], members).unwrap();
+    for ((_, target), peer) in &paths {
+        if *target == 4 {
+            *peer.handler.write().await = None;
+        }
+    }
+    tokio::time::sleep(opc_consensus::voter_slots::VOTER_RECENT_TRAFFIC_WINDOW).await;
+    let prepared = stores[0]
+        .replace_voter(retained_incarnations::verified_request(&initial, 5))
+        .await
+        .unwrap()
+        .table()
+        .clone();
+    let local = retained_incarnations::member(5, 2).identity.node_id();
     let backend = SqliteBackend::provision_config_member_repair(
-        retained_options(
+        retained_incarnations::options(
             &directory.path().join("replacement.sqlite"),
-            topology.clone(),
+            prepared.clone(),
+            local,
             9,
         ),
         audit_key(),
@@ -218,18 +311,20 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
     .await
     .unwrap();
     let snapshots = directory.path().join("repair-snapshots");
-    stores[4] = ConsensusConfigStore::open_with_operation_timeout(
-        topology,
+    stores[4] = ConsensusConfigStore::open_with_voter_slots_and_operation_timeout(
+        prepared,
+        local,
         backend,
         &snapshots,
-        peers_for(4),
+        resolver_for(4),
         Duration::from_secs(1),
     )
     .await
     .unwrap();
     for ((_, target), peer) in &paths {
         if *target == 4 {
-            peer.install(stores[4].rpc_handler()).await;
+            peer.install_incarnation(local, stores[4].rpc_handler())
+                .await;
         }
     }
     let former = &controls[0];
@@ -311,7 +406,20 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
 
 #[tokio::test]
 async fn repair_rediscovery_reuses_the_verified_checkpoint_for_the_same_snapshot() {
-    let mut cluster = ThreeNodeCluster::start().await;
+    let mut cluster =
+        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedIncarnations)
+            .await;
+    for result in futures_util::future::join_all(
+        cluster
+            .stores
+            .iter()
+            .map(|store| store.initialize_cluster()),
+    )
+    .await
+    {
+        result.unwrap();
+    }
+    cluster.wait_ready().await;
     let tx = TxId::new();
     cluster.stores[cluster.leader()]
         .append_commit_idempotent(
@@ -321,14 +429,18 @@ async fn repair_rediscovery_reuses_the_verified_checkpoint_for_the_same_snapshot
         .await
         .unwrap();
     cluster.stores[0].shutdown().await.unwrap();
-    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).unwrap());
-    let topology =
-        ConfigConsensusTopology::try_new(cluster.identity, nodes[0], nodes.into_iter().collect())
-            .unwrap();
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            *peer.handler.write().await = None;
+        }
+    }
+    let prepared = retained_incarnations::prepare(&cluster, 0).await;
+    let local = retained_incarnations::member(1, 2).identity.node_id();
     let backend = SqliteBackend::provision_config_member_repair(
-        retained_options(
+        retained_incarnations::options(
             &cluster._directory.path().join("rediscovery-repair.sqlite"),
-            topology.clone(),
+            prepared.clone(),
+            local,
             11,
         ),
         audit_key(),
@@ -336,30 +448,22 @@ async fn repair_rediscovery_reuses_the_verified_checkpoint_for_the_same_snapshot
     .await
     .unwrap();
     let control = Arc::new(RepairControl::default());
-    let peers = (1..3)
-        .map(|target| {
-            (
-                nodes[target],
-                Arc::new(RepairPeer {
-                    peer: cluster.paths[&(0, target)].clone(),
-                    control: control.clone(),
-                }) as Arc<dyn ConsensusPeer>,
-            )
-        })
-        .collect();
+    let resolver = repair_resolver(&cluster, 0, &control);
     let snapshots = cluster._directory.path().join("rediscovery-snapshots");
-    cluster.stores[0] = ConsensusConfigStore::open_with_operation_timeout(
-        topology,
+    cluster.stores[0] = ConsensusConfigStore::open_with_voter_slots_and_operation_timeout(
+        prepared,
+        local,
         backend,
         &snapshots,
-        peers,
+        resolver,
         Duration::from_secs(1),
     )
     .await
     .unwrap();
     for ((_, target), peer) in &cluster.paths {
         if *target == 0 {
-            peer.install(cluster.stores[0].rpc_handler()).await;
+            peer.install_incarnation(local, cluster.stores[0].rpc_handler())
+                .await;
         }
     }
     control.chunk_limit.store(1, Ordering::SeqCst);
@@ -406,7 +510,8 @@ async fn repair_rediscovery_reuses_the_verified_checkpoint_for_the_same_snapshot
 #[tokio::test]
 async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
     let mut cluster =
-        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew).await;
+        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedIncarnations)
+            .await;
     let (a, b, c) = tokio::join!(
         cluster.stores[0].initialize_cluster(),
         cluster.stores[1].initialize_cluster(),
@@ -426,43 +531,39 @@ async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
         .unwrap();
     cluster.stores[0].shutdown().await.unwrap();
 
-    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).unwrap());
-    let topology =
-        ConfigConsensusTopology::try_new(cluster.identity, nodes[0], nodes.into_iter().collect())
-            .unwrap();
-    let options = retained_options(
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            *peer.handler.write().await = None;
+        }
+    }
+    let prepared = retained_incarnations::prepare(&cluster, 0).await;
+    let local = retained_incarnations::member(1, 2).identity.node_id();
+    let options = retained_incarnations::options(
         &cluster._directory.path().join("bounded-repair.sqlite"),
-        topology.clone(),
+        prepared.clone(),
+        local,
         10,
     );
     let backend = SqliteBackend::provision_config_member_repair(options.clone(), audit_key())
         .await
         .unwrap();
     let control = Arc::new(RepairControl::default());
-    let peers = (1..3)
-        .map(|target| {
-            (
-                nodes[target],
-                Arc::new(RepairPeer {
-                    peer: cluster.paths[&(0, target)].clone(),
-                    control: control.clone(),
-                }) as Arc<dyn ConsensusPeer>,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let resolver = repair_resolver(&cluster, 0, &control);
     let snapshots = cluster._directory.path().join("bounded-repair-snapshots");
-    cluster.stores[0] = ConsensusConfigStore::open_with_operation_timeout(
-        topology.clone(),
+    cluster.stores[0] = ConsensusConfigStore::open_with_voter_slots_and_operation_timeout(
+        prepared.clone(),
+        local,
         backend,
         &snapshots,
-        peers.clone(),
+        resolver.clone(),
         Duration::from_secs(1),
     )
     .await
     .unwrap();
     for ((_, target), peer) in &cluster.paths {
         if *target == 0 {
-            peer.install(cluster.stores[0].rpc_handler()).await;
+            peer.install_incarnation(local, cluster.stores[0].rpc_handler())
+                .await;
         }
     }
     let mut previous_bytes = 0;
@@ -536,18 +637,20 @@ async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
             let backend = SqliteBackend::reopen_config_authority(options.clone(), audit_key())
                 .await
                 .unwrap();
-            let reopened = ConsensusConfigStore::open_with_operation_timeout(
-                topology.clone(),
+            let reopened = ConsensusConfigStore::open_with_voter_slots_and_operation_timeout(
+                prepared.clone(),
+                local,
                 backend,
                 &snapshots,
-                peers.clone(),
+                resolver.clone(),
                 Duration::from_secs(1),
             )
             .await
             .unwrap();
             for ((_, target), peer) in &cluster.paths {
                 if *target == 0 {
-                    peer.install(reopened.rpc_handler()).await;
+                    peer.install_incarnation(local, reopened.rpc_handler())
+                        .await;
                 }
             }
             cluster.stores.insert(0, reopened);
@@ -608,7 +711,8 @@ fn large_attested(tx: TxId) -> AttestedConfigCommit {
 #[tokio::test]
 async fn cancelled_repair_requires_fresh_quorum_then_reopens_with_a_majority() {
     let mut cluster =
-        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew).await;
+        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedIncarnations)
+            .await;
     let (a, b, c) = tokio::join!(
         cluster.stores[0].initialize_cluster(),
         cluster.stores[1].initialize_cluster(),
@@ -631,13 +735,17 @@ async fn cancelled_repair_requires_fresh_quorum_then_reopens_with_a_majority() {
     assert_ne!(leader, 0);
     cluster.stores[leader].trigger_snapshot().await.unwrap();
 
-    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).unwrap());
-    let topology =
-        ConfigConsensusTopology::try_new(cluster.identity, nodes[0], nodes.into_iter().collect())
-            .unwrap();
-    let options = retained_options(
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            *peer.handler.write().await = None;
+        }
+    }
+    let prepared = retained_incarnations::prepare(&cluster, 0).await;
+    let local = retained_incarnations::member(1, 2).identity.node_id();
+    let options = retained_incarnations::options(
         &cluster._directory.path().join("repair.sqlite"),
-        topology.clone(),
+        prepared.clone(),
+        local,
         9,
     );
     let backend = SqliteBackend::provision_config_member_repair(options.clone(), audit_key())
@@ -647,25 +755,21 @@ async fn cancelled_repair_requires_fresh_quorum_then_reopens_with_a_majority() {
     control
         .pause_after_first_chunk
         .store(true, Ordering::SeqCst);
-    let peers = (1..3)
-        .map(|target| {
-            (
-                nodes[target],
-                Arc::new(RepairPeer {
-                    peer: cluster.paths[&(0, target)].clone(),
-                    control: control.clone(),
-                }) as Arc<dyn ConsensusPeer>,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let resolver = repair_resolver(&cluster, 0, &control);
     let snapshots = cluster._directory.path().join("repair-snapshots");
-    cluster.stores[0] =
-        ConsensusConfigStore::open(topology.clone(), backend, &snapshots, peers.clone())
-            .await
-            .unwrap();
+    cluster.stores[0] = ConsensusConfigStore::open_with_voter_slots(
+        prepared.clone(),
+        local,
+        backend,
+        &snapshots,
+        resolver.clone(),
+    )
+    .await
+    .unwrap();
     for ((_, target), peer) in &cluster.paths {
         if *target == 0 {
-            peer.install(cluster.stores[0].rpc_handler()).await;
+            peer.install_incarnation(local, cluster.stores[0].rpc_handler())
+                .await;
         }
     }
     let recovering = cluster.stores[0].clone();
@@ -757,12 +861,14 @@ async fn cancelled_repair_requires_fresh_quorum_then_reopens_with_a_majority() {
     let backend = SqliteBackend::reopen_config_authority(options, audit_key())
         .await
         .unwrap();
-    let restored = ConsensusConfigStore::open(topology, backend, snapshots, peers)
-        .await
-        .unwrap();
+    let restored =
+        ConsensusConfigStore::open_with_voter_slots(prepared, local, backend, snapshots, resolver)
+            .await
+            .unwrap();
     for ((_, target), peer) in &cluster.paths {
         if *target == 0 {
-            peer.install(restored.rpc_handler()).await;
+            peer.install_incarnation(local, restored.rpc_handler())
+                .await;
         }
     }
     cluster.stores.insert(0, restored);
