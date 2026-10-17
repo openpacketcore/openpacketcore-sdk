@@ -400,6 +400,97 @@ async fn cancelled_prewarm_publishes_survivors_and_releases_admission() {
     fixture.assert_no_retained_capacity().await;
 }
 
+#[test]
+fn cancelled_prewarm_outside_runtime_releases_admission_and_expires_survivors() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("client runtime");
+    let fixture = runtime.block_on(async {
+        let origin = tokio::time::Instant::now();
+        tokio::time::resume();
+        let lifecycle = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::ZERO,
+        )
+        .expect("bounded lifecycle with a deterministic retry interval");
+        let fixture = InterruptedBatch::new(lifecycle).await;
+        pause_client_clock_at_tick(origin).await;
+        fixture
+    });
+    let mut prewarm = Box::pin(fixture.client.prewarm());
+    runtime.block_on(async {
+        without_clock_advance(async {
+            tokio::select! {
+                biased;
+                result = &mut prewarm => panic!("second resolver must remain pending: {result:?}"),
+                _ = fixture.second_entered.notified() => {}
+            }
+        })
+        .await;
+        let staged = fixture.client.diagnostics().await;
+        assert_eq!(staged.setup_attempts, 2);
+        assert_eq!(staged.setup_successes, 1);
+        assert_eq!(staged.setup_failures, 0);
+        assert_eq!(staged.active, 1);
+        assert_eq!(staged.idle, 0);
+        tokio::time::advance(Duration::from_millis(25)).await;
+    });
+
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(prewarm)));
+    if cancelled.is_err() {
+        // Retain the production panic as the RED while closing the real TLS
+        // transport before the fixture and its independent runtime exit.
+        runtime.block_on(without_clock_advance(fixture.client.shutdown()));
+    }
+    assert!(
+        cancelled.is_ok(),
+        "dropping a pending prewarm outside Runtime::block_on must not panic"
+    );
+    assert!(tokio::runtime::Handle::try_current().is_err());
+
+    runtime.block_on(async {
+        let partial = fixture.client.readiness().await;
+        assert!(!partial.ready);
+        assert_eq!(partial.configured_request_connections, 2);
+        assert_eq!(partial.ready_request_connections, 1);
+        let cancelled = fixture.client.diagnostics().await;
+        assert_eq!(cancelled.active, 1);
+        assert_eq!(cancelled.idle, 1);
+        assert_eq!(cancelled.setup_successes, 1);
+        assert_eq!(cancelled.setup_failures, 1);
+        assert_eq!(cancelled.inflight, 0);
+        assert_eq!(cancelled.queued, 0);
+        assert_eq!(cancelled.pool_wait_current, 0);
+
+        tokio::time::advance(Duration::from_millis(9)).await;
+        assert_eq!(
+            fixture.client.readiness().await.ready_request_connections,
+            1
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        fixture.assert_no_retained_capacity().await;
+        let recovered = without_clock_advance(fixture.client.prewarm())
+            .await
+            .expect("outside-runtime cancellation releases every admission");
+        assert!(recovered.ready);
+        assert_eq!(recovered.ready_request_connections, 2);
+        assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 4);
+        let completed = fixture.client.diagnostics().await;
+        assert_eq!(completed.setup_successes, 3);
+        assert_eq!(completed.setup_failures, 1);
+        assert_eq!(completed.active, 2);
+        assert!(completed.max_active <= 2);
+        without_clock_advance(fixture.client.shutdown()).await;
+        fixture.assert_no_retained_capacity().await;
+    });
+}
+
 #[tokio::test(start_paused = true)]
 async fn expired_setup_bound_cannot_activate_a_partial_prewarm_batch() {
     let runtime_origin = tokio::time::Instant::now();
