@@ -58,7 +58,7 @@ pub(super) fn start(inner: &Arc<ConsensusSessionStoreInner>) {
             }
             let due =
                 full_since.map(|since| since + inner.storage_shutdown.snapshot_pressure_timeout());
-            let transfer_due = target.is_some() || due.is_some_and(|due| now >= due);
+            let transfer_due = handoff.is_some() || due.is_some_and(|due| now >= due);
             if leader && active && transfer_due && now >= next_attempt {
                 let store = ConsensusSessionStore { inner };
                 let deadline = store.operation_deadline_from(now);
@@ -70,8 +70,8 @@ pub(super) fn start(inner: &Arc<ConsensusSessionStoreInner>) {
                 if !matches!(result, Ok(Ok(()))) {
                     tracing::warn!("snapshot pressure leadership transfer will retry");
                 }
-                // Keep the exact target/request across a failed attempt. The
-                // engine has irrevocably stopped this vote's new proposals.
+                // Keep an accepted target/request across a failed completion.
+                // A failed begin owns neither and still requires live pressure.
                 next_attempt = tokio::time::Instant::now() + Duration::from_secs(1);
                 continue;
             }

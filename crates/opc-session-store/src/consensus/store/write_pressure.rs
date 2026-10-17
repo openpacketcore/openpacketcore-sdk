@@ -22,6 +22,9 @@ impl ConsensusSessionStore {
         F: FnMut(tokio::time::Instant) -> Fut + Send + 'static,
         Fut: Future<Output = Option<T>> + Send,
     {
+        if self.inner.raft.metrics().borrow().running_state.is_err() {
+            return Err(PressureRetryFailure::NotTransmitted);
+        }
         if let Some(result) = attempt(first_deadline).await {
             return Ok(result);
         }
@@ -50,7 +53,8 @@ impl ConsensusSessionStore {
                             || current.running_state.is_err()
                     }) => {},
                 }
-                if store.inner.retirement.is_started()
+                if metrics.borrow().running_state.is_err()
+                    || store.inner.retirement.is_started()
                     || store
                         .inner
                         .shutdown

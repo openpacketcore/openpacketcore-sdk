@@ -11,6 +11,9 @@ mod write_retention;
 #[path = "snapshot_progress.rs"]
 mod snapshot_progress;
 
+#[path = "pressure_round.rs"]
+mod pressure_round;
+
 const WAIT: Duration = Duration::from_secs(60);
 
 async fn fleet(mode: SessionPersistenceMode) -> Fleet {

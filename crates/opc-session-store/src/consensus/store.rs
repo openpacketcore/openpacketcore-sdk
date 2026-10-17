@@ -8620,22 +8620,47 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
         cohort_freeze: Arc<AtomicBool>,
     ) -> FencedTransitionV2StatusLogicalTimeTicketReply {
-        let reply = self
-            .apply_on_local_leader_inner(
-                ForwardMutationRequest {
-                    work_class: ForwardWorkClass::Inferred,
-                    request_id: SessionConsensusRequestId::new(),
-                    intent: SessionMutationIntent::AdvanceLogicalTime,
-                    required_consumer_scope: ForwardConsumerScope::Consumer(Box::new(
-                        required_consumer_scope,
-                    )),
-                },
-                self.inner.local_node_id,
+        use super::log_admission::LogAdmissionError;
+
+        let request = ForwardMutationRequest {
+            work_class: ForwardWorkClass::Inferred,
+            request_id: SessionConsensusRequestId::new(),
+            intent: SessionMutationIntent::AdvanceLogicalTime,
+            required_consumer_scope: ForwardConsumerScope::Consumer(Box::new(
+                required_consumer_scope,
+            )),
+        };
+        let reply = loop {
+            let reply = self
+                .apply_on_local_leader_inner(
+                    request.clone(),
+                    self.inner.local_node_id,
+                    deadline,
+                    false,
+                    Some(Arc::clone(&cohort_freeze)),
+                )
+                .await;
+            if !matches!(reply, ForwardMutationReply::LogPressure) {
+                break reply;
+            }
+            // Pressure proves that this exact representative was not proposed,
+            // including a race at final enqueue. Release its authority/running
+            // credits while waiting, then re-admit it within the same deadline.
+            let admission = &self.inner.raft_handler.log_admission;
+            match tokio::time::timeout_at(
                 deadline,
-                false,
-                Some(cohort_freeze),
+                admission.while_leader(admission.ready_before(deadline)),
             )
-            .await;
+            .await
+            {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Err(LogAdmissionError::NotLeader(leader)))
+                | Ok(Ok(Err(LogAdmissionError::NotLeader(leader)))) => {
+                    return FencedTransitionV2StatusLogicalTimeTicketReply::NotLeader { leader };
+                }
+                _ => return FencedTransitionV2StatusLogicalTimeTicketReply::Unavailable,
+            }
+        };
         match reply {
             ForwardMutationReply::Applied(response) => {
                 match FencedTransitionV2StatusLogicalTimeTicket::try_from_response(

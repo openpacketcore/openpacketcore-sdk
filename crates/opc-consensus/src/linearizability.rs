@@ -6,7 +6,7 @@
 
 use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -314,6 +314,7 @@ where
     lease: LinearizableReadLease,
     lease_proof: Arc<Mutex<Option<LeaderLeaseProof<C::NodeId>>>>,
     lease_reuse_disabled: Arc<AtomicBool>,
+    lease_reuse_minimum_term: Arc<AtomicU64>,
 }
 
 impl<C> Clone for LinearizableReadBarrier<C>
@@ -328,6 +329,7 @@ where
             lease: self.lease,
             lease_proof: Arc::clone(&self.lease_proof),
             lease_reuse_disabled: Arc::clone(&self.lease_reuse_disabled),
+            lease_reuse_minimum_term: Arc::clone(&self.lease_reuse_minimum_term),
         }
     }
 }
@@ -355,6 +357,7 @@ where
             lease,
             lease_proof: Arc::new(Mutex::new(None)),
             lease_reuse_disabled: Arc::new(AtomicBool::new(false)),
+            lease_reuse_minimum_term: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -367,6 +370,22 @@ where
     pub fn disable_lease_reuse(&self) {
         self.lease_reuse_disabled.store(true, Ordering::SeqCst);
         self.forget_lease();
+    }
+
+    /// Fence cached proofs for this vote before a live leadership transfer.
+    ///
+    /// Clones and delayed quorum completions cannot restore reuse in this term.
+    /// A later elected term can cache its own fresh quorum proof. Planned
+    /// retirement must still use [`Self::disable_lease_reuse`] permanently.
+    pub fn fence_current_vote_lease_reuse(&self) {
+        let term = self.metrics.borrow().vote.leader_id.term;
+        if let Some(next_term) = term.checked_add(1) {
+            self.lease_reuse_minimum_term
+                .fetch_max(next_term, Ordering::SeqCst);
+            self.forget_lease();
+        } else {
+            self.disable_lease_reuse();
+        }
     }
 
     /// Fence one local read under the caller's absolute deadline.
@@ -610,6 +629,7 @@ where
         metrics: &RaftMetrics<C::NodeId, C::Node>,
     ) -> bool {
         if self.lease_reuse_disabled.load(Ordering::SeqCst)
+            || proof.term < self.lease_reuse_minimum_term.load(Ordering::SeqCst)
             || Instant::now() >= proof.expires_at
             || self.require_same_local_leader(metrics, proof.term).is_err()
         {
@@ -636,9 +656,11 @@ where
         };
         if let Ok(mut proof) = self.lease_proof.lock() {
             // Check under the cache lock as well as at admission: a quorum
-            // round started before retirement may finish after it. It must
-            // neither replace the cleared cache nor re-enable its reuse.
-            if self.lease_reuse_disabled.load(Ordering::SeqCst) {
+            // round started before a lease fence may finish after it. It must
+            // not restore a fenced term or a permanently disabled cache.
+            if self.lease_reuse_disabled.load(Ordering::SeqCst)
+                || term < self.lease_reuse_minimum_term.load(Ordering::SeqCst)
+            {
                 return;
             }
             *proof = Some(LeaderLeaseProof {
@@ -1300,6 +1322,77 @@ mod tests {
         assert_eq!(leased.read_log_id(), Some(log_id(3, 7, 10)));
         assert!(invocations.try_recv().is_err());
         assert_eq!(probe.invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn live_handoff_fences_delayed_proofs_but_allows_a_new_term_lease() {
+        let (barrier, metrics, mut invocations, probe) =
+            controlled_barrier(LinearizableReadLease::Enabled, Some(log_id(3, 7, 10)));
+        let deadline = Instant::now() + LONG_DEADLINE;
+        let before_handoff = tokio::spawn({
+            let barrier = barrier.clone();
+            async move { barrier.admit(deadline).await }
+        });
+        let delayed = timeout_at(deadline, invocations.recv())
+            .await
+            .expect("round stays within its deadline")
+            .expect("round before handoff");
+        barrier.clone().fence_current_vote_lease_reuse();
+        delayed.reply.send(ready(10)).expect("finish delayed round");
+        before_handoff.await.unwrap().unwrap();
+        assert!(barrier.load_lease().is_none());
+
+        let same_term = tokio::spawn({
+            let barrier = barrier.clone();
+            async move { barrier.admit(deadline).await }
+        });
+        timeout_at(deadline, invocations.recv())
+            .await
+            .expect("fenced admission reaches the engine before its deadline")
+            .expect("the fenced term still needs a full quorum round")
+            .reply
+            .send(ready(10))
+            .unwrap();
+        same_term.await.unwrap().unwrap();
+        assert!(barrier.load_lease().is_none());
+
+        metrics.send_replace(leader_metrics(4, Some(log_id(4, 7, 11))));
+        let reelected = tokio::spawn({
+            let barrier = barrier.clone();
+            async move { barrier.admit(deadline).await }
+        });
+        timeout_at(deadline, invocations.recv())
+            .await
+            .expect("new-term admission reaches the engine before its deadline")
+            .expect("new term requires its own proof")
+            .reply
+            .send(ready_for(4, 7, 11))
+            .unwrap();
+        reelected.await.unwrap().unwrap();
+        let leased = barrier.clone().admit(deadline).await.unwrap();
+        assert_eq!(leased.term, 4);
+        assert_eq!(leased.read_log_id(), Some(log_id(4, 7, 11)));
+        assert!(invocations.try_recv().is_err());
+        assert_eq!(probe.invocations.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn live_handoff_rechecks_a_cached_proof_after_apply_wait() {
+        let (barrier, metrics, _invocations, _probe) =
+            controlled_barrier(LinearizableReadLease::Enabled, Some(log_id(3, 7, 10)));
+        barrier.remember_lease(3, Some(log_id(3, 7, 11)), Instant::now());
+        let mut cached = Box::pin(barrier.try_lease(Instant::now() + LONG_DEADLINE));
+        std::future::poll_fn(|cx| match cached.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => panic!("apply wait must be pending: {result:?}"),
+        })
+        .await;
+        barrier.clone().fence_current_vote_lease_reuse();
+        metrics.send_modify(|metrics| {
+            metrics.last_applied = Some(log_id(3, 7, 11));
+            metrics.last_log_index = Some(11);
+        });
+        assert_eq!(cached.await.unwrap(), None);
     }
 
     #[tokio::test]

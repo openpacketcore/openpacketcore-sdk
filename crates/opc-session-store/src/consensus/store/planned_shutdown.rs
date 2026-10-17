@@ -111,7 +111,7 @@ impl ConsensusSessionStore {
             None => {
                 let metrics = self.inner.raft.metrics();
                 let current = metrics.borrow();
-                let successor = scope
+                scope
                     .1
                     .iter()
                     .copied()
@@ -124,21 +124,24 @@ impl ConsensusSessionStore {
                             .copied()
                             .flatten()
                     })
-                    .ok_or_else(consensus_unavailable)?;
-                *target = Some(successor);
-                successor
+                    .ok_or_else(consensus_unavailable)?
             }
         };
         if handoff.is_none() {
-            self.inner.raw_v2_read_barrier.disable_lease_reuse();
-            self.inner.read_barrier.disable_lease_reuse();
-            *handoff = Some(
-                self.inner
-                    .raft
-                    .begin_leadership_transfer(successor)
-                    .await
-                    .map_err(|_| consensus_unavailable())?,
-            );
+            self.inner
+                .raw_v2_read_barrier
+                .fence_current_vote_lease_reuse();
+            self.inner.read_barrier.fence_current_vote_lease_reuse();
+            let accepted = self
+                .inner
+                .raft
+                .begin_leadership_transfer(successor)
+                .await
+                .map_err(|_| consensus_unavailable())?;
+            // Only an accepted engine handoff survives a cleared pressure
+            // window. A rejected begin must not schedule an unrelated transfer.
+            *target = Some(successor);
+            *handoff = Some(accepted);
         }
         let request = handoff.as_ref().ok_or_else(consensus_unavailable)?;
         // This live source remains a voter. Source plus successor count toward
