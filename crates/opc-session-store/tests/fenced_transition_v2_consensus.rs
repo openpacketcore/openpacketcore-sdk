@@ -6,6 +6,9 @@
 //! require the internal operator-recovery and topology fixtures and are
 //! recorded in `docs/sdk-702-nonabsorbing-fenced-history-evidence.md`.
 
+#[path = "fenced_transition_v2_consensus/lease_contention_deferral.rs"]
+mod lease_contention_deferral;
+
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use bytes::Bytes;
