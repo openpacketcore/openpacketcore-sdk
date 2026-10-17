@@ -184,7 +184,7 @@ fn native_catalog_lease_deferral_retirement_separate_checkpoints() {
 #[test]
 fn native_catalog_lease_deferral_retirement_rejects_false_deletion_witnesses() {
     let (mut hot, pending) = full_epoch_pending_fixture(1);
-    let (mut files, _) = Files::with_maximum(&hot, 512 * 1024 * 1024);
+    let (files, _) = Files::with_maximum(&hot, 512 * 1024 * 1024);
     let prefix = files.bytes();
     hot.begin_changes().unwrap();
     let resolved_at = Timestamp::from_offset_datetime(
