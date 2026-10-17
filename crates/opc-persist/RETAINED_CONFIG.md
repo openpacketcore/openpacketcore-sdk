@@ -49,6 +49,9 @@ budget. A fresh response reuses the checkpoint only when its source, committed
 vote, and complete snapshot metadata still match; a successor or changed
 snapshot starts a new download. Snapshot reads share the publication gate so
 replacement cannot remove a selected file before it is verified and opened.
+The source waits for the snapshot cut to cover the accepted prefix within the
+request budget before fetching the snapshot; unrelated engine metrics updates
+do not cause repeated fetches.
 Cancellation and shutdown
 remove that partial download automatically, and ordinary startup removes any
 staging left by a crash. A completed repair persists through the

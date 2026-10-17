@@ -770,7 +770,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cancelled repair can retry without manual cleanup. Stalled saved repairs
   rediscover a live source and reuse partial bytes only for exactly matching
   snapshot authority. Snapshot reads remain valid across concurrent snapshot
-  replacement. (#1315)
+  replacement, and repair waits for actual snapshot progress before fetching.
+  (#1315)
 
 - `opc-proto-gtpv2c`: An empty Create Session Response APCO received before any
   retained APCO is discarded as malformed optional outer-IE data at every

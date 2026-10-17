@@ -145,7 +145,7 @@ impl ConsensusConfigStore {
                     .borrow_and_update()
                     .last_applied
                     .map(|log| log.index);
-                if self.repair_source_vote() != Some(vote) {
+                if Instant::now() >= deadline || self.repair_source_vote() != Some(vote) {
                     return Err(consensus_unavailable());
                 }
                 if applied >= required {
@@ -156,33 +156,39 @@ impl ConsensusConfigStore {
                     .map_err(|_| consensus_unavailable())?
                     .map_err(|_| consensus_unavailable())?;
             }
-            let snapshot = loop {
-                drop(metrics.borrow_and_update());
-                if self.repair_source_vote() != Some(vote) {
-                    return Err(consensus_unavailable());
-                }
-                if let Some(snapshot) = self
-                    .inner
-                    .raft
-                    .get_snapshot()
-                    .await
-                    .map_err(|_| consensus_unavailable())?
-                {
-                    if snapshot.meta.last_log_id.map(|log| log.index) >= required {
-                        break snapshot;
-                    }
-                }
+            let snapshot_cut = metrics.borrow_and_update().snapshot.map(|log| log.index);
+            if snapshot_cut < required {
                 self.inner
                     .raft
                     .trigger()
                     .snapshot()
                     .await
                     .map_err(|_| consensus_unavailable())?;
+            }
+            loop {
+                let snapshot_cut = metrics.borrow_and_update().snapshot.map(|log| log.index);
+                if Instant::now() >= deadline || self.repair_source_vote() != Some(vote) {
+                    return Err(consensus_unavailable());
+                }
+                if snapshot_cut >= required {
+                    break;
+                }
+                // Core messages also flush metrics without snapshot progress.
+                // Only the published cut can authorize a GetSnapshot call;
+                // polling that call would wake this same watch repeatedly.
                 tokio::time::timeout_at(deadline, metrics.changed())
                     .await
                     .map_err(|_| consensus_unavailable())?
                     .map_err(|_| consensus_unavailable())?;
-            };
+            }
+            let snapshot = self
+                .inner
+                .raft
+                .get_snapshot()
+                .await
+                .map_err(|_| consensus_unavailable())?
+                .filter(|snapshot| snapshot.meta.last_log_id.map(|log| log.index) >= required)
+                .ok_or_else(consensus_unavailable)?;
             (snapshot, 0)
         };
         if !exact_uniform_voter_membership(&snapshot.meta.last_membership, &self.inner.members)
