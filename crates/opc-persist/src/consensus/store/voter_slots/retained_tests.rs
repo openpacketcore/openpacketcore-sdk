@@ -269,18 +269,38 @@ async fn selected_candidate(
     tempfile::TempDir,
     RetainedConfigOptions,
 ) {
+    selected_candidate_with_timeout(
+        fleet,
+        prepared,
+        slot,
+        DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn selected_candidate_with_timeout(
+    fleet: &Fleet,
+    prepared: &VoterSlotTable,
+    slot: u16,
+    operation_timeout: Duration,
+) -> (
+    ConsensusConfigStore,
+    tempfile::TempDir,
+    RetainedConfigOptions,
+) {
     let directory = tempfile::tempdir().unwrap();
     let local = member(slot, 2).identity.node_id();
     let options = retained_options(directory.path(), prepared.clone(), local);
     let backend = SqliteBackend::provision_config_member_repair(options.clone(), audit_key())
         .await
         .unwrap();
-    let candidate = ConsensusConfigStore::open_with_voter_slots(
+    let candidate = ConsensusConfigStore::open_with_voter_slots_and_operation_timeout(
         prepared.clone(),
         local,
         backend,
         directory.path().join("snapshots"),
         Arc::new(Resolver(fleet.network.clone())),
+        operation_timeout,
     )
     .await
     .unwrap();
@@ -440,7 +460,13 @@ async fn five_retained_voters_replace_lost_vote_identity_through_a_learner() {
             .await
             .unwrap();
         assert!(prepared.table().is_retired(old));
-        let (candidate, directory, _) = selected_candidate(&fleet, prepared.table(), 5).await;
+        // Finalization is deliberately withheld below, so initialize must
+        // exhaust its own request budget. Use the same one-second attempt as
+        // the bounded-download regressions; the 30-second outer bound still
+        // includes the full authenticated-loss window and later vote lease.
+        let (candidate, directory, _) =
+            selected_candidate_with_timeout(&fleet, prepared.table(), 5, Duration::from_secs(1))
+                .await;
         fleet
             .network
             .freeze_after_marker
