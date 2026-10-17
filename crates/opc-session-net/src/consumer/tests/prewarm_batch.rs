@@ -2,6 +2,103 @@ use super::*;
 use crate::consumer::PersistentPrewarmBatch;
 use crate::lifecycle::{CertificateExpiryEvidence, TlsCompletionTime};
 
+struct ReviewReadyAtPeerBoundWriter {
+    ready_at: tokio::time::Instant,
+    accepted_bytes: Arc<AtomicUsize>,
+    accepted_writes: Arc<AtomicU64>,
+}
+
+impl AsyncWrite for ReviewReadyAtPeerBoundWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if tokio::time::Instant::now() < self.ready_at {
+            return Poll::Pending;
+        }
+        if !bytes.is_empty() {
+            self.accepted_bytes.fetch_add(bytes.len(), Ordering::SeqCst);
+            self.accepted_writes.fetch_add(1, Ordering::Release);
+        }
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn review_resume_first_write_at_peer_bound(watch: bool) {
+    let (client, _material) = stateless_test_client(SessionReauthenticationControl::new());
+    let client = client
+        .with_idle_timeout(Duration::from_millis(100))
+        .with_peer_idle_timeout(Duration::from_millis(100), Duration::from_millis(10));
+    let started = tokio::time::Instant::now();
+    let operation_deadline = started + Duration::from_millis(250);
+    let accepted_bytes = Arc::new(AtomicUsize::new(0));
+    let accepted_writes = Arc::new(AtomicU64::new(0));
+    let (mut connection, _) = synthetic_consumer_connection(
+        &client,
+        operation_deadline,
+        Box::new(ReviewReadyAtPeerBoundWriter {
+            ready_at: started + Duration::from_millis(90),
+            accepted_bytes: Arc::clone(&accepted_bytes),
+            accepted_writes: Arc::clone(&accepted_writes),
+        }),
+    );
+    connection.accepted_ciphertext_writes = Arc::clone(&accepted_writes);
+    assert_eq!(connection.peer_first_call_deadline, started + Duration::from_millis(90));
+    let result = if watch {
+        let request = SessionConsumerRequest::new(
+            scope(), SessionConsumerRequestId::new(),
+            SessionConsumerOperation::Watch { start_sequence: 0 },
+        );
+        let mut reauthentication = client.reauthentication.subscribe();
+        let mut material = Some(client.tls_config.subscribe_material_changes());
+        let write = client.write_watch_call_on_connection(
+            &mut connection, &request, operation_deadline, false,
+            &mut reauthentication, &mut material,
+        );
+        tokio::pin!(write);
+        assert!(write.as_mut().now_or_never().is_none());
+        assert_eq!(accepted_bytes.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(90)).await;
+        format!("{:?}", write.await)
+    } else {
+        let request = mutation_request(SessionConsumerRequestId::new());
+        let write = client.execute_on_connection(
+            &mut connection, &request, operation_deadline, false, operation_deadline, None,
+        );
+        tokio::pin!(write);
+        assert!(write.as_mut().now_or_never().is_none());
+        assert_eq!(accepted_bytes.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(90)).await;
+        format!("{:?}", write.await)
+    };
+    assert_eq!(tokio::time::Instant::now(), connection.peer_first_call_deadline);
+    eprintln!("review peer-bound resume watch={watch} elapsed_ms={} bytes={} writes={} result={result}",
+        started.elapsed().as_millis(), accepted_bytes.load(Ordering::SeqCst),
+        accepted_writes.load(Ordering::SeqCst));
+    assert_eq!(accepted_bytes.load(Ordering::SeqCst), 0,
+        "a pending first write must not transmit when resumed at the peer bound");
+    assert_eq!(accepted_writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn review_first_call_request_resume_at_peer_bound_writes_nothing() {
+    review_resume_first_write_at_peer_bound(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn review_first_call_watch_resume_at_peer_bound_writes_nothing() {
+    review_resume_first_write_at_peer_bound(true).await;
+}
+
 fn staged_connection(
     client: &PersistentSessionConsumerClient,
 ) -> (ConsumerConnection, tokio::io::DuplexStream) {
