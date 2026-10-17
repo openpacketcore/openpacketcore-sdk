@@ -8,6 +8,9 @@ use opc_consensus::DURABLE_OPENRAFT_PROFILE;
 #[path = "write_retention.rs"]
 mod write_retention;
 
+#[path = "snapshot_progress.rs"]
+mod snapshot_progress;
+
 const WAIT: Duration = Duration::from_secs(60);
 
 async fn fleet(mode: SessionPersistenceMode) -> Fleet {

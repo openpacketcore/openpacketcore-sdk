@@ -1524,6 +1524,8 @@ impl Wal {
                     let state = lock_state(&self.shared)?;
                     ensure_readable(&state)?;
                 }
+                #[cfg(test)]
+                (self.control.hook)(Point::NativeSnapshotExportProgress)?;
                 if cancelled() {
                     return Err(io::Error::other(SnapshotExportCancelled));
                 }
