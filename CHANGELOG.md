@@ -751,11 +751,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `opc-persist`: snapshot reads verify the opened descriptor after releasing
-  the publication gate, with separate bounded gate and operation budgets.
-  Retained repair and voter replacement request another build when an older
-  in-flight snapshot completes below the required cut, without polling snapshot
-  contents on unrelated engine updates.
+- `opc-persist`: snapshot reads pin the last durable publication independently
+  of building or installing its successor, including a delayed SQLite commit.
+  Publication holds only a brief gate; readers open independent descriptors and
+  verify them with bounded I/O stalls, allowing healthy large replacement reads
+  to outlive an RPC budget. Retained repair and voter replacement retry swallowed
+  build triggers even when a maintenance build completes at the same cut,
+  without polling snapshot contents on unrelated engine updates.
 
 - `opc-session-store`: read V2 history through its existing fresh quorum
   read-index barrier without proposing an unused logical-time advance. History

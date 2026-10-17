@@ -858,3 +858,6 @@ mod review_tests;
 
 #[path = "retry_tests.rs"]
 mod retry_tests;
+
+#[path = "snapshot_tests.rs"]
+mod snapshot_tests;
