@@ -9,7 +9,7 @@ use opc_consensus::engine::{
     network::{RPCOption, RaftNetwork, RaftNetworkFactory},
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, VoteRequest, VoteResponse,
+        InstallSnapshotResponse, PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse,
     },
     EmptyNode, Raft, ServerState, Vote,
 };
@@ -51,6 +51,8 @@ struct VoteExchange {
 }
 
 struct SplitGate {
+    pre_votes: watch::Sender<BTreeMap<u64, PreVoteRequest<u64>>>,
+    both_pre_votes: Barrier,
     arrivals: watch::Sender<BTreeMap<u64, VoteRequest<u64>>>,
     both_candidates: Barrier,
     term: Option<u64>,
@@ -98,6 +100,40 @@ impl Connection {
 }
 
 impl RaftNetwork<ElectionConfig> for Connection {
+    async fn pre_vote(
+        &mut self,
+        rpc: PreVoteRequest<u64>,
+        _option: RPCOption,
+    ) -> Result<PreVoteResponse<u64>, RPCError<u64, EmptyNode, RaftError<u64>>> {
+        let response = self
+            .target()
+            .map_err(RPCError::Unreachable)?
+            .pre_vote(rpc.clone())
+            .await
+            .map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))?;
+        let split = self
+            .network
+            .state
+            .split
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|gate| gate.term.is_none_or(|term| rpc.vote.leader_id.term == term));
+        if let Some(split) = split {
+            assert!(
+                response.vote_granted,
+                "split fixture begins after leader lease expiry"
+            );
+            split.pre_votes.send_modify(|arrivals| {
+                assert!(arrivals.insert(self.network.source, rpc).is_none());
+            });
+            // Deliver both real speculative grants before either candidate
+            // can persist its self-vote; then cross the two real Vote RPCs.
+            split.both_pre_votes.wait().await;
+        }
+        Ok(response)
+    }
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<ElectionConfig>,
@@ -233,10 +269,16 @@ async fn automatic_re_election_after_forced_split_vote() {
     nodes[0].shutdown().await.unwrap();
     state.votes.send_replace(Vec::new());
     *state.split.lock().unwrap() = Some(Arc::new(SplitGate {
+        pre_votes: watch::channel(BTreeMap::new()).0,
+        both_pre_votes: Barrier::new(2),
         arrivals: watch::channel(BTreeMap::new()).0,
         both_candidates: Barrier::new(2),
         term: None,
     }));
+
+    // The forced failed round begins after the last leader lease expires.
+    // The retry bound below still starts at the observed split.
+    tokio::time::sleep(Duration::from_millis(config.election_timeout_max + 1)).await;
 
     // These are the only forced campaigns: they construct the failed round.
     let first_trigger = nodes[1].trigger();

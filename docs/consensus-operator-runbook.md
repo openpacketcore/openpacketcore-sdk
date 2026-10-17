@@ -40,7 +40,7 @@ The session and configuration adapters use one fixed runtime profile from
 `opc-consensus`; operators cannot tune either domain onto a different election
 or heartbeat regime. This workspace revision exact-pins
 `https://github.com/openpacketcore/openraft` at
-`0be191c797fd8fab603474864ac8ba8211206dc2` with the complete release-0.9 history
+`1535ba4076398681127f9a8c4e4c5b8241de6be8` with the complete release-0.9 history
 through v0.9.25, bounded apply pages and joined replication retirement. Confirm the lock resolves only
 `openraft` and `openraft-macros` 0.9.25 from that full revision. Do not substitute
 a registry package, a branch, a tag, or a downstream partial patch.
@@ -552,7 +552,7 @@ See the [qualification contract](../crates/opc-session-testkit/README.md).
 The private schedule drops one successful release response per mutator to prove
 this path.
 More than eight such outcomes per node, any recovery episode beyond the fixed
-26-second two-election-plus-operation transition envelope, any retry before the
+26-second recovery SLO, any retry before the
 fixed 50 ms delay, or phase completion with an unresolved interruption fails
 the campaign. A terminal operation observed after that deadline reports the
 closed operation stage and elapsed milliseconds and stays failed; raw backend

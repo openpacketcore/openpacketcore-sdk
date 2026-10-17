@@ -82,7 +82,7 @@ Async support will require a new record version and a fresh install.
 
 `DURABLE_CONSENSUS_TIMING_PROFILE` is the sole timing authority for both
 durable domains: AppendEntries/Openraft read-index and heartbeat 2,000 ms,
-Vote 5,000 ms, elections `[5,000 ms, 8,000 ms)`, InstallSnapshot/forwarded
+Vote/Pre-Vote 5,000 ms, elections `[5,000 ms, 8,000 ms)`, InstallSnapshot/forwarded
 mutation/consumer ReadBarrier and operation default 10,000 ms, and listener
 idle/handler ceilings 30,000 ms. The 1,500 ms DNS/TCP/mTLS/bootstrap cold cap is
 contained inside the selected family deadline, never added to it.
@@ -159,9 +159,17 @@ version so scripted samples pass through the same range sampler.
 ## Interim source-build gate
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
-pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`0be191c797fd8fab603474864ac8ba8211206dc2` (0.9.25 plus fork fixes). It retains the
-per-campaign election-timeout fix and preserves a recovering snapshot target's
+pins `https://github.com/openpacketcore/openraft` at the full revision
+`1535ba4076398681127f9a8c4e4c5b8241de6be8` (0.9.25 plus fork fixes). The fork adds a distinct,
+authenticated Pre-Vote inquiry before ordinary elections and evaluates election
+deadlines at intervals of at most 100 ms. Speculative grants do not change the
+recipient's term, vote, lease timestamp or durable state. A majority of inquiries
+starts the existing persisted-vote election, including both majorities for joint
+membership. The 26-second and 30-second acceptance budgets are unchanged;
+repeated failed campaigns can still exhaust them. Planned exact-vote handoff
+retains its existing election path.
+
+The fork also retains the per-campaign election-timeout fix and preserves a recovering snapshot target's
 required log suffix through successful handoff, while failed targets release
 their ownership before retrying. When a higher vote ends leadership, the core
 joins the former leader's replication readers before a conflicting suffix can

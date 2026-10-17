@@ -17,7 +17,7 @@ mod election;
 
 // Preserve the original acquisition deadline. Randomized elections can split
 // beyond it; the audit scenario controls real election inputs within this
-// bound, and a separate split-vote regression retains the timeout behavior.
+// bound, and divergent survivor logs have a separate Pre-Vote recovery regression.
 const TRANSITION_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
@@ -75,19 +75,24 @@ impl ConsensusPeer for Peer {
             .await
             .clone()
             .ok_or(ConsensusPeerError::Unavailable)?;
-        let gate = self
-            .election_vote
-            .lock()
-            .unwrap()
-            .clone()
-            .filter(|_| request.family == opc_consensus::ConsensusRpcFamily::Vote);
+        let gate = self.election_vote.lock().unwrap().clone();
+        let is_vote = request.family == opc_consensus::ConsensusRpcFamily::Vote;
+        let pre_vote =
+            (request.family == opc_consensus::ConsensusRpcFamily::PreVote).then(|| request.clone());
         if let Some(gate) = &gate {
-            gate.before_delivery(&request).await;
+            if is_vote {
+                gate.before_delivery(&request).await;
+            }
         }
         let sender = request.sender;
         let response = handler.handle(sender, request).await;
         if let Some(gate) = gate {
-            gate.after_delivery(sender, self.target, &response);
+            if is_vote {
+                gate.after_delivery(sender, self.target, &response);
+            }
+            if let Some(request) = pre_vote {
+                gate.after_pre_vote(self.target, &request, &response).await;
+            }
         }
         self.activity.notify_one();
         Ok(response)

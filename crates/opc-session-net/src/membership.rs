@@ -142,7 +142,7 @@ impl SessionMembershipAdmissionSnapshot {
         self.pending_members
     }
 
-    /// Whether the staged successor may send `Vote` RPCs after catch-up.
+    /// Whether the staged successor may send `Vote` and `PreVote` RPCs after catch-up.
     pub const fn pending_voting_admitted(&self) -> bool {
         self.pending_voting_admitted
     }
@@ -444,7 +444,7 @@ impl SessionMembershipAdmission {
         self.abort_successor_validated(request).await
     }
 
-    /// Admit `Vote` RPCs under the staged successor after joint commit.
+    /// Admit `Vote` and `PreVote` RPCs under the staged successor after joint commit.
     ///
     /// Learner catch-up alone does not grant voting authority. The transport
     /// admits only AppendEntries and snapshot traffic under the successor
@@ -791,7 +791,7 @@ impl SessionMembershipAdmission {
                 )
             });
         let pending_engine_catchup = match family {
-            ConsensusRpcFamily::Vote => pending_voting_admitted,
+            ConsensusRpcFamily::Vote | ConsensusRpcFamily::PreVote => pending_voting_admitted,
             ConsensusRpcFamily::AppendEntries
             | ConsensusRpcFamily::AppendEntriesRoster
             | ConsensusRpcFamily::InstallSnapshot
@@ -1214,6 +1214,19 @@ mod tests {
         );
         assert_eq!(
             admission
+                .revalidate_engine_scope(
+                    &pending_scope,
+                    five.consensus_identity(),
+                    pending_scope.sender_node_id,
+                    ConsensusRpcFamily::PreVote,
+                )
+                .await
+                .map(|_| ()),
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "a staged learner must not grant Pre-Vote before catch-up promotion"
+        );
+        assert_eq!(
+            admission
                 .admit_successor_voting_after_catch_up_for_test(&expand_request)
                 .await,
             Ok(SessionMembershipTransitionResult::VotingAdmitted)
@@ -1225,6 +1238,15 @@ mod tests {
             Ok(SessionMembershipTransitionResult::AlreadyVotingAdmitted)
         );
         assert!(admission.snapshot().await.pending_voting_admitted());
+        assert!(admission
+            .revalidate_engine_scope(
+                &pending_scope,
+                five.consensus_identity(),
+                pending_scope.sender_node_id,
+                ConsensusRpcFamily::PreVote,
+            )
+            .await
+            .is_ok());
         assert!(admission
             .revalidate_engine_scope(
                 &pending_scope,

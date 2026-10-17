@@ -793,15 +793,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, and repair waits for actual snapshot progress before fetching.
   (#1315)
 
-- `opc-session-testkit` and `opc-config-bus-consensus` fixtures synchronize
-  applied prefixes, old-leader RPC completion and real vote leases before one
-  designated successor campaign. Separate automatic-failover cases release
-  setup controls before the fault and retain the full authenticated VOID,
-  config/session isolation and live config projection workloads. Keep the
-  existing 26 s and 30 s deadlines and automatic-election negative controls
-  for failed campaigns with unequal logs. Qualification recovery limits remain
-  acceptance SLOs with unchanged fail-closed, reconciliation and shutdown
-  behavior. (#1324)
+- `opc-consensus`: the pinned OpenRaft fork uses a distinct authenticated
+  Pre-Vote inquiry before ordinary elections and checks election deadlines at
+  intervals of at most 100 ms. A stale or isolated candidate no longer consumes
+  a term before proving a prospective quorum. Inquiries leave the receiver's
+  vote and durable state unchanged; actual votes still persist through the
+  existing election path. Both SDK adapters enforce the existing voting and
+  membership admission rules for the new RPC. Automatic failover fixtures keep
+  their original helpers and 26 s/30 s limits; three- and five-voter regressions
+  kill the leader during sustained writes without first synchronizing survivor
+  logs. Repeated failed campaigns remain negative controls for these acceptance
+  SLOs. Planned handoff and operator timing profiles are unchanged. (#1333, #1324)
 
 - `opc-proto-gtpv2c`: An empty Create Session Response APCO received before any
   retained APCO is discarded as malformed optional outer-IE data at every

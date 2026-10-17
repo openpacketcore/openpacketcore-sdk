@@ -20,8 +20,7 @@ opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-schema-validate = { path = "../opc-schema-validate", version = "0.2.0" }
 opc-session-net = { path = "../opc-session-net", version = "0.2.0", default-features = false }
-# This unpublished crate owns deterministic real-engine fixture controls.
-opc-session-store = { path = "../opc-session-store", version = "0.2.0", features = ["test-control"] }
+opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
 opc-tls = { path = "../opc-tls", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0", features = ["async-time"] }
 async-trait = { workspace = true }
@@ -41,6 +40,8 @@ rcgen = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Scripted election negative controls are confined to this crate's tests.
+opc-session-store = { path = "../opc-session-store", version = "0.2.0", features = ["test-control"] }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0", features = ["dangerous-test-hooks"] }
 # These integration tests compile under the default (no-fixture) feature set.
 # Keep the fixture's production-only dependencies optional above, while making

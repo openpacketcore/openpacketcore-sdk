@@ -4,7 +4,7 @@ use super::*;
 use futures_util::FutureExt;
 use opc_consensus::engine::{
     error::RaftError,
-    raft::{VoteRequest, VoteResponse},
+    raft::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse},
     Vote,
 };
 use opc_consensus::test_runtime::{ElectionRngScript, ScriptedElectionRuntime};
@@ -35,49 +35,50 @@ pub(super) struct VoteGate {
     term: u64,
     arrivals: watch::Sender<Vec<(Instant, VoteRequest<ConfigConsensusNodeId>)>>,
     both_candidates: Option<Barrier>,
+    both_pre_votes: Barrier,
     replies: watch::Sender<Vec<VoteExchange>>,
 }
 
 impl VoteGate {
-    pub(super) fn observe(term: u64) -> Arc<Self> {
-        Arc::new(Self {
-            term,
-            arrivals: watch::channel(Vec::new()).0,
-            both_candidates: None,
-            replies: watch::channel(Vec::new()).0,
-        })
-    }
-
-    pub(super) async fn assert_one_granted_vote(
+    pub(super) async fn deliver(
         &self,
-        source: ConfigConsensusNodeId,
         target: ConfigConsensusNodeId,
-        committed: u64,
-    ) {
-        let replies = self
-            .replies
-            .subscribe()
-            .wait_for(|replies| !replies.is_empty())
-            .await
-            .unwrap()
-            .clone();
-        assert_eq!(replies.len(), 1, "one real peer vote, without a retry");
-        assert_eq!(replies[0].source, source);
-        assert_eq!(replies[0].target, target);
-        assert!(replies[0].response.vote_granted);
-        assert_eq!(replies[0].response.vote, Vote::new(self.term, source));
-        let arrivals = self.arrivals.borrow();
-        assert_eq!(arrivals.len(), 1, "no competing automatic campaign");
-        assert_eq!(arrivals[0].1.vote, replies[0].response.vote);
-        assert!(arrivals[0].1.last_log_id.map(|id| id.index) >= Some(committed));
+        handler: Arc<dyn ConsensusRpcHandler>,
+        request: ConsensusWireRequest,
+    ) -> ConsensusWireResponse {
+        if request.family == ConsensusRpcFamily::PreVote {
+            let (_, rpc): (u16, PreVoteRequest<ConfigConsensusNodeId>) =
+                opc_consensus::decode_bounded(&request.payload).unwrap();
+            let response = handler.handle(request.sender, request).await;
+            let (_, reply): (
+                u16,
+                Result<PreVoteResponse<ConfigConsensusNodeId>, RaftError<ConfigConsensusNodeId>>,
+            ) = opc_consensus::decode_bounded(response.result.as_ref().unwrap()).unwrap();
+            assert!(
+                reply.unwrap().vote_granted,
+                "both inquiries succeed before crossing real votes"
+            );
+            if rpc.vote.leader_id.term < self.term + 3 {
+                self.both_pre_votes.wait().await;
+            }
+            return response;
+        }
+        if request.family != ConsensusRpcFamily::Vote {
+            return handler.handle(request.sender, request).await;
+        }
+        self.before_delivery(&request).await;
+        let source = request.sender;
+        let response = handler.handle(source, request).await;
+        self.after_delivery(source, target, &response);
+        response
     }
 
     pub(super) async fn before_delivery(&self, request: &ConsensusWireRequest) {
         let (_, vote): (u16, VoteRequest<ConfigConsensusNodeId>) =
             opc_consensus::decode_bounded(&request.payload).expect("real vote request");
-        assert!((self.term..=self.term + 2).contains(&vote.vote.leader_id.term));
+        assert!((self.term..=self.term + 3).contains(&vote.vote.leader_id.term));
         assert_eq!(vote.vote.leader_id.voted_for(), Some(request.sender));
-        let split = vote.vote.leader_id.term < self.term + 2;
+        let split = vote.vote.leader_id.term < self.term + 3;
         self.arrivals.send_modify(|arrivals| {
             assert!(
                 arrivals.iter().all(|(_, seen)| seen.vote != vote.vote),
@@ -90,7 +91,7 @@ impl VoteGate {
                 return;
             }
             // Each request exists only after its sender has saved its own
-            // vote. Deliver both after that point, forcing exactly one split.
+            // vote. Deliver both after that point, forcing a real split vote.
             barrier.wait().await;
         }
     }
@@ -201,68 +202,6 @@ impl SuccessfulElection {
     }
 }
 
-/// The four-worker functional scenario designates one real campaign after
-/// every admitted old-leader RPC has completed. Setup and this phase keep
-/// normal time, including the original 30-second diagnostic deadline.
-pub(super) async fn elect_survivor(quorum: &ProjectionCluster, old: usize) -> usize {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let previous = quorum.stores[old].status();
-        let committed = previous
-            .committed_index
-            .expect("committed projection prefix");
-        let survivors: Vec<_> = (0..quorum.stores.len())
-            .filter(|index| *index != old)
-            .collect();
-        let candidate = survivors[0];
-        for index in &survivors {
-            let status = quorum.stores[*index].status();
-            assert_eq!(status.leader_id, Some(previous.node_id));
-            assert_eq!(status.term, previous.term);
-            assert!(
-                status.applied_index >= Some(committed),
-                "successor applies the original committed prefix"
-            );
-        }
-        let gate = VoteGate::observe(previous.term + 1);
-        quorum.observe_votes(Some(gate.clone()));
-        for index in &survivors {
-            quorum.stores[*index]
-                .wait_for_vote_lease_expiry_for_test()
-                .await
-                .unwrap();
-        }
-        quorum.stores[candidate]
-            .trigger_election_for_test()
-            .await
-            .unwrap();
-        let promoted = quorum.wait_promoted(old).await;
-        assert_eq!(promoted, candidate);
-        let leader = quorum.stores[promoted].status().node_id;
-        for index in &survivors {
-            quorum.stores[*index]
-                .wait_for_raft_status_for_test(|status| {
-                    status.leader_id == Some(leader) && status.term == previous.term + 1
-                })
-                .await
-                .unwrap();
-        }
-        assert_eq!(
-            quorum.stores[promoted].ensure_local_authority().await,
-            ConfigLocalAuthorityOutcome::LocalAuthority
-        );
-        gate.assert_one_granted_vote(
-            leader,
-            quorum.stores[survivors[1]].status().node_id,
-            committed,
-        )
-        .await;
-        quorum.observe_votes(None);
-        promoted
-    })
-    .await
-    .expect("surviving quorum failed to acquire fresh authority within 30 seconds")
-}
-
 #[tokio::test(start_paused = true)]
 async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
     let runtime_origin = Instant::now();
@@ -270,10 +209,17 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
     let mut election = SuccessfulElection::new(runtime_origin).await;
     election.scripts = [
         ElectionRngScript::new([LATE_SAMPLE; 2]),
-        ElectionRngScript::new([LATE_SAMPLE; 3]),
-        ElectionRngScript::new([LATE_SAMPLE, LATE_SAMPLE, EARLY_SAMPLE, LATE_SAMPLE]),
+        ElectionRngScript::new([LATE_SAMPLE; 4]),
+        ElectionRngScript::new([
+            LATE_SAMPLE,
+            LATE_SAMPLE,
+            LATE_SAMPLE,
+            EARLY_SAMPLE,
+            LATE_SAMPLE,
+        ]),
     ];
-    let quorum = ProjectionCluster::start_controlled(None, Some(&election.scripts), true).await;
+    let quorum =
+        ProjectionCluster::start_with_election_scripts(None, Some(&election.scripts)).await;
     let old_leader = quorum.leader();
     assert_eq!(old_leader, 0);
     let initial = quorum.stores[0].status();
@@ -314,6 +260,7 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
             term: initial.term + 1,
             arrivals: watch::channel(Vec::new()).0,
             both_candidates: Some(Barrier::new(2)),
+            both_pre_votes: Barrier::new(2),
             replies: watch::channel(Vec::new()).0,
         });
         quorum.observe_votes(Some(gate.clone()));
@@ -321,20 +268,26 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
         eprintln!("election_phase fixture=config elapsed_ms=0 phase=isolated equal_prefix=13");
         let first = election.late.campaign(Duration::ZERO, Duration::ZERO, true);
         let second = election.late.campaign(first, Duration::ZERO, false);
-        let success = election.early.campaign(second, Duration::ZERO, false);
-        assert_eq!(first, Duration::from_secs(18));
-        assert_eq!(second, Duration::from_secs(27));
-        assert_eq!(success, Duration::from_secs(33));
+        let third = election.late.campaign(second, Duration::ZERO, false);
+        let success = election.early.campaign(third, Duration::ZERO, false);
+        assert_eq!(first, Duration::from_millis(15_300));
+        assert_eq!(second, Duration::from_millis(22_600));
+        assert_eq!(third, Duration::from_millis(29_900));
+        assert_eq!(success, Duration::from_millis(35_700));
         let drive = async {
-            for seconds in (3..=30).step_by(3) {
-                let at = started + Duration::from_secs(seconds);
+            for millis in (100..=30_000).step_by(100) {
+                let elapsed = Duration::from_millis(millis);
+                let at = started + elapsed;
                 tokio::time::advance(at - Instant::now()).await;
                 for (index, script) in election.scripts.iter().enumerate() {
                     schedule::tick_registered(&mut script.sleeps(), at, election.late.tick).await;
                     election.ticks.wait(index as u64 + 1, at).await;
                 }
-                if seconds == 18 || seconds == 27 {
-                    let count = if seconds == 18 { 2 } else { 4 };
+                if let Some(round) = [first, second, third]
+                    .iter()
+                    .position(|time| *time == elapsed)
+                {
+                    let count = (round + 1) * 2;
                     let replies = gate
                         .replies
                         .subscribe()
@@ -361,12 +314,12 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
                     }
                     for script in &election.scripts[1..] {
                         let draws = script.draws();
-                        assert_eq!(draws.len(), if seconds == 18 { 2 } else { 3 });
+                        assert_eq!(draws.len(), round + 2);
                         assert_eq!(draws.last().unwrap().0, at);
                     }
                     eprintln!(
                         "election_phase fixture=config elapsed_ms={} phase=split_and_resampled",
-                        seconds * 1000
+                        millis
                     );
                 }
             }
@@ -376,15 +329,15 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
             drive
         );
         assert_eq!(Instant::now() - started, Duration::from_secs(30));
-        let panic = result.expect_err("two legal split campaigns exceed the unchanged 30s bound");
+        let panic = result.expect_err("three legal split campaigns exceed the unchanged 30s bound");
         let message = panic
             .downcast_ref::<String>()
             .expect("original helper panic");
         assert!(message.starts_with("surviving quorum failed to elect a new leader:"));
-        eprintln!("acquisition_deadline fixture=config elapsed_ms=30000 failed_campaigns=2");
+        eprintln!("acquisition_deadline fixture=config elapsed_ms=30000 failed_campaigns=3");
         for (index, expected) in [(1, 13), (2, 13)] {
             let status = quorum.stores[index].status();
-            assert_eq!(status.term, initial.term + 2);
+            assert_eq!(status.term, initial.term + 3);
             assert_eq!(status.leader_id, None);
             assert_eq!(status.applied_index, Some(expected));
             assert_eq!(status.committed_index, Some(expected));
@@ -401,18 +354,18 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
         let replies = gate
             .replies
             .subscribe()
-            .wait_for(|replies| replies.len() == 5)
+            .wait_for(|replies| replies.len() == 7)
             .await
             .unwrap()
             .clone();
-        assert_eq!(replies[4].at, started + success);
-        assert_eq!(replies[4].source, quorum.stores[2].status().node_id);
-        assert!(replies[4].response.vote_granted);
+        assert_eq!(replies[6].at, started + success);
+        assert_eq!(replies[6].source, quorum.stores[2].status().node_id);
+        assert!(replies[6].response.vote_granted);
         for store in &quorum.stores[1..] {
             store
                 .wait_for_raft_status_for_test(|status| {
                     status.leader_id == Some(quorum.stores[2].status().node_id)
-                        && status.term == initial.term + 3
+                        && status.term == initial.term + 4
                 })
                 .await
                 .unwrap();
@@ -422,7 +375,7 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
             ConfigLocalAuthorityOutcome::LocalAuthority
         );
         assert_eq!(Instant::now() - started, success);
-        eprintln!("automatic_recovery fixture=config elapsed_ms=33000 campaign=3");
+        eprintln!("automatic_recovery fixture=config elapsed_ms=35700 campaign=4");
         quorum.observe_votes(None);
         quorum.shutdown().await;
         for script in &election.scripts {

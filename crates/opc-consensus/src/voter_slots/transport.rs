@@ -173,7 +173,9 @@ impl<E: VoterResponseFenceEngine> VoterTransport<E> {
         let destination = self.route(find_member(table, target)?)?;
         if matches!(
             request.family,
-            crate::ConsensusRpcFamily::Vote | crate::ConsensusRpcFamily::LeadershipTransfer
+            crate::ConsensusRpcFamily::Vote
+                | crate::ConsensusRpcFamily::PreVote
+                | crate::ConsensusRpcFamily::LeadershipTransfer
         ) && (!self.admission.local_voting_admitted()
             || !table.slots.iter().any(|slot| {
                 slot.member == destination.member && slot.phase == VoterSlotPhase::Voting

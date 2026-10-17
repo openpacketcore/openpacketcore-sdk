@@ -46,7 +46,8 @@ impl ElectionSchedule {
         assert!(sampled_timeout >= Duration::from_millis(config.election_timeout_min));
         assert!(sampled_timeout < Duration::from_millis(config.election_timeout_max));
         Self {
-            tick: Duration::from_millis(config.heartbeat_interval * 3 / 2),
+            tick: Duration::from_millis(config.heartbeat_interval * 3 / 2)
+                .min(Duration::from_millis(100)),
             lease: Duration::from_millis(config.election_timeout_max),
             sampled_timeout,
         }

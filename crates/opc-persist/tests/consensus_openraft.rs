@@ -202,6 +202,7 @@ impl ConsensusPeer for LoopbackPeer {
             .ok_or(ConsensusPeerError::Unavailable)?;
         let sender = request.sender;
         let family = request.family;
+        let pre_vote_request = (family == ConsensusRpcFamily::PreVote).then(|| request.clone());
         // The owned handler pins this exact endpoint across verification and
         // dispatch, even if the fixture reconnects the route in the meantime.
         let compatibility = match (self.compatibility, handler.compatibility()) {
@@ -282,6 +283,14 @@ impl ConsensusPeer for LoopbackPeer {
                         .send((self.target, transfer.unwrap().last_log_id().unwrap().index))
                         .unwrap();
                 }
+            }
+        }
+        if let Some(request) = &pre_vote_request {
+            if let Some(gate) = &rolling_vote {
+                gate.after_pre_vote(request, &response).await;
+            }
+            if let Some(gate) = &retention_vote {
+                gate.after_pre_vote(request, &response).await;
             }
         }
         if let Some(gate) = &rolling_vote {

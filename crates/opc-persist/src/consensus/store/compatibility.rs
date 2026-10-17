@@ -221,6 +221,7 @@ impl ConsensusPeer for CompatiblePeer {
         if !matches!(
             request.family,
             ConsensusRpcFamily::Vote
+                | ConsensusRpcFamily::PreVote
                 | ConsensusRpcFamily::AppendEntries
                 | ConsensusRpcFamily::InstallSnapshot
                 | ConsensusRpcFamily::LeadershipTransfer

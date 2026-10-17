@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "adapter/election.rs"]
+mod election;
+
 use opc_config_bus::{
     CommitWrite, CommittedRevisionSource, ConfigBus, ConfigSnapshot, EncryptingManagedDatastore,
     ManagedDatastore, SealedConfig, StoreErrorCode, StoredConfig,
@@ -31,6 +34,7 @@ use opc_persist::{
 };
 use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp, TxId};
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct TestConfig {
@@ -196,20 +200,11 @@ impl ConsensusPeer for LoopbackPeer {
         {
             return Err(ConsensusPeerError::Unavailable);
         }
-        let gate = if request.family == ConsensusRpcFamily::Vote {
-            self.election_vote.lock().unwrap().clone()
-        } else {
-            None
-        };
-        if let Some(gate) = &gate {
-            gate.before_delivery(&request).await;
-        }
-        let source = request.sender;
-        let response = handler.handle(source, request).await;
+        let gate = self.election_vote.lock().unwrap().clone();
         if let Some(gate) = gate {
-            gate.after_delivery(source, self.target, &response);
+            return Ok(gate.deliver(self.target, handler, request).await);
         }
-        Ok(response)
+        Ok(handler.handle(request.sender, request).await)
     }
 }
 
@@ -227,20 +222,12 @@ impl ProjectionCluster {
     async fn start_with_continuity(
         checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
     ) -> Self {
-        Self::start_controlled(checkpoints, None, true).await
+        Self::start_with_election_scripts(checkpoints, None).await
     }
 
     async fn start_with_election_scripts(
         checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
         scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
-    ) -> Self {
-        Self::start_controlled(checkpoints, scripts, true).await
-    }
-
-    async fn start_controlled(
-        checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
-        scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
-        automatic: bool,
     ) -> Self {
         let directory = tempfile::tempdir().expect("projection cluster directory");
         let nodes = [1_u64, 2, 3]
@@ -283,7 +270,7 @@ impl ProjectionCluster {
             let topology = ConfigConsensusTopology::try_new(identity, node, members.clone())
                 .expect("projection cluster topology");
             let snapshots = directory.path().join(format!("snapshots-{index}"));
-            let opening = async {
+            let open = async {
                 if let Some(checkpoints) = &checkpoints {
                     use opc_persist::audit_authority::continuity::{
                         AuditContinuityPolicy, AuditKeyRing, AuditSigningKey,
@@ -311,26 +298,13 @@ impl ProjectionCluster {
                     )
                     .await
                 }
+            }
+            .instrument(election::delivery::node_span(node.get()));
+            let store = match scripts {
+                Some(scripts) => scripts[index].scope(open).await,
+                None => open.await,
             };
-            let opening = tracing::Instrument::instrument(
-                opening,
-                election::delivery::node_span(node.get()),
-            );
-            let store = if let Some(scripts) = scripts {
-                scripts[index]
-                    .scope(tracing::Instrument::instrument(
-                        opening,
-                        election::delivery::node_span(node.get()),
-                    ))
-                    .await
-            } else {
-                opening.await
-            }
-            .expect("projection cluster store");
-            if !automatic {
-                store.disable_automatic_elections_for_test();
-            }
-            stores.push(Arc::new(store));
+            stores.push(Arc::new(store.expect("projection cluster store")));
         }
         for ((_, target), path) in &paths {
             path.install(stores[*target].rpc_handler()).await;

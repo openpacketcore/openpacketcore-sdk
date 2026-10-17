@@ -527,6 +527,32 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
         .await
         .unwrap();
     assert_eq!(response.result, Err(ConsensusPeerError::ScopeMismatch));
+    let inquiry = ConsensusWireRequest::try_new(
+        leader.inner.identity,
+        member(3, 1).identity.node_id(),
+        ConsensusRpcFamily::PreVote,
+        encode_config_wire(&opc_consensus::engine::raft::PreVoteRequest::new(
+            Vote::new(100, member(3, 1).identity.node_id()),
+            None,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let inquiry_response = fleet.nodes[2]
+        .inner
+        .voter_profile
+        .as_ref()
+        .unwrap()
+        .transport
+        .peer(member(2, 1).identity.node_id())
+        .call(inquiry)
+        .await
+        .unwrap();
+    assert_eq!(
+        inquiry_response.result,
+        Err(ConsensusPeerError::ScopeMismatch)
+    );
+
     assert_eq!(
         before,
         survivor

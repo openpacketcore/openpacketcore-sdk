@@ -138,6 +138,9 @@ pub enum ConsensusRpcFamily {
     /// Pull an authoritative snapshot before a repaired config voter can
     /// participate with its restored durable log and vote.
     MemberRepair,
+    /// Read-only Openraft inquiry before requesting a persisted vote.
+    /// This is a distinct wire family; it must never fall back to Vote.
+    PreVote,
 }
 
 impl ConsensusRpcFamily {
@@ -154,6 +157,7 @@ impl ConsensusRpcFamily {
             Self::TopologyAdmissionBarrier => "topology_admission_barrier",
             Self::LeadershipTransfer => "leadership_transfer",
             Self::MemberRepair => "member_repair",
+            Self::PreVote => "pre_vote",
         }
     }
 
@@ -172,6 +176,7 @@ impl ConsensusRpcFamily {
                 CONSENSUS_MAX_ROSTER_RPC_PAYLOAD_BYTES
             }
             Self::Vote
+            | Self::PreVote
             | Self::AppendEntries
             | Self::InstallSnapshot
             | Self::ForwardMutation
@@ -594,6 +599,33 @@ mod tests {
             result: Ok(vec![0; CONSENSUS_MAX_RPC_PAYLOAD_BYTES + 1]),
         };
         assert_eq!(over_response.validate(), Err(ConsensusPeerError::Protocol));
+    }
+
+    #[test]
+    fn pre_vote_has_a_distinct_wire_tag_without_renumbering_existing_families() {
+        for (tag, family) in [
+            ConsensusRpcFamily::Vote,
+            ConsensusRpcFamily::AppendEntries,
+            ConsensusRpcFamily::AppendEntriesRoster,
+            ConsensusRpcFamily::InstallSnapshot,
+            ConsensusRpcFamily::ForwardMutation,
+            ConsensusRpcFamily::ForwardRosterMutation,
+            ConsensusRpcFamily::ReadBarrier,
+            ConsensusRpcFamily::TopologyAdmissionBarrier,
+            ConsensusRpcFamily::LeadershipTransfer,
+            ConsensusRpcFamily::MemberRepair,
+            ConsensusRpcFamily::PreVote,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(encode_bounded(&family).unwrap(), vec![tag as u8]);
+        }
+        assert_eq!(ConsensusRpcFamily::PreVote.as_str(), "pre_vote");
+        assert_eq!(
+            ConsensusRpcFamily::PreVote.max_request_payload_bytes(),
+            ConsensusRpcFamily::Vote.max_request_payload_bytes()
+        );
     }
 
     #[test]

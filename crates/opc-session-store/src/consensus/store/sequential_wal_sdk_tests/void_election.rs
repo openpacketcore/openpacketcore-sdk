@@ -1,13 +1,14 @@
-//! A legal successor-election schedule with all three durable voters live.
-//! The forced campaign meets a committed lease; the next automatic campaigns
-//! split, and the designated successor wins its computed retry. The original
-//! ten-second waiter is retained as a negative control, not a completion bound.
+//! A partition and successor election with all three durable voters live.
+//! A healthy leader rejects a forced Pre-Vote without changing any vote. After
+//! partitioning it, the survivors split once and elect the successor inside
+//! 26 seconds. The former ten-second waiter remains a negative control.
 
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 use opc_consensus::engine::{
     error::RaftError,
-    raft::{VoteRequest, VoteResponse},
+    raft::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse},
     Vote,
 };
 use opc_consensus::test_runtime::{ElectionRngScript, ScriptedElectionRuntime};
@@ -30,13 +31,26 @@ struct Exchange {
     response: VoteResponse<SessionConsensusNodeId>,
 }
 
-/// Deliver real RPCs. The successor schedule holds crossing requests until
-/// both self-votes persist; lease setup collects each pair of real replies
-/// before either can produce a new leader and a committed heartbeat.
+#[derive(Clone, Debug)]
+struct PreVoteExchange {
+    source: SessionConsensusNodeId,
+    target: SessionConsensusNodeId,
+    sent: Instant,
+    replied: Instant,
+    request: PreVoteRequest<SessionConsensusNodeId>,
+    response: PreVoteResponse<SessionConsensusNodeId>,
+}
+
+/// Delay genuine grants until both survivors have queried their peer, then
+/// cross their persisted real votes. No RPC response or engine state is forged.
 pub(super) struct VoteGate {
     candidates: [SessionConsensusNodeId; 2],
-    split_term: Option<u64>,
+    old: SessionConsensusNodeId,
+    partitioned: AtomicBool,
+    split_term: u64,
+    pre_vote_crossing: Barrier,
     crossing: Barrier,
+    pre_votes: watch::Sender<Vec<PreVoteExchange>>,
     exchanges: watch::Sender<Vec<Exchange>>,
 }
 
@@ -47,14 +61,50 @@ impl VoteGate {
         handler: Arc<dyn SessionConsensusRpcHandler>,
         request: SessionConsensusWireRequest,
     ) -> SessionConsensusWireResponse {
-        if request.family != crate::consensus::SessionConsensusRpcFamily::Vote {
-            return handler.handle(request.sender, request).await;
-        }
         let source = request.sender;
+        if self.partitioned.load(Ordering::Acquire) && (source == self.old || target == self.old) {
+            return SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Unavailable),
+            };
+        }
+        let sent = Instant::now();
+        if request.family == crate::consensus::SessionConsensusRpcFamily::PreVote {
+            let vote: PreVoteRequest<SessionConsensusNodeId> =
+                opc_consensus::decode_bounded(&request.payload).expect("real Pre-Vote request");
+            let response = handler.handle(source, request).await;
+            let reply: Result<
+                PreVoteResponse<SessionConsensusNodeId>,
+                RaftError<SessionConsensusNodeId>,
+            > = opc_consensus::decode_bounded(
+                response.result.as_ref().expect("Pre-Vote wire response"),
+            )
+            .expect("real Pre-Vote response");
+            let reply = reply.expect("engine Pre-Vote response");
+            let cross = vote.vote.leader_id.term == self.split_term
+                && reply.vote_granted
+                && self.candidates.contains(&source)
+                && self.candidates.contains(&target);
+            self.pre_votes.send_modify(|exchanges| {
+                exchanges.push(PreVoteExchange {
+                    source,
+                    target,
+                    sent,
+                    replied: Instant::now(),
+                    request: vote,
+                    response: reply,
+                });
+            });
+            if cross {
+                self.pre_vote_crossing.wait().await;
+            }
+            return response;
+        }
+        if request.family != crate::consensus::SessionConsensusRpcFamily::Vote {
+            return handler.handle(source, request).await;
+        }
         let vote: VoteRequest<SessionConsensusNodeId> =
             opc_consensus::decode_bounded(&request.payload).expect("real vote request");
-        let sent = Instant::now();
-        if Some(vote.vote.leader_id.term) == self.split_term
+        if vote.vote.leader_id.term == self.split_term
             && self.candidates.contains(&source)
             && self.candidates.contains(&target)
         {
@@ -74,9 +124,6 @@ impl VoteGate {
                 response: reply.expect("engine vote response"),
             });
         });
-        if self.split_term.is_none() {
-            self.crossing.wait().await;
-        }
         response
     }
 
@@ -86,6 +133,15 @@ impl VoteGate {
             .wait_for(|exchanges| exchanges.len() >= count)
             .await
             .expect("vote observations")
+            .clone()
+    }
+
+    async fn observed_pre_votes(&self, count: usize) -> Vec<PreVoteExchange> {
+        self.pre_votes
+            .subscribe()
+            .wait_for(|exchanges| exchanges.len() >= count)
+            .await
+            .expect("Pre-Vote observations")
             .clone()
     }
 }
@@ -109,7 +165,7 @@ impl VoidElection {
     ) -> Self {
         let config = durable_openraft_config(DurableOpenraftDomain::SessionState).unwrap();
         // Use the engine's own gen_range mapping and the unchanged SDK timers.
-        let early_sample = 0;
+        let early_sample = 1_u64 << 62;
         let late_sample = 3_u64 << 62;
         let calibration = ElectionRngScript::new([early_sample, late_sample]);
         let (early, late) = calibration
@@ -135,22 +191,15 @@ impl VoidElection {
         let successor = (old + 1) % fleet.peers.len();
         let scripts = (0..fleet.peers.len())
             .map(|index| {
-                // Construction samples once; each real campaign resamples.
-                // Lease setup elects the successor and then the old leader
-                // once each. The original successor schedule follows with
-                // its forced denial, split, and winning retry.
+                // Construction and bootstrap sample normally. The successor
+                // then makes one healthy inquiry, two partitioned inquiries,
+                // and a successful retry; the other survivor campaigns once.
                 ElectionRngScript::new(if index == old {
-                    vec![early_sample, early_sample, early_sample, late_sample]
+                    vec![early_sample; 2]
                 } else if index == successor {
-                    vec![
-                        early_sample,
-                        early_sample,
-                        early_sample,
-                        early_sample,
-                        late_sample,
-                    ]
+                    vec![early_sample; 5]
                 } else {
-                    vec![late_sample]
+                    vec![late_sample; 2]
                 })
             })
             .collect();
@@ -267,21 +316,21 @@ impl VoidElection {
         }
     }
 
-    /// A replicated command refreshes followers, but the leader's own vote
-    /// retains its bootstrap timestamp. Exercise that expired-lease case, then
-    /// elect away and back through real RPCs at controlled instants. The new
-    /// committed vote establishes the lease required by the original denial.
-    async fn renew_leader_lease(
+    pub(super) async fn change_leader(
         &mut self,
         fleet: &Fleet,
-        phases: &[Duration],
         request: &FencedTransitionV2Request,
         void_first: bool,
     ) {
+        let phases = self.settle(fleet).await;
         let old = &fleet.stores[self.old];
         let successor = &fleet.stores[self.successor];
+        let remaining = (0..fleet.stores.len())
+            .find(|index| *index != self.old && *index != self.successor)
+            .unwrap();
         let old_id = old.status().node_id;
         let successor_id = successor.status().node_id;
+        let remaining_id = fleet.stores[remaining].status().node_id;
         let old_term = old.status().term;
         assert_eq!(old.status().leader_id, Some(old_id));
         let old_updated = old
@@ -294,234 +343,59 @@ impl VoidElection {
             })
             .await
             .unwrap();
-        // Setup may already have expired this lease. Otherwise keep the real
-        // heartbeats running until the first tick strictly beyond its observed
-        // expiry, so every run covers the slow-setup precondition as well.
+        // A leader's bootstrap vote timestamp can expire while real quorum
+        // acknowledgements stay fresh. Such a leader must reject Pre-Vote.
         while Instant::now() <= old_updated + self.early.lease {
             self.advance_all(fleet, Instant::now() + self.early.tick)
                 .await;
         }
         self.started = Instant::now();
         self.anchor_followers(fleet, request, void_first).await;
-        let unchanged = old
-            .inner
-            .raft
-            .with_raft_state(|state| (*state.vote_ref(), state.vote_last_modified()))
-            .await
-            .unwrap();
-        assert_eq!(
-            unchanged,
-            (Vote::new_committed(old_term, old_id), Some(old_updated))
-        );
+        old.inner.raft.ensure_linearizable().await.unwrap();
         assert!(self.started > old_updated + self.early.lease);
-        let gate = Arc::new(VoteGate {
-            candidates: [old_id, successor_id],
-            split_term: None,
-            crossing: Barrier::new(2),
-            exchanges: watch::channel(Vec::new()).0,
-        });
-        for peer in &fleet.peers {
-            *peer.election_votes.lock().unwrap() = Some(gate.clone());
-        }
-        successor.inner.raft.trigger().elect().await.unwrap();
-        let first = gate.observed(2).await;
-        assert_eq!(first.len(), 2);
-        for exchange in &first {
-            assert_eq!(exchange.source, successor_id);
-            assert_ne!(exchange.target, successor_id);
-            assert_eq!(exchange.request.vote, Vote::new(old_term + 1, successor_id));
-            assert_eq!(exchange.response.vote_granted, exchange.target == old_id);
-            assert_eq!(
-                exchange.response.vote,
-                if exchange.target == old_id {
-                    exchange.request.vote
-                } else {
-                    Vote::new_committed(old_term, old_id)
-                }
-            );
-            assert_eq!(exchange.sent, self.started);
-            assert_eq!(exchange.replied, self.started);
-        }
-        while !fleet.stores.iter().all(|store| {
-            store.status().leader_id == Some(successor_id)
-                && store.inner.raft.metrics().borrow().vote
-                    == Vote::new_committed(old_term + 1, successor_id)
-        }) {
-            tokio::task::yield_now().await;
-        }
-        self.anchor_followers(fleet, request, void_first).await;
-        let successor_updated = successor
-            .inner
-            .raft
-            .with_raft_state(|state| {
-                state
-                    .vote_last_modified()
-                    .expect("temporary leader has a committed vote")
-            })
-            .await
-            .unwrap();
-        assert_eq!(successor_updated, self.started);
-        // Return leadership at the first ticker slot strictly after the
-        // temporary leader's lease, before either follower can auto-campaign.
-        let renewal = self.early.tick
-            * u32::try_from(self.early.lease.as_nanos() / self.early.tick.as_nanos() + 1)
-                .expect("finite lease setup");
-        assert!(renewal > self.early.lease);
-        for (index, phase) in phases.iter().copied().enumerate() {
-            if index != self.successor {
-                assert!(renewal < self.early.campaign(Duration::ZERO, phase, true));
-            }
-        }
-        let mut tick = self.early.tick;
-        while tick <= renewal {
-            self.advance_all(fleet, self.started + tick).await;
-            tick += self.early.tick;
-        }
-        // Core tick completion does not imply that the remaining voter has
-        // handled the resulting heartbeat. A replay must reach every applied
-        // frontier before this election relies on that voter's renewed lease.
-        self.anchor_followers(fleet, request, void_first).await;
-        let remaining = (0..fleet.stores.len())
-            .find(|index| *index != self.old && *index != self.successor)
-            .unwrap();
-        let remaining_vote = fleet.stores[remaining]
-            .inner
-            .raft
-            .with_raft_state(|state| (*state.vote_ref(), state.vote_last_modified()))
-            .await
-            .unwrap();
-        assert_eq!(
-            remaining_vote,
-            (
-                Vote::new_committed(old_term + 1, successor_id),
-                Some(self.started + renewal)
-            ),
-            "the remaining voter has the observed fresh denial lease"
-        );
-        let temporary_leader_vote = successor
-            .inner
-            .raft
-            .with_raft_state(|state| (*state.vote_ref(), state.vote_last_modified()))
-            .await
-            .unwrap();
-        assert_eq!(
-            temporary_leader_vote,
-            (
-                Vote::new_committed(old_term + 1, successor_id),
-                Some(successor_updated)
-            ),
-            "the replay leaves the temporary leader's expired lease unchanged"
-        );
-        assert!(self.started + renewal > successor_updated + self.early.lease);
-        assert_eq!(Instant::now(), self.started + renewal);
-        old.inner.raft.trigger().elect().await.unwrap();
-        let renewed = gate.observed(4).await;
-        assert_eq!(renewed.len(), 4);
-        for exchange in &renewed[2..] {
-            assert_eq!(exchange.source, old_id);
-            assert_ne!(exchange.target, old_id);
-            assert_eq!(exchange.request.vote, Vote::new(old_term + 2, old_id));
-            assert_eq!(
-                exchange.response.vote_granted,
-                exchange.target == successor_id
-            );
-            assert_eq!(
-                exchange.response.vote,
-                if exchange.target == successor_id {
-                    exchange.request.vote
-                } else {
-                    Vote::new_committed(old_term + 1, successor_id)
-                }
-            );
-            assert_eq!(exchange.sent - self.started, renewal);
-            assert_eq!(exchange.replied - self.started, renewal);
-        }
-        while !fleet.stores.iter().all(|store| {
-            store.status().leader_id == Some(old_id)
-                && store.inner.raft.metrics().borrow().vote
-                    == Vote::new_committed(old_term + 2, old_id)
-        }) {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(self.started.elapsed(), renewal);
-        self.started = Instant::now();
-        let renewed_at = old
-            .inner
-            .raft
-            .with_raft_state(|state| state.vote_last_modified())
-            .await
-            .unwrap();
-        assert_eq!(
-            renewed_at,
-            Some(self.started),
-            "fresh old-leader lease inside frozen time"
-        );
-        for peer in &fleet.peers {
-            *peer.election_votes.lock().unwrap() = None;
-        }
-        eprintln!(
-            "void election: renewed old leader's committed lease at frozen {renewal:?}; \
-             exchanges={renewed:?}"
-        );
-    }
-
-    pub(super) async fn change_leader(
-        &mut self,
-        fleet: &Fleet,
-        request: &FencedTransitionV2Request,
-        void_first: bool,
-    ) {
-        let phases = self.settle(fleet).await;
-        self.renew_leader_lease(fleet, &phases, request, void_first)
-            .await;
-        self.anchor_followers(fleet, request, void_first).await;
-        // Every voter participates in the original automatic split and retry.
-        // Only normal-time setup and explicit lease preparation suppress it.
-        for store in &fleet.stores {
-            store.inner.raft.runtime_config().elect(true);
-        }
-        let old = &fleet.stores[self.old];
-        let successor = &fleet.stores[self.successor];
-        let old_id = old.status().node_id;
-        let successor_id = successor.status().node_id;
-        let old_term = old.status().term;
-        assert_eq!(old.status().leader_id, Some(old_id));
         let applied = old.status().applied_index;
+        let mut before = Vec::new();
         for store in &fleet.stores {
             assert_eq!(
                 store.persistence_mode(),
                 crate::SessionPersistenceMode::Durable
             );
-            while store.status().applied_index != applied {
-                tokio::task::yield_now().await;
-            }
+            assert_eq!(store.status().applied_index, applied);
             assert_eq!(store.status().leader_id, Some(old_id));
+            before.push(
+                store
+                    .inner
+                    .raft
+                    .with_raft_state(|state| (*state.vote_ref(), state.vote_last_modified()))
+                    .await
+                    .unwrap(),
+            );
         }
-        for (index, script) in self.scripts.iter().enumerate() {
-            schedule::tick_registered(
-                &mut script.sleeps(),
-                self.started + phases[index],
-                self.early.tick,
-            )
-            .await;
+        assert_eq!(
+            before[self.old],
+            (Vote::new_committed(old_term, old_id), Some(old_updated))
+        );
+        for index in [self.successor, remaining] {
+            assert_eq!(
+                before[index],
+                (Vote::new_committed(old_term, old_id), Some(self.started))
+            );
         }
-        assert_eq!(Instant::now(), self.started);
         let gate = Arc::new(VoteGate {
-            candidates: [old_id, successor_id],
-            split_term: Some(old_term + 2),
+            candidates: [successor_id, remaining_id],
+            old: old_id,
+            partitioned: AtomicBool::new(false),
+            split_term: old_term + 1,
+            pre_vote_crossing: Barrier::new(2),
             crossing: Barrier::new(2),
+            pre_votes: watch::channel(Vec::new()).0,
             exchanges: watch::channel(Vec::new()).0,
         });
         for peer in &fleet.peers {
             *peer.election_votes.lock().unwrap() = Some(gate.clone());
         }
-        // A preempted WAL writer may still hold State after publishing a
-        // completion. Require real authority contention before releasing a
-        // 200 ms wall-time hold; neither contention nor release advances the
-        // protocol clock or changes the handler's real Vote response.
-        let remaining = (0..fleet.stores.len())
-            .find(|index| *index != self.old && *index != self.successor)
-            .unwrap();
+        // Retain real native-authority lock contention: the Pre-Vote handler
+        // must wait for the owner without advancing paused protocol time.
         let mut contended = fleet.stores[remaining]
             .inner
             .backend
@@ -545,7 +419,6 @@ impl VoidElection {
                 std::thread::sleep(Duration::from_millis(200));
             })
             .expect("hold native authority owner");
-            eprintln!("void election: native owner released after observed contention and 200 ms");
         });
         holding.await.expect("actual native owner held");
         successor.inner.raft.trigger().elect().await.unwrap();
@@ -554,16 +427,16 @@ impl VoidElection {
             .await
             .expect("real authority lock contention");
         release.send(()).expect("release contended native owner");
-        let initial = gate.observed(2).await;
+        let initial = gate.observed_pre_votes(2).await;
         holder.await.expect("join native authority hold");
-        eprintln!("void election: initial forced campaign replies={initial:?}");
         assert_eq!(initial.len(), 2);
         for exchange in &initial {
             assert_eq!(exchange.source, successor_id);
+            assert_ne!(exchange.target, successor_id);
             assert_eq!(exchange.request.vote, Vote::new(old_term + 1, successor_id));
             assert!(
                 !exchange.response.vote_granted,
-                "committed leader lease denies the forced campaign"
+                "healthy quorum denies the forced inquiry"
             );
             assert_eq!(
                 exchange.response.vote,
@@ -572,35 +445,44 @@ impl VoidElection {
             assert_eq!(exchange.sent, self.started);
             assert_eq!(exchange.replied, self.started);
         }
-        // A real heartbeat learns the candidate's higher term. No voter is
-        // stopped, no lease is shortened, and no engine state is overwritten.
-        old.inner.raft.trigger().heartbeat().await.unwrap();
-        while old.inner.raft.metrics().borrow().vote != Vote::new(old_term + 1, successor_id) {
-            tokio::task::yield_now().await;
+        for (store, expected) in fleet.stores.iter().zip(&before) {
+            let actual = store
+                .inner
+                .raft
+                .with_raft_state(|state| (*state.vote_ref(), state.vote_last_modified()))
+                .await
+                .unwrap();
+            assert_eq!(
+                &actual, expected,
+                "Pre-Vote changes neither votes nor their timestamps"
+            );
         }
-        eprintln!(
-            "void election: old leader learned the higher term at {:?}",
-            self.started.elapsed()
-        );
-        let first = self
+        assert!(gate.exchanges.borrow().is_empty());
+        gate.partitioned.store(true, Ordering::Release);
+        for store in &fleet.stores {
+            store.inner.raft.runtime_config().elect(true);
+        }
+        // The early survivor retries once before the peer's lease expires,
+        // then holds a genuine grant until that peer's automatic campaign.
+        let denied_at = self
             .early
             .campaign(Duration::ZERO, phases[self.successor], false);
-        assert_eq!(
-            first,
-            self.early.campaign(Duration::ZERO, phases[self.old], false)
+        let first_grant = self
+            .early
+            .campaign(denied_at, phases[self.successor], false);
+        let split_at = self.late.campaign(Duration::ZERO, phases[remaining], true);
+        let bound = self.early.campaign(split_at, phases[self.successor], false);
+        assert!(denied_at < self.early.lease && self.early.lease < first_grant);
+        assert!(first_grant < split_at);
+        assert!(
+            split_at - first_grant < Duration::from_secs(5),
+            "held grant stays inside the RPC timeout"
         );
-        let bound = self.early.campaign(first, phases[self.successor], false);
-        assert!(bound < self.late.campaign(first, phases[self.old], false));
-        let remaining = (0..fleet.stores.len())
-            .find(|index| *index != self.old && *index != self.successor)
-            .unwrap();
-        assert!(bound < self.late.campaign(Duration::ZERO, phases[remaining], true));
+        assert!(bound < self.late.campaign(split_at, phases[remaining], false));
+        assert!(bound < Duration::from_secs(26));
         let former_limit = Duration::from_secs(10);
-        assert!(first < former_limit && former_limit < bound);
+        assert!(former_limit < split_at && split_at < bound);
         let expired = watch::channel(false).0;
-        // Retain the exact former waiter to prove that this legal schedule
-        // crosses its deadline. The driver still requires actual agreement
-        // on the designated successor at the independently computed bound.
         let wait = async {
             let result = tokio::time::timeout(former_limit, async {
                 loop {
@@ -619,81 +501,127 @@ impl VoidElection {
             result
         };
         let drive = async {
-            let mut tick = phases[self.old] + self.early.tick;
+            let mut tick = self.early.tick;
             while tick <= bound {
-                if Instant::now() < self.started + former_limit
-                    && self.started + former_limit < self.started + tick
-                {
-                    tokio::time::advance(self.started + former_limit - Instant::now()).await;
+                self.advance_all(fleet, self.started + tick).await;
+                if tick == former_limit {
                     expired.subscribe().wait_for(|done| *done).await.unwrap();
                     assert!(fleet
                         .stores
                         .iter()
                         .all(|store| store.status().leader_id != Some(successor_id)));
-                    eprintln!(
-                        "void election: former deadline {former_limit:?} expired; \
-                         computed successor campaign {bound:?}"
+                }
+                if tick == denied_at {
+                    let queries = gate.observed_pre_votes(3).await;
+                    assert_eq!(queries.len(), 3);
+                    let exchange = &queries[2];
+                    assert_eq!(exchange.source, successor_id);
+                    assert_eq!(exchange.target, remaining_id);
+                    assert!(!exchange.response.vote_granted);
+                    assert_eq!(
+                        exchange.response.vote,
+                        Vote::new_committed(old_term, old_id)
                     );
+                    assert_eq!(exchange.sent - self.started, denied_at);
+                    assert_eq!(exchange.replied - self.started, denied_at);
+                    assert!(gate.exchanges.borrow().is_empty());
                 }
-                tokio::time::advance(self.started + tick - Instant::now()).await;
-                for (index, script) in self.scripts.iter().enumerate() {
-                    schedule::tick_registered(
-                        &mut script.sleeps(),
-                        self.started + tick,
-                        self.early.tick,
-                    )
-                    .await;
-                    self.ticks
-                        .wait(
-                            fleet.stores[index].status().node_id.get(),
-                            self.started + tick,
-                        )
-                        .await;
+                if tick == first_grant {
+                    let queries = gate.observed_pre_votes(4).await;
+                    assert_eq!(queries.len(), 4);
+                    assert!(queries[3].response.vote_granted);
+                    assert_eq!(queries[3].source, successor_id);
+                    assert_eq!(queries[3].target, remaining_id);
+                    assert_eq!(
+                        queries[3].response.vote,
+                        Vote::new_committed(old_term, old_id)
+                    );
+                    assert!(
+                        gate.exchanges.borrow().is_empty(),
+                        "one held Pre-Vote is not a real vote"
+                    );
+                    for index in [self.successor, remaining] {
+                        assert_eq!(fleet.stores[index].status().term, old_term);
+                    }
                 }
-                if tick == first {
-                    let split = gate.observed(6).await;
-                    eprintln!("void election: automatic split replies={:?}", &split[2..]);
-                    assert_eq!(split.len(), 6);
-                    for exchange in &split[2..] {
+                if tick == split_at {
+                    let queries = gate.observed_pre_votes(5).await;
+                    assert_eq!(queries.len(), 5);
+                    assert_eq!(queries[4].source, remaining_id);
+                    assert_eq!(queries[4].target, successor_id);
+                    assert!(queries[4].response.vote_granted);
+                    assert_eq!(
+                        queries[4].response.vote,
+                        Vote::new_committed(old_term, old_id)
+                    );
+                    let split = gate.observed(2).await;
+                    assert_eq!(split.len(), 2);
+                    for exchange in &split {
                         assert_eq!(
                             exchange.request.vote,
-                            Vote::new(old_term + 2, exchange.source)
+                            Vote::new(old_term + 1, exchange.source)
                         );
                         assert!(
                             !exchange.response.vote_granted,
-                            "real self-votes and the remaining leader lease split this term"
+                            "persisted self-votes split this term"
                         );
-                        assert_eq!(exchange.sent - self.started, first);
-                        assert_eq!(exchange.replied - self.started, first);
+                        assert_eq!(
+                            exchange.response.vote,
+                            Vote::new(old_term + 1, exchange.target)
+                        );
+                        assert_eq!(exchange.sent - self.started, split_at);
+                        assert_eq!(exchange.replied - self.started, split_at);
                     }
-                    assert_eq!(
-                        old.inner.raft.metrics().borrow().vote,
-                        Vote::new(old_term + 2, old_id)
-                    );
-                    assert_eq!(
-                        successor.inner.raft.metrics().borrow().vote,
-                        Vote::new(old_term + 2, successor_id)
-                    );
+                    for index in [self.successor, remaining] {
+                        let store = &fleet.stores[index];
+                        assert_eq!(
+                            store.inner.raft.metrics().borrow().vote,
+                            Vote::new(old_term + 1, store.status().node_id)
+                        );
+                    }
                 }
                 tick += self.early.tick;
             }
-            let exchanges = gate.observed(8).await;
-            assert_eq!(exchanges.len(), 8);
-            for exchange in &exchanges[6..] {
-                assert_eq!(exchange.source, successor_id);
-                assert_ne!(exchange.target, successor_id);
-                assert_eq!(exchange.request.vote, Vote::new(old_term + 3, successor_id));
-                assert!(exchange.response.vote_granted);
-                assert_eq!(exchange.response.vote, exchange.request.vote);
-                assert_eq!(exchange.sent - self.started, bound);
-                assert_eq!(exchange.replied - self.started, bound);
+            let exchanges = gate.observed(3).await;
+            assert_eq!(exchanges.len(), 3);
+            let winning = &exchanges[2];
+            assert_eq!(winning.source, successor_id);
+            assert_eq!(winning.target, remaining_id);
+            assert_eq!(winning.request.vote, Vote::new(old_term + 2, successor_id));
+            assert!(winning.response.vote_granted);
+            assert_eq!(winning.response.vote, winning.request.vote);
+            assert_eq!(winning.sent - self.started, bound);
+            assert_eq!(winning.replied - self.started, bound);
+            let queries = gate.observed_pre_votes(6).await;
+            assert_eq!(queries.len(), 6);
+            assert_eq!(queries[5].source, successor_id);
+            assert_eq!(queries[5].target, remaining_id);
+            assert!(queries[5].response.vote_granted);
+            assert_eq!(
+                queries[5].request.vote,
+                Vote::new(old_term + 2, successor_id)
+            );
+            for index in [self.successor, remaining] {
+                fleet.stores[index]
+                    .inner
+                    .raft
+                    .wait(None)
+                    .vote(
+                        Vote::new_committed(old_term + 2, successor_id),
+                        "survivor election",
+                    )
+                    .await
+                    .unwrap();
             }
+            gate.partitioned.store(false, Ordering::Release);
+            successor.inner.raft.trigger().heartbeat().await.unwrap();
             while !fleet.stores.iter().all(|store| {
                 store.status().leader_id == Some(successor_id)
-                    && store.status().term == old_term + 3
+                    && store.status().term == old_term + 2
             }) {
                 tokio::task::yield_now().await;
             }
+            successor.inner.raft.ensure_linearizable().await.unwrap();
             assert_eq!(self.started.elapsed(), bound);
             for script in &self.scripts {
                 script.finish();
@@ -701,10 +629,7 @@ impl VoidElection {
             for peer in &fleet.peers {
                 *peer.election_votes.lock().unwrap() = None;
             }
-            eprintln!(
-                "void election: all three voters agree on designated successor at {bound:?}; \
-                 exchanges={exchanges:?}"
-            );
+            eprintln!("void election: all durable voters agree at {bound:?}; pre_votes={queries:?}; votes={exchanges:?}");
         };
         let (result, ()) = tokio::join!(wait, drive);
         assert!(

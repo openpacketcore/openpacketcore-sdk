@@ -3380,39 +3380,6 @@ impl ConsensusSessionStore {
             .map_err(|_| consensus_unavailable())
     }
 
-    /// Wait for the real committed-vote lease after old-leader RPCs quiesce.
-    /// The fixture must bound this future with its existing transition deadline.
-    #[cfg(feature = "test-control")]
-    #[doc(hidden)]
-    pub async fn wait_for_vote_lease_expiry_for_test(&self) -> Result<(), StoreError> {
-        let lease = Duration::from_millis(
-            session_raft_config()
-                .map_err(|_| consensus_unavailable())?
-                .election_timeout_max,
-        );
-        loop {
-            let deadline = self
-                .inner
-                .raft
-                .with_raft_state(move |state| {
-                    if state.vote_ref().is_committed() {
-                        state.vote_last_modified().map(|updated| updated + lease)
-                    } else {
-                        None
-                    }
-                })
-                .await
-                .map_err(|_| consensus_unavailable())?;
-            let Some(deadline) = deadline else {
-                return Ok(());
-            };
-            if tokio::time::Instant::now() > deadline {
-                return Ok(());
-            }
-            tokio::time::sleep_until(deadline + Duration::from_nanos(1)).await;
-        }
-    }
-
     /// Ask Openraft to start one normal campaign for deterministic integration
     /// qualification. Openraft owns vote creation, persistence, and transport.
     #[cfg(feature = "test-control")]
@@ -12595,6 +12562,7 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
         if matches!(
             request.family,
             SessionConsensusRpcFamily::Vote
+                | SessionConsensusRpcFamily::PreVote
                 | SessionConsensusRpcFamily::AppendEntries
                 | SessionConsensusRpcFamily::AppendEntriesRoster
                 | SessionConsensusRpcFamily::InstallSnapshot

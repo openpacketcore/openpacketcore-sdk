@@ -4,7 +4,7 @@ use super::*;
 
 use opc_consensus::engine::{
     error::RaftError,
-    raft::{VoteRequest, VoteResponse},
+    raft::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse},
     Vote,
 };
 use opc_consensus::test_runtime::{ElectionRngScript, ScriptedElectionRuntime};
@@ -43,10 +43,31 @@ pub(crate) struct VoteGate {
         )>,
     >,
     both_candidates: Barrier,
+    both_pre_votes: Barrier,
     replies: watch::Sender<Vec<Exchange>>,
 }
 
 impl VoteGate {
+    pub(crate) async fn after_pre_vote(
+        &self,
+        request: &ConsensusWireRequest,
+        response: &ConsensusWireResponse,
+    ) {
+        let (_, rpc): (u16, PreVoteRequest<ConfigConsensusNodeId>) =
+            opc_consensus::decode_bounded(&request.payload).unwrap();
+        let (_, reply): (
+            u16,
+            Result<PreVoteResponse<ConfigConsensusNodeId>, RaftError<ConfigConsensusNodeId>>,
+        ) = opc_consensus::decode_bounded(response.result.as_ref().unwrap()).unwrap();
+        assert!(
+            reply.unwrap().vote_granted,
+            "equal logs permit both inquiries"
+        );
+        if rpc.vote.leader_id.term < self.first_term + self.split_rounds {
+            self.both_pre_votes.wait().await;
+        }
+    }
+
     pub(crate) async fn before_delivery(
         &self,
         target: ConfigConsensusNodeId,
@@ -234,6 +255,7 @@ impl RollingElection {
                 split_rounds: 0,
                 arrivals: watch::channel(Vec::new()).0,
                 both_candidates: Barrier::new(2),
+                both_pre_votes: Barrier::new(2),
                 replies: watch::channel(Vec::new()).0,
             });
             *fleet.paths[&(0, 1)].rolling_vote.lock().unwrap() = Some(gate.clone());
@@ -312,6 +334,7 @@ impl RollingElection {
                 split_rounds,
                 arrivals: watch::channel(Vec::new()).0,
                 both_candidates: Barrier::new(2),
+                both_pre_votes: Barrier::new(2),
                 replies: watch::channel(Vec::new()).0,
             });
             let paths = [(live[0], live[1]), (live[1], live[0])];
@@ -364,10 +387,10 @@ impl RollingElection {
                         .expect_err("two real split votes outlast the unchanged write deadline");
                     assert!(matches!(error.kind(), PersistErrorKind::OutcomeUnknown));
                     assert_eq!(Instant::now(), started + CLUSTER_TRANSITION_TIMEOUT);
-                    assert_eq!(gate.replies.borrow().len(), 2);
+                    assert_eq!(gate.replies.borrow().len(), 4);
                     for store in &stores {
                         assert_eq!(store.status().leader_id, None);
-                        assert_eq!(store.status().term, old_term + 1);
+                        assert_eq!(store.status().term, old_term + 2);
                     }
                     eprintln!("rolling write: OutcomeUnknown at {CLUSTER_TRANSITION_TIMEOUT:?} with both survivors leaderless");
                     expired.send(()).expect("election awaits the actual write result");
@@ -426,7 +449,8 @@ impl RollingElection {
         }
         if split_rounds == 2 {
             assert!(splits[0] < CLUSTER_TRANSITION_TIMEOUT);
-            assert!(CLUSTER_TRANSITION_TIMEOUT < splits[1]);
+            assert!(splits[1] < CLUSTER_TRANSITION_TIMEOUT);
+            assert!(CLUSTER_TRANSITION_TIMEOUT < bound);
             instants.push((CLUSTER_TRANSITION_TIMEOUT, false));
         } else {
             assert!(bound < CLUSTER_TRANSITION_TIMEOUT);

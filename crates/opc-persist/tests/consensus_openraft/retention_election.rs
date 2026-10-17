@@ -2,7 +2,7 @@ use super::*;
 
 use opc_consensus::engine::{
     error::RaftError,
-    raft::{VoteRequest, VoteResponse},
+    raft::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse},
     Vote,
 };
 use opc_consensus::test_runtime::{ElectionRngScript, ScriptedElectionRuntime};
@@ -28,10 +28,30 @@ pub(super) struct SplitVote {
     term: u64,
     arrivals: watch::Sender<Vec<(Instant, VoteRequest<ConfigConsensusNodeId>)>>,
     both_candidates: Barrier,
+    both_pre_votes: Barrier,
+    pre_votes: watch::Sender<Vec<PreVoteRequest<ConfigConsensusNodeId>>>,
     replies: watch::Sender<Vec<Exchange>>,
 }
 
 impl SplitVote {
+    pub(super) async fn after_pre_vote(
+        &self,
+        request: &ConsensusWireRequest,
+        response: &ConsensusWireResponse,
+    ) {
+        let (_, rpc): (u16, PreVoteRequest<ConfigConsensusNodeId>) =
+            opc_consensus::decode_bounded(&request.payload).unwrap();
+        let (_, reply): (
+            u16,
+            Result<PreVoteResponse<ConfigConsensusNodeId>, RaftError<ConfigConsensusNodeId>>,
+        ) = opc_consensus::decode_bounded(response.result.as_ref().unwrap()).unwrap();
+        assert!(reply.unwrap().vote_granted, "equal logs permit the inquiry");
+        if rpc.vote.leader_id.term == self.term {
+            self.pre_votes.send_modify(|votes| votes.push(rpc));
+            self.both_pre_votes.wait().await;
+        }
+    }
+
     pub(super) async fn before_delivery(&self, request: &ConsensusWireRequest) {
         let (_, vote): (u16, VoteRequest<ConfigConsensusNodeId>) =
             opc_consensus::decode_bounded(&request.payload).expect("retention vote request");
@@ -108,7 +128,7 @@ impl RetentionElection {
                 ElectionRngScript::new([sample; 3]),
                 ElectionRngScript::new([sample; 2]),
             ],
-            offset: schedule.tick / 6,
+            offset: Duration::from_millis(u64::try_from(schedule.tick.as_millis()).unwrap() / 6),
             started: Instant::now(),
             runtime_origin,
             schedule,
@@ -230,9 +250,9 @@ impl RetentionElection {
         let phases = [self.last_tick(1).0, self.last_tick(2).0].map(|at| at - self.started);
         let first = self.schedule.campaign(self.offset, phases[0], true);
         let second = self.schedule.campaign(self.offset, phases[1], true);
-        let retry = self.schedule.campaign(first, phases[0], false);
+        let retry = self.schedule.campaign(second, phases[0], false);
         let election_bound = retry - self.offset;
-        assert!(election_bound > CLUSTER_TRANSITION_TIMEOUT);
+        assert!(election_bound < CLUSTER_TRANSITION_TIMEOUT);
         assert!(retry < self.schedule.campaign(second, phases[1], false));
         assert!(
             second - first < DURABLE_CONSENSUS_TIMING_PROFILE.rpc_timeout(ConsensusRpcFamily::Vote)
@@ -241,13 +261,15 @@ impl RetentionElection {
             term: old_term + 1,
             arrivals: watch::channel(Vec::new()).0,
             both_candidates: Barrier::new(2),
+            both_pre_votes: Barrier::new(2),
+            pre_votes: watch::channel(Vec::new()).0,
             replies: watch::channel(Vec::new()).0,
         });
         for path in [(1, 2), (2, 1)] {
             *cluster.paths[&path].retention_vote.lock().unwrap() = Some(gate.clone());
         }
         let drive = async {
-            let mut instants = vec![(self.offset + CLUSTER_TRANSITION_TIMEOUT, None)];
+            let mut instants = Vec::new();
             for index in 1..3 {
                 let phase = phases[index - 1];
                 schedule::tick_registered(
@@ -262,7 +284,7 @@ impl RetentionElection {
                     .await;
                 let mut tick = phase + self.schedule.tick;
                 while tick <= retry {
-                    instants.push((tick, Some(index)));
+                    instants.push((tick, index));
                     tick += self.schedule.tick;
                 }
             }
@@ -270,36 +292,24 @@ impl RetentionElection {
             for (tick, index) in instants {
                 // Count before the advance: the winning campaign can create
                 // replication-worker sleeps after this final follower tick.
-                let sent_ticks = index.map(|index| self.scripts[index].sleeps().borrow().len());
+                let sent_ticks = self.scripts[index].sleeps().borrow().len();
                 tokio::time::advance(self.started + tick - Instant::now()).await;
-                if let Some(index) = index {
-                    schedule::tick_registered(
-                        &mut self.scripts[index].sleeps(),
-                        self.started + tick,
-                        self.schedule.tick,
-                    )
+                schedule::tick_registered(
+                    &mut self.scripts[index].sleeps(),
+                    self.started + tick,
+                    self.schedule.tick,
+                )
+                .await;
+                ticks
+                    .wait(index as u64 + 1, self.started + tick, sent_ticks)
                     .await;
-                    ticks
-                        .wait(index as u64 + 1, self.started + tick, sent_ticks.unwrap())
-                        .await;
-                } else {
-                    // The former aggregate wait expires before this legal
-                    // schedule can win. Both real split votes remain denied.
-                    assert_eq!(isolated.elapsed(), CLUSTER_TRANSITION_TIMEOUT);
-                    assert_eq!(gate.replies.borrow().len(), 2);
-                    for store in &cluster.stores[1..] {
-                        let state = store.status();
-                        assert_eq!(state.term, old_term + 1);
-                        assert_eq!(state.leader_id, None);
-                    }
-                }
                 if tick == first {
-                    gate.arrivals
+                    gate.pre_votes
                         .subscribe()
                         .wait_for(|arrivals| arrivals.len() == 1)
                         .await
                         .unwrap();
-                    assert_eq!(cluster.stores[1].status().term, old_term + 1);
+                    assert_eq!(cluster.stores[1].status().term, old_term);
                     assert_eq!(cluster.stores[2].status().term, old_term);
                 }
                 if tick == second {
@@ -313,6 +323,11 @@ impl RetentionElection {
                         .borrow()
                         .iter()
                         .all(|reply| !reply.response.vote_granted));
+                    assert_eq!(gate.pre_votes.borrow().len(), 2);
+                    for store in &cluster.stores[1..] {
+                        assert_eq!(store.status().term, old_term + 1);
+                        assert_eq!(store.status().leader_id, None);
+                    }
                     eprintln!(
                         "retention election: real split at {first:?}/{second:?}; \
                          old guard {CLUSTER_TRANSITION_TIMEOUT:?}; \
@@ -371,14 +386,7 @@ impl RetentionElection {
             );
             assert_eq!(exchange.response.vote, Vote::new(old_term + 1, target));
             assert!(!exchange.response.vote_granted);
-            assert_eq!(
-                exchange.sent_at - self.started,
-                if exchange.source == expected_leader {
-                    first
-                } else {
-                    second
-                }
-            );
+            assert_eq!(exchange.sent_at - self.started, second);
             assert_eq!(exchange.replied_at - self.started, second);
         }
         let winning = replies

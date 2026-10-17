@@ -21,7 +21,7 @@ async fn one_split_schedule() {
         .await;
     calibration.assert_exhausted();
     let schedule = ElectionSchedule::new(&config, sampled_timeout);
-    let offset = schedule.tick / 6;
+    let offset = Duration::from_millis(u64::try_from(schedule.tick.as_millis()).unwrap() / 6);
     let guard =
         Duration::from_millis(2 * DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis)
             + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout();
@@ -94,6 +94,8 @@ async fn one_split_schedule() {
     nodes[0].shutdown().await.unwrap();
     state.votes.send_replace(Vec::new());
     let split_gate = Arc::new(SplitGate {
+        pre_votes: watch::channel(BTreeMap::new()).0,
+        both_pre_votes: Barrier::new(2),
         arrivals: watch::channel(BTreeMap::new()).0,
         both_candidates: Barrier::new(2),
         term: Some(old_term + 1),
@@ -109,7 +111,7 @@ async fn one_split_schedule() {
     }
     let first = schedule.campaign(offset, Duration::ZERO, true);
     let second = schedule.campaign(offset, offset, true);
-    let retry = schedule.campaign(first, Duration::ZERO, false);
+    let retry = schedule.campaign(second, Duration::ZERO, false);
     assert!(second - first < Duration::from_millis(config.election_timeout_max));
     assert!(
         second - first
@@ -117,8 +119,9 @@ async fn one_split_schedule() {
     );
     assert!(retry < schedule.campaign(second, offset, false));
     let election_bound = retry - offset;
-    // The old aggregate 26-second wait excludes this legal one-split schedule.
-    assert!(election_bound > guard);
+    // Precise deadline evaluation puts this one-split schedule inside the
+    // unchanged acceptance budget. Repeated-split controls test exhaustion.
+    assert!(election_bound < guard);
     for node in &nodes[1..] {
         node.runtime_config().elect(true);
     }
@@ -138,7 +141,7 @@ async fn one_split_schedule() {
             .await;
         if tick == first {
             split_gate
-                .arrivals
+                .pre_votes
                 .subscribe()
                 .wait_for(|arrivals| arrivals.len() == 1)
                 .await
@@ -200,10 +203,7 @@ async fn one_split_schedule() {
         );
         assert!(!exchange.response.vote_granted);
         assert_eq!(exchange.request.last_log_id, Some(before.log_id));
-        assert_eq!(
-            exchange.sent_at - started,
-            if exchange.source == 1 { first } else { second }
-        );
+        assert_eq!(exchange.sent_at - started, second);
         assert_eq!(exchange.replied_at - started, second);
     }
     let winning = votes

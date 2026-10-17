@@ -59,6 +59,19 @@ impl LossConnection {
 }
 
 impl RaftNetwork<ElectionConfig> for LossConnection {
+    async fn pre_vote(
+        &mut self,
+        rpc: PreVoteRequest<u64>,
+        _option: RPCOption,
+    ) -> Result<PreVoteResponse<u64>, RPCError<u64, EmptyNode, RaftError<u64>>> {
+        self.deliver(Duration::from_millis(20))
+            .await
+            .map_err(RPCError::Unreachable)?
+            .pre_vote(rpc)
+            .await
+            .map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))
+    }
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<ElectionConfig>,

@@ -25,23 +25,15 @@ sequencing, or repair algorithm.
   for that member to complete a fresh Openraft linearizable barrier. Its 30 s
   limit diagnoses a fixture failure; randomized elections have no fixed
   completion bound.
-- `prepare_election(candidate)` waits for the original committed prefix and
-  suppresses competing campaigns during three-member fixture setup. For
-  automatic failover, drop the guard before the fault and observe recovery with
-  the ordinary readiness waiters. For a designated-campaign scenario, retain
-  the guard, isolate the old leader, and call `elect_once()` to quiesce RPCs,
-  observe real vote-lease expiry, and request one real campaign. Drop that guard
-  after rejoin. Both paths retain their existing acquisition deadlines.
 - `RestoreEvidenceAsserter::new(block_reasons)` exposes fluent assertions for
   stale-owner rejection, traffic blocking, and redaction-safe messages.
 
-This example isolates a confirmed follower, so recovery does not require a new
-election. Leader-loss scenarios can use `prepare_election` for prefix setup;
-release its guard before the fault to exercise automatic recovery. The VOID,
-config/session isolation, and config projection scenarios each retain automatic
-failover coverage alongside a separate designated-campaign test with the same
-workload and safety checks. A passing designated campaign does not establish the
-automatic-election recovery SLO.
+This example isolates a confirmed follower. Leader-loss scenarios leave the
+engine's automatic elections enabled throughout the fault and recovery, and
+observe the original readiness deadlines. The consensus regression also kills
+the leader during sustained writes with divergent survivor logs for three and
+five voters. Its 26-second budget includes fresh quorum authority and a new
+committed write; it does not synchronize the logs before the fault.
 
 ```rust,no_run
 use opc_session_testkit::ConsensusTestCluster;

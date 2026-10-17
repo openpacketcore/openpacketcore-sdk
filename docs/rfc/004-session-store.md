@@ -73,8 +73,8 @@ combined algorithm.
 
 See the [qualification contract](../../crates/opc-session-testkit/README.md).
 The fixed schedule drops one successful release response per mutator, allows eight
-outcomes per node, uses the fixed 26-second two-election-plus-operation
-transition envelope per recovery episode, and applies a 50 ms retry delay;
+outcomes per node, uses the fixed 26-second recovery SLO per episode,
+and applies a 50 ms retry delay;
 phase completion requires every interruption to be reconciled. Lease loss,
 unexpected state, and invariant failures fail closed. The admission-loss
 exact-address restart is watcher-only before exit and joins the mutator set

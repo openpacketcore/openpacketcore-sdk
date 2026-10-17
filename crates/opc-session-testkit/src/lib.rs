@@ -14,8 +14,6 @@
 pub mod authenticated_consumer_fixture;
 #[cfg(feature = "test-control")]
 mod consensus_observation;
-mod election;
-pub use election::ControlledConsensusElection;
 pub mod qualification;
 pub mod qualification_concurrent_v5;
 pub mod qualification_kubernetes;
@@ -158,8 +156,8 @@ struct InProcessConsensusPeer {
     scope: Option<SessionConsensusIdentity>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>>,
     online: Arc<AtomicBool>,
+    #[cfg(test)]
     admitted: Arc<tokio::sync::RwLock<()>>,
-    election_observation: Arc<std::sync::Mutex<Option<Arc<election::VoteObservation>>>>,
     #[cfg(test)]
     hold_log_entries: Arc<AtomicBool>,
     #[cfg(test)]
@@ -177,8 +175,8 @@ impl InProcessConsensusPeer {
             scope: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             online: Arc::new(AtomicBool::new(true)),
+            #[cfg(test)]
             admitted: Arc::new(tokio::sync::RwLock::new(())),
-            election_observation: Arc::default(),
             #[cfg(test)]
             hold_log_entries: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -237,6 +235,7 @@ impl InProcessConsensusPeer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        #[cfg(test)]
         let _admitted = self.admitted.read().await;
         if !self.online.load(Ordering::SeqCst) {
             return Err(SessionConsensusPeerError::Unavailable);
@@ -270,17 +269,7 @@ impl InProcessConsensusPeer {
                 return Ok(gate.deliver(self.node_id, handler, request).await);
             }
         }
-        let observation = if request.family == SessionConsensusRpcFamily::Vote {
-            self.election_observation.lock().unwrap().clone()
-        } else {
-            None
-        };
-        let recorded_request = observation.as_ref().map(|_| request.clone());
-        let response = handler.handle(request.sender, request).await;
-        if let Some(observation) = observation {
-            observation.record(self.node_id, &recorded_request.unwrap(), &response);
-        }
-        Ok(response)
+        Ok(handler.handle(request.sender, request).await)
     }
 }
 
@@ -294,7 +283,6 @@ pub struct ConsensusTestCluster {
     stores: Vec<ConsensusSessionStore>,
     paths: BTreeMap<(usize, usize), Arc<InProcessConsensusPeer>>,
     identity: SessionConsensusIdentity,
-    election_controlled: AtomicBool,
     #[cfg(feature = "test-control")]
     rpc_observations: Arc<consensus_observation::Observations>,
     #[cfg(feature = "consumer-fixture")]
@@ -497,13 +485,6 @@ impl ConsensusTestCluster {
             #[cfg(not(test))]
             let store = opening.await;
             let store = store.expect("open consensus test node");
-            #[cfg(test)]
-            let scripted = scripts.is_some();
-            #[cfg(not(test))]
-            let scripted = false;
-            if !scripted {
-                store.set_automatic_election_for_test(false);
-            }
             stores.push(store);
         }
 
@@ -519,16 +500,12 @@ impl ConsensusTestCluster {
             stores,
             paths,
             identity,
-            election_controlled: AtomicBool::new(false),
             #[cfg(feature = "test-control")]
             rpc_observations,
             #[cfg(feature = "consumer-fixture")]
             consumer_roster,
         };
         cluster.wait_ready(fixed).await;
-        for store in &cluster.stores {
-            store.set_automatic_election_for_test(true);
-        }
         cluster
     }
 
@@ -613,8 +590,6 @@ impl ConsensusTestCluster {
     ///
     /// This observes readiness within a diagnostic acceptance deadline. It
     /// does not guarantee convergence for an uncontrolled election schedule.
-    /// A [`Self::prepare_election`] guard used for setup must be dropped before
-    /// the fault when this waiter is used to observe automatic failover.
     pub async fn wait_node_durable_ready(&self, index: usize) {
         let store = self
             .stores
@@ -639,8 +614,7 @@ impl ConsensusTestCluster {
 
     async fn wait_ready_stores(stores: &[ConsensusSessionStore], fixed: bool) {
         // A diagnostic acceptance deadline, not an automatic-election bound.
-        // Formation uses one initialized campaign. Automatic failover scenarios
-        // restore elections after prefix setup and keep this original deadline.
+        // Automatic campaigns remain enabled during formation and failover.
         let deadline = tokio::time::Instant::now() + CONSENSUS_TEST_TRANSITION_TIMEOUT;
         loop {
             let reports = join_all(stores.iter().map(|store| async move {

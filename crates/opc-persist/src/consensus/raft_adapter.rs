@@ -11,7 +11,7 @@ use opc_consensus::engine::error::{
 use opc_consensus::engine::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+    PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse,
 };
 use opc_consensus::engine::{EmptyNode, Vote};
 use opc_consensus::{
@@ -259,6 +259,22 @@ impl RaftNetwork<ConfigRaftTypeConfig> for ConfigRaftNetwork {
         )
         .await
     }
+    async fn pre_vote(
+        &mut self,
+        request: PreVoteRequest<ConsensusNodeId>,
+        option: RPCOption,
+    ) -> Result<PreVoteResponse<ConsensusNodeId>, EngineRpcError> {
+        let payload = encode_config_wire(&request).map_err(|error| {
+            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+        })?;
+        self.call(
+            ConsensusRpcFamily::PreVote,
+            opc_consensus::engine::RPCTypes::PreVote,
+            payload,
+            option,
+        )
+        .await
+    }
 }
 
 fn map_peer_error<E>(
@@ -360,6 +376,16 @@ impl ConsensusRpcHandler for ConfigRaftRpcHandler {
                 };
                 encode_engine_result(&self.raft.handle_leadership_transfer(rpc).await)
             }
+            ConsensusRpcFamily::PreVote => {
+                let rpc = match decode_and_bind_sender::<PreVoteRequest<ConsensusNodeId>>(
+                    &request.payload,
+                    request.sender,
+                ) {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                encode_engine_result(&self.raft.pre_vote(rpc).await)
+            }
             ConsensusRpcFamily::InstallSnapshot => {
                 let rpc = match decode_and_bind_sender::<InstallSnapshotRequest<ConfigRaftTypeConfig>>(
                     &request.payload,
@@ -413,6 +439,12 @@ impl EngineRequestSender for AppendEntriesRequest<ConfigRaftTypeConfig> {
 }
 
 impl EngineRequestSender for VoteRequest<ConsensusNodeId> {
+    fn vote(&self) -> &Vote<ConsensusNodeId> {
+        &self.vote
+    }
+}
+
+impl EngineRequestSender for PreVoteRequest<ConsensusNodeId> {
     fn vote(&self) -> &Vote<ConsensusNodeId> {
         &self.vote
     }
