@@ -32,8 +32,12 @@ const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 8_192;
 const SNAPSHOT_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(test)]
+mod snapshot_staging_tests;
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct SnapshotTestHooks {
+    before_snapshot_commit: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pause_pinned_read: AtomicBool,
     read_pinned: tokio::sync::Notify,
     resume_pinned_read: tokio::sync::Notify,
@@ -54,6 +58,25 @@ pub(crate) struct SnapshotTestHooks {
     pub(crate) builds_returned_ok: AtomicU64,
     pub(crate) build_returned_ok: tokio::sync::Notify,
     pub(crate) read_gate_blocked: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SnapshotTestHooks {
+    fn before_commit(
+        &self,
+        conn: &rusqlite::Connection,
+        cancellation: &Arc<sqlite::SqliteWorkCancellation>,
+    ) -> io::Result<()> {
+        if let Some(hook) = self
+            .before_snapshot_commit
+            .lock()
+            .expect("snapshot commit hook")
+            .take()
+        {
+            cancellation.before_commit_for_test(conn, hook)?;
+        }
+        Ok(())
+    }
 }
 
 /// The last durable publication, independent of the SQLite worker. Readers
@@ -1186,8 +1209,12 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             let meta_for_install = meta.clone();
             let file_name_for_install = file_name.clone();
             let voter_hook = self.core.voter_admission.get().cloned();
+            #[cfg(test)]
+            let hooks = self.core.snapshot_test_hooks.clone();
             self.core
                 .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                    #[cfg(test)]
+                    hooks.before_commit(conn, cancellation)?;
                     sqlite::read_current_snapshot_sync(conn, identity, &members)?;
                     if let Some(runtime) = voter_hook.as_ref().and_then(std::sync::Weak::upgrade) {
                         let source = sqlite::validate_snapshot_database_sync(
@@ -1523,6 +1550,8 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
         let hooks = self.core.snapshot_test_hooks.clone();
         self.core
             .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                #[cfg(test)]
+                hooks.before_commit(conn, cancellation)?;
                 cancellation.check_io()?;
                 sqlite::read_current_snapshot_sync(conn, identity, &members)?;
                 sqlite::save_current_snapshot_sync(

@@ -300,6 +300,26 @@ impl SqliteWorkCancellation {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn before_commit_for_test(
+        self: &Arc<Self>,
+        conn: &Connection,
+        hook: Box<dyn FnOnce() + Send>,
+    ) -> io::Result<()> {
+        let cancellation = Arc::clone(self);
+        let mut hook = Some(hook);
+        conn.commit_hook(Some(move || {
+            if cancellation.authorize_commit().is_err() {
+                return true;
+            }
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+            false
+        }))
+        .map_err(db_error)
+    }
 }
 
 type InitializationCommitHook = Box<dyn FnOnce(&SqliteWorkCancellation) + Send>;
