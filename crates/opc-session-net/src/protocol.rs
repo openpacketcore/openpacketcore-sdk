@@ -3898,10 +3898,14 @@ where
 }
 
 fn write_timeout_error() -> ProtocolError {
-    ProtocolError::Io(std::io::Error::new(
+    ProtocolError::Io(write_timeout_io_error())
+}
+
+fn write_timeout_io_error() -> std::io::Error {
+    std::io::Error::new(
         std::io::ErrorKind::TimedOut,
         "timed out preparing or writing frame to peer",
-    ))
+    )
 }
 
 /// Effect boundary for one framed write.
@@ -4104,6 +4108,7 @@ impl FrameWriteProgress {
 struct WriteProgress<'a, W> {
     writer: &'a mut W,
     progress: &'a FrameWriteProgress,
+    deadline: tokio::time::Instant,
 }
 
 /// A framed Call writer with an opt-in pre-acceptance boundary.
@@ -4179,6 +4184,11 @@ where
         bytes: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        // Timeout polls its inner future first. Refuse each transport poll
+        // before delegation so a resumed writer cannot transmit at expiry.
+        if tokio::time::Instant::now() >= this.deadline {
+            return std::task::Poll::Ready(Err(write_timeout_io_error()));
+        }
         let attribution = this.progress.install_poll_attribution();
         match std::pin::Pin::new(&mut *this.writer).poll_write(context, bytes) {
             std::task::Poll::Ready(Ok(accepted)) => {
@@ -4200,6 +4210,11 @@ where
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        // A TLS flush can send buffered ciphertext even when poll_write
+        // only accepted plaintext; it has the same transmission boundary.
+        if tokio::time::Instant::now() >= this.deadline {
+            return std::task::Poll::Ready(Err(write_timeout_io_error()));
+        }
         let attribution = this.progress.install_poll_attribution();
         let result = std::pin::Pin::new(&mut *this.writer).poll_flush(context);
         drop(attribution);
@@ -4211,6 +4226,9 @@ where
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if tokio::time::Instant::now() >= this.deadline {
+            return std::task::Poll::Ready(Err(write_timeout_io_error()));
+        }
         std::pin::Pin::new(&mut *this.writer).poll_shutdown(context)
     }
 }
@@ -4232,7 +4250,8 @@ impl FrameWriteError {
 /// outside the encoded-byte contract. The length prefix is not emitted until
 /// encoding succeeds, so oversize, timeout, cancellation, and serialization
 /// failures leave the stream untouched. The same absolute deadline covers
-/// encoding, prefix, payload, and flush.
+/// encoding, prefix, payload, and flush. Every write and flush poll checks it
+/// before delegating, including polls resumed at or after expiry.
 pub(crate) async fn write_frame_bounded_until<W, T>(
     writer: &mut W,
     frame: &T,
@@ -4348,7 +4367,11 @@ where
         .map_err(|_| ProtocolError::FrameTooLarge(json.encoded_len))
         .map_err(FrameWriteError::BeforeWrite)?;
     let mut writer = TwoPhaseWriteProgress {
-        writer: WriteProgress { writer, progress },
+        writer: WriteProgress {
+            writer,
+            progress,
+            deadline: operation_deadline,
+        },
         progress,
         pre_accept_deadline,
     };
@@ -4455,7 +4478,11 @@ where
     let len = u32::try_from(json.encoded_len)
         .map_err(|_| ProtocolError::FrameTooLarge(json.encoded_len))
         .map_err(FrameWriteError::BeforeWrite)?;
-    let mut writer = WriteProgress { writer, progress };
+    let mut writer = WriteProgress {
+        writer,
+        progress,
+        deadline,
+    };
     let write = async {
         writer
             .write_all(&len.to_be_bytes())
@@ -6947,6 +6974,7 @@ mod tests {
     struct LateReadyWriteState {
         flush_waiting: AtomicBool,
         flush_ready: AtomicBool,
+        flush_polls: std::sync::atomic::AtomicUsize,
     }
 
     struct LateReadyWriter {
@@ -6969,6 +6997,7 @@ mod tests {
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
             self.state.flush_waiting.store(true, Ordering::Release);
+            self.state.flush_polls.fetch_add(1, Ordering::AcqRel);
             if self.state.flush_ready.load(Ordering::Acquire) {
                 std::task::Poll::Ready(Ok(()))
             } else {
@@ -7249,6 +7278,60 @@ mod tests {
             !progress.accepted_any(),
             "zero-byte TLS polling never becomes a Call transmission"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_phase_operation_deadline_refuses_a_resumed_flush_poll() {
+        for resumed_ms in [30, 31] {
+            let state = Arc::new(LateReadyWriteState::default());
+            let mut writer = LateReadyWriter {
+                bytes: Vec::new(),
+                state: Arc::clone(&state),
+            };
+            let progress = FrameWriteProgress::new();
+            let started = tokio::time::Instant::now();
+            let error = {
+                let write = write_frame_bounded_until_two_phase_classified_with_progress(
+                    &mut writer,
+                    &Response::WatchStream,
+                    MIN_NEGOTIATED_FRAME_SIZE,
+                    started + Duration::from_millis(10),
+                    started + Duration::from_millis(30),
+                    &progress,
+                );
+                tokio::pin!(write);
+                assert!(futures_util::poll!(&mut write).is_pending());
+                assert!(progress.accepted_any());
+                assert_eq!(state.flush_polls.load(Ordering::Acquire), 1);
+
+                tokio::time::advance(Duration::from_millis(10)).await;
+                assert!(
+                    futures_util::poll!(&mut write).is_pending(),
+                    "accepted frames retain their operation budget after pre-accept expiry"
+                );
+                let before_expiry = state.flush_polls.load(Ordering::Acquire);
+                assert!(
+                    before_expiry > 1,
+                    "flush remains eligible before operation expiry"
+                );
+                tokio::time::advance(Duration::from_millis(resumed_ms - 10)).await;
+                state.flush_ready.store(true, Ordering::Release);
+                let error = write.await.expect_err("operation deadline expired");
+                assert_eq!(
+                    state.flush_polls.load(Ordering::Acquire),
+                    before_expiry,
+                    "the ready flush must not be delegated at or after the operation bound"
+                );
+                error
+            };
+            assert!(matches!(error,
+                FrameWriteError::MayHaveWritten(ProtocolError::Io(ref error))
+                    if error.kind() == std::io::ErrorKind::TimedOut
+            ));
+            assert!(progress.accepted_any());
+            assert!(!writer.bytes.is_empty());
+            assert_eq!(started.elapsed(), Duration::from_millis(resumed_ms));
+        }
     }
 
     #[tokio::test]

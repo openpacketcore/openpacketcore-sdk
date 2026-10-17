@@ -52,17 +52,25 @@ async fn review_resume_first_write_at_peer_bound(watch: bool) {
         }),
     );
     connection.accepted_ciphertext_writes = Arc::clone(&accepted_writes);
-    assert_eq!(connection.peer_first_call_deadline, started + Duration::from_millis(90));
+    assert_eq!(
+        connection.peer_first_call_deadline,
+        started + Duration::from_millis(90)
+    );
     let result = if watch {
         let request = SessionConsumerRequest::new(
-            scope(), SessionConsumerRequestId::new(),
+            scope(),
+            SessionConsumerRequestId::new(),
             SessionConsumerOperation::Watch { start_sequence: 0 },
         );
         let mut reauthentication = client.reauthentication.subscribe();
         let mut material = Some(client.tls_config.subscribe_material_changes());
         let write = client.write_watch_call_on_connection(
-            &mut connection, &request, operation_deadline, false,
-            &mut reauthentication, &mut material,
+            &mut connection,
+            &request,
+            operation_deadline,
+            false,
+            &mut reauthentication,
+            &mut material,
         );
         tokio::pin!(write);
         assert!(write.as_mut().now_or_never().is_none());
@@ -72,7 +80,12 @@ async fn review_resume_first_write_at_peer_bound(watch: bool) {
     } else {
         let request = mutation_request(SessionConsumerRequestId::new());
         let write = client.execute_on_connection(
-            &mut connection, &request, operation_deadline, false, operation_deadline, None,
+            &mut connection,
+            &request,
+            operation_deadline,
+            false,
+            operation_deadline,
+            None,
         );
         tokio::pin!(write);
         assert!(write.as_mut().now_or_never().is_none());
@@ -80,12 +93,21 @@ async fn review_resume_first_write_at_peer_bound(watch: bool) {
         tokio::time::advance(Duration::from_millis(90)).await;
         format!("{:?}", write.await)
     };
-    assert_eq!(tokio::time::Instant::now(), connection.peer_first_call_deadline);
-    eprintln!("review peer-bound resume watch={watch} elapsed_ms={} bytes={} writes={} result={result}",
-        started.elapsed().as_millis(), accepted_bytes.load(Ordering::SeqCst),
-        accepted_writes.load(Ordering::SeqCst));
-    assert_eq!(accepted_bytes.load(Ordering::SeqCst), 0,
-        "a pending first write must not transmit when resumed at the peer bound");
+    assert_eq!(
+        tokio::time::Instant::now(),
+        connection.peer_first_call_deadline
+    );
+    eprintln!(
+        "review peer-bound resume watch={watch} elapsed_ms={} bytes={} writes={} result={result}",
+        started.elapsed().as_millis(),
+        accepted_bytes.load(Ordering::SeqCst),
+        accepted_writes.load(Ordering::SeqCst)
+    );
+    assert_eq!(
+        accepted_bytes.load(Ordering::SeqCst),
+        0,
+        "a pending first write must not transmit when resumed at the peer bound"
+    );
     assert_eq!(accepted_writes.load(Ordering::SeqCst), 0);
 }
 
@@ -97,6 +119,218 @@ async fn review_first_call_request_resume_at_peer_bound_writes_nothing() {
 #[tokio::test(start_paused = true)]
 async fn review_first_call_watch_resume_at_peer_bound_writes_nothing() {
     review_resume_first_write_at_peer_bound(true).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FirstCallPollBoundary {
+    PendingWrite,
+    PartialWrite,
+    BufferedFlush,
+    PartialFlush,
+}
+
+struct FirstCallBoundaryWriter {
+    boundary: FirstCallPollBoundary,
+    ready_at: tokio::time::Instant,
+    accepted_bytes: Arc<AtomicUsize>,
+    accepted_writes: Arc<AtomicU64>,
+    buffered_bytes: Arc<AtomicUsize>,
+}
+
+impl FirstCallBoundaryWriter {
+    fn accept(&self, count: usize) {
+        if count != 0 {
+            self.accepted_bytes.fetch_add(count, Ordering::SeqCst);
+            self.accepted_writes.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+impl AsyncWrite for FirstCallBoundaryWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if matches!(
+            self.boundary,
+            FirstCallPollBoundary::BufferedFlush | FirstCallPollBoundary::PartialFlush
+        ) {
+            // Model TLS accepting plaintext without any lower-socket write.
+            self.buffered_bytes.fetch_add(bytes.len(), Ordering::SeqCst);
+            return Poll::Ready(Ok(bytes.len()));
+        }
+        if matches!(self.boundary, FirstCallPollBoundary::PartialWrite)
+            && self.accepted_writes.load(Ordering::Acquire) == 0
+        {
+            let count = bytes.len().min(1);
+            self.accept(count);
+            return Poll::Ready(Ok(count));
+        }
+        if tokio::time::Instant::now() < self.ready_at {
+            return Poll::Pending;
+        }
+        self.accept(bytes.len());
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if matches!(self.boundary, FirstCallPollBoundary::PartialFlush)
+            && self.accepted_writes.load(Ordering::Acquire) == 0
+        {
+            assert!(self.buffered_bytes.load(Ordering::SeqCst) > 1);
+            self.buffered_bytes.fetch_sub(1, Ordering::SeqCst);
+            self.accept(1);
+            return Poll::Pending;
+        }
+        if tokio::time::Instant::now() < self.ready_at {
+            return Poll::Pending;
+        }
+        self.accept(self.buffered_bytes.swap(0, Ordering::SeqCst));
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush(context)
+    }
+}
+
+async fn assert_first_call_poll_boundary(watch: bool) {
+    for resumed_ms in [90, 91] {
+        for boundary in [
+            FirstCallPollBoundary::PendingWrite,
+            FirstCallPollBoundary::PartialWrite,
+            FirstCallPollBoundary::BufferedFlush,
+            FirstCallPollBoundary::PartialFlush,
+        ] {
+            let (client, _material) = stateless_test_client(SessionReauthenticationControl::new());
+            let client = client
+                .with_idle_timeout(Duration::from_millis(100))
+                .with_peer_idle_timeout(Duration::from_millis(100), Duration::from_millis(10));
+            let started = tokio::time::Instant::now();
+            let operation_deadline = started + Duration::from_millis(250);
+            let accepted_bytes = Arc::new(AtomicUsize::new(0));
+            let accepted_writes = Arc::new(AtomicU64::new(0));
+            let buffered_bytes = Arc::new(AtomicUsize::new(0));
+            let (mut connection, _) = synthetic_consumer_connection(
+                &client,
+                operation_deadline,
+                Box::new(FirstCallBoundaryWriter {
+                    boundary,
+                    ready_at: started + Duration::from_millis(90),
+                    accepted_bytes: Arc::clone(&accepted_bytes),
+                    accepted_writes: Arc::clone(&accepted_writes),
+                    buffered_bytes: Arc::clone(&buffered_bytes),
+                }),
+            );
+            connection.accepted_ciphertext_writes = Arc::clone(&accepted_writes);
+            assert_eq!(
+                connection.peer_first_call_deadline,
+                started + Duration::from_millis(90)
+            );
+            let partial = matches!(
+                boundary,
+                FirstCallPollBoundary::PartialWrite | FirstCallPollBoundary::PartialFlush
+            );
+            let before_expiry = usize::from(partial);
+            let result = {
+                let write = async {
+                    if watch {
+                        let request = SessionConsumerRequest::new(
+                            scope(),
+                            SessionConsumerRequestId::new(),
+                            SessionConsumerOperation::Watch { start_sequence: 0 },
+                        );
+                        let mut reauthentication = client.reauthentication.subscribe();
+                        let mut material = Some(client.tls_config.subscribe_material_changes());
+                        let progress = FrameWriteProgress::new();
+                        client
+                            .write_watch_call_on_connection_classified(
+                                &mut connection,
+                                &request,
+                                operation_deadline,
+                                false,
+                                ConsumerRotationReceivers {
+                                    reauthentication: &mut reauthentication,
+                                    material: &mut material,
+                                },
+                                &progress,
+                            )
+                            .await
+                            .map(|_| ())
+                    } else {
+                        let request = mutation_request(SessionConsumerRequestId::new());
+                        client
+                            .execute_on_connection(
+                                &mut connection,
+                                &request,
+                                operation_deadline,
+                                false,
+                                operation_deadline,
+                                None,
+                            )
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                tokio::pin!(write);
+                assert!(write.as_mut().now_or_never().is_none());
+                assert_eq!(accepted_bytes.load(Ordering::SeqCst), before_expiry);
+                assert_eq!(accepted_writes.load(Ordering::SeqCst), u64::from(partial));
+                let buffered = buffered_bytes.load(Ordering::SeqCst);
+                assert_eq!(
+                    buffered > 0,
+                    matches!(
+                        boundary,
+                        FirstCallPollBoundary::BufferedFlush | FirstCallPollBoundary::PartialFlush
+                    )
+                );
+                tokio::time::advance(Duration::from_millis(89)).await;
+                assert!(write.as_mut().now_or_never().is_none());
+                assert_eq!(accepted_bytes.load(Ordering::SeqCst), before_expiry);
+                tokio::time::advance(Duration::from_millis(resumed_ms - 89)).await;
+                let result = write.await;
+                assert_eq!(
+                    buffered_bytes.load(Ordering::SeqCst),
+                    buffered,
+                    "expiry must not flush buffered TLS output"
+                );
+                result
+            };
+            let expected = if partial {
+                SessionConsumerCallError::MayHaveSent(SessionConsumerClientError::Deadline)
+            } else {
+                SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Deadline)
+            };
+            assert_eq!(
+                result,
+                Err(expected),
+                "watch={watch} boundary={boundary:?} resumed_ms={resumed_ms}"
+            );
+            assert_eq!(
+                accepted_bytes.load(Ordering::SeqCst),
+                before_expiry,
+                "no additional byte may be accepted at or after expiry"
+            );
+            assert_eq!(accepted_writes.load(Ordering::SeqCst), u64::from(partial));
+            assert_eq!(
+                connection.calls, 1,
+                "the attempted Call reserved one correlation"
+            );
+            assert_eq!(started.elapsed(), Duration::from_millis(resumed_ms));
+            eprintln!("first_call_poll_boundary watch={watch} boundary={boundary:?} elapsed_ms={resumed_ms} accepted_bytes={before_expiry} result={result:?}");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_call_request_pending_write_and_flush_obey_peer_bound() {
+    assert_first_call_poll_boundary(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_call_watch_pending_write_and_flush_obey_peer_bound() {
+    assert_first_call_poll_boundary(true).await;
 }
 
 fn staged_connection(

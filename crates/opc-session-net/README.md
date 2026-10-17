@@ -732,6 +732,10 @@ idle deadline and its own peer first-Call bound. The latter is measured from the
 monotonic HelloAck receive instant, less the complete measured Hello round trip
 and a safety margin. Near-expiry lanes are retired during staging and before any
 first Call write; readiness never grants them another publication-based interval.
+Every first-Call write and flush poll checks that bound before delegating to the
+transport, so a pending writer cannot resume transmission at or after expiry.
+Buffered TLS plaintext alone does not make a timeout ambiguous; only bytes
+accepted by the lower transport before expiry can do so.
 The frozen HelloAck carries no idle duration. The client therefore defaults to the
 SDK server's five-second idle with a 50 ms margin; deployments with a shorter
 server idle must configure `with_peer_idle_timeout(timeout, safety_margin)` and a

@@ -793,6 +793,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cap unused lanes at their monotonic HelloAck peer-idle bound, accounting for
   measured transit time and a safety margin. Expose the peer-idle assumption for
   servers with shorter timeouts without changing the frozen HelloAck wire format.
+  Enforce the bound before every write and flush poll, preserving definite
+  non-transmission when no lower-transport byte was accepted before expiry.
   Discard staged lanes safely if Tokio's thread-local context is destroyed.
   Used lanes retain their conservative between-call deadline. (#1319)
 
