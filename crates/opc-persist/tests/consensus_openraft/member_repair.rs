@@ -1,11 +1,36 @@
 use super::*;
 
+#[derive(serde::Deserialize)]
+struct ReceivedRepairChunk {
+    vote: opc_consensus::engine::Vote<ConfigConsensusNodeId>,
+    meta: opc_consensus::engine::SnapshotMeta<
+        ConfigConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    offset: u64,
+    bytes: Vec<u8>,
+    done: bool,
+}
+
+#[derive(Debug)]
+struct RepairChunkObservation {
+    vote: opc_consensus::engine::Vote<ConfigConsensusNodeId>,
+    meta: opc_consensus::engine::SnapshotMeta<
+        ConfigConsensusNodeId,
+        opc_consensus::engine::EmptyNode,
+    >,
+    offset: u64,
+    length: usize,
+    done: bool,
+}
+
 #[derive(Debug, Default)]
 struct RepairControl {
     pause_after_first_chunk: AtomicBool,
     chunk_limit: AtomicUsize,
     chunks: AtomicUsize,
     calls: AtomicUsize,
+    received: StdMutex<Vec<RepairChunkObservation>>,
     blocked: tokio::sync::Notify,
 }
 
@@ -62,11 +87,217 @@ impl ConsensusPeer for RepairPeer {
             .peer
             .call_with_compatibility(request, required, timeout)
             .await?;
-        if repair && reply.response.result.is_ok() {
-            self.control.chunks.fetch_add(1, Ordering::SeqCst);
+        if repair {
+            if let Ok(bytes) = &reply.response.result {
+                let (_, chunk): (u16, ReceivedRepairChunk) =
+                    opc_consensus::decode_bounded(bytes).unwrap();
+                self.control
+                    .received
+                    .lock()
+                    .unwrap()
+                    .push(RepairChunkObservation {
+                        vote: chunk.vote,
+                        meta: chunk.meta,
+                        offset: chunk.offset,
+                        length: chunk.bytes.len(),
+                        done: chunk.done,
+                    });
+                self.control.chunks.fetch_add(1, Ordering::SeqCst);
+            }
         }
         Ok(reply)
     }
+}
+
+fn staged_repair_bytes(path: &std::path::Path) -> Vec<u64> {
+    std::fs::read_dir(path)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("incoming-"))
+        .map(|entry| entry.metadata().unwrap().len())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
+    let directory = tempfile::tempdir().unwrap();
+    let nodes = [1, 2, 3, 4, 5].map(|id| ConfigConsensusNodeId::new(id).unwrap());
+    let members: BTreeSet<_> = nodes.into_iter().collect();
+    let identity = ConfigConsensusIdentity::new(
+        ConfigConsensusClusterId::new("stalled-member-repair").unwrap(),
+        ConfigConsensusConfigurationId::from_bytes([0x71; 32]),
+        ConfigConsensusConfigurationEpoch::new(1).unwrap(),
+    );
+    let mut paths = BTreeMap::new();
+    for source in 0..5 {
+        for (target, node) in nodes.iter().enumerate() {
+            if source != target {
+                paths.insert((source, target), Arc::new(LoopbackPeer::new(*node)));
+            }
+        }
+    }
+    let controls: [_; 4] = std::array::from_fn(|_| Arc::new(RepairControl::default()));
+    let peers_for = |source| {
+        (0..5)
+            .filter(|target| *target != source)
+            .map(|target| {
+                let peer = paths[&(source, target)].clone() as Arc<dyn ConsensusPeer>;
+                let peer = if source == 4 {
+                    Arc::new(RepairPeer {
+                        peer,
+                        control: controls[target].clone(),
+                    }) as Arc<dyn ConsensusPeer>
+                } else {
+                    peer
+                };
+                (nodes[target], peer)
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let mut stores = Vec::new();
+    for index in 0..5 {
+        let backend = SqliteBackend::open_with_audit_key(
+            directory.path().join(format!("node-{index}.sqlite")),
+            true,
+            0,
+            audit_key(),
+        )
+        .await
+        .unwrap();
+        stores.push(
+            ConsensusConfigStore::open_with_operation_timeout(
+                ConfigConsensusTopology::try_new(identity, nodes[index], members.clone()).unwrap(),
+                backend,
+                directory.path().join(format!("snapshots-{index}")),
+                peers_for(index),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    for ((_, target), peer) in &paths {
+        peer.install(stores[*target].rpc_handler()).await;
+    }
+    for result in
+        futures_util::future::join_all(stores.iter().map(|s| s.initialize_cluster())).await
+    {
+        result.unwrap();
+    }
+    for store in &stores {
+        store.probe_durable_readiness().await.unwrap();
+    }
+    assert_eq!(stores[0].status().leader_id, Some(nodes[0]));
+    stores[4].shutdown().await.unwrap();
+    let tx = TxId::new();
+    stores[0]
+        .append_commit_idempotent(
+            ConfigConsensusRequestId::from_bytes([0x42; 16]),
+            large_attested(tx),
+        )
+        .await
+        .unwrap();
+    let topology = ConfigConsensusTopology::try_new(identity, nodes[4], members).unwrap();
+    let backend = SqliteBackend::provision_config_member_repair(
+        retained_options(
+            &directory.path().join("replacement.sqlite"),
+            topology.clone(),
+            9,
+        ),
+        audit_key(),
+    )
+    .await
+    .unwrap();
+    let snapshots = directory.path().join("repair-snapshots");
+    stores[4] = ConsensusConfigStore::open_with_operation_timeout(
+        topology,
+        backend,
+        &snapshots,
+        peers_for(4),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    for ((_, target), peer) in &paths {
+        if *target == 4 {
+            peer.install(stores[4].rpc_handler()).await;
+        }
+    }
+    let former = &controls[0];
+    former.pause_after_first_chunk.store(true, Ordering::SeqCst);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), stores[4].initialize_cluster())
+            .await
+            .expect("initial attempt retains its one-second operation deadline")
+            .is_err()
+    );
+    assert_eq!(former.chunks.load(Ordering::SeqCst), 1);
+    assert_eq!(staged_repair_bytes(&snapshots), [128 * 1024]);
+    assert!(!stores[4].status().admitted);
+    assert!(stores[4].status().applied_index.is_none());
+    {
+        let received = former.received.lock().unwrap();
+        assert_eq!(received[0].offset, 0);
+        assert_eq!(received[0].length, 128 * 1024);
+        assert!(!received[0].done);
+    }
+
+    let report = stores[0].shutdown_with_report().await.unwrap();
+    let opc_consensus::PlannedShutdownOutcome::LeaderTransferred { successor } = report else {
+        panic!("former leader must finish its ordinary planned handoff: {report:?}");
+    };
+    let successor_index = nodes.iter().position(|node| *node == successor).unwrap();
+    assert!((1..4).contains(&successor_index));
+    for store in &stores[1..4] {
+        store.probe_durable_readiness().await.unwrap();
+    }
+    let current = &controls[successor_index];
+    let requests_before = current.calls.load(Ordering::SeqCst);
+    let mut completed = false;
+    for _ in 0..3 {
+        let result = tokio::time::timeout(Duration::from_secs(2), stores[4].initialize_cluster())
+            .await
+            .expect("each retry retains its one-second operation deadline");
+        if result.is_ok() {
+            completed = true;
+            break;
+        }
+        assert!(!stores[4].status().admitted);
+        assert!(stores[4].status().applied_index.is_none());
+        stores[successor_index]
+            .probe_durable_readiness()
+            .await
+            .unwrap();
+    }
+    let admitted = stores[4].status().admitted;
+    let recovered = if completed {
+        stores[4]
+            .load_latest()
+            .await
+            .unwrap()
+            .map(|value| value.record.tx_id)
+    } else {
+        None
+    };
+    for result in futures_util::future::join_all(stores.iter().map(|s| s.shutdown())).await {
+        result.unwrap();
+    }
+    assert!(former.pause_after_first_chunk.load(Ordering::SeqCst));
+    assert!(
+        completed,
+        "saved repair must rediscover the healthy successor within three bounded retries while the former source stays stalled; successor repair requests: {}",
+        current.calls.load(Ordering::SeqCst) - requests_before
+    );
+    assert!(admitted);
+    assert_eq!(recovered, Some(tx));
+    assert!(current.calls.load(Ordering::SeqCst) > requests_before);
+    let old = former.received.lock().unwrap();
+    let new = current.received.lock().unwrap();
+    assert_eq!(new[0].offset, 0, "a different vote starts a clean snapshot");
+    assert_ne!(old[0].vote, new[0].vote);
+    assert_eq!(new[0].vote.leader_id.voted_for(), Some(successor));
+    assert_eq!(old[0].meta.last_membership, new[0].meta.last_membership);
+    assert!(staged_repair_bytes(&snapshots).is_empty());
 }
 
 #[tokio::test]
