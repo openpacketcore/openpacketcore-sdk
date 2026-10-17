@@ -27,6 +27,7 @@ struct CallState {
 #[derive(Default)]
 struct CallLifecycle {
     returned: bool,
+    deferred_live: bool,
     reclamation_started: bool,
 }
 
@@ -63,12 +64,27 @@ impl FencedTransitionV2RecoveryCall {
     /// Record a known return or cancellation. An unknown return must keep
     /// this registration alive until the original deadline or handle drop.
     pub fn returned(&self) {
-        self.notice
+        let mut lifecycle = self
+            .notice
             .0
             .lifecycle
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .returned = true;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.returned = true;
+        lifecycle.deferred_live = false;
+    }
+
+    /// A known deferral permits an explicit resume while retaining the live
+    /// caller's protection against reclamation until its deadline or drop.
+    pub fn lease_deferred(&self) {
+        let mut lifecycle = self
+            .notice
+            .0
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.returned = true;
+        lifecycle.deferred_live = true;
     }
 
     /// Clear prior return/cancellation eligibility before dispatch resumes.
@@ -85,6 +101,7 @@ impl FencedTransitionV2RecoveryCall {
             return false;
         }
         lifecycle.returned = false;
+        lifecycle.deferred_live = false;
         true
     }
 
@@ -254,6 +271,84 @@ impl FencedTransitionV2RecoveryJournal {
         Ok(call)
     }
 
+    /// Register a new attempt for the exact retained sealed request.
+    ///
+    /// This authenticates the existing row without inserting or changing it.
+    /// It only coordinates caller lifetime with reclamation: it does not prove
+    /// deferral or grant dispatch authority. The consumer must separately read
+    /// an authoritative, fully correlated `LeaseDeferred` status first.
+    /// An owned journal refuses a still-active caller or an already claimed
+    /// reclamation; replacing an ended caller disables its dispatch guard.
+    pub async fn begin_deferred_call(
+        &self,
+        prepared: &crate::PreparedFencedTransitionV2,
+        deadline: tokio::time::Instant,
+    ) -> Result<FencedTransitionV2RecoveryCall, StoreError> {
+        let id = prepared.request_id();
+        let expected = prepared.physical_request().clone();
+        let state = Arc::new(CallState {
+            physical_id: Mutex::new(Some(expected.request_id())),
+            deadline: Some(deadline),
+            lifecycle: Mutex::new(CallLifecycle::default()),
+            terminal: Mutex::new(None),
+        });
+        let call = FencedTransitionV2RecoveryCall {
+            notice: FencedTransitionV2RecoveryNotice(Arc::clone(&state)),
+            _owner: Arc::clone(&self.inner),
+        };
+        let ownership = self.inner.ownership.clone();
+        self.with_connection(false, move |conn, key| {
+            let transaction = recovery_read_transaction(conn)?;
+            verify_recovery_metadata(&transaction, key, None)?;
+            if read_recovery_entry(&transaction, key, id)?.as_ref() != Some(&expected) {
+                return Err(StoreError::FencedTransitionRequestConflict);
+            }
+            verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
+            transaction.commit().map_err(|_| recovery_unavailable())?;
+            if let Some(ownership) = ownership {
+                let mut lifetimes = ownership
+                    .lifetimes
+                    .lock()
+                    .map_err(|_| recovery_unavailable())?;
+                if let Some(previous) = lifetimes.calls.get(id.as_bytes()) {
+                    if *previous
+                        .physical_id
+                        .lock()
+                        .map_err(|_| recovery_unavailable())?
+                        != Some(expected.request_id())
+                    {
+                        return Err(StoreError::FencedTransitionRequestConflict);
+                    }
+                    let mut lifecycle = previous
+                        .lifecycle
+                        .lock()
+                        .map_err(|_| recovery_unavailable())?;
+                    if lifecycle.reclamation_started
+                        || (!lifecycle.returned
+                            && previous
+                                .deadline
+                                .is_none_or(|end| tokio::time::Instant::now() < end))
+                    {
+                        return Err(StoreError::FencedTransitionRequestConflict);
+                    }
+                    lifecycle.reclamation_started = true;
+                } else if !lifetimes.inherited.contains(id.as_bytes()) {
+                    // A current trait-level caller without a registration can
+                    // still dispatch; ownership alone does not exclude it.
+                    return Err(StoreError::FencedTransitionRequestConflict);
+                } else if lifetimes.calls.len() >= FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES
+                {
+                    return Err(StoreError::FencedTransitionHistoryFull);
+                }
+                lifetimes.inherited.remove(id.as_bytes());
+                lifetimes.calls.insert(*id.as_bytes(), state);
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(call)
+    }
+
     /// Check the caller-lifetime policy for a retained exact physical request.
     /// This is not a receipt or permission to remove the row.
     pub(crate) fn void_reclamation_eligibility(
@@ -277,14 +372,15 @@ impl FencedTransitionV2RecoveryJournal {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 == Some(physical)
-                && (call
-                    .lifecycle
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .returned
-                    || call
-                        .deadline
-                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline))
+                && ({
+                    let lifecycle = call
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    lifecycle.returned && !lifecycle.deferred_live
+                } || call
+                    .deadline
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline))
         }) {
             FencedTransitionV2VoidEligibility::Ready
         } else {
@@ -327,7 +423,7 @@ impl FencedTransitionV2RecoveryJournal {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if lifetimes.inherited.contains(id.as_bytes())
-            || lifecycle.returned
+            || (lifecycle.returned && !lifecycle.deferred_live)
             || lifecycle.reclamation_started
             || call
                 .deadline
@@ -369,6 +465,7 @@ impl FencedTransitionV2RecoveryJournal {
                     deadline: None,
                     lifecycle: Mutex::new(CallLifecycle {
                         returned: true,
+                        deferred_live: false,
                         reclamation_started: false,
                     }),
                     terminal: Mutex::new(None),

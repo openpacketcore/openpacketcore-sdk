@@ -587,6 +587,9 @@ fn consumer_v2_status_into_store(
         SessionConsumerV2FencedTransitionStatus::RetentionExhausted => {
             FencedTransitionV2Status::RetentionExhausted
         }
+        SessionConsumerV2FencedTransitionStatus::LeaseDeferred { request_id } => {
+            FencedTransitionV2Status::LeaseDeferred { request_id }
+        }
         _ => {
             return Err(StoreError::BackendUnavailable(
                 PREPARED_FENCED_V2_RECEIPT_UNAVAILABLE.into(),
@@ -752,6 +755,11 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
         self.route.admit_dispatch();
         let response = client.execute_v2_before(&wire, deadline).await;
         match response {
+            Ok(SessionConsumerV2Response::FencedTransitionV2Deferred { request_id })
+                if request_id == request.request_id() =>
+            {
+                FencedTransitionV2Effect::Resolved(Err(StoreError::FencedTransitionLeaseDeferred))
+            }
             Ok(SessionConsumerV2Response::FencedTransitionV2(Ok(outcome)))
                 if outcome.matches_v2_request(&request) =>
             {
@@ -1331,6 +1339,97 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         .map_err(|_| prepared_fenced_v2_deadline())?
     }
 
+    /// Resume the original sealed request only after a fresh authoritative
+    /// `LeaseDeferred` status for its complete identity.
+    ///
+    /// This reads and authenticates the retained row; it never prepares a new
+    /// request, calls a key provider, changes epoch, or inserts a journal row.
+    /// `None` grants no dispatch authority: the row was absent or the observed
+    /// status was not a deferral. In particular, `NotFound`, an unavailable
+    /// read, and an unknown outcome cannot authorize a retry. Keep using status
+    /// recovery for those outcomes. Every resumed attempt has a new caller
+    /// budget and must pass the current consumer admission before dispatch.
+    /// The returned handle cannot abandon the already-bound request.
+    /// An owned journal also requires the previous call to have returned a
+    /// known deferral, ended, or reached its deadline; drop an unknown handle
+    /// before resuming after a later authoritative deferral observation.
+    pub async fn resume_deferred_fenced_transition(
+        &self,
+        request_id: FencedTransitionRequestId,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<Option<SessionConsumerPreparedFencedTransitionV2>, StoreError> {
+        let deadline = budget.original_deadline();
+        if tokio::time::Instant::now() >= deadline {
+            return Err(prepared_fenced_v2_deadline());
+        }
+        let route = Arc::new(PreparedFencedTransitionV2Route::new(
+            prepared_fenced_v2_origin(&self.router, request_id),
+        ));
+        let backend = self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Fresh);
+        tokio::time::timeout_at(deadline, async {
+            let prepared = match backend
+                .recover_protected_fenced_transition_v2(request_id)
+                .await?
+            {
+                PreparedFencedTransitionV2Lookup::Found(prepared) => prepared,
+                PreparedFencedTransitionV2Lookup::Absent => return Ok(None),
+                _ => return Err(invalid_authenticated_consumer_fenced_transition()),
+            };
+            if let Some(legacy) = &self.legacy_v1 {
+                if legacy
+                    .recover_fenced_transition_status(request_id, budget)
+                    .await?
+                    .is_some()
+                {
+                    return Err(StoreError::FencedTransitionRequestConflict);
+                }
+            }
+            for _ in 0..self.router.clients.len() {
+                let Some(attempt_deadline) = reclaim_attempt_deadline(&budget, deadline) else {
+                    return Err(prepared_fenced_v2_deadline());
+                };
+                route.install_attempt_deadline(attempt_deadline);
+                match tokio::time::timeout_at(
+                    attempt_deadline,
+                    backend.protected_fenced_transition_v2_status(&prepared),
+                )
+                .await
+                {
+                    Ok(Ok(FencedTransitionV2Status::LeaseDeferred { .. })) => {
+                        // The protected wrapper and wire client both compare
+                        // the complete ID with the authenticated sealed body.
+                        let call = self
+                            .wrapper_factory
+                            .journal()
+                            .begin_deferred_call(&prepared, deadline)
+                            .await?;
+                        return Ok(Some(SessionConsumerPreparedFencedTransitionV2 {
+                            inner: PersistentPreparedFencedTransitionV2Token::new(
+                                Arc::clone(&backend),
+                                prepared,
+                                budget,
+                                self.handle_routing(Arc::clone(&route)),
+                                PreparedRequestState::new(0),
+                                false,
+                            )
+                            .with_call(call),
+                        }));
+                    }
+                    Ok(Ok(_)) => return Ok(None),
+                    Ok(Err(StoreError::TopologyAuthorityRevoked)) => {
+                        return Err(StoreError::TopologyAuthorityRevoked);
+                    }
+                    Ok(Err(_)) | Err(_) => {}
+                }
+            }
+            Err(StoreError::BackendUnavailable(
+                PREPARED_FENCED_V2_RECEIPT_UNAVAILABLE.into(),
+            ))
+        })
+        .await
+        .map_err(|_| prepared_fenced_v2_deadline())?
+    }
+
     /// Run one bounded reclamation sweep over retained rows.
     ///
     /// It first reads the linearized history state once and removes rows at
@@ -1465,7 +1564,10 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 }
             };
             let mut void_result = false;
-            if matches!(observed, FencedTransitionV2Status::NotFound) {
+            if matches!(
+                observed,
+                FencedTransitionV2Status::NotFound | FencedTransitionV2Status::LeaseDeferred { .. }
+            ) {
                 match backend.protected_fenced_transition_v2_void_eligibility(&prepared) {
                     opc_session_store::FencedTransitionV2VoidEligibility::Ready if attempt_void => {
                         let Some(attempt_deadline) = reclaim_attempt_deadline(&budget, deadline)
@@ -1662,6 +1764,8 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     /// Rotate read-only receipt lookups over the roster until a terminal
     /// status is found or the caller's absolute deadline is reached. It never
     /// re-enters mutation dispatch.
+    /// A correlated `LeaseDeferred` also returns immediately, remains
+    /// nonterminal, and keeps the row for explicit deferral resumption.
     ///
     /// A retained row that is missing or fails authentication is a local
     /// fail-closed condition: `Unavailable` is then returned at once and is
@@ -1739,6 +1843,8 @@ impl SessionConsumerRecoveredFencedTransitionV2Status {
     /// the caller's absolute deadline is reached. As for a live handle, a
     /// local row failure returns `Unavailable` at once and is final for this
     /// handle.
+    /// `LeaseDeferred` returns immediately without making the row releasable;
+    /// only the facade's explicit deferral resume method can restore dispatch.
     pub async fn status_until_terminal(
         &mut self,
         deadline: tokio::time::Instant,
@@ -2063,7 +2169,23 @@ impl PersistentPreparedFencedTransitionV2Token {
                     self.set_resolution(V2Resolution::Resolved);
                     return Ok(outcome);
                 }
+                FencedTransitionV2Effect::Resolved(Err(
+                    StoreError::FencedTransitionLeaseDeferred,
+                )) => {
+                    preparation.receipt_only();
+                    if let Some(call) = &self.recovery_call {
+                        call.lease_deferred();
+                    }
+                    returned.0 = None;
+                    return Err(FencedTransitionExecuteError::LeaseDeferred);
+                }
                 FencedTransitionV2Effect::Resolved(Err(StoreError::TopologyAuthorityRevoked)) => {
+                    if !self.original {
+                        preparation.receipt_only();
+                        return Err(FencedTransitionExecuteError::Rejected(
+                            StoreError::TopologyAuthorityRevoked,
+                        ));
+                    }
                     // Revocation is classified before any Call byte, and every
                     // earlier attempt proved the same. Nothing was sent, so a
                     // failed discard stays releasable.
@@ -2075,6 +2197,10 @@ impl PersistentPreparedFencedTransitionV2Token {
                     ));
                 }
                 FencedTransitionV2Effect::Resolved(Err(error)) => {
+                    if !self.original && v2_rejection_never_binds(&error) {
+                        preparation.receipt_only();
+                        return Err(FencedTransitionExecuteError::Rejected(error));
+                    }
                     preparation.terminal();
                     if matches!(
                         error,
@@ -2114,9 +2240,13 @@ impl PersistentPreparedFencedTransitionV2Token {
         // Every candidate proved that no Call byte was accepted, and only this
         // handle can dispatch the row, so no copy of the request was sent. A
         // failed or cancelled discard therefore stays releasable.
-        preparation.terminal();
-        self.set_resolution(V2Resolution::Resolved);
-        self.discard_own_unbound_row().await;
+        if self.original {
+            preparation.terminal();
+            self.set_resolution(V2Resolution::Resolved);
+            self.discard_own_unbound_row().await;
+        } else {
+            preparation.receipt_only();
+        }
         Err(FencedTransitionExecuteError::NotTransmitted)
     }
 
@@ -2229,6 +2359,7 @@ impl PersistentPreparedFencedTransitionV2Token {
             // NotFound is non-exclusionary while the request's epoch is
             // active; unavailable and per-attempt deadlines stay retryable.
             Ok(FencedTransitionV2Status::NotFound)
+            | Ok(FencedTransitionV2Status::LeaseDeferred { .. })
             | Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable) => result,
             Ok(_)
             | Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked) => {

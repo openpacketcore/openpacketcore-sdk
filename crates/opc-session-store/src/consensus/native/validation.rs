@@ -74,8 +74,17 @@ pub(super) fn validate_receipt(
         ));
     }
     validate_receipt_frontier(receipt, frontiers)?;
+    let deferred = receipt.lease_deferred();
+    if deferred
+        != (frontiers.fenced_transition_profile.defers_live_leases()
+            && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
+                receipt.retained_until,
+            ))
+    {
+        return Err(invalid("native image deferral profile or response differs"));
+    }
     if let Some(response) = receipt.response_facts()? {
-        if retention_deadline(response.logical_time) != Some(receipt.retained_until) {
+        if !deferred && retention_deadline(response.logical_time) != Some(receipt.retained_until) {
             return Err(invalid("native image receipt retention differs"));
         }
     }
@@ -352,7 +361,10 @@ impl NativeState {
             .and_then(|_| self.require_business_proof().ok());
         let mut receipt_order = match admitted {
             Some(proof) => proof.receipt_order.clone(),
-            None => history_order::ReceiptOrder::preparing(frontiers.history)?,
+            None => history_order::ReceiptOrder::preparing_with_profile(
+                frontiers.history,
+                frontiers.fenced_transition_profile,
+            )?,
         };
         if let Some(history) = frontiers.history {
             for (id, row) in &self.receipts {

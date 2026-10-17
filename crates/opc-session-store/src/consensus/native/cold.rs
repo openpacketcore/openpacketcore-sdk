@@ -96,7 +96,7 @@ pub(super) fn write_receipt(
         .map(|response| {
             crate::sqlite::consensus::encode_fenced_transition_v2_response_with_profile(
                 response,
-                FencedTransitionV2Profile::V2WithVoid,
+                FencedTransitionV2Profile::V2WithLeaseDeferral,
             )
         })
         .transpose()?;
@@ -165,11 +165,11 @@ fn decode(bytes: &[u8]) -> io::Result<(FencedTransitionV2RequestId, NativeReceip
         // catalog admission validates the result against its immutable frontier.
         let response = crate::sqlite::consensus::decode_fenced_transition_v2_response_with_profile(
             remaining,
-            FencedTransitionV2Profile::V2WithVoid,
+            FencedTransitionV2Profile::V2WithLeaseDeferral,
         )?;
         if crate::sqlite::consensus::encode_fenced_transition_v2_response_with_profile(
             &response,
-            FencedTransitionV2Profile::V2WithVoid,
+            FencedTransitionV2Profile::V2WithLeaseDeferral,
         )? != remaining
         {
             return Err(invalid("native cold response is not canonical"));
@@ -371,6 +371,10 @@ impl OwnedReceipt {
 }
 
 impl ResolvedReceipt {
+    pub(super) fn captured_revision(&self) -> &SharedRow<NativeReceipt> {
+        &self.ticket.row
+    }
+
     pub(super) fn matches_revision(&self, row: &SharedRow<NativeReceipt>) -> bool {
         self.ticket.row.ptr_eq(row)
     }
@@ -503,6 +507,7 @@ pub(super) fn copy_response(
             | StoreError::LeaseExpired
             | StoreError::PayloadTooLarge { .. }
             | StoreError::FencedTransitionVoided
+            | StoreError::FencedTransitionLeaseDeferred
             | StoreError::FencedTransitionStorageExhausted),
         ) => Err(error.clone()),
         _ => return Err(invalid("native cold output response outside V2 profile")),

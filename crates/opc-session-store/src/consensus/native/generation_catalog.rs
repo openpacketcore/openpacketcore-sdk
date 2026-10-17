@@ -725,7 +725,8 @@ impl Rows {
             rosters: Rosters::new(),
             _memory: memory,
         };
-        let mut ordinals = Ordinals::new()?;
+        let mut ordinals =
+            Ordinals::with_profile(base.context.business.frontiers.fenced_transition_profile)?;
         let counts = [
             base.context.business.counts[0],
             base.context.business.counts[1],
@@ -1042,14 +1043,32 @@ impl Rows {
                 check,
             )?;
             if let Some(old) = self.receipts.get(&id) {
+                let resolving =
+                    frontiers.fenced_transition_profile.defers_live_leases()
+                        && old.row.facts.lease_deferred
+                        && !row.facts.lease_deferred
+                        && row.facts.response.zip(old.row.facts.response).is_some_and(
+                            |(after, before)| after.logical_time >= before.logical_time,
+                        );
                 if row.facts.ordinal != old.row.facts.ordinal
-                    || row.facts.retained_until != old.row.facts.retained_until
-                    || (row.content != old.row.content
-                        && !(old.row.facts.response.is_some() && row.facts.response.is_none()))
+                    || row.facts.payload_digest != old.row.facts.payload_digest
+                    || (!resolving
+                        && (row.facts.retained_until != old.row.facts.retained_until
+                            || (row.content != old.row.content
+                                && !(old.row.facts.response.is_some()
+                                    && !old.row.facts.lease_deferred
+                                    && row.facts.response.is_none()))))
                 {
                     return Err(invalid(
                         "native catalog receipt changes its immutable binding",
                     ));
+                }
+                if resolving {
+                    ordinals.resolve_deferred(
+                        id.epoch().get(),
+                        row.facts.ordinal,
+                        row.facts.retained_until,
+                    )?;
                 }
             } else {
                 if !base

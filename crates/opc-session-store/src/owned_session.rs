@@ -440,6 +440,9 @@ impl OwnedSessionMutationError {
             StoreError::FencedTransitionVoided => Self::StoreRejected {
                 code: "fenced-transition-voided",
             },
+            StoreError::FencedTransitionLeaseDeferred => Self::StoreRejected {
+                code: "fenced-transition-lease-deferred",
+            },
             StoreError::BackendOperationOutcomeUnavailable => Self::StoreRejected {
                 code: "backend-operation-outcome-unavailable",
             },

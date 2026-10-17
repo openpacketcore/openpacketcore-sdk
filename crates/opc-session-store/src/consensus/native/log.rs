@@ -134,7 +134,7 @@ impl NativeLog {
     ) -> io::Result<()> {
         if matches!(&entry.payload, EntryPayload::Normal(command)
             if command.intent.contains_fenced_transition_v2_void())
-            && state.frontiers.fenced_transition_profile != FencedTransitionV2Profile::V2WithVoid
+            && !state.frontiers.fenced_transition_profile.permits_void()
         {
             return Err(invalid("native store profile does not permit void"));
         }

@@ -15,14 +15,46 @@ struct Epoch {
 
 pub(super) struct Ordinals {
     epochs: Vec<Epoch>,
+    deferrals: bool,
     _memory: VerificationMemory,
 }
 
 impl Ordinals {
+    pub(super) fn with_profile(profile: FencedTransitionV2Profile) -> io::Result<Self> {
+        let mut rows = Self::new()?;
+        rows.deferrals = profile.defers_live_leases();
+        Ok(rows)
+    }
+
+    pub(super) fn resolve_deferred(
+        &mut self,
+        number: u64,
+        ordinal: u64,
+        until: Timestamp,
+    ) -> io::Result<()> {
+        let index = Self::index(ordinal)?;
+        let epoch = self
+            .epochs
+            .iter_mut()
+            .find(|epoch| epoch.epoch == number)
+            .ok_or_else(|| invalid("native catalog deferred epoch absent"))?;
+        if !self.deferrals
+            || crate::fenced_transition::fenced_transition_v2_is_deferral_retention(until)
+            || epoch.times.get(index).copied().flatten().is_none_or(|old| {
+                !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(old)
+            })
+        {
+            return Err(invalid("native catalog deferred resolution is not exact"));
+        }
+        epoch.times[index] = Some(until);
+        Ok(())
+    }
+
     pub(super) fn new() -> io::Result<Self> {
         let memory = VerificationMemory::reserve(size_of::<Self>() + 16 * size_of::<Epoch>())?;
         Ok(Self {
             epochs: Vec::new(),
+            deferrals: false,
             _memory: memory,
         })
     }
@@ -87,8 +119,9 @@ impl Ordinals {
         }
         let previous = index.checked_sub(1).and_then(|index| epoch.times[index]);
         let next = epoch.times.get(index + 1).copied().flatten();
-        if previous.is_some_and(|previous| previous > until)
-            || next.is_some_and(|next| next < until)
+        if !self.deferrals
+            && (previous.is_some_and(|previous| previous > until)
+                || next.is_some_and(|next| next < until))
         {
             return Err(invalid("native catalog receipt retention order regressed"));
         }
@@ -153,7 +186,7 @@ impl Ordinals {
                 .ok_or_else(|| invalid("native catalog leading ordinal absent"))?;
             let last = epoch.times[epoch.last]
                 .ok_or_else(|| invalid("native catalog trailing ordinal absent"))?;
-            if previous.is_some_and(|previous| previous > first) {
+            if !self.deferrals && previous.is_some_and(|previous| previous > first) {
                 return Err(invalid("native catalog retention regressed across epochs"));
             }
             previous = Some(last);
@@ -172,7 +205,14 @@ impl Ordinals {
             if epoch.epoch > recovered_floor
                 && epoch.epoch > lifecycle::floor(before)
                 && epoch.epoch <= lifecycle::floor(after)
-                && epoch.times[epoch.last].is_none_or(|until| now.is_none_or(|now| until > now))
+                && if self.deferrals {
+                    epoch.times.iter().flatten().any(|until| {
+                        crate::fenced_transition::fenced_transition_v2_is_deferral_retention(*until)
+                            || now.is_none_or(|now| *until > now)
+                    })
+                } else {
+                    epoch.times[epoch.last].is_none_or(|until| now.is_none_or(|now| until > now))
+                }
             {
                 return Err(invalid("native catalog retired an unexpired exact epoch"));
             }

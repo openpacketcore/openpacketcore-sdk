@@ -23,6 +23,9 @@ mod header_budget_tests;
 #[path = "generation_roster_tests.rs"]
 mod roster_tests;
 
+#[path = "generation_catalog_lease_deferral_tests.rs"]
+mod lease_deferral_tests;
+
 const BLOCK: usize = 64 * 1024;
 const MAXIMUM: u64 = 32 * BLOCK as u64;
 const ROOT: [u8; 32] = [0xBD; 32];

@@ -113,8 +113,7 @@ impl Key {
     }
 }
 
-#[derive(Clone, Copy)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::consensus::native) struct Response {
     pub(in crate::consensus::native) sequence: u64,
     pub(in crate::consensus::native) logical_time: Timestamp,
@@ -210,6 +209,7 @@ pub(in crate::consensus::native) struct Receipt {
     pub(in crate::consensus::native) payload_digest: [u8; 32],
     pub(in crate::consensus::native) retained_until: Timestamp,
     pub(in crate::consensus::native) response: Option<Response>,
+    pub(in crate::consensus::native) lease_deferred: bool,
 }
 
 impl Receipt {
@@ -224,6 +224,7 @@ impl Receipt {
                 payload_digest: row.payload_digest,
                 retained_until: row.retained_until,
                 response: row.response.as_deref().map(Response::of).transpose()?,
+                lease_deferred: row.lease_deferred(),
             },
         })
     }

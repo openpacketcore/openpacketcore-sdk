@@ -15,9 +15,10 @@ use opc_session_store::{
     fenced_transition::FencedTransitionV2Effect, BackendCapabilities, Clock, CompareAndSet,
     CompareAndSetResult, EncryptingSessionBackend, FencedTransitionOutcome,
     FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionV2JournalScope,
-    FencedTransitionV2RecoveryJournal, FencedTransitionV2RecoveryJournalKey, LeaseGuard,
-    PreparedFencedTransitionV2, PreparedFencedTransitionV2Lookup,
-    ProtectedFencedTransitionV2Backend, SessionLeaseManager, SessionOp, SessionOpResult,
+    FencedTransitionV2Profile, FencedTransitionV2RecoveryJournal,
+    FencedTransitionV2RecoveryJournalKey, LeaseGuard, PreparedFencedTransitionV2,
+    PreparedFencedTransitionV2Lookup, ProtectedFencedTransitionV2Backend, SessionLeaseManager,
+    SessionOp, SessionOpResult,
 };
 use opc_types::Timestamp;
 use tokio::sync::Notify;
@@ -162,9 +163,12 @@ impl Fixture {
         let store = Arc::new(
             ConsensusSessionStore::open_with_clock(
                 topology(),
-                SqliteSessionBackend::open(directory.path().join("store.sqlite"))
-                    .expect("durable consensus backend")
-                    .with_clock(Arc::clone(&source)),
+                SqliteSessionBackend::open_with_fenced_transition_v2_profile(
+                    directory.path().join("store.sqlite"),
+                    FencedTransitionV2Profile::V2WithLeaseDeferral,
+                )
+                .expect("durable consensus backend")
+                .with_clock(Arc::clone(&source)),
                 directory.path().join("snapshots"),
                 BTreeMap::new(),
                 source,
@@ -278,9 +282,14 @@ async fn contend(caller: &Protected, prepared: &PreparedFencedTransitionV2) {
     };
     assert_eq!(
         error,
-        StoreError::LeaseHeld,
+        StoreError::FencedTransitionLeaseDeferred,
         "only actual lease contention sets up the regression"
     );
+    assert!(matches!(
+        caller.protected_fenced_transition_v2_status(prepared).await.unwrap(),
+        FencedTransitionV2Status::LeaseDeferred { request_id }
+            if request_id.epoch() == prepared.history_epoch()
+    ));
     assert_eq!(
         caller
             .retained_protected_fenced_transitions_v2()

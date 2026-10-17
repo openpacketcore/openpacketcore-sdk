@@ -1764,6 +1764,7 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         }
         StoreError::FencedTransitionHistoryFull
         | StoreError::FencedTransitionVoided
+        | StoreError::FencedTransitionLeaseDeferred
         | StoreError::FencedTransitionRetentionExhausted
         | StoreError::FencedTransitionStorageExhausted
         | StoreError::FencedTransitionHistoryEpochRetired

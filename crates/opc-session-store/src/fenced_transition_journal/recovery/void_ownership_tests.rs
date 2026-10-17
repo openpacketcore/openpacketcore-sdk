@@ -15,6 +15,108 @@ const SCOPE: [u8; 32] = [0x5c; 32];
 const CHILD: &str =
     "fenced_transition_journal::recovery::void_ownership_tests::owned_journal_process_child";
 
+#[tokio::test(start_paused = true)]
+async fn owned_journal_lease_deferral_resumes_one_binding_and_supersedes_each_dispatch_guard() {
+    let directory = directory();
+    let journal = FencedTransitionV2RecoveryJournal::create_new_owned(
+        directory.path().join("deferred.sqlite3"),
+        key(),
+    )
+    .unwrap();
+    journal.ensure_scope(SCOPE).await.unwrap();
+    let id = FencedTransitionRequestId::from_bytes([0xD1; 16]);
+    let request = request();
+    let prepared = crate::PreparedFencedTransitionV2::new(id, request.clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut call = journal.begin_call(id, deadline).await.unwrap();
+    journal.insert(SCOPE, id, &request).await.unwrap();
+    assert!(call.dispatch_started());
+    assert!(matches!(
+        journal.begin_deferred_call(&prepared, deadline).await,
+        Err(StoreError::FencedTransitionRequestConflict)
+    ));
+    for _ in 0..16 {
+        call.lease_deferred();
+        assert_eq!(
+            journal.void_reclamation_eligibility(id, request.request_id()),
+            FencedTransitionV2VoidEligibility::WaitingCaller
+        );
+        assert!(!journal.try_begin_void(id, request.request_id()));
+        let next = journal
+            .begin_deferred_call(&prepared, deadline)
+            .await
+            .unwrap();
+        assert!(
+            !call.dispatch_started(),
+            "superseded handles cannot dispatch"
+        );
+        assert!(next.dispatch_started());
+        drop(call);
+        call = next;
+        assert_eq!(journal.live_entries(SCOPE).await.unwrap(), 1);
+    }
+    call.lease_deferred();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(
+        journal.void_reclamation_eligibility(id, request.request_id()),
+        FencedTransitionV2VoidEligibility::Ready
+    );
+    assert!(journal.try_begin_void(id, request.request_id()));
+    assert!(!call.dispatch_started());
+    assert!(matches!(
+        journal.begin_deferred_call(&prepared, deadline).await,
+        Err(StoreError::FencedTransitionRequestConflict)
+    ));
+    assert_eq!(journal.live_entries(SCOPE).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn owned_journal_lease_deferral_inherited_resume_authenticates_the_exact_sealed_row() {
+    let directory = directory();
+    let path = directory.path().join("inherited-deferred.sqlite3");
+    let id = FencedTransitionRequestId::from_bytes([0xD2; 16]);
+    let request = request();
+    let journal = FencedTransitionV2RecoveryJournal::create_new_owned(&path, key()).unwrap();
+    journal.ensure_scope(SCOPE).await.unwrap();
+    journal.insert(SCOPE, id, &request).await.unwrap();
+    drop(journal);
+    let journal = FencedTransitionV2RecoveryJournal::open_existing_owned(&path, key()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let changed = FencedTransitionV2Request::new(
+        request.request_id().epoch(),
+        FencedTransitionV2CallerNonce::from_bytes([0xD3; 16]),
+        request.lease().clone(),
+        request.mutation().clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        journal
+            .begin_deferred_call(
+                &crate::PreparedFencedTransitionV2::new(id, changed),
+                deadline
+            )
+            .await,
+        Err(StoreError::FencedTransitionRequestConflict)
+    ));
+    assert_eq!(
+        journal.void_reclamation_eligibility(id, request.request_id()),
+        FencedTransitionV2VoidEligibility::Ready
+    );
+    let call = journal
+        .begin_deferred_call(
+            &crate::PreparedFencedTransitionV2::new(id, request.clone()),
+            deadline,
+        )
+        .await
+        .unwrap();
+    assert!(call.dispatch_started());
+    assert_eq!(
+        journal.void_reclamation_eligibility(id, request.request_id()),
+        FencedTransitionV2VoidEligibility::WaitingCaller
+    );
+    assert_eq!(journal.live_entries(SCOPE).await.unwrap(), 1);
+}
+
 fn key() -> FencedTransitionV2RecoveryJournalKey {
     FencedTransitionV2RecoveryJournalKey::from_bytes([0x31; 32])
 }

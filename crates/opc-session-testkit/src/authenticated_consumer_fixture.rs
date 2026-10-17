@@ -1168,10 +1168,25 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         fixed: bool,
         owned_recovery_journal: bool,
     ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
+        Self::start_with_profile_options(scopes, fixed, owned_recovery_journal, None).await
+    }
+
+    async fn start_with_profile_options(
+        scopes: impl IntoIterator<Item = SessionConsumerTenantNfScope>,
+        fixed: bool,
+        owned_recovery_journal: bool,
+        profile_clock: Option<(
+            opc_session_store::FencedTransitionV2Profile,
+            Arc<dyn opc_session_store::Clock>,
+        )>,
+    ) -> Result<Self, AuthenticatedPreparedFencedTransitionFixtureError> {
         let client_identity = SpiffeId::new(FIXTURE_CLIENT_SPIFFE)
             .expect("fixture client SPIFFE is a complete workload identity");
         let grant = SessionConsumerAuthorizationGrant::try_new(client_identity, scopes)?;
-        let cluster = if owned_recovery_journal {
+        let cluster = if let Some((profile, clock)) = profile_clock {
+            assert!(fixed && owned_recovery_journal);
+            ConsensusTestCluster::start_fixed_durable_with_profile_and_clock(profile, clock).await
+        } else if owned_recovery_journal {
             ConsensusTestCluster::start_fixed_durable_with_profile(
                 opc_session_store::FencedTransitionV2Profile::V2WithVoid,
             )
@@ -1934,6 +1949,8 @@ struct FixtureConsumer {
     #[cfg(test)]
     stall_fenced_transition_v2_status: AtomicBool,
     #[cfg(test)]
+    fenced_transition_v2_status_fault: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
     fenced_transition_v2_status_stalled: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     fenced_transition_response_suppressed: tokio::sync::Notify,
@@ -1979,6 +1996,8 @@ impl FixtureConsumer {
             last_fenced_transition_v2_request: Mutex::new(None),
             #[cfg(test)]
             stall_fenced_transition_v2_status: AtomicBool::new(false),
+            #[cfg(test)]
+            fenced_transition_v2_status_fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
             fenced_transition_v2_status_stalled: Arc::default(),
             #[cfg(test)]
@@ -2145,6 +2164,23 @@ impl SessionQuorumConsumer for FixtureConsumer {
         ) {
             self.fenced_transition_v2_status_calls
                 .fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            match self
+                .fenced_transition_v2_status_fault
+                .load(Ordering::SeqCst)
+            {
+                1 => {
+                    return SessionConsumerV2Response::FencedTransitionV2Status(Err(
+                        opc_session_store::SessionConsumerStoreError::Unavailable,
+                    ))
+                }
+                2 => {
+                    return SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                        opc_session_store::SessionConsumerV2FencedTransitionStatus::NotFound,
+                    ))
+                }
+                _ => {}
+            }
             // A stalled voter never answers a read-only receipt lookup; the
             // production client's own attempt deadline classifies it.
             #[cfg(test)]

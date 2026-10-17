@@ -18094,7 +18094,9 @@ pub(crate) fn activate_fenced_transition_v2_scope_sync(
     // active-epoch checks still ensure that an absent retained identity can
     // neither allocate nor execute. A floor/future race installs no
     // certificate and falls through to the caller-visible typed outcome.
-    if !fenced_transition_v2_history_epoch_may_recertify(&history, request_epoch) {
+    if !fenced_transition_profile_in_sync(conn, false)?.defers_live_leases()
+        && !fenced_transition_v2_history_epoch_may_recertify(&history, request_epoch)
+    {
         return Ok(());
     }
     conn.execute(
@@ -22548,7 +22550,8 @@ pub(crate) fn validate_command_for_log(
         if scope_identity.cluster_id() != command.identity.cluster_id()
             || voters.iter().all(|byte| *byte == 0)
             || (profile != crate::FencedTransitionV2Profile::V2.digest()
-                && profile != crate::FencedTransitionV2Profile::V2WithVoid.digest())
+                && profile != crate::FencedTransitionV2Profile::V2WithVoid.digest()
+                && profile != crate::FencedTransitionV2Profile::V2WithLeaseDeferral.digest())
         {
             return Err(invalid_data(
                 "session fenced transition V2 activation is invalid",
@@ -22822,8 +22825,7 @@ impl MembershipLogProjection {
             ));
         }
         if command.intent.contains_fenced_transition_v2_void()
-            && fenced_transition_profile_in_sync(conn, false)?
-                != crate::FencedTransitionV2Profile::V2WithVoid
+            && !fenced_transition_profile_in_sync(conn, false)?.permits_void()
         {
             return Err(invalid_data("store profile does not permit void"));
         }
@@ -22900,10 +22902,13 @@ impl MembershipLogProjection {
                         "projected fenced transition V2 activation profile is stale",
                     ));
                 }
-                Some(history) => fenced_transition_v2_history_epoch_may_recertify(
-                    &history,
-                    request.request_id().epoch(),
-                ),
+                Some(history) => {
+                    fenced_transition_profile_in_sync(conn, false)?.defers_live_leases()
+                        || fenced_transition_v2_history_epoch_may_recertify(
+                            &history,
+                            request.request_id().epoch(),
+                        )
+                }
             };
             if activation_epoch_is_admitted {
                 self.projected_v2_scope_activated = true;
@@ -22916,6 +22921,17 @@ impl MembershipLogProjection {
         let history = self
             .projected_v2_history
             .ok_or_else(|| invalid_data("projected fenced transition V2 history is missing"))?;
+        if fenced_transition_profile_in_sync(conn, false)?.defers_live_leases() {
+            // This profile certifies the current membership scope independently
+            // of the request's epoch after initial activation. All receipt,
+            // lease, capacity, and retention decisions belong to ordered apply:
+            // predicting them here would require executing pending business
+            // commands and could disagree when a deferred receipt resolves.
+            // The exact scope/profile checks above remain mandatory for every
+            // activation; no business outcome grants membership authority.
+            self.advance_projected_logical_time(command.logical_time);
+            return Ok(());
+        }
         let epoch = request.request_id().epoch().get();
         if epoch <= history.retired_through {
             self.advance_projected_logical_time(command.logical_time);
@@ -23037,6 +23053,21 @@ impl MembershipLogProjection {
                 "projected fenced transition V2 batch lacks an exact activation certificate",
             ));
         }
+        if fenced_transition_profile_in_sync(conn, false)?.defers_live_leases() {
+            for request in requests {
+                let singleton = SessionConsensusCommand {
+                    schema_version: command.schema_version,
+                    identity: command.identity,
+                    request_id: SessionConsensusRequestId::from_bytes(
+                        fenced_transition_v2_outer_request_id(request.request_id()),
+                    ),
+                    logical_time: command.logical_time,
+                    intent: fenced_transition_v2_singleton_intent(&command.intent, request)?,
+                };
+                self.project_fenced_transition_v2(conn, &singleton, storage_identity)?;
+            }
+            return Ok(());
+        }
         // Do not reject a whole closed-epoch batch here. Each member must
         // preserve apply's precedence: retained exact receipts replay before
         // the active-epoch gate, while an unbound closed identity remains a
@@ -23139,6 +23170,13 @@ impl MembershipLogProjection {
             expected_bound_entries,
         ) = fenced_transition_v2_maintenance(&command.intent)
             .ok_or_else(|| invalid_data("projected fenced transition V2 maintenance is missing"))?;
+        if fenced_transition_profile_in_sync(conn, false)?.defers_live_leases() {
+            // Maintenance carries no membership authority. The immutable
+            // deferral profile checks its history preconditions, pending pins,
+            // and storage horizons against the actual state at ordered apply.
+            self.advance_projected_logical_time(command.logical_time);
+            return Ok(());
+        }
         // The public operator path normally cannot submit this before V2
         // activation. If such a committed internal command is nevertheless
         // observed, apply returns its deterministic EpochNotActive no-effect
@@ -23246,7 +23284,11 @@ impl MembershipLogProjection {
                 })?;
                 let durable_maximum: Option<String> = conn
                     .query_row(
-                        "SELECT retained_until FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1 ORDER BY ordinal DESC LIMIT 1",
+                        if fenced_transition_profile_in_sync(conn, false)?.defers_live_leases() {
+                            "SELECT retained_until FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1 ORDER BY retained_until DESC LIMIT 1"
+                        } else {
+                            "SELECT retained_until FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1 ORDER BY ordinal DESC LIMIT 1"
+                        },
                         [checked_positive_i64(oldest)?],
                         |row| row.get(0),
                     )
@@ -27332,6 +27374,7 @@ struct FencedTransitionReceipt {
 
 struct FencedTransitionV2Receipt {
     history_epoch: u64,
+    ordinal: u64,
     payload_digest: [u8; 32],
     retained_until: Timestamp,
     response: Option<SessionConsensusResponse>,
@@ -27496,10 +27539,9 @@ pub(crate) fn encode_fenced_transition_v2_response_with_profile(
             out.extend_from_slice(&actual.to_be_bytes());
             out.extend_from_slice(&max.to_be_bytes());
         }
-        Err(StoreError::FencedTransitionVoided)
-            if profile == crate::FencedTransitionV2Profile::V2WithVoid =>
-        {
-            out.push(26)
+        Err(StoreError::FencedTransitionVoided) if profile.permits_void() => out.push(26),
+        Err(StoreError::FencedTransitionLeaseDeferred) if profile.defers_live_leases() => {
+            out.push(27)
         }
         Err(error) => out.push(fenced_transition_v2_response_error_tag(error)?),
         _ => return Err(fenced_transition_v2_response_invalid()),
@@ -27775,8 +27817,10 @@ pub(crate) fn decode_fenced_transition_v2_response_with_profile(
             FencedTransitionOutcome::new(lease, generation, mutation, recorded_at)
                 .map_err(|_| fenced_transition_v2_response_invalid())?,
         ))
-    } else if result_tag == 26 && profile == crate::FencedTransitionV2Profile::V2WithVoid {
+    } else if result_tag == 26 && profile.permits_void() {
         Err(StoreError::FencedTransitionVoided)
+    } else if result_tag == 27 && profile.defers_live_leases() {
+        Err(StoreError::FencedTransitionLeaseDeferred)
     } else {
         Err(decode_fenced_transition_v2_response_error(
             result_tag,
@@ -27833,6 +27877,11 @@ fn validate_fenced_transition_v2_response_for_request(
         {
             Ok(())
         }
+        Err(StoreError::FencedTransitionLeaseDeferred)
+            if matches!(request.lease(), FencedTransitionLease::Acquire { .. }) =>
+        {
+            Ok(())
+        }
         Err(error)
             if is_persistable_fenced_transition_error(error)
                 || matches!(error, StoreError::FencedTransitionVoided) =>
@@ -27848,17 +27897,14 @@ fn validate_fenced_transition_v2_response_for_request(
 fn validate_fenced_transition_v2_receipt_metadata(
     retained_until: Timestamp,
     response: &SessionConsensusResponse,
+    profile: crate::FencedTransitionV2Profile,
 ) -> io::Result<()> {
     if !fenced_transition_v2_timestamp_is_in_range(retained_until) {
         return Err(invalid_data(
             "persisted fenced transition V2 retention is invalid",
         ));
     }
-    validate_fenced_transition_receipt_with_profile(
-        retained_until,
-        response,
-        crate::FencedTransitionV2Profile::V2WithVoid,
-    )?;
+    validate_fenced_transition_receipt_with_profile(retained_until, response, profile)?;
     let logical_time = response.logical_time.ok_or_else(|| {
         invalid_data("persisted fenced transition V2 receipt logical time is invalid")
     })?;
@@ -27978,7 +28024,11 @@ fn read_fenced_transition_v2_receipt_sync(
                 &encoded,
                 fenced_transition_profile_in_sync(conn, false)?,
             )?;
-            validate_fenced_transition_v2_receipt_metadata(retained_until_timestamp, &response)?;
+            validate_fenced_transition_v2_receipt_metadata(
+                retained_until_timestamp,
+                &response,
+                fenced_transition_profile_in_sync(conn, false)?,
+            )?;
             validate_fenced_transition_v2_response_for_request(request, &response)?;
             let digest: [u8; 32] = digest
                 .try_into()
@@ -27990,7 +28040,16 @@ fn read_fenced_transition_v2_receipt_sync(
             }
             Some(response)
         }
-        (None, None) => None,
+        (None, None) => {
+            if fenced_transition_profile_in_sync(conn, false)?.defers_live_leases()
+                && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
+                    retained_until_timestamp,
+                )
+            {
+                return Err(invalid_data("persisted deferred response is missing"));
+            }
+            None
+        }
         _ => {
             return Err(invalid_data(
                 "persisted fenced transition V2 response is invalid",
@@ -27999,6 +28058,7 @@ fn read_fenced_transition_v2_receipt_sync(
     };
     Ok(Some(FencedTransitionV2Receipt {
         history_epoch,
+        ordinal,
         payload_digest,
         retained_until: retained_until_timestamp,
         response,
@@ -28014,7 +28074,11 @@ fn store_fenced_transition_v2_receipt_row_sync(
     retained_until: Timestamp,
     response: &SessionConsensusResponse,
 ) -> io::Result<()> {
-    validate_fenced_transition_v2_receipt_metadata(retained_until, response)?;
+    validate_fenced_transition_v2_receipt_metadata(
+        retained_until,
+        response,
+        fenced_transition_profile_in_sync(conn, false)?,
+    )?;
     validate_fenced_transition_v2_response_for_request(request, response)?;
     let encoded = encode_fenced_transition_v2_response_with_profile(
         response,
@@ -28124,14 +28188,83 @@ fn compact_fenced_transition_v2_receipt_sync(
     request: &FencedTransitionV2Request,
     logical_time: Timestamp,
 ) -> io::Result<()> {
+    let deferrals = fenced_transition_profile_in_sync(conn, false)?.defers_live_leases();
+    let pending = crate::fenced_transition::fenced_transition_v2_deferral_retention()
+        .map_err(|_| invalid_data("fenced transition deferral retention invalid"))?;
     conn.execute(
-        "UPDATE consensus_fenced_transition_v2_receipts SET response_json = NULL, response_digest = NULL WHERE request_id = ?1 AND retained_until <= ?2 AND response_json IS NOT NULL",
+        "UPDATE consensus_fenced_transition_v2_receipts SET response_json = NULL, response_digest = NULL WHERE request_id = ?1 AND retained_until <= ?2 AND response_json IS NOT NULL AND (NOT ?3 OR retained_until <> ?4)",
         params![
             request.request_id().to_bytes().as_slice(),
             ops::format_rfc3339_normalized(logical_time),
+            deferrals,
+            ops::format_rfc3339_normalized(pending),
         ],
     )
     .map_err(db_error)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_or_resolve_fenced_transition_v2_receipt_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    request: &FencedTransitionV2Request,
+    ordinal: u64,
+    payload_digest: [u8; 32],
+    retained_until: Timestamp,
+    response: &SessionConsensusResponse,
+    resolve: bool,
+) -> io::Result<()> {
+    if !resolve {
+        return store_fenced_transition_v2_receipt_sync(
+            conn,
+            identity,
+            request,
+            ordinal,
+            payload_digest,
+            retained_until,
+            response,
+        );
+    }
+    let profile = fenced_transition_profile_in_sync(conn, false)?;
+    let before = read_fenced_transition_v2_receipt_sync(conn, identity, request)?
+        .ok_or_else(|| invalid_data("fenced transition deferred binding is missing"))?;
+    if !profile.defers_live_leases()
+        || before.ordinal != ordinal
+        || before.payload_digest != payload_digest
+        || !before.response.as_ref().is_some_and(|prior| {
+            matches!(prior.result, Err(StoreError::FencedTransitionLeaseDeferred))
+                && prior.logical_time <= response.logical_time
+        })
+        || matches!(
+            response.result,
+            Err(StoreError::FencedTransitionLeaseDeferred)
+        )
+    {
+        return Err(invalid_data("fenced transition deferred binding differs"));
+    }
+    validate_fenced_transition_v2_receipt_metadata(retained_until, response, profile)?;
+    validate_fenced_transition_v2_response_for_request(request, response)?;
+    let encoded = encode_fenced_transition_v2_response_with_profile(response, profile)?;
+    let until = ops::format_rfc3339_normalized(retained_until);
+    let binding = fenced_transition_v2_receipt_binding_digest(
+        identity,
+        request.request_id().to_bytes(),
+        request.request_id().epoch().get(),
+        ordinal,
+        payload_digest,
+        &until,
+    )?;
+    let digest = fenced_transition_v2_receipt_response_digest(binding, &encoded)?;
+    let changed = conn.execute(
+        "UPDATE consensus_fenced_transition_v2_receipts SET retained_until=?1, binding_digest=?2, response_json=?3, response_digest=?4 WHERE request_id=?5 AND ordinal=?6 AND retained_until=?7",
+        params![until, binding.as_slice(), encoded, digest.as_slice(), request.request_id().to_bytes().as_slice(), checked_positive_i64(ordinal)?, ops::format_rfc3339_normalized(before.retained_until)],
+    ).map_err(db_error)?;
+    if changed != 1 {
+        return Err(invalid_data(
+            "fenced transition deferred resolution was not exact",
+        ));
+    }
     Ok(())
 }
 
@@ -28270,7 +28403,11 @@ fn maintain_fenced_transition_v2_history_sync(
             }
             let maximum_retained_until: Option<String> = conn
                 .query_row(
-                    "SELECT retained_until FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1 ORDER BY ordinal DESC LIMIT 1",
+                    if fenced_transition_profile_in_sync(conn, false)?.defers_live_leases() {
+                            "SELECT retained_until FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1 ORDER BY retained_until DESC LIMIT 1"
+                        } else {
+                            "SELECT retained_until FROM consensus_fenced_transition_v2_receipts WHERE history_epoch = ?1 ORDER BY ordinal DESC LIMIT 1"
+                        },
                     [checked_positive_i64(oldest)?],
                     |row| row.get(0),
                 )
@@ -28283,7 +28420,12 @@ fn maintain_fenced_transition_v2_history_sync(
             };
             let maximum_retained_until = Timestamp::from_str(&maximum_retained_until)
                 .map_err(|_| invalid_data("fenced transition V2 retention is invalid"))?;
-            if maximum_retained_until > effective_logical_time {
+            if maximum_retained_until > effective_logical_time
+                || (fenced_transition_profile_in_sync(conn, false)?.defers_live_leases()
+                    && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
+                        maximum_retained_until,
+                    ))
+            {
                 return Ok(FencedTransitionV2MaintenanceResult::Noop);
             }
             let remaining: u64 = conn
@@ -28451,6 +28593,27 @@ fn validate_fenced_transition_receipt_with_profile(
     let logical_time = response.logical_time.ok_or_else(|| {
         invalid_data("persisted fenced transition receipt logical time is invalid")
     })?;
+    if matches!(
+        response.result,
+        Err(StoreError::FencedTransitionLeaseDeferred)
+    ) {
+        if !profile.defers_live_leases()
+            || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(retained_until)
+            || !fenced_transition_v2_timestamp_is_in_range(logical_time)
+        {
+            return Err(invalid_data(
+                "persisted fenced transition deferral is invalid",
+            ));
+        }
+        return Ok(());
+    }
+    if profile.defers_live_leases()
+        && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(retained_until)
+    {
+        return Err(invalid_data(
+            "persisted fenced transition deferral response is missing",
+        ));
+    }
     let expected_retained_until =
         crate::ttl::checked_session_deadline(logical_time, FENCED_TRANSITION_OUTCOME_RETENTION)
             .map_err(|_| {
@@ -28472,8 +28635,7 @@ fn validate_fenced_transition_receipt_with_profile(
                 ));
             }
         }
-        Err(StoreError::FencedTransitionVoided)
-            if profile == crate::FencedTransitionV2Profile::V2WithVoid => {}
+        Err(StoreError::FencedTransitionVoided) if profile.permits_void() => {}
         Err(error) if is_persistable_fenced_transition_error(error) => {}
         Err(_) => {
             return Err(invalid_data(
@@ -29114,8 +29276,9 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
                 "persisted fenced transition V2 retention is invalid",
             ));
         }
-        if previous_retained_until
-            .is_some_and(|previous: Timestamp| retained_until_timestamp < previous)
+        if !fenced_transition_profile_in_sync(conn, false)?.defers_live_leases()
+            && previous_retained_until
+                .is_some_and(|previous: Timestamp| retained_until_timestamp < previous)
         {
             return Err(invalid_data(
                 "persisted fenced transition V2 retention order is invalid",
@@ -29153,6 +29316,7 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
                 validate_fenced_transition_v2_receipt_metadata(
                     retained_until_timestamp,
                     &response,
+                    fenced_transition_profile_in_sync(conn, false)?,
                 )?;
                 validate_fenced_transition_receipt_against_floors(
                     &FencedTransitionReceipt {
@@ -29176,6 +29340,13 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
                 }
             }
             (None, None) => {
+                if fenced_transition_profile_in_sync(conn, false)?.defers_live_leases()
+                    && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
+                        retained_until_timestamp,
+                    )
+                {
+                    return Err(invalid_data("persisted deferred response is missing"));
+                }
                 if !fenced_transition_v2_timestamp_is_in_range(retained_until_timestamp) {
                     return Err(invalid_data(
                         "persisted fenced transition V2 retention is invalid",
@@ -29675,6 +29846,16 @@ pub(crate) fn read_fenced_transition_v2_status_sync(
         .map_err(|_| {
             StoreError::BackendUnavailable("fenced transition V2 status is unavailable".into())
         })?;
+        if receipt.response.as_ref().is_some_and(|response| {
+            matches!(
+                response.result,
+                Err(StoreError::FencedTransitionLeaseDeferred)
+            )
+        }) {
+            return Ok(FencedTransitionV2Status::LeaseDeferred {
+                request_id: request.request_id(),
+            });
+        }
         if receipt.response.is_none()
             || machine.2.is_some_and(|time| receipt.retained_until <= time)
         {
@@ -29821,7 +30002,7 @@ fn replay_fenced_transition_receipt_sync(
     Ok(receipt.response)
 }
 
-fn fenced_transition_v2_singleton_intent(
+pub(crate) fn fenced_transition_v2_singleton_intent(
     intent: &SessionMutationIntent,
     request: &FencedTransitionV2Request,
 ) -> io::Result<SessionMutationIntent> {
@@ -29937,6 +30118,45 @@ fn apply_fenced_transition_v2_batch_command_sync(
         return Err(invalid_data(
             "fenced transition V2 batch lacks an exact activation certificate",
         ));
+    }
+    if fenced_transition_profile_in_sync(tx, false)?.defers_live_leases() {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            let singleton = SessionConsensusCommand {
+                schema_version: command.schema_version,
+                identity: command.identity,
+                request_id: SessionConsensusRequestId::from_bytes(
+                    fenced_transition_v2_outer_request_id(request.request_id()),
+                ),
+                logical_time: command.logical_time,
+                intent: fenced_transition_v2_singleton_intent(&command.intent, request)?,
+            };
+            let response = apply_fenced_transition_v2_command_sync(
+                tx,
+                storage_identity,
+                scope,
+                caps,
+                &singleton,
+                fenced_transition_v2_payload_digest(storage_identity, request)?,
+                raft_log_index,
+                machine,
+                notifications,
+            )?;
+            outcomes.push(match response.result {
+                Ok(SessionMutationOutcome::FencedTransition(outcome)) => Ok(outcome),
+                Err(error) => Err(error),
+                _ => return Err(invalid_data("fenced transition V2 batch result is invalid")),
+            });
+        }
+        validate_fenced_transition_v2_batch_outcomes(&outcomes)
+            .map_err(|_| invalid_data("fenced transition V2 batch outcome is invalid"))?;
+        return Ok(SessionConsensusResponse {
+            result: Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+            sequence: machine.0,
+            digest: Some(machine.1),
+            logical_time: machine.2,
+            raft_log_index,
+        });
     }
     let history = read_fenced_transition_v2_history_row_in_sync(tx, storage_identity, false)?;
     let mut outcomes = vec![None; requests.len()];
@@ -30160,8 +30380,7 @@ fn apply_fenced_transition_v2_command_sync(
         ));
     }
     if command.intent.contains_fenced_transition_v2_void()
-        && fenced_transition_profile_in_sync(tx, false)?
-            != crate::FencedTransitionV2Profile::V2WithVoid
+        && !fenced_transition_profile_in_sync(tx, false)?.permits_void()
     {
         return Err(invalid_data("store profile does not permit void"));
     }
@@ -30278,46 +30497,59 @@ fn apply_fenced_transition_v2_command_sync(
             StoreError::FencedTransitionHistoryEpochRetired,
         ));
     }
+    let profile = fenced_transition_profile_in_sync(tx, false)?;
+    let mut deferred_ordinal = None;
     if let Some(receipt) = read_fenced_transition_v2_receipt_sync(tx, storage_identity, request)? {
-        let replay_time = machine
-            .2
-            .map_or(command.logical_time, |time| time.max(command.logical_time));
-        let response = if receipt.payload_digest != payload_digest {
-            replay_conflict_response(
-                machine,
-                raft_log_index,
-                StoreError::FencedTransitionRequestConflict,
-            )
-        } else if receipt.response.is_none() || receipt.retained_until <= replay_time {
-            compact_fenced_transition_v2_receipt_sync(tx, request, replay_time)?;
-            replay_conflict_response(
-                machine,
-                raft_log_index,
-                StoreError::FencedTransitionRequestExpired,
-            )
+        if receipt.payload_digest == payload_digest
+            && receipt.response.as_ref().is_some_and(|response| {
+                matches!(
+                    response.result,
+                    Err(StoreError::FencedTransitionLeaseDeferred)
+                )
+            })
+        {
+            deferred_ordinal = Some(receipt.ordinal);
         } else {
-            receipt.response.expect("checked above")
-        };
-        advance_fenced_replay_logical_time_sync(
-            tx,
-            storage_identity,
-            command.logical_time,
-            machine,
-        )?;
-        return Ok(if access_is_authorized {
-            response
-        } else {
-            replay_conflict_response(
+            let replay_time = machine
+                .2
+                .map_or(command.logical_time, |time| time.max(command.logical_time));
+            let response = if receipt.payload_digest != payload_digest {
+                replay_conflict_response(
+                    machine,
+                    raft_log_index,
+                    StoreError::FencedTransitionRequestConflict,
+                )
+            } else if receipt.response.is_none() || receipt.retained_until <= replay_time {
+                compact_fenced_transition_v2_receipt_sync(tx, request, replay_time)?;
+                replay_conflict_response(
+                    machine,
+                    raft_log_index,
+                    StoreError::FencedTransitionRequestExpired,
+                )
+            } else {
+                receipt.response.expect("checked above")
+            };
+            advance_fenced_replay_logical_time_sync(
+                tx,
+                storage_identity,
+                command.logical_time,
                 machine,
-                raft_log_index,
-                StoreError::TopologyAuthorityRevoked,
-            )
-        });
+            )?;
+            return Ok(if access_is_authorized {
+                response
+            } else {
+                replay_conflict_response(
+                    machine,
+                    raft_log_index,
+                    StoreError::TopologyAuthorityRevoked,
+                )
+            });
+        }
     }
     // A valid full identity in a future epoch (or while a reclaim is in
     // progress) is not a permanently retired retry.  Keep that terminal
     // state distinct from a request at or below the retired floor.
-    if history.active_epoch != Some(request.request_id().epoch()) {
+    if deferred_ordinal.is_none() && history.active_epoch != Some(request.request_id().epoch()) {
         advance_fenced_replay_logical_time_sync(
             tx,
             storage_identity,
@@ -30330,7 +30562,9 @@ fn apply_fenced_transition_v2_command_sync(
             StoreError::FencedTransitionHistoryEpochNotActive,
         ));
     }
-    if history.current_bound_count >= FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+    if deferred_ordinal.is_none()
+        && history.current_bound_count >= FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+    {
         advance_fenced_replay_logical_time_sync(
             tx,
             storage_identity,
@@ -30350,17 +30584,27 @@ fn apply_fenced_transition_v2_command_sync(
     let logical_time = machine
         .2
         .map_or(command.logical_time, |time| time.max(command.logical_time));
-    let retained_until = match crate::ttl::checked_session_deadline(
+    let mut retained_until = match crate::ttl::checked_session_deadline(
         logical_time,
         FENCED_TRANSITION_OUTCOME_RETENTION,
     ) {
-        Ok(until) if fenced_transition_v2_timestamp_is_in_range(until) => until,
+        Ok(until)
+            if fenced_transition_v2_timestamp_is_in_range(until)
+                && (!profile.defers_live_leases()
+                    || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
+                        until,
+                    )) =>
+        {
+            until
+        }
         Ok(_) | Err(_) => {
             advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
             return Ok(replay_conflict_response(
                 machine,
                 raft_log_index,
-                if access_is_authorized {
+                if deferred_ordinal.is_some() {
+                    StoreError::FencedTransitionOutcomeUnknown
+                } else if access_is_authorized {
                     StoreError::FencedTransitionRetentionExhausted
                 } else {
                     StoreError::TopologyAuthorityRevoked
@@ -30368,17 +30612,19 @@ fn apply_fenced_transition_v2_command_sync(
             ));
         }
     };
-    let ordinal = u64::try_from(history.current_bound_count)
-        .map_err(|_| invalid_data("fenced transition V2 ordinal is invalid"))?
-        .checked_add(1)
-        .ok_or_else(|| invalid_data("fenced transition V2 ordinal is exhausted"))?;
+    let ordinal = deferred_ordinal.map(Ok).unwrap_or_else(|| {
+        u64::try_from(history.current_bound_count)
+            .map_err(|_| invalid_data("fenced transition V2 ordinal is invalid"))?
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("fenced transition V2 ordinal is exhausted"))
+    })?;
     if machine.0 >= i64::MAX as u64 {
         // Keep the terminal sequence behavior identical to V1: establish the
         // normal deterministic transition result in a savepoint, but never
         // let an otherwise successful operation mutate records, leases,
         // fences, restore state, or watches once SQLite's signed sequence
         // horizon has been reached.
-        let result = if access_is_authorized {
+        let mut result = if access_is_authorized {
             let mut savepoint = tx.savepoint().map_err(db_error)?;
             let result = match execute_intent_sync(
                 &savepoint,
@@ -30400,6 +30646,27 @@ fn apply_fenced_transition_v2_command_sync(
         } else {
             Err(StoreError::TopologyAuthorityRevoked)
         };
+        if profile.defers_live_leases()
+            && !command.intent.contains_fenced_transition_v2_void()
+            && matches!(result, Err(StoreError::LeaseHeld))
+        {
+            if deferred_ordinal.is_some() {
+                advance_fenced_replay_logical_time_sync(
+                    tx,
+                    storage_identity,
+                    logical_time,
+                    machine,
+                )?;
+                return Ok(replay_conflict_response(
+                    machine,
+                    raft_log_index,
+                    StoreError::FencedTransitionLeaseDeferred,
+                ));
+            }
+            result = Err(StoreError::FencedTransitionLeaseDeferred);
+            retained_until = crate::fenced_transition::fenced_transition_v2_deferral_retention()
+                .map_err(|_| invalid_data("fenced transition deferral retention invalid"))?;
+        }
         let response = SessionConsensusResponse {
             result,
             sequence: machine.0,
@@ -30407,7 +30674,7 @@ fn apply_fenced_transition_v2_command_sync(
             logical_time: Some(logical_time),
             raft_log_index,
         };
-        store_fenced_transition_v2_receipt_sync(
+        bind_or_resolve_fenced_transition_v2_receipt_sync(
             tx,
             storage_identity,
             request,
@@ -30415,6 +30682,7 @@ fn apply_fenced_transition_v2_command_sync(
             payload_digest,
             retained_until,
             &response,
+            deferred_ordinal.is_some(),
         )?;
         advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
         return Ok(response);
@@ -30426,7 +30694,7 @@ fn apply_fenced_transition_v2_command_sync(
     let command_digest = command
         .calculate_applied_digest(sequence, machine.1, logical_time)
         .map_err(|_| invalid_data("session consensus command digest failed"))?;
-    let (result, replication) = if access_is_authorized {
+    let (mut result, replication) = if access_is_authorized {
         let mut savepoint = tx.savepoint().map_err(db_error)?;
         match execute_intent_sync(
             &savepoint,
@@ -30452,6 +30720,22 @@ fn apply_fenced_transition_v2_command_sync(
     } else {
         (Err(StoreError::TopologyAuthorityRevoked), None)
     };
+    if profile.defers_live_leases()
+        && !command.intent.contains_fenced_transition_v2_void()
+        && matches!(result, Err(StoreError::LeaseHeld))
+    {
+        if deferred_ordinal.is_some() {
+            advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
+            return Ok(replay_conflict_response(
+                machine,
+                raft_log_index,
+                StoreError::FencedTransitionLeaseDeferred,
+            ));
+        }
+        result = Err(StoreError::FencedTransitionLeaseDeferred);
+        retained_until = crate::fenced_transition::fenced_transition_v2_deferral_retention()
+            .map_err(|_| invalid_data("fenced transition deferral retention invalid"))?;
+    }
     let response = SessionConsensusResponse {
         result,
         sequence,
@@ -30459,7 +30743,7 @@ fn apply_fenced_transition_v2_command_sync(
         logical_time: Some(logical_time),
         raft_log_index,
     };
-    store_fenced_transition_v2_receipt_sync(
+    bind_or_resolve_fenced_transition_v2_receipt_sync(
         tx,
         storage_identity,
         request,
@@ -30467,6 +30751,7 @@ fn apply_fenced_transition_v2_command_sync(
         payload_digest,
         retained_until,
         &response,
+        deferred_ordinal.is_some(),
     )?;
     let changed = tx
         .execute(
@@ -30905,6 +31190,7 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::CasIdempotencyOutcomeUnavailable
         | StoreError::FencedTransitionRequestConflict
         | StoreError::FencedTransitionOutcomeUnknown
+        | StoreError::FencedTransitionLeaseDeferred
         | StoreError::FencedTransitionHistoryFull
         | StoreError::FencedTransitionHistoryEpochRetired
         | StoreError::FencedTransitionHistoryEpochNotActive
@@ -40917,6 +41203,7 @@ pub(crate) mod historical_snapshot_fixture;
 #[cfg(test)]
 mod tests {
     mod activation_ack;
+    mod lease_deferral;
     #[path = "scope_authority.rs"]
     mod scope_authority_tests;
     #[path = "scope_batch.rs"]

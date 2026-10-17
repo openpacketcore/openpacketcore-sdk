@@ -140,6 +140,9 @@ pub(super) struct ColdReceipt {
     content: [u8; 32],
     response_sequence: u64,
     response_raft_index: u64,
+    // A deferral uses the reserved retention marker, so its actual consensus
+    // time cannot be reconstructed by subtracting the terminal window.
+    deferred_at: Option<Timestamp>,
 }
 
 // Complete admission already proves the exact fixed retention relation.
@@ -248,6 +251,18 @@ impl RowFingerprint for NativeReceipt {
 }
 
 impl NativeReceipt {
+    pub(super) fn lease_deferred(&self) -> bool {
+        self.response.as_ref().is_some_and(|response| {
+            matches!(
+                response.result,
+                Err(StoreError::FencedTransitionLeaseDeferred)
+            )
+        }) || self
+            .cold
+            .as_ref()
+            .is_some_and(|cold| cold.deferred_at.is_some())
+    }
+
     pub(super) fn relocation_allocation_bytes() -> usize {
         SharedRow::<Self>::relocated_allocation_bytes()
     }
@@ -263,7 +278,10 @@ impl NativeReceipt {
             }
             Ok(Some(generation::facts::Response {
                 sequence: cold.response_sequence,
-                logical_time: receipt_response_time(self.retained_until)?,
+                logical_time: match cold.deferred_at {
+                    Some(time) => time,
+                    None => receipt_response_time(self.retained_until)?,
+                },
                 raft_index: cold.response_raft_index,
             }))
         } else {
@@ -311,7 +329,13 @@ impl NativeReceipt {
             cold: None,
         };
         if let Some(response) = facts.facts.response {
-            if receipt_response_time(row.retained_until)? != response.logical_time {
+            if (facts.facts.lease_deferred
+                && !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
+                    row.retained_until,
+                ))
+                || (!facts.facts.lease_deferred
+                    && receipt_response_time(row.retained_until)? != response.logical_time)
+            {
                 return Err(invalid("native admitted receipt retention differs"));
             }
             row.cold = Some(ColdReceipt {
@@ -321,6 +345,7 @@ impl NativeReceipt {
                 content: facts.content,
                 response_sequence: response.sequence,
                 response_raft_index: response.raft_index,
+                deferred_at: facts.facts.lease_deferred.then_some(response.logical_time),
             });
         } else if changes::fingerprint(1, &id, &row)? != facts.content {
             return Err(invalid("native admitted receipt tombstone differs"));
@@ -341,6 +366,8 @@ impl NativeReceipt {
         if self.ordinal != decoded.ordinal
             || self.payload_digest != decoded.payload_digest
             || self.retained_until != decoded.retained_until
+            || self.lease_deferred() != decoded.lease_deferred()
+            || self.response_facts()? != decoded.response_facts()?
         {
             return Ok(false);
         }

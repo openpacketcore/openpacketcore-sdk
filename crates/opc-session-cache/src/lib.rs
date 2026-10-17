@@ -713,6 +713,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::CasIdempotencyOutcomeUnavailable => "cas_idempotency_outcome_unavailable",
         StoreError::FencedTransitionRequestConflict => "fenced_transition_request_conflict",
         StoreError::FencedTransitionVoided => "fenced_transition_voided",
+        StoreError::FencedTransitionLeaseDeferred => "fenced_transition_lease_deferred",
         StoreError::FencedTransitionOutcomeUnknown => "fenced_transition_outcome_unknown",
         StoreError::FencedTransitionRequestExpired => "fenced_transition_request_expired",
         StoreError::FencedTransitionHistoryFull => "fenced_transition_history_full",

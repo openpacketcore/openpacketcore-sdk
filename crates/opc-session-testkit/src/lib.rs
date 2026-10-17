@@ -311,6 +311,14 @@ impl ConsensusTestCluster {
         Self::start_with_authority_and_profile(3, true, profile).await
     }
 
+    #[cfg(feature = "consumer-fixture")]
+    pub(crate) async fn start_fixed_durable_with_profile_and_clock(
+        profile: opc_session_store::FencedTransitionV2Profile,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self::start_with_authority_profile_and_clock(3, true, profile, clock).await
+    }
+
     async fn start_with_authority(member_count: usize, fixed: bool) -> Self {
         Self::start_with_authority_and_profile(
             member_count,
@@ -333,6 +341,34 @@ impl ConsensusTestCluster {
         fixed: bool,
         profile: opc_session_store::FencedTransitionV2Profile,
         #[cfg(test)] scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript]>,
+        #[cfg(not(test))] scripts: Option<()>,
+    ) -> Self {
+        Self::start_controlled_with_clock(
+            member_count,
+            fixed,
+            profile,
+            Arc::new(SystemClock),
+            scripts,
+        )
+        .await
+    }
+
+    #[cfg(feature = "consumer-fixture")]
+    async fn start_with_authority_profile_and_clock(
+        member_count: usize,
+        fixed: bool,
+        profile: opc_session_store::FencedTransitionV2Profile,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self::start_controlled_with_clock(member_count, fixed, profile, clock, None).await
+    }
+
+    async fn start_controlled_with_clock(
+        member_count: usize,
+        fixed: bool,
+        profile: opc_session_store::FencedTransitionV2Profile,
+        clock: Arc<dyn Clock>,
+        #[cfg(test)] scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript]>,
         #[cfg(not(test))] _scripts: Option<()>,
     ) -> Self {
         assert!(
@@ -347,6 +383,7 @@ impl ConsensusTestCluster {
                     profile,
                 )
                 .expect("open consensus test SQLite backend")
+                .with_clock(Arc::clone(&clock))
             })
             .collect::<Vec<_>>();
         let members = (0..member_count)
@@ -451,11 +488,13 @@ impl ConsensusTestCluster {
                 if fixed {
                     // This fixture exercises fixed authority, not strict snapshot or
                     // independent physical failure-domain qualification.
-                    ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+                    ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
                         topologies[index].clone(),
                         backends[index].clone(),
                         directory.path().join(format!("snapshots-{index}")),
                         peers,
+                        Arc::clone(&clock),
+                        DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                         opc_session_store::SnapshotIntegrityPolicy::PortableVerified,
                     )
                     .await
@@ -465,7 +504,7 @@ impl ConsensusTestCluster {
                         backends[index].clone(),
                         directory.path().join(format!("snapshots-{index}")),
                         peers,
-                        Arc::new(SystemClock),
+                        Arc::clone(&clock),
                         DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                     )
                     .await

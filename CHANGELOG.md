@@ -82,6 +82,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-store` and `opc-session-net`: add the immutable
+  `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
+  Live predecessor-lease contention retains one nonterminal binding. Every
+  retry keeps the original sealed body, request identity, epoch, history
+  ordinal and caller journal row; ordered apply rechecks the original fence,
+  generation and current lease before one acquisition and mutation. Restart
+  recovery requires fresh, fully correlated `LeaseDeferred` status to resume;
+  unknown, unavailable and absent reads grant no dispatch authority. The
+  original profiles retain terminal `LeaseHeld`. Crossing profiles requires
+  a fresh install. (#1334)
+
 - `opc-types`, `opc-proto-ikev2` and `opc-proto-gtpv2c`: add shared checked
   N1-mode wire values, the three TS 24.302 N1 Notify codecs, directional
   ordinary APCO PDU-session/S-NSSAI containers at S2b Create Session top level,

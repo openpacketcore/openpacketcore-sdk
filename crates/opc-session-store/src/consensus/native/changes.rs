@@ -1028,20 +1028,33 @@ impl Publication {
                 .ok_or_else(|| invalid("native changed receipt history absent"))?;
             validation::validate_receipt(base.identity, id, row, &frontiers, history)?;
             if let Some(before) = base.receipts.get(id) {
+                let resolving = frontiers.fenced_transition_profile.defers_live_leases()
+                    && before.lease_deferred()
+                    && !row.lease_deferred()
+                    && row.retained()
+                    && row
+                        .response_facts()?
+                        .zip(before.response_facts()?)
+                        .is_some_and(|(after, before)| after.logical_time >= before.logical_time);
                 if row.ordinal != before.ordinal
                     || row.payload_digest != before.payload_digest
-                    || row.retained_until != before.retained_until
-                    || (resident::RowFingerprint::row_fingerprint(row, 1, id)?
-                        != resident::RowFingerprint::row_fingerprint(&**before, 1, id)?
-                        && !(before.retained()
-                            && !row.retained()
-                            && frontiers
-                                .logical_time
-                                .is_some_and(|now| now >= row.retained_until)))
+                    || (!resolving
+                        && (row.retained_until != before.retained_until
+                            || (resident::RowFingerprint::row_fingerprint(row, 1, id)?
+                                != resident::RowFingerprint::row_fingerprint(&**before, 1, id)?
+                                && !(before.retained()
+                                    && !before.lease_deferred()
+                                    && !row.retained()
+                                    && frontiers
+                                        .logical_time
+                                        .is_some_and(|now| now >= row.retained_until)))))
                 {
                     return Err(invalid(
                         "native receipt replacement changes its immutable binding",
                     ));
+                }
+                if resolving {
+                    receipt_order.resolve_deferred(*id, row.ordinal, row.retained_until)?;
                 }
             } else {
                 // One atomic apply can bind and then expire this ID. The

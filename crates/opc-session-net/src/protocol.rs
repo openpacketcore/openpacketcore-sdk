@@ -1878,6 +1878,7 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             // spelling rather than extending the frozen v5 enum.
             StoreError::FencedTransitionHistoryFull
             | StoreError::FencedTransitionVoided
+            | StoreError::FencedTransitionLeaseDeferred
             | StoreError::FencedTransitionHistoryEpochRetired
             | StoreError::FencedTransitionHistoryEpochNotActive
             | StoreError::FencedTransitionRetentionExhausted

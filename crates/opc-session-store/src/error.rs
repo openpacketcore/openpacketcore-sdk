@@ -238,6 +238,10 @@ pub enum StoreError {
     /// under the independently negotiated V2 void profile. It can never apply.
     #[error("fenced transition request was voided")]
     FencedTransitionVoided,
+    /// A live predecessor lease deferred the exact V2 request without a
+    /// business effect. This is nonterminal and uses the same durable binding.
+    #[error("fenced transition is deferred by a live lease")]
+    FencedTransitionLeaseDeferred,
 }
 
 /// Error type for lease operations.

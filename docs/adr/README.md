@@ -46,3 +46,4 @@ accepted.
 | [0031](0031-source-bound-dns-client.md) | Bounded asynchronous DNS uses configured servers, source-bound sockets, strict reply validation and real TTL provenance. |
 | [0032](0032-bounded-dns-srv.md) | SRV uses bounded priority/weighted target selection, source-bound address expansion and original record lifetimes. |
 | [0033](0033-n1-mode-codecs.md) | Shared checked N1-mode values have transport-specific IKEv2 Notify and directional S2b APCO codecs, value-free diagnostics and explicit duplicate rules. |
+| [0034](0034-fenced-transition-lease-deferral.md) | An immutable profile retains one pending lease-contention binding and permits explicit resumption of the original sealed request after correlated authoritative status. |
