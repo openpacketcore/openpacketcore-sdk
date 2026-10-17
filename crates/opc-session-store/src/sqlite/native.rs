@@ -69,7 +69,11 @@ impl AuthorityBackoff {
     }
 
     pub(super) async fn wait(&self) -> io::Result<()> {
-        let deadline = std::time::Instant::now() + Duration::from_millis(1);
+        self.wait_with_clock(std::time::Instant::now).await
+    }
+
+    async fn wait_with_clock(&self, now: impl Fn() -> std::time::Instant) -> io::Result<()> {
+        let deadline = now() + Duration::from_millis(1);
         let _waiter = {
             let mut waiters = self
                 .waiters
@@ -101,7 +105,7 @@ impl AuthorityBackoff {
             // A late joiner or stale readiness after cancellation must still
             // wait its own full interval. The next shared tick serves it;
             // adding callers does not add one interval per predecessor.
-            if std::time::Instant::now() >= deadline {
+            if now() >= deadline {
                 return Ok(());
             }
         }
@@ -428,6 +432,86 @@ mod authority_backoff_tests {
         .expect("128 concurrent waits must not queue 128 one-millisecond intervals");
         assert_eq!(results.len(), 128);
         assert!(results.iter().all(Result::is_ok));
+        assert_idle(&backoff);
+    }
+
+    async fn pulse_shared_expiry(backoff: &AuthorityBackoff) {
+        rustix::time::timerfd_settime(
+            backoff.timer.get_ref(),
+            rustix::time::TimerfdTimerFlags::empty(),
+            &rustix::time::Itimerspec {
+                it_interval: rustix::time::Timespec::default(),
+                it_value: rustix::time::Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1,
+                },
+            },
+        )
+        .expect("deliver one shared timer expiry");
+        // Observe readiness without consuming it: the registered waiters must
+        // process this same real timer event through the production wait loop.
+        let mut ready = tokio::time::timeout(Duration::from_secs(1), backoff.timer.readable())
+            .await
+            .expect("shared timer becomes readable")
+            .expect("shared timer readiness");
+        ready.retain_ready();
+    }
+
+    #[tokio::test]
+    async fn late_authority_waiter_honours_its_full_minimum_delay() {
+        let backoff = AuthorityBackoff::new().expect("startup timer");
+        let origin = std::time::Instant::now();
+        let now = std::cell::Cell::new(origin);
+        let mut early = Box::pin(backoff.wait_with_clock(|| now.get()));
+        assert!(futures_util::poll!(early.as_mut()).is_pending());
+        // Control tick delivery separately from the minimum-delay clock. Host
+        // scheduling can delay a pulse, but cannot satisfy a waiter's minimum.
+        backoff
+            .set_active(false)
+            .expect("control shared timer ticks");
+
+        let joined = origin + Duration::from_micros(900);
+        now.set(joined);
+        let late_clock_reads = std::cell::Cell::new(0);
+        let mut late = Box::pin(backoff.wait_with_clock(|| {
+            late_clock_reads.set(late_clock_reads.get() + 1);
+            now.get()
+        }));
+        assert!(futures_util::poll!(late.as_mut()).is_pending());
+        assert_eq!(*backoff.waiters.lock().unwrap(), 2);
+        assert_eq!(late_clock_reads.get(), 1);
+
+        now.set(origin + Duration::from_millis(1));
+        pulse_shared_expiry(&backoff).await;
+        assert!(matches!(
+            futures_util::poll!(early.as_mut()),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert!(
+            futures_util::poll!(late.as_mut()).is_pending(),
+            "a late joiner must not finish with the earlier cohort"
+        );
+        assert!(
+            late_clock_reads.get() > 1,
+            "the late joiner must have processed the shared expiry"
+        );
+        assert_eq!(*backoff.waiters.lock().unwrap(), 1);
+
+        let deadline = joined + Duration::from_millis(1);
+        now.set(deadline - Duration::from_nanos(1));
+        let reads_before = late_clock_reads.get();
+        pulse_shared_expiry(&backoff).await;
+        assert!(
+            futures_util::poll!(late.as_mut()).is_pending(),
+            "the late joiner must wait its entire one-millisecond minimum"
+        );
+        assert!(late_clock_reads.get() > reads_before);
+        now.set(deadline);
+        pulse_shared_expiry(&backoff).await;
+        assert!(matches!(
+            futures_util::poll!(late.as_mut()),
+            std::task::Poll::Ready(Ok(()))
+        ));
         assert_idle(&backoff);
     }
 
