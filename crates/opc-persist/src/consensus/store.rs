@@ -377,6 +377,13 @@ impl ConsensusConfigStore {
         self.inner.raft.runtime_config().elect(false);
     }
 
+    /// Resume automatic campaigns after a deterministic fixture's setup.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn enable_automatic_elections_for_test(&self) {
+        self.inner.raft.runtime_config().elect(true);
+    }
+
     /// Observe expiry of the engine's committed-vote lease without changing it.
     /// The caller must quiesce old-leader traffic and bound this future.
     #[cfg(feature = "dangerous-test-hooks")]

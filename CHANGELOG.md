@@ -795,8 +795,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-testkit` and `opc-config-bus-consensus` fixtures synchronize
   applied prefixes, old-leader RPC completion and real vote leases before one
-  designated successor campaign. Keep the existing 26 s and 30 s deadlines,
-  concurrent authenticated coverage, and automatic-election negative controls
+  designated successor campaign. Separate automatic-failover cases release
+  setup controls before the fault and retain the full authenticated VOID,
+  config/session isolation and live config projection workloads. Keep the
+  existing 26 s and 30 s deadlines and automatic-election negative controls
   for failed campaigns with unequal logs. Qualification recovery limits remain
   acceptance SLOs with unchanged fail-closed, reconciliation and shutdown
   behavior. (#1324)

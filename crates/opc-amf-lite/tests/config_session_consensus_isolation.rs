@@ -144,6 +144,15 @@ fn assert_config_head_unchanged(before: &StoredConfig<AmfConfig>, after: &Stored
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn config_and_session_groups_are_scope_and_availability_isolated() {
+    config_and_session_isolation(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_and_session_groups_are_isolated_with_a_designated_campaign() {
+    config_and_session_isolation(false).await;
+}
+
+async fn config_and_session_isolation(automatic: bool) {
     let temp = tempfile::tempdir().expect("config cluster tempdir");
     let mut config_cluster = ConfigCluster::start(temp.path()).await;
     let session_cluster = ConsensusTestCluster::start(3).await;
@@ -459,7 +468,12 @@ async fn config_and_session_groups_are_scope_and_availability_isolated() {
         .position(|store| store.status().node_id == old_session_leader_id)
         .unwrap();
     let candidate = (old_session_leader + 1) % session_stores.len();
-    let mut session_election = session_cluster.prepare_election(candidate).await;
+    let mut session_election = Some(session_cluster.prepare_election(candidate).await);
+    if automatic {
+        // Prefix setup is complete. Elections remain enabled throughout the
+        // complete outage, concurrent config writes, survivor recovery and heal.
+        drop(session_election.take());
+    }
 
     // Taking every in-process session consensus path offline is a complete
     // quorum outage, not a process/engine shutdown. Each node must report the
@@ -513,10 +527,18 @@ async fn config_and_session_groups_are_scope_and_availability_isolated() {
         }
     }
     // Enabling a member also enables incident paths; preserve the old leader's
-    // isolation until the designated survivor has fresh quorum authority.
+    // isolation until the survivors have fresh quorum authority.
     session_cluster.set_node_online(old_session_leader, false);
+    let recovery_started = tokio::time::Instant::now();
     tokio::time::timeout(cluster_transition_timeout(), async {
-        session_election.elect_once().await;
+        if let Some(election) = &mut session_election {
+            election.elect_once().await;
+        }
+        session_cluster.wait_node_durable_ready(candidate).await;
+        assert_ne!(
+            session_stores[candidate].status().leader_id,
+            Some(old_session_leader_id)
+        );
         session_cluster.set_node_online(old_session_leader, true);
         tokio::join!(
             session_cluster.wait_node_durable_ready(0),
@@ -526,6 +548,10 @@ async fn config_and_session_groups_are_scope_and_availability_isolated() {
     })
     .await
     .expect("session quorum heal is bounded");
+    eprintln!(
+        "functional_failover fixture=amf_isolation automatic={automatic} elapsed_ms={}",
+        recovery_started.elapsed().as_millis()
+    );
     drop(session_election);
 
     assert_eq!(

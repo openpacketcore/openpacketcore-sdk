@@ -612,8 +612,9 @@ impl ConsensusTestCluster {
     /// Wait until one member proves a fresh linearizable barrier.
     ///
     /// This observes readiness within a diagnostic acceptance deadline. It
-    /// does not guarantee convergence for an uncontrolled election schedule;
-    /// bounded functional failover tests use [`Self::prepare_election`].
+    /// does not guarantee convergence for an uncontrolled election schedule.
+    /// A [`Self::prepare_election`] guard used for setup must be dropped before
+    /// the fault when this waiter is used to observe automatic failover.
     pub async fn wait_node_durable_ready(&self, index: usize) {
         let store = self
             .stores
@@ -638,8 +639,8 @@ impl ConsensusTestCluster {
 
     async fn wait_ready_stores(stores: &[ConsensusSessionStore], fixed: bool) {
         // A diagnostic acceptance deadline, not an automatic-election bound.
-        // Formation uses one initialized campaign; bounded failure scenarios
-        // synchronize a designated campaign with prepare_election.
+        // Formation uses one initialized campaign. Automatic failover scenarios
+        // restore elections after prefix setup and keep this original deadline.
         let deadline = tokio::time::Instant::now() + CONSENSUS_TEST_TRANSITION_TIMEOUT;
         loop {
             let reports = join_all(stores.iter().map(|store| async move {

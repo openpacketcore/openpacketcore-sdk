@@ -42,8 +42,9 @@ impl VoteObservation {
 ///
 /// Prepare before partitioning the current leader. `elect_once` observes real
 /// lease expiry and requests one persisted, transported Openraft campaign.
-/// Keep this guard until rejoined members are ready; dropping it restores
-/// automatic elections. Automatic-election schedules have separate controls.
+/// Keep this guard until rejoined members are ready for a designated-campaign
+/// scenario. For automatic failover, drop it after setup and before introducing
+/// the fault, then observe recovery without calling `elect_once`.
 #[must_use]
 pub struct ControlledConsensusElection<'a> {
     cluster: &'a ConsensusTestCluster,
@@ -57,8 +58,9 @@ pub struct ControlledConsensusElection<'a> {
 
 impl ConsensusTestCluster {
     /// Synchronize the applied prefix and suppress competing automatic
-    /// campaigns before a test isolates the original leader. Normal operation
-    /// deadlines remain active throughout setup and the subsequent campaign.
+    /// campaigns during setup. Drop the returned guard before the fault when
+    /// testing automatic failover. Retain it only for a designated campaign.
+    /// Normal operation deadlines remain active throughout.
     pub async fn prepare_election(&self, candidate: usize) -> ControlledConsensusElection<'_> {
         assert_eq!(
             self.stores.len(),
