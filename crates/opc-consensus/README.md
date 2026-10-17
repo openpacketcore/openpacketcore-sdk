@@ -166,7 +166,7 @@ version so scripted samples pass through the same range sampler.
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
 pins `https://github.com/openpacketcore/openraft` at the full revision
-`1535ba4076398681127f9a8c4e4c5b8241de6be8` (0.9.25 plus fork fixes). The fork adds a distinct,
+`7865048c0ec698f3995bd630a6631becbadf69c4` (0.9.25 plus fork fixes). The fork adds a distinct,
 authenticated Pre-Vote inquiry before ordinary elections and evaluates election
 deadlines at intervals of at most 100 ms. Speculative grants do not change the
 recipient's term, vote, lease timestamp or durable state. A majority of inquiries

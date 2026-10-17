@@ -95,7 +95,7 @@ consensus authority remain unchanged. Historical HA profiles still bind the
 original revision above; current manifest/lock/metadata checks independently
 bind the new candidate. This source change does not confer qualification.
 
-The shared dependency update advances the candidate to `1535ba4076398681127f9a8c4e4c5b8241de6be8`,
+The shared dependency update advances the candidate to `7865048c0ec698f3995bd630a6631becbadf69c4`,
 which incorporates release-0.9 through v0.9.25 and the fork's bounded apply,
 joined replication retirement and fatal completion repairs. It also retires
 obsolete leadership and mismatched campaigns on an accepted newer self-vote,
