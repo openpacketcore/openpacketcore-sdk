@@ -12,11 +12,12 @@ use std::sync::{
 
 use async_trait::async_trait;
 use opc_session_store::{
-    fenced_transition::FencedTransitionV2Effect, BackendCapabilities, Clock,
-    EncryptingSessionBackend, FencedTransitionOutcome, FencedTransitionRequest,
-    FencedTransitionRequestId, FencedTransitionV2JournalScope, FencedTransitionV2RecoveryJournal,
-    FencedTransitionV2RecoveryJournalKey, PreparedFencedTransitionV2,
-    PreparedFencedTransitionV2Lookup, ProtectedFencedTransitionV2Backend, SessionLeaseManager,
+    fenced_transition::FencedTransitionV2Effect, BackendCapabilities, Clock, CompareAndSet,
+    CompareAndSetResult, EncryptingSessionBackend, FencedTransitionOutcome,
+    FencedTransitionRequest, FencedTransitionRequestId, FencedTransitionV2JournalScope,
+    FencedTransitionV2RecoveryJournal, FencedTransitionV2RecoveryJournalKey, LeaseGuard,
+    PreparedFencedTransitionV2, PreparedFencedTransitionV2Lookup,
+    ProtectedFencedTransitionV2Backend, SessionLeaseManager, SessionOp, SessionOpResult,
 };
 use opc_types::Timestamp;
 use tokio::sync::Notify;
@@ -68,6 +69,22 @@ impl SessionBackend for PhysicalBoundary {
 
     async fn get(&self, key: &SessionKey) -> Result<Option<StoredSessionRecord>, StoreError> {
         self.store.get(key).await
+    }
+
+    async fn compare_and_set(&self, op: CompareAndSet) -> Result<CompareAndSetResult, StoreError> {
+        self.store.compare_and_set(op).await
+    }
+
+    async fn delete_fenced(&self, lease: &LeaseGuard) -> Result<(), StoreError> {
+        self.store.delete_fenced(lease).await
+    }
+
+    async fn refresh_ttl(&self, lease: &LeaseGuard, ttl: Duration) -> Result<(), StoreError> {
+        self.store.refresh_ttl(lease, ttl).await
+    }
+
+    async fn batch(&self, ops: Vec<SessionOp>) -> Result<Vec<SessionOpResult>, StoreError> {
+        self.store.batch(ops).await
     }
 
     async fn observe_fenced_transition(
