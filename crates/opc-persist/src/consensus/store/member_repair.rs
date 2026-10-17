@@ -138,49 +138,8 @@ impl ConsensusConfigStore {
         } else {
             // Matching may include an accepted but not yet applied suffix.
             // A snapshot of only the current committed cut is insufficient.
-            let mut metrics = self.inner.raft.metrics();
-            let required = metrics.borrow_and_update().last_log_index;
-            loop {
-                let applied = metrics
-                    .borrow_and_update()
-                    .last_applied
-                    .map(|log| log.index);
-                if Instant::now() >= deadline || self.repair_source_vote() != Some(vote) {
-                    return Err(consensus_unavailable());
-                }
-                if applied >= required {
-                    break;
-                }
-                tokio::time::timeout_at(deadline, metrics.changed())
-                    .await
-                    .map_err(|_| consensus_unavailable())?
-                    .map_err(|_| consensus_unavailable())?;
-            }
-            let snapshot_cut = metrics.borrow_and_update().snapshot.map(|log| log.index);
-            if snapshot_cut < required {
-                self.inner
-                    .raft
-                    .trigger()
-                    .snapshot()
-                    .await
-                    .map_err(|_| consensus_unavailable())?;
-            }
-            loop {
-                let snapshot_cut = metrics.borrow_and_update().snapshot.map(|log| log.index);
-                if Instant::now() >= deadline || self.repair_source_vote() != Some(vote) {
-                    return Err(consensus_unavailable());
-                }
-                if snapshot_cut >= required {
-                    break;
-                }
-                // Core messages also flush metrics without snapshot progress.
-                // Only the published cut can authorize a GetSnapshot call;
-                // polling that call would wake this same watch repeatedly.
-                tokio::time::timeout_at(deadline, metrics.changed())
-                    .await
-                    .map_err(|_| consensus_unavailable())?
-                    .map_err(|_| consensus_unavailable())?;
-            }
+            let required = self.inner.raft.metrics().borrow().last_log_index;
+            self.wait_for_snapshot_cut(required, vote, deadline).await?;
             let snapshot = self
                 .inner
                 .raft

@@ -193,3 +193,425 @@ async fn repair_source_waits_for_snapshot_progress_before_fetching() {
     .await
     .expect("snapshot progress regression must complete within its bound");
 }
+
+#[tokio::test]
+async fn repair_source_retriggers_after_an_older_build_swallows_its_request() {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let identity = opc_consensus::ConsensusIdentity::new(
+            opc_consensus::ConsensusClusterId::new("repair-snapshot-retrigger").unwrap(),
+            opc_consensus::ConsensusConfigurationId::from_bytes([0x74; 32]),
+            opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let topology =
+            ConfigConsensusTopology::try_new(identity, node(1), BTreeSet::from([node(1)]))
+                .expect("singleton topology");
+        let backend = SqliteBackend::in_memory_for_test().await.expect("backend");
+        let hooks = Arc::clone(&backend.consensus_snapshot_test_hooks);
+        let store = ConsensusConfigStore::open_with_operation_timeout(
+            topology,
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("store");
+        store.initialize_cluster().await.expect("singleton leader");
+        let old_cut = store.inner.raft.metrics().borrow().last_applied;
+        hooks.pause_captured_build.store(true, Ordering::Release);
+        store.trigger_snapshot().await.expect("start older build");
+        hooks.build_captured.notified().await;
+
+        // The builder already copied its SQLite cut. This real later entry
+        // must also be present in the first repair snapshot.
+        let applied = store
+            .inner
+            .raft
+            .client_write(super::super::super::ConfigConsensusCommand {
+                schema_version: super::super::super::CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity,
+                request_id: opc_consensus::ConsensusRequestId::from_bytes([0x74; 16]),
+                logical_time: opc_types::Timestamp::now_utc(),
+                intent: ConfigMutationIntent::MarkConfirmed {
+                    tx_id: opc_types::TxId::new(),
+                },
+            })
+            .await
+            .expect("later entry commits and applies")
+            .log_id;
+        store
+            .inner
+            .raft
+            .wait(None)
+            .applied_index_at_least(Some(applied.index), "required repair cut")
+            .await
+            .unwrap();
+        assert!(Some(applied) > old_cut);
+        let reads_before = hooks.reads_started.load(Ordering::Acquire);
+        let repair = store.repair_snapshot_chunk(None, Instant::now() + Duration::from_secs(3));
+        tokio::pin!(repair);
+        assert!(poll_fn(|cx| Poll::Ready(repair.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        // These acknowledged core messages also ensure the repair's trigger
+        // has been processed while the first builder is still held.
+        for _ in 0..5 {
+            store.inner.raft.with_raft_state(|_| ()).await.unwrap();
+            assert!(poll_fn(|cx| Poll::Ready(repair.as_mut().poll(cx)))
+                .await
+                .is_pending());
+        }
+        assert_eq!(hooks.reads_started.load(Ordering::Acquire), reads_before);
+        assert_eq!(hooks.builds_started.load(Ordering::Acquire), 1);
+        hooks.pause_captured_build.store(false, Ordering::Release);
+        hooks.resume_captured_build.notify_one();
+        let chunk = repair.await.expect("repair owns the fresh build trigger");
+        let running = store.inner.raft.metrics().borrow().running_state.clone();
+        store.shutdown().await.expect("shutdown source");
+        assert!(running.is_ok());
+        assert!(chunk
+            .meta
+            .last_log_id
+            .is_some_and(|cut| cut.index >= applied.index));
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(hooks.builds_started.load(Ordering::Acquire), 2);
+        assert_eq!(
+            hooks.reads_started.load(Ordering::Acquire) - reads_before,
+            1
+        );
+    })
+    .await
+    .expect("swallowed-trigger recovery stays within the original request budget");
+}
+
+struct PublishedBuildRelease(Arc<crate::consensus::storage::SnapshotTestHooks>);
+
+impl Drop for PublishedBuildRelease {
+    fn drop(&mut self) {
+        self.0.pause_published_build.store(false, Ordering::Release);
+    }
+}
+
+async fn published_build_watchdog(operation: impl std::future::Future<Output = ()>) {
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (finished, mut watchdog) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        let result = held.recv_timeout(Duration::from_secs(30));
+        let _ = finished.send(result);
+    });
+    tokio::select! {
+        () = operation => {},
+        result = &mut watchdog => panic!("snapshot publication watchdog expired: {result:?}"),
+    }
+    drop(release);
+    assert!(matches!(
+        watchdog.await.unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    worker.join().unwrap();
+}
+
+async fn published_build_source() -> (
+    tempfile::TempDir,
+    ConsensusConfigStore,
+    Arc<crate::consensus::storage::SnapshotTestHooks>,
+) {
+    let directory = tempfile::tempdir().expect("snapshot directory");
+    let identity = opc_consensus::ConsensusIdentity::new(
+        opc_consensus::ConsensusClusterId::new("snapshot-publication").unwrap(),
+        opc_consensus::ConsensusConfigurationId::from_bytes([0x76; 32]),
+        opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap(),
+    );
+    let topology = ConfigConsensusTopology::try_new(identity, node(1), BTreeSet::from([node(1)]))
+        .expect("singleton topology");
+    let backend = SqliteBackend::in_memory_for_test().await.expect("backend");
+    let hooks = Arc::clone(&backend.consensus_snapshot_test_hooks);
+    let store = ConsensusConfigStore::open_with_operation_timeout(
+        topology,
+        backend,
+        directory.path().join("snapshots"),
+        BTreeMap::new(),
+        Duration::from_secs(3),
+    )
+    .await
+    .expect("store");
+    store.initialize_cluster().await.expect("singleton leader");
+    let applied = store
+        .inner
+        .raft
+        .client_write(super::super::super::ConfigConsensusCommand {
+            schema_version: super::super::super::CONFIG_CONSENSUS_COMMAND_VERSION,
+            identity,
+            request_id: opc_consensus::ConsensusRequestId::from_bytes([0x76; 16]),
+            logical_time: opc_types::Timestamp::now_utc(),
+            intent: ConfigMutationIntent::MarkConfirmed {
+                tx_id: opc_types::TxId::new(),
+            },
+        })
+        .await
+        .expect("initial entry commits")
+        .log_id;
+    store
+        .inner
+        .raft
+        .wait(None)
+        .applied_index_at_least(Some(applied.index), "initial applied cut")
+        .await
+        .expect("applied metrics");
+    let mut metrics = store.inner.raft.metrics();
+    store.trigger_snapshot().await.expect("initial snapshot");
+    loop {
+        if metrics.borrow_and_update().snapshot == Some(applied) {
+            break;
+        }
+        metrics
+            .changed()
+            .await
+            .expect("initial snapshot publication");
+    }
+    assert_eq!(hooks.builds_returned_ok.load(Ordering::Acquire), 1);
+    (directory, store, hooks)
+}
+
+#[tokio::test]
+async fn snapshot_publication_overdue_commit_without_reader_remains_healthy() {
+    published_build_watchdog(async {
+        let (_directory, store, hooks) = published_build_source().await;
+        let _release = PublishedBuildRelease(Arc::clone(&hooks));
+        hooks.pause_published_build.store(true, Ordering::Release);
+        store.trigger_snapshot().await.expect("second build");
+        hooks.build_published.notified().await;
+        // The durable publication committed. Only the blocking worker's
+        // return is held, modeling a delayed authorized commit completion.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        store
+            .inner
+            .raft
+            .with_raft_state(|_| ())
+            .await
+            .expect("core still healthy");
+        assert_eq!(hooks.builds_returned_ok.load(Ordering::Acquire), 1);
+        hooks.pause_published_build.store(false, Ordering::Release);
+        while hooks.builds_returned_ok.load(Ordering::Acquire) < 2 {
+            hooks.build_returned_ok.notified().await;
+        }
+        let snapshot = store
+            .inner
+            .raft
+            .get_snapshot()
+            .await
+            .expect("healthy read")
+            .expect("published snapshot");
+        assert!(snapshot.meta.last_log_id.is_some());
+        let running = store.inner.raft.metrics().borrow().running_state.clone();
+        store.shutdown().await.expect("shutdown control");
+        assert!(running.is_ok());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn snapshot_publication_reader_survives_an_overdue_commit() {
+    published_build_watchdog(async {
+        let (_directory, store, hooks) = published_build_source().await;
+        let _release = PublishedBuildRelease(Arc::clone(&hooks));
+        let previous = store
+            .inner
+            .raft
+            .get_snapshot()
+            .await
+            .unwrap()
+            .unwrap()
+            .meta;
+        hooks.pause_published_build.store(true, Ordering::Release);
+        store.trigger_snapshot().await.expect("second build");
+        hooks.build_published.notified().await;
+        let raft = store.inner.raft.clone();
+        let mut read = tokio::spawn(async move { raft.get_snapshot().await });
+        let outcome = tokio::select! {
+            result = &mut read => result.expect("independent read joined"),
+            () = hooks.read_gate_blocked.notified() => {
+                // Advance only when the read is queued on the held gate.
+                // An independent reader completes with real filesystem time.
+                assert!(store.inner.raft.metrics().borrow().running_state.is_ok());
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(61)).await;
+                tokio::time::resume();
+                read.await.expect("queued read joined")
+            },
+        };
+        let running = if let Err(error) = &outcome {
+            assert!(format!("{error:?}").contains("snapshot read gate timed out"));
+            let mut metrics = store.inner.raft.metrics();
+            loop {
+                let state = metrics.borrow_and_update().running_state.clone();
+                if state.is_err() {
+                    break state;
+                }
+                metrics.changed().await.expect("engine failure publication");
+            }
+        } else {
+            store.inner.raft.metrics().borrow().running_state.clone()
+        };
+        assert_eq!(hooks.builds_returned_ok.load(Ordering::Acquire), 1);
+        hooks.pause_published_build.store(false, Ordering::Release);
+        while hooks.builds_returned_ok.load(Ordering::Acquire) < 2 {
+            hooks.build_returned_ok.notified().await;
+        }
+        let shutdown = store.shutdown().await;
+        assert!(
+            running.is_ok(),
+            "a read queued behind an otherwise successful build must not kill the engine: {running:?}"
+        );
+        let snapshot = outcome.expect("snapshot remains readable").unwrap();
+        assert_eq!(snapshot.meta, previous);
+        assert!(shutdown.is_ok());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repair_source_retriggers_after_a_duplicate_cut_swallows_its_request() {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let identity = opc_consensus::ConsensusIdentity::new(
+            opc_consensus::ConsensusClusterId::new("repair-snapshot-retrigger").unwrap(),
+            opc_consensus::ConsensusConfigurationId::from_bytes([0x74; 32]),
+            opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let topology =
+            ConfigConsensusTopology::try_new(identity, node(1), BTreeSet::from([node(1)]))
+                .expect("singleton topology");
+        let backend = SqliteBackend::in_memory_for_test().await.expect("backend");
+        let hooks = Arc::clone(&backend.consensus_snapshot_test_hooks);
+        let store = ConsensusConfigStore::open_with_operation_timeout(
+            topology,
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("store");
+        store.initialize_cluster().await.expect("singleton leader");
+        // Initialization establishes membership before its applied metrics
+        // necessarily publish. Commit a real prefix before selecting the idle
+        // snapshot, so None cannot accidentally satisfy the publication wait.
+        let initial = store
+            .inner
+            .raft
+            .client_write(super::super::super::ConfigConsensusCommand {
+                schema_version: super::super::super::CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity,
+                request_id: opc_consensus::ConsensusRequestId::from_bytes([0x75; 16]),
+                logical_time: opc_types::Timestamp::now_utc(),
+                intent: ConfigMutationIntent::MarkConfirmed {
+                    tx_id: opc_types::TxId::new(),
+                },
+            })
+            .await
+            .expect("initial snapshot prefix commits and applies")
+            .log_id;
+        store
+            .inner
+            .raft
+            .wait(None)
+            .applied_index_at_least(Some(initial.index), "initial idle snapshot cut")
+            .await
+            .unwrap();
+        let old_cut = store.inner.raft.metrics().borrow().last_applied;
+        assert_eq!(old_cut, Some(initial));
+        store
+            .trigger_snapshot()
+            .await
+            .expect("publish the idle cut");
+        let mut metrics = store.inner.raft.metrics();
+        loop {
+            if metrics.borrow_and_update().snapshot == old_cut {
+                break;
+            }
+            metrics
+                .changed()
+                .await
+                .expect("initial snapshot publication");
+        }
+        assert!(old_cut.is_some());
+        assert_eq!(hooks.builds_started.load(Ordering::Acquire), 1);
+        hooks.pause_captured_build.store(true, Ordering::Release);
+        store
+            .trigger_snapshot()
+            .await
+            .expect("start duplicate-cut maintenance build");
+        hooks.build_captured.notified().await;
+
+        // The builder already copied its SQLite cut. This real later entry
+        // must also be present in the first repair snapshot.
+        let applied = store
+            .inner
+            .raft
+            .client_write(super::super::super::ConfigConsensusCommand {
+                schema_version: super::super::super::CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity,
+                request_id: opc_consensus::ConsensusRequestId::from_bytes([0x74; 16]),
+                logical_time: opc_types::Timestamp::now_utc(),
+                intent: ConfigMutationIntent::MarkConfirmed {
+                    tx_id: opc_types::TxId::new(),
+                },
+            })
+            .await
+            .expect("later entry commits and applies")
+            .log_id;
+        store
+            .inner
+            .raft
+            .wait(None)
+            .applied_index_at_least(Some(applied.index), "required repair cut")
+            .await
+            .unwrap();
+        assert!(Some(applied) > old_cut);
+        let reads_before = hooks.reads_started.load(Ordering::Acquire);
+        let repair = store.repair_snapshot_chunk(None, Instant::now() + Duration::from_secs(3));
+        tokio::pin!(repair);
+        assert!(poll_fn(|cx| Poll::Ready(repair.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        // These acknowledged core messages also ensure the repair's trigger
+        // has been processed while the first builder is still held.
+        for _ in 0..5 {
+            store.inner.raft.with_raft_state(|_| ()).await.unwrap();
+            assert!(poll_fn(|cx| Poll::Ready(repair.as_mut().poll(cx)))
+                .await
+                .is_pending());
+        }
+        assert_eq!(hooks.reads_started.load(Ordering::Acquire), reads_before);
+        assert_eq!(hooks.builds_started.load(Ordering::Acquire), 2);
+        assert_eq!(store.inner.raft.metrics().borrow().snapshot, old_cut);
+        hooks.pause_captured_build.store(false, Ordering::Release);
+        hooks.resume_captured_build.notify_one();
+        let chunk = repair.await.expect("repair owns the fresh build trigger");
+        let running = store.inner.raft.metrics().borrow().running_state.clone();
+        store.shutdown().await.expect("shutdown source");
+        assert!(running.is_ok());
+        assert!(chunk
+            .meta
+            .last_log_id
+            .is_some_and(|cut| cut.index >= applied.index));
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(hooks.builds_started.load(Ordering::Acquire), 3);
+        assert_eq!(
+            hooks.reads_started.load(Ordering::Acquire) - reads_before,
+            1
+        );
+    })
+    .await
+    .expect("duplicate-cut recovery stays within the original request budget");
+}

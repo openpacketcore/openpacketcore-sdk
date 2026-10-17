@@ -1047,6 +1047,62 @@ impl ConsensusConfigStore {
         result
     }
 
+    /// Wait for a completed build covering the required cut under the same leader.
+    /// Unrelated metrics flushes do not fetch snapshots or accelerate retries.
+    async fn wait_for_snapshot_cut(
+        &self,
+        required: Option<u64>,
+        vote: opc_consensus::engine::Vote<ConsensusNodeId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), PersistError> {
+        let mut metrics = self.inner.raft.metrics();
+        let mut requested_at = None;
+        let mut retry_at = deadline;
+        loop {
+            let (current, applied, snapshot) = {
+                let state = metrics.borrow_and_update();
+                (
+                    state.running_state.is_ok()
+                        && state.current_leader == Some(self.inner.local_node_id)
+                        && state.vote == vote,
+                    state.last_applied.map(|log| log.index),
+                    state.snapshot,
+                )
+            };
+            if !current
+                || self.inner.shutdown.is_started()
+                || tokio::time::Instant::now() >= deadline
+            {
+                return Err(consensus_unavailable());
+            }
+            if applied >= required {
+                if snapshot.map(|log| log.index) >= required {
+                    return Ok(());
+                }
+                if requested_at != Some(snapshot) || tokio::time::Instant::now() >= retry_at {
+                    // A duplicate maintenance build can finish without moving
+                    // the cut. Retry coarsely as well as on cut advancement;
+                    // a running builder coalesces these maintenance requests.
+                    tokio::time::timeout_at(deadline, self.inner.raft.trigger().snapshot())
+                        .await
+                        .map_err(|_| consensus_unavailable())?
+                        .map_err(|_| consensus_unavailable())?;
+                    requested_at = Some(snapshot);
+                    retry_at = (tokio::time::Instant::now() + Duration::from_secs(1)).min(deadline);
+                }
+            }
+            let wake = if applied >= required {
+                retry_at
+            } else {
+                deadline
+            };
+            tokio::select! {
+                changed = metrics.changed() => changed.map_err(|_| consensus_unavailable())?,
+                () = tokio::time::sleep_until(wake) => {},
+            }
+        }
+    }
+
     /// Apply an explicit acknowledged history-retention decision through the
     /// existing consensus authority, retaining the same request ID for retries.
     pub async fn retain_history_idempotent(

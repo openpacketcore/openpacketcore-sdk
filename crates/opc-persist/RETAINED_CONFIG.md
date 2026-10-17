@@ -47,8 +47,7 @@ snapshot can progress across operation deadlines. If a saved attempt makes no
 progress, the next call rediscovers authenticated sources within its existing
 budget. A fresh response reuses the checkpoint only when its source, committed
 vote, and complete snapshot metadata still match; a successor or changed
-snapshot starts a new download. Snapshot reads share the publication gate so
-replacement cannot remove a selected file before it is verified and opened.
+snapshot starts a new download.
 The source waits for the snapshot cut to cover the accepted prefix within the
 request budget before fetching the snapshot; unrelated engine metrics updates
 do not cause repeated fetches.
@@ -58,6 +57,20 @@ staging left by a crash. A completed repair persists through the
 ordinary retained reopen path and can rejoin with a compatible majority. This
 does not reset a leader's recorded replication progress, change stored formats,
 or require manual cleanup during restart.
+
+Snapshot reads pin the last published record under a brief publication gate,
+then open and verify an independent descriptor outside the gate. The pin keeps
+the old path available until open completes; after that, the descriptor remains
+valid when a successor removes the path. Building and installing a successor,
+including its durable SQLite commit, use separate serialization. Readers do not
+queue on that SQLite worker. Startup validates and restores the same published
+record before the engine starts. Snapshot waiters fetch only after the completed
+cut covers the required log prefix. They retry a swallowed build trigger at a coarse
+interval even when an idle maintenance build finishes at the same cut;
+unrelated engine updates do not cause repeated snapshot fetches. The coordinator
+awaits one accepted read even when it exceeds an RPC budget. Verification limits
+individual I/O stalls to 60 seconds, renewing that budget as bounded chunks make
+progress, so snapshot size alone does not expire a healthy read.
 
 ## SDK-owned local state
 

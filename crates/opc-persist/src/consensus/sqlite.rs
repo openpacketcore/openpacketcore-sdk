@@ -306,7 +306,9 @@ pub(crate) struct ConfigConsensusCore {
     pub(crate) identity: ConsensusIdentity,
     pub(crate) expected_members: Arc<BTreeSet<ConsensusNodeId>>,
     pub(crate) snapshot_dir: Arc<PathBuf>,
-    pub(crate) snapshot_gate: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) snapshot_gate:
+        Arc<tokio::sync::Mutex<Option<Arc<super::storage::PublishedSnapshot>>>>,
+    pub(crate) snapshot_build_gate: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     pub(crate) snapshot_test_hooks: Arc<super::storage::SnapshotTestHooks>,
     pub(crate) audit_key: Arc<AuditKey>,
@@ -522,7 +524,8 @@ impl ConfigConsensusCore {
             identity,
             expected_members: Arc::new(expected_members),
             snapshot_dir: Arc::new(snapshot_dir),
-            snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_gate: Arc::new(tokio::sync::Mutex::new(None)),
+            snapshot_build_gate: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             snapshot_test_hooks: Arc::clone(&backend.consensus_snapshot_test_hooks),
             audit_key: Arc::new(backend.audit_key().clone()),
