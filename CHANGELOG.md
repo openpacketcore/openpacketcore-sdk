@@ -751,8 +751,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `opc-proto-gtpv2c`: clarify that an empty optional response APCO is discarded
-  before duplicate selection at every validation level. Pin this behavior and
+- `opc-proto-gtpv2c`: An empty Create Session Response APCO received before any
+  retained APCO is discarded as malformed optional outer-IE data at every
+  validation level, including under `Reject`, so a later populated APCO can
+  supply N1 data. An APCO after a retained one is a repeat that the duplicate
+  policy governs. An empty request APCO received first fails receive decoding.
+  Pin this behavior and
   the one-octet length of container `0x0062` with regressions, and align the N1
   fixture specification reference with TS 24.008 V20.0.0. (#1321)
 

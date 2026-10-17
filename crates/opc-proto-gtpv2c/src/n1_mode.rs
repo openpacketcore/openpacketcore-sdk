@@ -228,11 +228,11 @@ impl N1ModeApcoResponse {
     /// `Last` policy have already discarded earlier occurrences; this helper
     /// cannot recover them.
     ///
-    /// An empty response APCO is discarded as malformed optional outer-IE data
-    /// at every validation level, before duplicate selection, including under
-    /// `Reject`. A later populated APCO can therefore supply N1 data. This does
-    /// not skip a nonempty APCO merely because its inner N1 contents are invalid.
-    /// An empty request APCO instead fails ordinary S2b receive decoding.
+    /// An empty Create Session Response APCO received before any retained APCO
+    /// is discarded as malformed optional outer-IE data at every validation
+    /// level, including under `Reject`, so a later populated APCO can supply N1
+    /// data. An APCO after a retained one is a repeat that the duplicate policy
+    /// governs. An empty request APCO received first fails receive decoding.
     ///
     /// PCO, grouped APCO and other instances are ignored. Call this after ordinary
     /// S2b message validation. A value or error neither changes Cause nor establishes

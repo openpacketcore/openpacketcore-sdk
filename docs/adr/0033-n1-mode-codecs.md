@@ -48,11 +48,11 @@ occurrence requires `S2bMessage::decode` with
 or explicit `First` at another validation level. `Reject` at another level
 rejects duplicates before projection. The default context and `Strict` with
 the default `Last` policy have already discarded earlier IEs; the projection
-cannot recover them. An empty Create Session Response APCO is discarded as
-malformed optional outer-IE data at every validation level, before duplicate
-selection, including under `Reject`. A later populated APCO can therefore
-supply N1 data. This does not skip a nonempty APCO merely because its inner N1
-contents are invalid. An empty request APCO instead fails receive decoding.
+cannot recover them. An empty Create Session Response APCO received before any
+retained APCO is discarded as malformed optional outer-IE data at every
+validation level, including under `Reject`, so a later populated APCO can
+supply N1 data. An APCO after a retained one is a repeat that the duplicate
+policy governs. An empty request APCO received first fails receive decoding.
 These decode policies remain unchanged.
 The S2b projection checks Create Session procedure, direction
 and header type and reads only top-level APCO type 163 instance 0. An optional

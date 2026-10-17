@@ -59,11 +59,11 @@ validation level. `Reject` at another level rejects retained duplicates before
 projection. The default context and `Strict` with the default `Last` policy
 discard earlier IEs, which the projection cannot recover.
 
-An empty Create Session Response APCO is malformed optional outer-IE data and
-is discarded under TS 29.274 §7.7.8 at every validation level, before duplicate
-selection, including under `Reject`. A later populated APCO can therefore
-supply N1 data. This does not skip a nonempty APCO merely because its inner N1
-contents are invalid. An empty request APCO instead fails receive decoding.
+An empty Create Session Response APCO received before any retained APCO is
+discarded as malformed optional outer-IE data at every validation level,
+including under `Reject`, so a later populated APCO can supply N1 data. An APCO
+after a retained one is a repeat that the duplicate policy governs. An empty
+request APCO received first fails receive decoding.
 S2b projections check message type, procedure and direction, and read only
 top-level APCO type 163 instance 0; PCO, grouped APCO and other instances cannot
 supply N1 data. Absence, a malformed recognized value and a valid value remain
