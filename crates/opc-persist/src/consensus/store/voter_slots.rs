@@ -30,6 +30,8 @@ pub(super) struct ConfigVoterProfile {
     pub(super) transport: Arc<ConfigVoterTransport>,
     core: super::super::sqlite::ConfigConsensusCore,
     incoming: tokio::sync::Mutex<Option<IncomingSnapshot>>,
+    coordinator: std::sync::OnceLock<tokio::sync::watch::Receiver<()>>,
+    snapshot_ready: Arc<tokio::sync::Notify>,
 }
 
 // One coordinator owns accepted work through completion. This cache is keyed
@@ -38,6 +40,7 @@ pub(super) struct ConfigVoterProfile {
 #[derive(Default)]
 struct ReplacementProgress {
     key: Option<([u8; 32], VoterSlotLogId, Vote<ConsensusNodeId>)>,
+    phase: Option<VoterReplacementPhase>,
     marker: Option<VoterSlotLogId>,
     snapshot: Option<SnapshotDelivery>,
     retry_delay: Duration,
@@ -55,6 +58,13 @@ impl ReplacementProgress {
                 key: Some(key),
                 ..Self::default()
             };
+        }
+        if self.phase != Some(operation.phase) {
+            // A long candidate download can reach the retry cap. Once the
+            // durable operation advances, that old delay must not hold up
+            // learner catch-up or the remaining membership transitions.
+            self.phase = Some(operation.phase);
+            self.retry_delay = Duration::ZERO;
         }
     }
 
@@ -99,6 +109,12 @@ enum ControlRequest {
         request_digest: [u8; 32],
         marker: VoterSlotLogId,
     },
+    ReplacementSnapshot {
+        request_digest: [u8; 32],
+    },
+    SnapshotReady {
+        request_digest: [u8; 32],
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -109,13 +125,157 @@ enum ControlReply {
     },
     SnapshotInstalled(VoterSnapshotEvidence),
     AppliedMarker(VoterSlotLogId),
+    ReplacementSnapshot(SnapshotTransfer),
+    SnapshotReady,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum SnapshotTransfer {
+    LeaderPush,
+    CandidatePull(Option<VoterSnapshotEvidence>),
 }
 
 impl ConfigVoterProfile {
+    async fn replacement_snapshot_evidence(
+        &self,
+        local: ConsensusNodeId,
+        request_digest: [u8; 32],
+    ) -> Result<Option<VoterSnapshotEvidence>, VoterReplacementError> {
+        let identity = self.core.identity;
+        let members = self.core.expected_members.clone();
+        self.core
+            .run_sqlite(move |conn| {
+                let invalid =
+                    || super::super::sqlite::invalid_data("config candidate binding mismatch");
+                let state =
+                    super::super::sqlite::voter_slots::read_sync(conn)?.ok_or_else(invalid)?;
+                let operation = state.table().replacement.as_ref().ok_or_else(invalid)?;
+                if operation.attestation.request_digest != request_digest
+                    || !state.table().slots.iter().any(|slot| {
+                        slot.member.identity.node_id() == local
+                            && slot.member.identity.slot() == operation.attestation.slot
+                    })
+                {
+                    return Err(invalid());
+                }
+                let Some(snapshot) =
+                    super::super::sqlite::read_current_snapshot_sync(conn, identity, &members)?
+                else {
+                    return Ok(None);
+                };
+                let cut = snapshot.0.last_log_id.ok_or_else(invalid)?;
+                if cut.index < operation.evidence.prepare.index {
+                    return Err(invalid());
+                }
+                Ok(Some(VoterSnapshotEvidence {
+                    cut: VoterSlotLogId {
+                        term: cut.leader_id.term,
+                        index: cut.index,
+                    },
+                    snapshot_id: snapshot.0.snapshot_id,
+                    digest: snapshot.2,
+                }))
+            })
+            .await
+            .map_err(|_| VoterReplacementError::InvalidTransition)
+    }
+
+    pub(super) async fn pulled_snapshot_is_applied(&self, store: &ConsensusConfigStore) -> bool {
+        let Some(prepare) = store
+            .inner
+            .backend
+            .retained_binding
+            .as_ref()
+            .and_then(|binding| binding.voter_slots())
+            .and_then(|initial| initial.replacement.as_ref())
+            .map(|operation| operation.evidence.prepare)
+        else {
+            return false;
+        };
+        let identity = self.core.identity;
+        let members = self.core.expected_members.clone();
+        !store.inner.shutdown.is_started()
+            && self
+                .core
+                .run_sqlite(move |conn| {
+                    let snapshot =
+                        super::super::sqlite::read_current_snapshot_sync(conn, identity, &members)?;
+                    let applied = super::super::sqlite::read_applied_sync(conn, identity)?;
+                    Ok(snapshot.is_some_and(|snapshot| {
+                        snapshot.0.last_log_id.is_some_and(|cut| {
+                            cut.index >= prepare.index && applied.is_some_and(|last| last >= cut)
+                        })
+                    }))
+                })
+                .await
+                .unwrap_or(false)
+    }
+
+    pub(super) async fn install_pulled_snapshot(
+        self: &Arc<Self>,
+        store: &ConsensusConfigStore,
+        source: ConsensusNodeId,
+        vote: Vote<ConsensusNodeId>,
+        mut snapshot: Snapshot<ConfigRaftTypeConfig>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), VoterReplacementError> {
+        let current = self.admission.durable_view()?;
+        let expected = current
+            .table()
+            .replacement
+            .as_ref()
+            .ok_or(VoterReplacementError::InvalidTransition)?;
+        let table = storage::inspect_voter_snapshot(
+            &self.core,
+            &mut snapshot.snapshot,
+            &snapshot.meta,
+            deadline,
+        )
+        .await
+        .map_err(|_| VoterReplacementError::InvalidTransition)?;
+        if !vote.is_committed()
+            || vote.leader_id.voted_for() != Some(source)
+            || !table.slots.iter().any(|slot| {
+                slot.member.identity.node_id() == source && slot.phase == VoterSlotPhase::Voting
+            })
+            || table.replacement.as_ref().is_none_or(|operation| {
+                operation.attestation.request_digest != expected.attestation.request_digest
+                    || operation.evidence.prepare != expected.evidence.prepare
+                    || operation.phase != VoterReplacementPhase::Prepared
+            })
+            || snapshot
+                .meta
+                .last_log_id
+                .is_none_or(|cut| cut.index < expected.evidence.prepare.index)
+        {
+            return Err(VoterReplacementError::UnauthorizedReplacement);
+        }
+        let members = snapshot
+            .meta
+            .last_membership
+            .nodes()
+            .map(|(node, _)| *node)
+            .collect();
+        let raft = store.inner.raft.clone();
+        let response = self
+            .admission
+            .run_snapshot(table, members, deadline, move || async move {
+                Ok(raft.install_full_snapshot(vote, snapshot).await)
+            })
+            .await?
+            .map_err(|_| VoterReplacementError::Unavailable)?;
+        if response.vote != vote || store.inner.shutdown.is_started() {
+            return Err(VoterReplacementError::Unavailable);
+        }
+        Ok(())
+    }
+
     async fn control(
         &self,
         store: &ConsensusConfigStore,
+        sender: ConsensusNodeId,
         request: ControlRequest,
+        deadline: tokio::time::Instant,
     ) -> Result<ControlReply, VoterReplacementError> {
         match request {
             ControlRequest::LossProbe { target, nonce, .. } => {
@@ -130,60 +290,44 @@ impl ConfigVoterProfile {
                 request_digest,
                 evidence,
             } => {
-                let local = store.inner.local_node_id;
-                let identity = self.core.identity;
-                let members = self.core.expected_members.clone();
                 let observed = self
-                    .core
-                    .run_sqlite(move |conn| {
-                        let state = super::super::sqlite::voter_slots::read_sync(conn)?
-                            .ok_or_else(|| {
-                                super::super::sqlite::invalid_data("missing config voter state")
-                            })?;
-                        let operation = state.table().replacement.as_ref().ok_or_else(|| {
-                            super::super::sqlite::invalid_data("missing config replacement")
-                        })?;
-                        let selected = state
-                            .table()
-                            .slots
-                            .iter()
-                            .find(|slot| slot.member.identity.slot() == operation.attestation.slot)
-                            .ok_or_else(|| {
-                                super::super::sqlite::invalid_data("missing config slot")
-                            })?;
-                        if operation.attestation.request_digest != request_digest
-                            || selected.member.identity.node_id() != local
-                        {
-                            return Err(super::super::sqlite::invalid_data(
-                                "config candidate binding mismatch",
-                            ));
-                        }
-                        let snapshot = super::super::sqlite::read_current_snapshot_sync(
-                            conn, identity, &members,
-                        )?
-                        .ok_or_else(|| {
-                            super::super::sqlite::invalid_data(
-                                "initial config snapshot not installed",
-                            )
-                        })?;
-                        let cut = snapshot.0.last_log_id.ok_or_else(|| {
-                            super::super::sqlite::invalid_data("config snapshot has no cut")
-                        })?;
-                        Ok(VoterSnapshotEvidence {
-                            cut: VoterSlotLogId {
-                                term: cut.leader_id.term,
-                                index: cut.index,
-                            },
-                            snapshot_id: snapshot.0.snapshot_id,
-                            digest: snapshot.2,
-                        })
-                    })
-                    .await
-                    .map_err(|_| VoterReplacementError::InvalidTransition)?;
+                    .replacement_snapshot_evidence(store.inner.local_node_id, request_digest)
+                    .await?
+                    .ok_or(VoterReplacementError::InvalidTransition)?;
                 if observed != evidence {
                     return Err(VoterReplacementError::InvalidTransition);
                 }
                 Ok(ControlReply::SnapshotInstalled(observed))
+            }
+            ControlRequest::ReplacementSnapshot { request_digest } => {
+                let installed = self
+                    .replacement_snapshot_evidence(store.inner.local_node_id, request_digest)
+                    .await?;
+                Ok(ControlReply::ReplacementSnapshot(
+                    if store.inner.backend.retained_repair_only {
+                        SnapshotTransfer::CandidatePull(installed)
+                    } else {
+                        SnapshotTransfer::LeaderPush
+                    },
+                ))
+            }
+            ControlRequest::SnapshotReady { request_digest } => {
+                let state = self.admission.durable_view()?;
+                let operation = state
+                    .table()
+                    .replacement
+                    .as_ref()
+                    .ok_or(VoterReplacementError::InvalidTransition)?;
+                if operation.attestation.request_digest != request_digest
+                    || !state.table().slots.iter().any(|slot| {
+                        slot.member.identity.node_id() == sender
+                            && slot.member.identity.slot() == operation.attestation.slot
+                    })
+                {
+                    return Err(VoterReplacementError::UnauthorizedReplacement);
+                }
+                self.snapshot_ready.notify_one();
+                Ok(ControlReply::SnapshotReady)
             }
             ControlRequest::AppliedMarker {
                 request_digest,
@@ -191,38 +335,57 @@ impl ConfigVoterProfile {
             } => {
                 let identity = self.core.identity;
                 let local = store.inner.local_node_id;
-                let applied = self
-                    .core
-                    .run_sqlite(move |conn| {
-                        let state = super::super::sqlite::voter_slots::read_sync(conn)?
-                            .ok_or_else(|| {
-                                super::super::sqlite::invalid_data("missing config voter state")
-                            })?;
-                        let operation = state.table().replacement.as_ref().ok_or_else(|| {
-                            super::super::sqlite::invalid_data("missing config replacement")
-                        })?;
-                        let selected = state
-                            .table()
-                            .slots
-                            .iter()
-                            .find(|slot| slot.member.identity.slot() == operation.attestation.slot)
-                            .ok_or_else(|| {
-                                super::super::sqlite::invalid_data("missing config slot")
-                            })?;
-                        let applied = super::super::sqlite::read_applied_sync(conn, identity)?;
-                        Ok(operation.attestation.request_digest == request_digest
-                            && selected.member.identity.node_id() == local
-                            && operation.phase >= VoterReplacementPhase::LearnerAdded
-                            && applied.is_some_and(|cut| {
-                                cut.leader_id.term == marker.term && cut.index >= marker.index
-                            }))
-                    })
-                    .await
-                    .map_err(|_| VoterReplacementError::Unavailable)?;
-                if !applied {
-                    return Err(VoterReplacementError::InvalidTransition);
+                let mut changed = self.core.durable_progress.subscribe_applied();
+                loop {
+                    let (selected, applied) = self
+                        .core
+                        .run_sqlite(move |conn| {
+                            let invalid = || {
+                                super::super::sqlite::invalid_data("invalid config catch-up marker")
+                            };
+                            let state = super::super::sqlite::voter_slots::read_sync(conn)?
+                                .ok_or_else(invalid)?;
+                            let operation =
+                                state.table().replacement.as_ref().ok_or_else(invalid)?;
+                            let selected = state
+                                .table()
+                                .slots
+                                .iter()
+                                .find(|slot| {
+                                    slot.member.identity.slot() == operation.attestation.slot
+                                })
+                                .ok_or_else(invalid)?;
+                            if operation.attestation.request_digest != request_digest
+                                || selected.member.identity.node_id() != local
+                            {
+                                return Ok((false, false));
+                            }
+                            let applied = super::super::sqlite::read_applied_sync(conn, identity)?;
+                            Ok((
+                                true,
+                                operation.phase >= VoterReplacementPhase::LearnerAdded
+                                    && applied.is_some_and(|cut| {
+                                        cut.leader_id.term == marker.term
+                                            && cut.index >= marker.index
+                                    }),
+                            ))
+                        })
+                        .await
+                        .map_err(|_| VoterReplacementError::Unavailable)?;
+                    if !selected {
+                        return Err(VoterReplacementError::InvalidTransition);
+                    }
+                    if applied {
+                        return Ok(ControlReply::AppliedMarker(marker));
+                    }
+                    // The committed marker can race its replication to the
+                    // learner. Wait for durable application within this RPC's
+                    // existing deadline instead of paying a coordinator retry.
+                    tokio::time::timeout_at(deadline, changed.changed())
+                        .await
+                        .map_err(|_| VoterReplacementError::Deadline)?
+                        .map_err(|_| VoterReplacementError::Unavailable)?;
                 }
-                Ok(ControlReply::AppliedMarker(marker))
             }
         }
     }
@@ -232,9 +395,10 @@ impl ConfigVoterProfile {
         resolver: Arc<dyn VoterPeerResolver>,
         compatibility: opc_consensus::ConsensusCompatibility,
     ) -> Result<Arc<Self>, ConfigConsensusOpenError> {
-        let admission = ConfigVoterAdmission::new(local, Arc::new(Reader(core.clone())))
-            .await
-            .map_err(|_| ConfigConsensusOpenError::DurableIdentityMismatch)?;
+        let admission =
+            ConfigVoterAdmission::new(local, Arc::new(Reader(core.admission_read_handle())))
+                .await
+                .map_err(|_| ConfigConsensusOpenError::DurableIdentityMismatch)?;
         core.voter_admission
             .set(Arc::downgrade(&admission))
             .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)?;
@@ -251,6 +415,8 @@ impl ConfigVoterProfile {
             transport,
             core,
             incoming: tokio::sync::Mutex::new(None),
+            coordinator: std::sync::OnceLock::new(),
+            snapshot_ready: Arc::new(tokio::sync::Notify::new()),
         }))
     }
 
@@ -262,6 +428,21 @@ impl ConfigVoterProfile {
             return false;
         };
         let metrics = raft.metrics().borrow().clone();
+        if metrics.running_state.is_err() {
+            return false;
+        }
+        // Joint membership makes the caught-up candidate an engine voter,
+        // but application readiness must wait for its local Finalize apply.
+        // Existing survivors continue serving while the owned coordinator
+        // completes the joint and uniform membership transition.
+        if state.table().replacement.as_ref().is_some_and(|operation| {
+            operation.successor.members.iter().any(|member| {
+                member.identity.node_id() == metrics.id
+                    && member.identity.slot() == operation.attestation.slot
+            })
+        }) {
+            return false;
+        }
         let membership = metrics.membership_config;
         let Some(cut) = *membership.log_id() else {
             return false;
@@ -307,7 +488,9 @@ impl ConfigVoterProfile {
         loop {
             // Never await admission's serial coordinator while holding the
             // incoming request guard; publication has its own independent task.
-            let state = Reader(self.core.clone()).read_voter_slot_state().await?;
+            let state = Reader(self.core.admission_read_handle())
+                .read_voter_slot_state()
+                .await?;
             if state.table().slots.iter().any(|slot| {
                 slot.member.identity.node_id() == local && slot.phase == VoterSlotPhase::Voting
             }) {
@@ -487,6 +670,31 @@ impl ConfigVoterProfile {
 }
 
 impl ConsensusConfigStore {
+    pub(super) async fn wake_replacement_after_download(&self, deadline: tokio::time::Instant) {
+        let Ok(state) = self.voter_slot_state().await else {
+            return;
+        };
+        let Some(operation) = state.table().replacement.as_ref() else {
+            return;
+        };
+        let vote = self.inner.raft.metrics().borrow().vote;
+        let Some(source) = vote.leader_id.voted_for() else {
+            return;
+        };
+        // The coordinator still verifies the installed artifact itself. This
+        // authenticated notice only wakes its retry wait, within this caller's
+        // unchanged deadline, after a potentially long checkpointed download.
+        let _ = self
+            .slot_control_call(
+                source,
+                &ControlRequest::SnapshotReady {
+                    request_digest: operation.attestation.request_digest,
+                },
+                deadline,
+            )
+            .await;
+    }
+
     /// Open the explicit Durable fixed-slot incarnation profile from a fresh installation.
     ///
     /// The resolver must prove both current workload credentials and the selected
@@ -498,6 +706,27 @@ impl ConsensusConfigStore {
         backend: SqliteBackend,
         snapshot_dir: impl Into<PathBuf>,
         resolver: Arc<dyn VoterPeerResolver>,
+    ) -> Result<Self, ConfigConsensusOpenError> {
+        Self::open_with_voter_slots_and_operation_timeout(
+            initial,
+            local,
+            backend,
+            snapshot_dir,
+            resolver,
+            DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Open the fixed-slot incarnation profile with an explicit complete
+    /// operation timeout, including candidate admission after retained repair.
+    pub async fn open_with_voter_slots_and_operation_timeout(
+        initial: VoterSlotTable,
+        local: ConsensusNodeId,
+        backend: SqliteBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        resolver: Arc<dyn VoterPeerResolver>,
+        operation_timeout: Duration,
     ) -> Result<Self, ConfigConsensusOpenError> {
         let topology = ConfigConsensusTopology::for_voter_slots(&initial, local)
             .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)?;
@@ -522,7 +751,7 @@ impl ConsensusConfigStore {
             snapshot_dir.into(),
             peers,
             Arc::new(SystemConfigConsensusClock),
-            DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+            operation_timeout,
             None,
             None,
             Some(ConfigVoterSetup { initial, resolver }),
@@ -537,7 +766,9 @@ impl ConsensusConfigStore {
             .voter_profile
             .as_ref()
             .ok_or(VoterReplacementError::IncompatibleProfile)?;
-        Reader(profile.core.clone()).read_voter_slot_state().await
+        Reader(profile.core.admission_read_handle())
+            .read_voter_slot_state()
+            .await
     }
 
     /// Resolve an accepted request using current controller authorization and a
@@ -921,9 +1152,31 @@ impl ConsensusConfigStore {
                             .await
                             .map_err(|_| VoterReplacementError::OutcomeUnknown)?;
                     }
-                    let evidence = self
-                        .deliver_initial_snapshot(target, &operation, vote, progress)
-                        .await?;
+                    let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
+                    let evidence = match self
+                        .slot_control_call(
+                            target,
+                            &ControlRequest::ReplacementSnapshot {
+                                request_digest: operation.attestation.request_digest,
+                            },
+                            deadline,
+                        )
+                        .await?
+                    {
+                        ControlReply::ReplacementSnapshot(SnapshotTransfer::CandidatePull(
+                            Some(evidence),
+                        )) => evidence,
+                        ControlReply::ReplacementSnapshot(SnapshotTransfer::CandidatePull(
+                            None,
+                        )) => {
+                            return Err(VoterReplacementError::Unavailable);
+                        }
+                        ControlReply::ReplacementSnapshot(SnapshotTransfer::LeaderPush) => {
+                            self.deliver_initial_snapshot(target, &operation, vote, progress)
+                                .await?
+                        }
+                        _ => return Err(VoterReplacementError::InvalidTransition),
+                    };
                     self.write_slot_control(advance(VoterReplacementStep::RecordSnapshot(
                         evidence,
                     )))
@@ -1211,19 +1464,27 @@ impl ConsensusConfigStore {
 }
 
 pub(super) fn start_coordinator(store: &ConsensusConfigStore) {
-    if store.inner.voter_profile.is_none() {
+    let Some(profile) = &store.inner.voter_profile else {
+        return;
+    };
+    let (finished, completion) = tokio::sync::watch::channel(());
+    if profile.coordinator.set(completion).is_err() {
         return;
     }
     let mut applied = store.inner.durable_progress.subscribe_applied();
+    let snapshot_ready = profile.snapshot_ready.clone();
     let weak = Arc::downgrade(&store.inner);
     let mut metrics = store.inner.raft.metrics();
     tokio::spawn(async move {
+        // Declared first, dropped last: completion cannot precede release of
+        // this coordinator's store, snapshot or accepted-work ownership.
+        let _finished = finished;
         let mut progress = ReplacementProgress::default();
         loop {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            if metrics.borrow().running_state.is_err() {
+            if metrics.borrow().running_state.is_err() || inner.shutdown.is_started() {
                 return;
             }
             let store = ConsensusConfigStore { inner };
@@ -1256,15 +1517,41 @@ pub(super) fn start_coordinator(store: &ConsensusConfigStore) {
             if pending {
                 // Our own apply notifications must not turn an error into a
                 // tight retry loop. Candidate recovery is checked at this cap.
-                tokio::time::sleep(progress.backoff()).await;
+                let retry = tokio::time::sleep(progress.backoff());
+                tokio::pin!(retry);
+                loop {
+                    tokio::select! {
+                        () = &mut retry => break,
+                        () = snapshot_ready.notified() => break,
+                        changed = metrics.changed() => {
+                            if changed.is_err() || metrics.borrow().running_state.is_err() {
+                                return;
+                            }
+                        },
+                    }
+                }
             } else {
                 tokio::select! {
+                    () = snapshot_ready.notified() => {},
                     changed = applied.changed() => if changed.is_err() { return; },
                     changed = metrics.changed() => if changed.is_err() { return; },
                 }
             }
         }
     });
+}
+
+pub(super) async fn join_coordinator(store: &ConsensusConfigStore) {
+    let Some(completion) = store
+        .inner
+        .voter_profile
+        .as_ref()
+        .and_then(|profile| profile.coordinator.get())
+    else {
+        return;
+    };
+    let mut completion = completion.clone();
+    while completion.changed().await.is_ok() {}
 }
 
 pub(super) async fn handle(
@@ -1323,14 +1610,35 @@ pub(super) async fn handle(
             let sender_voting = state.table().slots.iter().any(|slot| {
                 slot.member.identity.node_id() == sender && slot.phase == VoterSlotPhase::Voting
             });
-            if request.family != ConsensusRpcFamily::TopologyAdmissionBarrier && !sender_voting {
+            let repair_candidate = request.family == ConsensusRpcFamily::MemberRepair
+                && state.table().replacement.as_ref().is_some_and(|operation| {
+                    operation.phase == VoterReplacementPhase::Prepared
+                        && proof_replacement == Some(operation.attestation.request_digest)
+                        && state.table().slots.iter().any(|slot| {
+                            slot.member.identity.node_id() == sender
+                                && slot.member.identity.slot() == operation.attestation.slot
+                                && slot.phase == VoterSlotPhase::Pending
+                        })
+                });
+            if request.family == ConsensusRpcFamily::MemberRepair && !repair_candidate {
+                return Err(VoterReplacementError::UnauthorizedReplacement);
+            }
+            if request.family != ConsensusRpcFamily::TopologyAdmissionBarrier
+                && !sender_voting
+                && !repair_candidate
+            {
                 return Err(VoterReplacementError::UnauthorizedReplacement);
             }
             match request.family {
+                ConsensusRpcFamily::MemberRepair => {
+                    Ok(member_repair::handle(&store, &request.payload).await)
+                }
                 ConsensusRpcFamily::AppendEntries => {
                     let mut rpc = append.ok_or(VoterReplacementError::UnauthorizedReplacement)?;
                     let original_last = rpc.entries.last().map(|entry| entry.log_id);
-                    let state = Reader(profile.core.clone()).read_voter_slot_state().await?;
+                    let state = Reader(profile.core.admission_read_handle())
+                        .read_voter_slot_state()
+                        .await?;
                     if state.table().slots.iter().any(|slot| {
                         slot.member.identity.node_id() == store.inner.local_node_id
                             && slot.phase == VoterSlotPhase::Pending
@@ -1492,7 +1800,7 @@ pub(super) async fn handle(
                 ConsensusRpcFamily::TopologyAdmissionBarrier => {
                     let control = decode_config_wire(&request.payload)
                         .map_err(|_| VoterReplacementError::InvalidTransition)?;
-                    let response = profile.control(&store, control).await;
+                    let response = profile.control(&store, sender, control, deadline).await;
                     Ok(encode_config_wire(&response).map_or_else(
                         |_| rejected(ConsensusPeerError::Protocol),
                         |payload| ConsensusWireResponse {
@@ -1536,7 +1844,7 @@ fn rejected(error: ConsensusPeerError) -> ConsensusWireResponse {
     ConsensusWireResponse { result: Err(error) }
 }
 
-struct Reader(super::super::sqlite::ConfigConsensusCore);
+struct Reader(super::super::sqlite::ConfigConsensusReadHandle);
 impl std::fmt::Debug for Reader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConfigVoterStateReader")

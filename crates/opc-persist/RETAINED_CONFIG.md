@@ -27,36 +27,57 @@ qualification. It still requires lifecycle separation, scope/key validation,
 an exclusive opener and intact authenticated state. It is not general-purpose
 production durability evidence.
 
-After the backend is returned, pass the same topology to
+For ordinary retained authority, after the backend is returned pass the same topology to
 `ConsensusConfigStore::open`, wire its authenticated consensus transport, and
 call `initialize_cluster`. Returning a backend does not itself establish quorum
-or serving readiness. A repair member never bootstraps a new cluster, including
-when it is the canonical lowest member or after its next restart. While its
-storage is empty, it rejects engine RPCs and does not campaign. It pulls bounded
-snapshot chunks from an authenticated leader that proves a fresh surviving
-quorum. The snapshot covers the leader's accepted log prefix, including any
-tail that must finish applying, before Openraft installs the restored state and
-vote. Only then can the replacement participate in ordinary replication. This
-also supports repair after a planned handoff while the successor stays live.
-Repairing every member of a lost quorum cannot mint fresh genesis.
+or serving readiness. Repairing every member of a lost quorum cannot mint fresh
+genesis.
 
-Cancellation or a lost quorum leaves the empty member unadmitted; retry
-`initialize_cluster` on the same store when the quorum is available. A bounded
-attempt retains its verified partial download for the next call, so a large
-snapshot can progress across operation deadlines. If a saved attempt makes no
-progress, the next call rediscovers authenticated sources within its existing
-budget. A fresh response reuses the checkpoint only when its source, committed
-vote, and complete snapshot metadata still match; a successor or changed
-snapshot starts a new download.
-The source waits for the snapshot cut to cover the accepted prefix within the
-request budget before fetching the snapshot; unrelated engine metrics updates
-do not cause repeated fetches.
-Cancellation and shutdown
-remove that partial download automatically, and ordinary startup removes any
-staging left by a crash. A completed repair persists through the
-ordinary retained reopen path and can rejoin with a compatible majority. This
-does not reset a leader's recorded replication progress, change stored formats,
-or require manual cleanup during restart.
+### Repair after loss of durable Raft state
+
+A voter that loses its durable vote must use a new Raft identity. A current
+leader's committed term cannot reconstruct a vote the lost voter granted in an
+unfinished election outside that leader's quorum. Reusing the identity can
+therefore grant two candidates a vote in one term. This rule applies to every
+supported quorum size, including three voters.
+
+Use the [incarnation profile](../../docs/rfc/023-voter-slot-incarnations.md)
+from initial formation, with an authenticated `VoterPeerResolver`. The
+consumer's controller declares loss and proves the selected candidate key;
+`replace_voter` commits Prepare through the surviving quorum. Construct
+`RetainedConfigBinding::for_voter_slots` from that exact Prepare table, the
+selected new Pending identity, and independently admitted storage/key digests.
+Provision its fresh backing with `provision_config_member_repair`, then call
+`open_with_voter_slots` (or `open_with_voter_slots_and_operation_timeout`). Wire
+the new identity's authenticated endpoint and call `initialize_cluster`.
+
+Initialization downloads the snapshot from the surviving leader. Each chunk
+requires a fresh source quorum; the empty candidate never counts toward it.
+The SDK coordinator observes the installed snapshot, catches up the nonvoting
+learner, and commits joint and uniform membership before application admission. The old
+identity remains retired. The candidate cannot vote or bootstrap a new cluster
+while awaiting membership, even when its logical slot was the canonical
+bootstrap slot. Legacy same-identity repair starts with elections and
+heartbeats disabled, rejects consensus RPCs, and returns
+`VoterIdentityReplacementRequired` from `initialize_cluster`.
+
+Each initialization attempt keeps its original complete deadline. An ordinary
+deadline retains the verified download checkpoint for the next attempt; fresh
+discovery reuses it only for the exact same source vote and snapshot metadata.
+A stalled former source triggers rediscovery. Cancelling an active attempt
+removes its partial file, including a checkpoint that attempt had resumed.
+Shutdown removes a saved checkpoint. Once installation is dispatched, the
+admission owner joins its engine effect even if the caller stops waiting.
+
+Keep the exact initial binding when reopening the same candidate backing; the
+replicated table advances inside it. Cancellation of an admission wait does
+not cancel the accepted replacement. Restart with intact backing resumes the
+same incarnation and durable phase through the SDK-owned coordinator, without
+another replacement request or a manual recovery step. If that backing is
+lost again, the controller must select another new incarnation. Crossing into
+the incarnation stored format requires a fresh installation. Shutdown joins the
+replacement coordinator and active admission reads, including SQLite work whose
+caller was cancelled, before reporting completion and allowing retained reopen.
 
 Snapshot reads pin the last published record under a brief publication gate,
 then open and verify an independent descriptor outside the gate. The pin keeps

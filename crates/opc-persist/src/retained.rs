@@ -58,6 +58,7 @@ enum OpenIntent {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RetainedConfigBinding {
     topology: ConfigConsensusTopology,
+    voter_slots: Option<opc_consensus::voter_slots::VoterSlotTable>,
     backing_identity: [u8; 32],
     key_scope: [u8; 32],
 }
@@ -74,16 +75,39 @@ impl RetainedConfigBinding {
         }
         Ok(Self {
             topology,
+            voter_slots: None,
             backing_identity,
             key_scope,
         })
+    }
+
+    /// Bind a retained voter to its independently admitted incarnation table.
+    ///
+    /// A replacement uses the committed Prepare table and its selected new
+    /// identity. Keep this exact initial binding when reopening the same backing;
+    /// the replicated table advances inside the authenticated retained storage.
+    pub fn for_voter_slots(
+        initial: opc_consensus::voter_slots::VoterSlotTable,
+        local_node_id: crate::ConfigConsensusNodeId,
+        backing_identity: [u8; 32],
+        key_scope: [u8; 32],
+    ) -> Result<Self, RetainedConfigError> {
+        let topology = ConfigConsensusTopology::for_voter_slots(&initial, local_node_id)
+            .map_err(|_| RetainedConfigError::InvalidRequest)?;
+        let mut binding = Self::new(topology, backing_identity, key_scope)?;
+        binding.voter_slots = Some(initial);
+        Ok(binding)
     }
 
     pub(crate) fn topology(&self) -> &ConfigConsensusTopology {
         &self.topology
     }
 
-    fn digest(&self, key: &AuditKey) -> [u8; 32] {
+    pub(crate) fn voter_slots(&self) -> Option<&opc_consensus::voter_slots::VoterSlotTable> {
+        self.voter_slots.as_ref()
+    }
+
+    fn digest(&self, key: &AuditKey) -> Result<[u8; 32], RetainedConfigError> {
         let identity = self.topology.identity();
         let mut digest = Sha256::new();
         digest.update(BINDING_DOMAIN);
@@ -99,7 +123,14 @@ impl RetainedConfigBinding {
         digest.update(self.key_scope);
         digest.update(key.epoch().to_be_bytes());
         digest.update(key.fingerprint());
-        digest.finalize().into()
+        if let Some(initial) = &self.voter_slots {
+            let encoded = opc_consensus::voter_slots::encode_voter_slot_table(initial)
+                .map_err(|_| RetainedConfigError::InvalidRequest)?;
+            digest.update(b"voter-slots/v1\0");
+            digest.update((encoded.len() as u64).to_be_bytes());
+            digest.update(encoded);
+        }
+        Ok(digest.finalize().into())
     }
 }
 
@@ -280,9 +311,14 @@ impl SqliteBackend {
     /// the authenticated existing quorum. Its persisted repair disposition
     /// forbids local genesis, including after reopening. Loss of the complete
     /// quorum therefore requires a separately approved new authority, never
-    /// repeated member repair. Existing artifacts are not overwritten. The
-    /// consensus store restores a quorum-authorized snapshot before the empty
-    /// replacement can vote or answer replication requests under its node ID.
+    /// repeated member repair. Existing artifacts are not overwritten.
+    ///
+    /// Loss of durable Raft state requires a new voter identity, even if a
+    /// surviving quorum can provide the complete history. Use
+    /// [`RetainedConfigBinding::for_voter_slots`] with the committed Prepare
+    /// table and selected Pending incarnation, then open the incarnation
+    /// profile. Legacy same-identity repair cannot initialize or process Raft
+    /// traffic; it returns `VoterIdentityReplacementRequired` on initialization.
     pub async fn provision_config_member_repair(
         options: RetainedConfigOptions,
         audit_key: AuditKey,
@@ -489,6 +525,7 @@ fn open_authority_sync(
         crate::consensus::provision_retained_schema(
             &conn,
             options.binding.topology(),
+            options.binding.voter_slots(),
             &audit_key,
             work.deadline,
         )
@@ -605,7 +642,7 @@ fn make_record(
 ) -> Result<[u8; RECORD_BYTES], RetainedConfigError> {
     let mut record = [0; RECORD_BYTES];
     record[..8].copy_from_slice(RECORD_MAGIC);
-    record[8..40].copy_from_slice(&binding.digest(key));
+    record[8..40].copy_from_slice(&binding.digest(key)?);
     record[40..72].copy_from_slice(&nonce);
     record[72] = u8::from(repair_only);
     for (i, value) in identity.iter().enumerate() {
@@ -630,7 +667,7 @@ fn validate_record(
     mac.update(&record[..RECORD_BYTES - 32]);
     mac.verify_slice(&record[RECORD_BYTES - 32..])
         .map_err(|_| RetainedConfigError::Rejected)?;
-    if &record[..8] != RECORD_MAGIC || record[8..40] != binding.digest(key) || record[72] > 1 {
+    if &record[..8] != RECORD_MAGIC || record[8..40] != binding.digest(key)? || record[72] > 1 {
         return Err(RetainedConfigError::Rejected);
     }
     Ok(())
@@ -781,6 +818,7 @@ fn validate_connection(
     crate::consensus::validate_retained_schema(
         conn,
         options.binding.topology(),
+        options.binding.voter_slots(),
         key,
         work.deadline,
     )

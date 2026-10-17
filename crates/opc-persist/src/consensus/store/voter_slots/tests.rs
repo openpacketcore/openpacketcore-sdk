@@ -52,10 +52,21 @@ fn genesis() -> VoterSlotTable {
 #[derive(Debug, Default)]
 struct Network {
     handlers: std::sync::RwLock<BTreeMap<ConsensusNodeId, Arc<dyn ConsensusRpcHandler>>>,
+    blocked_paths: std::sync::Mutex<BTreeSet<(ConsensusNodeId, ConsensusNodeId)>>,
+    votes: std::sync::Mutex<Vec<RecordedVote>>,
+    vote_changed: tokio::sync::Notify,
+    learner_binding: std::sync::Mutex<Option<VoterRpcBinding>>,
     freeze_after_marker: AtomicU64,
     paused_replication_to: AtomicU64,
     allow_paused_requests: std::sync::Mutex<BTreeSet<[u8; 32]>>,
     paused_nonempty_append_to: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+struct RecordedVote {
+    target: ConsensusNodeId,
+    request: VoteRequest<ConsensusNodeId>,
+    response: opc_consensus::engine::raft::VoteResponse<ConsensusNodeId>,
 }
 #[derive(Debug, Clone)]
 struct Resolver(Arc<Network>);
@@ -96,6 +107,15 @@ impl ConsensusPeer for Peer {
         binding: VoterRpcBinding,
         timeout: Duration,
     ) -> Result<VoterAuthenticatedResponse, ConsensusPeerError> {
+        if self
+            .network
+            .blocked_paths
+            .lock()
+            .unwrap()
+            .contains(&(request.sender, self.node_id()))
+        {
+            return Err(ConsensusPeerError::Unavailable);
+        }
         if self.network.paused_replication_to.load(Ordering::SeqCst) == self.node_id().get()
             && !self
                 .network
@@ -153,6 +173,24 @@ impl ConsensusPeer for Peer {
         let response = handler
             .handle_with_incarnation(proof, request.clone())
             .await;
+        if request.family == ConsensusRpcFamily::Vote {
+            if let Ok(payload) = &response.result {
+                if let Ok(Ok(vote)) = decode_config_wire::<
+                    Result<
+                        opc_consensus::engine::raft::VoteResponse<ConsensusNodeId>,
+                        RaftError<ConsensusNodeId>,
+                    >,
+                >(payload)
+                {
+                    self.network.votes.lock().unwrap().push(RecordedVote {
+                        target: self.node_id(),
+                        request: decode_config_wire(&request.payload).unwrap(),
+                        response: vote,
+                    });
+                    self.network.vote_changed.notify_waiters();
+                }
+            }
+        }
         if request.family == ConsensusRpcFamily::TopologyAdmissionBarrier
             && self.network.freeze_after_marker.load(Ordering::SeqCst) == self.node_id().get()
             && response.result.as_ref().is_ok_and(|payload| {
@@ -162,6 +200,7 @@ impl ConsensusPeer for Peer {
                 )
             })
         {
+            *self.network.learner_binding.lock().unwrap() = Some(binding.clone());
             self.network.freeze_after_marker.store(0, Ordering::SeqCst);
             self.network
                 .paused_replication_to
@@ -763,6 +802,28 @@ async fn authenticated_profile_forms_a_real_quorum_and_raw_vote_has_no_effect() 
         Err(VoterReplacementError::TargetStillLive)
     );
     assert_eq!(leader.voter_slot_state().await.unwrap().table(), &genesis());
+    let repair = ConsensusWireRequest::try_new(
+        store.inner.identity,
+        store.inner.local_node_id,
+        ConsensusRpcFamily::MemberRepair,
+        encode_config_wire(&()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .inner
+            .voter_profile
+            .as_ref()
+            .unwrap()
+            .transport
+            .peer(leader.inner.local_node_id)
+            .call_with_timeout(repair, Duration::from_secs(3))
+            .await
+            .unwrap()
+            .result,
+        Err(ConsensusPeerError::ScopeMismatch),
+        "authenticated voting members cannot enter the pending candidate download path"
+    );
     fleet.close().await;
 }
 
@@ -858,6 +919,9 @@ mod review_tests;
 
 #[path = "retry_tests.rs"]
 mod retry_tests;
+
+#[path = "retained_tests.rs"]
+mod retained_tests;
 
 #[path = "snapshot_tests.rs"]
 mod snapshot_tests;
