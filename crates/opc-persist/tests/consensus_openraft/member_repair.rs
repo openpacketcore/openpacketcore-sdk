@@ -118,6 +118,15 @@ fn staged_repair_bytes(path: &std::path::Path) -> Vec<u64> {
         .collect()
 }
 
+fn staged_repair_files(path: &std::path::Path) -> Vec<(std::ffi::OsString, u64)> {
+    std::fs::read_dir(path)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("incoming-"))
+        .map(|entry| (entry.file_name(), entry.metadata().unwrap().len()))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
     let directory = tempfile::tempdir().unwrap();
@@ -297,6 +306,100 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
     assert_ne!(old[0].vote, new[0].vote);
     assert_eq!(new[0].vote.leader_id.voted_for(), Some(successor));
     assert_eq!(old[0].meta.last_membership, new[0].meta.last_membership);
+    assert!(staged_repair_bytes(&snapshots).is_empty());
+}
+
+#[tokio::test]
+async fn repair_rediscovery_reuses_the_verified_checkpoint_for_the_same_snapshot() {
+    let mut cluster = ThreeNodeCluster::start().await;
+    let tx = TxId::new();
+    cluster.stores[cluster.leader()]
+        .append_commit_idempotent(
+            ConfigConsensusRequestId::from_bytes([0x44; 16]),
+            large_attested(tx),
+        )
+        .await
+        .unwrap();
+    cluster.stores[0].shutdown().await.unwrap();
+    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).unwrap());
+    let topology =
+        ConfigConsensusTopology::try_new(cluster.identity, nodes[0], nodes.into_iter().collect())
+            .unwrap();
+    let backend = SqliteBackend::provision_config_member_repair(
+        retained_options(
+            &cluster._directory.path().join("rediscovery-repair.sqlite"),
+            topology.clone(),
+            11,
+        ),
+        audit_key(),
+    )
+    .await
+    .unwrap();
+    let control = Arc::new(RepairControl::default());
+    let peers = (1..3)
+        .map(|target| {
+            (
+                nodes[target],
+                Arc::new(RepairPeer {
+                    peer: cluster.paths[&(0, target)].clone(),
+                    control: control.clone(),
+                }) as Arc<dyn ConsensusPeer>,
+            )
+        })
+        .collect();
+    let snapshots = cluster._directory.path().join("rediscovery-snapshots");
+    cluster.stores[0] = ConsensusConfigStore::open_with_operation_timeout(
+        topology,
+        backend,
+        &snapshots,
+        peers,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            peer.install(cluster.stores[0].rpc_handler()).await;
+        }
+    }
+    control.chunk_limit.store(1, Ordering::SeqCst);
+    assert!(cluster.stores[0].initialize_cluster().await.is_err());
+    let checkpoint = staged_repair_files(&snapshots);
+    assert_eq!(checkpoint.len(), 1);
+    assert_eq!(checkpoint[0].1, 128 * 1024);
+    // This retry makes no progress. The next one must rediscover, while
+    // retaining these bytes unless the authenticated snapshot has changed.
+    assert!(cluster.stores[0].initialize_cluster().await.is_err());
+    assert_eq!(staged_repair_files(&snapshots), checkpoint);
+    control.chunk_limit.store(2, Ordering::SeqCst);
+    assert!(cluster.stores[0].initialize_cluster().await.is_err());
+    let rediscovered_checkpoint = staged_repair_files(&snapshots);
+    assert!(!cluster.stores[0].status().admitted);
+    assert!(cluster.stores[0].status().applied_index.is_none());
+    control.chunk_limit.store(0, Ordering::SeqCst);
+    cluster.stores[0].initialize_cluster().await.unwrap();
+    let recovered = cluster.stores[0]
+        .load_latest()
+        .await
+        .unwrap()
+        .unwrap()
+        .record
+        .tx_id;
+    cluster.shutdown().await;
+
+    let received = control.received.lock().unwrap();
+    assert_eq!(
+        received[1].offset, 0,
+        "an unchanged retry triggers fresh discovery"
+    );
+    assert_eq!(received[0].vote, received[1].vote);
+    assert_eq!(received[0].meta, received[1].meta);
+    assert_eq!(
+        rediscovered_checkpoint, checkpoint,
+        "matching discovery must retain the same staging file and verified bytes"
+    );
+    assert!(received.iter().any(|chunk| chunk.offset == 128 * 1024));
+    assert_eq!(recovered, tx);
     assert!(staged_repair_bytes(&snapshots).is_empty());
 }
 
