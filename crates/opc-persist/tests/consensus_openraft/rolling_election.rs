@@ -274,7 +274,7 @@ impl RollingElection {
         assert!(live.contains(&writer), "the in-flight writer must survive");
         let state = fleet.store(index).status();
         if state.leader_id != Some(state.node_id) {
-            fleet.stop(index).await;
+            fleet.stop_disconnected(index).await;
             self.scripts[index].take().unwrap().finish();
             fleet.append(writer).await;
             return;
@@ -305,7 +305,7 @@ impl RollingElection {
                 tokio::task::yield_now().await;
             }
             let old_term = fleet.store(index).status().term;
-            fleet.stop(index).await;
+            fleet.stop_disconnected(index).await;
             self.scripts[index].take().unwrap().finish();
             let gate = Arc::new(VoteGate {
                 first_term: old_term + 1,
