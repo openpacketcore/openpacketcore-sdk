@@ -1122,13 +1122,27 @@ async fn blocked_transfer(mode: SessionPersistenceMode, window: u64, cycles: usi
                         store.inner.persistence_protocol.is_active(),
                         store.inner.backend.snapshot_observation().phase_for_test(),
                     )).collect::<Vec<_>>());
-                assert!(reply.unwrap().raft_log_index > target + 8,
+                let response = reply.unwrap();
+                assert!(response.raft_log_index > target + 8,
                     "the retained request must be committed after filling the window");
+                eprintln!("log_admission_transfer committed mode={mode:?} window={window} raft_log_index={} elapsed_millis={} original_voter={:?}",
+                    response.raft_log_index, resumed.elapsed().as_millis(),
+                    store.inner.raft.metrics().borrow().clone());
                 let mut metrics = store.inner.raft.metrics();
                 while store.log_pressure_snapshot().retained_rows >= window {
                     metrics.changed().await.unwrap();
                 }
-            }).await.expect("handoff, committed write and original-voter reclamation share the original recovery deadline");
+            }).await.inspect_err(|error| {
+                eprintln!("log_admission_transfer recovery deadline mode={mode:?} window={window} elapsed_millis={} error={error:?}; voters={:?}",
+                    resumed.elapsed().as_millis(),
+                    fleet.stores.iter().flatten().map(|store| (
+                        store.inner.local_node_id,
+                        store.log_pressure_snapshot(),
+                        store.inner.raft.metrics().borrow().clone(),
+                        store.inner.persistence_protocol.is_active(),
+                        store.inner.backend.snapshot_observation().phase_for_test(),
+                    )).collect::<Vec<_>>());
+            }).expect("handoff, committed write and original-voter reclamation share the original recovery deadline");
             assert!(store.log_pressure_snapshot().retained_rows < window);
             assert!(store.inner.raft.metrics().borrow().running_state.is_ok());
             eprintln!("log_admission_transfer mode={mode:?} window={window} resumed_millis={}", resumed.elapsed().as_millis());
