@@ -3930,6 +3930,47 @@ async fn config_openraft_forms_and_commits_over_the_shared_mtls_adapter_case() {
                 .is_some_and(|index| index >= catchup_index)
     }));
 
+    // A planned stop must also work through the authenticated production
+    // transport. Remove the old listener only after the store confirms its
+    // successor, then require a new committed command on the surviving quorum.
+    let report = stores[leader_index]
+        .shutdown_with_report()
+        .await
+        .expect("planned config leader shutdown over mTLS");
+    let opc_consensus::PlannedShutdownOutcome::LeaderTransferred { successor } = report else {
+        panic!("mTLS handoff did not confirm successor authority: {report:?}");
+    };
+    assert_ne!(successor, leader);
+    servers[leader_index]
+        .take()
+        .expect("retiring leader listener")
+        .abort_and_wait()
+        .await;
+    tokio::time::timeout(DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+        let error = stores[follower_index]
+            .mark_confirmed_idempotent(
+                ConfigConsensusRequestId::from_bytes([0xBE; 16]),
+                opc_types::TxId::new(),
+            )
+            .await
+            .expect_err("successor commits the deterministic missing-target result");
+        assert!(matches!(error.kind(), PersistErrorKind::RollbackNotFound));
+        for store in stores
+            .iter()
+            .filter(|store| store.status().node_id != leader)
+        {
+            store
+                .probe_durable_readiness()
+                .await
+                .expect("surviving mTLS quorum is ready after listener removal");
+            let status = store.status();
+            assert_eq!(status.leader_id, Some(successor));
+            assert!(status.term > original_term);
+        }
+    })
+    .await
+    .expect("post-handoff mTLS write retains the original operation budget");
+
     let _ = tokio::join!(
         stores[0].shutdown(),
         stores[1].shutdown(),
