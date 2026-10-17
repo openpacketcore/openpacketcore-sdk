@@ -3,6 +3,7 @@ use super::*;
 #[derive(Debug, Default)]
 struct RepairControl {
     pause_after_first_chunk: AtomicBool,
+    chunk_limit: AtomicUsize,
     chunks: AtomicUsize,
     calls: AtomicUsize,
     blocked: tokio::sync::Notify,
@@ -48,8 +49,10 @@ impl ConsensusPeer for RepairPeer {
         let repair = request.family == ConsensusRpcFamily::MemberRepair;
         if repair {
             self.control.calls.fetch_add(1, Ordering::SeqCst);
-            if self.control.chunks.load(Ordering::SeqCst) > 0
-                && self.control.pause_after_first_chunk.load(Ordering::SeqCst)
+            let chunks = self.control.chunks.load(Ordering::SeqCst);
+            let limit = self.control.chunk_limit.load(Ordering::SeqCst);
+            if (chunks > 0 && self.control.pause_after_first_chunk.load(Ordering::SeqCst))
+                || (limit > 0 && chunks >= limit)
             {
                 self.control.blocked.notify_one();
                 return std::future::pending().await;
@@ -64,6 +67,125 @@ impl ConsensusPeer for RepairPeer {
         }
         Ok(reply)
     }
+}
+
+#[tokio::test]
+async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
+    let mut cluster =
+        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew).await;
+    let (a, b, c) = tokio::join!(
+        cluster.stores[0].initialize_cluster(),
+        cluster.stores[1].initialize_cluster(),
+        cluster.stores[2].initialize_cluster()
+    );
+    a.unwrap();
+    b.unwrap();
+    c.unwrap();
+    cluster.wait_ready().await;
+    let tx = TxId::new();
+    cluster.stores[cluster.leader()]
+        .append_commit_idempotent(
+            ConfigConsensusRequestId::from_bytes([0x43; 16]),
+            large_attested(tx),
+        )
+        .await
+        .unwrap();
+    cluster.stores[0].shutdown().await.unwrap();
+
+    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).unwrap());
+    let topology =
+        ConfigConsensusTopology::try_new(cluster.identity, nodes[0], nodes.into_iter().collect())
+            .unwrap();
+    let backend = SqliteBackend::provision_config_member_repair(
+        retained_options(
+            &cluster._directory.path().join("bounded-repair.sqlite"),
+            topology.clone(),
+            10,
+        ),
+        audit_key(),
+    )
+    .await
+    .unwrap();
+    let control = Arc::new(RepairControl::default());
+    let peers = (1..3)
+        .map(|target| {
+            (
+                nodes[target],
+                Arc::new(RepairPeer {
+                    peer: cluster.paths[&(0, target)].clone(),
+                    control: control.clone(),
+                }) as Arc<dyn ConsensusPeer>,
+            )
+        })
+        .collect();
+    let snapshots = cluster._directory.path().join("bounded-repair-snapshots");
+    cluster.stores[0] = ConsensusConfigStore::open_with_operation_timeout(
+        topology,
+        backend,
+        &snapshots,
+        peers,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            peer.install(cluster.stores[0].rpc_handler()).await;
+        }
+    }
+    let mut previous_bytes = 0;
+    let mut completed = false;
+    for attempt in 0..16 {
+        let chunks_before = control.chunks.load(Ordering::SeqCst);
+        control
+            .chunk_limit
+            .store(chunks_before + 1, Ordering::SeqCst);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            cluster.stores[0].initialize_cluster(),
+        )
+        .await
+        .expect("each initialization keeps its original bounded deadline");
+        if result.is_ok() {
+            assert!(attempt > 0, "snapshot needs more than one admitted chunk");
+            completed = true;
+            break;
+        }
+        assert!(!cluster.stores[0].status().admitted);
+        assert!(cluster.stores[0].status().applied_index.is_none());
+        assert_eq!(
+            control.chunks.load(Ordering::SeqCst),
+            chunks_before + 1,
+            "a real snapshot chunk arrived before the bounded attempt ended"
+        );
+        let incoming = std::fs::read_dir(&snapshots)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("incoming-"))
+            .collect::<Vec<_>>();
+        assert_eq!(incoming.len(), 1, "deadline retains the partial download");
+        let bytes = incoming[0].metadata().unwrap().len();
+        assert!(
+            bytes > previous_bytes,
+            "retry advances instead of restarting"
+        );
+        previous_bytes = bytes;
+    }
+    assert!(
+        completed,
+        "finite snapshot completes across bounded retries"
+    );
+    assert_eq!(
+        cluster.stores[0]
+            .load_latest()
+            .await
+            .unwrap()
+            .unwrap()
+            .record
+            .tx_id,
+        tx
+    );
+    cluster.shutdown().await;
 }
 
 fn large_attested(tx: TxId) -> AttestedConfigCommit {
