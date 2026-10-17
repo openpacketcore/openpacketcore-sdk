@@ -20,6 +20,8 @@ use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::RwLock;
 
+mod four_worker;
+
 struct Pki(rcgen::CertifiedIssuer<'static, rcgen::KeyPair>);
 
 impl Pki {
@@ -134,6 +136,7 @@ struct NetworkPath {
     remote: RemoteSessionConsensusPeer,
     enabled: AtomicBool,
     activity: Arc<tokio::sync::Notify>,
+    election_vote: std::sync::Mutex<Option<Arc<election::VoteGate>>>,
 }
 
 #[async_trait::async_trait]
@@ -153,7 +156,20 @@ impl ConsensusPeer for NetworkPath {
         if !self.enabled.load(Ordering::Acquire) {
             return Err(ConsensusPeerError::Unavailable);
         }
+        let gate = self
+            .election_vote
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|_| request.family == ConsensusRpcFamily::Vote);
+        if let Some(gate) = &gate {
+            gate.before_delivery(&request).await;
+        }
+        let sender = request.sender;
         let result = self.remote.call(request).await;
+        if let (Some(gate), Ok(response)) = (gate, &result) {
+            gate.after_delivery(sender, self.node_id(), response);
+        }
         self.activity.notify_one();
         result
     }
@@ -168,17 +184,33 @@ impl ConsensusPeer for NetworkPath {
         }
         // Preserve the caller's remaining timeout and the adapter's fixed
         // family/cold-connection bounds. Never fall back to direct RPCs.
+        let gate = self
+            .election_vote
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|_| request.family == ConsensusRpcFamily::Vote);
+        if let Some(gate) = &gate {
+            gate.before_delivery(&request).await;
+        }
+        let sender = request.sender;
         let result = self.remote.call_with_timeout(request, timeout).await;
+        if let (Some(gate), Ok(response)) = (gate, &result) {
+            gate.after_delivery(sender, self.node_id(), response);
+        }
         self.activity.notify_one();
         result
     }
 }
+
+type SourceGates = Arc<BTreeMap<ConfigConsensusNodeId, tokio::sync::RwLock<bool>>>;
 
 #[derive(Debug)]
 struct ObservedHandler {
     inner: Arc<dyn ConsensusRpcHandler>,
     admissions: Arc<AtomicU64>,
     activity: Arc<tokio::sync::Notify>,
+    source_gates: SourceGates,
 }
 
 #[async_trait::async_trait]
@@ -193,7 +225,21 @@ impl ConsensusRpcHandler for ObservedHandler {
             "transport admitted a mismatched sender"
         );
         self.admissions.fetch_add(1, Ordering::AcqRel);
+        // A writer both blocks later old-leader requests and waits for every
+        // already-admitted handler to finish, including RPCs whose outbound
+        // caller was cancelled before the server completed the request.
+        let blocked = match self.source_gates.get(&authenticated_sender) {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        };
+        if blocked.as_ref().is_some_and(|blocked| **blocked) {
+            self.activity.notify_one();
+            return ConsensusWireResponse {
+                result: Err(ConsensusPeerError::Unavailable),
+            };
+        }
         let response = self.inner.handle(authenticated_sender, request).await;
+        drop(blocked);
         self.activity.notify_one();
         response
     }
@@ -210,10 +256,19 @@ struct NetworkQuorum {
     checkpoints: Arc<Checkpoints>,
     admissions: Arc<AtomicU64>,
     activity: Arc<tokio::sync::Notify>,
+    source_gates: SourceGates,
 }
 
 impl NetworkQuorum {
     async fn open() -> Self {
+        Self::open_scripted(None).await
+    }
+
+    async fn open_scripted(
+        scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
+    ) -> Self {
+        use tracing::Instrument;
+
         let pki = Pki::new();
         let manifest = manifest("netconf-required-authenticated-voters", 1, 1);
         let directory = tempfile::tempdir().unwrap();
@@ -224,6 +279,12 @@ impl NetworkQuorum {
         let nodes = bindings
             .each_ref()
             .map(|binding| binding.local_consensus_node_id());
+        let source_gates: SourceGates = Arc::new(
+            nodes
+                .into_iter()
+                .map(|node| (node, tokio::sync::RwLock::new(false)))
+                .collect(),
+        );
         let identity = bindings[0].consensus_identity();
         let addresses: Vec<_> = (0..3).map(|_| Arc::new(RwLock::new(None))).collect();
         let mut paths = BTreeMap::new();
@@ -245,6 +306,7 @@ impl NetworkQuorum {
                     ),
                     enabled: AtomicBool::new(true),
                     activity: activity.clone(),
+                    election_vote: std::sync::Mutex::new(None),
                 });
                 assert!(path.scope_identity() == Some(identity));
                 paths.insert((source, target), path.clone());
@@ -275,17 +337,25 @@ impl NetworkQuorum {
             .unwrap();
             let keys =
                 AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x91; 32]).unwrap()]).unwrap();
-            stores.push(Arc::new(
-                ConsensusConfigStore::open_with_audit_continuity(
-                    topology,
-                    backend,
-                    directory.path().join(format!("snapshots-{source}")),
-                    peers,
-                    AuditContinuityPolicy::new(keys, checkpoints.clone(), 1, 1).unwrap(),
-                )
-                .await
-                .unwrap(),
-            ));
+            let opening = ConsensusConfigStore::open_with_audit_continuity(
+                topology,
+                backend,
+                directory.path().join(format!("snapshots-{source}")),
+                peers,
+                AuditContinuityPolicy::new(keys, checkpoints.clone(), 1, 1).unwrap(),
+            );
+            let store = match scripts {
+                Some(scripts) => {
+                    scripts[source]
+                        .scope(
+                            opening.instrument(election::delivery::node_span(nodes[source].get())),
+                        )
+                        .await
+                }
+                None => opening.await,
+            }
+            .unwrap();
+            stores.push(Arc::new(store));
         }
         let mut servers = Vec::new();
         for (index, binding) in bindings.into_iter().enumerate() {
@@ -294,6 +364,7 @@ impl NetworkQuorum {
                     inner: stores[index].rpc_handler(),
                     admissions: admissions.clone(),
                     activity: activity.clone(),
+                    source_gates: source_gates.clone(),
                 }),
                 pki.server(index as u16 + 1),
                 binding,
@@ -316,6 +387,7 @@ impl NetworkQuorum {
             checkpoints,
             admissions,
             activity,
+            source_gates,
         }
     }
 
@@ -381,6 +453,13 @@ impl NetworkQuorum {
         }
     }
 
+    async fn isolate_and_quiesce(&self, node: usize) {
+        self.isolate(node);
+        *self.source_gates[&self.stores[node].status().node_id]
+            .write()
+            .await = true;
+    }
+
     async fn shutdown(self) {
         for server in self.servers {
             server.abort_and_wait().await;
@@ -393,6 +472,26 @@ impl NetworkQuorum {
         one.unwrap();
         two.unwrap();
         three.unwrap();
+    }
+}
+
+impl election::Voters for NetworkQuorum {
+    fn stores(&self) -> &[Arc<ConsensusConfigStore>] {
+        &self.stores
+    }
+
+    fn observe_votes(&self, gate: Option<Arc<election::VoteGate>>) {
+        for path in [(1, 2), (2, 1)] {
+            *self.paths[&path].election_vote.lock().unwrap() = gate.clone();
+        }
+    }
+
+    async fn isolate_and_quiesce(&self, node: usize) {
+        NetworkQuorum::isolate_and_quiesce(self, node).await;
+    }
+
+    async fn leader_except(&self, excluded: Option<usize>) -> usize {
+        NetworkQuorum::leader_except(self, excluded).await
     }
 }
 
@@ -420,6 +519,7 @@ async fn assert_authentication_controls(
             inner: handler,
             admissions: admissions.clone(),
             activity: Arc::new(tokio::sync::Notify::new()),
+            source_gates: Arc::default(),
         }),
         pki.server(2),
         accepted.bind_local(replica_id(2)).unwrap(),
@@ -521,74 +621,112 @@ async fn partitioned_authority_timeout_reports_observed_voter_state() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn required_running_terminal_debt_survives_authenticated_voter_leadership_change() {
-    let quorum = NetworkQuorum::open().await;
-    let result = AssertUnwindSafe(async {
-        // Use a dedicated counter/listener around the actual config handler.
-        // Background Raft traffic cannot hide a rejected call in this counter.
-        // Keep admission/formation within the fleet's failure cleanup boundary.
-        assert_authentication_controls(
-            &quorum.pki,
-            &quorum.manifest,
-            quorum.stores[1].rpc_handler(),
-        )
-        .await;
-        let (one, two, three) = tokio::join!(
-            quorum.stores[0].initialize_cluster(),
-            quorum.stores[1].initialize_cluster(),
-            quorum.stores[2].initialize_cluster(),
-        );
-        one.unwrap();
-        two.unwrap();
-        three.unwrap();
-        let old_leader = quorum.leader_except(None).await;
-        assert!(quorum.stores[old_leader]
-            .load_latest()
-            .await
-            .unwrap()
-            .is_none());
-        quorum.stores[old_leader]
-            .initialize_audit_authority(
-                &AuditPrivacyKey::new([0x81; 32]).unwrap(),
-                AuditLedgerLimits::new(90, 30).unwrap(),
-            )
-            .await
-            .unwrap();
-        let old_owner = Owner::open(quorum.stores[old_leader].clone(), true).await;
-        assert_eq!(quorum.checkpoints.sequence(), 3);
-        let old_server = running::required_server_for_bus(old_owner.bus.clone());
-        let old_sessions = SessionRegistry::new();
-        let old_registration = old_sessions.register(1).unwrap();
-        let request_id = RequestId::new();
-        quorum.checkpoints.refuse_from.store(6, Ordering::Release);
-        let reply = old_server
-            .handle_rpc_for_session_async(
-                request_id,
-                &principal(),
-                &edit("fixture-before-election"),
-                &MgmtLimits::default(),
-                1,
-                &old_sessions,
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let (
+        quorum,
+        (
+            old_leader,
+            old_owner,
+            old_server,
+            old_sessions,
+            old_registration,
+            request_id,
+            committed,
+            new_leader,
+        ),
+    ) = async {
+        let election = election::SuccessfulElection::new(runtime_origin).await;
+        let quorum = NetworkQuorum::open_scripted(Some(&election.scripts)).await;
+        let setup = AssertUnwindSafe(async {
+            // Use a dedicated counter/listener around the actual config handler.
+            // Background Raft traffic cannot hide a rejected call in this counter.
+            // Keep admission/formation within the fleet's failure cleanup boundary.
+            assert_authentication_controls(
+                &quorum.pki,
+                &quorum.manifest,
+                quorum.stores[1].rpc_handler(),
             )
             .await;
-        assert!(reply.reply_xml.contains("<ok/>"));
-        let committed = old_owner
-            .source
-            .load_committed_latest()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(committed.version, ConfigVersion::new(2));
-        assert!(
-            committed.request_id == Some(request_id),
-            "effect lost request"
-        );
-        assert_eq!(quorum.checkpoints.sequence(), 4);
-        assert!(quorum.admissions.load(Ordering::Acquire) > 0);
+            let (one, two, three) = tokio::join!(
+                quorum.stores[0].initialize_cluster(),
+                quorum.stores[1].initialize_cluster(),
+                quorum.stores[2].initialize_cluster(),
+            );
+            one.unwrap();
+            two.unwrap();
+            three.unwrap();
+            let old_leader = quorum.leader_except(None).await;
+            assert!(quorum.stores[old_leader]
+                .load_latest()
+                .await
+                .unwrap()
+                .is_none());
+            quorum.stores[old_leader]
+                .initialize_audit_authority(
+                    &AuditPrivacyKey::new([0x81; 32]).unwrap(),
+                    AuditLedgerLimits::new(90, 30).unwrap(),
+                )
+                .await
+                .unwrap();
+            let old_owner = Owner::open(quorum.stores[old_leader].clone(), true).await;
+            assert_eq!(quorum.checkpoints.sequence(), 3);
+            let old_server = running::required_server_for_bus(old_owner.bus.clone());
+            let old_sessions = SessionRegistry::new();
+            let old_registration = old_sessions.register(1).unwrap();
+            let request_id = RequestId::new();
+            quorum.checkpoints.refuse_from.store(6, Ordering::Release);
+            let reply = old_server
+                .handle_rpc_for_session_async(
+                    request_id,
+                    &principal(),
+                    &edit("fixture-before-election"),
+                    &MgmtLimits::default(),
+                    1,
+                    &old_sessions,
+                )
+                .await;
+            assert!(reply.reply_xml.contains("<ok/>"));
+            let committed = old_owner
+                .source
+                .load_committed_latest()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(committed.version, ConfigVersion::new(2));
+            assert!(
+                committed.request_id == Some(request_id),
+                "effect lost request"
+            );
+            assert_eq!(quorum.checkpoints.sequence(), 4);
+            assert!(quorum.admissions.load(Ordering::Acquire) > 0);
 
-        quorum.isolate(old_leader);
-        let new_leader = quorum.leader_except(Some(old_leader)).await;
+            let new_leader = election.elect_survivor(&quorum, old_leader).await;
+            (
+                old_leader,
+                old_owner,
+                old_server,
+                old_sessions,
+                old_registration,
+                request_id,
+                committed,
+                new_leader,
+            )
+        })
+        .catch_unwind()
+        .await;
+        match setup {
+            Ok(setup) => (quorum, setup),
+            Err(panic) => {
+                quorum.shutdown().await;
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+    .await;
+    let result = AssertUnwindSafe(async {
         assert_ne!(old_leader, new_leader);
         let new_owner = Owner::open(quorum.stores[new_leader].clone(), false).await;
         let exact = new_owner

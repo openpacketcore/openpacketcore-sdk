@@ -376,6 +376,44 @@ Limitations:
 
 ## Verification
 
+The native and authenticated three-voter required-audit recovery tests keep
+formation, authentication, audit setup and prefix catch-up on normal time, with
+their operation and connection deadlines active. They pause only for a finite
+election phase after observing ticker re-registration. Actual engine ticks and
+normal read-index heartbeats align the tick phase and observed vote leases;
+scoped election samples then require one automatic campaign and fresh local
+authority within the original 26-second acquisition deadline. Normal time
+resumes for every stale-owner, exact-result and terminal-recovery check. The
+wall-clock watchdog guards only the controlled election phase.
+
+A negative control uses real replicated commands and holds back one log entry
+so the surviving voters have committed and applied indexes 12 and 13, with
+unequal logs in their actual vote requests. It forces both self-votes before
+peer delivery at 18 seconds and verifies the original timeout, with both voters
+still leaderless in term 2, before the up-to-date voter's next eligible campaign
+at 27 seconds. The payloads and random samples are synthetic; this reproduces
+the historical failure shape, not its unrecorded seed or audit contents. A
+legal failed first campaign (a split vote or log-rejected campaign) invalidates
+a fixed acquisition guarantee for randomized production elections. Production
+timers and operation deadlines are unchanged.
+
+A four-worker companion runs the complete authenticated setup and recovery
+scenario with real mTLS, admission refusals, outstanding terminal debt, both
+writer fences and the subsequent write. It disables automatic campaigns only
+through a test hook, quiesces admitted traffic from the isolated leader, waits
+for the engine's recorded vote lease to expire, and triggers one designated
+campaign. Actual peer votes and the unchanged fresh-authority check must
+succeed before recovery. The paused fixture separately proves automatic
+election timing.
+
+The positive fixtures explicitly require the designated successor to have
+already **applied** its predecessor's committed audit prefix before isolation;
+the four-worker companion requires this of both survivors. This is stronger
+than merely containing the log entry. These scenarios do not cover a successor
+that first applies that last debt after election. The remaining fixed-envelope
+sweep in session-testkit and config-bus consensus is tracked in
+[#1324](https://github.com/openpacketcore/openpacketcore-sdk/issues/1324).
+
 Run:
 
 ```sh

@@ -13,9 +13,11 @@ use opc_persist::{
 };
 
 mod authenticated;
+mod election;
 
-// Same election/operation envelope as the persistence quorum qualification.
-// No sleeps, accelerated elections, or altered engine/operation deadlines.
+// Preserve the original acquisition deadline. Randomized elections can split
+// beyond it; the audit scenario controls real election inputs within this
+// bound, and a separate split-vote regression retains the timeout behavior.
 const TRANSITION_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
@@ -36,6 +38,9 @@ struct Peer {
     handler: tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>,
     enabled: AtomicBool,
     activity: Arc<tokio::sync::Notify>,
+    election_vote: std::sync::Mutex<Option<Arc<election::VoteGate>>>,
+    admitted: tokio::sync::RwLock<()>,
+    hold_log_entries: AtomicBool,
 }
 
 impl std::fmt::Debug for Peer {
@@ -54,7 +59,14 @@ impl ConsensusPeer for Peer {
         &self,
         request: ConsensusWireRequest,
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        let _admitted = self.admitted.read().await;
         if !self.enabled.load(Ordering::Acquire) {
+            return Err(ConsensusPeerError::Unavailable);
+        }
+        if self.hold_log_entries.load(Ordering::Acquire)
+            && request.family == opc_consensus::ConsensusRpcFamily::AppendEntries
+            && !ConsensusConfigStore::is_empty_append_entries_for_test(&request)
+        {
             return Err(ConsensusPeerError::Unavailable);
         }
         let handler = self
@@ -63,7 +75,20 @@ impl ConsensusPeer for Peer {
             .await
             .clone()
             .ok_or(ConsensusPeerError::Unavailable)?;
-        let response = handler.handle(request.sender, request).await;
+        let gate = self
+            .election_vote
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|_| request.family == opc_consensus::ConsensusRpcFamily::Vote);
+        if let Some(gate) = &gate {
+            gate.before_delivery(&request).await;
+        }
+        let sender = request.sender;
+        let response = handler.handle(sender, request).await;
+        if let Some(gate) = gate {
+            gate.after_delivery(sender, self.target, &response);
+        }
         self.activity.notify_one();
         Ok(response)
     }
@@ -79,6 +104,14 @@ struct Quorum {
 
 impl Quorum {
     async fn start() -> Self {
+        Self::start_scripted(None).await
+    }
+
+    async fn start_scripted(
+        scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
+    ) -> Self {
+        use tracing::Instrument;
+
         let directory = tempfile::tempdir().unwrap();
         let nodes = [1, 2, 3].map(|value| ConfigConsensusNodeId::new(value).unwrap());
         let activity = Arc::new(tokio::sync::Notify::new());
@@ -94,6 +127,9 @@ impl Quorum {
                             handler: tokio::sync::RwLock::new(None),
                             enabled: AtomicBool::new(true),
                             activity: activity.clone(),
+                            election_vote: std::sync::Mutex::new(None),
+                            admitted: tokio::sync::RwLock::new(()),
+                            hold_log_entries: AtomicBool::new(false),
                         }),
                     );
                 }
@@ -129,14 +165,21 @@ impl Quorum {
                 .collect();
             let keys =
                 AuditKeyRing::new(vec![AuditSigningKey::new(1, [0x91; 32]).unwrap()]).unwrap();
-            let store = ConsensusConfigStore::open_with_audit_continuity(
+            let opening = ConsensusConfigStore::open_with_audit_continuity(
                 topology,
                 backend,
                 directory.path().join(format!("snapshots-{index}")),
                 peers,
                 AuditContinuityPolicy::new(keys, checkpoints.clone(), 1, 1).unwrap(),
-            )
-            .await
+            );
+            let store = match scripts {
+                Some(scripts) => {
+                    scripts[index]
+                        .scope(opening.instrument(election::delivery::node_span(node.get())))
+                        .await
+                }
+                None => opening.await,
+            }
             .unwrap();
             stores.push(Arc::new(store));
         }
@@ -225,6 +268,17 @@ impl Quorum {
         }
     }
 
+    async fn isolate_and_quiesce(&self, node: usize) {
+        self.isolate(node);
+        for ((source, target), path) in &self.paths {
+            if *source == node || *target == node {
+                // A request takes this read guard before checking enabled.
+                // The writer drains every admitted call before time advances.
+                drop(path.admitted.write().await);
+            }
+        }
+    }
+
     async fn shutdown(self) {
         let (one, two, three) = tokio::join!(
             self.stores[0].shutdown(),
@@ -234,6 +288,26 @@ impl Quorum {
         one.unwrap();
         two.unwrap();
         three.unwrap();
+    }
+}
+
+impl election::Voters for Quorum {
+    fn stores(&self) -> &[Arc<ConsensusConfigStore>] {
+        &self.stores
+    }
+
+    fn observe_votes(&self, gate: Option<Arc<election::VoteGate>>) {
+        for path in [(1, 2), (2, 1)] {
+            *self.paths[&path].election_vote.lock().unwrap() = gate.clone();
+        }
+    }
+
+    async fn isolate_and_quiesce(&self, node: usize) {
+        Quorum::isolate_and_quiesce(self, node).await;
+    }
+
+    async fn leader_except(&self, excluded: Option<usize>) -> usize {
+        Quorum::leader_except(self, excluded).await
     }
 }
 
@@ -486,9 +560,12 @@ async fn assert_original_terminal(
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn required_running_terminal_debt_survives_leadership_change_and_fences_stale_owner() {
-    let quorum = Quorum::start().await;
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let election = election::SuccessfulElection::new(runtime_origin).await;
+    let quorum = Quorum::start_scripted(Some(&election.scripts)).await;
     let old_leader = quorum.leader_except(None).await;
     quorum.stores[old_leader]
         .initialize_audit_authority(
@@ -528,8 +605,8 @@ async fn required_running_terminal_debt_survives_leadership_change_and_fences_st
     );
     assert_eq!(quorum.checkpoints.sequence(), 4);
 
-    quorum.isolate(old_leader);
-    let new_leader = quorum.leader_except(Some(old_leader)).await;
+    let new_leader = election.elect_survivor(&quorum, old_leader).await;
+    // Resume normal time for the original stale-owner and recovery assertions.
     assert_ne!(old_leader, new_leader);
     let new_owner = Owner::open(quorum.stores[new_leader].clone(), false).await;
     let exact = new_owner

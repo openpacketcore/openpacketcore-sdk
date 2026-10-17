@@ -334,6 +334,78 @@ impl fmt::Debug for ConsensusConfigStore {
 }
 
 impl ConsensusConfigStore {
+    /// Inspect real AppendEntries frames without exposing the private command
+    /// representation. Fixtures can hold log replication while allowing reads'
+    /// empty heartbeats to refresh the unchanged engine lease.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn is_empty_append_entries_for_test(request: &ConsensusWireRequest) -> bool {
+        request.family == ConsensusRpcFamily::AppendEntries
+            && decode_config_wire::<
+                opc_consensus::engine::raft::AppendEntriesRequest<ConfigRaftTypeConfig>,
+            >(&request.payload)
+            .is_ok_and(|append| append.entries.is_empty())
+    }
+
+    /// Observe the actual vote-update instant, without changing the lease.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub async fn vote_updated_at_for_test(
+        &self,
+    ) -> Result<Option<tokio::time::Instant>, PersistError> {
+        self.inner
+            .raft
+            .with_raft_state(|state| state.vote_last_modified())
+            .await
+            .map_err(|_| consensus_unavailable())
+    }
+
+    /// Disable automatic campaigns for a deterministic concurrent fixture.
+    /// Explicit test campaigns still use the engine's normal voting path.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn disable_automatic_elections_for_test(&self) {
+        self.inner.raft.runtime_config().elect(false);
+    }
+
+    /// Observe expiry of the engine's committed-vote lease without changing it.
+    /// The caller must quiesce old-leader traffic and bound this future.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub async fn wait_for_vote_lease_expiry_for_test(&self) -> Result<(), PersistError> {
+        // Openraft derives its leader lease from election_timeout_max. Read
+        // the actual last vote update inside the core instead of guessing a
+        // delay from when the fixture disabled a transport path.
+        let lease = Duration::from_millis(
+            config_raft_config()
+                .map_err(|_| consensus_unavailable())?
+                .election_timeout_max,
+        );
+        loop {
+            let deadline = self
+                .inner
+                .raft
+                .with_raft_state(move |state| {
+                    if state.vote_ref().is_committed() {
+                        state.vote_last_modified().map(|updated| updated + lease)
+                    } else {
+                        None
+                    }
+                })
+                .await
+                .map_err(|_| consensus_unavailable())?;
+            let Some(deadline) = deadline else {
+                return Ok(());
+            };
+            if tokio::time::Instant::now() > deadline {
+                return Ok(());
+            }
+            // The engine refuses a vote at equality too. This is its exact
+            // expiry boundary, not a new election or operation timeout.
+            tokio::time::sleep_until(deadline + Duration::from_nanos(1)).await;
+        }
+    }
+
     /// Ask Openraft to start one normal campaign for deterministic integration
     /// qualification. Openraft owns vote creation, persistence, and transport.
     #[cfg(feature = "dangerous-test-hooks")]
