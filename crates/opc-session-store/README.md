@@ -2483,11 +2483,33 @@ by issue #143.
   voter's real native owner lock until authority contention is observed, then
   for another 200 ms of wall time. Contended authority reads await a one-millisecond
   real monotonic timer through the I/O reactor, retaining the original absolute
-  RPC deadline. Cancellation closes the timer without a detached retry task.
+  RPC deadline. The native handler creates and registers its timer once, before
+  storage admission can consume an Async clean-restart proof; cloned handlers
+  share that resource. Allocation failure preserves retained state and reports
+  the startup stage and original I/O error/errno. A later ordinary open can
+  consume the preserved proof without a repair step. Concurrent waiters share
+  timer expiries and each enforces its own one-millisecond monotonic minimum.
+  A late joiner may need the following tick, so the timer cadence contributes
+  between one and two milliseconds, independent of waiter count; scheduler
+  delay remains bounded by the caller's original RPC deadline. A short mutex
+  protects only the waiter count and arm/disarm syscalls, never an async wait.
+  The descriptor runs only while callers wait; the last completion or
+  cancellation disarms it. No wait creates a descriptor, thread or driver task,
+  and dropping the last handler owner closes the timer.
+  A protocol-clock sleep cannot provide this real-time delay while Tokio time
+  is frozen, so the shared timer retains the independent monotonic clock.
   Releasing the lock therefore needs no protocol-clock advance, and both real
   denials must still arrive at the exact initial instant. Focused authority tests
-  bound retry counts while the owner is held and cover paused-time release,
-  cancellation, and fail-closed deadline rejection.
+  bound both retry counts and wake-ups while the owner is held. The wake-up bound
+  also rejects spins that gate actual lock attempts on the standard clock.
+  Isolated resource tests exhaust `RLIMIT_NOFILE` after startup and prove a new
+  timer cannot be created, while preserving paused-time release, cancellation
+  and the complete-operation deadline. They also cover a saturated blocking
+  pool and require no new worker when all startup blocking threads have retired.
+  Cancelling a queued shared-timer wait must leave the next waiter able to finish.
+  A 128-waiter cohort must finish within 64 ms, sixteen concurrent waiters each
+  retain the wake bound, and cancelling expired or unexpired active waits must
+  preserve the next caller's fresh one-millisecond minimum.
   The unchanged 30-second wall-clock watchdog covers only this short frozen
   phase, whose duration is reported. Resuming normal time preserves the clock
   offset from ticker settling, lease renewal, and the election. The measured

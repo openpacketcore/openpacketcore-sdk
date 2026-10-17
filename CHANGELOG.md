@@ -776,6 +776,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained recovery, and linearizable read/write assertion. Production timers
   and operation budgets are unchanged. (#1302)
 
+- `opc-session-store`: create and register the native authority backoff timer
+  before storage opens, preserving retained state and clean Async restart proofs
+  when allocation fails. Startup diagnostics retain the I/O error and errno.
+  Concurrent contended reads share real-monotonic expiries while each retains
+  its own one-millisecond minimum, without allocating a descriptor or thread,
+  including under descriptor exhaustion. The original RPC deadline bounds the
+  wait; cancellation leaves no detached retry and the last waiter disarms the
+  timer. Regressions bound wake-ups as well as lock attempts and cover
+  real `RLIMIT_NOFILE` exhaustion, paused time, cancellation and waits without
+  an idle blocking worker. (#1313)
+
 - `opc-session-store`: retry contended native fixed-quorum authority reads with
   an awaited one-millisecond real monotonic backoff instead of a busy yield or
   protocol-clock sleep. A released owner lock can unblock inbound engine traffic

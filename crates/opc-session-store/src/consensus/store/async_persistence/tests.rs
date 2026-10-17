@@ -38,6 +38,7 @@ mod protected;
 mod races;
 mod retirement;
 mod snapshots;
+mod startup_resources;
 mod timing;
 mod voter_control;
 mod writer;

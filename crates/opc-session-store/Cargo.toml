@@ -83,7 +83,7 @@ proptest = "1.9"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The allocation counter is thread-local; pin only its model-measurement thread.
-nix = { workspace = true, features = ["sched"] }
+nix = { workspace = true, features = ["sched", "resource"] }
 
 [[test]]
 name = "sqlite_checkpoint_hotpath"

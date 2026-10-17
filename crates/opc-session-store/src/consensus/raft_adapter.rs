@@ -56,9 +56,12 @@ pub(crate) struct FixedQuorumEngineAdmission {
     placement_policy: PlacementResiliencePolicy,
     admitted: Arc<AtomicBool>,
     operation_timeout: std::time::Duration,
+    #[cfg(target_os = "linux")]
+    authority_backoff: Option<Arc<crate::sqlite::AuthorityBackoff>>,
 }
 
 impl FixedQuorumEngineAdmission {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         backend: SqliteSessionBackend,
         storage_identity: SessionConsensusIdentity,
@@ -67,6 +70,7 @@ impl FixedQuorumEngineAdmission {
         placement_policy: PlacementResiliencePolicy,
         admitted: Arc<AtomicBool>,
         operation_timeout: std::time::Duration,
+        #[cfg(target_os = "linux")] authority_backoff: Option<Arc<crate::sqlite::AuthorityBackoff>>,
     ) -> Self {
         Self {
             backend,
@@ -76,6 +80,8 @@ impl FixedQuorumEngineAdmission {
             placement_policy,
             admitted,
             operation_timeout,
+            #[cfg(target_os = "linux")]
+            authority_backoff,
         }
     }
 }
@@ -1398,6 +1404,8 @@ impl SessionRaftRpcHandler {
                         &authority.bindings,
                         authority.placement_policy,
                         !authority.admitted.load(Ordering::Acquire),
+                        #[cfg(target_os = "linux")]
+                        authority.authority_backoff.as_deref(),
                     ),
                 )
                 .await,
@@ -2664,6 +2672,10 @@ mod tests {
         .expect("fixed follower network");
         let directory = network.peer_directory();
         let bindings = member_bindings(&members);
+        #[cfg(target_os = "linux")]
+        let authority_backoff = backend
+            .new_authority_backoff()
+            .expect("prepare native authority timer before opening storage");
         let (mut log_store, mut state_machine, storage_identity) =
             storage::open_fixed_with_member_bindings_and_roster_attestation_root(
                 &backend,
@@ -2706,6 +2718,18 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         let snapshot_state_machine = state_machine.clone();
+        let admitted = Arc::new(AtomicBool::new(admitted));
+        let fixed_admission = FixedQuorumEngineAdmission::new(
+            backend.clone(),
+            storage_identity,
+            members,
+            bindings,
+            crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains,
+            admitted,
+            operation_timeout,
+            #[cfg(target_os = "linux")]
+            authority_backoff,
+        );
         let raft = SessionRaft::new(
             local,
             Arc::new(
@@ -2718,20 +2742,11 @@ mod tests {
         )
         .await
         .expect("fixed follower Raft");
-        let admitted = Arc::new(AtomicBool::new(admitted));
         let handler = SessionRaftRpcHandler::new_fixed_durable_quorum(
             raft.clone(),
             directory,
             local,
-            FixedQuorumEngineAdmission::new(
-                backend.clone(),
-                storage_identity,
-                members,
-                bindings,
-                crate::readiness::PlacementResiliencePolicy::RequireIndependentFailureDomains,
-                admitted,
-                operation_timeout,
-            ),
+            fixed_admission,
         );
         FixedFollowerFixture {
             _temp: temp,
@@ -3042,14 +3057,235 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct AuthorityWakeCounter {
+        parent: futures_util::task::AtomicWaker,
+        wakes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl futures_util::task::ArcWake for AuthorityWakeCounter {
+        fn wake_by_ref(counter: &Arc<Self>) {
+            counter.wakes.fetch_add(1, Ordering::SeqCst);
+            counter.parent.wake();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn count_authority_wakes<F: std::future::Future>(
+        future: F,
+    ) -> (
+        impl std::future::Future<Output = F::Output>,
+        Arc<AuthorityWakeCounter>,
+    ) {
+        let counter = Arc::new(AuthorityWakeCounter::default());
+        let observed = Arc::clone(&counter);
+        let mut future = Box::pin(future);
+        let counted = std::future::poll_fn(move |context| {
+            // Observe this RPC's wake-ups, including a yield loop whose
+            // standard-clock gate keeps the actual lock-attempt count low.
+            observed.parent.register(context.waker());
+            let waker = futures_util::task::waker_ref(&observed);
+            future
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(&waker))
+        });
+        (counted, counter)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn isolate_authority_resource_case(test: &str) -> bool {
+        use crate::test_process::CommandExt;
+        const CHILD: &str = "OPC_AUTHORITY_RESOURCE_TEST";
+        let test = format!("consensus::raft_adapter::tests::{test}");
+        if std::env::var(CHILD).as_deref() == Ok(test.as_str()) {
+            return false;
+        }
+        // Resource limits are process-wide. Every selected parent test runs
+        // its complete scenario in a child; no shared-harness test is skipped.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--test-threads=1", "--nocapture"])
+            .env(CHILD, &test)
+            .test_output()
+            .expect("isolated resource-pressure test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "{test}: {stdout}\n{stderr}"
+        );
+        eprint!("{stderr}");
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AuthorityDescriptorPressure {
+        original: (nix::sys::resource::rlim_t, nix::sys::resource::rlim_t),
+        descriptors: Vec<std::fs::File>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AuthorityDescriptorPressure {
+        fn new() -> Self {
+            use nix::sys::resource::{getrlimit, setrlimit, Resource};
+            assert!(
+                std::env::var_os("OPC_AUTHORITY_RESOURCE_TEST").is_some(),
+                "resource limits require an isolated child"
+            );
+            let mut pressure = Self {
+                original: getrlimit(Resource::RLIMIT_NOFILE).expect("original descriptor limit"),
+                descriptors: Vec::new(),
+            };
+            setrlimit(
+                Resource::RLIMIT_NOFILE,
+                pressure.original.1.min(64),
+                pressure.original.1,
+            )
+            .expect("lower only the isolated child's soft descriptor limit");
+            loop {
+                match std::fs::File::open("/dev/null") {
+                    Ok(file) => pressure.descriptors.push(file),
+                    Err(error) => {
+                        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                rustix::time::timerfd_create(
+                    rustix::time::TimerfdClockId::Monotonic,
+                    rustix::time::TimerfdFlags::NONBLOCK | rustix::time::TimerfdFlags::CLOEXEC,
+                )
+                .expect_err("a new timer descriptor must actually be unavailable"),
+                rustix::io::Errno::MFILE,
+            );
+            eprintln!(
+                "authority resource pressure: RLIMIT_NOFILE={}; timerfd_create=EMFILE",
+                pressure.original.1.min(64)
+            );
+            pressure
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for AuthorityDescriptorPressure {
+        fn drop(&mut self) {
+            self.descriptors.clear();
+            nix::sys::resource::setrlimit(
+                nix::sys::resource::Resource::RLIMIT_NOFILE,
+                self.original.0,
+                self.original.1,
+            )
+            .expect("restore the child's descriptor limit before engine work and cleanup");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct AuthorityBlockingWorkers {
+        active: tokio::sync::watch::Sender<usize>,
+        started: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn raw_fixed_handler_native_authority_check_honors_the_complete_operation_deadline() {
+        native_authority_check_deadline(false, false, None).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_authority_timer_failure_preserves_the_operation_deadline() {
+        if isolate_authority_resource_case(
+            "raw_fixed_handler_native_authority_timer_failure_preserves_the_operation_deadline",
+        ) {
+            return;
+        }
+        native_authority_check_deadline(true, false, None).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_fixed_handler_native_authority_timer_failure_bounds_a_saturated_blocking_pool() {
+        if isolate_authority_resource_case(
+            "raw_fixed_handler_native_authority_timer_failure_bounds_a_saturated_blocking_pool",
+        ) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("single blocking-worker runtime");
+        runtime.block_on(native_authority_check_deadline(true, true, None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_fixed_handler_native_authority_timer_failure_needs_no_blocking_worker() {
+        if isolate_authority_resource_case(
+            "raw_fixed_handler_native_authority_timer_failure_needs_no_blocking_worker",
+        ) {
+            return;
+        }
+        let workers = Arc::new(AuthorityBlockingWorkers::default());
+        let started = Arc::clone(&workers);
+        let stopped = Arc::clone(&workers);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .thread_keep_alive(Duration::ZERO)
+            .on_thread_start(move || {
+                started.started.fetch_add(1, Ordering::SeqCst);
+                started.active.send_modify(|active| *active += 1);
+            })
+            .on_thread_stop(move || {
+                stopped.active.send_modify(|active| *active -= 1);
+            })
+            .enable_all()
+            .build()
+            .expect("runtime with no retained blocking workers");
+        runtime.block_on(native_authority_check_deadline(true, false, Some(&workers)));
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn native_authority_check_deadline(
+        descriptor_pressure: bool,
+        saturate_pool: bool,
+        workers: Option<&AuthorityBlockingWorkers>,
+    ) {
         let fixture = fixed_follower_fixture(
             Duration::from_millis(40),
             true,
             FixedAuthorityBackend::Native,
         )
         .await;
+        let pool_blocker = if saturate_pool {
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, waiting) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).expect("pool saturation observed");
+                waiting
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("RPC deadline observed before releasing the pool");
+            });
+            started.await.expect("blocking pool is occupied");
+            Some((release, blocker))
+        } else {
+            None
+        };
+        let worker_starts_before = if let Some(workers) = workers {
+            let mut active = workers.active.subscribe();
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                active.wait_for(|active| *active == 0),
+            )
+            .await
+            .expect("all startup blocking workers retire")
+            .expect("worker observations remain live");
+            Some(workers.started.load(Ordering::SeqCst))
+        } else {
+            None
+        };
         let wal = fixture
             .backend
             .native_owner
@@ -3064,6 +3300,7 @@ mod tests {
         let (entered, holding) = tokio::sync::oneshot::channel();
         let holder = std::thread::spawn(move || {
             held_wal.with_native_owner_held_for_test(|| {
+                let _pressure = descriptor_pressure.then(AuthorityDescriptorPressure::new);
                 entered.send(()).expect("test awaits real lock acquisition");
                 // Release the fault independently of the Tokio executor, so
                 // even a blocking production regression can finish cleanup.
@@ -3079,10 +3316,14 @@ mod tests {
         )
         .expect("valid Vote envelope");
         let polls_before = *fixture.backend.fixed_quorum_native_contention.borrow();
+        let (response, wakes) =
+            count_authority_wakes(fixture.handler.handle(fixture.leader, request));
         let started = Instant::now();
-        let response = fixture.handler.handle(fixture.leader, request).await;
+        let response = response.await;
         let elapsed = started.elapsed();
+        let wakes = wakes.wakes.load(Ordering::SeqCst);
         let polls = *fixture.backend.fixed_quorum_native_contention.borrow() - polls_before;
+        let worker_starts_after = workers.map(|workers| workers.started.load(Ordering::SeqCst));
         holder
             .join()
             .expect("join finite fault")
@@ -3090,14 +3331,22 @@ mod tests {
         let after = wal
             .native_activation_facts_for_test()
             .expect("raw owner after");
+        if let Some((release, blocker)) = pool_blocker {
+            release.send(()).expect("release occupied blocking worker");
+            blocker.await.expect("join blocking worker");
+        }
         fixture
             .raft
             .shutdown()
             .await
             .expect("shutdown fixed test Raft");
         eprintln!(
-            "native raw authority elapsed_us={} retries={polls}",
+            "native raw authority descriptor_pressure={descriptor_pressure} elapsed_us={} retries={polls} wakes={wakes} saturated_pool={saturate_pool} blocking_starts={worker_starts_before:?}->{worker_starts_after:?}",
             elapsed.as_micros()
+        );
+        assert_eq!(
+            worker_starts_after, worker_starts_before,
+            "the authority wait must not create a blocking thread"
         );
         assert_eq!(
             response.result,
@@ -3118,11 +3367,31 @@ mod tests {
             after, before,
             "timed-out authority cannot mutate vote/log/application"
         );
+        assert!(
+            wakes as u128 <= elapsed.as_micros() / 250 + 4,
+            "held-owner wake-ups must stay below 4,000 per second: {wakes} in {elapsed:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn raw_fixed_handler_native_contention_backoff_progresses_with_paused_time() {
+        native_contention_backoff_paused(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_authority_timer_failure_progresses_with_paused_time() {
+        if isolate_authority_resource_case(
+            "raw_fixed_handler_native_authority_timer_failure_progresses_with_paused_time",
+        ) {
+            return;
+        }
+        native_contention_backoff_paused(true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn native_contention_backoff_paused(descriptor_pressure: bool) {
         let fixture = fixed_follower_fixture(
             Duration::from_millis(40),
             true,
@@ -3139,20 +3408,35 @@ mod tests {
             .expect("live native owner");
         let attempts = fixture.backend.fixed_quorum_native_contention.clone();
         let mut contended = attempts.subscribe();
+        let request = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::Vote,
+            encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
+        )
+        .expect("valid Vote envelope");
+        let (response, wakes) =
+            count_authority_wakes(fixture.handler.handle(fixture.leader, request));
         let (entered, holding) = tokio::sync::oneshot::channel();
         let (release, releasing) = std::sync::mpsc::channel();
         let (finished, finishing) = std::sync::mpsc::channel();
         let holder = tokio::task::spawn_blocking(move || {
             let observation = wal
                 .with_native_owner_held_for_test(|| {
+                    let _pressure = descriptor_pressure.then(AuthorityDescriptorPressure::new);
                     entered.send(()).expect("real lock acquisition awaited");
                     releasing
                         .recv_timeout(Duration::from_secs(30))
                         .expect("authority contention observed");
                     let polls_before = *attempts.borrow();
+                    let wakes_before = wakes.wakes.load(Ordering::SeqCst);
                     let started = Instant::now();
                     std::thread::sleep(Duration::from_millis(200));
-                    (*attempts.borrow() - polls_before, started.elapsed())
+                    (
+                        *attempts.borrow() - polls_before,
+                        wakes.wakes.load(Ordering::SeqCst) - wakes_before,
+                        started.elapsed(),
+                    )
                 })
                 .expect("held native owner");
             // Keep Tokio's automatic clock advance inhibited after unlocking
@@ -3165,31 +3449,35 @@ mod tests {
         holding.await.expect("real native owner held");
         tokio::time::pause();
         let frozen = tokio::time::Instant::now();
-        let request = SessionConsensusWireRequest::try_new(
-            fixture.scope,
-            fixture.leader,
-            SessionConsensusRpcFamily::Vote,
-            encode_bounded(&vote_request(fixture.leader)).expect("bounded Vote request"),
-        )
-        .expect("valid Vote envelope");
-        let mut response = Box::pin(fixture.handler.handle(fixture.leader, request));
-        tokio::select! {
+        let mut response = Box::pin(response);
+        let early_response = tokio::select! {
             biased;
-            unexpected = &mut response => panic!("held authority unexpectedly completed: {unexpected:?}"),
-            observed = contended.changed() => observed.expect("actual authority contention"),
-        }
+            unexpected = &mut response => Some(unexpected),
+            observed = contended.changed() => {
+                observed.expect("actual authority contention");
+                None
+            },
+        };
+        let completed_early = early_response.is_some();
         release.send(()).expect("start the measured owner hold");
-        let response = response.await;
+        let response = match early_response {
+            Some(response) => response,
+            None => response.await,
+        };
         let completed = tokio::time::Instant::now();
         tokio::time::resume();
         finished.send(()).expect("release the clock hold");
-        let (polls, elapsed) = holder.await.expect("join finite owner hold");
+        let (polls, wakes, elapsed) = holder.await.expect("join finite owner hold");
         fixture
             .raft
             .shutdown()
             .await
             .expect("shutdown fixed test Raft");
-        eprintln!("paused native authority retries={polls} held_for={elapsed:?}");
+        eprintln!("paused native authority descriptor_pressure={descriptor_pressure} retries={polls} wakes={wakes} held_for={elapsed:?}");
+        assert!(
+            !completed_early,
+            "held authority unexpectedly completed: {response:?}"
+        );
         assert_eq!(
             completed, frozen,
             "owner release needs no Tokio time advance"
@@ -3203,11 +3491,31 @@ mod tests {
             polls as u128 <= elapsed.as_micros() / 500 + 2,
             "held-owner retries must stay below 2,000 per second: {polls} in {elapsed:?}"
         );
+        assert!(
+            wakes as u128 <= elapsed.as_micros() / 250 + 4,
+            "held-owner wake-ups must stay below 4,000 per second: {wakes} in {elapsed:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn raw_fixed_handler_native_contention_cancellation_stops_retrying() {
+        native_contention_backoff_cancellation(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_fixed_handler_native_authority_timer_failure_cancellation_stops_retrying() {
+        if isolate_authority_resource_case(
+            "raw_fixed_handler_native_authority_timer_failure_cancellation_stops_retrying",
+        ) {
+            return;
+        }
+        native_contention_backoff_cancellation(true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn native_contention_backoff_cancellation(descriptor_pressure: bool) {
         let fixture = fixed_follower_fixture(
             Duration::from_millis(40),
             true,
@@ -3232,6 +3540,7 @@ mod tests {
         let holder = tokio::task::spawn_blocking(move || {
             held_wal
                 .with_native_owner_held_for_test(|| {
+                    let _pressure = descriptor_pressure.then(AuthorityDescriptorPressure::new);
                     entered.send(()).expect("real lock acquisition awaited");
                     releasing
                         .recv_timeout(Duration::from_secs(30))
@@ -3250,11 +3559,14 @@ mod tests {
         )
         .expect("valid Vote envelope");
         let mut response = Box::pin(fixture.handler.handle(fixture.leader, request));
-        tokio::select! {
+        let early_response = tokio::select! {
             biased;
-            unexpected = &mut response => panic!("held authority unexpectedly completed: {unexpected:?}"),
-            observed = contended.changed() => observed.expect("actual authority contention"),
-        }
+            unexpected = &mut response => Some(unexpected),
+            observed = contended.changed() => {
+                observed.expect("actual authority contention");
+                None
+            },
+        };
         drop(response);
         tokio::time::resume();
         let cancelled_at = *fixture.backend.fixed_quorum_native_contention.borrow();
@@ -3276,6 +3588,10 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown fixed test Raft");
+        assert!(
+            early_response.is_none(),
+            "held authority unexpectedly completed: {early_response:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -3389,6 +3705,13 @@ mod tests {
                 &bindings,
                 policy,
                 false,
+                fixture
+                    .handler
+                    .fixed_quorum_admission
+                    .as_ref()
+                    .expect("fixed authority")
+                    .authority_backoff
+                    .as_deref(),
             )
             .await;
         let after = wal
