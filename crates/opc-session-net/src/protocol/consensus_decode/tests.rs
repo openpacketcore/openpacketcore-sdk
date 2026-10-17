@@ -154,7 +154,13 @@ fn member_repair_control_round_trips_with_its_small_request_bound() {
         request(&serde_json::to_vec(&frame).unwrap()).unwrap(),
         frame
     );
-    let oversized = legacy_capture::request(ConsensusRpcFamily::MemberRepair, vec![0; 1025]);
+    // The typed constructor correctly rejects an oversized payload. Build
+    // the raw wire input here so the decoder's own bound is exercised too.
+    let mut oversized = serde_json::to_value(&frame).unwrap();
+    oversized["Call"]["request"]["payload"]
+        .as_array_mut()
+        .unwrap()
+        .push(0.into());
     assert!(request(&serde_json::to_vec(&oversized).unwrap()).is_err());
 }
 
