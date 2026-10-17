@@ -2088,6 +2088,7 @@ struct ConsensusSessionStoreInner {
 /// cleanup.  All clones therefore observe this single background operation.
 struct ConsensusShutdownCoordinator {
     completion: Mutex<Option<tokio::sync::watch::Receiver<ConsensusShutdownCompletion>>>,
+    handoff: Mutex<Option<opc_consensus::PlannedShutdownOutcome>>,
 }
 
 #[derive(Clone)]
@@ -2100,6 +2101,7 @@ impl ConsensusShutdownCoordinator {
     const fn new() -> Self {
         Self {
             completion: Mutex::new(None),
+            handoff: Mutex::new(None),
         }
     }
 
@@ -2129,6 +2131,17 @@ async fn shutdown_consensus_session_store(
     inner: Arc<ConsensusSessionStoreInner>,
     allow_closed_proof: bool,
 ) -> Result<(), StoreError> {
+    if allow_closed_proof {
+        let store = ConsensusSessionStore {
+            inner: Arc::clone(&inner),
+        };
+        let outcome = store.prepare_shutdown_for_stop().await;
+        *inner
+            .shutdown
+            .handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+    }
     // The shared coordinator owns this drain even if every observing caller
     // times out. Invalidate before joining storage, including work which has
     // accepted a capture but has not yet taken a native operation permit.
@@ -4186,9 +4199,11 @@ impl ConsensusSessionStore {
     /// engine-owned task to exit.
     ///
     /// Shutdown is clone-wide: every handle to this store observes the same
-    /// stopped engine. Callers must remove the store's authenticated RPC
-    /// handler from their transport before invoking this method so no new
-    /// request can enter while the engine drains. The bounded maintenance
+    /// stopped engine. Stop external consumers first and keep the authenticated
+    /// replication handler installed until this method finishes. Shutdown
+    /// automatically attempts one bounded leadership handoff, then proceeds
+    /// with ordinary drain even on failure. [`Self::shutdown_with_report`]
+    /// returns the typed handoff result; fallback is also logged. The bounded maintenance
     /// lanes are stopped and joined first, so a Raft shutdown that cannot
     /// complete cannot retain their workers or checkpoint connections. This
     /// call is bounded by the configured complete-operation deadline. On its
@@ -4206,6 +4221,22 @@ impl ConsensusSessionStore {
     /// reopening; they retain the existing snapshot-directory ownership lease.
     pub async fn shutdown(&self) -> Result<(), StoreError> {
         self.shutdown_with_closed_proof(true).await
+    }
+
+    /// Perform [`Self::shutdown`] and return its retained handoff result.
+    ///
+    /// A fallback still joins every engine and storage owner. Preparation and
+    /// drain are clone-wide and survive cancellation of an observing caller.
+    pub async fn shutdown_with_report(
+        &self,
+    ) -> Result<opc_consensus::PlannedShutdownOutcome, StoreError> {
+        self.shutdown().await?;
+        self.inner
+            .shutdown
+            .handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ok_or_else(consensus_unavailable)
     }
 
     async fn shutdown_with_closed_proof(&self, allow_closed_proof: bool) -> Result<(), StoreError> {

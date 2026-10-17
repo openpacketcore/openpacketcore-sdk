@@ -2,6 +2,7 @@
 
 use futures_util::stream::FuturesUnordered;
 use opc_consensus::engine::raft::{TransferLeaderError, TransferLeaderRequest};
+use opc_consensus::{planned_shutdown_timeout, PlannedShutdownFallback, PlannedShutdownOutcome};
 
 use super::*;
 
@@ -9,8 +10,10 @@ use super::*;
 /// neither resume local admission nor select another successor.
 pub(super) struct ConsensusRetirementCoordinator {
     started: AtomicBool,
-    completion: Mutex<Option<tokio::sync::watch::Receiver<ConsensusShutdownCompletion>>>,
+    completion: Mutex<Option<tokio::sync::watch::Receiver<Option<RetirementResult>>>>,
 }
+
+type RetirementResult = Result<PlannedShutdownOutcome, PlannedShutdownFallback>;
 
 impl ConsensusRetirementCoordinator {
     pub(super) const fn new() -> Self {
@@ -27,7 +30,8 @@ impl ConsensusRetirementCoordinator {
     fn start_or_subscribe(
         &self,
         store: ConsensusSessionStore,
-    ) -> tokio::sync::watch::Receiver<ConsensusShutdownCompletion> {
+        timeout: Duration,
+    ) -> tokio::sync::watch::Receiver<Option<RetirementResult>> {
         let mut completion = self
             .completion
             .lock()
@@ -35,16 +39,21 @@ impl ConsensusRetirementCoordinator {
         if let Some(receiver) = completion.as_ref() {
             return receiver.clone();
         }
-        let deadline = store.operation_deadline_from(tokio::time::Instant::now());
-        let (sender, receiver) = tokio::sync::watch::channel(ConsensusShutdownCompletion::Running);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (sender, receiver) = tokio::sync::watch::channel(None);
         *completion = Some(receiver.clone());
         tokio::spawn(async move {
-            // This is the original complete-operation budget. Later callers
-            // observe its retained outcome; they cannot extend the handoff.
-            let result = tokio::time::timeout_at(deadline, store.prepare_shutdown_before(deadline))
-                .await
-                .unwrap_or_else(|_| Err(consensus_unavailable()));
-            sender.send_replace(ConsensusShutdownCompletion::Finished(result));
+            // Explicit preparation keeps its complete-operation budget.
+            // Automatic preparation reserves time for drain. Later callers
+            // observe the first deadline and result, never extend or restart it.
+            let mut timeout_reason = PlannedShutdownFallback::DeadlineElapsed;
+            let result = tokio::time::timeout_at(
+                deadline,
+                store.prepare_shutdown_before(deadline, &mut timeout_reason),
+            )
+            .await
+            .unwrap_or(Err(timeout_reason));
+            sender.send_replace(Some(result));
         });
         receiver
     }
@@ -76,19 +85,44 @@ impl ConsensusSessionStore {
     /// separate engine/storage drain. Shutdown and native close proofs retain
     /// their existing contract. Reopening creates a new retirement incarnation.
     pub async fn prepare_shutdown(&self) -> Result<(), StoreError> {
-        let completion = self.inner.retirement.start_or_subscribe(self.clone());
-        tokio::time::timeout(
-            self.inner.operation_timeout,
-            await_consensus_session_store_shutdown(completion),
-        )
-        .await
-        .unwrap_or_else(|_| Err(consensus_unavailable()))
+        let completion = self
+            .inner
+            .retirement
+            .start_or_subscribe(self.clone(), self.inner.operation_timeout);
+        tokio::time::timeout(self.inner.operation_timeout, await_preparation(completion))
+            .await
+            .map_err(|_| consensus_unavailable())?
+            .map(|_| ())
+            .map_err(|_| consensus_unavailable())
+    }
+
+    pub(super) async fn prepare_shutdown_for_stop(&self) -> PlannedShutdownOutcome {
+        let completion = self.inner.retirement.start_or_subscribe(
+            self.clone(),
+            planned_shutdown_timeout(self.inner.operation_timeout),
+        );
+        // The coordinator itself has an original absolute deadline. Join that
+        // owned preparation before draining storage, even if the shutdown
+        // observer goes away; a prior explicit preparation is not abandoned.
+        let result = await_preparation(completion).await;
+        self.inner.raw_v2_read_barrier.disable_lease_reuse();
+        self.inner.read_barrier.disable_lease_reuse();
+        self.inner.retirement.started.store(true, Ordering::Release);
+        match result {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                tracing::warn!(?reason, "session consensus handoff fell back to shutdown");
+                PlannedShutdownOutcome::Fallback { reason }
+            }
+        }
     }
 
     async fn prepare_shutdown_before(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<(), StoreError> {
+        timeout_reason: &mut PlannedShutdownFallback,
+    ) -> RetirementResult {
+        use PlannedShutdownFallback as Reason;
         // Shared with ordinary operations, exclusive only against a topology
         // transition. No unrelated session is put behind a shutdown write lock.
         let _scope_guard = tokio::time::timeout_at(
@@ -99,24 +133,25 @@ impl ConsensusSessionStore {
                 .read_owned(),
         )
         .await
-        .map_err(|_| consensus_unavailable())?;
+        .map_err(|_| Reason::DeadlineElapsed)?;
         self.require_durable_fixed_quorum_admission_before(deadline)
-            .await?;
+            .await
+            .map_err(|_| Reason::NotAdmitted)?;
         if !matches!(
             self.operator_recovery_gate_before(deadline).await,
             OperatorRecoveryGate::Clear
         ) || !self
             .durable_uniform_scope_is_admitted()
             .await
-            .map_err(|_| consensus_unavailable())?
+            .map_err(|_| Reason::NotAdmitted)?
         {
-            return Err(consensus_unavailable());
+            return Err(Reason::NotAdmitted);
         }
-        let scope = self.current_scope()?;
+        let scope = self.current_scope().map_err(|_| Reason::ScopeChanged)?;
         let local = self.inner.local_node_id;
         let quorum = scope.1.len() / 2 + 1;
         if scope.1.len().saturating_sub(1) < quorum {
-            return Err(consensus_unavailable());
+            return Err(Reason::InsufficientSurvivingVoters);
         }
         let successor = {
             let metrics = self.inner.raft.metrics();
@@ -134,7 +169,7 @@ impl ConsensusSessionStore {
                         .copied()
                         .flatten()
                 })
-                .ok_or_else(consensus_unavailable)?
+                .ok_or(Reason::NoEligibleVoter)?
         };
 
         // Invalidate cached proofs before the engine can release a vote lease.
@@ -148,15 +183,26 @@ impl ConsensusSessionStore {
             .raft
             .prepare_shutdown(Some(successor))
             .await
-            .map_err(|_| consensus_unavailable())?;
+            .map_err(|_| Reason::EngineUnavailable)?;
         if let Some(request) = handoff.as_ref() {
+            *timeout_reason = Reason::SurvivingQuorumUnavailable;
             self.release_surviving_vote_leases(&scope, request, quorum, deadline)
-                .await?;
+                .await
+                .map_err(|_| Reason::SurvivingQuorumUnavailable)?;
+            *timeout_reason = Reason::NoUpToDateVoter;
             self.start_successor_election(&scope, request, deadline)
                 .await?;
         }
+        *timeout_reason = Reason::SuccessorUnconfirmed;
         self.confirm_surviving_leader(&scope, handoff.as_ref(), deadline)
             .await
+            .map_err(|_| Reason::SuccessorUnconfirmed)?;
+        Ok(match handoff {
+            Some(request) => PlannedShutdownOutcome::LeaderTransferred {
+                successor: *request.to(),
+            },
+            None => PlannedShutdownOutcome::FollowerRetired,
+        })
     }
 
     async fn release_surviving_vote_leases(
@@ -213,10 +259,13 @@ impl ConsensusSessionStore {
         scope: &(SessionConsensusIdentity, BTreeSet<SessionConsensusNodeId>),
         request: &TransferLeaderRequest<SessionConsensusNodeId>,
         deadline: tokio::time::Instant,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), PlannedShutdownFallback> {
+        use PlannedShutdownFallback as Reason;
         loop {
-            if self.current_scope()? != *scope || !self.inner.persistence_protocol.is_active() {
-                return Err(consensus_unavailable());
+            if self.current_scope().map_err(|_| Reason::ScopeChanged)? != *scope
+                || !self.inner.persistence_protocol.is_active()
+            {
+                return Err(Reason::ScopeChanged);
             }
             match self
                 .deliver_leadership_transfer(*request.to(), request, deadline)
@@ -228,9 +277,11 @@ impl ConsensusSessionStore {
                     // on existing route/replication progress and its bounded
                     // retry interval, under the original operation deadline.
                     self.wait_for_route_refresh(self.inner.local_node_id, deadline)
-                        .await?;
+                        .await
+                        .map_err(|_| Reason::NoUpToDateVoter)?;
                 }
-                _ => return Err(consensus_unavailable()),
+                Err(_) => return Err(Reason::NoUpToDateVoter),
+                _ => return Err(Reason::SuccessorRejected),
             }
         }
     }
@@ -296,5 +347,19 @@ impl ConsensusSessionStore {
                     .map_err(|_| consensus_unavailable())?;
             }
         }
+    }
+}
+
+async fn await_preparation(
+    mut completion: tokio::sync::watch::Receiver<Option<RetirementResult>>,
+) -> RetirementResult {
+    loop {
+        if let Some(result) = *completion.borrow_and_update() {
+            return result;
+        }
+        completion
+            .changed()
+            .await
+            .map_err(|_| PlannedShutdownFallback::EngineUnavailable)?;
     }
 }

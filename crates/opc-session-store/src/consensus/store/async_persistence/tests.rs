@@ -500,9 +500,10 @@ impl Fleet {
     }
 
     async fn close_clean(&mut self, index: usize) -> Result<(), StoreError> {
-        *self.peers[index].handler.write().await = None;
         if let Some(store) = self.stores[index].take() {
-            return store.shutdown().await;
+            let result = store.shutdown().await;
+            *self.peers[index].handler.write().await = None;
+            return result;
         }
         Ok(())
     }

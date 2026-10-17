@@ -116,6 +116,63 @@ async fn planned_native_follower_retirement_preserves_close_proof_and_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn automatic_native_leader_shutdown_preserves_close_proof_and_reopen() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(3);
+    let result = AssertUnwindSafe(async {
+        fleet.start().await;
+        let keys = provider();
+        let leader = fleet.leader();
+        let survivor = (leader + 1) % 3;
+        fleet
+            .store(survivor)
+            .activate_fenced_transition_capability()
+            .await
+            .unwrap();
+        let request = create_request(fleet.store(survivor), 61, keys.as_ref()).await;
+        let outcome = create(fleet.store(survivor), &request).await;
+        fleet.ready().await;
+        let close_proof = fleet
+            .directory
+            .path()
+            .join(format!("node-{leader}.sqlite.native-wal/ASYNC-CLOSED"));
+        assert!(!close_proof.exists());
+        let report = fleet.store(leader).shutdown_with_report().await.unwrap();
+        assert!(matches!(
+            report,
+            opc_consensus::PlannedShutdownOutcome::LeaderTransferred { .. }
+        ));
+        assert!(close_proof.is_file());
+        fleet.close_clean(leader).await.unwrap();
+        assert_recorded(fleet.store(survivor), &request, &outcome).await;
+        let next = create_request(fleet.store(survivor), 62, keys.as_ref()).await;
+        create(fleet.store(survivor), &next).await;
+        fleet
+            .open(leader, SessionPersistenceMode::Async)
+            .await
+            .unwrap();
+        assert!(!close_proof.exists());
+        assert_eq!(
+            fleet.store(leader).persistence_health().recovery,
+            Some(SessionAsyncRecoveryState::Active)
+        );
+        assert!(!fleet.store(leader).status().admitted);
+        assert!(!fleet.store(leader).inner.retirement.is_started());
+        clock::initialize(fleet.store(leader)).await.unwrap();
+        fleet.ready().await;
+        assert_recorded(fleet.store(leader), &request, &outcome).await;
+        let fresh = create_request(fleet.store(leader), 63, keys.as_ref()).await;
+        create(fleet.store(leader), &fresh).await;
+    })
+    .catch_unwind()
+    .await;
+    for index in 0..fleet.stores.len() {
+        let _ = fleet.close_and_join_result(index).await;
+    }
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retiring_native_voter_does_not_manufacture_missing_v1_activation() {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
     let mut fleet = Fleet::new(3);
