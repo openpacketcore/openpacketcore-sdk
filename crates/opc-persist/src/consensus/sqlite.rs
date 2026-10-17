@@ -656,12 +656,6 @@ where
         return Err(timed_out("config consensus SQLite deadline elapsed"));
     }
     let std_deadline = deadline.into_std();
-    #[cfg(test)]
-    let clock_diagnostic = (
-        deadline.saturating_duration_since(tokio::time::Instant::now()),
-        std::time::Instant::now().saturating_duration_since(std_deadline),
-        std::time::Instant::now().saturating_duration_since(tokio::time::Instant::now().into_std()),
-    );
     let permit = tokio::time::timeout_at(deadline, worker_gate.acquire_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite admission timed out"))?
@@ -732,16 +726,6 @@ where
         }
     };
     cancel_on_drop.disarm();
-    #[cfg(test)]
-    if let Err(error) = &result {
-        eprintln!(
-            "SQLITE_CLOCK_DIAGNOSTIC tokio_remaining_ms={} wall_deadline_elapsed_ms={} wall_clock_ahead_ms={} error_kind={:?} error={error}",
-            clock_diagnostic.0.as_millis(),
-            clock_diagnostic.1.as_millis(),
-            clock_diagnostic.2.as_millis(),
-            error.kind(),
-        );
-    }
     result
 }
 

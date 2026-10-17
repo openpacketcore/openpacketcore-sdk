@@ -115,21 +115,6 @@ impl ConsensusPeer for Peer {
 
 async fn lagging_successor(release_prefix: bool) {
     use PlannedShutdownFallback as Reason;
-    // Temporary bounded diagnostic: keep the original three-second operation
-    // bound, but make four seconds of startup wall time explicit.
-    // The fallback fixture remains an un-delayed control in the same run.
-    if release_prefix {
-        let virtual_started = tokio::time::Instant::now();
-        let wall_started = std::time::Instant::now();
-        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(4)))
-            .await
-            .unwrap();
-        eprintln!(
-            "PLANNED_SHUTDOWN_CLOCK_DIAGNOSTIC controlled_hold_wall_ms={} controlled_hold_tokio_ms={}",
-            wall_started.elapsed().as_millis(),
-            virtual_started.elapsed().as_millis(),
-        );
-    }
     let directory = tempfile::tempdir().unwrap();
     let nodes = [1, 2, 3].map(|id| ConsensusNodeId::new(id).unwrap());
     let members = nodes.into_iter().collect::<BTreeSet<_>>();
