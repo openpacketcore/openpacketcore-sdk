@@ -22,6 +22,8 @@ use tokio::sync::{watch, Barrier};
 mod memory_store;
 use memory_store::{MemoryLog, MemoryStateMachine};
 
+#[path = "reelection/leader_loss_under_writes.rs"]
+mod leader_loss_under_writes;
 #[path = "reelection/schedule.rs"]
 mod schedule;
 #[path = "reelection/scripted_split.rs"]
