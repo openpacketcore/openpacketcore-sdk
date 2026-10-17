@@ -107,7 +107,7 @@ impl RetainedConfigBinding {
         self.voter_slots.as_ref()
     }
 
-    fn digest(&self, key: &AuditKey) -> [u8; 32] {
+    fn digest(&self, key: &AuditKey) -> Result<[u8; 32], RetainedConfigError> {
         let identity = self.topology.identity();
         let mut digest = Sha256::new();
         digest.update(BINDING_DOMAIN);
@@ -125,12 +125,12 @@ impl RetainedConfigBinding {
         digest.update(key.fingerprint());
         if let Some(initial) = &self.voter_slots {
             let encoded = opc_consensus::voter_slots::encode_voter_slot_table(initial)
-                .expect("retained voter binding was validated at construction");
+                .map_err(|_| RetainedConfigError::InvalidRequest)?;
             digest.update(b"voter-slots/v1\0");
             digest.update((encoded.len() as u64).to_be_bytes());
             digest.update(encoded);
         }
-        digest.finalize().into()
+        Ok(digest.finalize().into())
     }
 }
 
@@ -642,7 +642,7 @@ fn make_record(
 ) -> Result<[u8; RECORD_BYTES], RetainedConfigError> {
     let mut record = [0; RECORD_BYTES];
     record[..8].copy_from_slice(RECORD_MAGIC);
-    record[8..40].copy_from_slice(&binding.digest(key));
+    record[8..40].copy_from_slice(&binding.digest(key)?);
     record[40..72].copy_from_slice(&nonce);
     record[72] = u8::from(repair_only);
     for (i, value) in identity.iter().enumerate() {
@@ -667,7 +667,7 @@ fn validate_record(
     mac.update(&record[..RECORD_BYTES - 32]);
     mac.verify_slice(&record[RECORD_BYTES - 32..])
         .map_err(|_| RetainedConfigError::Rejected)?;
-    if &record[..8] != RECORD_MAGIC || record[8..40] != binding.digest(key) || record[72] > 1 {
+    if &record[..8] != RECORD_MAGIC || record[8..40] != binding.digest(key)? || record[72] > 1 {
         return Err(RetainedConfigError::Rejected);
     }
     Ok(())
