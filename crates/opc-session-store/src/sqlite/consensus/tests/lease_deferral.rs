@@ -33,6 +33,10 @@ fn sqlite_lease_deferral_profile_has_an_independent_fixed_digest() {
 }
 
 fn initialize(conn: &Connection) {
+    initialize_profile(conn, PROFILE);
+}
+
+fn initialize_profile(conn: &Connection, profile: FencedTransitionV2Profile) {
     initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile(
         conn,
         None,
@@ -43,7 +47,7 @@ fn initialize(conn: &Connection) {
         ConsensusAuthorityProfile::FixedImmutable,
         Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
         None,
-        PROFILE,
+        profile,
     )
     .unwrap();
 }
@@ -97,6 +101,7 @@ fn fixture(
         activation(1, first.clone(), timestamp(1)),
     ];
     append_logs_sync(conn, identity(), &entries).unwrap();
+    save_committed_sync(conn, identity(), entries.last().map(|entry| entry.log_id)).unwrap();
     let result = apply_entries_sync(conn, identity(), &backend.caps, entries.to_vec()).unwrap();
     let Ok(SessionMutationOutcome::FencedTransition(outcome)) = &result.responses[1].result else {
         panic!("successful original acquisition")
@@ -137,6 +142,73 @@ fn sqlite_lease_deferral_codec_is_profile_closed_and_requires_the_pending_marker
         ..response
     };
     assert!(validate_fenced_transition_v2_receipt_metadata(marker, &terminal, PROFILE).is_err());
+}
+
+#[test]
+fn sqlite_lease_deferral_status_boundary_is_profile_specific_before_and_after_activation() {
+    let marker = crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap();
+    let boundary = Timestamp::from_offset_datetime(
+        *marker.as_offset_datetime() - FENCED_TRANSITION_OUTCOME_RETENTION,
+    );
+    let before = Timestamp::from_offset_datetime(
+        *boundary.as_offset_datetime() - time::Duration::seconds(1),
+    );
+    for profile in [
+        FencedTransitionV2Profile::V2,
+        FencedTransitionV2Profile::V2WithVoid,
+        PROFILE,
+    ] {
+        for active in [false, true] {
+            let backend = SqliteSessionBackend::in_memory().unwrap();
+            let conn = backend.conn.blocking_lock();
+            initialize_profile(&conn, profile);
+            let mut entries = vec![membership_entry()];
+            if active {
+                let original = fenced_transition_v2_request(0xC1, 1, "synthetic-predecessor");
+                let mut entry = activation(1, original, timestamp(1));
+                let EntryPayload::Normal(command) = &mut entry.payload else {
+                    unreachable!()
+                };
+                let SessionMutationIntent::ActivateFencedTransitionV2 { profile_digest, .. } =
+                    &mut command.intent
+                else {
+                    unreachable!()
+                };
+                *profile_digest = profile.digest();
+                entries.push(entry);
+            }
+            append_logs_sync(&conn, identity(), &entries).unwrap();
+            save_committed_sync(&conn, identity(), entries.last().map(|entry| entry.log_id))
+                .unwrap();
+            let applied = apply_entries_sync(&conn, identity(), &backend.caps, entries).unwrap();
+            assert!(applied
+                .responses
+                .iter()
+                .all(|response| response.result.is_ok()));
+            assert_eq!(
+                fenced_transition_v2_ledger_layout_sync(&conn).unwrap()
+                    == FencedTransitionV2LedgerLayout::Absent,
+                !active
+            );
+            let fresh = fenced_transition_v2_request(0xD8, 1, "synthetic-fresh-owner");
+            for now in [before, boundary] {
+                conn.execute(
+                    "UPDATE consensus_machine SET logical_time=?1 WHERE singleton=1",
+                    [ops::format_rfc3339_normalized(now)],
+                )
+                .unwrap();
+                assert_eq!(
+                    read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &fresh)
+                        .unwrap(),
+                    if now == boundary && profile.defers_live_leases() {
+                        FencedTransitionV2Status::RetentionExhausted
+                    } else {
+                        FencedTransitionV2Status::NotFound
+                    }
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -304,6 +376,7 @@ fn sqlite_lease_deferral_reopen_refuses_other_profiles_and_preserves_pending_sta
         let (request, _) = fixture(&backend, &conn);
         let entry = fenced_transition_v2_entry(2, request.clone(), timestamp(2));
         append_logs_sync(&conn, identity(), std::slice::from_ref(&entry)).unwrap();
+        save_committed_sync(&conn, identity(), Some(entry.log_id)).unwrap();
         let result = apply_entries_sync(&conn, identity(), &backend.caps, vec![entry]).unwrap();
         assert_eq!(
             result.responses[0].result,
@@ -336,6 +409,143 @@ fn sqlite_lease_deferral_reopen_refuses_other_profiles_and_preserves_pending_sta
         read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &request),
         Err(StoreError::BackendUnavailable(_))
     ));
+}
+
+#[test]
+fn sqlite_lease_deferral_snapshot_restores_pending_then_resolves_the_same_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.sqlite");
+    let snapshot = directory.path().join("snapshot.sqlite");
+    let source =
+        SqliteSessionBackend::open_with_fenced_transition_v2_profile(&source_path, PROFILE)
+            .unwrap();
+    let (request, meta) = {
+        let conn = source.conn.blocking_lock();
+        let (request, _) = fixture(&source, &conn);
+        let entry = fenced_transition_v2_entry(2, request.clone(), timestamp(2));
+        append_logs_sync(&conn, identity(), std::slice::from_ref(&entry)).unwrap();
+        save_committed_sync(&conn, identity(), Some(entry.log_id)).unwrap();
+        let applied = apply_entries_sync(&conn, identity(), &source.caps, vec![entry]).unwrap();
+        assert_eq!(
+            applied.responses[0].result,
+            Err(StoreError::FencedTransitionLeaseDeferred)
+        );
+        let (last_log_id, last_membership) =
+            build_snapshot_database_sync(&conn, identity(), &snapshot).unwrap();
+        (
+            request,
+            opc_consensus::engine::SnapshotMeta {
+                last_log_id,
+                last_membership,
+                snapshot_id: "lease-deferral".into(),
+            },
+        )
+    };
+    drop(source);
+    let members = expected_members();
+    let bindings = test_member_bindings(&members);
+    let install = |conn: &Connection| {
+        install_snapshot_database_with_authority_sync(
+            conn,
+            identity(),
+            ConsensusAuthorityProfile::FixedImmutable,
+            Some(&members),
+            Some(&bindings),
+            Some(PlacementResiliencePolicy::RequireIndependentFailureDomains),
+            &snapshot,
+            &meta,
+            "snapshot-00000000-0000-4000-8000-000000001334.opc",
+            [0xD3; 32],
+            std::fs::metadata(&snapshot).unwrap().len(),
+        )
+    };
+    for (index, profile) in [
+        FencedTransitionV2Profile::V2,
+        FencedTransitionV2Profile::V2WithVoid,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = directory
+            .path()
+            .join(format!("incompatible-{index}.sqlite"));
+        let target =
+            SqliteSessionBackend::open_with_fenced_transition_v2_profile(&path, profile).unwrap();
+        let conn = target.conn.blocking_lock();
+        initialize_profile(&conn, profile);
+        let before = read_machine_sync(&conn, identity()).unwrap();
+        assert!(install(&conn).is_err());
+        assert_eq!(read_machine_sync(&conn, identity()).unwrap(), before);
+        assert_eq!(
+            fenced_transition_profile_in_sync(&conn, false).unwrap(),
+            profile
+        );
+        assert_eq!(
+            fenced_transition_v2_ledger_layout_sync(&conn).unwrap(),
+            FencedTransitionV2LedgerLayout::Absent
+        );
+    }
+    let target_path = directory.path().join("target.sqlite");
+    let target =
+        SqliteSessionBackend::open_with_fenced_transition_v2_profile(&target_path, PROFILE)
+            .unwrap();
+    {
+        let conn = target.conn.blocking_lock();
+        initialize(&conn);
+        install(&conn).unwrap();
+    }
+    drop(target);
+    let reopened =
+        SqliteSessionBackend::open_with_fenced_transition_v2_profile(&target_path, PROFILE)
+            .unwrap();
+    let conn = reopened.conn.blocking_lock();
+    initialize(&conn);
+    assert_eq!(
+        read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &request).unwrap(),
+        FencedTransitionV2Status::LeaseDeferred {
+            request_id: request.request_id()
+        }
+    );
+    let pending = read_fenced_transition_v2_receipt_sync(&conn, identity(), &request)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.ordinal, 2);
+    assert_eq!(
+        pending.retained_until,
+        crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap()
+    );
+    let now = Timestamp::from_offset_datetime(
+        *timestamp(0).as_offset_datetime() + time::Duration::seconds(400),
+    );
+    let entry = fenced_transition_v2_entry(3, request.clone(), now);
+    append_logs_sync(&conn, identity(), std::slice::from_ref(&entry)).unwrap();
+    save_committed_sync(&conn, identity(), Some(entry.log_id)).unwrap();
+    let terminal = apply_entries_sync(&conn, identity(), &reopened.caps, vec![entry]).unwrap();
+    assert!(matches!(&terminal.responses[0].result,
+        Ok(SessionMutationOutcome::FencedTransition(outcome))
+            if outcome.mutation() == FencedTransitionMutationResult::Deleted));
+    assert!(ops::get_raw_sync(&conn, request.lease().key())
+        .unwrap()
+        .is_none());
+    assert_eq!(terminal.notifications.len(), 1);
+    let completed = read_fenced_transition_v2_receipt_sync(&conn, identity(), &request)
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.ordinal, pending.ordinal);
+    assert_eq!(completed.payload_digest, pending.payload_digest);
+    assert_eq!(
+        read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+            .unwrap()
+            .current_bound_count,
+        2
+    );
+    validate_existing_schema(&conn, identity()).unwrap();
+    let replay = fenced_transition_v2_entry(4, request, now);
+    append_logs_sync(&conn, identity(), std::slice::from_ref(&replay)).unwrap();
+    save_committed_sync(&conn, identity(), Some(replay.log_id)).unwrap();
+    let replay = apply_entries_sync(&conn, identity(), &reopened.caps, vec![replay]).unwrap();
+    assert_eq!(replay.responses[0], terminal.responses[0]);
+    assert!(replay.notifications.is_empty());
 }
 
 #[test]

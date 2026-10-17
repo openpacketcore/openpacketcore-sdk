@@ -29795,11 +29795,16 @@ pub(crate) fn read_fenced_transition_v2_status_sync(
         let machine = read_machine_sync(conn, storage_identity).map_err(|_| {
             StoreError::BackendUnavailable("fenced transition V2 status is unavailable".into())
         })?;
-        return Ok(if fenced_transition_v2_retention_is_exhausted(machine.2) {
-            FencedTransitionV2Status::RetentionExhausted
-        } else {
-            FencedTransitionV2Status::NotFound
-        });
+        let profile = fenced_transition_profile_in_sync(conn, false).map_err(|_| {
+            StoreError::BackendUnavailable("fenced transition V2 status is unavailable".into())
+        })?;
+        return Ok(
+            if fenced_transition_v2_retention_is_exhausted(machine.2, profile) {
+                FencedTransitionV2Status::RetentionExhausted
+            } else {
+                FencedTransitionV2Status::NotFound
+            },
+        );
     }
     let history = read_fenced_transition_v2_history_row_in_sync(conn, storage_identity, false)
         .map_err(|_| {
@@ -29880,7 +29885,10 @@ pub(crate) fn read_fenced_transition_v2_status_sync(
     let machine = read_machine_sync(conn, storage_identity).map_err(|_| {
         StoreError::BackendUnavailable("fenced transition V2 status is unavailable".into())
     })?;
-    if fenced_transition_v2_retention_is_exhausted(machine.2) {
+    let profile = fenced_transition_profile_in_sync(conn, false).map_err(|_| {
+        StoreError::BackendUnavailable("fenced transition V2 status is unavailable".into())
+    })?;
+    if fenced_transition_v2_retention_is_exhausted(machine.2, profile) {
         return Ok(FencedTransitionV2Status::RetentionExhausted);
     }
     Ok(FencedTransitionV2Status::NotFound)
@@ -29889,15 +29897,25 @@ pub(crate) fn read_fenced_transition_v2_status_sync(
 /// Report whether a fresh V2 request cannot bind its exact-result window at
 /// the persisted logical time. The fixed V2 timestamp profile is stricter
 /// than the optional local parser range, so status follows the same check as
-/// the unbound apply and follower-projection paths.
-fn fenced_transition_v2_retention_is_exhausted(logical_time: Option<Timestamp>) -> bool {
+/// the unbound apply and follower-projection paths. The deferral profile also
+/// reserves its pending marker, which cannot retain a terminal result.
+fn fenced_transition_v2_retention_is_exhausted(
+    logical_time: Option<Timestamp>,
+    profile: crate::FencedTransitionV2Profile,
+) -> bool {
     logical_time.is_some_and(|logical_time| {
         !fenced_transition_v2_timestamp_is_in_range(logical_time)
             || !crate::ttl::checked_session_deadline(
                 logical_time,
                 FENCED_TRANSITION_OUTCOME_RETENTION,
             )
-            .is_ok_and(fenced_transition_v2_timestamp_is_in_range)
+            .is_ok_and(|until| {
+                fenced_transition_v2_timestamp_is_in_range(until)
+                    && (!profile.defers_live_leases()
+                        || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
+                            until,
+                        ))
+            })
     })
 }
 

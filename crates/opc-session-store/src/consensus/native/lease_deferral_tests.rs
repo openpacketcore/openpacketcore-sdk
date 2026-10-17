@@ -42,6 +42,55 @@ pub(in crate::consensus::native) fn pending_fixture() -> (NativeStorage, FencedT
 }
 
 #[test]
+fn native_lease_deferral_status_boundary_is_profile_specific_before_and_after_activation() {
+    let marker = crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap();
+    let boundary = Timestamp::from_offset_datetime(
+        *marker.as_offset_datetime() - FENCED_TRANSITION_OUTCOME_RETENTION,
+    );
+    let before =
+        Timestamp::from_offset_datetime(*boundary.as_offset_datetime() - Duration::from_secs(1));
+    for profile in [
+        FencedTransitionV2Profile::V2,
+        FencedTransitionV2Profile::V2WithVoid,
+        FencedTransitionV2Profile::V2WithLeaseDeferral,
+    ] {
+        let (mut active, original, _) = fixture_with_profile(profile);
+        let mut inactive = NativeStorage::empty_with_roster_root_and_profile(
+            active.business.identity,
+            active.business.members.clone(),
+            None,
+            profile,
+        )
+        .unwrap();
+        assert!(inactive.business.frontiers.history.is_none());
+        assert_eq!(active.business.history().unwrap().bound_entries(), 1);
+        let fresh = FencedTransitionV2Request::new(
+            original.request_id().epoch(),
+            FencedTransitionV2CallerNonce::from_bytes([0xD8; 16]),
+            original.lease().clone(),
+            original.mutation().clone(),
+        )
+        .unwrap();
+        for storage in [&mut inactive, &mut active] {
+            storage.business.frontiers.logical_time = Some(before);
+            assert_eq!(
+                storage.business.status(&fresh).unwrap(),
+                FencedTransitionV2Status::NotFound
+            );
+            storage.business.frontiers.logical_time = Some(boundary);
+            assert_eq!(
+                storage.business.status(&fresh).unwrap(),
+                if profile.defers_live_leases() {
+                    FencedTransitionV2Status::RetentionExhausted
+                } else {
+                    FencedTransitionV2Status::NotFound
+                }
+            );
+        }
+    }
+}
+
+#[test]
 fn native_lease_deferral_reserved_retention_boundary_preserves_pending_and_reports_exhaustion() {
     let (mut storage, pending) = pending_fixture();
     let fresh = FencedTransitionV2Request::new(

@@ -1232,7 +1232,10 @@ impl NativeState {
                 } else if request.request_id().epoch().get() != self.frontiers.async_history_epoch()
                 {
                     FencedTransitionV2Status::EpochNotActive
-                } else if retention_exhausted(self.frontiers.logical_time) {
+                } else if retention_exhausted(
+                    self.frontiers.logical_time,
+                    self.frontiers.fenced_transition_profile,
+                ) {
                     FencedTransitionV2Status::RetentionExhausted
                 } else {
                     FencedTransitionV2Status::NotFound
@@ -1296,7 +1299,10 @@ impl NativeState {
                 FencedTransitionV2Status::EpochNotActive
             } else if history.bound_entries() >= FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
                 FencedTransitionV2Status::HistoryFull
-            } else if retention_exhausted(self.frontiers.logical_time) {
+            } else if retention_exhausted(
+                self.frontiers.logical_time,
+                self.frontiers.fenced_transition_profile,
+            ) {
                 FencedTransitionV2Status::RetentionExhausted
             } else {
                 FencedTransitionV2Status::NotFound
@@ -2162,8 +2168,15 @@ fn retention_deadline(now: Timestamp) -> Option<Timestamp> {
         })
 }
 
-fn retention_exhausted(now: Option<Timestamp>) -> bool {
-    now.is_some_and(|now| retention_deadline(now).is_none())
+fn retention_exhausted(now: Option<Timestamp>, profile: FencedTransitionV2Profile) -> bool {
+    now.is_some_and(|now| {
+        retention_deadline(now)
+            .filter(|until| {
+                !profile.defers_live_leases()
+                    || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(*until)
+            })
+            .is_none()
+    })
 }
 
 fn replay_outcome(
