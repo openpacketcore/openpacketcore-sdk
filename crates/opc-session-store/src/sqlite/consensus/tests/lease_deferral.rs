@@ -3,6 +3,22 @@ use crate::FencedTransitionV2Profile;
 
 const PROFILE: FencedTransitionV2Profile = FencedTransitionV2Profile::V2WithLeaseDeferral;
 
+fn expected_members() -> BTreeSet<SessionConsensusNodeId> {
+    [7, 8, 9]
+        .into_iter()
+        .map(|id| SessionConsensusNodeId::new(id).unwrap())
+        .collect()
+}
+
+fn membership_entry() -> Entry<SessionRaftTypeConfig> {
+    let mut entry = super::membership_entry();
+    entry.payload = EntryPayload::Membership(opc_consensus::engine::Membership::new(
+        vec![expected_members()],
+        expected_members(),
+    ));
+    entry
+}
+
 #[test]
 fn sqlite_lease_deferral_profile_has_an_independent_fixed_digest() {
     let hex = PROFILE
@@ -41,12 +57,16 @@ fn activation(
     let EntryPayload::Normal(command) = &mut entry.payload else {
         unreachable!()
     };
-    let SessionMutationIntent::ActivateFencedTransitionV2 { profile_digest, .. } =
-        &mut command.intent
+    let SessionMutationIntent::ActivateFencedTransitionV2 {
+        profile_digest,
+        voter_set_digest,
+        ..
+    } = &mut command.intent
     else {
         unreachable!()
     };
     *profile_digest = PROFILE.digest();
+    *voter_set_digest = fenced_transition_voter_set_digest(identity(), &expected_members());
     entry
 }
 
@@ -117,6 +137,160 @@ fn sqlite_lease_deferral_codec_is_profile_closed_and_requires_the_pending_marker
         ..response
     };
     assert!(validate_fenced_transition_v2_receipt_metadata(marker, &terminal, PROFILE).is_err());
+}
+
+#[test]
+fn sqlite_lease_deferral_reserved_retention_boundary_preserves_pending_and_reports_exhaustion() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let conn = backend.conn.blocking_lock();
+    let (pending, _) = fixture(&backend, &conn);
+    let first = apply_entries_sync(
+        &conn,
+        identity(),
+        &backend.caps,
+        vec![fenced_transition_v2_entry(2, pending.clone(), timestamp(2))],
+    )
+    .unwrap();
+    assert_eq!(
+        first.responses[0].result,
+        Err(StoreError::FencedTransitionLeaseDeferred)
+    );
+    let fresh = FencedTransitionV2Request::new(
+        pending.request_id().epoch(),
+        crate::FencedTransitionV2CallerNonce::from_bytes([0xD4; 16]),
+        pending.lease().clone(),
+        pending.mutation().clone(),
+    )
+    .unwrap();
+    let marker = crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap();
+    let now = Timestamp::from_offset_datetime(
+        *marker.as_offset_datetime() - FENCED_TRANSITION_OUTCOME_RETENTION,
+    );
+    assert_eq!(
+        crate::ttl::checked_session_deadline(now, FENCED_TRANSITION_OUTCOME_RETENTION).unwrap(),
+        marker
+    );
+    let before = read_machine_sync(&conn, identity()).unwrap();
+    let result = apply_entries_sync(
+        &conn,
+        identity(),
+        &backend.caps,
+        vec![
+            fenced_transition_v2_entry(3, pending.clone(), now),
+            fenced_transition_v2_entry(4, fresh.clone(), now),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        result.responses[0].result,
+        Err(StoreError::FencedTransitionOutcomeUnknown)
+    );
+    assert_eq!(
+        result.responses[1].result,
+        Err(StoreError::FencedTransitionRetentionExhausted)
+    );
+    let after = read_machine_sync(&conn, identity()).unwrap();
+    assert_eq!((before.0, before.1, before.3), (after.0, after.1, after.3));
+    assert!(result.notifications.is_empty());
+    assert_eq!(
+        read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+            .unwrap()
+            .current_bound_count,
+        2
+    );
+    validate_fenced_transition_v2_receipts_sync(&conn, identity()).unwrap();
+    assert_eq!(
+        read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &pending).unwrap(),
+        FencedTransitionV2Status::LeaseDeferred {
+            request_id: pending.request_id()
+        }
+    );
+    assert_eq!(
+        read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &fresh).unwrap(),
+        FencedTransitionV2Status::RetentionExhausted
+    );
+}
+
+#[test]
+fn sqlite_lease_deferral_sequence_exhaustion_resolves_once_without_a_business_effect() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let conn = backend.conn.blocking_lock();
+    let (pending, _) = fixture(&backend, &conn);
+    let first = apply_entries_sync(
+        &conn,
+        identity(),
+        &backend.caps,
+        vec![fenced_transition_v2_entry(2, pending.clone(), timestamp(2))],
+    )
+    .unwrap();
+    assert_eq!(
+        first.responses[0].result,
+        Err(StoreError::FencedTransitionLeaseDeferred)
+    );
+    conn.execute(
+        "UPDATE consensus_machine SET application_sequence=?1 WHERE singleton=1",
+        [i64::MAX],
+    )
+    .unwrap();
+    let record_before = ops::get_raw_sync(&conn, pending.lease().key()).unwrap();
+    assert!(record_before.is_some());
+    let before = read_machine_sync(&conn, identity()).unwrap();
+    let busy = apply_entries_sync(
+        &conn,
+        identity(),
+        &backend.caps,
+        vec![fenced_transition_v2_entry(3, pending.clone(), timestamp(3))],
+    )
+    .unwrap();
+    assert_eq!(
+        busy.responses[0].result,
+        Err(StoreError::FencedTransitionLeaseDeferred)
+    );
+    let now = Timestamp::from_offset_datetime(
+        *timestamp(0).as_offset_datetime() + time::Duration::seconds(400),
+    );
+    let terminal = apply_entries_sync(
+        &conn,
+        identity(),
+        &backend.caps,
+        vec![fenced_transition_v2_entry(4, pending.clone(), now)],
+    )
+    .unwrap();
+    assert_eq!(
+        terminal.responses[0].result,
+        Err(StoreError::FencedTransitionStorageExhausted)
+    );
+    assert!(terminal.notifications.is_empty());
+    assert_eq!(
+        ops::get_raw_sync(&conn, pending.lease().key()).unwrap(),
+        record_before
+    );
+    let after = read_machine_sync(&conn, identity()).unwrap();
+    assert_eq!((before.0, before.1, before.3), (after.0, after.1, after.3));
+    assert_eq!(
+        read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+            .unwrap()
+            .current_bound_count,
+        2
+    );
+    let row = read_fenced_transition_v2_receipt_sync(&conn, identity(), &pending)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.ordinal, 2);
+    assert_eq!(
+        row.retained_until,
+        crate::ttl::checked_session_deadline(now, FENCED_TRANSITION_OUTCOME_RETENTION).unwrap()
+    );
+    validate_fenced_transition_v2_receipts_sync(&conn, identity()).unwrap();
+    let replay = apply_entries_sync(
+        &conn,
+        identity(),
+        &backend.caps,
+        vec![fenced_transition_v2_entry(5, pending, now)],
+    )
+    .unwrap();
+    assert_eq!(replay.responses[0], terminal.responses[0]);
+    assert!(replay.notifications.is_empty());
 }
 
 #[test]

@@ -1360,7 +1360,7 @@ where
                 Ok(FencedTransitionV2Status::RetentionExhausted) => {
                     resolved[index] = Some(Err(StoreError::FencedTransitionRetentionExhausted));
                 }
-                Err(_) => {
+                Ok(FencedTransitionV2Status::LeaseDeferred { .. }) | Err(_) => {
                     return Err(ReleaseBatchFailure {
                         stage: ReleaseBatchFailureStage::StatusReadRejected,
                     });

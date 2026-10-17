@@ -42,6 +42,99 @@ pub(in crate::consensus::native) fn pending_fixture() -> (NativeStorage, FencedT
 }
 
 #[test]
+fn native_lease_deferral_reserved_retention_boundary_preserves_pending_and_reports_exhaustion() {
+    let (mut storage, pending) = pending_fixture();
+    let fresh = FencedTransitionV2Request::new(
+        pending.request_id().epoch(),
+        FencedTransitionV2CallerNonce::from_bytes([0xD4; 16]),
+        pending.lease().clone(),
+        pending.mutation().clone(),
+    )
+    .unwrap();
+    let marker = crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap();
+    let now = Timestamp::from_offset_datetime(
+        *marker.as_offset_datetime() - FENCED_TRANSITION_OUTCOME_RETENTION,
+    );
+    assert_eq!(retention_deadline(now), Some(marker));
+    let sequence = storage.business.frontiers.sequence;
+    let watch = storage.business.frontiers.watch_sequence;
+    let response = apply(&mut storage, &[command(3, &pending, now, false)])
+        .responses
+        .remove(0);
+    assert_eq!(
+        response.result,
+        Err(StoreError::FencedTransitionOutcomeUnknown)
+    );
+    let rejected = apply(&mut storage, &[command(4, &fresh, now, false)])
+        .responses
+        .remove(0);
+    assert_eq!(
+        rejected.result,
+        Err(StoreError::FencedTransitionRetentionExhausted)
+    );
+    assert_eq!(storage.business.frontiers.sequence, sequence);
+    assert_eq!(storage.business.frontiers.watch_sequence, watch);
+    assert_eq!(storage.business.history().unwrap().bound_entries(), 2);
+    assert_eq!(
+        storage
+            .business
+            .get(pending.lease().key())
+            .unwrap()
+            .generation,
+        crate::Generation::new(1)
+    );
+    assert_eq!(
+        storage.business.status(&pending).unwrap(),
+        FencedTransitionV2Status::LeaseDeferred {
+            request_id: pending.request_id()
+        }
+    );
+    assert_eq!(
+        storage.business.status(&fresh).unwrap(),
+        FencedTransitionV2Status::RetentionExhausted
+    );
+}
+
+#[test]
+fn native_lease_deferral_sequence_exhaustion_resolves_once_without_a_business_effect() {
+    let (mut storage, pending) = pending_fixture();
+    storage.business.frontiers.sequence = COUNTER_MAX;
+    storage.business.admit_business().unwrap();
+    storage.log.admit(&storage.business).unwrap();
+    let watch = storage.business.frontiers.watch_sequence;
+    assert_eq!(
+        apply(&mut storage, &[command(3, &pending, time(3), false)]).responses[0].result,
+        Err(StoreError::FencedTransitionLeaseDeferred)
+    );
+    let terminal = apply(&mut storage, &[command(4, &pending, at(80), false)])
+        .responses
+        .remove(0);
+    assert_eq!(
+        terminal.result,
+        Err(StoreError::FencedTransitionStorageExhausted)
+    );
+    assert_eq!(storage.business.frontiers.sequence, COUNTER_MAX);
+    assert_eq!(storage.business.frontiers.watch_sequence, watch);
+    assert_eq!(storage.business.history().unwrap().bound_entries(), 2);
+    assert_eq!(
+        storage
+            .business
+            .get(pending.lease().key())
+            .unwrap()
+            .generation,
+        crate::Generation::new(1)
+    );
+    let row = &storage.business.receipts[&pending.request_id()];
+    assert_eq!(row.ordinal, 2);
+    assert_eq!(row.retained_until, retention_deadline(at(80)).unwrap());
+    assert!(!row.lease_deferred());
+    assert_eq!(
+        apply(&mut storage, &[command(5, &pending, at(81), false)]).responses[0],
+        terminal
+    );
+}
+
+#[test]
 fn native_lease_deferral_retries_and_image_restart_keep_one_ordinal_then_resolve_once() {
     let (mut storage, pending) = pending_fixture();
     let sequence = storage.business.frontiers.sequence;

@@ -4,6 +4,7 @@ use opc_session_store::{Clock, FencedTransitionV2Profile, SessionLeaseManager};
 use opc_types::Timestamp;
 use std::sync::atomic::AtomicU64;
 
+#[derive(Debug)]
 struct StoreClock {
     origin: Timestamp,
     seconds: AtomicU64,
@@ -142,6 +143,149 @@ fn status_fault(fixture: &AuthenticatedPreparedFencedTransitionFixture, fault: u
             .service
             .fenced_transition_v2_status_fault
             .store(fault, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_lease_deferral_full_journal_retains_one_binding_and_reuses_completion_capacity() {
+    let (fixture, clock) = fixture().await;
+    // Exercise the same authenticated admission fence in both profiles. The
+    // test-control profile supplies the existing small-capacity fixture hook;
+    // ordinary builds fill the complete production bound rather than skip.
+    #[cfg(feature = "test-control")]
+    let fixture = {
+        let mut fixture = fixture;
+        fixture.recovery_capacity = 4;
+        fixture
+    };
+    let capacity = if cfg!(feature = "test-control") {
+        4
+    } else {
+        FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES
+    };
+    let result = std::panic::AssertUnwindSafe(tokio::time::timeout(
+        Duration::from_secs(
+            if capacity == FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES {
+                900
+            } else {
+                60
+            },
+        ),
+        async {
+            let provider = CountingProvider::new();
+            let facade = fixture
+                .open_local_aead_v2(Arc::clone(&provider), "lease-deferral-full")
+                .await
+                .unwrap();
+            let prior = predecessor(&facade, 2000).await;
+            let request = successor(&prior, request_id(2001));
+            let id = request.request_id();
+            let deadline = soon();
+            let mut prepared = facade
+                .prepare_fenced_transition(request.clone(), budget(deadline))
+                .await
+                .unwrap();
+            deferred(&mut prepared, deadline).await;
+            let exact = sealed_request(&fixture, id);
+            drop(prepared);
+            let mut fillers = Vec::new();
+            for ordinal in 1..capacity as u64 {
+                fillers.push(
+                    facade
+                        .prepare_fenced_transition(
+                            create(request_id(20_000 + ordinal), 30_000 + ordinal, PAYLOAD),
+                            budget(soon()),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert_eq!(
+                facade.retained_fenced_transitions().await.unwrap(),
+                capacity
+            );
+            let calls = fixture.diagnostics().fenced_transition_v2_calls();
+            let provider_calls = provider.calls();
+            let extra = create(request_id(99_000), 99_000, PAYLOAD);
+            assert!(matches!(
+                facade
+                    .prepare_fenced_transition(extra.clone(), budget(soon()))
+                    .await,
+                Err(StoreError::FencedTransitionHistoryFull)
+            ));
+            assert_eq!(provider.calls(), provider_calls);
+            assert_eq!(fixture.diagnostics().fenced_transition_v2_calls(), calls);
+            for _ in 1..16 {
+                let deadline = soon();
+                let mut resumed = facade
+                    .resume_deferred_fenced_transition(id, budget(deadline))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                deferred(&mut resumed, deadline).await;
+                assert_eq!(sealed_request(&fixture, id), exact);
+                assert_eq!(
+                    facade.retained_fenced_transitions().await.unwrap(),
+                    capacity
+                );
+                assert_eq!(provider.calls(), provider_calls);
+                assert_eq!(
+                    fixture
+                        .cluster
+                        .store(0)
+                        .fenced_transition_v2_history_state()
+                        .await
+                        .unwrap()
+                        .bound_entries(),
+                    2
+                );
+            }
+            assert_eq!(
+                fixture.diagnostics().fenced_transition_v2_calls(),
+                calls + 15
+            );
+            clock.advance(31);
+            let deadline = soon();
+            let mut resumed = facade
+                .resume_deferred_fenced_transition(id, budget(deadline))
+                .await
+                .unwrap()
+                .unwrap();
+            let result = committed_v2(&mut resumed, &request, deadline).await;
+            assert_eq!(result.committed_generation(), Generation::new(2));
+            resumed.release_resolved().await.unwrap();
+            assert_eq!(
+                facade.retained_fenced_transitions().await.unwrap(),
+                capacity - 1
+            );
+            assert_eq!(
+                fixture.diagnostics().fenced_transition_v2_calls(),
+                calls + 16
+            );
+            let replacement = facade
+                .prepare_fenced_transition(extra, budget(soon()))
+                .await
+                .unwrap();
+            assert_eq!(
+                facade.retained_fenced_transitions().await.unwrap(),
+                capacity
+            );
+            assert_eq!(
+                fixture.diagnostics().fenced_transition_v2_calls(),
+                calls + 16
+            );
+            drop(replacement);
+            drop(fillers);
+        },
+    ))
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await.unwrap();
+    match result {
+        Ok(completed) => {
+            completed.expect("full deferral journal proof finishes within its fixed watchdog")
+        }
+        Err(error) => std::panic::resume_unwind(error),
     }
 }
 

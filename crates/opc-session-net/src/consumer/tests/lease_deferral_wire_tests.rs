@@ -82,7 +82,7 @@ async fn lease_deferral_wire_requires_full_identity_and_is_never_a_terminal_erro
     );
     assert!(!v2_response_matches_request(
         &original,
-        &SessionConsumerV2Response::FencedTransitionV2(Err(error.clone()))
+        &SessionConsumerV2Response::FencedTransitionV2(Err(error))
     ));
     assert_eq!(
         error.into_store_error(),
