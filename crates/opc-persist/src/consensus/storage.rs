@@ -1181,13 +1181,37 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             .snapshot_test_hooks
             .reads_started
             .fetch_add(1, Ordering::AcqRel);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(SNAPSHOT_OPERATION_TIMEOUT)
+            .ok_or_else(|| {
+                storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    sqlite::invalid_data("config consensus snapshot read deadline overflow"),
+                )
+            })?;
         validate_snapshot_binding(&self.core)
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
+        // Publication removes the superseded path. Keep the selected metadata,
+        // envelope verification and final open under the same gate as build
+        // and install; the returned descriptor survives subsequent unlinking.
+        let _guard = tokio::time::timeout_at(deadline, self.core.snapshot_gate.lock())
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    sqlite::invalid_data("config consensus snapshot read timed out"),
+                )
+            })?;
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let current = self
             .core
-            .run_sqlite(move |conn| sqlite::read_current_snapshot_sync(conn, identity, &members))
+            .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                cancellation.check_io()?;
+                sqlite::read_current_snapshot_sync(conn, identity, &members)
+            })
             .await
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
         let Some((meta, file_name, expected_checksum, expected_length)) = current else {
@@ -1195,7 +1219,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         };
         let path = self.core.snapshot_dir.join(file_name);
         let (_, checksum, length) =
-            tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, verify_snapshot_envelope(&path))
+            tokio::time::timeout_at(deadline, verify_snapshot_envelope(&path))
                 .await
                 .map_err(|_| {
                     storage_error(
@@ -1228,13 +1252,22 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             self.core.snapshot_test_hooks.read_verified.notify_one();
             self.core.snapshot_test_hooks.resume_read.notified().await;
         }
-        let file = ConfigSnapshotFile::open(path).await.map_err(|error| {
-            storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                error,
-            )
-        })?;
+        let file = tokio::time::timeout_at(deadline, ConfigSnapshotFile::open(path))
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    sqlite::invalid_data("config consensus snapshot read timed out"),
+                )
+            })?
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
         Ok(Some(Snapshot {
             meta,
             snapshot: Box::new(file),
