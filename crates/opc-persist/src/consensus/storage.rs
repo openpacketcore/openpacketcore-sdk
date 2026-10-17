@@ -2170,6 +2170,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_sqlite_worker_keeps_shutdown_pending_until_connection_release() {
+        let temp = tempfile::tempdir().expect("snapshot tempdir");
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        let connection = Arc::downgrade(&backend.conn());
+        let (log, _, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("storage");
+        let mut shutdown = log.core.storage_shutdown_observer();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            log.core
+                .run_sqlite_cancellable(move |conn, cancellation| {
+                    let _: i64 = conn
+                        .query_row("SELECT 1", [], |row| row.get(0))
+                        .map_err(|_| sqlite::invalid_data("worker probe failed"))?;
+                    let _ = started.send(());
+                    released
+                        .recv()
+                        .map_err(|_| sqlite::invalid_data("worker release unavailable"))?;
+                    cancellation.check_io()
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("actual SQLite worker starts")
+            .expect("worker start signal");
+        caller.abort();
+        assert!(caller
+            .await
+            .expect_err("cancel awaiting future")
+            .is_cancelled());
+        drop(backend);
+        let shutdown_pending = shutdown.has_changed().is_ok();
+        let connection_retained = connection.strong_count() > 0;
+        release.send(()).expect("release the actual worker");
+        tokio::time::timeout(Duration::from_secs(2), shutdown.changed())
+            .await
+            .expect("worker releases all storage owners")
+            .expect_err("only owner exhaustion closes the completion channel");
+        assert!(
+            shutdown_pending,
+            "caller cancellation cannot complete the drain"
+        );
+        assert!(connection_retained, "the blocked worker still owns SQLite");
+        assert_eq!(
+            connection.strong_count(),
+            0,
+            "connection released before completion"
+        );
+    }
+
+    #[tokio::test]
     async fn pre_core_probe_timeout_never_queues_late_work_and_reuses_backend() {
         let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
             .await

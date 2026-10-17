@@ -1,5 +1,6 @@
 //! One owned shutdown: fence admission, attempt handoff, then join the engine.
 
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use opc_consensus::engine::raft::{TransferLeaderError, TransferLeaderRequest};
 use opc_consensus::{planned_shutdown_timeout, PlannedShutdownFallback, PlannedShutdownOutcome};
 use tokio::sync::watch;
@@ -69,6 +70,13 @@ impl ConfigShutdownCoordinator {
                 .await
                 .map(|()| outcome)
                 .map_err(|_| consensus_unavailable());
+            // Raft joins its core and replication tasks, but its state-machine
+            // worker and snapshot builders can still own storage afterwards.
+            // Keep this drain owned across every caller timeout until all of
+            // those handles, including cancelled SQLite workers, have exited.
+            let mut storage_shutdown = store.inner.storage_shutdown.clone();
+            while storage_shutdown.changed().await.is_ok() {}
+            drop(store);
             sender.send_replace(Some(result));
         });
         receiver
@@ -168,27 +176,23 @@ impl ConsensusConfigStore {
         }
 
         *timeout_reason = Reason::SurvivingQuorumUnavailable;
-        let mut releases = tokio::task::JoinSet::new();
+        // Borrowed calls are cancelled synchronously with this preparation.
+        // No detached release task may retain a store after shutdown completes.
+        let mut releases = FuturesUnordered::new();
         for node in scope
             .0
             .iter()
             .copied()
             .filter(|node| *node != self.inner.local_node_id && node != request.to())
         {
-            let store = self.clone();
-            let request = request.clone();
-            releases.spawn(async move {
-                store
-                    .deliver_shutdown_transfer(node, &request, deadline)
-                    .await
-            });
+            releases.push(self.deliver_shutdown_transfer(node, &request, deadline));
         }
         let mut released = 0;
-        while let Some(result) = releases.join_next().await {
+        while let Some(result) = releases.next().await {
             if !self.shutdown_scope_is_current(&scope) {
                 return Err(Reason::ScopeChanged);
             }
-            if matches!(result, Ok(Ok(Ok(())))) {
+            if matches!(result, Ok(Ok(()))) {
                 released += 1;
                 if released >= quorum - 1 {
                     break;

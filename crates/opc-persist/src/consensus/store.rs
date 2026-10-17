@@ -314,6 +314,7 @@ struct ConsensusConfigStoreInner {
     proposal_admission: Arc<tokio::sync::Semaphore>,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
     durable_progress: Arc<storage::ConfigDurableProgress>,
+    storage_shutdown: tokio::sync::watch::Receiver<()>,
     voter_profile: Option<Arc<voter_slots::ConfigVoterProfile>>,
     shutdown: planned_shutdown::ConfigShutdownCoordinator,
 }
@@ -622,11 +623,12 @@ impl ConsensusConfigStore {
         )
         .await
         .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
+        let storage_shutdown = log_store.core.storage_shutdown_observer();
         let voter_profile = if let Some(setup) = voter_setup {
             Some(
                 voter_slots::ConfigVoterProfile::new(
                     local_node_id,
-                    log_store.core.clone(),
+                    log_store.core.clone_for_admission_reader(),
                     setup.resolver,
                     compatibility.digest(),
                 )
@@ -699,6 +701,7 @@ impl ConsensusConfigStore {
                 )),
                 metric_leader: std::sync::Mutex::new(None),
                 durable_progress,
+                storage_shutdown,
                 voter_profile,
             }),
         };

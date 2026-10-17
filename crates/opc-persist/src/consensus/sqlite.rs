@@ -317,9 +317,25 @@ pub(crate) struct ConfigConsensusCore {
     sqlite_worker_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) apply_gate: Arc<tokio::sync::Semaphore>,
+    // Drop last: channel closure proves that every engine-owned connection
+    // and snapshot-directory handle has been released.
+    storage_owner: tokio::sync::watch::Sender<()>,
 }
 
 impl ConfigConsensusCore {
+    pub(crate) fn storage_shutdown_observer(&self) -> tokio::sync::watch::Receiver<()> {
+        self.storage_owner.subscribe()
+    }
+
+    /// Store-owned admission readers outlive the engine join. Track them
+    /// separately so they cannot keep the engine's completion channel open.
+    pub(crate) fn clone_for_admission_reader(&self) -> Self {
+        Self {
+            storage_owner: tokio::sync::watch::channel(()).0,
+            ..self.clone()
+        }
+    }
+
     pub(crate) async fn initialize(
         backend: &SqliteBackend,
         snapshot_directory: super::storage::AdmittedSnapshotDirectory,
@@ -514,6 +530,7 @@ impl ConfigConsensusCore {
             sqlite_worker_gate: worker_gate,
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
+            storage_owner: tokio::sync::watch::channel(()).0,
         })
     }
 
@@ -549,6 +566,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
+            Some(self.storage_owner.clone()),
             deadline,
             operation,
         )
@@ -584,6 +602,7 @@ impl ConfigConsensusCore {
         run_sqlite_worker_until(
             self.sqlite_worker_gate.clone(),
             self.conn.clone(),
+            Some(self.storage_owner.clone()),
             deadline,
             operation,
         )
@@ -611,6 +630,7 @@ where
     run_sqlite_worker_until(
         backend.config_consensus_worker_gate(),
         backend.conn(),
+        None,
         deadline,
         operation,
     )
@@ -620,6 +640,7 @@ where
 async fn run_sqlite_worker_until<T, F>(
     worker_gate: Arc<tokio::sync::Semaphore>,
     conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
+    storage_owner: Option<tokio::sync::watch::Sender<()>>,
     deadline: tokio::time::Instant,
     operation: F,
 ) -> io::Result<T>
@@ -642,24 +663,34 @@ where
     let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
     let worker_cancellation = cancellation.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
+        // An aborted awaiting future cannot release storage ownership while
+        // the blocking worker still holds its connection. Locals drop in
+        // reverse order, including early errors and unwinding.
+        let _storage_owner = storage_owner;
         let _permit = permit;
+        let worker_conn = conn;
         let commit_cancellation = worker_cancellation.clone();
-        conn.commit_hook(Some(move || {
-            commit_cancellation.authorize_commit().is_err()
-        }))
-        .map_err(db_error)?;
+        worker_conn
+            .commit_hook(Some(move || {
+                commit_cancellation.authorize_commit().is_err()
+            }))
+            .map_err(db_error)?;
         let progress_cancellation = worker_cancellation.clone();
-        conn.progress_handler(
-            1_000,
-            Some(move || {
-                progress_cancellation.is_cancelled() || std::time::Instant::now() >= std_deadline
-            }),
-        )
-        .map_err(db_error)?;
-        let result = operation(&conn, &worker_cancellation);
-        conn.commit_hook(None::<fn() -> bool>)
+        worker_conn
+            .progress_handler(
+                1_000,
+                Some(move || {
+                    progress_cancellation.is_cancelled()
+                        || std::time::Instant::now() >= std_deadline
+                }),
+            )
+            .map_err(db_error)?;
+        let result = operation(&worker_conn, &worker_cancellation);
+        worker_conn
+            .commit_hook(None::<fn() -> bool>)
             .expect("installed SQLite hook belongs to an owned connection");
-        conn.progress_handler(0, None::<fn() -> bool>)
+        worker_conn
+            .progress_handler(0, None::<fn() -> bool>)
             .expect("installed SQLite hook belongs to an owned connection");
         result
     });
