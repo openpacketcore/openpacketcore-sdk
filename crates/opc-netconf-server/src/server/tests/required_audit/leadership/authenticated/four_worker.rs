@@ -12,6 +12,8 @@ async fn elect_caught_up_survivor(quorum: &NetworkQuorum, old_leader: usize) -> 
         let committed = old.committed_index.expect("committed audit prefix");
         let candidate = quorum.stores[1].status().node_id;
         let witness = quorum.stores[2].status().node_id;
+        // This companion deliberately requires both followers to have already
+        // applied the committed audit prefix, not merely to contain its log.
         for store in &quorum.stores[1..] {
             store
                 .wait_for_raft_status_for_test(|status| {
@@ -21,6 +23,15 @@ async fn elect_caught_up_survivor(quorum: &NetworkQuorum, old_leader: usize) -> 
                 })
                 .await
                 .unwrap();
+        }
+        for store in &quorum.stores[1..] {
+            let status = store.status();
+            assert_eq!(status.term, old.term);
+            assert_eq!(status.leader_id, Some(old.node_id));
+            assert!(
+                status.applied_index >= Some(committed),
+                "applied-prefix precondition"
+            );
         }
         let votes = election::VoteGate::observe(old.term + 1);
         quorum.observe_votes(Some(votes.clone()));

@@ -486,8 +486,8 @@ impl election::Voters for NetworkQuorum {
         }
     }
 
-    fn isolate(&self, node: usize) {
-        NetworkQuorum::isolate(self, node);
+    async fn isolate_and_quiesce(&self, node: usize) {
+        NetworkQuorum::isolate_and_quiesce(self, node).await;
     }
 
     async fn leader_except(&self, excluded: Option<usize>) -> usize {
@@ -623,6 +623,8 @@ async fn partitioned_authority_timeout_reports_observed_voter_state() {
 
 #[tokio::test(start_paused = true)]
 async fn required_running_terminal_debt_survives_authenticated_voter_leadership_change() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
     let (
         quorum,
         (
@@ -635,8 +637,8 @@ async fn required_running_terminal_debt_survives_authenticated_voter_leadership_
             committed,
             new_leader,
         ),
-    ) = election::schedule::with_frozen_time(async {
-        let election = election::SuccessfulElection::new().await;
+    ) = async {
+        let election = election::SuccessfulElection::new(runtime_origin).await;
         let quorum = NetworkQuorum::open_scripted(Some(&election.scripts)).await;
         let setup = AssertUnwindSafe(async {
             // Use a dedicated counter/listener around the actual config handler.
@@ -722,7 +724,7 @@ async fn required_running_terminal_debt_survives_authenticated_voter_leadership_
                 std::panic::resume_unwind(panic);
             }
         }
-    })
+    }
     .await;
     let result = AssertUnwindSafe(async {
         assert_ne!(old_leader, new_leader);

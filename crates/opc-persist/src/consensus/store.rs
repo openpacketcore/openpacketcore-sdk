@@ -334,6 +334,32 @@ impl fmt::Debug for ConsensusConfigStore {
 }
 
 impl ConsensusConfigStore {
+    /// Inspect real AppendEntries frames without exposing the private command
+    /// representation. Fixtures can hold log replication while allowing reads'
+    /// empty heartbeats to refresh the unchanged engine lease.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn is_empty_append_entries_for_test(request: &ConsensusWireRequest) -> bool {
+        request.family == ConsensusRpcFamily::AppendEntries
+            && decode_config_wire::<
+                opc_consensus::engine::raft::AppendEntriesRequest<ConfigRaftTypeConfig>,
+            >(&request.payload)
+            .is_ok_and(|append| append.entries.is_empty())
+    }
+
+    /// Observe the actual vote-update instant, without changing the lease.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub async fn vote_updated_at_for_test(
+        &self,
+    ) -> Result<Option<tokio::time::Instant>, PersistError> {
+        self.inner
+            .raft
+            .with_raft_state(|state| state.vote_last_modified())
+            .await
+            .map_err(|_| consensus_unavailable())
+    }
+
     /// Disable automatic campaigns for a deterministic concurrent fixture.
     /// Explicit test campaigns still use the engine's normal voting path.
     #[cfg(feature = "dangerous-test-hooks")]

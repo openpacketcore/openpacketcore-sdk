@@ -767,14 +767,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and duplicate-selection boundary with regressions.
 
 - `opc-netconf-server` tests: make native and authenticated required-audit
-  leadership changes deterministic with scoped election samples and observed engine ticks. Require
-  one automatic campaign and fresh authority within the original 26-second
-  deadline, preserving every terminal-debt and stale-owner assertion. Retain a
-  real split vote at 18 seconds as a negative control: its next campaign cannot
-  begin until 27 seconds. Production timers and operation budgets are unchanged.
-  A four-worker companion preserves the complete real-mTLS audit-recovery
-  scenario with one explicitly synchronized campaign; the paused fixture
-  independently proves automatic election timing. (#1322)
+  leadership changes deterministic with scoped election samples and observed
+  engine ticks, retaining the 26-second deadline and every terminal-debt and
+  stale-owner assertion. A four-worker companion preserves the complete real
+  mTLS recovery scenario with one synchronized campaign. Positive fixtures
+  explicitly require an already-applied audit prefix. Setup retains normal
+  timers; only the finite election proof pauses time. The negative control
+  reproduces unequal committed/applied prefixes of 12 and 13, a split at 18
+  seconds and a next eligible campaign at 27 seconds. Production timers and
+  operation budgets are unchanged. (#1322)
 
 - `opc-persist` tests: script real one- and two-split elections during mixed-voter
   rolls while keeping writes in flight across leader loss. Require one-split

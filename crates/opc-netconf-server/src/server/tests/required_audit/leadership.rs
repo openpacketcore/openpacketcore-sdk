@@ -39,6 +39,8 @@ struct Peer {
     enabled: AtomicBool,
     activity: Arc<tokio::sync::Notify>,
     election_vote: std::sync::Mutex<Option<Arc<election::VoteGate>>>,
+    admitted: tokio::sync::RwLock<()>,
+    hold_log_entries: AtomicBool,
 }
 
 impl std::fmt::Debug for Peer {
@@ -57,7 +59,14 @@ impl ConsensusPeer for Peer {
         &self,
         request: ConsensusWireRequest,
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        let _admitted = self.admitted.read().await;
         if !self.enabled.load(Ordering::Acquire) {
+            return Err(ConsensusPeerError::Unavailable);
+        }
+        if self.hold_log_entries.load(Ordering::Acquire)
+            && request.family == opc_consensus::ConsensusRpcFamily::AppendEntries
+            && !ConsensusConfigStore::is_empty_append_entries_for_test(&request)
+        {
             return Err(ConsensusPeerError::Unavailable);
         }
         let handler = self
@@ -119,6 +128,8 @@ impl Quorum {
                             enabled: AtomicBool::new(true),
                             activity: activity.clone(),
                             election_vote: std::sync::Mutex::new(None),
+                            admitted: tokio::sync::RwLock::new(()),
+                            hold_log_entries: AtomicBool::new(false),
                         }),
                     );
                 }
@@ -257,6 +268,17 @@ impl Quorum {
         }
     }
 
+    async fn isolate_and_quiesce(&self, node: usize) {
+        self.isolate(node);
+        for ((source, target), path) in &self.paths {
+            if *source == node || *target == node {
+                // A request takes this read guard before checking enabled.
+                // The writer drains every admitted call before time advances.
+                drop(path.admitted.write().await);
+            }
+        }
+    }
+
     async fn shutdown(self) {
         let (one, two, three) = tokio::join!(
             self.stores[0].shutdown(),
@@ -280,8 +302,8 @@ impl election::Voters for Quorum {
         }
     }
 
-    fn isolate(&self, node: usize) {
-        Quorum::isolate(self, node);
+    async fn isolate_and_quiesce(&self, node: usize) {
+        Quorum::isolate_and_quiesce(self, node).await;
     }
 
     async fn leader_except(&self, excluded: Option<usize>) -> usize {
@@ -540,72 +562,50 @@ async fn assert_original_terminal(
 
 #[tokio::test(start_paused = true)]
 async fn required_running_terminal_debt_survives_leadership_change_and_fences_stale_owner() {
-    let (
-        quorum,
-        old_leader,
-        old_owner,
-        old_server,
-        old_sessions,
-        old_registration,
-        request_id,
-        committed,
-        new_leader,
-    ) = election::schedule::with_frozen_time(async {
-        let election = election::SuccessfulElection::new().await;
-        let quorum = Quorum::start_scripted(Some(&election.scripts)).await;
-        let old_leader = quorum.leader_except(None).await;
-        quorum.stores[old_leader]
-            .initialize_audit_authority(
-                &AuditPrivacyKey::new([0x81; 32]).unwrap(),
-                AuditLedgerLimits::new(90, 30).unwrap(),
-            )
-            .await
-            .unwrap();
-        let old_owner = Owner::open(quorum.stores[old_leader].clone(), true).await;
-        assert_eq!(quorum.checkpoints.sequence(), 3);
-        let old_server = running::required_server_for_bus(old_owner.bus.clone());
-        let old_sessions = SessionRegistry::new();
-        let old_registration = old_sessions.register(1).unwrap();
-        let request_id = RequestId::new();
-        quorum.checkpoints.refuse_from.store(6, Ordering::Release);
-        let reply = old_server
-            .handle_rpc_for_session_async(
-                request_id,
-                &principal(),
-                &edit("fixture-before-election"),
-                &MgmtLimits::default(),
-                1,
-                &old_sessions,
-            )
-            .await;
-        assert!(reply.reply_xml.contains("<ok/>"));
-        let committed = old_owner
-            .source
-            .load_committed_latest()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(committed.version, ConfigVersion::new(2));
-        assert!(
-            committed.request_id == Some(request_id),
-            "effect lost request"
-        );
-        assert_eq!(quorum.checkpoints.sequence(), 4);
-
-        let new_leader = election.elect_survivor(&quorum, old_leader).await;
-        (
-            quorum,
-            old_leader,
-            old_owner,
-            old_server,
-            old_sessions,
-            old_registration,
-            request_id,
-            committed,
-            new_leader,
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let election = election::SuccessfulElection::new(runtime_origin).await;
+    let quorum = Quorum::start_scripted(Some(&election.scripts)).await;
+    let old_leader = quorum.leader_except(None).await;
+    quorum.stores[old_leader]
+        .initialize_audit_authority(
+            &AuditPrivacyKey::new([0x81; 32]).unwrap(),
+            AuditLedgerLimits::new(90, 30).unwrap(),
         )
-    })
-    .await;
+        .await
+        .unwrap();
+    let old_owner = Owner::open(quorum.stores[old_leader].clone(), true).await;
+    assert_eq!(quorum.checkpoints.sequence(), 3);
+    let old_server = running::required_server_for_bus(old_owner.bus.clone());
+    let old_sessions = SessionRegistry::new();
+    let old_registration = old_sessions.register(1).unwrap();
+    let request_id = RequestId::new();
+    quorum.checkpoints.refuse_from.store(6, Ordering::Release);
+    let reply = old_server
+        .handle_rpc_for_session_async(
+            request_id,
+            &principal(),
+            &edit("fixture-before-election"),
+            &MgmtLimits::default(),
+            1,
+            &old_sessions,
+        )
+        .await;
+    assert!(reply.reply_xml.contains("<ok/>"));
+    let committed = old_owner
+        .source
+        .load_committed_latest()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.version, ConfigVersion::new(2));
+    assert!(
+        committed.request_id == Some(request_id),
+        "effect lost request"
+    );
+    assert_eq!(quorum.checkpoints.sequence(), 4);
+
+    let new_leader = election.elect_survivor(&quorum, old_leader).await;
     // Resume normal time for the original stale-owner and recovery assertions.
     assert_ne!(old_leader, new_leader);
     let new_owner = Owner::open(quorum.stores[new_leader].clone(), false).await;

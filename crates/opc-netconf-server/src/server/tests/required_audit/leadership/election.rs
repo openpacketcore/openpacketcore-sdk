@@ -40,7 +40,7 @@ pub(super) struct VoteGate {
 pub(super) trait Voters {
     fn stores(&self) -> &[Arc<ConsensusConfigStore>];
     fn observe_votes(&self, gate: Option<Arc<VoteGate>>);
-    fn isolate(&self, node: usize);
+    async fn isolate_and_quiesce(&self, node: usize);
     async fn leader_except(&self, excluded: Option<usize>) -> usize;
 }
 
@@ -120,7 +120,7 @@ impl VoteGate {
 
 pub(super) struct SuccessfulElection {
     pub scripts: [ElectionRngScript; 3],
-    started: Instant,
+    runtime_origin: Instant,
     early: schedule::ElectionSchedule,
     late: schedule::ElectionSchedule,
     ticks: delivery::TickDelivery,
@@ -128,7 +128,7 @@ pub(super) struct SuccessfulElection {
 }
 
 impl SuccessfulElection {
-    pub(super) async fn new() -> Self {
+    pub(super) async fn new(runtime_origin: Instant) -> Self {
         let (ticks, tracing) = delivery::TickDelivery::install();
         let config = durable_openraft_config(DurableOpenraftDomain::ConfigurationState).unwrap();
         let calibration = ElectionRngScript::new([EARLY_SAMPLE, LATE_SAMPLE]);
@@ -151,7 +151,7 @@ impl SuccessfulElection {
                 ElectionRngScript::new([EARLY_SAMPLE; 2]),
                 ElectionRngScript::new([LATE_SAMPLE]),
             ],
-            started: Instant::now(),
+            runtime_origin,
             early: schedule::ElectionSchedule::new(&config, early),
             late: schedule::ElectionSchedule::new(&config, late),
             ticks,
@@ -159,76 +159,143 @@ impl SuccessfulElection {
         }
     }
 
+    async fn pause_after_follower_tick(&self) {
+        let mut sleeps = self.scripts[1].sleeps();
+        let before = sleeps.borrow().len();
+        tokio::time::timeout(
+            TRANSITION_TIMEOUT,
+            sleeps.wait_for(|sleeps| sleeps.len() > before),
+        )
+        .await
+        .expect("follower ticker re-registers on normal time")
+        .expect("follower ticker remains live");
+        tokio::time::pause();
+    }
+
+    /// Only the finite election phase uses frozen time. Delay the already
+    /// running tickers by at most one tick to align their next registrations,
+    /// then send the normal read-index heartbeats to anchor both real leases.
+    async fn align_and_anchor(&self, quorum: &impl Voters, old_leader: usize) -> Instant {
+        let millis = (Instant::now() + self.early.tick - self.runtime_origin)
+            .as_nanos()
+            .div_ceil(1_000_000);
+        let started = self.runtime_origin
+            + Duration::from_millis(u64::try_from(millis).expect("finite election clock"));
+        tokio::time::advance(started - Instant::now()).await;
+        for (store, script) in quorum.stores().iter().zip(&self.scripts) {
+            schedule::tick_registered(&mut script.sleeps(), started, self.early.tick).await;
+            self.ticks.wait(store.status().node_id.get(), started).await;
+        }
+        assert_eq!(
+            quorum.stores()[old_leader].ensure_local_authority().await,
+            ConfigLocalAuthorityOutcome::LocalAuthority
+        );
+        for store in &quorum.stores()[1..] {
+            loop {
+                if store.vote_updated_at_for_test().await.unwrap() == Some(started) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        started
+    }
+
     pub(super) async fn elect_survivor(self, quorum: &impl Voters, old_leader: usize) -> usize {
         assert_eq!(old_leader, 0);
         let stores = quorum.stores();
-        let nodes: Vec<_> = stores.iter().map(|store| store.status().node_id).collect();
         let old = stores[old_leader].status();
         let committed = old.committed_index.expect("committed audit prefix");
-        let expected = nodes[1];
-        // The selected survivor must actually have the committed audit debt.
-        // A missing prefix blocks setup instead of manufacturing authority.
-        stores[1]
-            .wait_for_raft_status_for_test(|status| {
+        // Deliberately stronger than log containment: this scenario elects a
+        // follower that has already APPLIED its predecessor's audit prefix.
+        // It does not cover applying that last debt for the first time after
+        // election. Keep setup's own timers active while waiting for it.
+        tokio::time::timeout(
+            TRANSITION_TIMEOUT,
+            stores[1].wait_for_raft_status_for_test(|status| {
                 status.leader_id == Some(old.node_id)
                     && status.term == old.term
                     && status.applied_index >= Some(committed)
-            })
-            .await
-            .unwrap();
-        for script in &self.scripts {
-            schedule::tick_registered(&mut script.sleeps(), self.started, self.early.tick).await;
-        }
+            }),
+        )
+        .await
+        .expect("designated candidate applies the audit prefix before isolation")
+        .unwrap();
+        self.pause_after_follower_tick().await;
+        let result = schedule::with_frozen_time(
+            AssertUnwindSafe(self.elect_frozen(quorum, old_leader, old.term, committed))
+                .catch_unwind(),
+        )
+        .await;
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    async fn elect_frozen(
+        self,
+        quorum: &impl Voters,
+        old_leader: usize,
+        old_term: u64,
+        committed: u64,
+    ) -> usize {
+        let started = self.align_and_anchor(quorum, old_leader).await;
+        let stores = quorum.stores();
+        let nodes: Vec<_> = stores.iter().map(|store| store.status().node_id).collect();
+        let expected = nodes[1];
+        let applied = stores[1].status();
+        assert_eq!(applied.term, old_term);
+        assert_eq!(applied.leader_id, Some(nodes[old_leader]));
+        assert!(
+            applied.applied_index >= Some(committed),
+            "applied-prefix precondition"
+        );
         let gate = Arc::new(VoteGate {
-            term: old.term + 1,
+            term: old_term + 1,
             arrivals: watch::channel(Vec::new()).0,
             both_candidates: None,
             replies: watch::channel(Vec::new()).0,
         });
         quorum.observe_votes(Some(gate.clone()));
-        quorum.isolate(old_leader);
-        assert_eq!(Instant::now(), self.started);
+        quorum.isolate_and_quiesce(old_leader).await;
+        assert_eq!(Instant::now(), started);
         let elected_at = self.early.campaign(Duration::ZERO, Duration::ZERO, true);
         assert!(elected_at < TRANSITION_TIMEOUT);
         assert!(elected_at < self.late.campaign(Duration::ZERO, Duration::ZERO, true));
         let driving = async {
             let mut tick = self.early.tick;
             while tick <= elected_at {
-                tokio::time::advance(self.started + tick - Instant::now()).await;
+                tokio::time::advance(started + tick - Instant::now()).await;
                 for (index, script) in self.scripts.iter().enumerate() {
                     schedule::tick_registered(
                         &mut script.sleeps(),
-                        self.started + tick,
+                        started + tick,
                         self.early.tick,
                     )
                     .await;
-                    self.ticks
-                        .wait(nodes[index].get(), self.started + tick)
-                        .await;
+                    self.ticks.wait(nodes[index].get(), started + tick).await;
                 }
                 tick += self.early.tick;
             }
         };
         let (new_leader, ()) = tokio::join!(quorum.leader_except(Some(old_leader)), driving);
         assert_eq!(new_leader, 1);
-        assert_eq!(Instant::now() - self.started, elected_at);
+        assert_eq!(Instant::now() - started, elected_at);
         for store in &stores[1..] {
             store
                 .wait_for_raft_status_for_test(|status| {
-                    status.leader_id == Some(expected) && status.term == old.term + 1
+                    status.leader_id == Some(expected) && status.term == old_term + 1
                 })
                 .await
                 .unwrap();
         }
         let arrivals = gate.arrivals.borrow().clone();
         assert_eq!(arrivals.len(), 1, "one automatic campaign, without a retry");
-        assert_eq!(arrivals[0].0, self.started + elected_at);
-        assert_eq!(arrivals[0].1.vote, Vote::new(old.term + 1, expected));
+        assert_eq!(arrivals[0].0, started + elected_at);
+        assert_eq!(arrivals[0].1.vote, Vote::new(old_term + 1, expected));
         assert!(arrivals[0].1.last_log_id.map(|id| id.index) >= Some(committed));
         let replies = gate.replies.borrow().clone();
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].source, expected);
-        assert_eq!(replies[0].at, self.started + elected_at);
+        assert_eq!(replies[0].at, started + elected_at);
         assert!(replies[0].response.vote_granted);
         assert_eq!(replies[0].response.vote, arrivals[0].1.vote);
         quorum.observe_votes(None);
@@ -241,33 +308,65 @@ impl SuccessfulElection {
 
 #[tokio::test(start_paused = true)]
 async fn split_vote_reproduces_authority_timeout() {
+    let runtime_origin = Instant::now();
+    tokio::time::resume();
+    let mut election = SuccessfulElection::new(runtime_origin).await;
+    election.scripts = std::array::from_fn(|_| ElectionRngScript::new([LATE_SAMPLE; 2]));
+    let quorum = Quorum::start_scripted(Some(&election.scripts)).await;
+    let old_leader = quorum.leader_except(None).await;
+    assert_eq!(old_leader, 0);
+    let initial = quorum.stores[old_leader].status();
+    assert_eq!(initial.applied_index, Some(1));
+    assert_eq!(initial.committed_index, Some(1));
+    // Real replicated commands establish the historical index shape. Unknown
+    // transaction confirmations have a durable NotFound outcome and add one
+    // log entry each; these synthetic payloads do not claim to reconstruct the
+    // historical audit contents or random seed.
+    for index in 2..=13_u8 {
+        if index == 13 {
+            quorum.paths[&(0, 1)]
+                .hold_log_entries
+                .store(true, Ordering::Release);
+        }
+        let error = quorum.stores[old_leader]
+            .mark_confirmed_idempotent(
+                opc_consensus::ConsensusRequestId::from_bytes([index; 16]),
+                opc_types::TxId::new(),
+            )
+            .await
+            .expect_err("absent transaction has a replicated NotFound outcome");
+        assert!(matches!(
+            error.kind(),
+            opc_persist::PersistErrorKind::RollbackNotFound
+        ));
+        for (node, store) in quorum.stores.iter().enumerate() {
+            let expected = if node == 1 && index == 13 {
+                12
+            } else {
+                u64::from(index)
+            };
+            tokio::time::timeout(
+                TRANSITION_TIMEOUT,
+                store.wait_for_raft_status_for_test(|status| {
+                    status.applied_index == Some(expected)
+                        && status.committed_index == Some(expected)
+                }),
+            )
+            .await
+            .expect("normal-time prefix setup retains its diagnostic deadline")
+            .unwrap();
+        }
+    }
+    election.pause_after_follower_tick().await;
     schedule::with_frozen_time(async {
-        let (ticks, _tracing) = delivery::TickDelivery::install();
-        let config = durable_openraft_config(DurableOpenraftDomain::ConfigurationState).unwrap();
-        let calibration = ElectionRngScript::new([LATE_SAMPLE]);
-        let sampled = calibration
-            .scope(async {
-                Duration::from_millis(config.new_rand_election_timeout::<ScriptedElectionRuntime>())
-            })
-            .await;
-        calibration.assert_exhausted();
-        let schedule = schedule::ElectionSchedule::new(&config, sampled);
-        let scripts = std::array::from_fn(|_| ElectionRngScript::new([LATE_SAMPLE; 2]));
-        let started = Instant::now();
-        let quorum = Quorum::start_scripted(Some(&scripts)).await;
-        let old_leader = quorum.leader_except(None).await;
-        assert_eq!(old_leader, 0);
-        let initial = quorum.stores[old_leader].status();
-        for (store, script) in quorum.stores.iter().zip(&scripts) {
-            store
-                .wait_for_raft_status_for_test(|status| {
-                    status.leader_id == Some(initial.node_id)
-                        && status.term == initial.term
-                        && status.applied_index == initial.applied_index
-                })
-                .await
-                .unwrap();
-            schedule::tick_registered(&mut script.sleeps(), started, schedule.tick).await;
+        let started = election.align_and_anchor(&quorum, old_leader).await;
+        let schedule = &election.late;
+        let scripts = &election.scripts;
+        let ticks = &election.ticks;
+        for (index, expected) in [(1, 12), (2, 13)] {
+            let status = quorum.stores[index].status();
+            assert_eq!(status.applied_index, Some(expected));
+            assert_eq!(status.committed_index, Some(expected));
         }
         let gate = Arc::new(VoteGate {
             term: initial.term + 1,
@@ -278,7 +377,7 @@ async fn split_vote_reproduces_authority_timeout() {
         for path in [(1, 2), (2, 1)] {
             *quorum.paths[&path].election_vote.lock().unwrap() = Some(gate.clone());
         }
-        quorum.isolate(old_leader);
+        quorum.isolate_and_quiesce(old_leader).await;
         assert_eq!(Instant::now(), started);
         let split_at = schedule.campaign(Duration::ZERO, Duration::ZERO, true);
         let retry_at = schedule.campaign(split_at, Duration::ZERO, false);
@@ -316,7 +415,14 @@ async fn split_vote_reproduces_authority_timeout() {
                     assert_eq!(arrivals.len(), 2);
                     for (at, vote) in arrivals {
                         assert_eq!(at, started + split_at);
-                        assert_eq!(vote.last_log_id.map(|id| id.index), initial.applied_index);
+                        let expected = if vote.vote
+                            == Vote::new(gate.term, ConfigConsensusNodeId::new(2).unwrap())
+                        {
+                            12
+                        } else {
+                            13
+                        };
+                        assert_eq!(vote.last_log_id.map(|id| id.index), Some(expected));
                     }
                 }
                 tick += schedule.tick;
@@ -343,15 +449,20 @@ async fn split_vote_reproduces_authority_timeout() {
         assert!(message.starts_with("quorum did not establish fresh local authority: Elapsed(())"));
         assert!(message.contains("excluded=Some(0)"));
         assert!(message.contains("probes=0"));
-        for store in &quorum.stores[1..] {
-            let status = store.status();
+        for (index, expected) in [(1, 12), (2, 13)] {
+            let status = quorum.stores[index].status();
             assert_eq!(status.term, initial.term + 1);
             assert_eq!(status.leader_id, None);
+            assert_eq!(status.applied_index, Some(expected));
+            assert_eq!(status.committed_index, Some(expected));
         }
         quorum.shutdown().await;
         for script in scripts {
             script.finish();
         }
+        // RED evidence: preserve the original helper's failure after checking
+        // the exact historical index shape. The final negative control catches it.
+        std::panic::resume_unwind(panic);
     })
     .await;
 }
