@@ -31,6 +31,15 @@ pub(crate) const SNAPSHOT_MAX_ENVELOPE_BYTES: u64 = SNAPSHOT_MAX_BYTES + SNAPSHO
 const SNAPSHOT_DIRECTORY_MAX_ENTRIES: usize = 8_192;
 const SNAPSHOT_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SnapshotTestHooks {
+    pause_verified_read: AtomicBool,
+    read_verified: tokio::sync::Notify,
+    resume_read: tokio::sync::Notify,
+    build_gate_acquired: AtomicBool,
+}
+
 #[must_use = "staging artifacts must stay guarded until they are durably referenced"]
 struct StagingArtifact {
     path: PathBuf,
@@ -1200,6 +1209,16 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 sqlite::invalid_data("config consensus snapshot metadata mismatch"),
             ));
         }
+        #[cfg(test)]
+        if self
+            .core
+            .snapshot_test_hooks
+            .pause_verified_read
+            .load(Ordering::Acquire)
+        {
+            self.core.snapshot_test_hooks.read_verified.notify_one();
+            self.core.snapshot_test_hooks.resume_read.notified().await;
+        }
         let file = ConfigSnapshotFile::open(path).await.map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
@@ -1239,6 +1258,11 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     sqlite::invalid_data("config consensus snapshot build timed out"),
                 )
             })?;
+        #[cfg(test)]
+        self.core
+            .snapshot_test_hooks
+            .build_gate_acquired
+            .store(true, Ordering::Release);
         let raw = self
             .core
             .snapshot_dir
@@ -1927,6 +1951,115 @@ mod tests {
             .expect("referenced snapshot");
         drop(snapshot);
         snapshot_file_name(backend).await
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_read_survives_concurrent_snapshot_replacement() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let temp = tempfile::tempdir().expect("snapshot tempdir");
+            let backend = SqliteBackend::open_with_audit_key(
+                temp.path().join("config.sqlite"),
+                true,
+                0,
+                shared_audit_key(),
+            )
+            .await
+            .expect("config backend");
+            let (_, mut machine, _) = open(
+                &backend,
+                temp.path().join("snapshots"),
+                identity(),
+                members(),
+            )
+            .await
+            .expect("config consensus storage");
+            machine
+                .apply([membership_entry(), mutation_entry()])
+                .await
+                .expect("initial snapshot state");
+            let original = machine
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .expect("original snapshot");
+            let original_meta = original.meta.clone();
+            let original_path = original.snapshot.path().to_path_buf();
+            let original_bytes = tokio::fs::read(&original_path)
+                .await
+                .expect("original snapshot bytes");
+            drop(original);
+            machine
+                .apply([Entry {
+                    log_id: log_id(2),
+                    payload: EntryPayload::Blank,
+                }])
+                .await
+                .expect("replacement snapshot state");
+
+            let hooks = Arc::clone(&machine.core.snapshot_test_hooks);
+            hooks.pause_verified_read.store(true, Ordering::Release);
+            hooks.build_gate_acquired.store(false, Ordering::Release);
+            let mut reader = machine.clone();
+            let read = tokio::spawn(async move { reader.get_current_snapshot().await });
+            hooks.read_verified.notified().await;
+
+            let mut builder = machine.get_snapshot_builder().await;
+            let replacement = builder.build_snapshot();
+            tokio::pin!(replacement);
+            // Poll exactly once to attempt the gate. If the reader does not
+            // hold it, finish publishing and removing its old path before
+            // resuming the verified read. No scheduler delay creates the race.
+            let first_poll = poll_fn(|cx| Poll::Ready(replacement.as_mut().poll(cx))).await;
+            let published_before_read = if hooks.build_gate_acquired.load(Ordering::Acquire) {
+                let result = match first_poll {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => replacement.as_mut().await,
+                };
+                Some(result.expect("concurrent replacement snapshot"))
+            } else {
+                assert!(
+                    first_poll.is_pending(),
+                    "replacement must wait for the read"
+                );
+                None
+            };
+            hooks.pause_verified_read.store(false, Ordering::Release);
+            hooks.resume_read.notify_one();
+            let read = read.await.expect("snapshot reader joined");
+            let replacement = match published_before_read {
+                Some(snapshot) => snapshot,
+                None => replacement.as_mut().await.expect("replacement after read"),
+            };
+            assert_eq!(Some(log_id(2)), replacement.meta.last_log_id);
+            assert_ne!(original_meta.snapshot_id, replacement.meta.snapshot_id);
+            assert!(
+                !original_path.exists(),
+                "superseded snapshot must be removed"
+            );
+
+            let mut read = read
+                .expect("a current snapshot read must survive concurrent replacement")
+                .expect("current snapshot");
+            assert_eq!(
+                original_meta, read.meta,
+                "read must retain its selected cut"
+            );
+            let mut bytes = Vec::new();
+            read.snapshot
+                .read_to_end(&mut bytes)
+                .await
+                .expect("selected snapshot remains readable after path removal");
+            assert_eq!(
+                original_bytes, bytes,
+                "selected envelope must remain intact"
+            );
+        })
+        .await
+        .expect("snapshot replacement race must complete within its bound");
     }
 
     #[tokio::test]
