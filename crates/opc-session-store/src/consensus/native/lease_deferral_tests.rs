@@ -6,6 +6,112 @@ use crate::{
 use changes::tests::{apply, command, fixture_with_profile, time, void_command};
 use std::time::Duration;
 
+// Independent review probes: the candidate's production code is unchanged.
+fn review_cohort_resolution_expiry_case(grouped: bool) {
+    let (mut storage, pending) = pending_fixture();
+    let sequence = storage.business.frontiers.sequence;
+    let entries = [
+        command(3, &pending, at(80), false),
+        command(4, &pending, retention_deadline(at(80)).unwrap(), false),
+    ];
+    let responses = if grouped {
+        apply(&mut storage, &entries).responses
+    } else {
+        entries
+            .iter()
+            .flat_map(|entry| apply(&mut storage, std::slice::from_ref(entry)).responses)
+            .collect::<Vec<_>>()
+    };
+    assert!(matches!(
+        responses[0].result,
+        Ok(SessionMutationOutcome::FencedTransition(_))
+    ));
+    assert_eq!(
+        responses[1].result,
+        Err(StoreError::FencedTransitionRequestExpired)
+    );
+    assert_eq!(storage.business.frontiers.sequence, sequence + 1);
+    assert_eq!(storage.business.history().unwrap().bound_entries(), 2);
+    assert_eq!(
+        storage.business.status(&pending).unwrap(),
+        FencedTransitionV2Status::Expired
+    );
+    let row = &storage.business.receipts[&pending.request_id()];
+    assert_eq!(row.ordinal, 2);
+    assert!(!row.retained());
+    assert_eq!(row.retained_until, retention_deadline(at(80)).unwrap());
+}
+
+#[test]
+fn review_cohort_native_resolution_expiry_grouped() {
+    review_cohort_resolution_expiry_case(true);
+}
+
+#[test]
+fn review_cohort_native_resolution_expiry_separate() {
+    review_cohort_resolution_expiry_case(false);
+}
+
+fn review_cohort_resolution_retirement_case(grouped: bool) {
+    let (mut storage, pending) = pending_fixture();
+    let mut row = (**storage
+        .business
+        .receipts
+        .get(&pending.request_id())
+        .unwrap())
+    .clone();
+    row.ordinal = 1;
+    storage.business.receipts.clear();
+    storage
+        .business
+        .receipts
+        .insert(pending.request_id(), SharedRow::new(row).unwrap());
+    let history = FencedTransitionV2HistoryState::new(
+        Some(FencedTransitionV2HistoryEpoch::new(8).unwrap()),
+        None,
+        None,
+        0,
+        7,
+        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+        0,
+    )
+    .unwrap();
+    lifecycle_tests::seed(&mut storage, history, at(100_000), None, true);
+    let complete = command(3, &pending, at(100_001), false);
+    let retire =
+        lifecycle_tests::maintenance(&storage, 4, retention_deadline(at(100_001)).unwrap());
+    let responses = if grouped {
+        apply(&mut storage, &[complete, retire]).responses
+    } else {
+        [complete, retire]
+            .iter()
+            .flat_map(|entry| apply(&mut storage, std::slice::from_ref(entry)).responses)
+            .collect::<Vec<_>>()
+    };
+    assert!(matches!(
+        responses[0].result,
+        Ok(SessionMutationOutcome::FencedTransition(_))
+    ));
+    assert_eq!(
+        storage.business.history().unwrap().retired_through(),
+        Some(FencedTransitionV2HistoryEpoch::new(1).unwrap())
+    );
+    assert_eq!(
+        storage.business.status(&pending).unwrap(),
+        FencedTransitionV2Status::Retired
+    );
+}
+
+#[test]
+fn review_cohort_native_resolution_retirement_grouped() {
+    review_cohort_resolution_retirement_case(true);
+}
+
+#[test]
+fn review_cohort_native_resolution_retirement_separate() {
+    review_cohort_resolution_retirement_case(false);
+}
+
 fn at(seconds: u64) -> Timestamp {
     Timestamp::from_offset_datetime(*time(0).as_offset_datetime() + Duration::from_secs(seconds))
 }

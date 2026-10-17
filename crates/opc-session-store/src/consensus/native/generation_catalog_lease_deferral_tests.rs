@@ -5,6 +5,47 @@ fn expired() -> Timestamp {
     Timestamp::from_offset_datetime(*time(0).as_offset_datetime() + time::Duration::seconds(80))
 }
 
+fn review_cohort_catalog_resolution_expiry_case(separate_checkpoint: bool) {
+    let (mut hot, pending) = pending_fixture();
+    let (mut files, _catalog) = Files::new(&hot);
+    hot.begin_changes().unwrap();
+    let completed = apply(&mut hot, &[command(3, &pending, expired(), false)]);
+    assert!(matches!(
+        completed.responses[0].result,
+        Ok(SessionMutationOutcome::FencedTransition(_))
+    ));
+    if separate_checkpoint {
+        files.append(&mut hot, 19);
+    }
+    let expires = crate::consensus::native::retention_deadline(expired()).unwrap();
+    let replay = apply(&mut hot, &[command(4, &pending, expires, false)]);
+    assert_eq!(
+        replay.responses[0].result,
+        Err(StoreError::FencedTransitionRequestExpired)
+    );
+    let cold = files
+        .append(&mut hot, if separate_checkpoint { 20 } else { 19 })
+        .into_storage(&|| Ok(()))
+        .unwrap();
+    assert_eq!(
+        cold.business.status(&pending).unwrap(),
+        FencedTransitionV2Status::Expired
+    );
+    assert_eq!(cold.business.receipts[&pending.request_id()].ordinal, 2);
+    assert_eq!(cold.business.history().unwrap().bound_entries(), 2);
+    cold.validate_image().unwrap();
+}
+
+#[test]
+fn review_cohort_catalog_resolution_expiry_one_checkpoint() {
+    review_cohort_catalog_resolution_expiry_case(false);
+}
+
+#[test]
+fn review_cohort_catalog_resolution_expiry_separate_checkpoints() {
+    review_cohort_catalog_resolution_expiry_case(true);
+}
+
 #[test]
 fn native_catalog_lease_deferral_base_and_terminal_delta_preserve_the_same_binding() {
     let (mut hot, pending) = pending_fixture();

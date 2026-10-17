@@ -3,6 +3,52 @@ use crate::FencedTransitionV2Profile;
 
 const PROFILE: FencedTransitionV2Profile = FencedTransitionV2Profile::V2WithLeaseDeferral;
 
+#[test]
+fn review_cohort_sqlite_resolution_expiry_grouped() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let conn = backend.conn.blocking_lock();
+    let (pending, _) = fixture(&backend, &conn);
+    let defer = fenced_transition_v2_entry(2, pending.clone(), timestamp(2));
+    append_logs_sync(&conn, identity(), std::slice::from_ref(&defer)).unwrap();
+    save_committed_sync(&conn, identity(), Some(defer.log_id)).unwrap();
+    let deferred = apply_entries_sync(&conn, identity(), &backend.caps, vec![defer]).unwrap();
+    assert_eq!(
+        deferred.responses[0].result,
+        Err(StoreError::FencedTransitionLeaseDeferred)
+    );
+    let now = Timestamp::from_offset_datetime(
+        *timestamp(0).as_offset_datetime() + Duration::from_secs(400),
+    );
+    let expires =
+        crate::ttl::checked_session_deadline(now, FENCED_TRANSITION_OUTCOME_RETENTION).unwrap();
+    let entries = vec![
+        fenced_transition_v2_entry(3, pending.clone(), now),
+        fenced_transition_v2_entry(4, pending.clone(), expires),
+    ];
+    append_logs_sync(&conn, identity(), &entries).unwrap();
+    save_committed_sync(&conn, identity(), entries.last().map(|entry| entry.log_id)).unwrap();
+    let applied = apply_entries_sync(&conn, identity(), &backend.caps, entries).unwrap();
+    assert!(matches!(
+        applied.responses[0].result,
+        Ok(SessionMutationOutcome::FencedTransition(_))
+    ));
+    assert_eq!(
+        applied.responses[1].result,
+        Err(StoreError::FencedTransitionRequestExpired)
+    );
+    assert_eq!(
+        read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
+            .unwrap()
+            .current_bound_count,
+        2
+    );
+    assert_eq!(
+        read_fenced_transition_v2_status_sync(&conn, identity(), identity(), &pending).unwrap(),
+        FencedTransitionV2Status::Expired
+    );
+    validate_fenced_transition_v2_receipts_sync(&conn, identity()).unwrap();
+}
+
 fn expected_members() -> BTreeSet<SessionConsensusNodeId> {
     [7, 8, 9]
         .into_iter()
