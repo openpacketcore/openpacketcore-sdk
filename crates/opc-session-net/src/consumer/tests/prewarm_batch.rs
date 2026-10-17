@@ -1,6 +1,7 @@
 use super::*;
-use crate::consumer::PersistentPrewarmBatch;
+use crate::consumer::{ConsumerRotationReceivers, PersistentPrewarmBatch};
 use crate::lifecycle::{CertificateExpiryEvidence, TlsCompletionTime};
+use crate::protocol::FrameWriteProgress;
 
 struct ReviewReadyAtPeerBoundWriter {
     ready_at: tokio::time::Instant,
@@ -217,7 +218,7 @@ async fn assert_first_call_poll_boundary(watch: bool) {
                 operation_deadline,
                 Box::new(FirstCallBoundaryWriter {
                     boundary,
-                    ready_at: started + Duration::from_millis(90),
+                    ready_at: started + Duration::from_millis(resumed_ms),
                     accepted_bytes: Arc::clone(&accepted_bytes),
                     accepted_writes: Arc::clone(&accepted_writes),
                     buffered_bytes: Arc::clone(&buffered_bytes),
