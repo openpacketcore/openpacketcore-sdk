@@ -15,6 +15,10 @@ mod planned_shutdown;
 #[path = "consensus_openraft/member_repair.rs"]
 mod member_repair;
 
+#[cfg(feature = "dangerous-test-hooks")]
+#[path = "consensus_openraft/voter_identity_replacement.rs"]
+mod voter_identity_replacement;
+
 use quorum_admission::rolling_election;
 
 use std::collections::{BTreeMap, BTreeSet};
