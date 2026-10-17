@@ -6,7 +6,7 @@ use opc_proto_gtpv2c::n1_mode::{
 use opc_proto_gtpv2c::{AdditionalProtocolConfigurationOptions, Indication, TypedIe, TypedIeValue};
 use opc_protocol::{DecodeContext, EncodeContext};
 
-// TS 24.008 V18.8.0 §10.5.6.3: no nested NAS IEI/length around the slice.
+// TS 24.008 V20.0.0 §10.5.6.3: no nested NAS IEI/length around the slice.
 const REQUEST: &[u8] = &[0x80, 0, 0x1a, 1, 7];
 const RESPONSE: &[u8] = &[0x80, 0, 0x1b, 7, 1, 0x12, 0x34, 0x56, 0x00, 0xf1, 0x10];
 
@@ -213,6 +213,111 @@ fn two_octet_length_units_cannot_hide_or_forge_n1_containers() {
     );
     assert!(N1ModeApcoResponse::decode(&apco(&[0x80, 0, 0x23, 0])).is_err());
     assert!(N1ModeApcoRequest::decode(&apco(&[0x80, 0, 0x41, 1, 0])).is_err());
+}
+
+#[test]
+fn nssaa_eap_cannot_forge_a_request_identity() {
+    // TS 24.008 V20.0.0: 0061H encloses one opaque six-octet EAP message.
+    let wire = [0x80, 0, 0x61, 0, 6, 0xee, 0, 0, 0x1a, 1, 15];
+    assert_eq!(N1ModeApcoRequest::decode(&apco(&wire)), Ok(None));
+}
+
+#[test]
+fn nssaa_eap_cannot_hide_a_request_identity() {
+    let wire = [0x80, 0, 0x61, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd, 0, 0x1a, 1, 7];
+    assert_eq!(N1ModeApcoRequest::decode(&apco(&wire)), Ok(Some(request())));
+}
+
+#[test]
+fn nssaa_eap_cannot_forge_a_response_slice() {
+    let wire = [
+        0x80, 0, 0x61, 0, 12, 0xee, 0, 0, 0x1b, 7, 1, 0x12, 0x34, 0x56, 0, 0xf1, 0x10,
+    ];
+    assert_eq!(N1ModeApcoResponse::decode(&apco(&wire)), Ok(None));
+}
+
+#[test]
+fn nssaa_eap_cannot_hide_a_response_slice() {
+    let wire = [
+        0x80, 0, 0x61, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd, 0, 0x1b, 7, 1, 0x12, 0x34, 0x56, 0, 0xf1, 0x10,
+    ];
+    assert_eq!(
+        N1ModeApcoResponse::decode(&apco(&wire)),
+        Ok(Some(response()))
+    );
+}
+
+#[test]
+fn every_two_octet_identifier_obeys_its_directional_length_rule() {
+    fn opaque_unit(identifier: u16, length_octets: usize, payload: &[u8]) -> Vec<u8> {
+        let mut wire = vec![0x80];
+        wire.extend_from_slice(&identifier.to_be_bytes());
+        if length_octets == 2 {
+            wire.push(0);
+        }
+        wire.push(u8::try_from(payload.len()).unwrap());
+        wire.extend_from_slice(payload);
+        wire
+    }
+
+    // Independent TS 24.008 V20.0.0 table: all eight earlier identifiers and
+    // NSSAA EAP (0061H). The second column is the MS-to-network length width;
+    // all nine use two octets from network to MS. The prefix also forms an
+    // empty unknown unit if a two-octet length is wrongly read as one octet.
+    for (identifier, request_length_octets) in [
+        (0x0023, 1),
+        (0x0024, 1),
+        (0x0030, 1),
+        (0x0031, 1),
+        (0x0032, 1),
+        (0x0041, 2),
+        (0x0051, 2),
+        (0x0056, 2),
+        (0x0061, 2),
+    ] {
+        let unknown_request = opaque_unit(
+            identifier,
+            request_length_octets,
+            &[0xee, 0, 0, 0x1a, 1, 15],
+        );
+        assert_eq!(
+            N1ModeApcoRequest::decode(&apco(&unknown_request)),
+            Ok(None),
+            "MS-to-network {identifier:#06x} cannot forge an identity"
+        );
+        let with_request = [unknown_request.as_slice(), &REQUEST[1..]].concat();
+        assert_eq!(
+            N1ModeApcoRequest::decode(&apco(&with_request)),
+            Ok(Some(request())),
+            "MS-to-network {identifier:#06x} cannot hide an identity"
+        );
+        assert_eq!(
+            request().append_to(&apco(&unknown_request)).unwrap().value,
+            with_request,
+            "MS-to-network {identifier:#06x} is preserved by append"
+        );
+
+        let unknown_response = opaque_unit(identifier, 2, &[0xee, 0, 0, 0x1b, 4, 2, 0, 0xf1, 0x10]);
+        assert_eq!(
+            N1ModeApcoResponse::decode(&apco(&unknown_response)),
+            Ok(None),
+            "network-to-MS {identifier:#06x} cannot forge a slice"
+        );
+        let with_response = [unknown_response.as_slice(), &RESPONSE[1..]].concat();
+        assert_eq!(
+            N1ModeApcoResponse::decode(&apco(&with_response)),
+            Ok(Some(response())),
+            "network-to-MS {identifier:#06x} cannot hide a slice"
+        );
+        assert_eq!(
+            response()
+                .append_to(&apco(&unknown_response))
+                .unwrap()
+                .value,
+            with_response,
+            "network-to-MS {identifier:#06x} is preserved by append"
+        );
+    }
 }
 
 #[test]

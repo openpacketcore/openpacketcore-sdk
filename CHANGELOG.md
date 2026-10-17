@@ -751,6 +751,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-proto-gtpv2c`: frame NSSAA EAP APCO container `0x0061` with a two-octet
+  length in both directions per TS 24.008 V20.0.0, so opaque EAP data cannot
+  forge or hide N1 values. Document the decode-context precondition for
+  first-occurrence APCO projection and cover every directional length entry
+  and duplicate-selection boundary with regressions.
+
 - `opc-persist` tests: script real one- and two-split elections during mixed-voter
   rolls while keeping writes in flight across leader loss. Require one-split
   writes to succeed; use the two-split write's exact 26-second `OutcomeUnknown`

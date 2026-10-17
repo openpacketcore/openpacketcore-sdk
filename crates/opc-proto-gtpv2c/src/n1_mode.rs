@@ -11,7 +11,7 @@
 //! validity only: negotiation, slice authorization and session mapping remain
 //! caller responsibilities.
 //!
-//! @spec 3GPP TS24008 V18.8.0 10.5.6.3
+//! @spec 3GPP TS24008 V20.0.0 10.5.6.3
 //! @spec 3GPP TS29274 V18.8.0 7.2.1, 7.2.2, 8.12, 8.94
 //! @conformance boundary-only
 
@@ -106,10 +106,17 @@ impl N1ModeApcoRequest {
 
     /// Read N1 data from an S2b Create Session Request's top-level APCO instance 0.
     ///
-    /// The first matching IE supplies the value, consistent with the existing
-    /// procedure-aware S2b singleton receive rule. PCO, grouped APCO and other
-    /// instances are ignored. Call this after ordinary S2b message validation;
-    /// it does not validate unrelated mandatory IEs or establish authorization.
+    /// The first matching IE still present in `view` supplies the value. To
+    /// preserve the first occurrence on the wire, decode with `S2bMessage::decode`
+    /// and `ValidationLevel::ProcedureAware` (which forces `DuplicateIePolicy::First`),
+    /// or select `First` explicitly at another validation level. `Reject` at
+    /// another level rejects duplicates before projection. The default context
+    /// and `Strict` with the default `Last` policy have already discarded earlier
+    /// occurrences; this helper cannot recover them.
+    ///
+    /// PCO, grouped APCO and other instances are ignored. Call this after ordinary
+    /// S2b message validation; it does not validate unrelated mandatory IEs or
+    /// establish authorization.
     ///
     /// # Errors
     ///
@@ -212,11 +219,17 @@ impl N1ModeApcoResponse {
 
     /// Read N1 data from an S2b Create Session Response's top-level APCO instance 0.
     ///
-    /// The first matching IE supplies the value, consistent with the existing
-    /// procedure-aware singleton receive rule. PCO, grouped APCO and other
-    /// instances are ignored. Call this after ordinary S2b message validation.
-    /// A value or error neither changes Cause nor establishes session acceptance
-    /// or rejection; that decision remains with the caller.
+    /// The first matching IE still present in `view` supplies the value. To
+    /// preserve the first occurrence on the wire, decode with `S2bMessage::decode`
+    /// and `ValidationLevel::ProcedureAware` (which forces `DuplicateIePolicy::First`),
+    /// or select `First` explicitly at another validation level. `Reject` at
+    /// another level rejects duplicates before projection. The default context
+    /// and `Strict` with the default `Last` policy have already discarded earlier
+    /// occurrences; this helper cannot recover them.
+    ///
+    /// PCO, grouped APCO and other instances are ignored. Call this after ordinary
+    /// S2b message validation. A value or error neither changes Cause nor establishes
+    /// session acceptance or rejection; that decision remains with the caller.
     ///
     /// # Errors
     ///
@@ -287,8 +300,8 @@ enum Direction {
 
 impl Direction {
     fn has_two_octet_length(self, identifier: u16) -> bool {
-        // TS 24.008 V18.8.0 §10.5.6.3: length fields are direction-specific.
-        matches!(identifier, 0x0041 | 0x0051 | 0x0056)
+        // TS 24.008 V20.0.0 §10.5.6.3: length fields are direction-specific.
+        matches!(identifier, 0x0041 | 0x0051 | 0x0056 | 0x0061)
             || (matches!(self, Self::NetworkToMs)
                 && matches!(identifier, 0x0023 | 0x0024 | 0x0030 | 0x0031 | 0x0032))
     }

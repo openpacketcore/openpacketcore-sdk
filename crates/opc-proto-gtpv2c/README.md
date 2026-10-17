@@ -25,10 +25,16 @@ control-plane stack.
   Decode distinguishes absence from malformed data, ignores opposite-direction
   identifiers, and checks framing through the end. Append preserves all other
   bytes. Repeated N1 containers, including identical copies, fail as an SDK
-  ambiguity rule; top-level IE duplicates retain the existing S2b first-occurrence
-  receive policy. Work is bounded to 64 units and 251 ordinary PCO content
+  ambiguity rule. `from_s2b` selects the first matching IE remaining in the view.
+  Wire-order first occurrence requires `S2bMessage::decode` with
+  `ValidationLevel::ProcedureAware` (which forces `DuplicateIePolicy::First`),
+  or explicit `First` at another validation level. `Reject` at another level
+  rejects duplicates before projection. Default and `Strict` contexts with
+  the default `Last` policy have already discarded earlier IEs; the projection
+  cannot recover them. Work is bounded to 64 units and 251 ordinary PCO content
   octets. Large APCO/ePCO is outside this codec. These additions use TS 24.008
-  **V18.8.0** §10.5.6.3 and TS 29.274 **V18.8.0** §§7.2.1, 7.2.2, 8.94.
+  **V20.0.0** §10.5.6.3, including the two-octet length of NSSAA EAP container
+  `0x0061` in both directions, and TS 29.274 **V18.8.0** §§7.2.1, 7.2.2, 8.94.
 - `Indication::flag` and `set_flag` expose independent `IndicationFlag` values
   for 5GSIWKI, 5GCNRS and 5GCNRI (TS 29.274 §8.12). Reads treat absent extension
   octets as clear; updates preserve all unrelated bits. The codecs do not infer

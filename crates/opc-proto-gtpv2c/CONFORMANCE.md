@@ -4,11 +4,12 @@
 
 - **Specification family:** 3GPP TS 29.274 (GTPv2-C), Release 18 naming.
 - **Referenced specification:** 3GPP TS 24.008 V20.0.0, clause 10.5.6.3 only,
-  for the address/IPCP PCO inner codec. Unless explicitly versioned otherwise,
-  every 10.5.6.3 reference in this document is to that
-  version, and the clause text this crate relies on is unchanged from V13.7.0
-  through V20.0.0. The bare TS 24.008 TFT references below (clause 10.5.6.12
-  format, cited without a clause or version number) are `opc-proto-tft`'s
+  for the address/IPCP PCO and N1 APCO inner codecs. Unless explicitly versioned
+  otherwise, every 10.5.6.3 reference in this document is to that version.
+  The address/IPCP formats used here are unchanged from V13.7.0
+  through V20.0.0; N1 APCO framing uses V20.0.0's directional length table,
+  including NSSAA EAP container `0x0061`. The bare TS 24.008 TFT references below
+  (clause 10.5.6.12 format, cited without a clause or version number) are `opc-proto-tft`'s
   boundary and are pinned in that crate, not by the V20.0.0 pin above.
 - **Crate status:** Experimental S2b-focused typed subset with a raw-preserving
   message/IE shell. `S2b Production Profile v1` is the retained candidate
@@ -34,14 +35,15 @@
 ## N1-mode APCO value boundary
 
 `src/n1_mode.rs` implements the ordinary APCO value format from TS 24.008
-**V18.8.0** §10.5.6.3 and TS 29.274 **V18.8.0** §§7.2.1, 7.2.2, 8.94.
+**V20.0.0** §10.5.6.3 and TS 29.274 **V18.8.0** §§7.2.1, 7.2.2, 8.94.
 The request direction recognizes only container `0x001a` (PDU session identity);
 the response direction recognizes only `0x001b` (complete S-NSSAI followed by
 three PLMN octets). S-NSSAI has no nested NAS IEI/length. Shared checked values
 preserve all five S-NSSAI forms and mapped-HPLMN fields.
 
 The parser checks the complete contents region, including unknown units and
-the pinned specification's direction-dependent two-octet length fields. It
+the pinned specification's direction-dependent two-octet length fields;
+NSSAA EAP container `0x0061` uses two octets in both directions. It
 accepts receiver-ignored spare bits and configuration-protocol fallback values;
 builders emit `0x80`. Unknown and opposite-direction identifiers are ignored as
 N1 data, and append preserves their original bytes. The ordinary contents limit
@@ -49,9 +51,14 @@ is 251 octets; the local work bound is 64 protocol/container units. Large APCO
 and standalone ePCO are excluded.
 
 Identical and conflicting repeated N1 containers are rejected under an explicit
-SDK ambiguity rule. Top-level IE duplicate handling remains the existing
-procedure-aware first-occurrence rule. S2b projections check message type,
-procedure and direction, and read only top-level APCO type 163 instance 0;
+SDK ambiguity rule. The projection selects the first matching IE still in the
+view. Preserving first occurrence on the wire requires `S2bMessage::decode`
+with `ValidationLevel::ProcedureAware`, which forces `DuplicateIePolicy::First`,
+or explicit `First` at another validation level. `Reject` at another level
+rejects duplicates before projection. The default context and `Strict` with
+the default `Last` policy discard earlier IEs, which the projection cannot
+recover. S2b projections check message type, procedure and direction, and read
+only top-level APCO type 163 instance 0;
 PCO, grouped APCO and other instances cannot supply N1 data. Absence, a malformed
 recognized value and a valid value remain distinct. An optional-value error
 does not change the peer's Cause or establish a whole-session rejection.
@@ -63,7 +70,10 @@ setting extends only as needed and preserves all other bits.
 `tests/n1_mode.rs` supplies independent literal values, round trips, direction,
 length/digit/duplicate/bounds negatives, unknown-unit preservation, diagnostic
 redaction and all flag combinations. `tests/n1_mode_s2b.rs` exercises existing
-spec-authored Create Session fixtures and placement/direction/Cause boundaries.
+spec-authored Create Session fixtures and placement/direction/Cause boundaries,
+all validation-level/duplicate-policy combinations, and views that retain two
+APCOs. Literal NSSAA EAP vectors and a nine-identifier table in both directions
+verify that opaque data can neither forge nor hide N1 containers.
 `tests/n1_mode_corpus.rs` verifies exact fuzz mirrors of the textual APCO
 fixtures; `fuzz/fuzz_targets/n1_mode.rs` checks round trips and append invariants.
 `examples/n1_mode.rs` demonstrates these additive codecs and independent flags.

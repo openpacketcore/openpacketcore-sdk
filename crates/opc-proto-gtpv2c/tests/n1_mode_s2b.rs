@@ -5,7 +5,9 @@ use opc_proto_gtpv2c::{
     AdditionalProtocolConfigurationOptions, BearerContext, ProtocolConfigurationOptions,
     S2bMessage, TypedIe, TypedIeValue,
 };
-use opc_protocol::{DecodeContext, EncodeContext, ValidationLevel};
+use opc_protocol::{
+    DecodeContext, DecodeErrorCode, DuplicateIePolicy, EncodeContext, ValidationLevel,
+};
 
 const REQUEST_MESSAGE: &[u8] =
     include_bytes!("fixtures/spec/create_session_request_s2b_ipv4_dynamic.bin");
@@ -171,4 +173,135 @@ fn malformed_first_top_level_apco_is_not_replaced_by_a_later_valid_one() {
         N1ModeApcoRequest::from_s2b(message.as_view().unwrap()),
         Err(N1ModeApcoError::TruncatedContainer)
     );
+}
+
+#[test]
+fn request_projection_selects_first_apco_in_a_view_containing_duplicates() {
+    let (_, message) = S2bMessage::decode(REQUEST_MESSAGE, context()).unwrap();
+    for (first, expected) in [
+        (REQUEST_APCO, Ok(Some(7))),
+        (
+            &[0x80, 0, 0x1a, 1, 16][..],
+            Err(N1ModeApcoError::InvalidPduSessionId),
+        ),
+        (&[0x80][..], Ok(None)),
+    ] {
+        let mut view = message.as_view().unwrap().clone();
+        view.ies.push(apco_ie(first, 0));
+        view.ies.push(apco_ie(&[0x80, 0, 0x1a, 1, 15], 0));
+        assert_eq!(
+            view.ies
+                .iter()
+                .filter(|ie| ie.ie_type() == 163 && ie.instance == 0)
+                .count(),
+            2
+        );
+        assert_eq!(
+            N1ModeApcoRequest::from_s2b(&view)
+                .map(|value| value.map(|request| request.pdu_session_id().value())),
+            expected
+        );
+    }
+}
+
+#[test]
+fn response_projection_selects_first_apco_in_a_view_containing_duplicates() {
+    let (_, message) = S2bMessage::decode(RESPONSE_MESSAGE, context()).unwrap();
+    for (first, expected) in [
+        (RESPONSE_APCO, Ok(Some(vec![1, 0x12, 0x34, 0x56]))),
+        (
+            &[0x80, 0, 0x1b, 1, 1][..],
+            Err(N1ModeApcoError::InvalidSnssai),
+        ),
+        (&[0x80][..], Ok(None)),
+    ] {
+        let mut view = message.as_view().unwrap().clone();
+        view.ies.push(apco_ie(first, 0));
+        view.ies
+            .push(apco_ie(&[0x80, 0, 0x1b, 4, 2, 0, 0xf1, 0x10], 0));
+        assert_eq!(
+            view.ies
+                .iter()
+                .filter(|ie| ie.ie_type() == 163 && ie.instance == 0)
+                .count(),
+            2
+        );
+        assert_eq!(
+            N1ModeApcoResponse::from_s2b(&view)
+                .map(|value| value.map(|response| response.snssai().as_bytes().to_vec())),
+            expected
+        );
+    }
+}
+
+#[test]
+fn wire_duplicate_selection_depends_on_the_decode_context() {
+    use DuplicateIePolicy::{First, Last, Reject};
+    use ValidationLevel::{HeaderOnly, ProcedureAware, Strict, Structural};
+
+    let configured = |validation_level, duplicate_ie_policy| DecodeContext {
+        validation_level,
+        duplicate_ie_policy,
+        ..DecodeContext::default()
+    };
+    let cases = [
+        (DecodeContext::default(), Last),
+        (configured(HeaderOnly, First), First),
+        (configured(HeaderOnly, Last), Last),
+        (configured(HeaderOnly, Reject), Reject),
+        (configured(Structural, First), First),
+        (configured(Structural, Reject), Reject),
+        (configured(Strict, First), First),
+        (configured(Strict, Last), Last),
+        (configured(Strict, Reject), Reject),
+        (configured(ProcedureAware, First), First),
+        (configured(ProcedureAware, Last), First),
+        (configured(ProcedureAware, Reject), First),
+        (DecodeContext::conservative(), Reject),
+    ];
+    for (fixture, malformed, valid, n1_error) in [
+        (
+            REQUEST_MESSAGE,
+            &[0x80, 0, 0x1a, 1, 16][..],
+            REQUEST_APCO,
+            N1ModeApcoError::InvalidPduSessionId,
+        ),
+        (
+            RESPONSE_MESSAGE,
+            &[0x80, 0, 0x1b, 1, 1][..],
+            RESPONSE_APCO,
+            N1ModeApcoError::InvalidSnssai,
+        ),
+    ] {
+        let first = append_ie(fixture, &apco_ie(malformed, 0));
+        let wire = append_ie(&first, &apco_ie(valid, 0));
+        for (ctx, selection) in cases {
+            let decoded = S2bMessage::decode(&wire, ctx);
+            if selection == Reject {
+                assert_eq!(decoded.unwrap_err().code(), &DecodeErrorCode::DuplicateIe);
+                continue;
+            }
+            let (tail, message) = decoded.unwrap();
+            assert!(tail.is_empty());
+            let view = message.as_view().unwrap();
+            assert_eq!(
+                view.ies
+                    .iter()
+                    .filter(|ie| ie.ie_type() == 163 && ie.instance == 0)
+                    .count(),
+                1
+            );
+            let projected = if fixture == REQUEST_MESSAGE {
+                N1ModeApcoRequest::from_s2b(view).map(|value| value.map(|_| ()))
+            } else {
+                N1ModeApcoResponse::from_s2b(view).map(|value| value.map(|_| ()))
+            };
+            let expected = if selection == First {
+                Err(n1_error)
+            } else {
+                Ok(Some(()))
+            };
+            assert_eq!(projected, expected, "decode context: {ctx:?}");
+        }
+    }
 }
