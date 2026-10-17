@@ -1027,14 +1027,14 @@ async fn select_snapshot(store: &ConsensusSessionStore) {
 async fn blocked_transfer(mode: SessionPersistenceMode, window: u64, cycles: usize) {
     let mut fleet = fleet(mode).await;
     let result = AssertUnwindSafe(async {
-        let leader = fleet.leader();
-        let follower = (leader + 1) % 3;
-        let store = fleet.store(leader);
-        let follower_store = fleet.store(follower);
-        follower_store.inner.raft.runtime_config().elect(false);
-        let command = repeated_command(store);
-        store.inner.raft_handler.set_log_admission_window_for_test(window);
         for _ in 0..cycles {
+            let leader = fleet.leader();
+            let follower = (leader + 1) % 3;
+            let store = fleet.store(leader);
+            let follower_store = fleet.store(follower);
+            follower_store.inner.raft.runtime_config().elect(false);
+            let command = repeated_command(store);
+            store.inner.raft_handler.set_log_admission_window_for_test(window);
             // Start from a caught-up voter and a compact live leader window.
             select_snapshot(store).await;
             let mut metrics = store.inner.raft.metrics();
@@ -1081,23 +1081,54 @@ async fn blocked_transfer(mode: SessionPersistenceMode, window: u64, cycles: usi
             assert_eq!(propose(store, &command, tokio::time::Instant::now() + Duration::from_millis(40)).await,
                 ForwardMutationReply::Unavailable);
             assert!(store.inner.raft.metrics().borrow().running_state.is_ok());
-            // Resume the same transfer. No further snapshot or purge is triggered
-            // by the test, and the leader must clear backpressure on its own.
+            // Keep the real transfer held until automatic pressure recovery
+            // changes the leader. The supported write owns this one immutable
+            // request across that reroute; no test-triggered snapshot or purge
+            // helps reclaim the original voter's prefix.
             let resumed = std::time::Instant::now();
-            eprintln!("log_admission_transfer releasing mode={mode:?} window={window} held_cut={held_cut} target={target} before={before:?}; current={:?}", store.inner.raft.metrics().borrow());
-            drop(hold);
-            let reply = propose(store, &command, tokio::time::Instant::now() + WAIT).await;
-            assert!(matches!(&reply, ForwardMutationReply::Applied(response) if response.result.is_ok()),
-                "transfer recovery: {reply:?}; unavailable={}; outcome_unknown={}; voters={:?}",
-                reply == ForwardMutationReply::Unavailable,
-                reply == ForwardMutationReply::OutcomeUnknown,
-                fleet.stores.iter().flatten().map(|store| (
-                    store.inner.local_node_id,
-                    store.log_pressure_snapshot(),
-                    store.inner.raft.metrics().borrow().clone(),
-                    store.inner.persistence_protocol.is_active(),
-                    store.inner.backend.snapshot_observation().phase_for_test(),
-                )).collect::<Vec<_>>());
+            let deadline = tokio::time::Instant::now() + WAIT;
+            let original_vote = store.inner.raft.metrics().borrow().vote;
+            // The fill command deliberately replays one receipt. Recovery
+            // needs a fresh identity once, then retains it across every route.
+            let request_id = SessionConsensusRequestId::new();
+            tokio::time::timeout_at(deadline, async {
+                let handoff = async {
+                    let mut metrics = store.inner.raft.metrics();
+                    let elected = metrics.wait_for(|current| {
+                        current.vote.is_committed()
+                            && current.vote.leader_id.term > original_vote.leader_id.term
+                            && current.current_leader.is_some_and(|node| node != store.inner.local_node_id)
+                    }).await.unwrap().clone();
+                    assert_ne!(elected.current_leader, Some(store.inner.local_node_id),
+                        "full-window recovery must actually transfer leadership");
+                    eprintln!("log_admission_transfer releasing mode={mode:?} window={window} held_cut={held_cut} target={target} before={before:?}; elected={elected:?}");
+                    drop(hold);
+                };
+                let (reply, ()) = tokio::join!(
+                    store.submit_request_before(
+                        request_id,
+                        SessionMutationIntent::AdvanceLogicalTime,
+                        None,
+                        deadline,
+                    ),
+                    handoff,
+                );
+                assert!(matches!(&reply, Ok(response) if response.result.is_ok()),
+                    "transfer recovery: {reply:?}; voters={:?}",
+                    fleet.stores.iter().flatten().map(|store| (
+                        store.inner.local_node_id,
+                        store.log_pressure_snapshot(),
+                        store.inner.raft.metrics().borrow().clone(),
+                        store.inner.persistence_protocol.is_active(),
+                        store.inner.backend.snapshot_observation().phase_for_test(),
+                    )).collect::<Vec<_>>());
+                assert!(reply.unwrap().raft_log_index > target + 8,
+                    "the retained request must be committed after filling the window");
+                let mut metrics = store.inner.raft.metrics();
+                while store.log_pressure_snapshot().retained_rows >= window {
+                    metrics.changed().await.unwrap();
+                }
+            }).await.expect("handoff, committed write and original-voter reclamation share the original recovery deadline");
             assert!(store.log_pressure_snapshot().retained_rows < window);
             assert!(store.inner.raft.metrics().borrow().running_state.is_ok());
             eprintln!("log_admission_transfer mode={mode:?} window={window} resumed_millis={}", resumed.elapsed().as_millis());
