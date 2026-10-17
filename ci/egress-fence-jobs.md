@@ -84,12 +84,14 @@ The two serial scope-payload/child-read contracts retain owner 1 and run in
 fresh processes before its ordinary suite. The three full-bound native log
 proofs instead have owners 4 (leader), 5 (Durable) and 6 (Async). The eleven
 lease-deferral receipt-history proofs have owners 7 through 17, as listed in
-the [full-bound proof mapping](README.md). All fourteen run at O1
-with the original six-package selection, one exact proof and one test thread
+the [full-bound proof mapping](README.md). The four full-window log-admission
+proofs have owners 18 (Durable blocked build), 19 (Async blocked build),
+20 (Durable blocked transfer) and 21 (Async blocked transfer). All eighteen run
+at O1 with the original six-package selection, one exact proof and one test thread
 per dedicated runner. Their live O1 precheck rejects missing, ignored or
 ambiguous names; they need no ordinary-profile build. All ordinary inventories
-verify their ownership and exclusions. Million-entry inputs, three-cycle
-companions, assertions and test deadlines are preserved. See [CI sizing](README.md)
+verify their ownership and exclusions. Million-entry and full-window inputs,
+three-cycle companions, assertions and test deadlines are preserved. See [CI sizing](README.md)
 for the hosted timing evidence behind the new job budgets.
 
 Each ordinary shard runs the original Cargo package/feature selection with four test
@@ -101,9 +103,9 @@ general-CI real-time exclusion list.
 
 Each ordinary shard uploads `egress-fence-test-map-N`, containing
 `egress-fence-test-map.json`: revision, every harness test name, ignored status,
-owner (0–2 for ordinary shards, 3 for `host-proofs`, or 4–17 for full-bound
-proofs) and all eighteen plans. Each full-bound runner uploads its own exact
-command map. Console output names the current invocation; the artifacts retain
+owner (0–2 for ordinary shards, 3 for `host-proofs`, or 4–21 for full-bound and
+full-window proofs) and all twenty-two plans. Each dedicated runner uploads its
+own exact command map. Console output names the current invocation; the artifacts retain
 the complete exclusion arguments without emitting a single oversized log line.
 Generate the same map locally without executing tests with:
 
@@ -162,13 +164,13 @@ measured eBPF feature gates at 37s, object rebuilds at 141s, host oracles at
 so its estimate also uses the 95s completed step in
 [run 38043827932](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38043827932).
 
-The earlier ordinary-shard estimates removed the approximately 11-minute
-isolated O1 build/proofs from the former shard 2's 37–41-minute cold estimate.
-Shards 1 and 2 now also need a six-package O1 library build and serial full-bound
-native log proofs. Their total hosted times need fresh measurement; the earlier
-ordinary-only estimates do not include that work. The separate proof job includes
-its own cold six-package inventory build, proof-profile compilation, all 14
-executions and cache overhead.
+The ordinary-shard estimates below removed the approximately 11-minute isolated
+O1 build/proofs from the former shard 2's 37–41-minute cold estimate. The dedicated
+native log jobs now own the O1 compilation and full-bound/full-window proofs;
+that work no longer precedes or follows the ordinary suites. The separate
+`host-proofs` job includes its own cold six-package inventory build, proof-profile
+compilation, all 14 executions and cache overhead. These historical estimates
+still need confirmation on the current hosted layout.
 
 | New job | Estimated hosted wall time | Basis and allowance |
 | --- | --- | --- |
@@ -176,8 +178,8 @@ executions and cache overhead.
 | `oracles` | 4–8 minutes | Own setup, host compilation/tests, 34s privileged proofs, artifact/cache allowance |
 | `installer` | 4–8 minutes | Own setup and a cold small-package build; completed old step was 95s |
 | `host-tests (0)` | 20–28 minutes | Roughly one third of ordinary tests, 5m initial build, setup/cache allowance; six isolated proofs moved out |
-| `host-tests (1)` | Pending updated hosted measurement | Prior ordinary-only estimate: 23–30m, including examples/doctests/profile compilation. Add the six-package O1 library build and three serial full-bound reclamation/admission proofs. |
-| `host-tests (2)` | Pending updated hosted measurement | Prior ordinary-only estimate: 26–32m. Add the six-package O1 library build and four serial full-bound reclamation/admission proofs. |
+| `host-tests (1)` | 23–30 minutes | Roughly one third of ordinary tests, 5m initial build, examples/doctests/profile compilation, setup/cache allowance |
+| `host-tests (2)` | 26–32 minutes | Former 37–41m cold estimate less 11m O1 build/proofs, with cache allowance |
 | `host-proofs` | 27–35 minutes | 5m inventory build, 5m isolated-profile compilation, 6m21s isolated proofs, 11m O1 build/proofs, setup/cache allowance |
 | `host-native-log-proofs` | Pending hosted measurement | One exact O1 proof per runner; the leader has 120 minutes and other proofs have 75 minutes, including compilation. Budgets follow proof identity. See [CI sizing](README.md). |
 | `root-cgroup-egress` | Under 1 minute | Checkout and aggregate result check |
@@ -185,5 +187,6 @@ executions and cache overhead.
 These estimates include repeated compilation on separate runners and assume
 roughly balanced test durations, not just balanced counts. They are not timing
 qualification: the hosted train must confirm all three ordinary shards and
-the proof job finish comfortably below 45 minutes. Test and job deadlines,
-full input counts, assertions and ignored-test statuses are unchanged.
+the isolated proof job finish comfortably below their unchanged 45-minute limits,
+and each native log proof below its configured 120- or 75-minute limit. Test deadlines, full input
+counts, assertions and ignored-test statuses are unchanged.

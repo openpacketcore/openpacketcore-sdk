@@ -882,13 +882,13 @@ class QuiescentShardPlanTests(unittest.TestCase):
 class LibraryGroupPlanTests(unittest.TestCase):
     LIVE_LOG_FULL_WINDOW = {
         "consensus::store::async_persistence::tests::log_admission::"
-        "log_admission_full_window_blocked_build_durable": "heavy-0",
+        "log_admission_full_window_blocked_build_durable": "native-log-3",
         "consensus::store::async_persistence::tests::log_admission::"
-        "log_admission_full_window_blocked_build_async": "heavy-0",
+        "log_admission_full_window_blocked_build_async": "native-log-4",
         "consensus::store::async_persistence::tests::log_admission::"
-        "log_admission_full_window_blocked_transfer_durable": "heavy-1",
+        "log_admission_full_window_blocked_transfer_durable": "native-log-5",
         "consensus::store::async_persistence::tests::log_admission::"
-        "log_admission_full_window_blocked_transfer_async": "heavy-1",
+        "log_admission_full_window_blocked_transfer_async": "native-log-6",
     }
     NATIVE_FULL_BOUND = (
         "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
@@ -998,7 +998,7 @@ class LibraryGroupPlanTests(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises(SystemExit):
                 TEST_SHARDS.verify_lib_plan(plan)
 
-    def test_live_log_windows_keep_heavy_ownership_and_optimized_serial_execution(self) -> None:
+    def test_live_log_windows_have_dedicated_owners_and_optimized_serial_execution(self) -> None:
         invocations = [(shard, command)
                        for shard in TEST_SHARDS.shard_ids(self.plan)
                        for command in TEST_SHARDS.commands(self.plan, shard, self.targets)
@@ -1010,6 +1010,7 @@ class LibraryGroupPlanTests(unittest.TestCase):
                 self.assertEqual(len(selected), 1)
                 shard, command = selected[0]
                 self.assertEqual(shard, owner)
+                self.assertEqual(len([c for s, c in invocations if s == owner]), 1)
                 self.assertEqual(command[:2], ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"])
                 self.assertEqual(command[2:2 + len(TEST_SHARDS.SELECTION)], TEST_SHARDS.SELECTION)
                 self.assertIn("--test-threads=1", command)
@@ -1022,14 +1023,16 @@ class LibraryGroupPlanTests(unittest.TestCase):
 
     def test_live_log_windows_cannot_disappear_move_or_change_an_ordinary_group_profile(self) -> None:
         for name, owner in self.LIVE_LOG_FULL_WINDOW.items():
-            for mutation in ("missing", "other-heavy", "ordinary", "mixed"):
+            for mutation in ("missing", "other-native", "heavy", "ordinary", "mixed"):
                 plan = copy.deepcopy(self.plan)
                 group = next(group for group in plan["lib_groups"]
                              if name in TEST_SHARDS.lib_group_names(group))
                 if mutation == "missing":
                     group["tests"].remove(name.rsplit("::", 1)[1])
-                elif mutation == "other-heavy":
-                    group["shard"] = "heavy-1" if owner == "heavy-0" else "heavy-0"
+                elif mutation == "other-native":
+                    group["shard"] = "native-log-4" if owner == "native-log-3" else "native-log-3"
+                elif mutation == "heavy":
+                    group["shard"] = "heavy-0"
                 elif mutation == "ordinary":
                     group["shard"] = "it-1"
                 else:
@@ -1037,8 +1040,8 @@ class LibraryGroupPlanTests(unittest.TestCase):
                 with self.subTest(name=name, mutation=mutation), self.assertRaises(SystemExit):
                     TEST_SHARDS.verify_lib_plan(plan)
 
-    def test_live_log_precheck_resolves_enabled_names_in_each_heavy_execution_profile(self) -> None:
-        for shard in ("heavy-0", "heavy-1"):
+    def test_live_log_precheck_resolves_enabled_names_in_each_dedicated_execution_profile(self) -> None:
+        for shard in self.LIVE_LOG_FULL_WINDOW.values():
             calls = []
 
             def listed(command, **kwargs):
@@ -1053,7 +1056,7 @@ class LibraryGroupPlanTests(unittest.TestCase):
                 patch.object(TEST_SHARDS, "integration_targets", return_value=self.targets),
                 patch.object(TEST_SHARDS, "verify"),
                 patch.object(TEST_SHARDS, "quiescent_lib_tests_for_shard", return_value=()),
-                patch.object(TEST_SHARDS, "list_heavy_tests", return_value=self.plan["heavy"]["shards"][int(shard[-1])]),
+                patch.object(TEST_SHARDS, "list_heavy_tests", side_effect=AssertionError("ordinary profile must not compile")),
                 patch.object(TEST_SHARDS.subprocess, "run", side_effect=listed),
             ):
                 TEST_SHARDS.precheck(self.plan, shard)
@@ -1087,7 +1090,7 @@ class LibraryGroupPlanTests(unittest.TestCase):
             TEST_SHARDS.precheck(self.plan, "heavy-1")
             for shard in TEST_SHARDS.native_log_bound.CORE_SHARDS:
                 TEST_SHARDS.precheck(self.plan, shard)
-        for name in self.NATIVE_FULL_BOUND:
+        for name in (*self.NATIVE_FULL_BOUND, *self.LIVE_LOG_FULL_WINDOW):
             selected = [command for command in calls if name in command]
             with self.subTest(name=name):
                 self.assertEqual(len(selected), 2)
@@ -1095,7 +1098,7 @@ class LibraryGroupPlanTests(unittest.TestCase):
                                     for command in selected))
                 self.assertEqual(sum("--ignored" in command for command in selected), 1)
         ordinary = [command for command in calls
-                    if not any(name in command for name in self.NATIVE_FULL_BOUND)]
+                    if not any(name in command for name in (*self.NATIVE_FULL_BOUND, *self.LIVE_LOG_FULL_WINDOW))]
         self.assertTrue(ordinary)
         self.assertTrue(all(command[:len(TEST_SHARDS.SELECTION)] == TEST_SHARDS.SELECTION
                             for command in ordinary))

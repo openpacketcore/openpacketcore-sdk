@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Partition the egress host tests by exact libtest name, without narrowing features.
 
-Every ordinary pass retains the six-package/all-features selection and uses exact
-test-name exclusions. Shards 1 and 2 also compile that six-package --lib selection
-at O1, then run their assigned full-bound native log reclamation and admission
-proofs serially after the ordinary pass. Cargo retains its working-directory
-setup. Other isolated proofs retain their package selection, single-test
-processes and prescribed profiles.
+Every ordinary shard retains the six-package/all-features selection and uses
+exact test-name exclusions. Dedicated shards each compile the same six-package
+--lib selection at O1 and run one full-bound reclamation or full-window admission
+proof. Cargo retains its working-directory setup. Other isolated proofs retain
+their package selection, single-test processes and prescribed profiles.
 """
 
 from __future__ import annotations

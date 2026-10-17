@@ -291,37 +291,6 @@ class NativeLogBoundPhaseTests(unittest.TestCase):
             execute.assert_not_called()
             self.assertTrue(output.is_file())
 
-    def test_dedicated_native_entrypoint_builds_only_its_optimized_profile(self):
-        name = self.NAMES[0]
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "mapping.json"
-            with (
-                patch.object(sys, "argv", ["egress-fence-tests.py", "--shard", "4", "--output", str(output)]),
-                patch.object(FENCE, "inventory", side_effect=AssertionError("ordinary profile must not compile")),
-                patch.object(FENCE, "capture", side_effect=["f" * 40, f"{name}: test\n", ""]) as capture,
-                patch.object(FENCE, "run_commands") as execute,
-            ):
-                self.assertEqual(FENCE.main(), 0)
-            execute.assert_called_once_with([FENCE.native_log_bound_command(name)])
-            self.assertEqual(capture.call_count, 3)
-            self.assertTrue(all(call.kwargs["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"] == "1"
-                                for call in capture.call_args_list[1:]))
-            self.assertTrue(output.is_file())
-
-    def test_ordinary_entrypoint_does_not_precompile_any_full_bound_proof(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "mapping.json"
-            with (
-                patch.object(sys, "argv", ["egress-fence-tests.py", "--shard", "2", "--output", str(output)]),
-                patch.object(FENCE, "inventory", return_value=self.rows()),
-                patch.object(FENCE, "capture", return_value="f" * 40) as capture,
-                patch.object(FENCE, "run_commands") as execute,
-            ):
-                self.assertEqual(FENCE.main(), 0)
-            capture.assert_called_once_with(["git", "rev-parse", "HEAD"])
-            self.assertTrue(all(command["env"] == {} for command in execute.call_args.args[0]))
-            self.assertFalse(any(command["name"] in self.NAMES for command in execute.call_args.args[0]))
-
     def test_all_full_native_names_are_prechecked_at_the_execution_profile(self):
         for name in self.NAMES:
             command = {"name": name, "env": {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"}, "argv": [
@@ -337,6 +306,37 @@ class NativeLogBoundPhaseTests(unittest.TestCase):
                     self.assertIn("--list", call.args[0])
                 with patch.object(FENCE, "capture", return_value=""), self.assertRaises(ValueError):
                     FENCE.precheck_native_log_bound([command])
+
+    def test_dedicated_native_entrypoint_builds_only_its_optimized_profile(self):
+        for shard, name in enumerate(self.NAMES, start=4):
+            with self.subTest(shard=shard), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "mapping.json"
+                with (
+                    patch.object(sys, "argv", ["egress-fence-tests.py", "--shard", str(shard), "--output", str(output)]),
+                    patch.object(FENCE, "inventory", side_effect=AssertionError("ordinary profile must not compile")),
+                    patch.object(FENCE, "capture", side_effect=["f" * 40, f"{name}: test\n", ""]) as capture,
+                    patch.object(FENCE, "run_commands") as execute,
+                ):
+                    self.assertEqual(FENCE.main(), 0)
+                execute.assert_called_once_with([FENCE.native_log_bound_command(name)])
+                self.assertEqual(capture.call_count, 3)
+                self.assertTrue(all(call.kwargs["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"] == "1"
+                                    for call in capture.call_args_list[1:]))
+                self.assertTrue(output.is_file())
+
+    def test_ordinary_entrypoint_does_not_precompile_any_full_bound_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "mapping.json"
+            with (
+                patch.object(sys, "argv", ["egress-fence-tests.py", "--shard", "2", "--output", str(output)]),
+                patch.object(FENCE, "inventory", return_value=self.rows()),
+                patch.object(FENCE, "capture", return_value="f" * 40) as capture,
+                patch.object(FENCE, "run_commands") as execute,
+            ):
+                self.assertEqual(FENCE.main(), 0)
+            capture.assert_called_once_with(["git", "rev-parse", "HEAD"])
+            self.assertTrue(all(command["env"] == {} for command in execute.call_args.args[0]))
+            self.assertFalse(any(command["name"] in self.NAMES for command in execute.call_args.args[0]))
 
     def test_full_native_plan_rejects_lost_duplicate_early_and_overlapping_execution(self):
         for name in self.NAMES:
