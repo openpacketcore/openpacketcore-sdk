@@ -8,7 +8,10 @@ use std::sync::atomic::AtomicBool;
 
 use opc_consensus::engine::{
     error::RaftError,
-    raft::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse},
+    raft::{
+        AppendEntriesRequest, AppendEntriesResponse, PreVoteRequest, PreVoteResponse, VoteRequest,
+        VoteResponse,
+    },
     Vote,
 };
 use opc_consensus::test_runtime::{ElectionRngScript, ScriptedElectionRuntime};
@@ -104,6 +107,25 @@ impl VoteGate {
             return response;
         }
         if request.family != crate::consensus::SessionConsensusRpcFamily::Vote {
+            if request.family == crate::consensus::SessionConsensusRpcFamily::AppendEntries {
+                let append: AppendEntriesRequest<crate::consensus::SessionRaftTypeConfig> =
+                    opc_consensus::decode_bounded(&request.payload).expect("real append request");
+                eprintln!("void election: append {source:?}->{target:?} vote={:?} prev={:?} last={:?} commit={:?} at={sent:?}", append.vote, append.prev_log_id, append.entries.last().map(|entry| entry.log_id), append.leader_commit);
+                let response = handler.handle(source, request).await;
+                let reply = response.result.as_ref().map(|payload| {
+                    opc_consensus::decode_bounded::<
+                        Result<
+                            AppendEntriesResponse<SessionConsensusNodeId>,
+                            RaftError<SessionConsensusNodeId>,
+                        >,
+                    >(payload)
+                });
+                eprintln!(
+                    "void election: append reply {source:?}->{target:?} {reply:?} at={:?}",
+                    Instant::now()
+                );
+                return response;
+            }
             return handler.handle(source, request).await;
         }
         let vote: VoteRequest<SessionConsensusNodeId> =
@@ -119,6 +141,10 @@ impl VoteGate {
         let reply: Result<VoteResponse<SessionConsensusNodeId>, RaftError<SessionConsensusNodeId>> =
             opc_consensus::decode_bounded(response.result.as_ref().expect("vote wire response"))
                 .expect("real vote response");
+        eprintln!(
+            "void election: real Vote reply {source:?}->{target:?} {reply:?} at={:?}",
+            Instant::now()
+        );
         self.exchanges.send_modify(|exchanges| {
             exchanges.push(Exchange {
                 source,
@@ -604,6 +630,10 @@ impl VoidElection {
                 tick += self.early.tick;
             }
             let exchanges = gate.observed(3).await;
+            eprintln!(
+                "void election: winning persisted vote observed at {:?}",
+                self.started.elapsed()
+            );
             assert_eq!(exchanges.len(), 3);
             let winning = &exchanges[2];
             assert_eq!(winning.source, successor_id);
@@ -633,8 +663,13 @@ impl VoidElection {
                     )
                     .await
                     .unwrap();
+                eprintln!(
+                    "void election: committed survivor vote observed on {:?}",
+                    fleet.stores[index].status().node_id
+                );
             }
             gate.partitioned.store(false, Ordering::Release);
+            eprintln!("void election: healed former leader; triggering heartbeat");
             successor.inner.raft.trigger().heartbeat().await.unwrap();
             while !fleet.stores.iter().all(|store| {
                 store.status().leader_id == Some(successor_id)
@@ -642,7 +677,9 @@ impl VoidElection {
             }) {
                 tokio::task::yield_now().await;
             }
+            eprintln!("void election: all voters observed successor; awaiting linearizability");
             successor.inner.raft.ensure_linearizable().await.unwrap();
+            eprintln!("void election: successor linearizability confirmed");
             assert_eq!(self.started.elapsed(), bound);
             for script in &self.scripts {
                 script.finish();
