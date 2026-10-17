@@ -719,8 +719,15 @@ adapter-local plaintext buffering over zero/Pending/error lower transport
 remains exactly `NotTransmitted`. Each
 prewarm performs a rolling resolver/TCP/TLS/Hello refresh of every configured
 lane and retains already refreshed plus unprocessed healthy capacity on a
-partial failure. Prewarm and readiness establish authenticated transport
-capacity only, not quorum or product readiness. Diagnostics are
+partial failure. Newly authenticated unused replacements form one prewarm
+batch: their local idle intervals start together at publication, after the
+remaining lanes have been set up. Cancellation or failure publishes surviving
+replacements and releases admission; it does not discard healthy unprocessed
+siblings. Staging does not extend authentication, lifecycle, address-generation,
+shutdown or peer deadlines, and cannot revive an expired or closed lane. A lane
+that has carried a Call keeps its conservative between-call deadline. Exact-width
+readiness remains mandatory for activation. Prewarm and readiness establish
+authenticated transport capacity only, not quorum or product readiness. Diagnostics are
 fixed and nonidentifying: setup phase, pool wait, active/maximum/idle counts,
 reuse/reconnect, queue/in-flight/oldest age, and bounded outcome classes. They
 never contain endpoints, identities, scopes, credentials, keys, payloads,

@@ -13181,6 +13181,113 @@ struct PersistentPrewarmActivity {
     pool: Arc<PersistentSessionConsumerPool>,
 }
 
+/// Fresh unused lanes retain their physical admission while the rest of the
+/// prewarm is in progress. Dropping this batch publishes surviving replacements
+/// before the prewarm's logical permits are released, including on cancellation
+/// or a later setup failure. Unprocessed original lanes stay in the idle pool.
+struct PersistentPrewarmBatch {
+    pool: Arc<PersistentSessionConsumerPool>,
+    connections: Vec<ConsumerConnection>,
+}
+
+impl PersistentPrewarmBatch {
+    fn new(pool: Arc<PersistentSessionConsumerPool>) -> Self {
+        Self {
+            connections: Vec::with_capacity(pool.config.request_connections),
+            pool,
+        }
+    }
+
+    fn current(pool: &PersistentSessionConsumerPool, connection: &mut ConsumerConnection) -> bool {
+        connection.calls == 0
+            && connection.returnable_after_authenticated_work()
+            && connection.current(&pool.client.tls_config, &pool.client.reauthentication)
+            && connection
+                .lifecycle
+                .admitted_material_epoch()
+                .is_some_and(|epoch| {
+                    consumer_fresh_admission_is_current(
+                        connection.lifecycle.admitted_generation(),
+                        epoch,
+                        pool.client.reauthentication.generation(),
+                        pool.client.tls_config.material_status().epoch(),
+                    )
+                })
+    }
+
+    /// Staging defers only the local unused-lane idle clock. Absolute
+    /// authentication retirement and peer closure still end the batch while a
+    /// subsequent resolver/TCP/TLS/Hello attempt is pending.
+    async fn retire_unusable(&mut self) {
+        let mut reauthentication = self.pool.client.reauthentication.subscribe();
+        let mut material = Some(self.pool.client.tls_config.subscribe_material_changes());
+        loop {
+            if self.connections.is_empty() {
+                std::future::pending::<()>().await;
+            }
+            if let Some(index) = self
+                .connections
+                .iter_mut()
+                .position(|connection| !Self::current(&self.pool, connection))
+            {
+                counter_increment(&self.pool.counters.reconnects);
+                self.connections.remove(index);
+                return;
+            }
+            let deadline = self
+                .connections
+                .iter()
+                .map(|connection| connection.lifecycle.retire_at())
+                .min()
+                .unwrap_or_else(tokio::time::Instant::now);
+            let closed = {
+                let mut peers: stream::FuturesUnordered<_> = self
+                    .connections
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(index, connection)| async move {
+                        let mut byte = [0];
+                        // No application response is legal before the first
+                        // Call. EOF, errors and unsolicited data all retire
+                        // this unused lane; a pending read consumes nothing.
+                        let _ = connection.reader.read(&mut byte).await;
+                        index
+                    })
+                    .collect();
+                tokio::select! {
+                    biased;
+                    closed = peers.next() => closed,
+                    _ = tokio::time::sleep_until(deadline) => None,
+                    _ = reauthentication.changed() => None,
+                    _ = wait_consumer_material_change(&mut material) => None,
+                }
+            };
+            if let Some(index) = closed {
+                counter_increment(&self.pool.counters.reconnects);
+                self.connections.remove(index);
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for PersistentPrewarmBatch {
+    fn drop(&mut self) {
+        let published_at = tokio::time::Instant::now();
+        for mut connection in self.connections.drain(..) {
+            let mut byte = [0];
+            if self.pool.phase() != PersistentShutdownPhase::Running
+                || !Self::current(&self.pool, &mut connection)
+                || connection.reader.read(&mut byte).now_or_never().is_some()
+            {
+                counter_increment(&self.pool.counters.reconnects);
+                continue;
+            }
+            self.pool.return_idle_at(connection, Some(published_at));
+        }
+    }
+}
+
 impl Drop for PersistentCallActivity {
     fn drop(&mut self) {
         let mut activity = self
@@ -13786,7 +13893,15 @@ impl PersistentSessionConsumerPool {
 
     fn try_return_idle(
         self: &Arc<Self>,
+        connection: ConsumerConnection,
+    ) -> Option<ConsumerConnection> {
+        self.try_return_idle_at(connection, None)
+    }
+
+    fn try_return_idle_at(
+        self: &Arc<Self>,
         mut connection: ConsumerConnection,
+        batch_published_at: Option<tokio::time::Instant>,
     ) -> Option<ConsumerConnection> {
         if self.phase() != PersistentShutdownPhase::Running {
             self.release_checked_out(&connection);
@@ -13806,7 +13921,8 @@ impl PersistentSessionConsumerPool {
             return Some(connection);
         }
         if connection.calls == 0 {
-            connection.idle_deadline = tokio::time::Instant::now()
+            connection.idle_deadline = batch_published_at
+                .unwrap_or_else(tokio::time::Instant::now)
                 .checked_add(effective_consumer_idle_timeout(self.client.idle_timeout))
                 .expect("validated consumer idle timeout has a bounded deadline");
         }
@@ -13831,6 +13947,11 @@ impl PersistentSessionConsumerPool {
         }
         if !connection.reusable()
             || !connection.current(&self.client.tls_config, &self.client.reauthentication)
+            // A staged batch has not yet published its fresh admission. Check
+            // that exact authority again at queue publication, after its peer
+            // probe, without changing ordinary returned-lane rotation policy.
+            || (batch_published_at.is_some()
+                && !PersistentPrewarmBatch::current(self, &mut connection))
         {
             Self::remove_checked_out(&mut checked_out, &connection);
             return Some(connection);
@@ -13874,7 +13995,15 @@ impl PersistentSessionConsumerPool {
     }
 
     fn return_idle(self: &Arc<Self>, connection: ConsumerConnection) {
-        if let Some(connection) = self.try_return_idle(connection) {
+        self.return_idle_at(connection, None);
+    }
+
+    fn return_idle_at(
+        self: &Arc<Self>,
+        connection: ConsumerConnection,
+        batch_published_at: Option<tokio::time::Instant>,
+    ) {
+        if let Some(connection) = self.try_return_idle_at(connection, batch_published_at) {
             counter_increment(&self.counters.reconnects);
             drop(connection);
             self.warm_capacity_changed.notify_waiters();
@@ -16215,7 +16344,9 @@ impl PersistentSessionConsumerClient {
 
     /// Establish or rolling-refresh every configured request lane without
     /// dispatching an application operation. Only one prewarm may run at a
-    /// time.
+    /// time. Newly authenticated unused lanes begin their local idle intervals
+    /// together when the batch is published; absolute authentication and peer
+    /// deadlines continue to apply throughout setup.
     pub async fn prewarm(
         &self,
     ) -> Result<PersistentSessionConsumerReadiness, SessionConsumerClientError> {
@@ -16284,9 +16415,10 @@ impl PersistentSessionConsumerClient {
         .await?;
         // A successful prewarm is a live DNS/TCP/TLS/Hello proof, not merely
         // a snapshot of sockets that still look current locally. Refresh one
-        // original lane at a time and publish each authenticated replacement
-        // immediately. A later failure therefore preserves every unprocessed
-        // sibling instead of collapsing the whole usable pool to zero.
+        // original lane at a time. Stage fresh unused replacements together so
+        // later setup cannot consume their local idle intervals. The batch's
+        // drop publishes its surviving replacements on success, failure or
+        // cancellation, preserving every unprocessed healthy sibling too.
         let refresh_count = {
             let mut idle = self
                 .pool
@@ -16296,6 +16428,7 @@ impl PersistentSessionConsumerClient {
             self.pool.prune_idle(&mut idle);
             idle.len()
         };
+        let mut batch = PersistentPrewarmBatch::new(Arc::clone(&self.pool));
         for index in 0..self.pool.config.request_connections {
             let (physical_admission, persistent_physical_admission) = if index < refresh_count {
                 let mut idle = self
@@ -16323,6 +16456,9 @@ impl PersistentSessionConsumerClient {
                 _ = wait_for_shutdown(&mut shutdown) => {
                     return Err(SessionConsumerClientError::ShuttingDown);
                 }
+                _ = batch.retire_unusable() => {
+                    return Err(SessionConsumerClientError::Unavailable);
+                }
                 connection = self.pool.connect_with_physical_admission(
                     deadline,
                     physical_admission,
@@ -16331,8 +16467,9 @@ impl PersistentSessionConsumerClient {
                     None,
                 ) => connection?,
             };
-            self.pool.return_idle(connection);
+            batch.connections.push(connection);
         }
+        drop(batch);
         drop(lane_permits);
         drop(admission_permits);
         if self.pool.phase() != PersistentShutdownPhase::Running {
@@ -21454,6 +21591,8 @@ mod payload_profile;
 
 #[cfg(test)]
 mod tests {
+    #[path = "prewarm_batch.rs"]
+    mod prewarm_batch;
     #[path = "void_alpn_tests.rs"]
     mod void_alpn_tests;
     #[path = "void_wire_tests.rs"]

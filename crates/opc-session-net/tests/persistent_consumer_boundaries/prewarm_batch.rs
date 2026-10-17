@@ -157,7 +157,7 @@ async fn sequential_activation_prewarm_publishes_unused_lanes_as_one_batch() {
             )
             .with_operation_timeout(Duration::from_millis(250))
             .with_idle_timeout(idle_timeout),
-            config.clone(),
+            config,
         )
         .expect("persistent client");
         let activation = {
@@ -213,4 +213,295 @@ async fn sequential_activation_prewarm_publishes_unused_lanes_as_one_batch() {
             "exact-width activation with {idle_timeout:?} idle"
         );
     }
+}
+
+struct InterruptedBatch {
+    server: Option<IndependentServer>,
+    client: PersistentSessionConsumerClient,
+    second_entered: Arc<Notify>,
+    resolutions: Arc<AtomicUsize>,
+}
+
+impl InterruptedBatch {
+    async fn new(lifecycle: ConnectionLifecyclePolicy) -> Self {
+        let pki = TestPki::new();
+        let server_spiffe = spiffe("interrupted-batch-server");
+        let client_spiffe = spiffe("interrupted-batch-client");
+        let (authorizer, _scope, voter_authority) =
+            authorizer_and_scope(&client_spiffe, &server_spiffe).await;
+        let (server, address) = IndependentServer::start(SessionQuorumConsumerServer::new(
+            Arc::new(ActivationConsumer),
+            pki.server_config(&server_spiffe),
+            authorizer,
+        ))
+        .await;
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let second_entered = Arc::new(Notify::new());
+        let resolver: RemoteAddrResolver = {
+            let resolutions = Arc::clone(&resolutions);
+            let second_entered = Arc::clone(&second_entered);
+            Arc::new(move || {
+                let resolutions = Arc::clone(&resolutions);
+                let second_entered = Arc::clone(&second_entered);
+                Box::pin(async move {
+                    if resolutions.fetch_add(1, Ordering::SeqCst) == 1 {
+                        second_entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(address)
+                })
+            })
+        };
+        let config = PersistentSessionConsumerConfig::try_new(
+            2,
+            4,
+            Duration::from_millis(250),
+            1,
+            Duration::from_millis(600),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        )
+        .expect("bounded interrupted-batch configuration");
+        let client = PersistentSessionConsumerClient::try_from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                resolver,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                voter_authority,
+                pki.client_config(&client_spiffe),
+            )
+            .with_operation_timeout(Duration::from_millis(250))
+            .with_idle_timeout(Duration::from_millis(10))
+            .with_connection_lifecycle(lifecycle),
+            config,
+        )
+        .expect("interrupted-batch client");
+        Self {
+            server: Some(server),
+            client,
+            second_entered,
+            resolutions,
+        }
+    }
+
+    async fn start(&self) -> tokio::task::JoinHandle<Result<(), opc_session_store::StoreError>> {
+        let client = self.client.clone();
+        let activation = tokio::spawn(async move {
+            SessionConsumerPreparedFencedTransitionBackend::persistent_exact_voter_prewarm_roster([
+                client,
+            ])
+            .await
+            .map(|_| ())
+        });
+        without_clock_advance(self.second_entered.notified()).await;
+        let diagnostics = self.client.diagnostics().await;
+        assert_eq!(diagnostics.setup_attempts, 2);
+        assert_eq!(diagnostics.setup_successes, 1);
+        assert_eq!(diagnostics.setup_failures, 0);
+        assert_eq!(diagnostics.active, 1);
+        assert_eq!(diagnostics.idle, 0, "the unused lane is still staged");
+        activation
+    }
+
+    async fn assert_no_retained_capacity(&self) {
+        let readiness = self.client.readiness().await;
+        assert!(!readiness.ready);
+        assert_eq!(readiness.configured_request_connections, 2);
+        assert_eq!(readiness.ready_request_connections, 0);
+        let diagnostics = self.client.diagnostics().await;
+        assert_eq!(diagnostics.active, 0);
+        assert_eq!(diagnostics.idle, 0);
+        assert_eq!(diagnostics.inflight, 0);
+        assert_eq!(diagnostics.queued, 0);
+        assert_eq!(diagnostics.pool_wait_current, 0);
+        assert!(diagnostics.max_active <= 2);
+    }
+}
+
+async fn assert_activation_unavailable(
+    activation: tokio::task::JoinHandle<Result<(), opc_session_store::StoreError>>,
+) {
+    let result = without_clock_advance(activation)
+        .await
+        .expect("activation task");
+    assert!(matches!(
+        result,
+        Err(opc_session_store::StoreError::BackendUnavailable(message))
+            if message == "authenticated consumer activation readiness unavailable"
+    ));
+}
+
+// Keep setup on normal time, then align the paused client to its runtime's
+// original timer tick. Tokio rounds timer registrations up to milliseconds;
+// an arbitrary pause instant would leave the exact 25/600 ms boundary below
+// the registered tick while the I/O anchor correctly prevents auto-advance.
+async fn pause_client_clock_at_tick(runtime_origin: tokio::time::Instant) {
+    tokio::time::pause();
+    let now = tokio::time::Instant::now();
+    let next_tick = u64::try_from((now - runtime_origin).as_millis())
+        .expect("fixture duration fits milliseconds")
+        + 1;
+    let aligned = runtime_origin + Duration::from_millis(next_tick);
+    tokio::time::advance(aligned - now).await;
+    assert_eq!(tokio::time::Instant::now(), aligned);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_prewarm_publishes_survivors_and_releases_admission() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let lifecycle = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        Duration::ZERO,
+    )
+    .expect("bounded lifecycle with a deterministic retry interval");
+    let fixture = InterruptedBatch::new(lifecycle).await;
+    pause_client_clock_at_tick(runtime_origin).await;
+    let activation = fixture.start().await;
+    tokio::time::advance(Duration::from_millis(25)).await;
+    activation.abort();
+    assert!(without_clock_advance(activation)
+        .await
+        .expect_err("activation cancelled")
+        .is_cancelled());
+
+    let partial = fixture.client.readiness().await;
+    assert!(!partial.ready);
+    assert_eq!(partial.ready_request_connections, 1);
+    let cancelled = fixture.client.diagnostics().await;
+    assert_eq!(cancelled.active, 1);
+    assert_eq!(cancelled.idle, 1);
+    assert_eq!(cancelled.setup_successes, 1);
+    assert_eq!(cancelled.setup_failures, 1);
+    assert_eq!(cancelled.queued, 0);
+
+    tokio::time::advance(Duration::from_millis(9)).await;
+    assert_eq!(
+        fixture.client.readiness().await.ready_request_connections,
+        1
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    fixture.assert_no_retained_capacity().await;
+    let recovered = without_clock_advance(fixture.client.prewarm())
+        .await
+        .expect("cancelled prewarm releases every logical and physical admission");
+    assert!(recovered.ready);
+    assert_eq!(recovered.ready_request_connections, 2);
+    assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 4);
+    let completed = fixture.client.diagnostics().await;
+    assert_eq!(completed.setup_successes, 3);
+    assert_eq!(completed.setup_failures, 1);
+    assert_eq!(completed.active, 2);
+    assert!(completed.max_active <= 2);
+    without_clock_advance(fixture.client.shutdown()).await;
+    fixture.assert_no_retained_capacity().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_setup_bound_cannot_activate_a_partial_prewarm_batch() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let fixture = InterruptedBatch::new(ConnectionLifecyclePolicy::default()).await;
+    pause_client_clock_at_tick(runtime_origin).await;
+    let started = tokio::time::Instant::now();
+    let activation = fixture.start().await;
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    tokio::time::advance(Duration::from_millis(599)).await;
+    assert!(!activation.is_finished());
+    assert_eq!(fixture.client.diagnostics().await.active, 1);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_activation_unavailable(activation).await;
+    assert_eq!(started.elapsed(), Duration::from_millis(600));
+    let partial = fixture.client.readiness().await;
+    assert!(!partial.ready);
+    assert_eq!(partial.configured_request_connections, 2);
+    assert_eq!(partial.ready_request_connections, 1);
+    let diagnostics = fixture.client.diagnostics().await;
+    assert_eq!(diagnostics.setup_attempts, 2);
+    assert_eq!(diagnostics.setup_successes, 1);
+    assert_eq!(diagnostics.setup_failures, 1);
+    assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 2);
+    without_clock_advance(fixture.client.shutdown()).await;
+    fixture.assert_no_retained_capacity().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn staged_prewarm_lane_retires_at_its_absolute_lifecycle_bound() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let lifecycle = ConnectionLifecyclePolicy::try_new(
+        Duration::from_millis(31),
+        Duration::from_millis(6),
+        Duration::from_millis(1),
+        Duration::from_millis(1),
+        Duration::ZERO,
+    )
+    .expect("absolute retirement at 25 ms after authentication");
+    let fixture = InterruptedBatch::new(lifecycle).await;
+    pause_client_clock_at_tick(runtime_origin).await;
+    let started = tokio::time::Instant::now();
+    let activation = fixture.start().await;
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    tokio::time::advance(Duration::from_millis(24)).await;
+    assert!(!activation.is_finished());
+    assert_eq!(fixture.client.diagnostics().await.active, 1);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_activation_unavailable(activation).await;
+    assert_eq!(started.elapsed(), Duration::from_millis(25));
+    fixture.assert_no_retained_capacity().await;
+    let diagnostics = fixture.client.diagnostics().await;
+    assert_eq!(diagnostics.setup_successes, 1);
+    assert_eq!(diagnostics.setup_failures, 1);
+    assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 2);
+    without_clock_advance(fixture.client.shutdown()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn staged_prewarm_lane_cannot_survive_peer_closure() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let mut fixture = InterruptedBatch::new(ConnectionLifecyclePolicy::default()).await;
+    pause_client_clock_at_tick(runtime_origin).await;
+    let activation = fixture.start().await;
+    drop(fixture.server.take());
+    assert_activation_unavailable(activation).await;
+    fixture.assert_no_retained_capacity().await;
+    assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.client.diagnostics().await.setup_successes, 1);
+    without_clock_advance(fixture.client.shutdown()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn staged_prewarm_lane_cannot_survive_explicit_reauthentication() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let fixture = InterruptedBatch::new(ConnectionLifecyclePolicy::default()).await;
+    pause_client_clock_at_tick(runtime_origin).await;
+    let activation = fixture.start().await;
+    fixture
+        .client
+        .request_reauthentication()
+        .expect("advance authenticated generation");
+    assert_activation_unavailable(activation).await;
+    fixture.assert_no_retained_capacity().await;
+    assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 2);
+    without_clock_advance(fixture.client.shutdown()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn staged_prewarm_lane_cannot_publish_after_shutdown() {
+    let runtime_origin = tokio::time::Instant::now();
+    tokio::time::resume();
+    let fixture = InterruptedBatch::new(ConnectionLifecyclePolicy::default()).await;
+    pause_client_clock_at_tick(runtime_origin).await;
+    let activation = fixture.start().await;
+    let report = without_clock_advance(fixture.client.shutdown()).await;
+    assert_activation_unavailable(activation).await;
+    assert_eq!(report.forced_calls, 0);
+    assert_eq!(report.forced_watches, 0);
+    fixture.assert_no_retained_capacity().await;
+    assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 2);
 }
