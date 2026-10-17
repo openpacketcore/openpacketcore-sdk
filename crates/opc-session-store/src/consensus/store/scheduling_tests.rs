@@ -16,6 +16,13 @@ async fn log_admission_preflight_resident_deadline_preserves_diagnostic() {
     )
     .await
     .expect("preflight admission store");
+    let initializing_store = store.clone();
+    crate::formation_clock::run(async move { initializing_store.initialize_cluster().await })
+        .await
+        .expect("initialize preflight admission leader");
+    store
+        .require_exact_membership_admission()
+        .expect("preflight deadline fixture has admitted membership");
     let mut reservations = Vec::new();
     for _ in 0..crate::scope_scheduler::ScopeSchedulerBudgets::default()
         .maintenance
@@ -64,6 +71,74 @@ async fn log_admission_preflight_resident_deadline_preserves_diagnostic() {
         before + 1,
         "preflight admission timeouts remain observable"
     );
+}
+
+#[tokio::test]
+async fn log_admission_preflight_rejects_unadmitted_before_resident_wait() {
+    let directory = tempfile::tempdir().expect("unadmitted preflight directory");
+    let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+        .expect("unadmitted preflight backend");
+    let store = ConsensusSessionStore::open_with_clock(
+        membership_tests::singleton_topology(),
+        backend,
+        directory.path().join("snapshots"),
+        BTreeMap::new(),
+        Arc::new(SystemClock),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("unadmitted preflight store");
+    assert!(store.require_exact_membership_admission().is_err());
+    let mut reservations = Vec::new();
+    for _ in 0..crate::scope_scheduler::ScopeSchedulerBudgets::default()
+        .maintenance
+        .queued
+    {
+        reservations.push(
+            store
+                .inner
+                .proposal_admission
+                .reserve_for(ScopeSchedulerKey::INTERNAL, ScopeWorkClass::Maintenance)
+                .await
+                .expect("reserve maintenance resident capacity"),
+        );
+    }
+    let before = store
+        .inner
+        .diagnostics
+        .proposal_permit_deadline
+        .load(Ordering::Relaxed);
+    let mut preflight = Box::pin(store.preflight_record_expiry_on_local_leader(
+        Vec::new(),
+        ForwardConsumerScope::Internal,
+        store.inner.local_node_id,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    ));
+    assert_eq!(
+        futures_util::poll!(&mut preflight),
+        std::task::Poll::Ready(ForwardMutationReply::Unavailable),
+        "unadmitted membership rejects before waiting for resident capacity"
+    );
+    drop(preflight);
+    assert_eq!(
+        store
+            .inner
+            .diagnostics
+            .proposal_permit_deadline
+            .load(Ordering::Relaxed),
+        before,
+        "membership rejection is not an admission deadline"
+    );
+    assert_eq!(
+        store.inner.proposal_admission.available_permits(),
+        SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS,
+        "unadmitted preflight does not consume an execution credit"
+    );
+    drop(reservations);
+    store
+        .shutdown()
+        .await
+        .expect("unadmitted preflight shutdown");
 }
 
 #[tokio::test]
