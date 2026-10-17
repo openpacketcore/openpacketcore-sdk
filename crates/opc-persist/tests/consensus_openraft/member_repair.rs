@@ -367,7 +367,16 @@ async fn saved_repair_rediscovers_successor_when_former_source_stalls() {
             break;
         }
         assert!(!stores[4].status().admitted);
-        assert!(stores[4].status().applied_index.is_none());
+        assert!(
+            stores[4].status().applied_index.is_none(),
+            "unfinished retry: result={result:?}, status={:?}, replacement={:?}",
+            stores[4].status(),
+            stores[4].voter_slot_state().await.map(|state| state
+                .table()
+                .replacement
+                .as_ref()
+                .map(|operation| operation.phase)),
+        );
         stores[successor_index]
             .probe_durable_readiness()
             .await
@@ -585,7 +594,16 @@ async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
             break;
         }
         assert!(!cluster.stores[0].status().admitted);
-        assert!(cluster.stores[0].status().applied_index.is_none());
+        assert!(
+            cluster.stores[0].status().applied_index.is_none(),
+            "unfinished attempt {attempt}: result={result:?}, status={:?}, replacement={:?}",
+            cluster.stores[0].status(),
+            cluster.stores[0].voter_slot_state().await.map(|state| state
+                .table()
+                .replacement
+                .as_ref()
+                .map(|operation| operation.phase)),
+        );
         assert_eq!(
             control.chunks.load(Ordering::SeqCst),
             chunks_before + 1,

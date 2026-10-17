@@ -40,6 +40,7 @@ pub(super) struct ConfigVoterProfile {
 #[derive(Default)]
 struct ReplacementProgress {
     key: Option<([u8; 32], VoterSlotLogId, Vote<ConsensusNodeId>)>,
+    phase: Option<VoterReplacementPhase>,
     marker: Option<VoterSlotLogId>,
     snapshot: Option<SnapshotDelivery>,
     retry_delay: Duration,
@@ -57,6 +58,13 @@ impl ReplacementProgress {
                 key: Some(key),
                 ..Self::default()
             };
+        }
+        if self.phase != Some(operation.phase) {
+            // A long candidate download can reach the retry cap. Once the
+            // durable operation advances, that old delay must not hold up
+            // learner catch-up or the remaining membership transitions.
+            self.phase = Some(operation.phase);
+            self.retry_delay = Duration::ZERO;
         }
     }
 
@@ -267,6 +275,7 @@ impl ConfigVoterProfile {
         store: &ConsensusConfigStore,
         sender: ConsensusNodeId,
         request: ControlRequest,
+        deadline: tokio::time::Instant,
     ) -> Result<ControlReply, VoterReplacementError> {
         match request {
             ControlRequest::LossProbe { target, nonce, .. } => {
@@ -326,38 +335,57 @@ impl ConfigVoterProfile {
             } => {
                 let identity = self.core.identity;
                 let local = store.inner.local_node_id;
-                let applied = self
-                    .core
-                    .run_sqlite(move |conn| {
-                        let state = super::super::sqlite::voter_slots::read_sync(conn)?
-                            .ok_or_else(|| {
-                                super::super::sqlite::invalid_data("missing config voter state")
-                            })?;
-                        let operation = state.table().replacement.as_ref().ok_or_else(|| {
-                            super::super::sqlite::invalid_data("missing config replacement")
-                        })?;
-                        let selected = state
-                            .table()
-                            .slots
-                            .iter()
-                            .find(|slot| slot.member.identity.slot() == operation.attestation.slot)
-                            .ok_or_else(|| {
-                                super::super::sqlite::invalid_data("missing config slot")
-                            })?;
-                        let applied = super::super::sqlite::read_applied_sync(conn, identity)?;
-                        Ok(operation.attestation.request_digest == request_digest
-                            && selected.member.identity.node_id() == local
-                            && operation.phase >= VoterReplacementPhase::LearnerAdded
-                            && applied.is_some_and(|cut| {
-                                cut.leader_id.term == marker.term && cut.index >= marker.index
-                            }))
-                    })
-                    .await
-                    .map_err(|_| VoterReplacementError::Unavailable)?;
-                if !applied {
-                    return Err(VoterReplacementError::InvalidTransition);
+                let mut changed = self.core.durable_progress.subscribe_applied();
+                loop {
+                    let (selected, applied) = self
+                        .core
+                        .run_sqlite(move |conn| {
+                            let invalid = || {
+                                super::super::sqlite::invalid_data("invalid config catch-up marker")
+                            };
+                            let state = super::super::sqlite::voter_slots::read_sync(conn)?
+                                .ok_or_else(invalid)?;
+                            let operation =
+                                state.table().replacement.as_ref().ok_or_else(invalid)?;
+                            let selected = state
+                                .table()
+                                .slots
+                                .iter()
+                                .find(|slot| {
+                                    slot.member.identity.slot() == operation.attestation.slot
+                                })
+                                .ok_or_else(invalid)?;
+                            if operation.attestation.request_digest != request_digest
+                                || selected.member.identity.node_id() != local
+                            {
+                                return Ok((false, false));
+                            }
+                            let applied = super::super::sqlite::read_applied_sync(conn, identity)?;
+                            Ok((
+                                true,
+                                operation.phase >= VoterReplacementPhase::LearnerAdded
+                                    && applied.is_some_and(|cut| {
+                                        cut.leader_id.term == marker.term
+                                            && cut.index >= marker.index
+                                    }),
+                            ))
+                        })
+                        .await
+                        .map_err(|_| VoterReplacementError::Unavailable)?;
+                    if !selected {
+                        return Err(VoterReplacementError::InvalidTransition);
+                    }
+                    if applied {
+                        return Ok(ControlReply::AppliedMarker(marker));
+                    }
+                    // The committed marker can race its replication to the
+                    // learner. Wait for durable application within this RPC's
+                    // existing deadline instead of paying a coordinator retry.
+                    tokio::time::timeout_at(deadline, changed.changed())
+                        .await
+                        .map_err(|_| VoterReplacementError::Deadline)?
+                        .map_err(|_| VoterReplacementError::Unavailable)?;
                 }
-                Ok(ControlReply::AppliedMarker(marker))
             }
         }
     }
@@ -1772,7 +1800,7 @@ pub(super) async fn handle(
                 ConsensusRpcFamily::TopologyAdmissionBarrier => {
                     let control = decode_config_wire(&request.payload)
                         .map_err(|_| VoterReplacementError::InvalidTransition)?;
-                    let response = profile.control(&store, sender, control).await;
+                    let response = profile.control(&store, sender, control, deadline).await;
                     Ok(encode_config_wire(&response).map_or_else(
                         |_| rejected(ConsensusPeerError::Protocol),
                         |payload| ConsensusWireResponse {
