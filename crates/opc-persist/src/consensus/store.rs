@@ -3,6 +3,7 @@
 mod audit;
 mod audit_continuity;
 mod compatibility;
+mod member_repair;
 mod planned_shutdown;
 pub(crate) mod voter_slots;
 
@@ -312,6 +313,8 @@ struct ConsensusConfigStoreInner {
     clock: Arc<dyn ConfigConsensusClock>,
     operation_timeout: Duration,
     admitted: AtomicBool,
+    repair_pending: AtomicBool,
+    repair_lock: tokio::sync::Mutex<()>,
     audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
@@ -417,11 +420,12 @@ impl ConsensusConfigStore {
     #[cfg(feature = "dangerous-test-hooks")]
     #[doc(hidden)]
     pub async fn trigger_election_for_test(&self) -> Result<(), PersistError> {
-        if self
-            .inner
-            .voter_profile
-            .as_ref()
-            .is_some_and(|profile| !profile.admission.local_voting_admitted())
+        if self.inner.repair_pending.load(Ordering::Acquire)
+            || self
+                .inner
+                .voter_profile
+                .as_ref()
+                .is_some_and(|profile| !profile.admission.local_voting_admitted())
         {
             return Err(consensus_unavailable());
         }
@@ -627,6 +631,19 @@ impl ConsensusConfigStore {
         .await
         .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         let storage_shutdown = log_store.core.storage_shutdown_observer();
+        // A repair root has lost the old voter's log and vote. Do not expose
+        // that empty state to a live leader or another candidate. A previously
+        // restored root retains its ordinary durable restart behavior.
+        let repair_pending = if backend.retained_repair_only && voter_setup.is_none() {
+            log_store
+                .core
+                .run_sqlite(move |conn| super::sqlite::read_applied_sync(conn, identity))
+                .await
+                .map_err(|_| ConfigConsensusOpenError::StorageUnavailable)?
+                .is_none()
+        } else {
+            false
+        };
         let voter_profile = if let Some(setup) = voter_setup {
             Some(
                 voter_slots::ConfigVoterProfile::new(
@@ -654,7 +671,7 @@ impl ConsensusConfigStore {
             .as_ref()
             .map(|profile| profile.transport.clone());
         let mut config = config_raft_config()?;
-        if voter_profile.is_some() {
+        if voter_profile.is_some() || repair_pending {
             config.enable_elect = false;
             config.enable_heartbeat = false;
         }
@@ -696,6 +713,8 @@ impl ConsensusConfigStore {
                 clock,
                 operation_timeout,
                 admitted: AtomicBool::new(false),
+                repair_pending: AtomicBool::new(repair_pending),
+                repair_lock: tokio::sync::Mutex::new(()),
                 shutdown: planned_shutdown::ConfigShutdownCoordinator::new(),
                 audit_continuity,
                 linearizability,
@@ -727,7 +746,9 @@ impl ConsensusConfigStore {
     /// with durable Openraft state skip bootstrap and re-admit normally. Clean
     /// first formation fails closed if the canonical member is absent.
     /// A retained member provisioned for repair never invokes bootstrap; it
-    /// must recover the existing membership through its authenticated peers.
+    /// must first restore a snapshot from an authenticated leader with a fresh
+    /// surviving-quorum proof. Until then it cannot vote, campaign, or report
+    /// its lost log as a conflict to the existing leader.
     ///
     /// A returning voter needs a compatible majority of the fixed voter set,
     /// including itself, proved on authenticated peer connections. Transports
@@ -750,6 +771,9 @@ impl ConsensusConfigStore {
                 .compatibility
                 .verify(deadline, !initialized)
                 .await?;
+        }
+        if self.inner.repair_pending.load(Ordering::Acquire) {
+            self.recover_member_before_participation(deadline).await?;
         }
         if !initialized
             && canonical_bootstrap == Some(self.inner.local_node_id)
@@ -2007,6 +2031,11 @@ impl ConfigConsensusService {
             | ConsensusRpcFamily::AppendEntries
             | ConsensusRpcFamily::InstallSnapshot
             | ConsensusRpcFamily::LeadershipTransfer => {
+                if self.store.inner.repair_pending.load(Ordering::Acquire) {
+                    return ConsensusWireResponse {
+                        result: Err(ConsensusPeerError::Unavailable),
+                    };
+                }
                 if request.family == ConsensusRpcFamily::LeadershipTransfer
                     && (!self.store.exact_membership_is_admitted()
                         || !self.store.is_live_voter(authenticated_sender))
@@ -2029,6 +2058,9 @@ impl ConfigConsensusService {
                     .raft_handler
                     .handle(authenticated_sender, request)
                     .await
+            }
+            ConsensusRpcFamily::MemberRepair => {
+                member_repair::handle(&self.store, &request.payload).await
             }
             ConsensusRpcFamily::ForwardMutation => {
                 if !self.store.is_live_voter(authenticated_sender) {

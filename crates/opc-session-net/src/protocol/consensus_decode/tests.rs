@@ -148,6 +148,17 @@ fn family_limit_precedes_payload_ownership_even_when_payload_is_first() {
 }
 
 #[test]
+fn member_repair_control_round_trips_with_its_small_request_bound() {
+    let frame = legacy_capture::request(ConsensusRpcFamily::MemberRepair, vec![0; 1024]);
+    assert_eq!(
+        request(&serde_json::to_vec(&frame).unwrap()).unwrap(),
+        frame
+    );
+    let oversized = legacy_capture::request(ConsensusRpcFamily::MemberRepair, vec![0; 1025]);
+    assert!(request(&serde_json::to_vec(&oversized).unwrap()).is_err());
+}
+
+#[test]
 fn counting_pass_stops_at_the_payload_bound_without_an_owner() {
     let at = serde_json::to_vec(&vec![0u8; SESSION_CONSENSUS_MAX_RPC_PAYLOAD_BYTES]).unwrap();
     assert_eq!(

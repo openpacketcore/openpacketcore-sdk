@@ -95,6 +95,7 @@ impl DurableConsensusTimingProfile {
             ConsensusRpcFamily::AppendEntries => self.append_entries_timeout_millis,
             ConsensusRpcFamily::AppendEntriesRoster => self.append_entries_timeout_millis,
             ConsensusRpcFamily::InstallSnapshot => self.install_snapshot_timeout_millis,
+            ConsensusRpcFamily::MemberRepair => self.install_snapshot_timeout_millis,
             ConsensusRpcFamily::ForwardMutation => self.forward_mutation_timeout_millis,
             ConsensusRpcFamily::ForwardRosterMutation => self.forward_mutation_timeout_millis,
             ConsensusRpcFamily::ReadBarrier => self.read_barrier_timeout_millis,
@@ -356,6 +357,7 @@ mod tests {
         );
         for family in [
             ConsensusRpcFamily::InstallSnapshot,
+            ConsensusRpcFamily::MemberRepair,
             ConsensusRpcFamily::ForwardMutation,
             ConsensusRpcFamily::ForwardRosterMutation,
             ConsensusRpcFamily::ReadBarrier,
