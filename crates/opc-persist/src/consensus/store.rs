@@ -77,6 +77,10 @@ pub enum ConfigConsensusOpenError {
     /// Legacy authority requires an explicit approved recovery snapshot.
     #[error("config consensus legacy recovery is required")]
     RecoveryRequired,
+    /// Lost durable vote state requires a selected new incarnation, never reuse
+    /// of the former voter identity.
+    #[error("config consensus repair requires a new voter identity")]
+    VoterIdentityReplacementRequired,
     /// Persisted identity or schema differs from this deployment.
     #[error("config consensus durable identity does not match configuration")]
     DurableIdentityMismatch,
@@ -420,7 +424,8 @@ impl ConsensusConfigStore {
     #[cfg(feature = "dangerous-test-hooks")]
     #[doc(hidden)]
     pub async fn trigger_election_for_test(&self) -> Result<(), PersistError> {
-        if self.inner.repair_pending.load(Ordering::Acquire)
+        if self.requires_voter_identity_replacement()
+            || self.inner.repair_pending.load(Ordering::Acquire)
             || self
                 .inner
                 .voter_profile
@@ -568,6 +573,25 @@ impl ConsensusConfigStore {
         }
         let identity = topology.identity();
         let local_node_id = topology.local_node_id();
+        if backend.retained_repair_only
+            && voter_setup.as_ref().is_some_and(|setup| {
+                !setup.initial.replacement.as_ref().is_some_and(|operation| {
+                    operation.phase == opc_consensus::voter_slots::VoterReplacementPhase::Prepared
+                        && setup.initial.slots.iter().any(|slot| {
+                            slot.member.identity.node_id() == local_node_id
+                                && slot.member.identity.slot() == operation.attestation.slot
+                                && slot.phase == opc_consensus::voter_slots::VoterSlotPhase::Pending
+                                && !operation
+                                    .predecessor
+                                    .members
+                                    .iter()
+                                    .any(|member| member.identity.node_id() == local_node_id)
+                        })
+                })
+            })
+        {
+            return Err(ConfigConsensusOpenError::VoterIdentityReplacementRequired);
+        }
         let members = topology.members().clone();
         let expected_peers = members
             .iter()
@@ -670,7 +694,7 @@ impl ConsensusConfigStore {
             .as_ref()
             .map(|profile| profile.transport.clone());
         let mut config = config_raft_config()?;
-        if voter_profile.is_some() || repair_pending {
+        if voter_profile.is_some() || backend.retained_repair_only {
             config.enable_elect = false;
             config.enable_heartbeat = false;
         }
@@ -744,12 +768,9 @@ impl ConsensusConfigStore {
     /// members wait for that exact membership to replicate. Restarted members
     /// with durable Openraft state skip bootstrap and re-admit normally. Clean
     /// first formation fails closed if the canonical member is absent.
-    /// A retained member provisioned for repair never invokes bootstrap; it
-    /// must first restore a snapshot from an authenticated leader with a fresh
-    /// surviving-quorum proof. Until then it cannot vote, campaign, or report
-    /// its lost log as a conflict to the existing leader.
-    /// Repeated bounded attempts retain partial snapshot progress; cancelling
-    /// an active attempt or shutting down discards that download automatically.
+    /// A retained member provisioned for repair never invokes bootstrap. It
+    /// requires a selected new incarnation and joins through learner catch-up
+    /// and committed membership promotion.
     ///
     /// A returning voter needs a compatible majority of the fixed voter set,
     /// including itself, proved on authenticated peer connections. Transports
@@ -759,6 +780,9 @@ impl ConsensusConfigStore {
     /// Admission can be retried on this same store after a peer returns.
     pub async fn initialize_cluster(&self) -> Result<(), ConfigConsensusOpenError> {
         self.inner.admitted.store(false, Ordering::Release);
+        if self.requires_voter_identity_replacement() {
+            return Err(ConfigConsensusOpenError::VoterIdentityReplacementRequired);
+        }
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
@@ -1369,6 +1393,10 @@ impl ConsensusConfigStore {
                     &self.inner.members,
                 )
         })
+    }
+
+    fn requires_voter_identity_replacement(&self) -> bool {
+        self.inner.backend.retained_repair_only && self.inner.voter_profile.is_none()
     }
 
     fn exact_membership_is_admitted(&self) -> bool {
@@ -2067,6 +2095,11 @@ impl ConfigConsensusService {
         request: ConsensusWireRequest,
         compatibility: Option<opc_consensus::ConsensusCompatibility>,
     ) -> ConsensusWireResponse {
+        if self.store.requires_voter_identity_replacement() {
+            return ConsensusWireResponse {
+                result: Err(ConsensusPeerError::ScopeMismatch),
+            };
+        }
         if request.validate().is_err()
             || request.identity != self.store.inner.identity
             || request.sender != authenticated_sender

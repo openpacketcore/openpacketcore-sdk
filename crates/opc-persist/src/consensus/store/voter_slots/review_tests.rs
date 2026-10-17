@@ -300,7 +300,7 @@ async fn voter_candidate_withholds_joint_append_success_until_durable_joint_appl
     );
 }
 
-fn probe_marker(
+pub(super) fn probe_marker(
     store: &ConsensusConfigStore,
     task: u8,
     n: u32,
