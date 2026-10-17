@@ -1609,6 +1609,10 @@ async fn vetoed_prepare_recovers_with_elected_leader(winner: u16) {
     })
     .await;
     elected.expect("selected survivor wins the next election");
+    assert!(
+        target.inner.raft.metrics().borrow().running_state.is_ok(),
+        "the automatically elected successor has no fatal engine error"
+    );
     {
         let mut blocked = fleet.network.probe_blocked.lock().unwrap();
         for pair in [(a, b), (b, a), (a, c), (c, a)] {

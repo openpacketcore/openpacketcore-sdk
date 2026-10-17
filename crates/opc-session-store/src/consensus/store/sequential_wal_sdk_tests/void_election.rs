@@ -80,6 +80,9 @@ impl VoteGate {
             )
             .expect("real Pre-Vote response");
             let reply = reply.expect("engine Pre-Vote response");
+            eprintln!(
+                "void election: Pre-Vote {source:?}->{target:?} request={vote:?} reply={reply:?} at={sent:?}"
+            );
             let cross = vote.vote.leader_id.term == self.split_term
                 && reply.vote_granted
                 && self.candidates.contains(&source)
@@ -96,6 +99,7 @@ impl VoteGate {
             });
             if cross {
                 self.pre_vote_crossing.wait().await;
+                eprintln!("void election: release crossed Pre-Vote {source:?}->{target:?}");
             }
             return response;
         }
@@ -104,6 +108,7 @@ impl VoteGate {
         }
         let vote: VoteRequest<SessionConsensusNodeId> =
             opc_consensus::decode_bounded(&request.payload).expect("real vote request");
+        eprintln!("void election: real Vote {source:?}->{target:?} request={vote:?}");
         if vote.vote.leader_id.term == self.split_term
             && self.candidates.contains(&source)
             && self.candidates.contains(&target)
@@ -559,6 +564,9 @@ impl VoidElection {
                 if tick == split_at {
                     eprintln!("void election: observing crossed real votes at {tick:?}");
                     let queries = gate.observed_pre_votes(5).await;
+                    eprintln!(
+                        "void election: both split inquiries observed; awaiting persisted votes"
+                    );
                     assert_eq!(queries.len(), 5);
                     assert_eq!(queries[4].source, remaining_id);
                     assert_eq!(queries[4].target, successor_id);

@@ -307,6 +307,13 @@ impl RollingElection {
         }
         self.leader_stops += 1;
         let split_rounds = if self.leader_stops == 2 { 2 } else { 1 };
+        // A retained leader may still be completing its initial read fence.
+        // Observe that healthy setup on normal time before fixing the clock
+        // for the replay that anchors all surviving follower leases.
+        eprintln!("rolling election: reading retained head before freezing time");
+        let stored = fleet.store(index).load_latest().await.unwrap().unwrap();
+        assert_eq!(stored.record.tx_id, fleet.head);
+        eprintln!("rolling election: retained head read completed");
         tokio::time::pause();
         schedule::with_frozen_time(async {
             eprintln!("rolling election: align healthy ticks before stopping voter {}", index + 1);
@@ -317,8 +324,6 @@ impl RollingElection {
             eprintln!("rolling election: healthy ticks aligned");
             // Replay the existing request to give every follower the same
             // committed-vote instant without adding a configuration version.
-            let stored = fleet.store(index).load_latest().await.unwrap().unwrap();
-            assert_eq!(stored.record.tx_id, fleet.head);
             let before = fleet.store(index).status().applied_index;
             fleet
                 .store(index)
