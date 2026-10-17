@@ -193,3 +193,97 @@ async fn repair_source_waits_for_snapshot_progress_before_fetching() {
     .await
     .expect("snapshot progress regression must complete within its bound");
 }
+
+#[tokio::test]
+async fn repair_source_retriggers_after_an_older_build_swallows_its_request() {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let identity = opc_consensus::ConsensusIdentity::new(
+            opc_consensus::ConsensusClusterId::new("repair-snapshot-retrigger").unwrap(),
+            opc_consensus::ConsensusConfigurationId::from_bytes([0x74; 32]),
+            opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let topology =
+            ConfigConsensusTopology::try_new(identity, node(1), BTreeSet::from([node(1)]))
+                .expect("singleton topology");
+        let backend = SqliteBackend::in_memory_for_test().await.expect("backend");
+        let hooks = Arc::clone(&backend.consensus_snapshot_test_hooks);
+        let store = ConsensusConfigStore::open_with_operation_timeout(
+            topology,
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("store");
+        store.initialize_cluster().await.expect("singleton leader");
+        let old_cut = store.inner.raft.metrics().borrow().last_applied;
+        hooks.pause_captured_build.store(true, Ordering::Release);
+        store.trigger_snapshot().await.expect("start older build");
+        hooks.build_captured.notified().await;
+
+        // The builder already copied its SQLite cut. This real later entry
+        // must also be present in the first repair snapshot.
+        let applied = store
+            .inner
+            .raft
+            .client_write(super::super::super::ConfigConsensusCommand {
+                schema_version: super::super::super::CONFIG_CONSENSUS_COMMAND_VERSION,
+                identity,
+                request_id: opc_consensus::ConsensusRequestId::from_bytes([0x74; 16]),
+                logical_time: opc_types::Timestamp::now_utc(),
+                intent: ConfigMutationIntent::MarkConfirmed {
+                    tx_id: opc_types::TxId::new(),
+                },
+            })
+            .await
+            .expect("later entry commits and applies")
+            .log_id;
+        store
+            .inner
+            .raft
+            .wait(None)
+            .applied_index_at_least(Some(applied.index), "required repair cut")
+            .await
+            .unwrap();
+        assert!(Some(applied) > old_cut);
+        let reads_before = hooks.reads_started.load(Ordering::Acquire);
+        let repair = store.repair_snapshot_chunk(None, Instant::now() + Duration::from_secs(3));
+        tokio::pin!(repair);
+        assert!(poll_fn(|cx| Poll::Ready(repair.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        // These acknowledged core messages also ensure the repair's trigger
+        // has been processed while the first builder is still held.
+        for _ in 0..5 {
+            store.inner.raft.with_raft_state(|_| ()).await.unwrap();
+            assert!(poll_fn(|cx| Poll::Ready(repair.as_mut().poll(cx)))
+                .await
+                .is_pending());
+        }
+        assert_eq!(hooks.reads_started.load(Ordering::Acquire), reads_before);
+        assert_eq!(hooks.builds_started.load(Ordering::Acquire), 1);
+        hooks.pause_captured_build.store(false, Ordering::Release);
+        hooks.resume_captured_build.notify_one();
+        let chunk = repair.await.expect("repair owns the fresh build trigger");
+        let running = store.inner.raft.metrics().borrow().running_state.clone();
+        store.shutdown().await.expect("shutdown source");
+        assert!(running.is_ok());
+        assert!(chunk
+            .meta
+            .last_log_id
+            .is_some_and(|cut| cut.index >= applied.index));
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(hooks.builds_started.load(Ordering::Acquire), 2);
+        assert_eq!(
+            hooks.reads_started.load(Ordering::Acquire) - reads_before,
+            1
+        );
+    })
+    .await
+    .expect("swallowed-trigger recovery stays within the original request budget");
+}

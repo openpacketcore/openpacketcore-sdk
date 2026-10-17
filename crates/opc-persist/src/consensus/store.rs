@@ -1047,6 +1047,54 @@ impl ConsensusConfigStore {
         result
     }
 
+    /// Wait for a completed build covering the required cut under the same leader.
+    /// Metrics flushes without snapshot progress must not fetch or retrigger it.
+    async fn wait_for_snapshot_cut(
+        &self,
+        required: Option<u64>,
+        vote: opc_consensus::engine::Vote<ConsensusNodeId>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), PersistError> {
+        let mut metrics = self.inner.raft.metrics();
+        let mut requested_at = None;
+        loop {
+            let (current, applied, snapshot) = {
+                let state = metrics.borrow_and_update();
+                (
+                    state.running_state.is_ok()
+                        && state.current_leader == Some(self.inner.local_node_id)
+                        && state.vote == vote,
+                    state.last_applied.map(|log| log.index),
+                    state.snapshot,
+                )
+            };
+            if !current
+                || self.inner.shutdown.is_started()
+                || tokio::time::Instant::now() >= deadline
+            {
+                return Err(consensus_unavailable());
+            }
+            if applied >= required {
+                if snapshot.map(|log| log.index) >= required {
+                    return Ok(());
+                }
+                if requested_at != Some(snapshot) {
+                    // An already running build can swallow our trigger. Its
+                    // completed cut is the event that permits another attempt.
+                    tokio::time::timeout_at(deadline, self.inner.raft.trigger().snapshot())
+                        .await
+                        .map_err(|_| consensus_unavailable())?
+                        .map_err(|_| consensus_unavailable())?;
+                    requested_at = Some(snapshot);
+                }
+            }
+            tokio::time::timeout_at(deadline, metrics.changed())
+                .await
+                .map_err(|_| consensus_unavailable())?
+                .map_err(|_| consensus_unavailable())?;
+        }
+    }
+
     /// Apply an explicit acknowledged history-retention decision through the
     /// existing consensus authority, retaining the same request ID for retries.
     pub async fn retain_history_idempotent(

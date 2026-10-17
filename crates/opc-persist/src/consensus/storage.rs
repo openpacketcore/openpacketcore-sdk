@@ -34,14 +34,18 @@ const SNAPSHOT_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::fro
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct SnapshotTestHooks {
-    pause_verified_read: AtomicBool,
-    read_verified: tokio::sync::Notify,
+    pause_open_read: AtomicBool,
+    read_opened: tokio::sync::Notify,
     resume_read: tokio::sync::Notify,
     build_gate_acquired: AtomicBool,
     pub(crate) pause_build: AtomicBool,
     pub(crate) build_started: tokio::sync::Notify,
     pub(crate) resume_build: tokio::sync::Notify,
     pub(crate) reads_started: AtomicU64,
+    pub(crate) builds_started: AtomicU64,
+    pub(crate) pause_captured_build: AtomicBool,
+    pub(crate) build_captured: tokio::sync::Notify,
+    pub(crate) resume_captured_build: tokio::sync::Notify,
 }
 
 #[must_use = "staging artifacts must stay guarded until they are durably referenced"]
@@ -1181,78 +1185,49 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             .snapshot_test_hooks
             .reads_started
             .fetch_add(1, Ordering::AcqRel);
-        let deadline = tokio::time::Instant::now()
-            .checked_add(SNAPSHOT_OPERATION_TIMEOUT)
-            .ok_or_else(|| {
-                storage_error(
-                    ErrorSubject::Snapshot(None),
-                    ErrorVerb::Read,
-                    sqlite::invalid_data("config consensus snapshot read deadline overflow"),
-                )
-            })?;
         validate_snapshot_binding(&self.core)
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
-        // Publication removes the superseded path. Keep the selected metadata,
-        // envelope verification and final open under the same gate as build
-        // and install; the returned descriptor survives subsequent unlinking.
-        let _guard = tokio::time::timeout_at(deadline, self.core.snapshot_gate.lock())
-            .await
-            .map_err(|_| {
-                storage_error(
-                    ErrorSubject::Snapshot(None),
-                    ErrorVerb::Read,
-                    sqlite::invalid_data("config consensus snapshot read timed out"),
-                )
-            })?;
-        let identity = self.core.identity;
-        let members = self.core.expected_members.clone();
-        let current = self
-            .core
-            .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
-                cancellation.check_io()?;
-                sqlite::read_current_snapshot_sync(conn, identity, &members)
-            })
-            .await
-            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
-        let Some((meta, file_name, expected_checksum, expected_length)) = current else {
-            return Ok(None);
-        };
-        let path = self.core.snapshot_dir.join(file_name);
-        let (_, checksum, length) =
-            tokio::time::timeout_at(deadline, verify_snapshot_envelope(&path))
-                .await
-                .map_err(|_| {
+        let (meta, expected_checksum, expected_length, mut file) = {
+            // Publication may unlink the selected path. Bind the record to an
+            // open descriptor under the gate; verification does not need it.
+            let _guard =
+                tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, self.core.snapshot_gate.lock())
+                    .await
+                    .map_err(|_| {
+                        storage_error(
+                            ErrorSubject::Snapshot(None),
+                            ErrorVerb::Read,
+                            sqlite::invalid_data("config consensus snapshot read gate timed out"),
+                        )
+                    })?;
+            let deadline = tokio::time::Instant::now()
+                .checked_add(SNAPSHOT_OPERATION_TIMEOUT)
+                .ok_or_else(|| {
                     storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorSubject::Snapshot(None),
                         ErrorVerb::Read,
-                        sqlite::invalid_data("config consensus snapshot verification timed out"),
-                    )
-                })?
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
+                        sqlite::invalid_data("config consensus snapshot read deadline overflow"),
                     )
                 })?;
-        if checksum != expected_checksum || length != expected_length {
-            return Err(storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                sqlite::invalid_data("config consensus snapshot metadata mismatch"),
-            ));
-        }
-        #[cfg(test)]
-        if self
-            .core
-            .snapshot_test_hooks
-            .pause_verified_read
-            .load(Ordering::Acquire)
-        {
-            self.core.snapshot_test_hooks.read_verified.notify_one();
-            self.core.snapshot_test_hooks.resume_read.notified().await;
-        }
-        let file = tokio::time::timeout_at(deadline, ConfigSnapshotFile::open(path))
+            let identity = self.core.identity;
+            let members = self.core.expected_members.clone();
+            let current = self
+                .core
+                .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                    cancellation.check_io()?;
+                    sqlite::read_current_snapshot_sync(conn, identity, &members)
+                })
+                .await
+                .map_err(|error| {
+                    storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error)
+                })?;
+            let Some((meta, file_name, expected_checksum, expected_length)) = current else {
+                return Ok(None);
+            };
+            let file = tokio::time::timeout_at(
+                deadline,
+                ConfigSnapshotFile::open(self.core.snapshot_dir.join(file_name)),
+            )
             .await
             .map_err(|_| {
                 storage_error(
@@ -1268,6 +1243,43 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     error,
                 )
             })?;
+            (meta, expected_checksum, expected_length, file)
+        };
+        let (_, checksum, length) = tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, async {
+            #[cfg(test)]
+            if self
+                .core
+                .snapshot_test_hooks
+                .pause_open_read
+                .load(Ordering::Acquire)
+            {
+                self.core.snapshot_test_hooks.read_opened.notify_one();
+                self.core.snapshot_test_hooks.resume_read.notified().await;
+            }
+            verify_open_snapshot_envelope(&mut file).await
+        })
+        .await
+        .map_err(|_| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                sqlite::invalid_data("config consensus snapshot verification timed out"),
+            )
+        })?
+        .map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
+        if checksum != expected_checksum || length != expected_length {
+            return Err(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                sqlite::invalid_data("config consensus snapshot metadata mismatch"),
+            ));
+        }
         Ok(Some(Snapshot {
             meta,
             snapshot: Box::new(file),
@@ -1279,6 +1291,19 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
     async fn build_snapshot(
         &mut self,
     ) -> Result<Snapshot<ConfigRaftTypeConfig>, StorageError<ConsensusNodeId>> {
+        validate_snapshot_binding(&self.core).map_err(|error| {
+            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+        })?;
+        let _guard =
+            tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, self.core.snapshot_gate.lock())
+                .await
+                .map_err(|_| {
+                    storage_error(
+                        ErrorSubject::Snapshot(None),
+                        ErrorVerb::Write,
+                        sqlite::invalid_data("config consensus snapshot build gate timed out"),
+                    )
+                })?;
         let deadline = tokio::time::Instant::now()
             .checked_add(SNAPSHOT_OPERATION_TIMEOUT)
             .ok_or_else(|| {
@@ -1288,23 +1313,16 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     sqlite::invalid_data("config consensus snapshot build deadline overflow"),
                 )
             })?;
-        validate_snapshot_binding(&self.core).map_err(|error| {
-            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-        })?;
-        let _guard = tokio::time::timeout_at(deadline, self.core.snapshot_gate.lock())
-            .await
-            .map_err(|_| {
-                storage_error(
-                    ErrorSubject::Snapshot(None),
-                    ErrorVerb::Write,
-                    sqlite::invalid_data("config consensus snapshot build timed out"),
-                )
-            })?;
         #[cfg(test)]
         self.core
             .snapshot_test_hooks
             .build_gate_acquired
             .store(true, Ordering::Release);
+        #[cfg(test)]
+        self.core
+            .snapshot_test_hooks
+            .builds_started
+            .fetch_add(1, Ordering::AcqRel);
         #[cfg(test)]
         if self
             .core
@@ -1338,6 +1356,20 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             })
             .await
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
+        #[cfg(test)]
+        if self
+            .core
+            .snapshot_test_hooks
+            .pause_captured_build
+            .load(Ordering::Acquire)
+        {
+            self.core.snapshot_test_hooks.build_captured.notify_one();
+            self.core
+                .snapshot_test_hooks
+                .resume_captured_build
+                .notified()
+                .await;
+        }
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let file_name = format!("snapshot-{snapshot_id}.opc");
         let final_path = self.core.snapshot_dir.join(&file_name);
@@ -1498,16 +1530,22 @@ async fn envelope_snapshot_database(
 }
 
 pub(crate) async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
-    let source = open_read_nofollow(path)?;
-    let metadata = source.metadata()?;
-    let total = metadata.len();
+    let mut file = ConfigSnapshotFile::open(path.to_path_buf()).await?;
+    verify_open_snapshot_envelope(&mut file).await
+}
+
+/// Verify the selected descriptor even if publication has unlinked its path.
+/// A successful verification rewinds it for the snapshot transport reader.
+pub(crate) async fn verify_open_snapshot_envelope(
+    file: &mut ConfigSnapshotFile,
+) -> io::Result<(u64, [u8; 32], u64)> {
+    let total = file.seek(io::SeekFrom::End(0)).await?;
     if total <= SNAPSHOT_FOOTER_BYTES || total > SNAPSHOT_MAX_BYTES + SNAPSHOT_FOOTER_BYTES {
         return Err(sqlite::invalid_data(
             "config consensus snapshot size is invalid",
         ));
     }
     let payload_length = total - SNAPSHOT_FOOTER_BYTES;
-    let mut file = tokio::fs::File::from_std(source);
     file.seek(io::SeekFrom::Start(payload_length)).await?;
     let mut magic = [0_u8; 8];
     file.read_exact(&mut magic).await?;
@@ -1556,6 +1594,7 @@ pub(crate) async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u
             "config consensus snapshot checksum mismatch",
         ));
     }
+    file.seek(io::SeekFrom::Start(0)).await?;
     Ok((payload_length, actual, total))
 }
 
@@ -2053,18 +2092,18 @@ mod tests {
                 .expect("replacement snapshot state");
 
             let hooks = Arc::clone(&machine.core.snapshot_test_hooks);
-            hooks.pause_verified_read.store(true, Ordering::Release);
+            hooks.pause_open_read.store(true, Ordering::Release);
             hooks.build_gate_acquired.store(false, Ordering::Release);
             let mut reader = machine.clone();
             let read = tokio::spawn(async move { reader.get_current_snapshot().await });
-            hooks.read_verified.notified().await;
+            hooks.read_opened.notified().await;
 
             let mut builder = machine.get_snapshot_builder().await;
             let replacement = builder.build_snapshot();
             tokio::pin!(replacement);
-            // Poll exactly once to attempt the gate. If the reader does not
-            // hold it, finish publishing and removing its old path before
-            // resuming the verified read. No scheduler delay creates the race.
+            // Poll exactly once to attempt the gate, then publish and unlink
+            // before verifying the opened descriptor. No scheduler delay
+            // creates the race.
             let first_poll = poll_fn(|cx| Poll::Ready(replacement.as_mut().poll(cx))).await;
             let published_before_read = if hooks.build_gate_acquired.load(Ordering::Acquire) {
                 let result = match first_poll {
@@ -2079,7 +2118,11 @@ mod tests {
                 );
                 None
             };
-            hooks.pause_verified_read.store(false, Ordering::Release);
+            assert!(
+                published_before_read.is_some(),
+                "an opened read must release the gate before verification"
+            );
+            hooks.pause_open_read.store(false, Ordering::Release);
             hooks.resume_read.notify_one();
             let read = read.await.expect("snapshot reader joined");
             let replacement = match published_before_read {
@@ -2112,6 +2155,130 @@ mod tests {
         })
         .await
         .expect("snapshot replacement race must complete within its bound");
+    }
+
+    async fn snapshot_budget_watchdog(operation: impl std::future::Future<Output = ()>) {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let mut watchdog =
+            tokio::task::spawn_blocking(move || held.recv_timeout(Duration::from_secs(10)));
+        tokio::select! {
+            () = operation => {},
+            result = &mut watchdog => panic!("snapshot budget watchdog expired: {result:?}"),
+        }
+        drop(release);
+        assert!(matches!(
+            watchdog.await.unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    async fn queued_snapshot_keeps_work_budget(build: bool, expire_gate: bool) {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let temp = tempfile::tempdir().expect("snapshot directory");
+        let backend = SqliteBackend::in_memory_for_test().await.expect("backend");
+        let (_, mut machine, _) = open(
+            &backend,
+            temp.path().join("snapshots"),
+            identity(),
+            members(),
+        )
+        .await
+        .expect("storage");
+        machine
+            .apply([membership_entry(), mutation_entry()])
+            .await
+            .expect("snapshot state");
+        machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let hooks = machine.core.snapshot_test_hooks.clone();
+        let gate = machine.core.snapshot_gate.clone();
+        let held = gate.lock().await;
+        let operation = async move {
+            if build {
+                machine.get_snapshot_builder().await.build_snapshot().await
+            } else {
+                machine
+                    .get_current_snapshot()
+                    .await
+                    .map(|snapshot| snapshot.expect("current snapshot"))
+            }
+        };
+        let mut operation = Box::pin(operation);
+        assert!(poll_fn(|cx| Poll::Ready(operation.as_mut().poll(cx)))
+            .await
+            .is_pending());
+
+        // All real SQLite setup is complete. Advance only while the gate or
+        // explicit test hook prevents filesystem work, then restore real time.
+        tokio::time::pause();
+        tokio::time::advance(if expire_gate {
+            SNAPSHOT_OPERATION_TIMEOUT + Duration::from_millis(1)
+        } else {
+            SNAPSHOT_OPERATION_TIMEOUT - Duration::from_secs(1)
+        })
+        .await;
+        tokio::time::resume();
+        if expire_gate {
+            let error = operation
+                .await
+                .expect_err("snapshot gate wait must stay bounded");
+            assert!(error.to_string().contains("gate timed out"));
+            drop(held);
+            return;
+        }
+
+        if build {
+            hooks.pause_build.store(true, Ordering::Release);
+        } else {
+            hooks.pause_open_read.store(true, Ordering::Release);
+        }
+        drop(held);
+        let operation = tokio::spawn(operation);
+        if build {
+            hooks.build_started.notified().await;
+        } else {
+            hooks.read_opened.notified().await;
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
+        if build {
+            hooks.pause_build.store(false, Ordering::Release);
+            hooks.resume_build.notify_one();
+        } else {
+            hooks.pause_open_read.store(false, Ordering::Release);
+            hooks.resume_read.notify_one();
+        }
+        let snapshot = operation
+            .await
+            .expect("snapshot task joined")
+            .expect("gate queue time must not consume the work budget");
+        assert_eq!(snapshot.meta.last_log_id, Some(log_id(1)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_gate_queue_does_not_consume_verification_budget() {
+        snapshot_budget_watchdog(queued_snapshot_keeps_work_budget(false, false)).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_gate_queue_does_not_consume_build_budget() {
+        snapshot_budget_watchdog(queued_snapshot_keeps_work_budget(true, false)).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_read_and_build_gate_waits_remain_bounded() {
+        snapshot_budget_watchdog(async {
+            queued_snapshot_keeps_work_budget(false, true).await;
+            queued_snapshot_keeps_work_budget(true, true).await;
+        })
+        .await;
     }
 
     #[tokio::test]
