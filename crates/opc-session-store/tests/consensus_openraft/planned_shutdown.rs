@@ -132,6 +132,60 @@ async fn leader_shutdown_preserves_surviving_lease_renewal() {
     surviving_quorum_renewal_after_shutdown(true).await;
 }
 
+async fn shutdown_without_explicit_preparation_preserves_renewal(stop_leader: bool) {
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
+    let (leader, leader_id, term) = cluster.observed_leader();
+    let stopped = if stop_leader {
+        leader
+    } else {
+        (leader + 1) % MEMBER_COUNT
+    };
+    let survivor = (0..MEMBER_COUNT)
+        .find(|index| *index != stopped && *index != leader)
+        .unwrap();
+    let lease = cluster.stores[survivor]
+        .acquire(
+            &session_key(b"automatic-planned-shutdown"),
+            owner("automatic-shutdown-owner"),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("live lease before shutdown");
+    cluster.wait_all_ready(RECOVERY_TIMEOUT).await.unwrap();
+    // Exercise the ordinary public stop path: callers need not remember a
+    // separate prepare call to preserve the surviving renewal budget.
+    tokio::time::timeout(CALLER_RENEWAL_BUDGET, cluster.stores[stopped].shutdown())
+        .await
+        .expect("planned shutdown stays inside the existing renewal budget")
+        .expect("engine and storage close");
+    cluster.isolate(stopped);
+    let renewed = tokio::time::timeout(
+        CALLER_RENEWAL_BUDGET,
+        cluster.stores[survivor].renew(&lease, Duration::from_secs(60)),
+    )
+    .await
+    .expect("survivors renew within the unchanged caller budget")
+    .expect("survivor quorum remains writable");
+    assert_eq!(renewed.fence(), lease.fence());
+    assert_eq!(renewed.owner(), lease.owner());
+    let after = cluster.stores[survivor].status();
+    assert_eq!(after.term == term, !stop_leader);
+    assert_eq!(after.leader_id == Some(leader_id), !stop_leader);
+    close_cluster(&cluster).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_automatically_hands_leadership_to_a_surviving_voter() {
+    shutdown_without_explicit_preparation_preserves_renewal(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_automatically_retires_a_follower_without_electing() {
+    shutdown_without_explicit_preparation_preserves_renewal(false).await;
+}
+
 struct PausedHandoffHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
     captured: tokio::sync::mpsc::Sender<SessionConsensusWireRequest>,
