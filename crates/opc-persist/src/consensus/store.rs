@@ -9,6 +9,9 @@ pub(crate) mod voter_slots;
 #[cfg(test)]
 mod capacity_tests;
 
+#[cfg(test)]
+mod member_repair_tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
