@@ -10,7 +10,7 @@ fn at(seconds: u64) -> Timestamp {
     Timestamp::from_offset_datetime(*time(0).as_offset_datetime() + Duration::from_secs(seconds))
 }
 
-fn successor(prior: &FencedTransitionOutcome) -> FencedTransitionV2Request {
+fn lease_deferral_successor_request(prior: &FencedTransitionOutcome) -> FencedTransitionV2Request {
     FencedTransitionV2Request::new(
         FencedTransitionV2HistoryEpoch::new(1).unwrap(),
         FencedTransitionV2CallerNonce::from_bytes([0xD3; 16]),
@@ -30,7 +30,7 @@ pub(in crate::consensus::native) fn pending_fixture() -> (NativeStorage, FencedT
 {
     let (mut storage, _, prior) =
         fixture_with_profile(FencedTransitionV2Profile::V2WithLeaseDeferral);
-    let pending = successor(&prior);
+    let pending = lease_deferral_successor_request(&prior);
     let response = apply(&mut storage, &[command(2, &pending, time(2), false)])
         .responses
         .remove(0);
@@ -298,7 +298,7 @@ fn native_lease_deferral_preserves_the_original_profiles_terminal_contention() {
         FencedTransitionV2Profile::V2WithVoid,
     ] {
         let (mut storage, _, prior) = fixture_with_profile(profile);
-        let request = successor(&prior);
+        let request = lease_deferral_successor_request(&prior);
         let first = apply(&mut storage, &[command(2, &request, time(2), false)])
             .responses
             .remove(0);
