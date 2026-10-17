@@ -147,6 +147,13 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let directory = tempfile::tempdir().expect("private fixture directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("private recovery journal directory");
+        }
         let clock = Arc::new(StoreClock {
             origin: Timestamp::now_utc(),
             seconds: AtomicU64::new(0),
