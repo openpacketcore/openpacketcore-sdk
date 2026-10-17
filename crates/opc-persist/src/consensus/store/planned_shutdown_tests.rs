@@ -116,7 +116,7 @@ impl ConsensusPeer for Peer {
 async fn lagging_successor(release_prefix: bool) {
     use PlannedShutdownFallback as Reason;
     // Temporary bounded diagnostic: keep the original three-second operation
-    // bound and frozen Tokio clock, but make startup's wall-clock drift explicit.
+    // bound, but make four seconds of startup wall time explicit.
     // The fallback fixture remains an un-delayed control in the same run.
     if release_prefix {
         let virtual_started = tokio::time::Instant::now();
@@ -199,6 +199,10 @@ async fn lagging_successor(release_prefix: bool) {
     for store in &stores {
         store.probe_durable_readiness().await.unwrap();
     }
+    // SQLite cancellation compares converted operation deadlines to wall time.
+    // Complete real startup/readiness before freezing Tokio for the shutdown
+    // scenario so setup cannot consume a deadline while virtual time stands still.
+    tokio::time::pause();
     let before = stores[0].status().applied_index.unwrap();
     for target in [1, 2] {
         paths[&(0, target)]
@@ -304,7 +308,7 @@ async fn lagging_successor(release_prefix: bool) {
     three.unwrap();
 }
 
-async fn frozen(operation: impl Future<Output = ()>) {
+async fn with_wall_clock_watchdog(operation: impl Future<Output = ()>) {
     let (release, held) = std::sync::mpsc::channel::<()>();
     let mut watchdog =
         tokio::task::spawn_blocking(move || held.recv_timeout(Duration::from_secs(30)));
@@ -320,12 +324,12 @@ async fn frozen(operation: impl Future<Output = ()>) {
     ));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn accepted_prefix_catches_up_before_successor_campaigns() {
-    frozen(lagging_successor(true)).await;
+    with_wall_clock_watchdog(lagging_successor(true)).await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn no_up_to_date_voter_has_a_typed_bounded_fallback() {
-    frozen(lagging_successor(false)).await;
+    with_wall_clock_watchdog(lagging_successor(false)).await;
 }
