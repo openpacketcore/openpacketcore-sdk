@@ -79,9 +79,9 @@ impl Drop for IndependentServer {
     }
 }
 
-// A hang guard, not a latency or protocol bound: real TCP/TLS setup on slow
-// debug runners, including i686, can exceed five wall-clock seconds while the
-// protocol clock is paused. Product timing is checked against that clock.
+// Detect stalls while the protocol clock is held fixed, including a reconnect
+// cooldown accidentally stamped on real time during outside-runtime cancellation.
+// This is a wall-clock hang guard; product timing uses the paused clock below.
 const LOOPBACK_HANG_GUARD: Duration = Duration::from_secs(60);
 
 // Keep an I/O anchor runnable while real TCP/TLS work completes. Only the

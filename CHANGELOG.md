@@ -790,6 +790,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rolling refresh, cancellation cleanup, fixed physical admission, and all
   lifecycle, authentication, address-generation, shutdown and peer limits.
   Cancellation cleanup also works outside the polling runtime's context.
+  Stamp cancelled or failed reconnect cooldowns on the admitting runtime's clock,
+  so cancellation outside that runtime cannot strand subsequent setup.
   Cap unused lanes at their monotonic HelloAck peer-idle bound, accounting for
   measured transit time and a safety margin. Expose the peer-idle assumption for
   servers with shorter timeouts without changing the frozen HelloAck wire format.

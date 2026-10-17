@@ -725,8 +725,14 @@ remaining lanes have been set up. Cancellation or failure publishes surviving
 replacements and releases admission; it does not discard healthy unprocessed
 siblings. A pending prewarm future may also be dropped outside its polling
 runtime's context, with the same survivor expiry and admission-release guarantees.
+Cancelled and failed reconnect attempts stamp their cooldown using the runtime
+that admitted them, even when cancellation runs on another thread or inside
+another runtime. This keeps cooldown publication and enforcement on one clock.
 If Tokio's thread-local context has already been destroyed, cancellation instead
 discards the staged lanes and releases their admission without entering a runtime.
+An unfinished reconnect attempt publishes its cooldown on its admitting runtime
+and retains reconnect admission until publication; runtime shutdown discards that
+publication task and releases admission.
 Each unused lane's effective expiry is the earlier of its local publication-based
 idle deadline and its own peer first-Call bound. The latter is measured from the
 monotonic HelloAck receive instant, less the complete measured Hello round trip
