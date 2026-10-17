@@ -19,6 +19,24 @@ pub(crate) struct SnapshotCapture {
 }
 
 impl SnapshotCapture {
+    /// Size opaque export validation/ordering from this immutable capture.
+    /// Collection cardinalities are cached; this does not visit historical
+    /// rows or expose the native state's private collections to the adapter.
+    pub(crate) fn export_work_rows(&self) -> u64 {
+        let state = &self.storage.business;
+        [
+            state.keys.len(),
+            state.receipts.len(),
+            state.generic_receipts.len(),
+            state.notifications.len(),
+            state.roster.rows.len(),
+            state.roster.partitions.len(),
+            self.storage.log.entries.len(),
+        ]
+        .into_iter()
+        .fold(0_u64, |total, rows| total.saturating_add(rows as u64))
+    }
+
     /// Application may advance during export. The immutable snapshot keeps
     /// its captured cut, but a different live authority cannot authorize its
     /// return. The WAL adapter separately checks its current running owner.

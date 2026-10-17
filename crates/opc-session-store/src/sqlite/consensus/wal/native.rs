@@ -1537,16 +1537,14 @@ impl Wal {
             // callbacks scale with these rows, while copying the compatibility
             // basis scales with its actual descriptor length. Neither can be
             // charged a fixed wall-clock budget independent of state size.
-            let state = &capture.storage.business;
-            let work_rows = [
-                state.keys.len(), state.receipts.len(), state.generic_receipts.len(),
-                state.notifications.len(), state.roster.rows.len(),
-                state.roster.partitions.len(), capture.storage.log.entries.len(),
-            ].into_iter().fold(0_u64, |total, rows| total.saturating_add(rows as u64));
+            let work_rows = capture.export_work_rows();
             let basis_bytes = if progress.is_some() {
                 crate::sqlite::open_regular_read_nofollow(&self.directory.join("basis.sqlite"))?
-                    .metadata()?.len()
-            } else { 0 };
+                    .metadata()?
+                    .len()
+            } else {
+                0
+            };
             #[cfg(feature = "test-control")]
             let export_step = std::cell::Cell::new("before_capture_read");
             macro_rules! export_step {
@@ -1566,9 +1564,13 @@ impl Wal {
                 if cancelled() {
                     return Err(io::Error::other(SnapshotExportCancelled));
                 }
-                let extent = destination.map(|destination| destination.file().metadata().map(|m| m.len()))
-                    .transpose()?.unwrap_or(0);
-                if progress.is_some_and(|progress| !progress(basis_bytes.saturating_add(extent), work_rows)) {
+                let extent = destination
+                    .map(|destination| destination.file().metadata().map(|m| m.len()))
+                    .transpose()?
+                    .unwrap_or(0);
+                if progress.is_some_and(|progress| {
+                    !progress(basis_bytes.saturating_add(extent), work_rows)
+                }) {
                     return Err(io::Error::other(SnapshotExportCancelled));
                 }
                 if let Some(destination) = destination {
