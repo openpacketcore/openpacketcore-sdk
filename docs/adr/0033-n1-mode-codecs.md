@@ -42,12 +42,18 @@ Repeated recognized Notify types and repeated N1 container identifiers are
 rejected, including identical duplicates. This is a local SDK ambiguity rule,
 not a claim that the specifications mandate this duplicate disposition.
 The S2b projection selects the first matching IE remaining in the supplied view.
-Preserving the wire's first occurrence requires `S2bMessage::decode` with
+Among APCOs that survive outer-IE decoding, preserving the wire's first
+occurrence requires `S2bMessage::decode` with
 `ValidationLevel::ProcedureAware` (which forces `DuplicateIePolicy::First`),
 or explicit `First` at another validation level. `Reject` at another level
 rejects duplicates before projection. The default context and `Strict` with
 the default `Last` policy have already discarded earlier IEs; the projection
-cannot recover them. These decode policies remain unchanged.
+cannot recover them. An empty Create Session Response APCO is discarded as
+malformed optional outer-IE data at every validation level, before duplicate
+selection, including under `Reject`. A later populated APCO can therefore
+supply N1 data. This does not skip a nonempty APCO merely because its inner N1
+contents are invalid. An empty request APCO instead fails receive decoding.
+These decode policies remain unchanged.
 The S2b projection checks Create Session procedure, direction
 and header type and reads only top-level APCO type 163 instance 0. An optional
 N1 decoding error does not alter Cause or authorize whole-session rejection.

@@ -751,6 +751,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-proto-gtpv2c`: clarify that an empty optional response APCO is discarded
+  before duplicate selection at every validation level. Pin this behavior and
+  the one-octet length of container `0x0062` with regressions, and align the N1
+  fixture specification reference with TS 24.008 V20.0.0. (#1321)
+
 - `opc-proto-gtpv2c`: frame NSSAA EAP APCO container `0x0061` with a two-octet
   length in both directions per TS 24.008 V20.0.0, so opaque EAP data cannot
   forge or hide N1 values. Document the decode-context precondition for

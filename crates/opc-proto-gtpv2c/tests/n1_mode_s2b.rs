@@ -305,3 +305,56 @@ fn wire_duplicate_selection_depends_on_the_decode_context() {
         }
     }
 }
+
+#[test]
+fn empty_first_apco_is_discarded_only_for_response_before_duplicate_selection() {
+    use DuplicateIePolicy::{First, Last, Reject};
+    use ValidationLevel::{HeaderOnly, ProcedureAware, Strict, Structural};
+
+    let mut contexts = vec![DecodeContext::default(), DecodeContext::conservative()];
+    for validation_level in [HeaderOnly, Structural, Strict, ProcedureAware] {
+        for duplicate_ie_policy in [First, Last, Reject] {
+            contexts.push(DecodeContext {
+                validation_level,
+                duplicate_ie_policy,
+                ..DecodeContext::default()
+            });
+        }
+    }
+
+    // An empty APCO is invalid outer-IE data, so supply its raw TLIV bytes.
+    // append_ie updates the message length after adding the populated APCO.
+    let empty_request = [REQUEST_MESSAGE, &[163, 0, 0, 0]].concat();
+    let request_wire = append_ie(&empty_request, &apco_ie(REQUEST_APCO, 0));
+    let empty_response = [RESPONSE_MESSAGE, &[163, 0, 0, 0]].concat();
+    let response_wire = append_ie(&empty_response, &apco_ie(RESPONSE_APCO, 0));
+
+    for ctx in contexts {
+        let request_error = S2bMessage::decode(&request_wire, ctx).unwrap_err();
+        assert_eq!(request_error.code(), &DecodeErrorCode::Truncated, "{ctx:?}");
+
+        // Response APCO is optional: discard the empty occurrence before
+        // selecting duplicates, even under Reject. The populated IE is first
+        // among retained APCOs, so it supplies the response's N1 value.
+        let (tail, message) = S2bMessage::decode(&response_wire, ctx).unwrap();
+        assert!(tail.is_empty(), "{ctx:?}");
+        let view = message.as_view().unwrap();
+        assert_eq!(
+            view.ies
+                .iter()
+                .filter(|ie| ie.ie_type() == 163 && ie.instance == 0)
+                .count(),
+            1,
+            "{ctx:?}"
+        );
+        let n1 = N1ModeApcoResponse::from_s2b(view).unwrap().unwrap();
+        assert_eq!(n1.snssai().as_bytes(), &[1, 0x12, 0x34, 0x56], "{ctx:?}");
+        assert_eq!(n1.plmn_id().as_bytes(), &[0, 0xf1, 0x10], "{ctx:?}");
+        let retained = view
+            .ies
+            .iter()
+            .find(|ie| ie.ie_type() == 163 && ie.instance == 0)
+            .unwrap();
+        assert_eq!(*retained, apco_ie(RESPONSE_APCO, 0), "{ctx:?}");
+    }
+}

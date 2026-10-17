@@ -220,12 +220,19 @@ impl N1ModeApcoResponse {
     /// Read N1 data from an S2b Create Session Response's top-level APCO instance 0.
     ///
     /// The first matching IE still present in `view` supplies the value. To
-    /// preserve the first occurrence on the wire, decode with `S2bMessage::decode`
-    /// and `ValidationLevel::ProcedureAware` (which forces `DuplicateIePolicy::First`),
-    /// or select `First` explicitly at another validation level. `Reject` at
-    /// another level rejects duplicates before projection. The default context
-    /// and `Strict` with the default `Last` policy have already discarded earlier
-    /// occurrences; this helper cannot recover them.
+    /// preserve the first occurrence that survives outer-IE decoding, use
+    /// `S2bMessage::decode` with `ValidationLevel::ProcedureAware` (which forces
+    /// `DuplicateIePolicy::First`), or select `First` explicitly at another
+    /// validation level. `Reject` at another level rejects retained duplicates
+    /// before projection. The default context and `Strict` with the default
+    /// `Last` policy have already discarded earlier occurrences; this helper
+    /// cannot recover them.
+    ///
+    /// An empty response APCO is discarded as malformed optional outer-IE data
+    /// at every validation level, before duplicate selection, including under
+    /// `Reject`. A later populated APCO can therefore supply N1 data. This does
+    /// not skip a nonempty APCO merely because its inner N1 contents are invalid.
+    /// An empty request APCO instead fails ordinary S2b receive decoding.
     ///
     /// PCO, grouped APCO and other instances are ignored. Call this after ordinary
     /// S2b message validation. A value or error neither changes Cause nor establishes

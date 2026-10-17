@@ -52,16 +52,23 @@ and standalone ePCO are excluded.
 
 Identical and conflicting repeated N1 containers are rejected under an explicit
 SDK ambiguity rule. The projection selects the first matching IE still in the
-view. Preserving first occurrence on the wire requires `S2bMessage::decode`
-with `ValidationLevel::ProcedureAware`, which forces `DuplicateIePolicy::First`,
-or explicit `First` at another validation level. `Reject` at another level
-rejects duplicates before projection. The default context and `Strict` with
-the default `Last` policy discard earlier IEs, which the projection cannot
-recover. S2b projections check message type, procedure and direction, and read
-only top-level APCO type 163 instance 0;
-PCO, grouped APCO and other instances cannot supply N1 data. Absence, a malformed
-recognized value and a valid value remain distinct. An optional-value error
-does not change the peer's Cause or establish a whole-session rejection.
+view. Among APCOs that survive outer-IE decoding, preserving wire-order first
+occurrence requires `S2bMessage::decode` with `ValidationLevel::ProcedureAware`,
+which forces `DuplicateIePolicy::First`, or explicit `First` at another
+validation level. `Reject` at another level rejects retained duplicates before
+projection. The default context and `Strict` with the default `Last` policy
+discard earlier IEs, which the projection cannot recover.
+
+An empty Create Session Response APCO is malformed optional outer-IE data and
+is discarded under TS 29.274 §7.7.8 at every validation level, before duplicate
+selection, including under `Reject`. A later populated APCO can therefore
+supply N1 data. This does not skip a nonempty APCO merely because its inner N1
+contents are invalid. An empty request APCO instead fails receive decoding.
+S2b projections check message type, procedure and direction, and read only
+top-level APCO type 163 instance 0; PCO, grouped APCO and other instances cannot
+supply N1 data. Absence, a malformed recognized value and a valid value remain
+distinct. An optional-value error does not change the peer's Cause or establish
+a whole-session rejection.
 
 `IndicationFlag` covers 5GSIWKI (IE octet 11 bit 6), 5GCNRS (octet 12 bit 4)
 and 5GCNRI (octet 12 bit 3), per TS 29.274 §8.12. Missing octets read clear;
@@ -71,9 +78,11 @@ setting extends only as needed and preserves all other bits.
 length/digit/duplicate/bounds negatives, unknown-unit preservation, diagnostic
 redaction and all flag combinations. `tests/n1_mode_s2b.rs` exercises existing
 spec-authored Create Session fixtures and placement/direction/Cause boundaries,
-all validation-level/duplicate-policy combinations, and views that retain two
-APCOs. Literal NSSAA EAP vectors and a nine-identifier table in both directions
-verify that opaque data can neither forge nor hide N1 containers.
+all validation-level/duplicate-policy combinations (including the empty-first
+response APCO discard), and views that retain two APCOs. NSSAA status `0x0062`
+regressions pin its one-octet length in both directions. Literal NSSAA EAP
+vectors and a nine-identifier table in both directions verify that opaque data
+can neither forge nor hide N1 containers.
 `tests/n1_mode_corpus.rs` verifies exact fuzz mirrors of the textual APCO
 fixtures; `fuzz/fuzz_targets/n1_mode.rs` checks round trips and append invariants.
 `examples/n1_mode.rs` demonstrates these additive codecs and independent flags.
@@ -302,8 +311,9 @@ failures and must cover at least these rules:
   29.274 clause 7.7.10 instead: the first singleton key in each top-level or
   grouped scope is retained, later occurrences are ignored, and bounded
   `S2bReceiveDiagnostics` records only type, instance, scope/depth, first
-  offset, and a saturated duplicate count. A malformed or semantically invalid
-  first value remains an error and cannot be repaired by a later value. For
+  offset, and a saturated duplicate count. Malformed optional IEs discarded
+  under clause 7.7.8 do not reserve a duplicate key. A malformed or semantically
+  invalid retained first value cannot be repaired by a later value. For
   Create Session Response nested F-TEIDs, this rule applies per `(type,
   instance)` singleton key: distinct table-defined instances remain eligible
   for their distinct roles, while a later duplicate at the same instance can

@@ -248,6 +248,34 @@ fn nssaa_eap_cannot_hide_a_response_slice() {
 }
 
 #[test]
+fn nssaa_status_keeps_one_octet_request_length() {
+    // TS 24.008 V20.0.0: 0062H is reserved in this direction and still uses
+    // one-octet framing; it is NSSAA status from network to MS.
+    let status = apco(&[0x80, 0, 0x62, 1, 1]);
+    assert_eq!(N1ModeApcoRequest::decode(&status), Ok(None));
+    let with_request = [status.value.as_slice(), &REQUEST[1..]].concat();
+    assert_eq!(
+        N1ModeApcoRequest::decode(&apco(&with_request)),
+        Ok(Some(request()))
+    );
+    assert_eq!(request().append_to(&status).unwrap().value, with_request);
+    assert_eq!(status.value, [0x80, 0, 0x62, 1, 1]);
+}
+
+#[test]
+fn nssaa_status_keeps_one_octet_response_length() {
+    let status = apco(&[0x80, 0, 0x62, 1, 1]);
+    assert_eq!(N1ModeApcoResponse::decode(&status), Ok(None));
+    let with_response = [status.value.as_slice(), &RESPONSE[1..]].concat();
+    assert_eq!(
+        N1ModeApcoResponse::decode(&apco(&with_response)),
+        Ok(Some(response()))
+    );
+    assert_eq!(response().append_to(&status).unwrap().value, with_response);
+    assert_eq!(status.value, [0x80, 0, 0x62, 1, 1]);
+}
+
+#[test]
 fn every_two_octet_identifier_obeys_its_directional_length_rule() {
     fn opaque_unit(identifier: u16, length_octets: usize, payload: &[u8]) -> Vec<u8> {
         let mut wire = vec![0x80];

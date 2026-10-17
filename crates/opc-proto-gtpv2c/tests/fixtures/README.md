@@ -35,9 +35,11 @@ Clause abbreviations used in the tables: IMSI §8.3.2, Cause §8.4, Recovery
 ### N1-mode APCO contents
 
 `n1_mode_apco_request.hex` and `n1_mode_apco_response.hex` are ordinary APCO
-contents, excluding the GTP TLIV header. They are authored from TS 24.008
-V18.8.0 §10.5.6.3 and TS 29.274 V18.8.0 §8.94. They contain synthetic values
-and are not captures. `tests/n1_mode_corpus.rs` checks the exact mirrors in
+contents, excluding the GTP TLIV header. Originally authored from TS 24.008
+V18.8.0 §10.5.6.3 and TS 29.274 V18.8.0 §8.94, their `0x001a`/`0x001b` contents
+have been checked against the codec's current TS 24.008 V20.0.0 §10.5.6.3 pin
+and remain unchanged. They contain synthetic values and are not captures.
+`tests/n1_mode_corpus.rs` checks the exact mirrors in
 `fuzz/corpus/n1_mode/`; the `n1_mode` fuzz target consumes raw APCO contents.
 
 | File | Octets | Meaning |

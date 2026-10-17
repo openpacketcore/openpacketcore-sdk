@@ -26,13 +26,19 @@ control-plane stack.
   identifiers, and checks framing through the end. Append preserves all other
   bytes. Repeated N1 containers, including identical copies, fail as an SDK
   ambiguity rule. `from_s2b` selects the first matching IE remaining in the view.
-  Wire-order first occurrence requires `S2bMessage::decode` with
+  Among APCOs that survive outer-IE decoding, wire-order first occurrence
+  requires `S2bMessage::decode` with
   `ValidationLevel::ProcedureAware` (which forces `DuplicateIePolicy::First`),
   or explicit `First` at another validation level. `Reject` at another level
   rejects duplicates before projection. Default and `Strict` contexts with
   the default `Last` policy have already discarded earlier IEs; the projection
-  cannot recover them. Work is bounded to 64 units and 251 ordinary PCO content
-  octets. Large APCO/ePCO is outside this codec. These additions use TS 24.008
+  cannot recover them. An empty Create Session Response APCO is discarded as
+  malformed optional outer-IE data at every validation level, before duplicate
+  selection, including under `Reject`; a later populated APCO can supply N1
+  data. This does not skip a nonempty APCO merely because its inner N1 contents
+  are invalid. An empty request APCO instead fails receive decoding.
+  Work is bounded to 64 units and 251 ordinary PCO content octets.
+  Large APCO/ePCO is outside this codec. These additions use TS 24.008
   **V20.0.0** §10.5.6.3, including the two-octet length of NSSAA EAP container
   `0x0061` in both directions, and TS 29.274 **V18.8.0** §§7.2.1, 7.2.2, 8.94.
 - `Indication::flag` and `set_flag` expose independent `IndicationFlag` values
