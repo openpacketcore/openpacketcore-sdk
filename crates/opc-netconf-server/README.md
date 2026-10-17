@@ -376,15 +376,19 @@ Limitations:
 
 ## Verification
 
-The native three-voter required-audit recovery test controls raw election
-samples and observes actual engine tick delivery while protocol time is paused.
-It requires a single automatic campaign and fresh local authority within the
-original 26-second acquisition deadline, then resumes normal time for the
+The native and authenticated three-voter required-audit recovery tests control
+raw election samples and observe actual engine tick delivery while protocol time
+is paused. Each requires a single automatic campaign and fresh local authority
+within the original 26-second acquisition deadline, then resumes normal time for the
 stale-owner, exact-result and terminal-recovery checks. A separate regression
 forces a real split vote at 18 seconds and verifies the original timeout before
 the next eligible campaign at 27 seconds. These are controlled test schedules,
 not a fixed failover guarantee for randomized production elections. The engine
 configuration and operation deadlines are unchanged.
+
+Paused time requires a current-thread Tokio runtime. The authenticated election
+retains its real mTLS transport, admission refusals and audit-recovery checks,
+but no longer exercises concurrent dispatch across four Tokio workers.
 
 Run:
 

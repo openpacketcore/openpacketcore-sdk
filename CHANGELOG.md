@@ -766,13 +766,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first-occurrence APCO projection and cover every directional length entry
   and duplicate-selection boundary with regressions.
 
-- `opc-netconf-server` tests: make the native required-audit leadership change
-  deterministic with scoped election samples and observed engine ticks. Require
+- `opc-netconf-server` tests: make native and authenticated required-audit
+  leadership changes deterministic with scoped election samples and observed engine ticks. Require
   one automatic campaign and fresh authority within the original 26-second
   deadline, preserving every terminal-debt and stale-owner assertion. Retain a
   real split vote at 18 seconds as a negative control: its next campaign cannot
   begin until 27 seconds. Production timers and operation budgets are unchanged.
-  (#1322)
+  The authenticated election uses a current-thread Tokio runtime for controlled
+  time; all real mTLS and audit-recovery checks remain. (#1322)
 
 - `opc-persist` tests: script real one- and two-split elections during mixed-voter
   rolls while keeping writes in flight across leader loss. Require one-split

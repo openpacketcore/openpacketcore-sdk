@@ -164,7 +164,7 @@ impl Quorum {
             let store = match scripts {
                 Some(scripts) => {
                     scripts[index]
-                        .scope(opening.instrument(election::delivery::node_span(index as u64 + 1)))
+                        .scope(opening.instrument(election::delivery::node_span(node.get())))
                         .await
                 }
                 None => opening.await,
@@ -266,6 +266,26 @@ impl Quorum {
         one.unwrap();
         two.unwrap();
         three.unwrap();
+    }
+}
+
+impl election::Voters for Quorum {
+    fn stores(&self) -> &[Arc<ConsensusConfigStore>] {
+        &self.stores
+    }
+
+    fn observe_votes(&self, gate: Option<Arc<election::VoteGate>>) {
+        for path in [(1, 2), (2, 1)] {
+            *self.paths[&path].election_vote.lock().unwrap() = gate.clone();
+        }
+    }
+
+    fn isolate(&self, node: usize) {
+        Quorum::isolate(self, node);
+    }
+
+    async fn leader_except(&self, excluded: Option<usize>) -> usize {
+        Quorum::leader_except(self, excluded).await
     }
 }
 

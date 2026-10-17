@@ -29,11 +29,19 @@ struct VoteExchange {
     response: VoteResponse<ConfigConsensusNodeId>,
 }
 
+#[derive(Debug)]
 pub(super) struct VoteGate {
     term: u64,
     arrivals: watch::Sender<Vec<(Instant, VoteRequest<ConfigConsensusNodeId>)>>,
     both_candidates: Option<Barrier>,
     replies: watch::Sender<Vec<VoteExchange>>,
+}
+
+pub(super) trait Voters {
+    fn stores(&self) -> &[Arc<ConsensusConfigStore>];
+    fn observe_votes(&self, gate: Option<Arc<VoteGate>>);
+    fn isolate(&self, node: usize);
+    async fn leader_except(&self, excluded: Option<usize>) -> usize;
 }
 
 impl VoteGate {
@@ -118,14 +126,16 @@ impl SuccessfulElection {
         }
     }
 
-    pub(super) async fn elect_survivor(self, quorum: &Quorum, old_leader: usize) -> usize {
+    pub(super) async fn elect_survivor(self, quorum: &impl Voters, old_leader: usize) -> usize {
         assert_eq!(old_leader, 0);
-        let old = quorum.stores[old_leader].status();
+        let stores = quorum.stores();
+        let nodes: Vec<_> = stores.iter().map(|store| store.status().node_id).collect();
+        let old = stores[old_leader].status();
         let committed = old.committed_index.expect("committed audit prefix");
-        let expected = quorum.stores[1].status().node_id;
+        let expected = nodes[1];
         // The selected survivor must actually have the committed audit debt.
         // A missing prefix blocks setup instead of manufacturing authority.
-        quorum.stores[1]
+        stores[1]
             .wait_for_raft_status_for_test(|status| {
                 status.leader_id == Some(old.node_id)
                     && status.term == old.term
@@ -142,9 +152,7 @@ impl SuccessfulElection {
             both_candidates: None,
             replies: watch::channel(Vec::new()).0,
         });
-        for path in [(1, 2), (2, 1)] {
-            *quorum.paths[&path].election_vote.lock().unwrap() = Some(gate.clone());
-        }
+        quorum.observe_votes(Some(gate.clone()));
         quorum.isolate(old_leader);
         assert_eq!(Instant::now(), self.started);
         let elected_at = self.early.campaign(Duration::ZERO, Duration::ZERO, true);
@@ -161,7 +169,9 @@ impl SuccessfulElection {
                         self.early.tick,
                     )
                     .await;
-                    self.ticks.wait(index as u64 + 1, self.started + tick).await;
+                    self.ticks
+                        .wait(nodes[index].get(), self.started + tick)
+                        .await;
                 }
                 tick += self.early.tick;
             }
@@ -169,7 +179,7 @@ impl SuccessfulElection {
         let (new_leader, ()) = tokio::join!(quorum.leader_except(Some(old_leader)), driving);
         assert_eq!(new_leader, 1);
         assert_eq!(Instant::now() - self.started, elected_at);
-        for store in &quorum.stores[1..] {
+        for store in &stores[1..] {
             store
                 .wait_for_raft_status_for_test(|status| {
                     status.leader_id == Some(expected) && status.term == old.term + 1
@@ -188,9 +198,7 @@ impl SuccessfulElection {
         assert_eq!(replies[0].at, self.started + elected_at);
         assert!(replies[0].response.vote_granted);
         assert_eq!(replies[0].response.vote, arrivals[0].1.vote);
-        for path in [(1, 2), (2, 1)] {
-            *quorum.paths[&path].election_vote.lock().unwrap() = None;
-        }
+        quorum.observe_votes(None);
         for script in self.scripts {
             script.finish();
         }
