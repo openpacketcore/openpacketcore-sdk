@@ -265,6 +265,18 @@ impl ConfigVoterProfile {
         if metrics.running_state.is_err() {
             return false;
         }
+        // Joint membership makes the caught-up candidate an engine voter,
+        // but application readiness must wait for its local Finalize apply.
+        // Existing survivors continue serving while the owned coordinator
+        // completes the joint and uniform membership transition.
+        if state.table().replacement.as_ref().is_some_and(|operation| {
+            operation.successor.members.iter().any(|member| {
+                member.identity.node_id() == metrics.id
+                    && member.identity.slot() == operation.attestation.slot
+            })
+        }) {
+            return false;
+        }
         let membership = metrics.membership_config;
         let Some(cut) = *membership.log_id() else {
             return false;
