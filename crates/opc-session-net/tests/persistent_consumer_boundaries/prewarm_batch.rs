@@ -491,6 +491,77 @@ fn cancelled_prewarm_outside_runtime_releases_admission_and_expires_survivors() 
     });
 }
 
+#[test]
+fn cancelled_prewarm_after_runtime_shutdown_releases_admission() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("client runtime");
+    let fixture = runtime.block_on(async {
+        let origin = tokio::time::Instant::now();
+        tokio::time::resume();
+        let lifecycle = ConnectionLifecyclePolicy::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::ZERO,
+        )
+        .expect("bounded lifecycle with a deterministic retry interval");
+        let fixture = InterruptedBatch::new(lifecycle).await;
+        pause_client_clock_at_tick(origin).await;
+        fixture
+    });
+    let mut prewarm = Box::pin(fixture.client.prewarm());
+    runtime.block_on(async {
+        without_clock_advance(async {
+            tokio::select! {
+                biased;
+                result = &mut prewarm => panic!("second resolver must remain pending: {result:?}"),
+                _ = fixture.second_entered.notified() => {}
+            }
+        })
+        .await;
+        let staged = fixture.client.diagnostics().await;
+        assert_eq!(staged.setup_attempts, 2);
+        assert_eq!(staged.setup_successes, 1);
+        assert_eq!(staged.active, 1);
+        assert_eq!(staged.idle, 0);
+    });
+    drop(runtime);
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(prewarm)));
+    let replacement_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("replacement client runtime");
+    if cancelled.is_err() {
+        replacement_runtime.block_on(without_clock_advance(fixture.client.shutdown()));
+    }
+    assert!(
+        cancelled.is_ok(),
+        "cancellation after the originating runtime exits must not panic"
+    );
+    replacement_runtime.block_on(async {
+        fixture.assert_no_retained_capacity().await;
+        let recovered = without_clock_advance(fixture.client.prewarm())
+            .await
+            .expect("retired runtime leaves no prewarm or transport admission behind");
+        assert!(recovered.ready);
+        assert_eq!(recovered.ready_request_connections, 2);
+        assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 4);
+        let completed = fixture.client.diagnostics().await;
+        assert_eq!(completed.setup_successes, 3);
+        assert_eq!(completed.setup_failures, 1);
+        assert_eq!(completed.active, 2);
+        assert!(completed.max_active <= 2);
+        without_clock_advance(fixture.client.shutdown()).await;
+        fixture.assert_no_retained_capacity().await;
+    });
+}
+
 #[tokio::test(start_paused = true)]
 async fn expired_setup_bound_cannot_activate_a_partial_prewarm_batch() {
     let runtime_origin = tokio::time::Instant::now();

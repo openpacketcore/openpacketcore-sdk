@@ -13188,6 +13188,7 @@ struct PersistentPrewarmActivity {
 struct PersistentPrewarmBatch {
     pool: Arc<PersistentSessionConsumerPool>,
     connections: Vec<ConsumerConnection>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl PersistentPrewarmBatch {
@@ -13195,6 +13196,7 @@ impl PersistentPrewarmBatch {
         Self {
             connections: Vec::with_capacity(pool.config.request_connections),
             pool,
+            runtime: tokio::runtime::Handle::current(),
         }
     }
 
@@ -13273,6 +13275,10 @@ impl PersistentPrewarmBatch {
 
 impl Drop for PersistentPrewarmBatch {
     fn drop(&mut self) {
+        // The public prewarm future may be cancelled after its caller leaves
+        // the runtime, or while another runtime is entered. Keep the original
+        // clock and idle-reaper executor without requiring a current context.
+        let _runtime = self.runtime.enter();
         let published_at = tokio::time::Instant::now();
         for mut connection in self.connections.drain(..) {
             let mut byte = [0];

@@ -15,6 +15,78 @@ fn staged_connection(
     (connection, peer)
 }
 
+#[test]
+fn prewarm_batch_drop_reaps_on_its_origin_runtime_without_a_pruning_api() {
+    for enter_other_runtime in [false, true] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("origin runtime");
+        let (client, batch, _peer, deadline, _metrics_guard) = runtime.block_on(async {
+            let metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+                .lock()
+                .await;
+            let (stateless, _material) =
+                stateless_test_client(SessionReauthenticationControl::new());
+            let client = PersistentSessionConsumerClient::try_from_stateless(
+                stateless.with_idle_timeout(Duration::from_millis(10)),
+                PersistentSessionConsumerConfig {
+                    request_connections: 1,
+                    ..PersistentSessionConsumerConfig::default()
+                },
+            )
+            .expect("one physical lane");
+            let (mut connection, peer) = staged_connection(&client);
+            connection._persistent_physical_admission = Some(
+                Arc::clone(&client.pool.physical_lanes)
+                    .try_acquire_owned()
+                    .expect("staged lane owns physical admission"),
+            );
+            let mut batch = PersistentPrewarmBatch::new(Arc::clone(&client.pool));
+            batch.connections.push(connection);
+            tokio::time::advance(Duration::from_millis(25)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+            (client, batch, peer, deadline, metrics_guard)
+        });
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let other_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("unrelated runtime");
+        {
+            let _other = enter_other_runtime.then(|| other_runtime.enter());
+            drop(batch);
+            assert_eq!(
+                tokio::runtime::Handle::try_current().is_ok(),
+                enter_other_runtime,
+                "batch cleanup restores the caller's runtime context"
+            );
+        }
+        drop(other_runtime);
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        {
+            let idle = client.pool.idle.lock().expect("published idle lane");
+            assert_eq!(idle.len(), 1);
+            assert_eq!(idle[0].idle_deadline, deadline);
+            assert_eq!(client.pool.physical_lanes.available_permits(), 0);
+        }
+        runtime.block_on(async {
+            wait_for_idle_reaper_armed_deadline(&client, deadline, "outside-runtime cancellation")
+                .await;
+            tokio::time::advance(Duration::from_millis(9)).await;
+            wait_for_raw_idle_count(&client, 1).await;
+            assert_eq!(client.pool.physical_lanes.available_permits(), 0);
+            tokio::time::advance(Duration::from_millis(1)).await;
+            wait_for_raw_idle_count(&client, 0).await;
+            assert_eq!(client.pool.physical_lanes.available_permits(), 1);
+            client.shutdown().await;
+        });
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn prewarm_batch_publication_keeps_peer_and_used_lane_deadlines() {
     let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK

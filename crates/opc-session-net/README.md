@@ -723,7 +723,9 @@ partial failure. Newly authenticated unused replacements form one prewarm
 batch: their local idle intervals start together at publication, after the
 remaining lanes have been set up. Cancellation or failure publishes surviving
 replacements and releases admission; it does not discard healthy unprocessed
-siblings. Staging does not extend authentication, lifecycle, address-generation,
+siblings. A pending prewarm future may also be dropped outside its polling
+runtime's context, with the same survivor expiry and admission-release guarantees.
+Staging does not extend authentication, lifecycle, address-generation,
 shutdown or peer deadlines, and cannot revive an expired or closed lane. A lane
 that has carried a Call keeps its conservative between-call deadline. Exact-width
 readiness remains mandatory for activation. Prewarm and readiness establish
