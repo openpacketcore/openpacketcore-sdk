@@ -499,6 +499,27 @@ impl ConsensusConfigStore {
         snapshot_dir: impl Into<PathBuf>,
         resolver: Arc<dyn VoterPeerResolver>,
     ) -> Result<Self, ConfigConsensusOpenError> {
+        Self::open_with_voter_slots_and_operation_timeout(
+            initial,
+            local,
+            backend,
+            snapshot_dir,
+            resolver,
+            DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Open the fixed-slot incarnation profile with an explicit complete
+    /// operation timeout, including candidate admission after retained repair.
+    pub async fn open_with_voter_slots_and_operation_timeout(
+        initial: VoterSlotTable,
+        local: ConsensusNodeId,
+        backend: SqliteBackend,
+        snapshot_dir: impl Into<PathBuf>,
+        resolver: Arc<dyn VoterPeerResolver>,
+        operation_timeout: Duration,
+    ) -> Result<Self, ConfigConsensusOpenError> {
         let topology = ConfigConsensusTopology::for_voter_slots(&initial, local)
             .map_err(|_| ConfigConsensusOpenError::InvalidRuntimeConfiguration)?;
         let peers = initial
@@ -522,7 +543,7 @@ impl ConsensusConfigStore {
             snapshot_dir.into(),
             peers,
             Arc::new(SystemConfigConsensusClock),
-            DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+            operation_timeout,
             None,
             None,
             Some(ConfigVoterSetup { initial, resolver }),

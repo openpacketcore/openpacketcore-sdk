@@ -15,6 +15,9 @@ mod planned_shutdown;
 #[path = "consensus_openraft/member_repair.rs"]
 mod member_repair;
 
+#[path = "consensus_openraft/retained_incarnations.rs"]
+mod retained_incarnations;
+
 #[cfg(feature = "dangerous-test-hooks")]
 #[path = "consensus_openraft/voter_identity_replacement.rs"]
 mod voter_identity_replacement;
@@ -23,7 +26,7 @@ use quorum_admission::rolling_election;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -78,6 +81,7 @@ struct LoopbackPeer {
     target: ConfigConsensusNodeId,
     compatibility: Option<opc_consensus::ConsensusCompatibility>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>>,
+    installed_identity: Arc<AtomicU64>,
     enabled: Arc<AtomicBool>,
     drop_forward_responses: Arc<AtomicUsize>,
     stall_forward_mutation: Arc<AtomicBool>,
@@ -99,6 +103,7 @@ impl LoopbackPeer {
             target,
             compatibility: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
+            installed_identity: Arc::new(AtomicU64::new(target.get())),
             enabled: Arc::new(AtomicBool::new(true)),
             drop_forward_responses: Arc::new(AtomicUsize::new(0)),
             stall_forward_mutation: Arc::new(AtomicBool::new(false)),
@@ -117,6 +122,17 @@ impl LoopbackPeer {
 
     async fn install(&self, handler: Arc<dyn ConsensusRpcHandler>) {
         *self.handler.write().await = Some(handler);
+    }
+
+    async fn install_incarnation(
+        &self,
+        identity: ConfigConsensusNodeId,
+        handler: Arc<dyn ConsensusRpcHandler>,
+    ) {
+        let mut installed = self.handler.write().await;
+        self.installed_identity
+            .store(identity.get(), Ordering::SeqCst);
+        *installed = Some(handler);
     }
 
     fn set_enabled(&self, enabled: bool) {
@@ -180,6 +196,26 @@ impl ConsensusPeer for LoopbackPeer {
         required: Option<opc_consensus::ConsensusCompatibility>,
         _timeout: Duration,
     ) -> Result<opc_consensus::ConsensusCallResponse, ConsensusPeerError> {
+        self.call_bound(request, required, None).await
+    }
+
+    async fn call_with_incarnation(
+        &self,
+        request: ConsensusWireRequest,
+        binding: opc_consensus::voter_slots::VoterRpcBinding,
+        timeout: Duration,
+    ) -> Result<opc_consensus::voter_slots::VoterAuthenticatedResponse, ConsensusPeerError> {
+        retained_incarnations::call(self, request, binding, timeout).await
+    }
+}
+
+impl LoopbackPeer {
+    async fn call_bound(
+        &self,
+        request: ConsensusWireRequest,
+        required: Option<opc_consensus::ConsensusCompatibility>,
+        incarnation: Option<opc_consensus::voter_slots::VerifiedVoterRpc>,
+    ) -> Result<opc_consensus::ConsensusCallResponse, ConsensusPeerError> {
         if !self.enabled.load(Ordering::SeqCst) {
             return Err(ConsensusPeerError::Unavailable);
         }
@@ -198,12 +234,13 @@ impl ConsensusPeer for LoopbackPeer {
             std::future::pending::<()>().await;
             unreachable!("stalled consensus peer resumed");
         }
-        let handler = self
-            .handler
-            .read()
-            .await
-            .clone()
-            .ok_or(ConsensusPeerError::Unavailable)?;
+        let handler = {
+            let installed = self.handler.read().await;
+            if self.installed_identity.load(Ordering::SeqCst) != self.target.get() {
+                return Err(ConsensusPeerError::ScopeMismatch);
+            }
+            installed.clone().ok_or(ConsensusPeerError::Unavailable)?
+        };
         let sender = request.sender;
         let family = request.family;
         // The owned handler pins this exact endpoint across verification and
@@ -256,9 +293,14 @@ impl ConsensusPeer for LoopbackPeer {
             .unwrap()
             .1
         });
-        let response = handler
-            .handle_with_compatibility(sender, request, compatibility)
-            .await;
+        let response = match incarnation {
+            Some(proof) => handler.handle_with_incarnation(proof, request).await,
+            None => {
+                handler
+                    .handle_with_compatibility(sender, request, compatibility)
+                    .await
+            }
+        };
         if family == ConsensusRpcFamily::LeadershipTransfer {
             let decoded = response.result.as_ref().map(|payload| {
                 opc_consensus::decode_bounded::<(
@@ -428,8 +470,20 @@ impl ThreeNodeCluster {
             ConfigConsensusConfigurationId::from_bytes([0x99; 32]),
             epoch,
         );
+        let initial =
+            matches!(lifecycle, FixtureStorage::RetainedNew).then(retained_incarnations::genesis);
+        let identity = initial.as_ref().map_or(identity, |table| {
+            table
+                .current_configuration()
+                .identity(table.cluster_instance, table.manifest_digest)
+                .expect("incarnation configuration")
+        });
         let topologies = nodes.map(|node| {
-            ConfigConsensusTopology::try_new(identity, node, members.clone()).expect("topology")
+            match &initial {
+                Some(table) => ConfigConsensusTopology::for_voter_slots(table, node),
+                None => ConfigConsensusTopology::try_new(identity, node, members.clone()),
+            }
+            .expect("topology")
         });
         let mut paths = BTreeMap::new();
         for source in 0..3 {
@@ -457,9 +511,10 @@ impl ThreeNodeCluster {
                 .expect("repair backend")
             } else if matches!(lifecycle, FixtureStorage::RetainedNew) {
                 SqliteBackend::provision_config_authority(
-                    retained_options(
+                    retained_incarnations::options(
                         &directory.path().join(format!("node-{index}.sqlite")),
-                        topology.clone(),
+                        initial.clone().expect("incarnation profile"),
+                        nodes[index],
                         index as u8 + 1,
                     ),
                     AuditKey::new(audit_key_material[index]).expect("audit key"),
@@ -486,7 +541,24 @@ impl ThreeNodeCluster {
                 .collect();
             let snapshots = directory.path().join(format!("snapshots-{index}"));
             let open = async {
-                if let Some(policy) = policy {
+                if let Some(initial) = &initial {
+                    assert!(
+                        policy.is_none(),
+                        "retained incarnation fixture has no audit policy"
+                    );
+                    ConsensusConfigStore::open_with_voter_slots_and_operation_timeout(
+                        initial.clone(),
+                        nodes[index],
+                        backend,
+                        snapshots,
+                        Arc::new(retained_incarnations::Resolver {
+                            source: index,
+                            paths: paths.clone(),
+                        }),
+                        Duration::from_secs(3),
+                    )
+                    .await
+                } else if let Some(policy) = policy {
                     ConsensusConfigStore::open_with_audit_continuity(
                         topology,
                         backend,
@@ -1638,52 +1710,39 @@ async fn history_retention_survives_natural_leader_change_and_member_snapshot_in
         .append_attested_commit(attested(commit(ids[4], Some(ids[3]), 5, 0x62), vec![]))
         .await
         .expect("next canonical revision");
-    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).expect("node"));
-    let identity = ConfigConsensusIdentity::new(
-        ConfigConsensusClusterId::new("opc-persist-three-node-tests").expect("cluster"),
-        ConfigConsensusConfigurationId::from_bytes([0x99; 32]),
-        ConfigConsensusConfigurationEpoch::new(1).expect("epoch"),
-    );
-    let topology = ConfigConsensusTopology::try_new(
-        identity,
-        nodes[original_leader],
-        nodes.into_iter().collect(),
-    )
-    .expect("repair topology");
     let repair_path = cluster._directory.path().join("retention-repaired.sqlite");
-    let backend = SqliteBackend::provision_config_member_repair(
-        retained_options(&repair_path, topology.clone(), 9),
-        audit_key(),
-    )
-    .await
-    .expect("explicit member repair");
-    let peers = (0..3)
-        .filter(|index| *index != original_leader)
-        .map(|index| {
-            let peer: Arc<dyn ConsensusPeer> = cluster.paths[&(original_leader, index)].clone();
-            (nodes[index], peer)
-        })
-        .collect();
-    let repair = ConsensusConfigStore::open_with_operation_timeout(
-        topology,
-        backend,
-        cluster._directory.path().join("retention-repair-snapshots"),
-        peers,
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("repair store");
-    for ((_, target), path) in &cluster.paths {
-        if *target == original_leader {
-            path.install(repair.rpc_handler()).await;
-        }
-    }
-    cluster.stores[original_leader] = repair;
-    cluster.heal(original_leader);
-    cluster.stores[original_leader]
-        .initialize_cluster()
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let prepared = retained_incarnations::prepare(&cluster, original_leader).await;
+        let local = retained_incarnations::member(original_leader as u16 + 1, 2)
+            .identity
+            .node_id();
+        let backend = SqliteBackend::provision_config_member_repair(
+            retained_incarnations::options(&repair_path, prepared.clone(), local, 9),
+            audit_key(),
+        )
         .await
-        .expect("snapshot-backed member recovery");
+        .expect("explicit member repair");
+        let repair = ConsensusConfigStore::open_with_voter_slots_and_operation_timeout(
+            prepared,
+            local,
+            backend,
+            cluster._directory.path().join("retention-repair-snapshots"),
+            Arc::new(retained_incarnations::Resolver {
+                source: original_leader,
+                paths: cluster.paths.clone(),
+            }),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("repair store");
+        retained_incarnations::install(&mut cluster, original_leader, repair).await;
+        cluster.stores[original_leader]
+            .initialize_cluster()
+            .await
+            .expect("snapshot-backed member recovery");
+    })
+    .await
+    .expect("new-identity repair preserves the thirty-second bound");
     cluster.wait_ready().await;
     let observer =
         rusqlite::Connection::open(&repair_path).expect("installed snapshot observation");
@@ -3378,54 +3437,41 @@ async fn retained_member_repair_recovers_from_surviving_quorum() {
             *peer.handler.write().await = None;
         }
     }
-    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).expect("node"));
-    let identity = ConfigConsensusIdentity::new(
-        ConfigConsensusClusterId::new("opc-persist-three-node-tests").expect("cluster"),
-        ConfigConsensusConfigurationId::from_bytes([0x99; 32]),
-        ConfigConsensusConfigurationEpoch::new(1).expect("epoch"),
-    );
-    let topology =
-        ConfigConsensusTopology::try_new(identity, nodes[0], nodes.into_iter().collect())
-            .expect("topology");
     let path = cluster._directory.path().join("replacement.sqlite");
-    assert!(SqliteBackend::reopen_config_authority(
-        retained_options(&path, topology.clone(), 9),
-        audit_key()
-    )
-    .await
-    .is_err());
-    assert!(!path.exists());
-    let backend = SqliteBackend::provision_config_member_repair(
-        retained_options(&path, topology.clone(), 9),
-        audit_key(),
-    )
-    .await
-    .expect("explicit repair");
-    let peers = (1..3)
-        .map(|target| {
-            let peer: Arc<dyn ConsensusPeer> = cluster.paths[&(0, target)].clone();
-            (nodes[target], peer)
-        })
-        .collect();
-    let replacement = ConsensusConfigStore::open_with_operation_timeout(
-        topology,
-        backend,
-        cluster._directory.path().join("replacement-snapshots"),
-        peers,
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("replacement store");
-    for ((_, target), peer) in &cluster.paths {
-        if *target == 0 {
-            peer.install(replacement.rpc_handler()).await;
-        }
-    }
-    cluster.stores[0] = replacement;
-    cluster.stores[0]
-        .initialize_cluster()
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let prepared = retained_incarnations::prepare(&cluster, 0).await;
+        let local = retained_incarnations::member(1, 2).identity.node_id();
+        let options = retained_incarnations::options(&path, prepared.clone(), local, 9);
+        assert!(
+            SqliteBackend::reopen_config_authority(options.clone(), audit_key())
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+        let backend = SqliteBackend::provision_config_member_repair(options, audit_key())
+            .await
+            .expect("explicit repair");
+        let replacement = ConsensusConfigStore::open_with_voter_slots_and_operation_timeout(
+            prepared,
+            local,
+            backend,
+            cluster._directory.path().join("replacement-snapshots"),
+            Arc::new(retained_incarnations::Resolver {
+                source: 0,
+                paths: cluster.paths.clone(),
+            }),
+            Duration::from_secs(30),
+        )
         .await
-        .expect("recover exact membership");
+        .expect("replacement store");
+        retained_incarnations::install(&mut cluster, 0, replacement).await;
+        cluster.stores[0]
+            .initialize_cluster()
+            .await
+            .expect("recover exact membership under the new incarnation");
+    })
+    .await
+    .expect("new-identity repair preserves the thirty-second bound");
     cluster.wait_ready().await;
     assert_eq!(
         cluster.stores[0]
