@@ -365,6 +365,7 @@ impl LoopbackPeer {
 enum FixtureStorage {
     Legacy,
     RetainedNew,
+    RetainedIncarnations,
     RetainedRepair,
 }
 
@@ -470,8 +471,8 @@ impl ThreeNodeCluster {
             ConfigConsensusConfigurationId::from_bytes([0x99; 32]),
             epoch,
         );
-        let initial =
-            matches!(lifecycle, FixtureStorage::RetainedNew).then(retained_incarnations::genesis);
+        let initial = matches!(lifecycle, FixtureStorage::RetainedIncarnations)
+            .then(retained_incarnations::genesis);
         let identity = initial.as_ref().map_or(identity, |table| {
             table
                 .current_configuration()
@@ -509,12 +510,23 @@ impl ThreeNodeCluster {
                 )
                 .await
                 .expect("repair backend")
-            } else if matches!(lifecycle, FixtureStorage::RetainedNew) {
+            } else if let Some(initial) = &initial {
                 SqliteBackend::provision_config_authority(
                     retained_incarnations::options(
                         &directory.path().join(format!("node-{index}.sqlite")),
-                        initial.clone().expect("incarnation profile"),
+                        initial.clone(),
                         nodes[index],
+                        index as u8 + 1,
+                    ),
+                    AuditKey::new(audit_key_material[index]).expect("audit key"),
+                )
+                .await
+                .expect("retained backend")
+            } else if matches!(lifecycle, FixtureStorage::RetainedNew) {
+                SqliteBackend::provision_config_authority(
+                    retained_options(
+                        &directory.path().join(format!("node-{index}.sqlite")),
+                        topology.clone(),
                         index as u8 + 1,
                     ),
                     AuditKey::new(audit_key_material[index]).expect("audit key"),
@@ -1569,7 +1581,7 @@ async fn history_retention_survives_natural_leader_change_and_member_snapshot_in
     let mut schedule = retention_election::RetentionElection::new(runtime_origin).await;
     let mut cluster = ThreeNodeCluster::build_with_election_offset(
         [[0x55; 32]; 3],
-        FixtureStorage::RetainedNew,
+        FixtureStorage::RetainedIncarnations,
         None,
         Some(&schedule.scripts),
         schedule.offset,
@@ -3408,7 +3420,8 @@ async fn retained_consensus_snapshot_and_reopen_preserve_committed_history() {
 #[tokio::test]
 async fn retained_member_repair_recovers_from_surviving_quorum() {
     let mut cluster =
-        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew).await;
+        ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedIncarnations)
+            .await;
     let (a, b, c) = tokio::join!(
         cluster.stores[0].initialize_cluster(),
         cluster.stores[1].initialize_cluster(),
