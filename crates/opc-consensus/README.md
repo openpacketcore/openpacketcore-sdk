@@ -146,11 +146,17 @@ signal; these helpers are scheduling and gating, not a parallel authority.
 
 ## Deterministic election fixtures
 
-Election regression tests control raw RNG samples and vote delivery while the
-unchanged engine performs each automatic campaign. Their protocol bounds include
-the committed-vote lease, sampled timeout, and heartbeat-derived tick rounding.
+Election regression tests control raw RNG samples and delivery of actual
+Pre-Vote and Vote RPCs while the production engine performs automatic campaigns.
+Their protocol bounds include the committed-vote lease, sampled timeout, and
+election evaluation at intervals of at most 100 ms.
 The one-split schedule verifies both survivors retain `[41, 42]`; it is not a
 fixed failover guarantee for randomized elections, which can split repeatedly.
+Separate three- and five-voter regressions stop the leader during sustained
+pipelined writes, with outstanding writes and divergent survivor logs at the
+fault. They require fresh quorum authority, a new write and survivor
+reconciliation within 26 seconds, preserving acknowledged writes. These paused
+engine regressions do not qualify process scheduling or disk latency.
 The `dangerous-test-hooks` feature exposes a scoped Tokio runtime adapter for
 these fixtures. Outside a script it uses Tokio's ordinary RNG, and production
 dependencies do not enable this feature. It uses the engine's existing rand 0.8
