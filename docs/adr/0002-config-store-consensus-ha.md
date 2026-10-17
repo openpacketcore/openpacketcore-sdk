@@ -18,6 +18,8 @@ Amended 2026-09-13 for explicit retained-authority provisioning, reopening and
 member repair (SDK #800), and separate non-voting consumer checkpoint/apply
 recovery (SDK #799).
 
+Amended 2026-10-17 for bounded planned leadership handoff (SDK #1315).
+
 ## Context
 
 Single-node SQLite persistence cannot support a carrier-HA configuration
@@ -191,6 +193,26 @@ procedure. Real-mTLS tests prove that a subsequent new call/full handshake
 observes a renewed SVID and rejects a wrong rotated identity; they do not prove
 retained-connection retirement or seamless continuity merely because the
 config adapter uses the shared port.
+
+### Planned shutdown
+
+Ordinary store shutdown closes application admission and uses Openraft's
+engine-issued retirement request to transfer a leader's complete accepted
+prefix to a current voter. The adapter authenticates that control request,
+releases the retiring vote's leases on enough surviving voters, and requires
+the successor to apply the prefix before campaigning. Success requires a
+fresh successor vote and an engine quorum read proof in the unchanged scope.
+This composes the engine's authority without creating another election path.
+
+Keep authenticated replication available until shutdown completes. Automatic
+preparation has one deadline, at most five seconds and half the configured
+operation budget. Failure still proceeds to ordinary engine shutdown and
+retains a typed fallback reason. Caller cancellation cannot cancel that owned
+drain, reopen admission, or start a second handoff. Accepted writes retain
+their original completion and same-request-ID recovery semantics. Reopen and
+config-bus projection reconciliation remain separate admission requirements.
+Abrupt loss continues to use ordinary elections; stored formats and election
+timers are unchanged.
 
 ### Legacy admission and rollback
 

@@ -685,8 +685,17 @@ recovery succeed. `Active` permits consensus participation, not traffic by
 itself; ordinary admission can still return `ClusterFormationRejected`.
 
 For a planned voter restart, first stop external consumers, then call
-`ConsensusSessionStore::prepare_shutdown()` while the authenticated replication
-listener remains available. The store closes local consumer admission and
+`ConsensusSessionStore::shutdown()` while the authenticated replication
+listener remains available. Shutdown automatically prepares retirement before
+draining the engine and storage. `shutdown_with_report()` returns the retained
+`PlannedShutdownOutcome`, including a typed reason if preparation failed and
+ordinary shutdown proceeded. Automatic preparation gets at most five seconds
+and half the configured complete-operation budget, reserving time for drain.
+A caller timeout leaves the same owned drain running; a later clone must
+observe completion before storage is reopened.
+
+Call `prepare_shutdown()` explicitly when a separate preparation phase is
+needed before removing the listener. The store closes local consumer admission and
 atomically asks the engine to retire from campaigning. A retiring leader hands
 off its exact accepted prefix to a current voter; a follower or candidate must
 observe a different current leader. Success requires a fresh engine quorum
@@ -711,8 +720,8 @@ checks its own certificate before activation succeeds, including when Raft
 metrics publication lags application. Concurrent activation requires no
 operator intervention and retains the existing operation deadline.
 
-After preparation completes and the RPC handler is removed,
-`shutdown()` joins the active consensus engine and every storage owner, drains
+After automatic or explicit preparation, `shutdown()` joins the active consensus
+engine and every storage owner, drains
 the final generation, then publishes a one-use proof while retaining the root
 lock. Reopen validates the exact root, generation, full vote/log/application
 cut, membership and any required snapshot, then durably consumes the proof
@@ -720,6 +729,10 @@ before starting consensus. This supports orderly sequential, majority and
 all-voter restart without adding a disk wait to ordinary acknowledgements.
 The proof permits consensus participation; it grants no lease or traffic
 authority. Initialization and each operation still require fresh quorum checks.
+The consumer's emergency hold still governs whether a voluntary stop is
+permitted; handoff does not terminate sessions or release their fences. No
+operator action or node cleanup is required for the restart. Abrupt loss keeps
+ordinary elections and the existing cold-recovery rules.
 
 Native roots use `OPCNR002` (Durable) and `OPCNA004` (Async). Earlier native
 roots are refused with `ConsensusSessionStoreOpenError::FreshInstallationRequired`;

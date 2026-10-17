@@ -79,6 +79,15 @@ membership drift, or local apply lag fails closed. The numeric ID is only a
 routing hint. Products that need a network endpoint must resolve it through
 their fixed, authenticated roster rather than treating it as an address.
 
+For a planned restart, close external config-write admission and call the
+underlying `ConsensusConfigStore::shutdown()` while its authenticated consensus
+listener remains available. The store performs a bounded leadership handoff;
+`shutdown_with_report()` exposes a typed fallback if it cannot confirm a
+successor. Remove the listener after the engine drain completes. A promoted
+worker must still call `reconcile_and_open()` on its live projection before
+writing; handoff does not bypass the projection-head authority check. Abrupt
+loss retains the engine's ordinary election behavior.
+
 The authority check also compares the config bus's payload-free
 `{tx_id, version}` projection head with the canonical local state-machine head
 while all fixed proposal-admission slots are drained under the existing

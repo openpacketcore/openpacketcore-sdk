@@ -335,6 +335,18 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   following unsafe file types; drop guards clean canceled staging work.
 - `probe_durable_readiness` uses Openraft's linearizable path; listener bind or
   a local SQLite read is not readiness evidence.
+- Planned `ConsensusConfigStore::shutdown()` closes application admission and
+  hands leadership to a current voter before joining the engine. Stop external
+  consumers first and keep authenticated replication available until shutdown
+  completes. The successor must apply every accepted entry and supply a fresh
+  engine quorum read proof. No command is resubmitted by the handoff.
+  `shutdown_with_report()` retains `PlannedShutdownOutcome` for all clones,
+  including a typed fallback reason when handoff fails. Automatic preparation
+  gets at most five seconds and half the configured operation budget; failure
+  proceeds to ordinary shutdown. A caller timeout does not cancel the owned
+  drain: observe its completion from a later clone before reopening storage.
+  Restart each voter normally and preserve a surviving quorum. Abrupt loss
+  still uses ordinary elections, and no storage format or timer changes.
 - `ensure_local_authority` is deliberately distinct from routed durable reads:
   only the current local leader can pass it. Unknown leadership, quorum loss,
   membership drift, or apply timeout is an unavailable result, never
