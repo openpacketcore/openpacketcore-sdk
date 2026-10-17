@@ -319,7 +319,7 @@ async fn split_vote_reproduces_authority_timeout() {
     assert_eq!(initial.applied_index, Some(1));
     assert_eq!(initial.committed_index, Some(1));
     // Real replicated commands establish the historical index shape. Unknown
-    // transaction confirmations have a durable NotFound outcome and add one
+    // transaction recovery-marker clears have a durable NotFound outcome and add one
     // log entry each; these synthetic payloads do not claim to reconstruct the
     // historical audit contents or random seed.
     for index in 2..=13_u8 {
@@ -329,16 +329,19 @@ async fn split_vote_reproduces_authority_timeout() {
                 .store(true, Ordering::Release);
         }
         let error = quorum.stores[old_leader]
-            .mark_confirmed_idempotent(
+            .clear_recovery_required_idempotent(
                 opc_consensus::ConsensusRequestId::from_bytes([index; 16]),
                 opc_types::TxId::new(),
             )
             .await
             .expect_err("absent transaction has a replicated NotFound outcome");
-        assert!(matches!(
-            error.kind(),
-            opc_persist::PersistErrorKind::RollbackNotFound
-        ));
+        assert!(
+            matches!(
+                error.kind(),
+                opc_persist::PersistErrorKind::RollbackNotFound
+            ),
+            "expected durable NotFound at log index {index}, got {error:?}"
+        );
         for (node, store) in quorum.stores.iter().enumerate() {
             let expected = if node == 1 && index == 13 {
                 12
