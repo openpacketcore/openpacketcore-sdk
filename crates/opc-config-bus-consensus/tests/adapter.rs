@@ -5,9 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[path = "adapter/election.rs"]
-mod election;
-
 use opc_config_bus::{
     CommitWrite, CommittedRevisionSource, ConfigBus, ConfigSnapshot, EncryptingManagedDatastore,
     ManagedDatastore, SealedConfig, StoreErrorCode, StoredConfig,
@@ -22,8 +19,8 @@ use opc_config_model::{
     WorkloadIdentity, YangPath,
 };
 use opc_consensus::{
-    ConsensusPeer, ConsensusPeerError, ConsensusRpcHandler, ConsensusWireRequest,
-    ConsensusWireResponse, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler,
+    ConsensusWireRequest, ConsensusWireResponse, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_persist::{
@@ -34,7 +31,6 @@ use opc_persist::{
 };
 use opc_types::{ConfigVersion, SchemaDigest, TenantId, Timestamp, TxId};
 use serde::{Deserialize, Serialize};
-use tracing::Instrument;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct TestConfig {
@@ -135,11 +131,13 @@ fn provider() -> Arc<MemoryKeyProvider> {
     provider
 }
 
-#[derive(Clone)]
 struct LoopbackPeer {
     target: ConfigConsensusNodeId,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
+    admitted: tokio::sync::RwLock<()>,
+    hold_log_entries: AtomicBool,
+    election_vote: std::sync::Mutex<Option<Arc<election::VoteGate>>>,
 }
 
 impl LoopbackPeer {
@@ -148,6 +146,9 @@ impl LoopbackPeer {
             target,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
+            admitted: tokio::sync::RwLock::new(()),
+            hold_log_entries: AtomicBool::new(false),
+            election_vote: std::sync::Mutex::new(None),
         }
     }
 
@@ -179,6 +180,7 @@ impl ConsensusPeer for LoopbackPeer {
         &self,
         request: ConsensusWireRequest,
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        let _admitted = self.admitted.read().await;
         if !self.enabled.load(Ordering::Acquire) {
             return Err(ConsensusPeerError::Unavailable);
         }
@@ -188,7 +190,26 @@ impl ConsensusPeer for LoopbackPeer {
             .await
             .clone()
             .ok_or(ConsensusPeerError::Unavailable)?;
-        Ok(handler.handle(request.sender, request).await)
+        if self.hold_log_entries.load(Ordering::Acquire)
+            && request.family == ConsensusRpcFamily::AppendEntries
+            && !ConsensusConfigStore::is_empty_append_entries_for_test(&request)
+        {
+            return Err(ConsensusPeerError::Unavailable);
+        }
+        let gate = if request.family == ConsensusRpcFamily::Vote {
+            self.election_vote.lock().unwrap().clone()
+        } else {
+            None
+        };
+        if let Some(gate) = &gate {
+            gate.before_delivery(&request).await;
+        }
+        let source = request.sender;
+        let response = handler.handle(source, request).await;
+        if let Some(gate) = gate {
+            gate.after_delivery(source, self.target, &response);
+        }
+        Ok(response)
     }
 }
 
@@ -206,12 +227,20 @@ impl ProjectionCluster {
     async fn start_with_continuity(
         checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
     ) -> Self {
-        Self::start_with_election_scripts(checkpoints, None).await
+        Self::start_controlled(checkpoints, None, true).await
     }
 
     async fn start_with_election_scripts(
         checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
         scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
+    ) -> Self {
+        Self::start_controlled(checkpoints, scripts, true).await
+    }
+
+    async fn start_controlled(
+        checkpoints: Option<Arc<dyn opc_persist::audit_authority::continuity::AuditCheckpointPort>>,
+        scripts: Option<&[opc_consensus::test_runtime::ElectionRngScript; 3]>,
+        automatic: bool,
     ) -> Self {
         let directory = tempfile::tempdir().expect("projection cluster directory");
         let nodes = [1_u64, 2, 3]
@@ -254,7 +283,7 @@ impl ProjectionCluster {
             let topology = ConfigConsensusTopology::try_new(identity, node, members.clone())
                 .expect("projection cluster topology");
             let snapshots = directory.path().join(format!("snapshots-{index}"));
-            let open = async {
+            let opening = async {
                 if let Some(checkpoints) = &checkpoints {
                     use opc_persist::audit_authority::continuity::{
                         AuditContinuityPolicy, AuditKeyRing, AuditSigningKey,
@@ -282,13 +311,21 @@ impl ProjectionCluster {
                     )
                     .await
                 }
-            }
-            .instrument(election::delivery::node_span(node.get()));
-            let store = match scripts {
-                Some(scripts) => scripts[index].scope(open).await,
-                None => open.await,
             };
-            stores.push(Arc::new(store.expect("projection cluster store")));
+            let opening = tracing::Instrument::instrument(
+                opening,
+                election::delivery::node_span(node.get()),
+            );
+            let store = if let Some(scripts) = scripts {
+                scripts[index].scope(opening).await
+            } else {
+                opening.await
+            }
+            .expect("projection cluster store");
+            if !automatic {
+                store.disable_automatic_elections_for_test();
+            }
+            stores.push(Arc::new(store));
         }
         for ((_, target), path) in &paths {
             path.install(stores[*target].rpc_handler()).await;
@@ -325,6 +362,56 @@ impl ProjectionCluster {
             cluster.wait_ready().await;
         }
         cluster
+    }
+
+    async fn wait_promoted(&self, original_leader: usize) -> usize {
+        let original_leader_id = self.stores[original_leader].status().node_id;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let promoted = self
+                    .stores
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != original_leader)
+                    .find(|(_, store)| {
+                        store
+                            .status()
+                            .leader_id
+                            .is_some_and(|leader| leader != original_leader_id)
+                            && store.status().leader_id == Some(store.status().node_id)
+                    })
+                    .map(|(index, _)| index);
+                if let Some(promoted) = promoted {
+                    return promoted;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "surviving quorum failed to elect a new leader: {:?}",
+                self.stores
+                    .iter()
+                    .map(|store| store.status())
+                    .collect::<Vec<_>>()
+            )
+        })
+    }
+
+    async fn isolate_and_quiesce(&self, node: usize) {
+        self.isolate(node);
+        for ((source, target), path) in &self.paths {
+            if *source == node || *target == node {
+                let _quiesced = path.admitted.write().await;
+            }
+        }
+    }
+
+    fn observe_votes(&self, gate: Option<Arc<election::VoteGate>>) {
+        for path in self.paths.values() {
+            *path.election_vote.lock().unwrap() = gate.clone();
+        }
     }
 
     async fn wait_ready(&self) {
