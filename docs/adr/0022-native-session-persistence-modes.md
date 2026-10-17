@@ -684,9 +684,18 @@ cold-rejoin barrier receives its exemption only after authentication through
 the private cold-cut path; ordinary AdvanceLogicalTime is still gated.
 
 The engine owns snapshot selection, transfer and purge. SDK snapshot construction
-has a 60-second prepublication attempt deadline, cancellation fencing immediately
-before publication, and an automatic retry after one second. An expired native
-export observes cancellation cooperatively. Blocking I/O retains the actual
+starts its budget only after acquiring the physical worker gate. Actual native
+export units and hash chunks renew a 60-second stall grace; there is no total
+build-time limit. Opaque whole-image work receives additional time from its size:
+one second per MiB of the actual pinned image and per 1,000 captured native rows.
+Native export includes its compatibility basis, growing output, and immutable
+capture cardinalities; SQLite capture uses its reader's page extent including
+WAL-resident pages. Finalization, sync, sealing and current/predecessor verification
+use the actual descriptor length. Completing a sized phase restores ordinary
+stall grace before waiting to publish. These conservative allowances are progress
+budgets, not measured throughput guarantees or a cap on cumulative business state.
+Expired attempts retry after one second. Cancellation is fenced immediately
+before publication, and an expired native export observes it cooperatively. Blocking I/O retains the actual
 worker gate, descriptors, namespace and shutdown owner until it really exits;
 expiry cannot start a second worker or publish a stale attempt. Once metadata
 publication commits, its owner finishes delivering that exact cut to Raft rather
@@ -697,8 +706,10 @@ treated as attempt expiry.
 
 An active leader that remains full for five seconds without snapshot or purge
 progress starts an authenticated live leadership transfer. Each transfer attempt
-is bounded and failed attempts retain the same target and transfer request. The
-source continues replication, voting and snapshot recovery; it does not retire
+is bounded. Only an engine-accepted handoff retains its target and transfer
+request; a failed begin is retried only while pressure still requires it. Live
+handoff fences lease reuse for the current term, allowing a fresh proof after
+re-election. The source continues replication, voting and snapshot recovery; it does not retire
 the store or stop emergency sessions. This also bounds leadership held by an
 uncancellable snapshot worker. Heartbeats and new appends cannot reset the
 no-progress timer. No restart or operator action is needed.

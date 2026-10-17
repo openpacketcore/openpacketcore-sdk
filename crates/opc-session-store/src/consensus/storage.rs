@@ -2607,8 +2607,25 @@ enum SnapshotIntegrityGate {
 struct SnapshotIntegrityWork {
     _gate: SnapshotIntegrityGate,
     _lease: Arc<SnapshotDirectoryLease>,
+    attempt: Option<Arc<SnapshotBuildAttempt>>,
     // Last: a cancelled worker must retire its descriptor and gate first.
     _shutdown: Option<Arc<ConsensusStorageShutdownGuard>>,
+}
+
+impl SnapshotIntegrityWork {
+    fn sized_phase(&self, bytes: u64) -> io::Result<()> {
+        if let Some(attempt) = &self.attempt {
+            attempt.sized_phase(bytes, 0)?;
+        }
+        Ok(())
+    }
+
+    fn progress(&self) -> io::Result<()> {
+        if let Some(attempt) = &self.attempt {
+            attempt.progress()?;
+        }
+        Ok(())
+    }
 }
 
 async fn seal_snapshot_pin(
@@ -2617,11 +2634,17 @@ async fn seal_snapshot_pin(
     expected_payload_checksum: Option<[u8; 32]>,
     retention: Option<SnapshotIntegrityWork>,
 ) -> io::Result<PinnedSqliteFile> {
+    if let Some(work) = &retention {
+        work.sized_phase(pinned.file().metadata()?.len())?;
+    }
     let (result, _retention) = tokio::task::spawn_blocking(move || {
         let result = (|| {
             pinned.seal_with_integrity(policy)?;
             if let Some(checksum) = expected_payload_checksum {
                 pinned.verify_and_bind_payload_checksum(checksum)?;
+            }
+            if let Some(work) = &retention {
+                work.progress()?;
             }
             Ok(pinned)
         })();
@@ -2677,6 +2700,9 @@ async fn verify_admitted_snapshot(
     length: u64,
     retention: Option<SnapshotIntegrityWork>,
 ) -> io::Result<PinnedSqliteFile> {
+    if let Some(work) = &retention {
+        work.sized_phase(file.metadata()?.len())?;
+    }
     let (result, _retention) = tokio::task::spawn_blocking(move || {
         let result = (|| {
             let path = lease.namespace.sqlite_child_path(&name)?;
@@ -2695,6 +2721,9 @@ async fn verify_admitted_snapshot(
                 length,
             )?;
             pinned.verify_bound_immutable_snapshot_envelope(&path, verified.total_length)?;
+            if let Some(work) = &retention {
+                work.progress()?;
+            }
             Ok(pinned)
         })();
         (result, retention)
@@ -4517,6 +4546,14 @@ async fn validate_and_clean_snapshot_directory_with_retention(
                         .and_then(std::fs::File::try_clone),
                 }
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+                if let Some(work) = &retention {
+                    work.sized_phase(
+                        file.metadata()
+                            .map_err(|_| SessionConsensusStorageError::CorruptState)?
+                            .len(),
+                    )
+                    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+                }
                 let mut snapshot = SessionSnapshotFile::from_std(file, path.clone())
                     .await
                     .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -5925,6 +5962,7 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                             _guard: Arc::clone(&serving_guard),
                         },
                         _lease: Arc::clone(&self._snapshot_directory_lease),
+                        attempt: None,
                         _shutdown: Some(Arc::new(self.shutdown_guard.child())),
                     }),
                 )
@@ -6055,6 +6093,7 @@ impl SqliteConsensusStateMachine {
                 _guard: snapshot_gate.clone(),
             },
             _lease: Arc::clone(&self._snapshot_directory_lease),
+            attempt: None,
             _shutdown: Some(Arc::new(self.shutdown_guard.child())),
         };
         reject_indeterminate_snapshot_publication(&self.core).map_err(|error| {
@@ -6931,11 +6970,15 @@ async fn build_file_backed_snapshot_database(
                     // the eventual sealed inode. Reclaim the empty raw reservation
                     // before allocating pages; there is no full-size compaction copy.
                     drop(raw_snapshot);
-                    let Some((export, captured_cut)) =
-                        wal.native_export_portable_snapshot_into(&vacuum_snapshot, &|| {
-                            worker_shutdown_guard.snapshot_shutdown_requested()
-                                || attempt.cancelled()
-                        })?
+                    let Some((export, captured_cut)) = wal
+                        .native_export_portable_snapshot_with_progress_into(
+                            &vacuum_snapshot,
+                            &|| {
+                                worker_shutdown_guard.snapshot_shutdown_requested()
+                                    || attempt.cancelled()
+                            },
+                            &|bytes, rows| attempt.sized_phase(bytes, rows).is_ok(),
+                        )?
                     else {
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
@@ -6948,6 +6991,7 @@ async fn build_file_backed_snapshot_database(
                             "native snapshot export stopped after Raft shutdown",
                         ));
                     }
+                    attempt.sized_phase(vacuum_snapshot.file().metadata()?.len(), 0)?;
                     consensus::finalize_native_snapshot_database_sync(
                         export,
                         vacuum_snapshot,
@@ -7083,17 +7127,22 @@ async fn build_file_backed_snapshot_database(
             capture_observation.record_phase_for_test("worker_capturing");
             #[cfg(test)]
             snapshot_capture_gate.block_after_capture();
-            let captured = consensus::capture_snapshot_database_from_reader_into_sync(
-                &worker.reader,
-                storage_identity,
-                authority_profile,
-                &expected_members,
-                &expected_bindings,
-                fixed_placement_policy,
-                &source_cut,
-                raw_snapshot,
-                &snapshot_foreground_pacer,
-            );
+            let captured = (|| {
+                let (pages, page_size) =
+                    consensus::snapshot_database_extent_sync(&worker.reader.connection)?;
+                attempt.sized_phase(pages as u64 * page_size, 0)?;
+                consensus::capture_snapshot_database_from_reader_into_sync(
+                    &worker.reader,
+                    storage_identity,
+                    authority_profile,
+                    &expected_members,
+                    &expected_bindings,
+                    fixed_placement_policy,
+                    &source_cut,
+                    raw_snapshot,
+                    &snapshot_foreground_pacer,
+                )
+            })();
             // The source transaction is retained only through `Backup`; all
             // cleanup, VACUUM, validation, hashing, and sealing follow release.
             let released = consensus::release_snapshot_read_sync(&worker.reader);
@@ -7102,6 +7151,7 @@ async fn build_file_backed_snapshot_database(
                     #[cfg(feature = "test-control")]
                     capture_observation.record_phase_for_test("worker_finalizing");
                     let (captured_cut, raw_snapshot, wal_bytes) = captured;
+                    attempt.sized_phase(raw_snapshot.file().metadata()?.len(), 0)?;
                     let raw_snapshot = consensus::finalize_captured_snapshot_database_into_sync(
                         storage_identity,
                         authority_profile,
@@ -7193,7 +7243,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         io::Error::new(io::ErrorKind::Interrupted, "snapshot build stopped after Raft shutdown"),
                     ));
                 },
-                () = tokio::time::sleep_until(attempt.deadline()) => {
+                () = attempt.stalled() => {
                     if attempt.published() {
                         // Publication crossed the irreversible boundary. Keep
                         // its completion owner until Raft receives this exact
@@ -7203,7 +7253,6 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
                         // bounded pressure leadership transfer.
                         return build.await;
                     }
-                    attempt.expire();
                 },
                 }
             }
@@ -7236,6 +7285,9 @@ impl SqliteConsensusSnapshotBuilder {
             &self._snapshot_directory_lease,
         );
         let snapshot_guard = live_terminal_consumer.acquire_worker_gate().await;
+        attempt.start().map_err(|error| {
+            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+        })?;
         let shutdown_owner = Arc::new(self._shutdown_guard.child());
         #[cfg(test)]
         if let Some(completion) = self._shutdown_guard.0.as_ref() {
@@ -7250,6 +7302,7 @@ impl SqliteConsensusSnapshotBuilder {
                 _guard: snapshot_guard.clone(),
             },
             _lease: Arc::clone(&self._snapshot_directory_lease),
+            attempt: Some(Arc::clone(&attempt)),
             _shutdown: Some(shutdown_owner),
         };
         reject_indeterminate_snapshot_publication(&self.core).map_err(|error| {
@@ -7417,6 +7470,15 @@ impl SqliteConsensusSnapshotBuilder {
             })?;
             let (membership, raw_snapshot) = {
                 let conn = self.core.conn.lock().await;
+                let (pages, page_size) =
+                    consensus::snapshot_database_extent_sync(&conn).map_err(|error| {
+                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error)
+                    })?;
+                attempt
+                    .sized_phase(pages as u64 * page_size, 0)
+                    .map_err(|error| {
+                        storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+                    })?;
                 consensus::build_snapshot_database_pinned_with_authority_into_sync(
                     &conn,
                     consensus::SnapshotBuildAuthority {
@@ -7527,6 +7589,9 @@ impl SqliteConsensusSnapshotBuilder {
         self.core
             .snapshot_observation
             .record_phase_for_test("verifying_envelope");
+        integrity_work
+            .sized_phase(byte_length)
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
         let (published_pin, snapshot_guard) = if self.core.authority_profile
             == ConsensusAuthorityProfile::FixedImmutable
         {
@@ -7606,6 +7671,9 @@ impl SqliteConsensusSnapshotBuilder {
             // still able to acquire the SQLite mutex.
             wait_before_fixed_prepublication_verify(&final_path).await;
         }
+        integrity_work
+            .progress()
+            .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
         let snapshot_id = format!("session-{}", uuid::Uuid::new_v4());
         #[cfg(target_os = "linux")]
         let snapshot_id =
@@ -7699,6 +7767,9 @@ impl SqliteConsensusSnapshotBuilder {
                 )
             })?
         };
+        integrity_work.progress().map_err(|error| {
+            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+        })?;
         #[cfg(test)]
         if let Some(completion) = self._shutdown_guard.0.as_ref() {
             completion.snapshot_build.before_publication().await;
@@ -8040,6 +8111,9 @@ async fn seal_snapshot_database_in_place(
     UnpublishedSnapshotArtifact,
 )> {
     raw_snapshot.verify_identity()?;
+    if let Some(work) = &integrity_work {
+        work.progress()?;
+    }
     let payload_length = raw_snapshot.file().metadata()?.len();
     if payload_length == 0 || payload_length > SNAPSHOT_MAX_BYTES {
         return Err(consensus::invalid_data(
@@ -8101,6 +8175,9 @@ async fn seal_snapshot_database_in_place(
             ));
         }
         hasher.update(&buffer[..read]);
+        if let Some(work) = &integrity_work {
+            work.progress()?;
+        }
     }
     if copied != payload_length {
         return Err(consensus::invalid_data(
@@ -8117,6 +8194,9 @@ async fn seal_snapshot_database_in_place(
     output.write_all(&payload_length.to_be_bytes()).await?;
     output.write_all(&checksum).await?;
     output.flush().await?;
+    if let Some(work) = &integrity_work {
+        work.sized_phase(payload_length)?;
+    }
     output.sync_all().await?;
     let (snapshot, fixed_pin) = if let Some(fixed_pin) = fixed_pin {
         drop(output);
@@ -8213,6 +8293,7 @@ pub(crate) async fn inspect_voter_snapshot(
         let work = SnapshotIntegrityWork {
             _gate: SnapshotIntegrityGate::Mutation { _guard: gate },
             _lease: lease.clone(),
+            attempt: None,
             _shutdown: None,
         };
         let survivors = validate_and_clean_snapshot_directory(&core, Some(&lease))
@@ -8793,8 +8874,10 @@ async fn track_previous_snapshot_artifact(
             Some(integrity_work.clone()),
         )
         .await?;
+        integrity_work.sized_phase(file.metadata()?.len())?;
         let mut snapshot = SessionSnapshotFile::from_std(file, path.clone()).await?;
         let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot).await?;
+        integrity_work.progress()?;
         if checksum != *expected_checksum || length != *expected_length {
             return Err(consensus::invalid_data(
                 "previous snapshot differs from durable row",
