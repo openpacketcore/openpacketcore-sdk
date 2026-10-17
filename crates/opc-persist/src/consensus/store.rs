@@ -657,7 +657,7 @@ impl ConsensusConfigStore {
         // A repair root has lost the old voter's log and vote. Do not expose
         // that empty state to a live leader or another candidate. A previously
         // restored root retains its ordinary durable restart behavior.
-        let repair_pending = if backend.retained_repair_only && voter_setup.is_none() {
+        let repair_pending = if backend.retained_repair_only {
             log_store
                 .core
                 .run_sqlite(move |conn| super::sqlite::read_applied_sync(conn, identity))

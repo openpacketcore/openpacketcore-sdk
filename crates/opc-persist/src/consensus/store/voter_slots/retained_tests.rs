@@ -453,7 +453,14 @@ async fn five_retained_voters_replace_lost_vote_identity_through_a_learner() {
             .insert(new, candidate.rpc_handler());
         fleet.nodes.push(candidate.clone());
         fleet.directories.push(directory);
-        let finished = wait_for_replacement(&leader).await;
+        let (finished, admission) = tokio::join!(
+            wait_for_replacement(&leader),
+            candidate.initialize_cluster()
+        );
+        assert!(
+            admission.is_err(),
+            "the candidate still awaits local finalization"
+        );
         assert_eq!(finished.table().configuration_epoch.get(), 2);
         assert_eq!(
             fleet.network.paused_replication_to.load(Ordering::SeqCst),
@@ -733,8 +740,10 @@ async fn retained_replacement_resumes_after_the_leader_restarts() {
             .insert(new, candidate.rpc_handler());
         // Ordinary engine election and the store-owned coordinator recover the
         // accepted request. No election trigger or replacement resubmission.
-        let finished = wait_for_replacement(&resumed).await;
-        wait_for_admitted_candidate(&candidate).await;
+        let (finished, ()) = tokio::join!(
+            wait_for_replacement(&resumed),
+            wait_for_admitted_candidate(&candidate)
+        );
         assert!(finished.table().is_retired(old));
         assert_eq!(finished.table().configuration_epoch.get(), 2);
         assert_eq!(finished.table().slots[2].member.identity.node_id(), new);

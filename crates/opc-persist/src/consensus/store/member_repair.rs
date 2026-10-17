@@ -1,10 +1,10 @@
-//! Restore a lost fixed voter's prefix before admitting any engine response.
+//! Restore a lost voter's prefix under its selected new identity.
 //!
 //! The incumbent leader's recorded matching index must never be reset. Its
 //! snapshot covers the complete log present when recovery starts, including
 //! any accepted tail, and comes from a fresh quorum read with this empty
-//! replacement unable to vote or acknowledge heartbeats. Ordinary replication
-//! resumes only after Openraft has durably installed that snapshot and vote.
+//! replacement unable to vote or acknowledge heartbeats. Installation leaves
+//! the candidate nonvoting until learner catch-up and membership promotion.
 
 use opc_consensus::engine::{Snapshot, SnapshotMeta, Vote};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -79,7 +79,7 @@ pub(super) async fn handle(store: &ConsensusConfigStore, payload: &[u8]) -> Cons
         Ok(request) => request,
         Err(_) => return protocol_rejection(),
     };
-    if request.compatibility != store.peer_compatibility() || store.inner.voter_profile.is_some() {
+    if request.compatibility != store.peer_compatibility() {
         return ConsensusWireResponse {
             result: Err(ConsensusPeerError::ScopeMismatch),
         };
@@ -104,6 +104,24 @@ pub(super) async fn handle(store: &ConsensusConfigStore, payload: &[u8]) -> Cons
 }
 
 impl ConsensusConfigStore {
+    fn repair_source_members(&self) -> Option<BTreeSet<ConsensusNodeId>> {
+        match &self.inner.voter_profile {
+            Some(profile) => Some(
+                profile
+                    .admission
+                    .durable_view()
+                    .ok()?
+                    .table()
+                    .current_configuration()
+                    .members
+                    .iter()
+                    .map(|member| member.identity.node_id())
+                    .collect(),
+            ),
+            None => Some(self.inner.members.clone()),
+        }
+    }
+
     fn repair_source_vote(&self) -> Option<Vote<ConsensusNodeId>> {
         self.require_admission().ok()?;
         map_watch_snapshot(&self.inner.raft.metrics(), |metrics| {
@@ -150,7 +168,10 @@ impl ConsensusConfigStore {
                 .ok_or_else(consensus_unavailable)?;
             (snapshot, 0)
         };
-        if !exact_uniform_voter_membership(&snapshot.meta.last_membership, &self.inner.members)
+        let members = self
+            .repair_source_members()
+            .ok_or_else(consensus_unavailable)?;
+        if !exact_uniform_voter_membership(&snapshot.meta.last_membership, &members)
             || snapshot.meta.last_log_id.is_none()
         {
             return Err(consensus_unavailable());
@@ -267,8 +288,10 @@ impl ConsensusConfigStore {
             if self.installed_repair_is_ready().await {
                 *progress = None;
                 self.inner.repair_pending.store(false, Ordering::Release);
-                self.inner.raft.runtime_config().elect(true);
-                self.inner.raft.runtime_config().heartbeat(true);
+                if self.inner.voter_profile.is_none() {
+                    self.inner.raft.runtime_config().elect(true);
+                    self.inner.raft.runtime_config().heartbeat(true);
+                }
                 return Ok(());
             }
             if progress.as_ref().is_none_or(|download| download.rediscover) {
@@ -336,6 +359,13 @@ impl ConsensusConfigStore {
     }
 
     async fn installed_repair_is_ready(&self) -> bool {
+        if let Some(profile) = &self.inner.voter_profile {
+            // Pending candidates reject ordinary appends until a selected
+            // snapshot has been installed. Its applied cut is sufficient to
+            // finish downloading; application/voting admission still waits
+            // for the separate learner and membership transitions.
+            return profile.pulled_snapshot_is_applied(self).await;
+        }
         let Ok(Some(snapshot)) = self.inner.raft.get_snapshot().await else {
             return false;
         };
@@ -453,6 +483,21 @@ impl ConsensusConfigStore {
             .await
             .map_err(|_| consensus_unavailable())?;
         let download = progress.take().ok_or_else(consensus_unavailable)?;
+        if let Some(profile) = &self.inner.voter_profile {
+            return profile
+                .install_pulled_snapshot(
+                    self,
+                    download.source,
+                    download.vote,
+                    Snapshot {
+                        meta: download.meta,
+                        snapshot: download.snapshot,
+                    },
+                    deadline,
+                )
+                .await
+                .map_err(|_| consensus_unavailable());
+        }
         let response = self
             .inner
             .raft
