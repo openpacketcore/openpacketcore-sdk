@@ -100,6 +100,7 @@ pub mod ike_sa_rekey;
 pub mod iv_reservation;
 pub mod message;
 pub mod message_id_sync;
+pub mod n1_mode;
 pub mod nat_detection;
 pub mod nat_traversal;
 pub mod notify;
@@ -264,6 +265,10 @@ pub use message_id_sync::{
     Ikev2MessageIdSyncPending, Ikev2MessageIdSyncRole, Ikev2MessageIdSyncRuleError,
     Ikev2MessageIdSyncSa, Ikev2MessageIdSyncSupported,
 };
+pub use n1_mode::{
+    build_ikev2_n1_mode_notify, decode_ikev2_n1_mode_notify, Ikev2N1ModeNotifications,
+    Ikev2N1ModeNotify, Ikev2N1ModeNotifyError, N1_MODE_MAX_NOTIFIES,
+};
 pub use nat_detection::{
     evaluate_ikev2_nat_detection, ikev2_nat_detection_hash, Ikev2NatDetectionEndpointStatus,
     Ikev2NatDetectionEvaluation, Ikev2NatDetectionObservedEndpoint, Ikev2NatDetectionOutcome,
@@ -292,9 +297,10 @@ pub use notify::{
     IKEV2_NOTIFY_INVALID_KE_PAYLOAD, IKEV2_NOTIFY_INVALID_MAJOR_VERSION,
     IKEV2_NOTIFY_INVALID_MESSAGE_ID, IKEV2_NOTIFY_INVALID_SELECTORS, IKEV2_NOTIFY_INVALID_SPI,
     IKEV2_NOTIFY_INVALID_SYNTAX, IKEV2_NOTIFY_MESSAGE_ID_SYNC,
-    IKEV2_NOTIFY_MESSAGE_ID_SYNC_SUPPORTED, IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP,
-    IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP, IKEV2_NOTIFY_NO_ADDITIONAL_SAS,
-    IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
+    IKEV2_NOTIFY_MESSAGE_ID_SYNC_SUPPORTED, IKEV2_NOTIFY_N1_MODE_CAPABILITY,
+    IKEV2_NOTIFY_N1_MODE_INFORMATION, IKEV2_NOTIFY_N1_MODE_S_NSSAI_PLMN_ID,
+    IKEV2_NOTIFY_NAT_DETECTION_DESTINATION_IP, IKEV2_NOTIFY_NAT_DETECTION_SOURCE_IP,
+    IKEV2_NOTIFY_NO_ADDITIONAL_SAS, IKEV2_NOTIFY_NO_PROPOSAL_CHOSEN, IKEV2_NOTIFY_PROTOCOL_ID_NONE,
     IKEV2_NOTIFY_P_CSCF_RESELECTION_SUPPORT, IKEV2_NOTIFY_REKEY_SA,
     IKEV2_NOTIFY_SIGNATURE_HASH_ALGORITHMS, IKEV2_NOTIFY_SINGLE_PAIR_REQUIRED,
     IKEV2_NOTIFY_TEMPORARY_FAILURE, IKEV2_NOTIFY_TS_UNACCEPTABLE,

@@ -22,6 +22,25 @@ state, retransmission policy, cookie policy, Child SA lifecycle, XFRM/IPsec
 programming, bearer admission or allocation policy, carrier acceptance
 evidence, or a production ePDG control-plane stack.
 
+## N1-mode Notify values
+
+`n1_mode` implements TS 24.302 V18.7.0 sections 8.2.9.15–8.2.9.17:
+`N1_MODE_CAPABILITY` (51015), `N1_MODE_INFORMATION` (51115), and
+`N1_MODE_S_NSSAI_PLMN_ID` (52216). `decode_ikev2_n1_mode_notify` returns
+`Ok(None)` for an unrelated Notify, a typed value for a valid recognized
+Notify, and a value-free error for a malformed recognized Notify. SPI size and
+SPI must both be empty; the inner one-octet length must exactly cover the value.
+Builders emit Protocol ID zero, while receivers ignore it for an empty SPI as
+RFC 7296 section 3.10 requires.
+
+`Ikev2N1ModeNotifications::decode` consumes a caller-selected collection of at
+most 64 Notifies, counting unrelated types. It rejects repeated recognized
+types even when identical and returns no partial result. This duplicate rule
+is an SDK ambiguity policy. Authentication, exchange-specific combinations,
+negotiation, slice authorization and session mapping remain caller-owned.
+The shared `opc_types::n1_mode` values preserve all five S-NSSAI forms and
+redact formatting. See [ADR 0033](../../docs/adr/0033-n1-mode-codecs.md).
+
 ## Message-ID synchronization primitives and pure rules
 
 `message_id_sync` provides RFC 6311 support and synchronization Notify codecs.

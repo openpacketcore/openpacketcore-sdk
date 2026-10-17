@@ -14,6 +14,28 @@ control-plane stack.
 
 ## API Shape
 
+- `n1_mode` provides directional ordinary APCO codecs: `N1ModeApcoRequest`
+  carries MS-to-network PDU session identity container `0x001a`, and
+  `N1ModeApcoResponse` carries network-to-MS S-NSSAI plus its associated PLMN in
+  container `0x001b`. `encode_apco` supplies the existing Create Session
+  context's `apco` field; `to_s2b_ie` emits top-level APCO type 163 instance 0.
+  `from_s2b` checks the Create Session procedure, direction and header type,
+  and reads only top-level APCO instance 0. Malformed optional N1 data produces
+  a value-free codec error; it does not rewrite the message Cause.
+  Decode distinguishes absence from malformed data, ignores opposite-direction
+  identifiers, and checks framing through the end. Append preserves all other
+  bytes. Repeated N1 containers, including identical copies, fail as an SDK
+  ambiguity rule; top-level IE duplicates retain the existing S2b first-occurrence
+  receive policy. Work is bounded to 64 units and 251 ordinary PCO content
+  octets. Large APCO/ePCO is outside this codec. These additions use TS 24.008
+  **V18.8.0** §10.5.6.3 and TS 29.274 **V18.8.0** §§7.2.1, 7.2.2, 8.94.
+- `Indication::flag` and `set_flag` expose independent `IndicationFlag` values
+  for 5GSIWKI, 5GCNRS and 5GCNRI (TS 29.274 §8.12). Reads treat absent extension
+  octets as clear; updates preserve all unrelated bits. The codecs do not infer
+  N1 enablement, subscription or authorization. See
+  [ADR 0033](../../docs/adr/0033-n1-mode-codecs.md).
+  The runnable [`n1_mode` example](examples/n1_mode.rs) shows checked values,
+  preserving existing APCO options and independently setting the flags.
 - `header` exposes `Header`, the bounded `MessagePriority` value,
   `MessageType`, `decode_header`, and `encode_header`. TEID-present EPC
   headers accept the TS 29.274 MP flag and four-bit priority; no-TEID headers
@@ -209,8 +231,8 @@ control-plane stack.
 - `PcoRequest` and `PcoAddressConfiguration` provide a bounded TS 24.008
   V20.0.0 clause 10.5.6.3 inner codec for IPv4/IPv6 DNS and P-CSCF containers
   and for the IPCP (`0x8021`) configuration protocol, while the outer PCO/APCO
-  IE transport remains opaque and byte-preserving. Every 10.5.6.3 reference
-  below is to that version, and the clause text this crate relies on is
+  IE transport remains opaque and byte-preserving. The following address/IPCP
+  codec's 10.5.6.3 references are to that version, and the clause text it relies on is
   unchanged from V13.7.0 through V20.0.0.
   `PcoRequest::p_cscf` carries the P-CSCF address request and, in
   `PcscfRequest::reselection_support`, the exact empty request container
@@ -670,8 +692,10 @@ Known limits include no full Release 18 GTPv2-C matrix, no independent-peer
 interoperability claim, and no product bearer-policy/dataplane state machine.
 The triggered transaction helper is in-memory and transport-neutral; callers
 own UDP I/O, persistence across process loss, cancellation/rollback of timed-out
-application work, and the monotonic clock. The PCO inner codec is limited to
-DNS/P-CSCF address projection and safely skips other well-formed containers.
+application work, and the monotonic clock. The address PCO codec covers
+DNS/P-CSCF, IPv4 Link MTU and IPCP; the separate N1-mode APCO codec covers only
+the two directional N1 containers described above. Neither claims independent
+peer interoperability.
 
 ## Roadmap
 

@@ -45,3 +45,4 @@ accepted.
 | [0030](0030-dns-discovery-contracts.md) | DNS freshness follows record provenance; consumers retain last-good keys and own asynchronous cache driving. |
 | [0031](0031-source-bound-dns-client.md) | Bounded asynchronous DNS uses configured servers, source-bound sockets, strict reply validation and real TTL provenance. |
 | [0032](0032-bounded-dns-srv.md) | SRV uses bounded priority/weighted target selection, source-bound address expansion and original record lifetimes. |
+| [0033](0033-n1-mode-codecs.md) | Shared checked N1-mode values have transport-specific IKEv2 Notify and directional S2b APCO codecs, value-free diagnostics and explicit duplicate rules. |
