@@ -316,19 +316,14 @@ async fn leader_loss_under_writes(voters: u64) {
         acknowledged_at_fault.len() >= 10,
         "sustained successful pre-fault workload"
     );
-    let newest = *survivor_heads.iter().max().unwrap();
-    assert_eq!(
-        survivor_heads
-            .iter()
-            .filter(|head| **head == newest)
-            .count(),
-        (voters / 2) as usize,
-        "one fresh survivor in three voters, two in five; shorter logs remain at the fault"
-    );
-    for head in &survivor_heads[..(voters / 2) as usize] {
+    let (stale_heads, fresh_heads) = survivor_heads.split_at((voters / 2) as usize);
+    let newest_stale = stale_heads.iter().max().unwrap();
+    // Active replication can leave the fresh survivors at different indices.
+    // Require both to be ahead of the stale minority, without synchronizing them.
+    for head in fresh_heads {
         assert!(
-            *head < newest,
-            "the earlier election samples belong to stale survivors"
+            head > newest_stale,
+            "one fresh survivor in three voters, two in five; earlier election samples belong to stale survivors"
         );
     }
     let leader = recovery
