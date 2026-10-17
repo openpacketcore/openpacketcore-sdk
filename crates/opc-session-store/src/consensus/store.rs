@@ -8707,6 +8707,19 @@ impl ConsensusSessionStore {
                 )))
             }
         };
+        // Membership admission precedes both resident reservation and the
+        // leader/log-pressure gates. Activated scope traffic retains its
+        // existing authority while a topology transition drains other traffic.
+        let scope_traffic = scope_profile::is_scope_command(&request.intent);
+        if self.require_exact_membership_admission().is_err()
+            && (!scope_traffic
+                || self
+                    .require_scope_traffic_authority_before(deadline)
+                    .await
+                    .is_err())
+        {
+            return ForwardMutationReply::Unavailable;
+        }
         // Known immutable receipts remain reachable without a proposal slot.
         // Its short authority guard is released before a missing receipt waits
         // for capacity, so queued ordinary requests cannot pin the drain gate.
@@ -8759,7 +8772,6 @@ impl ConsensusSessionStore {
                 Err(reply) => return reply,
             }
         };
-        let scope_traffic = scope_profile::is_scope_command(&request.intent);
         // Membership changes take the exclusive side of this gate. Holding a
         // shared guard through the definitive proposal result lets the
         // transition driver drain every already-admitted application write
@@ -9798,6 +9810,9 @@ impl ConsensusSessionStore {
         let persistence_stamp = self.inner.persistence_protocol.operation_stamp();
         if let Err(error) = validate_record_expiry_preflights_profile(&preflights) {
             return ForwardMutationReply::RecordExpiryPreflight(Err(error));
+        }
+        if self.require_exact_membership_admission().is_err() {
+            return ForwardMutationReply::Unavailable;
         }
         let reservation = match tokio::time::timeout_at(
             deadline,
