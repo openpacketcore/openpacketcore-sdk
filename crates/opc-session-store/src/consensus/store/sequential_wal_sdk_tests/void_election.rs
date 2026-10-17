@@ -671,15 +671,19 @@ impl VoidElection {
             gate.partitioned.store(false, Ordering::Release);
             eprintln!("void election: healed former leader; triggering heartbeat");
             successor.inner.raft.trigger().heartbeat().await.unwrap();
+            // The former leader's replication stream can still be in its
+            // unreachable-peer backoff. The existing read fence sends fresh
+            // probes to every voter, so run it before waiting at this frozen
+            // instant for the healed peer to observe the committed vote.
+            successor.inner.raft.ensure_linearizable().await.unwrap();
+            eprintln!("void election: successor linearizability confirmed");
             while !fleet.stores.iter().all(|store| {
                 store.status().leader_id == Some(successor_id)
                     && store.status().term == old_term + 2
             }) {
                 tokio::task::yield_now().await;
             }
-            eprintln!("void election: all voters observed successor; awaiting linearizability");
-            successor.inner.raft.ensure_linearizable().await.unwrap();
-            eprintln!("void election: successor linearizability confirmed");
+            eprintln!("void election: all voters observed successor");
             assert_eq!(self.started.elapsed(), bound);
             for script in &self.scripts {
                 script.finish();

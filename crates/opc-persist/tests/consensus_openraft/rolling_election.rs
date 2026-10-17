@@ -307,13 +307,34 @@ impl RollingElection {
         }
         self.leader_stops += 1;
         let split_rounds = if self.leader_stops == 2 { 2 } else { 1 };
-        // A retained leader may still be completing its initial read fence.
-        // Observe that healthy setup on normal time before fixing the clock
-        // for the replay that anchors all surviving follower leases.
+        // A retained leader starts before its peers reopen, so its replication
+        // streams can still be backing off even after a read fence succeeds.
+        // Complete an actual replay on every peer on normal time before the
+        // frozen replay that anchors all surviving follower leases.
         eprintln!("rolling election: reading retained head before freezing time");
         let stored = fleet.store(index).load_latest().await.unwrap().unwrap();
         assert_eq!(stored.record.tx_id, fleet.head);
         eprintln!("rolling election: retained head read completed");
+        let before = fleet.store(index).status().applied_index;
+        fleet
+            .store(index)
+            .append_attested_commit(attested(stored.record.clone(), audit(fleet.head)))
+            .await
+            .expect("healthy replay retires reopened-peer replication backoff");
+        tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+            loop {
+                let anchor = fleet.store(index).status().applied_index;
+                if anchor > before
+                    && (0..3).all(|node| fleet.store(node).status().applied_index >= anchor)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("healthy replay reaches every retained voter before freezing time");
+        eprintln!("rolling election: healthy replay applied on every voter");
         tokio::time::pause();
         schedule::with_frozen_time(async {
             eprintln!("rolling election: align healthy ticks before stopping voter {}", index + 1);
