@@ -103,6 +103,13 @@ workload credential and incarnation key. Raw legacy RPC admission is refused.
 resolves an accepted request under current controller authorization without
 renewing the original credential or granting another replacement.
 
+Retained incarnations use `RetainedConfigBinding::for_voter_slots`. Loss of the
+durable vote requires a selected new identity, snapshot-backed learner catch-up,
+and membership promotion; a surviving leader's term cannot justify reusing the
+lost identity. Legacy same-identity repair refuses initialization with
+`VoterIdentityReplacementRequired`. The [retained lifecycle contract](RETAINED_CONFIG.md#repair-after-loss-of-durable-raft-state)
+describes provisioning, cancellation and restart of the replacement.
+
 A provisional retirement is stored with the exact retained Prepare log entry.
 The committed table and bounded receipt are published with apply. Truncation
 and snapshot installation release a provisional gate only when durable evidence

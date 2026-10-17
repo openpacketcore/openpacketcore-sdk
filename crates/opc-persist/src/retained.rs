@@ -311,9 +311,14 @@ impl SqliteBackend {
     /// the authenticated existing quorum. Its persisted repair disposition
     /// forbids local genesis, including after reopening. Loss of the complete
     /// quorum therefore requires a separately approved new authority, never
-    /// repeated member repair. Existing artifacts are not overwritten. The
-    /// consensus store restores a quorum-authorized snapshot before the empty
-    /// replacement can vote or answer replication requests under its node ID.
+    /// repeated member repair. Existing artifacts are not overwritten.
+    ///
+    /// Loss of durable Raft state requires a new voter identity, even if a
+    /// surviving quorum can provide the complete history. Use
+    /// [`RetainedConfigBinding::for_voter_slots`] with the committed Prepare
+    /// table and selected Pending incarnation, then open the incarnation
+    /// profile. Legacy same-identity repair cannot initialize or process Raft
+    /// traffic; it returns `VoterIdentityReplacementRequired` on initialization.
     pub async fn provision_config_member_repair(
         options: RetainedConfigOptions,
         audit_key: AuditKey,

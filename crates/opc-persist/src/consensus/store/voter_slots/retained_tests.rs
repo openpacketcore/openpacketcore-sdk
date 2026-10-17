@@ -658,3 +658,90 @@ async fn three_retained_voters_resume_a_learner_after_cancellation_and_restart()
     .expect("three-voter restart and cancellation preserve the 30-second repair bound");
     fleet.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_replacement_resumes_after_the_leader_restarts() {
+    let (mut fleet, initial) = retained_fleet(3).await;
+    let old = member(3, 1).identity.node_id();
+    let new = member(3, 2).identity.node_id();
+    let leader_id = member(1, 1).identity.node_id();
+    fleet.network.handlers.write().unwrap().remove(&old);
+    fleet.nodes[2].shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::sleep(VOTER_RECENT_TRAFFIC_WINDOW).await;
+        let prepared = fleet.nodes[0]
+            .replace_voter(verified_request(&initial, 3))
+            .await
+            .unwrap();
+        let operation = prepared.table().replacement.as_ref().unwrap();
+        assert_eq!(operation.phase, VoterReplacementPhase::Prepared);
+        fleet.nodes[1]
+            .inner
+            .raft
+            .wait(None)
+            .applied_index_at_least(
+                Some(operation.evidence.prepare.index),
+                "survivor retains Prepare",
+            )
+            .await
+            .unwrap();
+
+        fleet.network.handlers.write().unwrap().remove(&leader_id);
+        let leader = fleet.nodes.remove(0);
+        let vote = durable_vote(&leader).await;
+        let retired_owner = Arc::downgrade(&leader.inner);
+        leader.shutdown().await.unwrap();
+        drop(leader);
+        // The in-process fixture must finish the stopped owner's work before
+        // it models a new process opening the same exclusive retained backing.
+        while retired_owner.strong_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let directory = fleet.directories[0].path();
+        let backend = SqliteBackend::reopen_config_authority(
+            retained_options(directory, initial.clone(), leader_id),
+            audit_key(),
+        )
+        .await
+        .expect("ordinary retained reopen of the stopped leader");
+        let resumed = ConsensusConfigStore::open_with_voter_slots(
+            initial.clone(),
+            leader_id,
+            backend,
+            directory.join("snapshots"),
+            Arc::new(Resolver(fleet.network.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(durable_vote(&resumed).await, vote);
+        assert_eq!(resumed.voter_slot_state().await.unwrap(), prepared);
+        fleet
+            .network
+            .handlers
+            .write()
+            .unwrap()
+            .insert(leader_id, resumed.rpc_handler());
+
+        let (candidate, directory, _) = selected_candidate(&fleet, prepared.table(), 3).await;
+        fleet
+            .network
+            .handlers
+            .write()
+            .unwrap()
+            .insert(new, candidate.rpc_handler());
+        // Ordinary engine election and the store-owned coordinator recover the
+        // accepted request. No election trigger or replacement resubmission.
+        let finished = wait_for_replacement(&resumed).await;
+        wait_for_admitted_candidate(&candidate).await;
+        assert!(finished.table().is_retired(old));
+        assert_eq!(finished.table().configuration_epoch.get(), 2);
+        assert_eq!(finished.table().slots[2].member.identity.node_id(), new);
+        assert_eq!(candidate.voter_slot_state().await.unwrap(), finished);
+        fleet.nodes.push(resumed);
+        fleet.nodes.push(candidate);
+        fleet.directories.push(directory);
+    })
+    .await
+    .expect("retained leader restart preserves the thirty-second replacement bound");
+    fleet.close().await;
+}

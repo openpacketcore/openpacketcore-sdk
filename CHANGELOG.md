@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-persist`: retained repair after loss of durable Raft state requires a
+  new voter incarnation. Legacy same-identity repair refuses consensus traffic
+  and returns `VoterIdentityReplacementRequired` during initialization. Bind
+  replacement storage with `RetainedConfigBinding::for_voter_slots` and use the
+  authenticated incarnation profile to catch up a learner and promote it through
+  committed membership. This prevents an identity from granting two votes in one
+  term when the lost vote was unknown to the surviving quorum. Crossing into the
+  incarnation stored format requires a fresh installation. (#1330)
+
 - `opc-session-net`: the first fenced roster reconcile closes prepare and
   execute for the entire admission, including older handles and equal-fence
   readback. Providers must durably exclude the exact binding before signing
