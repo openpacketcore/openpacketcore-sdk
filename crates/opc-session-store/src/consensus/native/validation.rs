@@ -101,6 +101,61 @@ pub(super) fn validate_receipt(
     Ok(())
 }
 
+// A coalesced interval may already have expired or reclaimed the terminal
+// response. Its fixed retention deadline still preserves the exact resolution
+// time. Validate that time against both the pending receipt and the interval,
+// rather than requiring an intermediate response to survive aggregation.
+pub(super) fn receipt_resolves_deferral(
+    was_deferred: bool,
+    response: Option<generation::facts::Response>,
+    until: Timestamp,
+    before: &NativeFrontiers,
+    after: &NativeFrontiers,
+) -> io::Result<bool> {
+    if !after.fenced_transition_profile.defers_live_leases()
+        || !was_deferred
+        || crate::fenced_transition::fenced_transition_v2_is_deferral_retention(until)
+    {
+        return Ok(false);
+    }
+    let resolved_at = resident::receipt_response_time(until)?;
+    if response.is_none_or(|response| resolved_at < response.logical_time)
+        || before.logical_time.is_some_and(|time| resolved_at < time)
+        || after.logical_time.is_none_or(|time| resolved_at > time)
+    {
+        return Err(invalid(
+            "native receipt resolution time is outside its interval",
+        ));
+    }
+    Ok(true)
+}
+
+// Removed rows no longer participate in the final ordinal index. Check their
+// retirement eligibility before dropping them, including the pending marker
+// at the timestamp horizon. Explicit asynchronous recovery keeps its existing
+// separate authority to retire an unavailable epoch.
+pub(super) fn validate_removed_retention(
+    id: FencedTransitionV2RequestId,
+    until: Timestamp,
+    before: &NativeFrontiers,
+    after: &NativeFrontiers,
+) -> io::Result<()> {
+    if !fenced_transition_v2_timestamp_is_in_range(until) {
+        return Err(invalid(
+            "native removed receipt retention is outside profile",
+        ));
+    }
+    if id.epoch().get() > lifecycle::floor(before.history)
+        && id.epoch().get() > after.async_fence_floor()
+        && (after.logical_time.is_none_or(|now| until > now)
+            || (after.fenced_transition_profile.defers_live_leases()
+                && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(until)))
+    {
+        return Err(invalid("native history removed an unexpired exact receipt"));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_generic(
     id: &SessionConsensusRequestId,
     receipt: &NativeGenericReceipt,

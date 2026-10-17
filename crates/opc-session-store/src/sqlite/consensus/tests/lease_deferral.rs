@@ -74,8 +74,32 @@ fn sqlite_lease_deferral_profile_has_an_independent_fixed_digest() {
         .collect::<String>();
     assert_eq!(
         hex,
-        "ff9fb5a129821261d9ddd2cd1482aedd4e528642fc3f3474ce8580c86a6c3d4a"
+        "9c417cb163de21b72f8862cc8f998076a02d991699b53a34136eb0b8a0f27906"
     );
+}
+
+#[test]
+fn sqlite_lease_deferral_reopen_refuses_the_profile_without_deletion_witnesses() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("previous-profile.sqlite");
+    let backend =
+        SqliteSessionBackend::open_with_fenced_transition_v2_profile(&path, PROFILE).unwrap();
+    {
+        let conn = backend.conn.blocking_lock();
+        fixture(&backend, &conn);
+        let previous =
+            hex::decode("ff9fb5a129821261d9ddd2cd1482aedd4e528642fc3f3474ce8580c86a6c3d4a")
+                .unwrap();
+        assert_eq!(conn.execute(
+            "UPDATE consensus_fenced_transition_profile SET profile_digest=?1 WHERE singleton=1",
+            [previous.as_slice()],
+        ).unwrap(), 1);
+    }
+    drop(backend);
+    assert!(matches!(
+        SqliteSessionBackend::open_with_fenced_transition_v2_profile(&path, PROFILE),
+        Err(StoreError::BackendUnavailable(reason)) if reason == "fenced_transition_store_profile_mismatch"
+    ));
 }
 
 fn initialize(conn: &Connection) {

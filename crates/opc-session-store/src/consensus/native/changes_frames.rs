@@ -214,13 +214,23 @@ impl BusinessChanges {
             frame::write_binary(writer, &(key, change.after.as_deref()))?;
         }
         for deleted in &self.deletions {
-            deleted.for_each(|id, _, _, hash| {
+            deleted.for_each(|id, ordinal, until, _, hash| {
                 check()?;
-                if !self.receipts.contains_key(&id) {
-                    writer.write_all(&[1])?;
-                    frame::write_before(writer, hash.map(|stamp| stamp.content))?;
-                    writer.write_all(&id.to_bytes())?;
-                    writer.write_all(&[0])?;
+                let before = self
+                    .receipts
+                    .get(&id)
+                    .map_or(hash, |change| change.before_hash);
+                writer.write_all(&[1])?;
+                frame::write_before(writer, before.map(|stamp| stamp.content))?;
+                writer.write_all(&id.to_bytes())?;
+                writer.write_all(&[0])?;
+                if self
+                    .target
+                    .frontiers
+                    .fenced_transition_profile
+                    .defers_live_leases()
+                {
+                    frame::write_binary(writer, &(ordinal, until))?;
                 }
                 Ok(())
             })?;
@@ -228,12 +238,7 @@ impl BusinessChanges {
         for (id, change) in self
             .receipts
             .iter()
-            .filter(|(_, change)| change.after.is_none())
-            .chain(
-                self.receipts
-                    .iter()
-                    .filter(|(_, change)| change.after.is_some()),
-            )
+            .filter(|(_, change)| change.after.is_some())
         {
             check()?;
             writer.write_all(&[1])?;
@@ -287,13 +292,23 @@ impl BusinessChanges {
             })?;
         }
         for deleted in &self.deletions {
-            deleted.for_each(|id, _, _, hash| {
+            deleted.for_each(|id, ordinal, until, _, hash| {
                 check()?;
-                if !self.receipts.contains_key(&id) {
-                    frame::expect(reader, &[1])?;
-                    frame::expect_before(reader, hash.map(|stamp| stamp.content))?;
-                    frame::expect(reader, &id.to_bytes())?;
-                    frame::expect(reader, &[0])?;
+                let before = self
+                    .receipts
+                    .get(&id)
+                    .map_or(hash, |change| change.before_hash);
+                frame::expect(reader, &[1])?;
+                frame::expect_before(reader, before.map(|stamp| stamp.content))?;
+                frame::expect(reader, &id.to_bytes())?;
+                frame::expect(reader, &[0])?;
+                if self
+                    .target
+                    .frontiers
+                    .fenced_transition_profile
+                    .defers_live_leases()
+                {
+                    frame::verify_binary::<(u64, Timestamp)>(reader, &(ordinal, until))?;
                 }
                 Ok(())
             })?;
@@ -301,12 +316,7 @@ impl BusinessChanges {
         for (id, change) in self
             .receipts
             .iter()
-            .filter(|(_, change)| change.after.is_none())
-            .chain(
-                self.receipts
-                    .iter()
-                    .filter(|(_, change)| change.after.is_some()),
-            )
+            .filter(|(_, change)| change.after.is_some())
         {
             check()?;
             frame::expect(reader, &[1])?;

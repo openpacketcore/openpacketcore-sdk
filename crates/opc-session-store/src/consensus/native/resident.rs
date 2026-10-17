@@ -150,7 +150,7 @@ pub(super) struct ColdReceipt {
 // without rounding, saturation or an inferred default. Constructors compare
 // this inverse to the independently decoded response before discarding its
 // duplicate field. Full response bytes and their content digest stay intact.
-fn receipt_response_time(retained_until: Timestamp) -> io::Result<Timestamp> {
+pub(super) fn receipt_response_time(retained_until: Timestamp) -> io::Result<Timestamp> {
     let retention = time::Duration::try_from(FENCED_TRANSITION_OUTCOME_RETENTION)
         .map_err(|_| invalid("native receipt retention duration invalid"))?;
     retained_until

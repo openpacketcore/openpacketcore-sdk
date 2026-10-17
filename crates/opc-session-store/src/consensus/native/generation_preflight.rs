@@ -173,7 +173,15 @@ fn skip_rows(
                 1 => {
                     reader.before()?;
                     reader.scalar::<56>()?;
-                    optional_bytes(reader, cold::MAX_BYTES, check)?;
+                    if reader.present()? {
+                        skip_bytes(reader, cold::MAX_BYTES, check)?;
+                    } else if context
+                        .frontiers
+                        .fenced_transition_profile
+                        .defers_live_leases()
+                    {
+                        skip_bytes(reader, 128, check)?;
+                    }
                 }
                 3 => {
                     skip_bytes(reader, MAX_ITEM, check)?;

@@ -91,7 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovery requires fresh, fully correlated `LeaseDeferred` status to resume;
   unknown, unavailable and absent reads grant no dispatch authority. The
   original profiles retain terminal `LeaseHeld`. Crossing profiles requires
-  a fresh install. (#1334)
+  a fresh install. Native apply and checkpoint replay preserve resolution
+  through grouped expiry and retirement, including a reclaimed receipt;
+  deletion witnesses remain bound to the immutable profile digest. (#1334)
 
 - `opc-types`, `opc-proto-ikev2` and `opc-proto-gtpv2c`: add shared checked
   N1-mode wire values, the three TS 24.302 N1 Notify codecs, directional

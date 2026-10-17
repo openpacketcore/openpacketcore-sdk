@@ -51,14 +51,10 @@ impl Removals {
         ordinal: u64,
         source: &history_order::ReceiptOrder,
     ) -> io::Result<()> {
-        if source
+        let current = source
             .get(id.epoch().get(), ordinal)
-            .is_none_or(|row| row.id != id)
-        {
-            return Err(invalid(
-                "native removed identity differs from its exact index",
-            ));
-        }
+            .filter(|row| row.id == id)
+            .ok_or_else(|| invalid("native removed identity differs from its exact index"))?;
         let next = self
             .count
             .checked_add(1)
@@ -69,16 +65,18 @@ impl Removals {
                 return Err(invalid("native removed inventory repeats or regresses"));
             }
             if range.epoch == id.epoch().get() && end == ordinal {
-                if range
+                let previous = range
                     .source
                     .get(range.epoch, ordinal)
-                    .is_none_or(|row| row.id != id)
-                {
-                    return Err(invalid("native removed range changed its immutable index"));
+                    .filter(|row| row.id == id)
+                    .ok_or_else(|| invalid("native removed range changed its immutable index"))?;
+                // Coalescing must preserve each slot's final retention as
+                // well as its identity in the saved immutable index root.
+                if previous.retained_until == current.retained_until {
+                    range.count += 1;
+                    self.count = next;
+                    return Ok(());
                 }
-                range.count += 1;
-                self.count = next;
-                return Ok(());
             }
         }
         // Eight inline persistent-vector roots, a growing range slot and
@@ -110,13 +108,13 @@ impl Removals {
 
     pub(in crate::consensus::native) fn iter(
         &self,
-    ) -> impl Iterator<Item = io::Result<(FencedTransitionV2RequestId, u64)>> + '_ {
+    ) -> impl Iterator<Item = io::Result<(FencedTransitionV2RequestId, u64, Timestamp)>> + '_ {
         self.ranges.iter().flat_map(|range| {
             (range.first..range.first + range.count as u64).map(move |ordinal| {
                 range
                     .source
                     .get(range.epoch, ordinal)
-                    .map(|row| (row.id, ordinal))
+                    .map(|row| (row.id, ordinal, row.retained_until))
                     .ok_or_else(|| invalid("native removed inventory has an ordinal hole"))
             })
         })
@@ -238,7 +236,7 @@ impl DeletedRows {
         };
         let mut rows = Vec::with_capacity(count);
         for entry in inventory.iter() {
-            let (id, ordinal) = entry?;
+            let (id, ordinal, _) = entry?;
             if let Some(row) = base.capture_row(&id) {
                 if row.value().ordinal != ordinal {
                     return Err(invalid(
@@ -288,6 +286,7 @@ impl DeletedRows {
         mut visit: impl FnMut(
             FencedTransitionV2RequestId,
             u64,
+            Timestamp,
             Option<&SharedRow<NativeReceipt>>,
             Option<RowStamp>,
         ) -> io::Result<()>,
@@ -295,7 +294,7 @@ impl DeletedRows {
         let mut rows = self.rows.iter().peekable();
         let mut count = 0;
         for entry in self.inventory.iter() {
-            let (id, ordinal) = entry?;
+            let (id, ordinal, until) = entry?;
             let row = if rows.peek().is_some_and(|row| *row.row.key() == id) {
                 rows.next()
             } else {
@@ -303,7 +302,7 @@ impl DeletedRows {
             };
             let before = row.map(|row| row.row.value());
             let hash = row.map(|row| row.hash);
-            visit(id, ordinal, before, hash)?;
+            visit(id, ordinal, until, before, hash)?;
             count += 1;
         }
         if rows.next().is_some() || count != self.inventory.len() {

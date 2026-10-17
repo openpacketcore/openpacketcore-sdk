@@ -6,7 +6,7 @@ use crate::{
 use changes::tests::{apply, command, fixture_with_profile, time, void_command};
 use std::time::Duration;
 
-// Independent review probes: the candidate's production code is unchanged.
+// Regression probes preserve grouped and separately delivered schedules.
 fn review_cohort_resolution_expiry_case(grouped: bool) {
     let (mut storage, pending) = pending_fixture();
     let sequence = storage.business.frontiers.sequence;
@@ -145,6 +145,147 @@ pub(in crate::consensus::native) fn pending_fixture() -> (NativeStorage, FencedT
         Err(StoreError::FencedTransitionLeaseDeferred)
     );
     (storage, pending)
+}
+
+pub(in crate::consensus::native) fn full_epoch_pending_fixture(
+    ordinal: u64,
+) -> (NativeStorage, FencedTransitionV2Request) {
+    let (mut storage, pending) = pending_fixture();
+    let mut row = (**storage
+        .business
+        .receipts
+        .get(&pending.request_id())
+        .unwrap())
+    .clone();
+    row.ordinal = ordinal;
+    let history = FencedTransitionV2HistoryState::new(
+        Some(FencedTransitionV2HistoryEpoch::new(8).unwrap()),
+        None,
+        None,
+        0,
+        7,
+        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES,
+        0,
+    )
+    .unwrap();
+    lifecycle_tests::seed(&mut storage, history, at(100_000), None, false);
+    storage
+        .business
+        .receipts
+        .remove(&lifecycle_tests::synthetic_id(1, ordinal));
+    storage
+        .business
+        .receipts
+        .insert(pending.request_id(), SharedRow::new(row).unwrap());
+    storage.business.admit_business().unwrap();
+    storage.log.admit(&storage.business).unwrap();
+    storage.validate_image().unwrap();
+    (storage, pending)
+}
+
+#[test]
+fn native_lease_deferral_grouped_retirement_validates_a_surviving_resolution() {
+    let ordinal = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64;
+    let (mut storage, pending) = full_epoch_pending_fixture(ordinal);
+    let sequence = storage.business.frontiers.sequence;
+    let complete = command(3, &pending, at(100_001), false);
+    let retire =
+        lifecycle_tests::maintenance(&storage, 4, retention_deadline(at(100_001)).unwrap());
+    let delivery = apply(&mut storage, &[complete, retire]);
+    assert!(matches!(
+        delivery.responses[0].result,
+        Ok(SessionMutationOutcome::FencedTransition(_))
+    ));
+    assert_eq!(
+        delivery.responses[1].result,
+        Ok(SessionMutationOutcome::Unit)
+    );
+    assert_eq!(storage.business.frontiers.sequence, sequence + 2);
+    let row = &storage.business.receipts[&pending.request_id()];
+    assert_eq!(row.ordinal, ordinal);
+    assert!(!row.lease_deferred());
+    assert_eq!(row.retained_until, retention_deadline(at(100_001)).unwrap());
+    assert_eq!(
+        storage.business.history().unwrap().reclaimed_entries(),
+        crate::fenced_transition::FENCED_TRANSITION_V2_RECLAIM_BATCH as u64
+    );
+    assert_eq!(
+        storage.business.status(&pending).unwrap(),
+        FencedTransitionV2Status::Retired
+    );
+    storage.validate_image().unwrap();
+}
+
+#[test]
+fn native_lease_deferral_expired_resolution_rejects_changed_binding_and_impossible_time() {
+    let (storage, pending) = pending_fixture();
+    let entries = [
+        command(3, &pending, at(80), false),
+        command(4, &pending, retention_deadline(at(80)).unwrap(), false),
+    ];
+    for kind in 0..5 {
+        let mut delta = storage.business.prepare(&entries).unwrap();
+        let row = delta.receipts.get_mut(&pending.request_id()).unwrap();
+        assert!(!row.retained());
+        match kind {
+            0 => row.ordinal = 1,
+            1 => row.payload_digest[0] ^= 1,
+            2 => row.retained_until = retention_deadline(time(1)).unwrap(),
+            3 => {
+                row.retained_until =
+                    crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap()
+            }
+            _ => row.retained_until = retention_deadline(at(81)).unwrap(),
+        }
+        assert!(
+            changes::Publication::prepare(delta).is_err(),
+            "invalid expired resolution {kind}"
+        );
+        assert!(storage.business.receipts[&pending.request_id()].lease_deferred());
+        storage.validate_image().unwrap();
+    }
+}
+
+#[test]
+fn native_lease_deferral_retirement_rejects_unresolved_removed_and_surviving_receipts() {
+    for ordinal in [1, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64] {
+        let (storage, pending) = full_epoch_pending_fixture(ordinal);
+        let complete = command(3, &pending, at(100_001), false);
+        let retire =
+            lifecycle_tests::maintenance(&storage, 4, retention_deadline(at(100_001)).unwrap());
+        let entries = [complete, retire];
+        let mut delta = storage.business.prepare(&entries).unwrap();
+        if ordinal == 1 {
+            assert!(!delta.receipts.contains_key(&pending.request_id()));
+            // Keep the legal retirement frontier and exact deletion IDs, but
+            // substitute the genuinely pending predecessor's removal witness.
+            let original = &storage
+                .business
+                .require_business_proof()
+                .unwrap()
+                .receipt_order;
+            let mut forged = changes::Removals::default();
+            for entry in delta.receipt_removals.iter() {
+                let (id, ordinal, _) = entry.unwrap();
+                forged.insert(id, ordinal, original).unwrap();
+            }
+            delta.receipt_removals = forged;
+        } else {
+            assert!(delta.receipts.contains_key(&pending.request_id()));
+            delta.receipts.insert(
+                pending.request_id(),
+                (**storage
+                    .business
+                    .receipts
+                    .get(&pending.request_id())
+                    .unwrap())
+                .clone(),
+            );
+        }
+        assert!(changes::Publication::prepare(delta).is_err());
+        assert!(storage.business.receipts[&pending.request_id()].lease_deferred());
+        storage.validate_image().unwrap();
+    }
 }
 
 #[test]

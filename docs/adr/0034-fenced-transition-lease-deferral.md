@@ -56,6 +56,16 @@ checks it against the decoded response. A concurrent read can refresh that
 one terminal successor; it cannot refresh back to pending or repeatedly
 replace terminal receipts. No migration or alternate-format fallback exists.
 
+Apply and checkpoint grouping do not alter those decisions. A terminal
+deadline preserves its exact resolution time even after the response expires.
+Validation checks that time against the pending binding and the captured
+interval before evaluating retirement. A deletion in this profile carries
+its original before-row hash, full ID, ordinal and final retention deadline;
+replay validates that witness before removing the row. Remaining pending
+rows still block retirement. This deletion vocabulary is part of the profile
+digest, so crossing from an earlier experimental profile requires a fresh
+install and its stored profile is refused.
+
 ## Membership and ordered application
 
 Initial history activation still requires epoch one. After initialization,
@@ -111,6 +121,7 @@ The acceptance cases cover sixteen refusals without growth, one completion
 after store-clock expiry, caller restart, predecessor renewal and newer-owner
 races, an interrupted completion followed by unavailable or absent status,
 and repeated release and reuse. Additional tests cover wire correlation,
-profile isolation, pending retirement pins, cold persistence, and caller
+profile isolation, pending retirement pins, grouped expiry and retirement,
+reclaimed resolution witnesses, cold persistence, and caller
 lifetime exclusion. These are synthetic SDK contracts; they establish no
 deployment, live traffic, continuity or performance qualification.
