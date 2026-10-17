@@ -43,7 +43,13 @@ Repairing every member of a lost quorum cannot mint fresh genesis.
 Cancellation or a lost quorum leaves the empty member unadmitted; retry
 `initialize_cluster` on the same store when the quorum is available. A bounded
 attempt retains its verified partial download for the next call, so a large
-snapshot can progress across operation deadlines. Cancellation and shutdown
+snapshot can progress across operation deadlines. If a saved attempt makes no
+progress, the next call rediscovers authenticated sources within its existing
+budget. A fresh response reuses the checkpoint only when its source, committed
+vote, and complete snapshot metadata still match; a successor or changed
+snapshot starts a new download. Snapshot reads share the publication gate so
+replacement cannot remove a selected file before it is verified and opened.
+Cancellation and shutdown
 remove that partial download automatically, and ordinary startup removes any
 staging left by a crash. A completed repair persists through the
 ordinary retained reopen path and can rejoin with a compatible majority. This
