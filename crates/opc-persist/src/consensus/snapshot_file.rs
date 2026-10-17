@@ -15,23 +15,46 @@ pub(crate) struct ConfigSnapshotFile {
     file: tokio::fs::File,
     path: PathBuf,
     cleanup_on_drop: bool,
+    _owner: Option<std::sync::Arc<super::storage::SnapshotDirectoryOwner>>,
 }
 
 impl ConfigSnapshotFile {
+    #[cfg(test)]
     pub(crate) async fn create(path: PathBuf) -> io::Result<Self> {
-        let file = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await?;
-        #[cfg(unix)]
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(Self {
-            file,
-            path,
-            cleanup_on_drop: true,
+        Self::create_with_owner(path, None).await
+    }
+
+    pub(crate) async fn create_owned(
+        path: PathBuf,
+        owner: std::sync::Arc<super::storage::SnapshotDirectoryOwner>,
+    ) -> io::Result<Self> {
+        Self::create_with_owner(path, Some(owner)).await
+    }
+
+    async fn create_with_owner(
+        path: PathBuf,
+        owner: Option<std::sync::Arc<super::storage::SnapshotDirectoryOwner>>,
+    ) -> io::Result<Self> {
+        // Construct the cleanup guard in the blocking task. Cancellation of
+        // its receiver cannot strand a file created after the caller was gone.
+        tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let file = options.open(&path)?;
+            let staged = Self {
+                file: tokio::fs::File::from_std(file),
+                path,
+                cleanup_on_drop: true,
+                _owner: owner,
+            };
+            #[cfg(unix)]
+            std::fs::set_permissions(&staged.path, std::fs::Permissions::from_mode(0o600))?;
+            Ok(staged)
         })
+        .await
+        .map_err(|_| io::Error::other("config snapshot receiver creation failed"))?
     }
 
     pub(crate) async fn open(path: PathBuf) -> io::Result<Self> {
@@ -48,6 +71,7 @@ impl ConfigSnapshotFile {
             file,
             path,
             cleanup_on_drop: false,
+            _owner: None,
         })
     }
 

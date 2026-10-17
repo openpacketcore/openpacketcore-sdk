@@ -145,14 +145,64 @@ struct StagingArtifact {
     path: PathBuf,
     sqlite_sidecars: bool,
     armed: bool,
+    _owner: Option<Arc<SnapshotDirectoryOwner>>,
 }
 
 impl StagingArtifact {
+    async fn create(
+        path: PathBuf,
+        sqlite_sidecars: bool,
+        owner: Arc<SnapshotDirectoryOwner>,
+    ) -> io::Result<(tokio::fs::File, Self)> {
+        Self::create_with_hook(
+            path,
+            sqlite_sidecars,
+            owner,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn create_with_hook(
+        path: PathBuf,
+        sqlite_sidecars: bool,
+        owner: Arc<SnapshotDirectoryOwner>,
+        #[cfg(test)] before_create: Option<Box<dyn FnOnce() + Send>>,
+    ) -> io::Result<(tokio::fs::File, Self)> {
+        // Opening a file can outlive cancellation of its async caller. The
+        // blocking task must own both cleanup and admission before it opens.
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut cleanup = Self {
+                path,
+                sqlite_sidecars,
+                armed: false,
+                _owner: Some(owner),
+            };
+            #[cfg(test)]
+            if let Some(hook) = before_create {
+                hook();
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let file = options.open(&cleanup.path)?;
+            cleanup.armed = true;
+            Ok((tokio::fs::File::from_std(file), cleanup))
+        });
+        tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, worker)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "snapshot creation timed out"))?
+            .map_err(|_| io::Error::other("config snapshot creation failed"))?
+    }
+
     fn file(path: PathBuf) -> Self {
         Self {
             path,
             sqlite_sidecars: false,
             armed: true,
+            _owner: None,
         }
     }
 
@@ -161,7 +211,13 @@ impl StagingArtifact {
             path,
             sqlite_sidecars: true,
             armed: true,
+            _owner: None,
         }
+    }
+
+    fn with_owner(mut self, owner: Arc<SnapshotDirectoryOwner>) -> Self {
+        self._owner = Some(owner);
+        self
     }
 
     fn replace_path(&mut self, path: PathBuf) {
@@ -284,6 +340,30 @@ pub(crate) struct AdmittedSnapshotDirectory {
     pub(crate) path: PathBuf,
     pub(crate) binding_path: PathBuf,
     pub(crate) guard: Arc<std::fs::File>,
+    pub(crate) owner: Arc<SnapshotDirectoryOwner>,
+}
+
+/// Keep both the descriptor-relative namespace and shutdown accounting alive
+/// until an asynchronous receiver or blocking commit has disposed of its files.
+pub(crate) struct SnapshotDirectoryOwner {
+    _directory: Arc<std::fs::File>,
+    _lock: Arc<crate::local_sqlite::AdmissionFileLock>,
+    // Drop after the directory descriptor, as in ConfigConsensusCore.
+    pub(crate) storage_owner: tokio::sync::watch::Sender<()>,
+}
+
+impl SnapshotDirectoryOwner {
+    pub(crate) fn new(
+        directory: Arc<std::fs::File>,
+        lock: Arc<crate::local_sqlite::AdmissionFileLock>,
+        storage_owner: tokio::sync::watch::Sender<()>,
+    ) -> Self {
+        Self {
+            _directory: directory,
+            _lock: lock,
+            storage_owner,
+        }
+    }
 }
 
 pub(crate) async fn open(
@@ -323,7 +403,11 @@ pub(crate) async fn open_with_recovery(
         Some(approval) if !already_completed => Some(
             tokio::time::timeout(
                 SNAPSHOT_OPERATION_TIMEOUT,
-                stage_legacy_recovery_snapshot(&snapshot_directory.path, approval),
+                stage_legacy_recovery_snapshot(
+                    &snapshot_directory.path,
+                    approval,
+                    snapshot_directory.owner.clone(),
+                ),
             )
             .await
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)??,
@@ -431,12 +515,29 @@ fn admit_snapshot_directory(
     directory
         .sync_all()
         .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+    // A second opener must not sweep staging still owned by a live receiver,
+    // builder, installer, or detached SQLite worker. This acquisition never
+    // waits; process death releases the lock before the next bounded sweep.
+    let lock = Arc::new(
+        crate::local_sqlite::AdmissionFileLock::acquire(
+            directory
+                .try_clone()
+                .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?,
+        )
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?,
+    );
     let directory = Arc::new(directory);
+    let owner = Arc::new(SnapshotDirectoryOwner::new(
+        directory.clone(),
+        lock,
+        tokio::sync::watch::channel(()).0,
+    ));
     let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
     Ok(AdmittedSnapshotDirectory {
         path: descriptor_path,
         binding_path: canonical,
         guard: directory,
+        owner,
     })
 }
 
@@ -475,6 +576,7 @@ fn validate_snapshot_binding(_core: &sqlite::ConfigConsensusCore) -> io::Result<
 async fn stage_legacy_recovery_snapshot(
     snapshot_dir: &std::path::Path,
     approval: ApprovedLegacyConfigRecovery,
+    owner: Arc<SnapshotDirectoryOwner>,
 ) -> Result<sqlite::StagedLegacyRecovery, ConfigConsensusStorageError> {
     let source = approval.snapshot_path();
     let source_file =
@@ -493,15 +595,10 @@ async fn stage_legacy_recovery_snapshot(
     }
     let staged_path = snapshot_dir.join(format!("approved-legacy-{}.sqlite", uuid::Uuid::new_v4()));
     let mut input = tokio::fs::File::from_std(source_file);
-    let mut output = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&staged_path)
-        .await
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
-    set_private_file_permissions(&staged_path)
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
-    let mut staged_cleanup = StagingArtifact::sqlite(staged_path.clone());
+    let (mut output, mut staged_cleanup) =
+        StagingArtifact::create(staged_path.clone(), true, owner)
+            .await
+            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -597,16 +694,6 @@ fn validate_open_file_binding(path: &Path, opened: &std::fs::File) -> io::Result
 }
 
 #[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> io::Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn open_read_nofollow(path: &Path) -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
@@ -633,10 +720,14 @@ async fn validate_and_clean_snapshot_directory(
         .map(|(_, file_name, _, _)| file_name.as_str());
     if let Some((_, file_name, expected_checksum, expected_length)) = &current {
         let path = core.snapshot_dir.join(file_name);
-        let file_type = tokio::fs::symlink_metadata(&path)
-            .await
-            .map_err(|_| ConfigConsensusStorageError::CorruptState)?
-            .file_type();
+        let file_type = tokio::time::timeout(
+            SNAPSHOT_OPERATION_TIMEOUT,
+            tokio::fs::symlink_metadata(&path),
+        )
+        .await
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+        .map_err(|_| ConfigConsensusStorageError::CorruptState)?
+        .file_type();
         if !file_type.is_file() {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
@@ -650,16 +741,11 @@ async fn validate_and_clean_snapshot_directory(
         }
     }
 
-    let mut directory = tokio::fs::read_dir(core.snapshot_dir.as_ref())
-        .await
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+    let mut directory =
+        snapshot_directory_io(tokio::fs::read_dir(core.snapshot_dir.as_ref())).await?;
     let mut inspected = 0_usize;
     let mut removed = false;
-    while let Some(entry) = directory
-        .next_entry()
-        .await
-        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-    {
+    while let Some(entry) = snapshot_directory_io(directory.next_entry()).await? {
         inspected = inspected
             .checked_add(1)
             .ok_or(ConfigConsensusStorageError::CorruptState)?;
@@ -684,22 +770,15 @@ async fn validate_and_clean_snapshot_directory(
         if !part_staging && !sqlite_staging && !orphan_snapshot {
             continue;
         }
-        let file_type = entry
-            .file_type()
-            .await
-            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        let file_type = snapshot_directory_io(entry.file_type()).await?;
         if !file_type.is_file() && !file_type.is_symlink() {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
-        tokio::fs::remove_file(entry.path())
-            .await
-            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        snapshot_directory_io(tokio::fs::remove_file(entry.path())).await?;
         removed = true;
     }
     if removed {
-        sync_directory(core.snapshot_dir.as_ref())
-            .await
-            .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
+        snapshot_directory_io(sync_directory(core.snapshot_dir.as_ref())).await?;
     }
     let published = current.map(|(meta, file_name, checksum, length)| {
         Arc::new(PublishedSnapshot::new(
@@ -711,6 +790,15 @@ async fn validate_and_clean_snapshot_directory(
     });
     *core.snapshot_gate.lock().await = published;
     Ok(())
+}
+
+async fn snapshot_directory_io<T>(
+    operation: impl std::future::Future<Output = io::Result<T>>,
+) -> Result<T, ConfigConsensusStorageError> {
+    tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, operation)
+        .await
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)
 }
 
 fn storage_error(
@@ -1076,12 +1164,26 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
         validate_snapshot_binding(&self.core).map_err(|error| {
             storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
         })?;
-        ConfigSnapshotFile::create(
-            self.core
-                .snapshot_dir
-                .join(format!("incoming-{}.part", uuid::Uuid::new_v4())),
+        let owner = self.core.snapshot_directory_owner().map_err(|error| {
+            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+        })?;
+        tokio::time::timeout(
+            SNAPSHOT_OPERATION_TIMEOUT,
+            ConfigSnapshotFile::create_owned(
+                self.core
+                    .snapshot_dir
+                    .join(format!("incoming-{}.part", uuid::Uuid::new_v4())),
+                owner,
+            ),
         )
         .await
+        .map_err(|_| {
+            storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                sqlite::invalid_data("config consensus snapshot receiver timed out"),
+            )
+        })?
         .map(Box::new)
         .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))
     }
@@ -1101,6 +1203,13 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 )
             })?;
         let result = async {
+            let owner = self.core.snapshot_directory_owner().map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Write,
+                    error,
+                )
+            })?;
             validate_snapshot_binding(&self.core).map_err(|error| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
@@ -1136,7 +1245,8 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             let incoming = snapshot.path().to_path_buf();
             snapshot.disarm_cleanup();
             drop(snapshot);
-            let _incoming_cleanup = StagingArtifact::file(incoming.clone());
+            let incoming_cleanup =
+                StagingArtifact::file(incoming.clone()).with_owner(owner.clone());
             let (payload_length, checksum, total_length) =
                 tokio::time::timeout_at(deadline, verify_snapshot_envelope(&incoming))
                     .await
@@ -1158,9 +1268,9 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 .core
                 .snapshot_dir
                 .join(format!("install-{}.sqlite", uuid::Uuid::new_v4()));
-            let _raw_cleanup = tokio::time::timeout_at(
+            let raw_cleanup = tokio::time::timeout_at(
                 deadline,
-                extract_snapshot_database(&incoming, &raw, payload_length),
+                extract_snapshot_database(&incoming, &raw, payload_length, owner.clone()),
             )
             .await
             .map_err(|_| {
@@ -1185,7 +1295,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 .join(format!("promote-{}.part", uuid::Uuid::new_v4()));
             let mut final_cleanup = tokio::time::timeout_at(
                 deadline,
-                copy_and_promote(&incoming, &promoting, &final_path),
+                copy_and_promote(&incoming, &promoting, &final_path, owner),
             )
             .await
             .map_err(|_| {
@@ -1213,6 +1323,8 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             let hooks = self.core.snapshot_test_hooks.clone();
             self.core
                 .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                    let _incoming_cleanup = incoming_cleanup;
+                    let _raw_cleanup = raw_cleanup;
                     #[cfg(test)]
                     hooks.before_commit(conn, cancellation)?;
                     sqlite::read_current_snapshot_sync(conn, identity, &members)?;
@@ -1251,6 +1363,9 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                         total_length,
                         cancellation,
                     )?;
+                    // The transaction owns this decision even if its awaiting
+                    // runtime has gone away after commit authorization.
+                    final_cleanup.disarm();
                     Ok(())
                 })
                 .await
@@ -1261,7 +1376,6 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                         error,
                     )
                 })?;
-            final_cleanup.disarm();
             publish_snapshot(
                 &self.core,
                 PublishedSnapshot::new(meta.clone(), final_path, checksum, total_length),
@@ -1450,22 +1564,28 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             .core
             .snapshot_dir
             .join(format!("build-{}.sqlite", uuid::Uuid::new_v4()));
-        let _raw_cleanup = StagingArtifact::sqlite(raw.clone());
+        let owner = self.core.snapshot_directory_owner().map_err(|error| {
+            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+        })?;
+        let raw_cleanup = StagingArtifact::sqlite(raw.clone()).with_owner(owner.clone());
         let identity = self.core.identity;
         let members = self.core.expected_members.clone();
         let audit_key = self.core.audit_key.clone();
         let raw_for_build = raw.clone();
-        let (last_log_id, last_membership) = self
+        let (last_log_id, last_membership, raw_cleanup) = self
             .core
             .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
-                sqlite::build_snapshot_database_cancellable_sync(
-                    conn,
-                    identity,
-                    &members,
-                    &audit_key,
-                    &raw_for_build,
-                    cancellation,
-                )
+                let cleanup = raw_cleanup;
+                let (last_log_id, last_membership) =
+                    sqlite::build_snapshot_database_cancellable_sync(
+                        conn,
+                        identity,
+                        &members,
+                        &audit_key,
+                        &raw_for_build,
+                        cancellation,
+                    )?;
+                Ok((last_log_id, last_membership, cleanup))
             })
             .await
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
@@ -1491,7 +1611,7 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             .snapshot_dir
             .join(format!("snapshot-{snapshot_id}.part"));
         let (checksum, length, mut final_cleanup) =
-            tokio::time::timeout_at(deadline, envelope_snapshot_database(&raw, &staging))
+            tokio::time::timeout_at(deadline, envelope_snapshot_database(&raw, &staging, owner))
                 .await
                 .map_err(|_| {
                     storage_error(
@@ -1550,6 +1670,7 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
         let hooks = self.core.snapshot_test_hooks.clone();
         self.core
             .run_sqlite_cancellable_until(deadline, move |conn, cancellation| {
+                let _raw_cleanup = raw_cleanup;
                 #[cfg(test)]
                 hooks.before_commit(conn, cancellation)?;
                 cancellation.check_io()?;
@@ -1563,6 +1684,9 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     checksum,
                     length,
                 )?;
+                // Disarm in the worker that knows the durable outcome, never
+                // in the cancellable future awaiting that outcome.
+                final_cleanup.disarm();
                 #[cfg(test)]
                 if hooks.pause_published_build.load(Ordering::Acquire) {
                     // Hold only the return after an actual successful commit.
@@ -1582,7 +1706,6 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
                     error,
                 )
             })?;
-        final_cleanup.disarm();
         publish_snapshot(
             &self.core,
             PublishedSnapshot::new(meta.clone(), final_path, checksum, length),
@@ -1613,6 +1736,7 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
 async fn envelope_snapshot_database(
     raw: &Path,
     output: &Path,
+    owner: Arc<SnapshotDirectoryOwner>,
 ) -> io::Result<([u8; 32], u64, StagingArtifact)> {
     let metadata = tokio::fs::metadata(raw).await?;
     if metadata.len() == 0 || metadata.len() > SNAPSHOT_MAX_BYTES {
@@ -1621,13 +1745,8 @@ async fn envelope_snapshot_database(
         ));
     }
     let mut source = tokio::fs::File::from_std(open_read_nofollow(raw)?);
-    let mut destination = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(output)
-        .await?;
-    set_private_file_permissions(output)?;
-    let cleanup = StagingArtifact::file(output.to_path_buf());
+    let (mut destination, cleanup) =
+        StagingArtifact::create(output.to_path_buf(), false, owner).await?;
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -1766,6 +1885,7 @@ pub(crate) async fn inspect_voter_snapshot(
     meta: &SnapshotMeta<ConsensusNodeId, opc_consensus::engine::EmptyNode>,
     deadline: tokio::time::Instant,
 ) -> io::Result<opc_consensus::voter_slots::VoterSlotTable> {
+    let owner = core.snapshot_directory_owner()?;
     let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
     if budget.is_zero() {
         return Err(io::Error::new(
@@ -1778,7 +1898,7 @@ pub(crate) async fn inspect_voter_snapshot(
     let raw = core
         .snapshot_dir
         .join(format!("inspect-{}.sqlite", uuid::Uuid::new_v4()));
-    let cleanup = extract_snapshot_database(snapshot.path(), &raw, length).await?;
+    let cleanup = extract_snapshot_database(snapshot.path(), &raw, length, owner).await?;
     let identity = core.identity;
     let members = core.expected_members.clone();
     let key = core.audit_key.clone();
@@ -1815,15 +1935,11 @@ async fn extract_snapshot_database(
     envelope: &Path,
     destination: &Path,
     payload_length: u64,
+    owner: Arc<SnapshotDirectoryOwner>,
 ) -> io::Result<StagingArtifact> {
     let mut source = tokio::fs::File::from_std(open_read_nofollow(envelope)?);
-    let mut output = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(destination)
-        .await?;
-    set_private_file_permissions(destination)?;
-    let cleanup = StagingArtifact::sqlite(destination.to_path_buf());
+    let (mut output, cleanup) =
+        StagingArtifact::create(destination.to_path_buf(), true, owner).await?;
     let mut remaining = payload_length;
     let mut buffer = vec![0_u8; 1024 * 1024];
     while remaining > 0 {
@@ -1848,15 +1964,11 @@ async fn copy_and_promote(
     source: &Path,
     staging: &Path,
     final_path: &Path,
+    owner: Arc<SnapshotDirectoryOwner>,
 ) -> io::Result<StagingArtifact> {
     let mut input = tokio::fs::File::from_std(open_read_nofollow(source)?);
-    let mut output = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(staging)
-        .await?;
-    set_private_file_permissions(staging)?;
-    let mut cleanup = StagingArtifact::file(staging.to_path_buf());
+    let (mut output, mut cleanup) =
+        StagingArtifact::create(staging.to_path_buf(), false, owner).await?;
     tokio::io::copy(&mut input, &mut output).await?;
     output.sync_all().await?;
     drop(output);

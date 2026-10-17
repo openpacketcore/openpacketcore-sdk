@@ -122,6 +122,9 @@ impl ConfigShutdownCoordinator {
                 .await
                 .map(|()| outcome)
                 .map_err(|_| consensus_unavailable());
+            if let Some(profile) = store.inner.voter_profile.as_ref() {
+                profile.discard_snapshot_receiver().await;
+            }
             // Raft joins its core and replication tasks, but its state-machine
             // worker and snapshot builders can still own storage afterwards.
             // Keep this drain owned across every caller timeout until all of

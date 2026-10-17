@@ -1,6 +1,86 @@
 use super::*;
 
 #[tokio::test]
+async fn shutdown_discards_partial_snapshot_and_reopens_with_old_handles_alive() {
+    let directory = tempfile::tempdir().unwrap();
+    let network = Arc::new(Network::default());
+    let backend = SqliteBackend::open_with_audit_key(
+        directory.path().join("config.sqlite"),
+        true,
+        0,
+        crate::AuditKey::new([42; 32]).unwrap(),
+    )
+    .await
+    .unwrap();
+    let snapshots = directory.path().join("snapshots");
+    let local = member(1, 1).identity.node_id();
+    let store = ConsensusConfigStore::open_with_voter_slots(
+        genesis(),
+        local,
+        backend.clone(),
+        &snapshots,
+        Arc::new(Resolver(network.clone())),
+    )
+    .await
+    .unwrap();
+    let profile = store.inner.voter_profile.as_ref().unwrap().clone();
+    let source = member(2, 1).identity.node_id();
+    let request = InstallSnapshotRequest {
+        vote: opc_consensus::engine::Vote::new_committed(1, source),
+        meta: opc_consensus::engine::SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "interrupted-shutdown-transfer".into(),
+        },
+        offset: 0,
+        data: b"partial snapshot".to_vec(),
+        done: false,
+    };
+    let response = profile
+        .receive_snapshot(
+            &store,
+            source,
+            request.clone(),
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert!(response.result.is_ok());
+    let path = {
+        let incoming = profile.incoming.lock().await;
+        snapshots.join(incoming.as_ref().unwrap().data.path().file_name().unwrap())
+    };
+    assert!(path.is_file());
+    tokio::time::timeout(Duration::from_secs(10), store.shutdown())
+        .await
+        .expect("shutdown must release its partial transfer within the existing budget")
+        .expect("shutdown must finish while old handles stay alive");
+    assert!(profile.incoming.lock().await.is_none());
+    assert!(!path.exists(), "shutdown removes the interrupted transfer");
+    assert!(profile
+        .receive_snapshot(
+            &store,
+            source,
+            request,
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .is_err());
+    let reopened = ConsensusConfigStore::open_with_voter_slots(
+        genesis(),
+        local,
+        backend,
+        &snapshots,
+        Arc::new(Resolver(network)),
+    )
+    .await
+    .expect("restart must not require dropping old public store handles");
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn replacement_awaits_one_snapshot_read_beyond_its_rpc_budget() {
     let (release, held) = std::sync::mpsc::channel::<()>();
     let mut watchdog =

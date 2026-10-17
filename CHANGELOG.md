@@ -1095,6 +1095,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   speculative replies before split votes and expires renewed replication
   leases before its post-restart campaign. (#1333)
 
+- `opc-persist`: retain snapshot staging ownership through file creation and
+  SQLite commit when an async runtime is dropped. Committed build/install
+  artifacts survive teardown, and the next open removes stale artifacts while
+  excluding live owners. Planned shutdown removes partial voter transfers and
+  permits restart with old closed handles still alive. (#1340)
+
 - `opc-persist`: snapshot reads pin the last durable publication independently
   of building or installing its successor, including a delayed SQLite commit.
   Publication holds only a brief gate; readers open independent descriptors and

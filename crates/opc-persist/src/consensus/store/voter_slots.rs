@@ -328,6 +328,28 @@ impl ConfigVoterProfile {
         replacement: Option<[u8; 32]>,
         deadline: tokio::time::Instant,
     ) -> Result<ConsensusWireResponse, VoterReplacementError> {
+        tokio::select! {
+            biased;
+            () = store.inner.shutdown.wait_started() => Err(VoterReplacementError::Unavailable),
+            result = self.receive_snapshot_chunk(store, source, rpc, replacement, deadline) => result,
+        }
+    }
+
+    pub(super) async fn discard_snapshot_receiver(&self) {
+        // Shutdown has fenced and cancelled chunk reception before this lock.
+        // A partial transfer belongs to the engine drain, not to retained
+        // public store handles or admission readers.
+        drop(self.incoming.lock().await.take());
+    }
+
+    async fn receive_snapshot_chunk(
+        self: &Arc<Self>,
+        store: &ConsensusConfigStore,
+        source: ConsensusNodeId,
+        rpc: InstallSnapshotRequest<ConfigRaftTypeConfig>,
+        replacement: Option<[u8; 32]>,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConsensusWireResponse, VoterReplacementError> {
         let admission_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
         if admission_budget.is_zero() {
             return Err(VoterReplacementError::Deadline);

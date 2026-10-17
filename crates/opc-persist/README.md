@@ -329,10 +329,16 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   Startup verifies the referenced snapshot before a bounded directory cleanup.
   Build and install use one absolute 60-second deadline across file work,
   stepped SQLite backup, validation, and the drained authority transaction;
-  timeout cannot leave a detached worker or report failure after commit.
+  a caller timeout drains the transaction and reports its durable outcome.
   Interrupted receive/build/install/promote artifacts, SQLite sidecars,
   approved-recovery staging, and unreferenced snapshots are removed without
-  following unsafe file types; drop guards clean canceled staging work.
+  following unsafe file types. Creation and commit workers own their cleanup
+  guards even when the async runtime disappears. A committed artifact remains
+  published; the next open verifies it and sweeps recognized stale artifacts.
+  Nonblocking exclusive directory admission prevents a second opener from
+  sweeping a live receiver or worker. Shutdown discards partial voter transfers
+  and releases admission after cleanup; retained admission readers do not hold
+  that lock. No manual staging cleanup is required.
 - `probe_durable_readiness` uses Openraft's linearizable path; listener bind or
   a local SQLite read is not readiness evidence.
 - Planned `ConsensusConfigStore::shutdown()` closes application admission and

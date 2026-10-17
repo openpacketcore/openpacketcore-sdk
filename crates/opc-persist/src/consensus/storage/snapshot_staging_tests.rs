@@ -78,7 +78,7 @@ fn files(path: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-fn runtime_drop_during_commit(install: bool) {
+fn runtime_drop_during_commit(install: bool, probe_ongoing_commit: bool) {
     let temp = tempfile::tempdir().expect("snapshot fixture");
     let database = temp.path().join("config.sqlite");
     let snapshots = temp.path().join("snapshots");
@@ -181,6 +181,22 @@ fn runtime_drop_during_commit(install: bool) {
             .expect("runtime cancellation is bounded")
             .expect_err("runtime teardown must drop the snapshot future");
         assert!(cancelled.is_cancelled());
+        if probe_ongoing_commit {
+            let competing = tokio::time::timeout(
+                WATCHDOG,
+                open(&config_backend, &snapshots, identity(), members()),
+            )
+            .await
+            .expect("a live commit owner must be rejected without waiting for SQLite");
+            assert!(matches!(
+                competing,
+                Err(ConfigConsensusStorageError::BackendUnavailable)
+            ));
+            assert!(
+                snapshots.join(&staged).is_file(),
+                "the detached commit worker still owns the staged publication"
+            );
+        }
         resume_tx.send(()).expect("release authorized commit");
         assert!(
             tokio::time::timeout(WATCHDOG, owner.changed())
@@ -230,12 +246,18 @@ fn runtime_drop_during_commit(install: bool) {
 
 #[test]
 fn runtime_drop_during_build_commit_recovers_staging() {
-    runtime_drop_during_commit(false);
+    runtime_drop_during_commit(false, false);
 }
 
 #[test]
 fn runtime_drop_during_install_commit_recovers_staging() {
-    runtime_drop_during_commit(true);
+    runtime_drop_during_commit(true, false);
+}
+
+#[test]
+fn runtime_drop_keeps_committing_workers_directory_owned() {
+    runtime_drop_during_commit(false, true);
+    runtime_drop_during_commit(true, true);
 }
 
 #[tokio::test]
@@ -275,5 +297,164 @@ async fn next_open_does_not_remove_a_live_owners_staging() {
     assert!(
         !path.exists(),
         "the live owner still removes its own staging"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_receiver_retains_ownership_after_its_core_is_dropped() {
+    let temp = tempfile::tempdir().expect("snapshot fixture");
+    let config_backend = backend(&temp.path().join("config.sqlite")).await;
+    let snapshots = temp.path().join("snapshots");
+    let (log, mut machine, _) = open(&config_backend, &snapshots, identity(), members())
+        .await
+        .expect("initial snapshot owner");
+    let mut released = machine.core.storage_shutdown_observer();
+    let mut staging = machine.begin_receiving_snapshot().await.expect("receiver");
+    staging
+        .write_all(b"owned transfer")
+        .await
+        .expect("transfer");
+    staging.sync_all().await.expect("persist transfer");
+    let path = snapshots.join(staging.path().file_name().expect("staging filename"));
+    drop(log);
+    drop(machine);
+    assert!(
+        released.has_changed().is_ok(),
+        "receiver remains a storage owner"
+    );
+    let competing = tokio::time::timeout(
+        WATCHDOG,
+        open(&config_backend, &snapshots, identity(), members()),
+    )
+    .await
+    .expect("owner exclusion is bounded");
+    assert!(matches!(
+        competing,
+        Err(ConfigConsensusStorageError::BackendUnavailable)
+    ));
+    assert_eq!(
+        b"owned transfer",
+        std::fs::read(&path).expect("owned file").as_slice()
+    );
+    drop(staging);
+    assert!(tokio::time::timeout(WATCHDOG, released.changed())
+        .await
+        .expect("receiver release is bounded")
+        .is_err());
+    assert!(
+        !path.exists(),
+        "receiver cleanup retains a usable directory descriptor"
+    );
+    open(&config_backend, &snapshots, identity(), members())
+        .await
+        .expect("dead owner releases admission automatically");
+    assert!(files(&snapshots).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_snapshot_directory_io_remains_bounded() {
+    let started = tokio::time::Instant::now();
+    let error = snapshot_directory_io(std::future::pending::<io::Result<()>>())
+        .await
+        .expect_err("stalled cleanup must time out");
+    assert_eq!(ConfigConsensusStorageError::BackendUnavailable, error);
+    assert_eq!(SNAPSHOT_OPERATION_TIMEOUT, started.elapsed());
+}
+
+#[tokio::test]
+async fn admission_reader_does_not_retain_a_retired_snapshot_owner() {
+    let temp = tempfile::tempdir().expect("snapshot fixture");
+    let config_backend = backend(&temp.path().join("config.sqlite")).await;
+    let snapshots = temp.path().join("snapshots");
+    let (log, machine, _) = open(&config_backend, &snapshots, identity(), members())
+        .await
+        .expect("initial snapshot owner");
+    let reader = machine.core.clone_for_admission_reader();
+    let mut released = machine.core.storage_shutdown_observer();
+    drop(log);
+    drop(machine);
+    assert!(tokio::time::timeout(WATCHDOG, released.changed())
+        .await
+        .expect("engine owner drain is bounded")
+        .is_err());
+    let reopened = open(&config_backend, &snapshots, identity(), members())
+        .await
+        .expect("a retained admission reader cannot prevent restart");
+    assert_eq!(reader.identity, reopened.0.core.identity);
+    assert!(reader.snapshot_directory_owner().is_err());
+}
+
+#[tokio::test]
+async fn staging_creation_finishing_after_cancellation_removes_its_file() {
+    let temp = tempfile::tempdir().expect("snapshot fixture");
+    let config_backend = backend(&temp.path().join("config.sqlite")).await;
+    let snapshots = temp.path().join("snapshots");
+    let (log, machine, _) = open(&config_backend, &snapshots, identity(), members())
+        .await
+        .expect("snapshot owner");
+    let mut released = machine.core.storage_shutdown_observer();
+    let path = machine.core.snapshot_dir.join("promote-delayed.part");
+    let owner = machine.core.snapshot_directory_owner().expect("live owner");
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (resume, paused) = std::sync::mpsc::channel();
+    let task = tokio::spawn(StagingArtifact::create_with_hook(
+        path,
+        false,
+        owner,
+        Some(Box::new(move || {
+            entered.send(()).expect("creation started");
+            paused.recv_timeout(WATCHDOG).expect("resume creation");
+        })),
+    ));
+    tokio::time::timeout(WATCHDOG, started)
+        .await
+        .expect("creation starts within watchdog")
+        .expect("creation hook");
+    task.abort();
+    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+    drop(log);
+    drop(machine);
+    assert!(matches!(
+        open(&config_backend, &snapshots, identity(), members()).await,
+        Err(ConfigConsensusStorageError::BackendUnavailable)
+    ));
+    assert!(!snapshots.join("promote-delayed.part").exists());
+    resume
+        .send(())
+        .expect("complete creation after cancellation");
+    assert!(tokio::time::timeout(WATCHDOG, released.changed())
+        .await
+        .expect("creation releases ownership within watchdog")
+        .is_err());
+    assert!(files(&snapshots).is_empty(), "late creation cleans itself");
+    open(&config_backend, &snapshots, identity(), members())
+        .await
+        .expect("restart after cancelled creation");
+}
+
+#[tokio::test]
+async fn refused_staging_creation_preserves_an_existing_file() {
+    let temp = tempfile::tempdir().expect("snapshot fixture");
+    let config_backend = backend(&temp.path().join("config.sqlite")).await;
+    let (_, machine, _) = open(
+        &config_backend,
+        temp.path().join("snapshots"),
+        identity(),
+        members(),
+    )
+    .await
+    .expect("snapshot owner");
+    let path = machine.core.snapshot_dir.join("incoming-existing.part");
+    std::fs::write(&path, b"existing owner").expect("existing file");
+    let result = StagingArtifact::create(
+        path.clone(),
+        false,
+        machine.core.snapshot_directory_owner().expect("live owner"),
+    )
+    .await;
+    assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::AlreadyExists));
+    assert_eq!(
+        std::fs::read(path).expect("existing file"),
+        b"existing owner"
     );
 }

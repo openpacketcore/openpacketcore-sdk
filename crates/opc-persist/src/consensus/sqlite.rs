@@ -370,6 +370,8 @@ pub(crate) struct ConfigConsensusCore {
     pub(crate) audit_key: Arc<AuditKey>,
     pub(crate) management_audit_keys: Option<Arc<crate::audit_authority::continuity::AuditKeyRing>>,
     pub(crate) _snapshot_dir_guard: Arc<std::fs::File>,
+    snapshot_directory_owner: std::sync::Weak<super::storage::SnapshotDirectoryOwner>,
+    _snapshot_directory_owner: Option<Arc<super::storage::SnapshotDirectoryOwner>>,
     pub(crate) snapshot_binding_path: Arc<PathBuf>,
     pub(crate) durable_progress: Arc<super::storage::ConfigDurableProgress>,
     pub(crate) voter_admission:
@@ -387,10 +389,22 @@ impl ConfigConsensusCore {
         self.storage_owner.subscribe()
     }
 
+    pub(crate) fn snapshot_directory_owner(
+        &self,
+    ) -> io::Result<Arc<super::storage::SnapshotDirectoryOwner>> {
+        self.snapshot_directory_owner
+            .upgrade()
+            .ok_or_else(|| io::Error::other("config snapshot owner has retired"))
+    }
+
     /// Store-owned admission readers outlive the engine join. Track them
     /// separately so they cannot keep the engine's completion channel open.
     pub(crate) fn clone_for_admission_reader(&self) -> Self {
         Self {
+            // Readers retain their descriptor binding but cannot extend the
+            // engine's exclusive admission. Actual staging upgrades the weak
+            // owner and participates in the engine's shutdown drain.
+            _snapshot_directory_owner: None,
             storage_owner: tokio::sync::watch::channel(()).0,
             ..self.clone()
         }
@@ -502,18 +516,21 @@ impl ConfigConsensusCore {
         let worker_members = expected_members.clone();
         let worker_audit_key = backend.audit_key().clone();
         let worker_backend = backend.clone();
+        let worker_snapshot_directory = Arc::clone(&snapshot_directory.owner);
         let retained = backend.retained_binding.is_some();
         let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(worker_deadline));
         let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
         let worker_cancellation = cancellation.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
+            let _snapshot_directory = worker_snapshot_directory;
+            let staged_recovery = recovery;
             let _permit = permit;
             let progress_cancellation = worker_cancellation.clone();
             worker_conn
                 .progress_handler(1_000, Some(move || progress_cancellation.is_cancelled()))
                 .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
             let result = if retained {
-                if recovery.is_some() {
+                if staged_recovery.is_some() {
                     Err(ConfigConsensusStorageError::RecoveryRequired)
                 } else {
                     validate_existing_schema(
@@ -534,7 +551,7 @@ impl ConfigConsensusCore {
                     identity,
                     &worker_members,
                     &worker_audit_key,
-                    recovery.as_ref(),
+                    staged_recovery.as_ref(),
                     initial_slots.as_ref(),
                     &worker_cancellation,
                     before_commit,
@@ -572,7 +589,9 @@ impl ConfigConsensusCore {
             path: snapshot_dir,
             binding_path: snapshot_binding_path,
             guard: snapshot_dir_guard,
+            owner: snapshot_directory_owner,
         } = snapshot_directory;
+        let storage_owner = snapshot_directory_owner.storage_owner.clone();
         Ok(Self {
             conn,
             identity,
@@ -585,13 +604,15 @@ impl ConfigConsensusCore {
             audit_key: Arc::new(backend.audit_key().clone()),
             management_audit_keys: backend.management_audit_keys(),
             _snapshot_dir_guard: snapshot_dir_guard,
+            snapshot_directory_owner: Arc::downgrade(&snapshot_directory_owner),
+            _snapshot_directory_owner: Some(snapshot_directory_owner),
             snapshot_binding_path: Arc::new(snapshot_binding_path),
             durable_progress,
             voter_admission: Arc::new(std::sync::OnceLock::new()),
             sqlite_worker_gate: worker_gate,
             #[cfg(test)]
             apply_gate: Arc::clone(&backend.consensus_apply_gate),
-            storage_owner: tokio::sync::watch::channel(()).0,
+            storage_owner,
         })
     }
 
