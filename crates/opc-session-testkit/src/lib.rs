@@ -456,7 +456,10 @@ impl ConsensusTestCluster {
                     (node_ids[target], peer)
                 })
                 .collect();
-            let opening = async {
+            // Keep the large store-opening future out of the enclosing fixture
+            // state before adding optional election/tracing wrappers. Otherwise
+            // nested authenticated fixture constructors can exhaust test stacks.
+            let opening = Box::pin(async {
                 if fixed {
                     // This fixture exercises fixed authority, not strict snapshot or
                     // independent physical failure-domain qualification.
@@ -479,7 +482,7 @@ impl ConsensusTestCluster {
                     )
                     .await
                 }
-            };
+            });
             #[cfg(test)]
             let store = if let Some(scripts) = scripts {
                 scripts[index]
