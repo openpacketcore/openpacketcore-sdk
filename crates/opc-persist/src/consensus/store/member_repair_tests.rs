@@ -1,5 +1,5 @@
 use super::*;
-use opc_consensus::engine::raft::{AppendEntriesRequest, VoteRequest};
+use opc_consensus::engine::raft::{AppendEntriesRequest, PreVoteRequest, VoteRequest};
 use opc_consensus::engine::{CommittedLeaderId, Vote};
 
 #[derive(Debug)]
@@ -93,6 +93,20 @@ async fn empty_repair_cannot_vote_before_quorum_recovery() {
     };
     assert_repair_rejects_engine_request(
         ConsensusRpcFamily::Vote,
+        encode_config_wire(&request).unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn empty_repair_cannot_pre_vote_before_quorum_recovery() {
+    let sender = ConsensusNodeId::new(2).unwrap();
+    let request = PreVoteRequest {
+        vote: Vote::new(7, sender),
+        last_log_id: Some(LogId::new(CommittedLeaderId::new(6, sender), 3)),
+    };
+    assert_repair_rejects_engine_request(
+        ConsensusRpcFamily::PreVote,
         encode_config_wire(&request).unwrap(),
     )
     .await;
