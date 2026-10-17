@@ -524,7 +524,7 @@ impl ConfigConsensusCore {
             snapshot_dir: Arc::new(snapshot_dir),
             snapshot_gate: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
-            snapshot_test_hooks: Arc::new(super::storage::SnapshotTestHooks::default()),
+            snapshot_test_hooks: Arc::clone(&backend.consensus_snapshot_test_hooks),
             audit_key: Arc::new(backend.audit_key().clone()),
             management_audit_keys: backend.management_audit_keys(),
             _snapshot_dir_guard: snapshot_dir_guard,

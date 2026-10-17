@@ -119,3 +119,77 @@ fn discovery_rejects_invalid_authority_membership_and_first_chunk_shape() {
     invalid.done = true;
     assert!(valid_first_repair_chunk(node(1), &invalid, &members()));
 }
+
+#[tokio::test]
+async fn repair_source_waits_for_snapshot_progress_before_fetching() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().expect("snapshot directory");
+        let identity = opc_consensus::ConsensusIdentity::new(
+            opc_consensus::ConsensusClusterId::new("repair-snapshot-progress").unwrap(),
+            opc_consensus::ConsensusConfigurationId::from_bytes([0x73; 32]),
+            opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let topology =
+            ConfigConsensusTopology::try_new(identity, node(1), BTreeSet::from([node(1)]))
+                .expect("singleton topology");
+        let backend = SqliteBackend::in_memory_for_test().await.expect("backend");
+        let hooks = Arc::clone(&backend.consensus_snapshot_test_hooks);
+        let store = ConsensusConfigStore::open_with_operation_timeout(
+            topology,
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("store");
+        store.initialize_cluster().await.expect("singleton leader");
+        let required = store.inner.raft.metrics().borrow().last_log_index;
+        assert!(required.is_some());
+        assert!(store.inner.raft.metrics().borrow().snapshot.is_none());
+
+        hooks.pause_build.store(true, Ordering::Release);
+        let reads_before = hooks.reads_started.load(Ordering::Acquire);
+        let source = store.clone();
+        let repair = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                source.repair_snapshot_chunk(None, Instant::now() + Duration::from_secs(3)),
+            )
+            .await
+        });
+        hooks.build_started.notified().await;
+        // These real core messages flush metrics while the snapshot cut is
+        // unchanged. Their watch updates must not cause GetSnapshot requests.
+        for _ in 0..5 {
+            store
+                .inner
+                .raft
+                .with_raft_state(|_| ())
+                .await
+                .expect("live core");
+        }
+        let premature_reads = hooks.reads_started.load(Ordering::Acquire) - reads_before;
+        hooks.pause_build.store(false, Ordering::Release);
+        hooks.resume_build.notify_one();
+        let chunk = repair
+            .await
+            .expect("repair source joined")
+            .expect("repair source request stayed bounded")
+            .expect("repair source snapshot");
+        let running = store.inner.raft.metrics().borrow().running_state.clone();
+        store.shutdown().await.expect("shutdown source");
+        assert!(
+            running.is_ok(),
+            "snapshot request must leave the leader alive"
+        );
+        assert!(chunk.meta.last_log_id.map(|log| log.index) >= required);
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(
+            premature_reads, 0,
+            "snapshot fetch must wait for actual snapshot progress, not metrics flushes"
+        );
+    })
+    .await
+    .expect("snapshot progress regression must complete within its bound");
+}

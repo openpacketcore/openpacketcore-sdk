@@ -192,6 +192,8 @@ pub struct SqliteBackend {
     config_consensus_worker_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    pub(crate) consensus_snapshot_test_hooks: Arc<crate::consensus::SnapshotTestHooks>,
     /// Audit HMAC key used to seal and verify local audit-trail rows.
     audit_key: Arc<AuditKey>,
     management_audit_keys:
@@ -394,6 +396,8 @@ impl SqliteBackend {
             config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            consensus_snapshot_test_hooks: Arc::new(crate::consensus::SnapshotTestHooks::default()),
             audit_key: Arc::new(audit_key),
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
@@ -434,6 +438,8 @@ impl SqliteBackend {
             config_consensus_worker_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            consensus_snapshot_test_hooks: Arc::new(crate::consensus::SnapshotTestHooks::default()),
             audit_key: Arc::new(audit_key),
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),

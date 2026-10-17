@@ -38,6 +38,10 @@ pub(crate) struct SnapshotTestHooks {
     read_verified: tokio::sync::Notify,
     resume_read: tokio::sync::Notify,
     build_gate_acquired: AtomicBool,
+    pub(crate) pause_build: AtomicBool,
+    pub(crate) build_started: tokio::sync::Notify,
+    pub(crate) resume_build: tokio::sync::Notify,
+    pub(crate) reads_started: AtomicU64,
 }
 
 #[must_use = "staging artifacts must stay guarded until they are durably referenced"]
@@ -1172,6 +1176,11 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ConfigRaftTypeConfig>>, StorageError<ConsensusNodeId>> {
+        #[cfg(test)]
+        self.core
+            .snapshot_test_hooks
+            .reads_started
+            .fetch_add(1, Ordering::AcqRel);
         validate_snapshot_binding(&self.core)
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, error))?;
         let identity = self.core.identity;
@@ -1263,6 +1272,16 @@ impl RaftSnapshotBuilder<ConfigRaftTypeConfig> for SqliteConfigSnapshotBuilder {
             .snapshot_test_hooks
             .build_gate_acquired
             .store(true, Ordering::Release);
+        #[cfg(test)]
+        if self
+            .core
+            .snapshot_test_hooks
+            .pause_build
+            .load(Ordering::Acquire)
+        {
+            self.core.snapshot_test_hooks.build_started.notify_one();
+            self.core.snapshot_test_hooks.resume_build.notified().await;
+        }
         let raw = self
             .core
             .snapshot_dir

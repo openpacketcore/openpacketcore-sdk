@@ -25,6 +25,8 @@ mod snapshot_file;
 mod sqlite;
 pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
+#[cfg(test)]
+pub(crate) use storage::SnapshotTestHooks;
 mod store;
 mod types;
 
