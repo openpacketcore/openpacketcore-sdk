@@ -1366,15 +1366,31 @@ impl ConsensusConfigStore {
     ) -> Result<(), ConfigConsensusOpenError> {
         let mut metrics = self.inner.raft.metrics();
         loop {
-            {
+            let uniform_initial_membership = {
                 let current = metrics.borrow();
                 if current.running_state.is_err() {
                     return Err(ConfigConsensusOpenError::EngineUnavailable);
                 }
-                let membership = current.membership_config.as_ref();
-                if exact_uniform_voter_membership(membership, &self.inner.members) {
+                exact_uniform_voter_membership(
+                    current.membership_config.as_ref(),
+                    &self.inner.members,
+                )
+            };
+            if let Some(profile) = &self.inner.voter_profile {
+                // The initial roster is the predecessor during replacement.
+                // It can be exact while this node is only a learner, and it
+                // ceases to be exact when the new identity is promoted. Join
+                // against the published incarnation state and actual engine
+                // membership, including restored response fences.
+                tokio::time::timeout_at(deadline, profile.admission.reconcile())
+                    .await
+                    .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?
+                    .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
+                if profile.application_admitted(&self.inner.raft) {
                     return Ok(());
                 }
+            } else if uniform_initial_membership {
+                return Ok(());
             }
             match tokio::time::timeout_at(deadline, metrics.changed()).await {
                 Ok(Ok(())) => {}
@@ -1410,6 +1426,9 @@ impl ConsensusConfigStore {
     }
 
     fn apply_live_membership_admission(&self, live_membership_is_exact: bool) -> bool {
+        if let Some(profile) = &self.inner.voter_profile {
+            return profile.application_admitted(&self.inner.raft);
+        }
         if !self.inner.admitted.load(Ordering::Acquire) {
             return false;
         }

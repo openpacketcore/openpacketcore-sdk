@@ -262,6 +262,9 @@ impl ConfigVoterProfile {
             return false;
         };
         let metrics = raft.metrics().borrow().clone();
+        if metrics.running_state.is_err() {
+            return false;
+        }
         let membership = metrics.membership_config;
         let Some(cut) = *membership.log_id() else {
             return false;

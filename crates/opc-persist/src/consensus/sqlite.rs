@@ -771,6 +771,7 @@ pub(crate) fn validate_retained_schema(
     voter_slots::validate_profile_sync(conn, initial_slots)
 }
 
+#[cfg(test)]
 fn initialize_schema(
     conn: &Connection,
     identity: ConsensusIdentity,

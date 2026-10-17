@@ -311,6 +311,7 @@ async fn wait_for_admitted_candidate(candidate: &ConsensusConfigStore) {
         .initialize_cluster()
         .await
         .expect("candidate becomes an admitted voter");
+    assert!(candidate.status().admitted);
     assert!(candidate
         .inner
         .voter_profile
@@ -321,6 +322,7 @@ async fn wait_for_admitted_candidate(candidate: &ConsensusConfigStore) {
 }
 
 async fn learner_refuses_vote(fleet: &Fleet, candidate: &ConsensusConfigStore, term: u64) {
+    assert!(!candidate.status().admitted);
     let mut binding = fleet
         .network
         .learner_binding
