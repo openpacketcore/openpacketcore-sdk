@@ -356,3 +356,207 @@ async fn lost_vote_repair_never_grants_a_second_vote_under_the_same_identity() {
     .await
     .expect("five-voter lost-vote regression stays within the existing repair bound");
 }
+
+#[tokio::test]
+async fn completed_same_identity_repair_never_grants_a_second_vote() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fleet = FiveVoterFleet::start().await;
+        let source_term = fleet.stores[0].status().term;
+        fleet.partition();
+        // Wait for the engine's actual lease boundary. No randomized campaign,
+        // guessed sleep, synthetic term advance, or paused storage clock is used.
+        let (candidate, voter) = tokio::join!(
+            fleet.stores[3].wait_for_vote_lease_expiry_for_test(),
+            fleet.stores[4].wait_for_vote_lease_expiry_for_test(),
+        );
+        candidate.expect("candidate's old lease expires");
+        voter.expect("voter's old lease expires");
+        fleet.stores[3]
+            .trigger_election_for_test()
+            .await
+            .expect("candidate 4 starts a real campaign");
+        let first = fleet.votes[&(3, 4)]
+            .subscribe()
+            .wait_for(|votes| votes.iter().any(|(_, response)| response.vote_granted))
+            .await
+            .expect("voter 5 replies")
+            .iter()
+            .find(|(_, response)| response.vote_granted)
+            .cloned()
+            .expect("record original grant");
+        assert_eq!(first.0.vote, Vote::new(source_term + 1, fleet.nodes[3]));
+        assert_eq!(first.1.vote, first.0.vote);
+        assert_eq!(
+            first.0.last_log_id.map(|log| log.index),
+            fleet.stores[2].status().applied_index,
+            "candidate 3 has the same committed log as candidate 4",
+        );
+        assert_eq!(fleet.stores[3].status().leader_id, None);
+        assert_eq!(fleet.stores[4].status().leader_id, None);
+        let original_path = fleet.directory.path().join("node-4.sqlite");
+        assert_eq!(persisted_vote(&original_path), first.0.vote);
+
+        fleet.stores[0]
+            .probe_durable_readiness()
+            .await
+            .expect("source proves a fresh quorum consisting only of voters 1, 2, 3");
+        for store in &fleet.stores[..3] {
+            assert_eq!(store.status().term, source_term);
+            assert_eq!(store.status().leader_id, Some(fleet.nodes[0]));
+        }
+
+        // Candidate 3 has the same committed prefix, but a distinct candidate
+        // ID in the exact unfinished term whose original grant will be lost.
+        let second_vote = VoteRequest {
+            vote: Vote::new(first.0.vote.leader_id.term, fleet.nodes[2]),
+            last_log_id: first.0.last_log_id,
+        };
+        let payload = opc_consensus::encode_bounded(&(
+            opc_persist::CONFIG_CONSENSUS_WIRE_VERSION,
+            &second_vote,
+        ))
+        .expect("second candidate vote payload");
+        let request = ConsensusWireRequest::try_new(
+            fleet.identity,
+            fleet.nodes[2],
+            ConsensusRpcFamily::Vote,
+            payload,
+        )
+        .expect("second authenticated candidate");
+        let compatibility = fleet.stores[2].rpc_handler().compatibility().unwrap();
+        let endpoint = &fleet.paths[&(2, 4)];
+        endpoint.set_enabled(true);
+        let control = endpoint
+            .with_compatibility(compatibility)
+            .expect("bound original endpoint")
+            .call_with_compatibility(request.clone(), Some(compatibility), Duration::from_secs(3))
+            .await
+            .expect("deliver control request to the original voter");
+        let (_, control): (
+            u16,
+            Result<VoteResponse<ConfigConsensusNodeId>, RaftError<ConfigConsensusNodeId>>,
+        ) = opc_consensus::decode_bounded(control.response.result.as_ref().expect("control reply"))
+            .expect("control vote encoding");
+        let control = control.expect("control vote response");
+        assert!(
+            !control.vote_granted,
+            "retained vote rejects a second candidate"
+        );
+        assert_eq!(control.vote, first.0.vote);
+        endpoint.set_enabled(false);
+
+        fleet.stores[4].shutdown().await.expect("lose voter 5");
+        for ((_, target), peer) in &fleet.paths {
+            if *target == 4 {
+                *peer.handler.write().await = None;
+            }
+        }
+        // The old volume is inaccessible to the replacement. Keep it only as
+        // immutable test evidence of the vote that the repair cannot recover.
+        let repair_path = fleet.directory.path().join("replacement.sqlite");
+        let topology = ConfigConsensusTopology::try_new(
+            fleet.identity,
+            fleet.nodes[4],
+            fleet.nodes.into_iter().collect(),
+        )
+        .expect("same-identity repair topology");
+        let backend = SqliteBackend::provision_config_member_repair(
+            retained_options(&repair_path, topology.clone(), 9),
+            audit_key(),
+        )
+        .await
+        .expect("provision the existing repair path");
+        let peers = (0..4)
+            .map(|target| {
+                let peer: Arc<dyn ConsensusPeer> = fleet.paths[&(4, target)].clone();
+                (fleet.nodes[target], peer)
+            })
+            .collect();
+        let replacement = ConsensusConfigStore::open_with_operation_timeout(
+            topology,
+            backend,
+            fleet.directory.path().join("replacement-snapshots"),
+            peers,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("open the existing repair path");
+        replacement.disable_automatic_elections_for_test();
+        assert!(!replacement.status().admitted);
+        // Recover only from the lower-term quorum. No original volume or
+        // candidate 4 response can reconstruct voter 5's lost unfinished vote.
+        for ((source, target), peer) in &fleet.paths {
+            if *target == 4 {
+                peer.install(replacement.rpc_handler()).await;
+                peer.set_enabled(false);
+            } else if *source == 4 {
+                peer.set_enabled(*target < 3);
+            }
+        }
+        match replacement.initialize_cluster().await {
+            Ok(()) => {
+                replacement.disable_automatic_elections_for_test();
+                assert!(replacement.status().admitted);
+                assert_eq!(replacement.status().node_id, fleet.nodes[4]);
+                assert_eq!(
+                    replacement.status().applied_index,
+                    first.0.last_log_id.map(|log| log.index)
+                );
+                let restored = persisted_vote(&repair_path);
+                assert_eq!(restored, Vote::new_committed(source_term, fleet.nodes[0]));
+                assert!(restored.leader_id.term < first.0.vote.leader_id.term);
+                assert_eq!(persisted_vote(&original_path), first.0.vote);
+                for store in &fleet.stores[..3] {
+                    assert_eq!(store.status().term, source_term);
+                    assert_eq!(store.status().leader_id, Some(fleet.nodes[0]));
+                }
+                // The restored leader lease only delays the conflicting vote.
+                // Wait on the real engine boundary, without altering the term.
+                replacement
+                    .wait_for_vote_lease_expiry_for_test()
+                    .await
+                    .expect("restored lower-term leader lease expires");
+            }
+            Err(error) => {
+                // A safe implementation can refuse legacy restoration, but a
+                // timeout or fixture failure must never turn this test green.
+                assert_eq!(
+                    error.to_string(),
+                    "config consensus repair requires a new voter identity",
+                    "legacy recovery must complete or explicitly require replacement",
+                );
+                assert!(!replacement.status().admitted);
+            }
+        }
+        endpoint.set_enabled(true);
+        let response = endpoint
+            .with_compatibility(compatibility)
+            .expect("bound candidate endpoint")
+            .call_with_compatibility(request, Some(compatibility), Duration::from_secs(3))
+            .await
+            .expect("deliver second candidate's vote request");
+        let second_granted = response.response.result.as_ref().is_ok_and(|payload| {
+            let (_, vote): (
+                u16,
+                Result<VoteResponse<ConfigConsensusNodeId>, RaftError<ConfigConsensusNodeId>>,
+            ) = opc_consensus::decode_bounded(payload).expect("second engine response");
+            vote.is_ok_and(|vote| vote.vote_granted && vote.vote == second_vote.vote)
+        });
+        if second_granted {
+            assert_eq!(persisted_vote(&repair_path), second_vote.vote);
+        }
+        assert_eq!(persisted_vote(&original_path), first.0.vote);
+        replacement.shutdown().await.expect("stop replacement");
+        for store in &fleet.stores[..4] {
+            store.shutdown().await.expect("stop surviving voter");
+        }
+        assert!(
+            !second_granted,
+            "identity 5 durably granted candidate 4 and candidate 3 votes in term {}; \
+             a voter with lost vote state must be replaced under a new identity",
+            first.0.vote.leader_id.term,
+        );
+    })
+    .await
+    .expect("completed five-voter repair regression stays within the existing repair bound");
+}
