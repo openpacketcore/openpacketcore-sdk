@@ -216,12 +216,10 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
     assert_eq!(old_leader, 0);
     let initial = quorum.stores[0].status();
     assert_eq!(initial.applied_index, Some(1));
+    // Equal durable prefixes allow both candidates to retry at the same tick.
+    // A peer with a shorter log instead receives the engine's additional
+    // smaller-log backoff after a rejection; that is a separate scenario.
     for index in 2..=13_u8 {
-        if index == 13 {
-            quorum.paths[&(0, 1)]
-                .hold_log_entries
-                .store(true, Ordering::Release);
-        }
         let error = quorum.stores[0]
             .clear_recovery_required_idempotent(
                 opc_consensus::ConsensusRequestId::from_bytes([index; 16]),
@@ -233,12 +231,8 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
             error.kind(),
             opc_persist::PersistErrorKind::RollbackNotFound
         ));
-        for (node, store) in quorum.stores.iter().enumerate() {
-            let expected = if node == 1 && index == 13 {
-                12
-            } else {
-                u64::from(index)
-            };
+        for store in &quorum.stores {
+            let expected = u64::from(index);
             tokio::time::timeout(
                 Duration::from_secs(30),
                 store.wait_for_raft_status_for_test(|status| {
@@ -262,6 +256,7 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
         });
         quorum.observe_votes(Some(gate.clone()));
         quorum.isolate_and_quiesce(old_leader).await;
+        eprintln!("election_phase fixture=config elapsed_ms=0 phase=isolated equal_prefix=13");
         let first = election.late.campaign(Duration::ZERO, Duration::ZERO, true);
         let second = election.late.campaign(first, Duration::ZERO, false);
         let success = election.early.campaign(second, Duration::ZERO, false);
@@ -296,15 +291,21 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
                     }
                     for (observed_at, request) in &gate.arrivals.borrow()[count - 2..] {
                         assert_eq!(*observed_at, at);
-                        let expected = if request.vote.leader_id.voted_for()
-                            == Some(ConfigConsensusNodeId::new(2).unwrap())
-                        {
-                            12
-                        } else {
-                            13
-                        };
-                        assert_eq!(request.last_log_id.map(|id| id.index), Some(expected));
+                        assert!(matches!(
+                            request.vote.leader_id.voted_for().map(|node| node.get()),
+                            Some(2 | 3)
+                        ));
+                        assert_eq!(request.last_log_id.map(|id| id.index), Some(13));
                     }
+                    for script in &election.scripts[1..] {
+                        let draws = script.draws();
+                        assert_eq!(draws.len(), if seconds == 18 { 2 } else { 3 });
+                        assert_eq!(draws.last().unwrap().0, at);
+                    }
+                    eprintln!(
+                        "election_phase fixture=config elapsed_ms={} phase=split_and_resampled",
+                        seconds * 1000
+                    );
                 }
             }
         };
@@ -319,7 +320,7 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
             .expect("original helper panic");
         assert!(message.starts_with("surviving quorum failed to elect a new leader:"));
         eprintln!("acquisition_deadline fixture=config elapsed_ms=30000 failed_campaigns=2");
-        for (index, expected) in [(1, 12), (2, 13)] {
+        for (index, expected) in [(1, 13), (2, 13)] {
             let status = quorum.stores[index].status();
             assert_eq!(status.term, initial.term + 2);
             assert_eq!(status.leader_id, None);

@@ -33,6 +33,7 @@ struct Exchange {
 
 pub(super) struct VoteGate {
     first_term: u64,
+    split: bool,
     crossing: Barrier,
     exchanges: watch::Sender<Vec<Exchange>>,
 }
@@ -51,7 +52,7 @@ impl VoteGate {
         let vote: VoteRequest<SessionConsensusNodeId> =
             opc_consensus::decode_bounded(&request.payload).unwrap();
         assert!((self.first_term..=self.first_term + 2).contains(&vote.vote.leader_id.term));
-        if vote.vote.leader_id.term < self.first_term + 2 {
+        if self.split && vote.vote.leader_id.term < self.first_term + 2 {
             // Both requests exist only after their real self-votes persist.
             self.crossing.wait().await;
         }
@@ -102,6 +103,57 @@ fn key(index: usize) -> SessionKey {
     }
 }
 
+async fn replicated_cluster(
+    scripts: &[ElectionRngScript],
+    old: usize,
+    short: usize,
+    nodes: [SessionConsensusNodeId; 3],
+    unequal: bool,
+) -> ConsensusTestCluster {
+    let cluster = ConsensusTestCluster::start_controlled(
+        3,
+        false,
+        opc_session_store::FencedTransitionV2Profile::V2,
+        Some(scripts),
+    )
+    .await;
+    for (store, node) in cluster.stores.iter().zip(nodes) {
+        assert_eq!(store.status().node_id, node);
+    }
+    let initial = cluster.stores[old].status();
+    assert_eq!(initial.leader_id, Some(nodes[old]));
+    for index in 0..2 {
+        if unequal && index == 1 {
+            cluster.paths[&(old, short)]
+                .hold_log_entries
+                .store(true, Ordering::Release);
+        }
+        cluster.stores[old]
+            .acquire(
+                &key(index),
+                OwnerId::new("election-owner").unwrap(),
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap();
+        let committed = cluster.stores[old].status().applied_index.unwrap();
+        for (node, store) in cluster.stores.iter().enumerate() {
+            let expected = if unequal && index == 1 && node == short {
+                committed - 1
+            } else {
+                committed
+            };
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                store.wait_for_status_for_test(|status| status.applied_index == Some(expected)),
+            )
+            .await
+            .expect("normal-time replicated prefix");
+        }
+    }
+    cluster
+}
+
 #[tokio::test(start_paused = true)]
 async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
     let origin = Instant::now();
@@ -136,50 +188,14 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
             })
         })
         .collect();
-    let cluster = ConsensusTestCluster::start_controlled(
-        3,
-        false,
-        opc_session_store::FencedTransitionV2Profile::V2,
-        Some(&scripts),
-    )
-    .await;
-    for (store, node) in cluster.stores.iter().zip(nodes) {
-        assert_eq!(store.status().node_id, node);
-    }
+    // Repeated splits use equal durable prefixes. An unequal rejection makes
+    // the shorter node back off by the engine's additional smaller-log delay;
+    // the separate unequal-log control below exercises that rejection.
+    let cluster = replicated_cluster(&scripts, old, short, nodes, false).await;
     let initial = cluster.stores[old].status();
-    assert_eq!(initial.leader_id, Some(nodes[old]));
-    for index in 0..2 {
-        if index == 1 {
-            cluster.paths[&(old, short)]
-                .hold_log_entries
-                .store(true, Ordering::Release);
-        }
-        cluster.stores[old]
-            .acquire(
-                &key(index),
-                OwnerId::new("election-owner").unwrap(),
-                Duration::from_secs(3600),
-            )
-            .await
-            .unwrap();
-        let committed = cluster.stores[old].status().applied_index.unwrap();
-        for (node, store) in cluster.stores.iter().enumerate() {
-            let expected = if index == 1 && node == short {
-                committed - 1
-            } else {
-                committed
-            };
-            tokio::time::timeout(
-                Duration::from_secs(30),
-                store.wait_for_status_for_test(|status| status.applied_index == Some(expected)),
-            )
-            .await
-            .expect("normal-time replicated prefix");
-        }
-    }
     let short_prefix = cluster.stores[short].status().applied_index.unwrap();
     let long_prefix = cluster.stores[long].status().applied_index.unwrap();
-    assert_eq!(long_prefix, short_prefix + 1);
+    assert_eq!(long_prefix, short_prefix);
     let mut sleeps = scripts[short].sleeps();
     let before = sleeps.borrow().len();
     tokio::time::timeout(
@@ -216,6 +232,7 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
         }
         let gate = Arc::new(VoteGate {
             first_term: initial.term + 1,
+            split: true,
             crossing: Barrier::new(2),
             exchanges: watch::channel(Vec::new()).0,
         });
@@ -228,6 +245,9 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
                 let _quiesced = path.admitted.write().await;
             }
         }
+        eprintln!(
+            "election_phase fixture=session elapsed_ms=0 phase=isolated equal_prefix={long_prefix}"
+        );
         let first = late.campaign(Duration::ZERO, Duration::ZERO, true);
         let second = late.campaign(first, Duration::ZERO, false);
         let success = early.campaign(second, Duration::ZERO, false);
@@ -298,6 +318,17 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
                         );
                     }
                 }
+                if seconds == 18 || seconds == 27 {
+                    for index in &survivors {
+                        let draws = scripts[*index].draws();
+                        assert_eq!(draws.len(), if seconds == 18 { 2 } else { 3 });
+                        assert_eq!(draws.last().unwrap().0, at);
+                    }
+                    eprintln!(
+                        "election_phase fixture=session elapsed_ms={} phase=split_and_resampled",
+                        seconds * 1000
+                    );
+                }
                 // A waiter must fail at its own deadline before the clock advances.
                 if seconds == 26 {
                     at26.take().unwrap().await.unwrap();
@@ -366,4 +397,145 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
     .await;
     // RED checkpoint: surface the original deadline failure after cleanup.
     std::panic::resume_unwind(result);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unequal_log_rejects_first_automatic_campaign_without_a_competing_self_vote() {
+    let origin = Instant::now();
+    tokio::time::resume();
+    let (ticks, _observer) = delivery::TickDelivery::install();
+    let config = durable_openraft_config(DurableOpenraftDomain::SessionState).unwrap();
+    let calibration = ElectionRngScript::new([EARLY]);
+    let sample = calibration
+        .scope(async { config.new_rand_election_timeout::<ScriptedElectionRuntime>() })
+        .await;
+    calibration.finish();
+    let schedule = schedule::ElectionSchedule::new(&config, Duration::from_millis(sample));
+    let nodes = nodes();
+    let old = (0..3).min_by_key(|index| nodes[*index]).unwrap();
+    let survivors: Vec<_> = (0..3).filter(|index| *index != old).collect();
+    let short = survivors[0];
+    let long = survivors[1];
+    let scripts: Vec<_> = (0..3)
+        .map(|index| {
+            ElectionRngScript::new(if index == old {
+                vec![LATE; 2]
+            } else if index == short {
+                vec![EARLY, LATE]
+            } else {
+                vec![LATE]
+            })
+        })
+        .collect();
+    let cluster = replicated_cluster(&scripts, old, short, nodes, true).await;
+    let term = cluster.stores[old].status().term;
+    let short_prefix = cluster.stores[short].status().applied_index.unwrap();
+    let long_prefix = cluster.stores[long].status().applied_index.unwrap();
+    assert_eq!(long_prefix, short_prefix + 1);
+    let mut sleeps = scripts[short].sleeps();
+    let before = sleeps.borrow().len();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        sleeps.wait_for(|sleeps| sleeps.len() > before),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::pause();
+    schedule::with_frozen_time(async {
+        let millis = (Instant::now() + schedule.tick - origin)
+            .as_nanos()
+            .div_ceil(1_000_000);
+        let started = origin + Duration::from_millis(millis.try_into().unwrap());
+        tokio::time::advance(started - Instant::now()).await;
+        for (index, script) in scripts.iter().enumerate() {
+            schedule::tick_registered(&mut script.sleeps(), started, schedule.tick).await;
+            ticks.wait(nodes[index].get(), started).await;
+        }
+        assert!(cluster.stores[old]
+            .probe_durable_readiness()
+            .await
+            .is_ready());
+        for index in &survivors {
+            while cluster.stores[*index]
+                .vote_updated_at_for_test()
+                .await
+                .unwrap()
+                != Some(started)
+            {
+                tokio::task::yield_now().await;
+            }
+        }
+        let gate = Arc::new(VoteGate {
+            first_term: term + 1,
+            split: false,
+            crossing: Barrier::new(2),
+            exchanges: watch::channel(Vec::new()).0,
+        });
+        for path in cluster.paths.values() {
+            *path.election_vote.lock().unwrap() = Some(gate.clone());
+        }
+        cluster.set_node_online(old, false);
+        for ((source, target), path) in &cluster.paths {
+            if *source == old || *target == old {
+                let _quiesced = path.admitted.write().await;
+            }
+        }
+        let first = schedule.campaign(Duration::ZERO, Duration::ZERO, true);
+        assert_eq!(first, Duration::from_secs(15));
+        assert!(
+            first > schedule.lease,
+            "rejection occurs after the committed lease expires"
+        );
+        for seconds in (3..=15).step_by(3) {
+            let at = started + Duration::from_secs(seconds);
+            tokio::time::advance(at - Instant::now()).await;
+            for (index, script) in scripts.iter().enumerate() {
+                schedule::tick_registered(&mut script.sleeps(), at, schedule.tick).await;
+                ticks.wait(nodes[index].get(), at).await;
+            }
+        }
+        let exchanges = gate.observed(1).await;
+        let exchange = &exchanges[0];
+        assert_eq!(exchange.at, started + first);
+        assert_eq!(exchange.source, nodes[short]);
+        assert_eq!(exchange.target, nodes[long]);
+        assert_eq!(exchange.request.vote, Vote::new(term + 1, nodes[short]));
+        assert_eq!(
+            exchange.request.last_log_id.map(|id| id.index),
+            Some(short_prefix)
+        );
+        assert!(!exchange.response.vote_granted);
+        assert_eq!(
+            exchange.response.last_log_id.map(|id| id.index),
+            Some(long_prefix)
+        );
+        assert_eq!(
+            exchange.response.vote,
+            Vote::new_committed(term, nodes[old]),
+            "the rejecting voter never cast a competing self-vote"
+        );
+        assert_eq!(
+            scripts[long].draws().len(),
+            1,
+            "only construction sampled on the rejecting voter"
+        );
+        assert_eq!(
+            scripts[short].draws().len(),
+            2,
+            "the real automatic candidate resampled"
+        );
+        assert_eq!(scripts[short].draws()[1].0, started + first);
+        assert_eq!(cluster.stores[short].status().term, term + 1);
+        assert_eq!(cluster.stores[short].status().leader_id, None);
+        eprintln!("election_phase fixture=session_unequal elapsed_ms=15000 phase=log_rejection_without_competing_vote");
+        for path in cluster.paths.values() {
+            *path.election_vote.lock().unwrap() = None;
+        }
+        cluster.shutdown().await;
+        for script in &scripts {
+            script.finish();
+        }
+    })
+    .await;
 }
