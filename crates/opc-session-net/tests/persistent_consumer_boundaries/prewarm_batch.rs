@@ -646,6 +646,10 @@ fn cancelled_prewarm_outside_runtime_releases_admission_and_expires_survivors() 
         tokio::time::advance(Duration::from_millis(25)).await;
     });
 
+    // Cancellation must use the client's paused clock even when real time
+    // advances after leaving its runtime. A wall-clock cooldown stamp would
+    // strand recovery beyond the scenario's exact 25 + 9 + 1 ms advances.
+    std::thread::sleep(Duration::from_millis(50));
     assert!(tokio::runtime::Handle::try_current().is_err());
     let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(prewarm)));
     if cancelled.is_err() {
