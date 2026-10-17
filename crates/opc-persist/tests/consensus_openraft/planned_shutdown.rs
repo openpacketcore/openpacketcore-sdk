@@ -1,4 +1,39 @@
 use super::*;
+use opc_consensus::{PlannedShutdownFallback, PlannedShutdownOutcome};
+
+pub(super) struct TransferGate {
+    captured: tokio::sync::mpsc::Sender<ConsensusWireRequest>,
+    release: tokio::sync::watch::Receiver<bool>,
+}
+
+impl TransferGate {
+    pub(super) async fn before_delivery(&self, request: &ConsensusWireRequest) {
+        self.captured.send(request.clone()).await.unwrap();
+        let mut release = self.release.clone();
+        release.wait_for(|released| *released).await.unwrap();
+    }
+}
+
+fn hold_transfer(
+    cluster: &ThreeNodeCluster,
+    leader: usize,
+) -> (
+    tokio::sync::mpsc::Receiver<ConsensusWireRequest>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let (captured, receiver) = tokio::sync::mpsc::channel(8);
+    let (release, released) = tokio::sync::watch::channel(false);
+    let gate = Arc::new(TransferGate {
+        captured,
+        release: released,
+    });
+    for ((source, _), peer) in &cluster.paths {
+        if *source == leader {
+            *peer.transfer_gate.lock().unwrap() = Some(gate.clone());
+        }
+    }
+    (receiver, release)
+}
 
 /// Keep disk work off the protocol clock. Even the earliest ordinary election
 /// needs the unchanged eight-second lease plus five-second election timeout.
@@ -131,6 +166,173 @@ async fn planned_leader_stop_preserves_write_stream_within_operation_budget() {
             )
             .await
             .expect("same-ID recovery finds the accepted write after handoff");
+        cluster.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_shutdown_observer_keeps_one_handoff_and_rejects_forged_requests() {
+    scripted_election::schedule::with_frozen_time(async {
+        let cluster = ThreeNodeCluster::start().await;
+        let leader = cluster.leader();
+        let leader_id = cluster.stores[leader].status().node_id;
+        let term = cluster.stores[leader].status().term;
+        let survivors: Vec<_> = (0..3).filter(|index| *index != leader).collect();
+        let (mut captured, release) = hold_transfer(&cluster, leader);
+        let store = cluster.stores[leader].clone();
+        let observer = tokio::spawn(async move { store.shutdown_with_report().await });
+        let exact = captured
+            .recv()
+            .await
+            .expect("owned handoff reached transport");
+        observer.abort();
+        assert!(observer.await.unwrap_err().is_cancelled());
+        assert!(!cluster.stores[leader].status().admitted);
+        let tx = TxId::new();
+        assert!(
+            cluster.stores[leader]
+                .append_attested_commit_local(attested(commit(tx, None, 1, 10), audit(tx)))
+                .await
+                .is_err(),
+            "cancelled observer cannot reopen proposal admission"
+        );
+
+        let handler = cluster.stores[survivors[0]].rpc_handler();
+        let other_id = cluster.stores[survivors[1]].status().node_id;
+        for (sender, request, compatibility) in [
+            (other_id, exact.clone(), handler.compatibility()),
+            (
+                other_id,
+                ConsensusWireRequest {
+                    sender: other_id,
+                    ..exact.clone()
+                },
+                handler.compatibility(),
+            ),
+            (
+                leader_id,
+                ConsensusWireRequest {
+                    identity: topology().identity(),
+                    ..exact.clone()
+                },
+                handler.compatibility(),
+            ),
+            (leader_id, exact.clone(), Some([0; 32])),
+        ] {
+            assert_eq!(
+                handler
+                    .handle_with_compatibility(sender, request, compatibility)
+                    .await
+                    .result,
+                Err(ConsensusPeerError::ScopeMismatch)
+            );
+        }
+        assert_eq!(
+            handler
+                .handle_with_compatibility(
+                    leader_id,
+                    ConsensusWireRequest {
+                        payload: Vec::new(),
+                        ..exact.clone()
+                    },
+                    handler.compatibility()
+                )
+                .await
+                .result,
+            Err(ConsensusPeerError::Protocol)
+        );
+        assert!(cluster
+            .stores
+            .iter()
+            .all(|store| store.status().term == term));
+        release.send_replace(true);
+        let report = cluster.stores[leader].shutdown_with_report().await.unwrap();
+        let PlannedShutdownOutcome::LeaderTransferred { successor } = report else {
+            panic!("expected a confirmed successor: {report:?}");
+        };
+        assert_ne!(successor, leader_id);
+        assert_eq!(captured.try_recv().unwrap(), exact);
+        assert!(captured.try_recv().is_err());
+        assert_eq!(
+            cluster.stores[leader].shutdown_with_report().await.unwrap(),
+            report
+        );
+        assert!(
+            captured.try_recv().is_err(),
+            "a clone observes the retained result"
+        );
+        assert!(!cluster.stores[leader].status().admitted);
+
+        let response = handler
+            .handle_with_compatibility(leader_id, exact, handler.compatibility())
+            .await;
+        let (_, stale): (
+            u16,
+            Result<
+                (),
+                opc_consensus::engine::error::RaftError<
+                    ConfigConsensusNodeId,
+                    opc_consensus::engine::raft::TransferLeaderError,
+                >,
+            >,
+        ) = opc_consensus::decode_bounded(&response.result.unwrap()).unwrap();
+        assert_eq!(
+            stale,
+            Err(opc_consensus::engine::error::RaftError::APIError(
+                opc_consensus::engine::raft::TransferLeaderError::VoteChanged
+            ))
+        );
+        cluster.isolate(leader);
+        let successor = cluster
+            .stores
+            .iter()
+            .position(|store| store.status().node_id == successor)
+            .unwrap();
+        cluster.stores[successor]
+            .append_attested_commit_local(attested(commit(tx, None, 1, 10), audit(tx)))
+            .await
+            .unwrap();
+        cluster.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_handoff_falls_back_once_within_the_original_shutdown_budget() {
+    scripted_election::schedule::with_frozen_time(async {
+        let cluster = ThreeNodeCluster::start().await;
+        let leader = cluster.leader();
+        let (mut captured, _release) = hold_transfer(&cluster, leader);
+        let store = cluster.stores[leader].clone();
+        let started = tokio::time::Instant::now();
+        let stopping = tokio::spawn(async move { store.shutdown_with_report().await });
+        captured
+            .recv()
+            .await
+            .expect("handoff entered its owned deadline");
+        let handoff_budget = opc_consensus::planned_shutdown_timeout(Duration::from_secs(3));
+        tokio::time::advance(handoff_budget + Duration::from_millis(1)).await;
+        let report = stopping
+            .await
+            .unwrap()
+            .expect("fallback still joins the engine");
+        assert_eq!(
+            report,
+            PlannedShutdownOutcome::Fallback {
+                reason: PlannedShutdownFallback::SurvivingQuorumUnavailable,
+            }
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!cluster.stores[leader].status().admitted);
+        assert_eq!(
+            cluster.stores[leader].shutdown_with_report().await.unwrap(),
+            report
+        );
+        assert!(
+            captured.try_recv().is_err(),
+            "failed handoff is never restarted"
+        );
         cluster.shutdown().await;
     })
     .await;

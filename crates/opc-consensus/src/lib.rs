@@ -15,6 +15,7 @@ pub mod codec;
 pub mod identity;
 pub mod linearizability;
 pub mod profile;
+pub mod shutdown;
 pub mod transport;
 pub mod voter_slots;
 
@@ -53,6 +54,7 @@ pub use profile::{
     DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
     DURABLE_OPENRAFT_PROFILE, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
+pub use shutdown::{planned_shutdown_timeout, PlannedShutdownFallback, PlannedShutdownOutcome};
 pub use transport::{
     decode_roster_bounded, encode_roster_bounded, ConsensusCallResponse, ConsensusCompatibility,
     ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler,

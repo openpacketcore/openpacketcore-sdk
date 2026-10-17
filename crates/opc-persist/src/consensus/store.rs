@@ -3,6 +3,7 @@
 mod audit;
 mod audit_continuity;
 mod compatibility;
+mod planned_shutdown;
 pub(crate) mod voter_slots;
 
 #[cfg(test)]
@@ -314,6 +315,7 @@ struct ConsensusConfigStoreInner {
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
     durable_progress: Arc<storage::ConfigDurableProgress>,
     voter_profile: Option<Arc<voter_slots::ConfigVoterProfile>>,
+    shutdown: planned_shutdown::ConfigShutdownCoordinator,
 }
 
 /// SQLite config state coordinated by the SDK's shared Openraft engine.
@@ -689,6 +691,7 @@ impl ConsensusConfigStore {
                 clock,
                 operation_timeout,
                 admitted: AtomicBool::new(false),
+                shutdown: planned_shutdown::ConfigShutdownCoordinator::new(),
                 audit_continuity,
                 linearizability,
                 proposal_admission: Arc::new(tokio::sync::Semaphore::new(
@@ -793,7 +796,8 @@ impl ConsensusConfigStore {
                         ),
                 )
             });
-        let admitted = self.apply_live_membership_admission(live_membership_is_exact);
+        let admitted = !self.inner.shutdown.is_started()
+            && self.apply_live_membership_admission(live_membership_is_exact);
 
         ConfigConsensusStatus {
             node_id: self.inner.local_node_id,
@@ -1021,13 +1025,17 @@ impl ConsensusConfigStore {
             .into_result()
     }
 
-    /// Stop this Openraft node and all of its engine tasks.
+    /// Hand off a leader, then stop this Openraft node and join its engine tasks.
+    ///
+    /// Stop external consumers first and keep the authenticated replication
+    /// listener available until this call finishes. The clone-wide handoff is
+    /// bounded within the existing operation budget; failure falls back to
+    /// ordinary shutdown and is logged with a typed reason. Use
+    /// [`Self::shutdown_with_report`] to inspect that result. Cancelling a caller
+    /// does not cancel the owned shutdown or reopen local admission. If a caller
+    /// times out, a later clone must observe completion before reopening storage.
     pub async fn shutdown(&self) -> Result<(), PersistError> {
-        self.inner
-            .raft
-            .shutdown()
-            .await
-            .map_err(|_| consensus_unavailable())
+        self.shutdown_with_report().await.map(|_| ())
     }
 
     /// Append with a caller-retained durable request ID so a timed-out caller
@@ -1296,7 +1304,7 @@ impl ConsensusConfigStore {
     }
 
     fn require_admission(&self) -> Result<(), PersistError> {
-        if self.exact_membership_is_admitted() {
+        if !self.inner.shutdown.is_started() && self.exact_membership_is_admitted() {
             Ok(())
         } else {
             Err(consensus_unavailable())
@@ -1991,7 +1999,16 @@ impl ConfigConsensusService {
         match request.family {
             ConsensusRpcFamily::Vote
             | ConsensusRpcFamily::AppendEntries
-            | ConsensusRpcFamily::InstallSnapshot => {
+            | ConsensusRpcFamily::InstallSnapshot
+            | ConsensusRpcFamily::LeadershipTransfer => {
+                if request.family == ConsensusRpcFamily::LeadershipTransfer
+                    && (!self.store.exact_membership_is_admitted()
+                        || !self.store.is_live_voter(authenticated_sender))
+                {
+                    return ConsensusWireResponse {
+                        result: Err(ConsensusPeerError::ScopeMismatch),
+                    };
+                }
                 if let Err(error) = self
                     .store
                     .inner

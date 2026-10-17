@@ -83,6 +83,7 @@ struct LoopbackPeer {
     retention_vote: Arc<StdMutex<Option<Arc<retention_election::SplitVote>>>>,
     rolling_vote: Arc<StdMutex<Option<Arc<rolling_election::VoteGate>>>>,
     transfer_lag: Arc<StdMutex<Option<TransferLagSender>>>,
+    transfer_gate: Arc<StdMutex<Option<Arc<planned_shutdown::TransferGate>>>>,
 }
 
 impl LoopbackPeer {
@@ -103,6 +104,7 @@ impl LoopbackPeer {
             retention_vote: Arc::new(StdMutex::new(None)),
             rolling_vote: Arc::new(StdMutex::new(None)),
             transfer_lag: Arc::new(StdMutex::new(None)),
+            transfer_gate: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -206,6 +208,12 @@ impl ConsensusPeer for LoopbackPeer {
         };
         if required.is_some() && required != compatibility {
             return Err(ConsensusPeerError::ScopeMismatch);
+        }
+        let transfer_gate = self.transfer_gate.lock().unwrap().clone();
+        if family == ConsensusRpcFamily::LeadershipTransfer {
+            if let Some(gate) = transfer_gate {
+                gate.before_delivery(&request).await;
+            }
         }
         let election_vote = self
             .election_vote

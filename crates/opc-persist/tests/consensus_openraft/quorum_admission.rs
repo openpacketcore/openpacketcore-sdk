@@ -271,6 +271,49 @@ async fn retained_majority_reopens_without_the_third_voter() {
 }
 
 #[tokio::test]
+async fn rolling_restart_hands_off_each_current_leader_and_preserves_writes() {
+    let mut fleet = RetainedFleet::start().await;
+    let mut stopped = BTreeSet::new();
+    for _ in 0..3 {
+        let leader = (0..3)
+            .find(|index| {
+                let status = fleet.store(*index).status();
+                status.leader_id == Some(status.node_id)
+            })
+            .expect("current writable leader");
+        let term = fleet.store(leader).status().term;
+        let report = fleet.store(leader).shutdown_with_report().await.unwrap();
+        let opc_consensus::PlannedShutdownOutcome::LeaderTransferred { successor } = report else {
+            panic!("planned leader restart did not hand off: {report:?}");
+        };
+        stopped.insert(leader);
+        fleet.stop(leader).await;
+        let successor = (0..3)
+            .find(|index| *index != leader && fleet.store(*index).status().node_id == successor)
+            .unwrap();
+        assert!(fleet.store(successor).status().term > term);
+        fleet.append(successor).await;
+        fleet
+            .open(
+                leader,
+                Protocol::Current,
+                DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout(),
+            )
+            .await;
+        fleet.admit(&[leader]).await;
+        fleet.assert_reads(&[0, 1, 2]).await;
+        fleet.append(leader).await;
+        fleet.assert_reads(&[0, 1, 2]).await;
+    }
+    assert_eq!(
+        stopped.len(),
+        3,
+        "every voter was restarted while it was leader"
+    );
+    fleet.stop_all().await;
+}
+
+#[tokio::test]
 async fn lone_retained_voter_retries_admission_without_restarting() {
     let mut fleet = RetainedFleet::start().await;
     fleet.stop_all().await;

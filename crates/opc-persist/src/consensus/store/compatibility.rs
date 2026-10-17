@@ -223,6 +223,7 @@ impl ConsensusPeer for CompatiblePeer {
             ConsensusRpcFamily::Vote
                 | ConsensusRpcFamily::AppendEntries
                 | ConsensusRpcFamily::InstallSnapshot
+                | ConsensusRpcFamily::LeadershipTransfer
         ) {
             return self.peer.call_with_timeout(request, timeout).await;
         }
