@@ -37,6 +37,16 @@ struct RepairChunk {
     done: bool,
 }
 
+pub(super) struct RepairDownload {
+    source: ConsensusNodeId,
+    vote: Vote<ConsensusNodeId>,
+    meta: SnapshotMeta<ConsensusNodeId, EmptyNode>,
+    snapshot: Box<crate::consensus::snapshot_file::ConfigSnapshotFile>,
+    offset: u64,
+    chunk: Option<RepairChunk>,
+    done: bool,
+}
+
 pub(super) async fn handle(store: &ConsensusConfigStore, payload: &[u8]) -> ConsensusWireResponse {
     let request: RepairRequest = match decode_config_wire(payload) {
         Ok(request) => request,
@@ -194,14 +204,59 @@ impl ConsensusConfigStore {
         &self,
         deadline: Instant,
     ) -> Result<(), ConfigConsensusOpenError> {
-        let recovery = async {
-            let _guard = self.inner.repair_lock.lock().await;
-            while self.inner.repair_pending.load(Ordering::Acquire) {
-                if self.inner.shutdown.is_started() {
-                    return Err(ConfigConsensusOpenError::EngineUnavailable);
-                }
-                // Discover in parallel: a follower rejects immediately and
-                // an unreachable route cannot delay trying the actual leader.
+        let mut saved = tokio::select! {
+            biased;
+            _ = self.inner.shutdown.wait_started() => {
+                return Err(ConfigConsensusOpenError::EngineUnavailable);
+            }
+            result = tokio::time::timeout_at(deadline, self.inner.repair_progress.lock()) => {
+                result.map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?
+            }
+        };
+        // While an attempt runs, it owns the file locally. External
+        // cancellation therefore drops it, including a resumed checkpoint.
+        let mut progress = saved.take();
+        let result = tokio::select! {
+            biased;
+            _ = self.inner.shutdown.wait_started() => {
+                Err(ConfigConsensusOpenError::EngineUnavailable)
+            }
+            result = tokio::time::timeout_at(
+                deadline,
+                self.continue_member_recovery(&mut progress, deadline),
+            ) => result.unwrap_or(Err(ConfigConsensusOpenError::ClusterFormationRejected)),
+        };
+        // An ordinary bounded attempt may need several calls for a large
+        // snapshot. Preserve its verified cursor without extending this call.
+        if Instant::now() >= deadline && !self.inner.shutdown.is_started() {
+            *saved = progress;
+        }
+        result
+    }
+
+    async fn continue_member_recovery(
+        &self,
+        progress: &mut Option<RepairDownload>,
+        deadline: Instant,
+    ) -> Result<(), ConfigConsensusOpenError> {
+        while self.inner.repair_pending.load(Ordering::Acquire) {
+            if self.inner.shutdown.is_started() {
+                return Err(ConfigConsensusOpenError::EngineUnavailable);
+            }
+            // Installation belongs to the engine once dispatched and can
+            // finish after an earlier caller's deadline or cancellation.
+            // Engine RPCs remain gated, so only this recovery could have
+            // installed a snapshot on this initially empty repair root.
+            if self.installed_repair_is_ready().await {
+                *progress = None;
+                self.inner.repair_pending.store(false, Ordering::Release);
+                self.inner.raft.runtime_config().elect(true);
+                self.inner.raft.runtime_config().heartbeat(true);
+                return Ok(());
+            }
+            if progress.is_none() {
+                // A follower rejects immediately; an unreachable route must
+                // not delay trying the actual leader.
                 let mut requests = futures_util::stream::FuturesUnordered::new();
                 for target in self.inner.peers.keys().copied() {
                     requests.push(async move {
@@ -221,25 +276,44 @@ impl ConsensusConfigStore {
                 }
                 drop(requests);
                 if let Some((source, first)) = source {
-                    if self
-                        .restore_repair_snapshot(source, first, deadline)
-                        .await
-                        .is_ok()
-                    {
-                        self.inner.repair_pending.store(false, Ordering::Release);
-                        self.inner.raft.runtime_config().elect(true);
-                        self.inner.raft.runtime_config().heartbeat(true);
-                        return Ok(());
-                    }
+                    *progress = self.start_repair_snapshot(source, first).await.ok();
                 }
-                tokio::time::sleep_until((Instant::now() + ROUTE_RETRY_BACKOFF).min(deadline))
-                    .await;
             }
-            Ok(())
+            if progress.is_some() {
+                let restored = self.restore_repair_snapshot(progress, deadline).await;
+                if restored.is_ok() {
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    return Err(ConfigConsensusOpenError::ClusterFormationRejected);
+                }
+                // Rejection before the deadline can mean the leader or its
+                // snapshot changed. Rediscover instead of splicing versions.
+                *progress = None;
+            }
+            tokio::time::sleep_until((Instant::now() + ROUTE_RETRY_BACKOFF).min(deadline)).await;
+        }
+        Ok(())
+    }
+
+    async fn installed_repair_is_ready(&self) -> bool {
+        let Ok(Some(snapshot)) = self.inner.raft.get_snapshot().await else {
+            return false;
         };
-        tokio::time::timeout_at(deadline, recovery)
-            .await
-            .unwrap_or(Err(ConfigConsensusOpenError::ClusterFormationRejected))
+        if snapshot.meta.last_log_id.is_none()
+            || !exact_uniform_voter_membership(&snapshot.meta.last_membership, &self.inner.members)
+            || self.inner.shutdown.is_started()
+        {
+            return false;
+        }
+        map_watch_snapshot(&self.inner.raft.metrics(), |current| {
+            current.running_state.is_ok()
+                && current.last_applied >= snapshot.meta.last_log_id
+                && exact_uniform_voter_membership(
+                    current.membership_config.as_ref(),
+                    &self.inner.members,
+                )
+        })
     }
 
     async fn fetch_repair_chunk(
@@ -261,75 +335,101 @@ impl ConsensusConfigStore {
         .await
     }
 
-    async fn restore_repair_snapshot(
+    async fn start_repair_snapshot(
         &self,
         source: ConsensusNodeId,
-        mut chunk: RepairChunk,
-        deadline: Instant,
-    ) -> Result<(), PersistError> {
-        let vote = chunk.vote;
-        let meta = chunk.meta.clone();
-        if !vote.is_committed()
-            || vote.leader_id.voted_for() != Some(source)
-            || meta.last_log_id.is_none()
-            || !exact_uniform_voter_membership(&meta.last_membership, &self.inner.members)
+        chunk: RepairChunk,
+    ) -> Result<RepairDownload, PersistError> {
+        if !chunk.vote.is_committed()
+            || chunk.vote.leader_id.voted_for() != Some(source)
+            || chunk.meta.last_log_id.is_none()
+            || !exact_uniform_voter_membership(&chunk.meta.last_membership, &self.inner.members)
         {
             return Err(consensus_unavailable());
         }
-        let mut snapshot = self
+        let snapshot = self
             .inner
             .raft
             .begin_receiving_snapshot()
             .await
             .map_err(|_| consensus_unavailable())?;
-        let mut offset = 0_u64;
-        loop {
-            if chunk.vote != vote
-                || chunk.meta != meta
-                || chunk.offset != offset
+        Ok(RepairDownload {
+            source,
+            vote: chunk.vote,
+            meta: chunk.meta.clone(),
+            snapshot,
+            offset: 0,
+            chunk: Some(chunk),
+            done: false,
+        })
+    }
+
+    async fn restore_repair_snapshot(
+        &self,
+        progress: &mut Option<RepairDownload>,
+        deadline: Instant,
+    ) -> Result<(), PersistError> {
+        let download = progress.as_mut().ok_or_else(consensus_unavailable)?;
+        while !download.done {
+            if download.chunk.is_none() {
+                download.chunk = Some(
+                    self.fetch_repair_chunk(
+                        download.source,
+                        Some(RepairCursor {
+                            vote: download.vote,
+                            snapshot_id: download.meta.snapshot_id.clone(),
+                            offset: download.offset,
+                        }),
+                        deadline,
+                    )
+                    .await?,
+                );
+            }
+            let chunk = download.chunk.as_ref().ok_or_else(consensus_unavailable)?;
+            if chunk.vote != download.vote
+                || chunk.meta != download.meta
+                || chunk.offset != download.offset
                 || chunk.bytes.len() > CHUNK_BYTES
                 || chunk.bytes.is_empty() && !chunk.done
-                || offset + chunk.bytes.len() as u64 > storage::SNAPSHOT_MAX_ENVELOPE_BYTES
+                || download.offset + chunk.bytes.len() as u64 > storage::SNAPSHOT_MAX_ENVELOPE_BYTES
             {
                 return Err(consensus_unavailable());
             }
-            snapshot
+            // write_all is cancellable after a partial write. Always resume
+            // at the last complete chunk, overwriting any uncommitted bytes.
+            download
+                .snapshot
+                .seek(std::io::SeekFrom::Start(download.offset))
+                .await
+                .map_err(|_| consensus_unavailable())?;
+            download
+                .snapshot
                 .write_all(&chunk.bytes)
                 .await
                 .map_err(|_| consensus_unavailable())?;
-            offset += chunk.bytes.len() as u64;
-            if chunk.done {
-                break;
-            }
-            chunk = self
-                .fetch_repair_chunk(
-                    source,
-                    Some(RepairCursor {
-                        vote,
-                        snapshot_id: meta.snapshot_id.clone(),
-                        offset,
-                    }),
-                    deadline,
-                )
-                .await?;
+            download.offset += chunk.bytes.len() as u64;
+            download.done = chunk.done;
+            download.chunk = None;
         }
-        snapshot
+        download
+            .snapshot
             .sync_all()
             .await
             .map_err(|_| consensus_unavailable())?;
+        let download = progress.take().ok_or_else(consensus_unavailable)?;
         let response = self
             .inner
             .raft
             .install_full_snapshot(
-                vote,
+                download.vote,
                 Snapshot {
-                    meta: meta.clone(),
-                    snapshot,
+                    meta: download.meta.clone(),
+                    snapshot: download.snapshot,
                 },
             )
             .await
             .map_err(|_| consensus_unavailable())?;
-        if response.vote != vote || self.inner.shutdown.is_started() {
+        if response.vote != download.vote || self.inner.shutdown.is_started() {
             return Err(consensus_unavailable());
         }
         let mut metrics = self.inner.raft.metrics();
@@ -339,7 +439,7 @@ impl ConsensusConfigStore {
                 if current.running_state.is_err() || self.inner.shutdown.is_started() {
                     return Err(consensus_unavailable());
                 }
-                if current.last_applied >= meta.last_log_id
+                if current.last_applied >= download.meta.last_log_id
                     && exact_uniform_voter_membership(
                         current.membership_config.as_ref(),
                         &self.inner.members,

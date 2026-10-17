@@ -96,16 +96,14 @@ async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
     let topology =
         ConfigConsensusTopology::try_new(cluster.identity, nodes[0], nodes.into_iter().collect())
             .unwrap();
-    let backend = SqliteBackend::provision_config_member_repair(
-        retained_options(
-            &cluster._directory.path().join("bounded-repair.sqlite"),
-            topology.clone(),
-            10,
-        ),
-        audit_key(),
-    )
-    .await
-    .unwrap();
+    let options = retained_options(
+        &cluster._directory.path().join("bounded-repair.sqlite"),
+        topology.clone(),
+        10,
+    );
+    let backend = SqliteBackend::provision_config_member_repair(options.clone(), audit_key())
+        .await
+        .unwrap();
     let control = Arc::new(RepairControl::default());
     let peers = (1..3)
         .map(|target| {
@@ -117,13 +115,13 @@ async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
                 }) as Arc<dyn ConsensusPeer>,
             )
         })
-        .collect();
+        .collect::<BTreeMap<_, _>>();
     let snapshots = cluster._directory.path().join("bounded-repair-snapshots");
     cluster.stores[0] = ConsensusConfigStore::open_with_operation_timeout(
-        topology,
+        topology.clone(),
         backend,
         &snapshots,
-        peers,
+        peers.clone(),
         Duration::from_secs(1),
     )
     .await
@@ -170,6 +168,57 @@ async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
             "retry advances instead of restarting"
         );
         previous_bytes = bytes;
+        if attempt == 0 {
+            // Cancel a resumed attempt, after it has taken the checkpoint.
+            control.blocked.notified().await;
+            let recovering = cluster.stores[0].clone();
+            let resumed = tokio::spawn(async move { recovering.initialize_cluster().await });
+            tokio::time::timeout(Duration::from_secs(2), control.blocked.notified())
+                .await
+                .expect("resumed attempt reached the paused next chunk");
+            resumed.abort();
+            assert!(resumed.await.unwrap_err().is_cancelled());
+            assert!(std::fs::read_dir(&snapshots).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("incoming-")));
+            previous_bytes = 0;
+        } else if attempt == 1 {
+            // A saved download must not outlive shutdown, even while another
+            // store clone still exists. Reopen retries from its empty root.
+            cluster.stores[0].shutdown().await.unwrap();
+            assert!(std::fs::read_dir(&snapshots).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("incoming-")));
+            for ((_, target), peer) in &cluster.paths {
+                if *target == 0 {
+                    *peer.handler.write().await = None;
+                }
+            }
+            drop(cluster.stores.remove(0));
+            let backend = SqliteBackend::reopen_config_authority(options.clone(), audit_key())
+                .await
+                .unwrap();
+            let reopened = ConsensusConfigStore::open_with_operation_timeout(
+                topology.clone(),
+                backend,
+                &snapshots,
+                peers.clone(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            for ((_, target), peer) in &cluster.paths {
+                if *target == 0 {
+                    peer.install(reopened.rpc_handler()).await;
+                }
+            }
+            cluster.stores.insert(0, reopened);
+            previous_bytes = 0;
+        }
     }
     assert!(
         completed,

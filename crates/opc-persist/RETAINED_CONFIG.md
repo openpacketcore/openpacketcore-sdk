@@ -41,8 +41,11 @@ also supports repair after a planned handoff while the successor stays live.
 Repairing every member of a lost quorum cannot mint fresh genesis.
 
 Cancellation or a lost quorum leaves the empty member unadmitted; retry
-`initialize_cluster` on the same store when the quorum is available. Incomplete
-downloads are removed automatically. A completed repair persists through the
+`initialize_cluster` on the same store when the quorum is available. A bounded
+attempt retains its verified partial download for the next call, so a large
+snapshot can progress across operation deadlines. Cancellation and shutdown
+remove that partial download automatically, and ordinary startup removes any
+staging left by a crash. A completed repair persists through the
 ordinary retained reopen path and can rejoin with a compatible majority. This
 does not reset a leader's recorded replication progress, change stored formats,
 or require manual cleanup during restart.

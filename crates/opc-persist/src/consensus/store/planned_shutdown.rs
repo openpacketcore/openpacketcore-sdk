@@ -17,19 +17,31 @@ type Scope = (BTreeSet<ConsensusNodeId>, Option<LogId<ConsensusNodeId>>);
 
 pub(super) struct ConfigShutdownCoordinator {
     started: AtomicBool,
+    started_notify: tokio::sync::Notify,
     completion: std::sync::Mutex<Option<watch::Receiver<Completion>>>,
 }
 
 impl ConfigShutdownCoordinator {
-    pub(super) const fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             started: AtomicBool::new(false),
+            started_notify: tokio::sync::Notify::new(),
             completion: std::sync::Mutex::new(None),
         }
     }
 
     pub(super) fn is_started(&self) -> bool {
         self.started.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn wait_started(&self) {
+        let notified = self.started_notify.notified();
+        tokio::pin!(notified);
+        // Register before checking the flag so shutdown cannot be missed.
+        notified.as_mut().enable();
+        if !self.is_started() {
+            notified.await;
+        }
     }
 
     fn start_or_subscribe(&self, store: ConsensusConfigStore) -> watch::Receiver<Completion> {
@@ -46,7 +58,12 @@ impl ConfigShutdownCoordinator {
         // Config reads never reuse cached leases. Fence every public/forwarded
         // application path before the engine can release a leader vote lease.
         self.started.store(true, Ordering::Release);
+        self.started_notify.notify_waiters();
         tokio::spawn(async move {
+            // Active recovery observes the shutdown notification and drops
+            // its local download. Also discard a checkpoint left by a prior
+            // bounded attempt before publishing shutdown completion.
+            drop(store.inner.repair_progress.lock().await.take());
             let mut timeout_reason = PlannedShutdownFallback::DeadlineElapsed;
             let preparation = tokio::time::timeout_at(
                 deadline,

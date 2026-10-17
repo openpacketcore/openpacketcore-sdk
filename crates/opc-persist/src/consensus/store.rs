@@ -314,7 +314,7 @@ struct ConsensusConfigStoreInner {
     operation_timeout: Duration,
     admitted: AtomicBool,
     repair_pending: AtomicBool,
-    repair_lock: tokio::sync::Mutex<()>,
+    repair_progress: tokio::sync::Mutex<Option<member_repair::RepairDownload>>,
     audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
@@ -714,7 +714,7 @@ impl ConsensusConfigStore {
                 operation_timeout,
                 admitted: AtomicBool::new(false),
                 repair_pending: AtomicBool::new(repair_pending),
-                repair_lock: tokio::sync::Mutex::new(()),
+                repair_progress: tokio::sync::Mutex::new(None),
                 shutdown: planned_shutdown::ConfigShutdownCoordinator::new(),
                 audit_continuity,
                 linearizability,
@@ -749,6 +749,8 @@ impl ConsensusConfigStore {
     /// must first restore a snapshot from an authenticated leader with a fresh
     /// surviving-quorum proof. Until then it cannot vote, campaign, or report
     /// its lost log as a conflict to the existing leader.
+    /// Repeated bounded attempts retain partial snapshot progress; cancelling
+    /// an active attempt or shutting down discards that download automatically.
     ///
     /// A returning voter needs a compatible majority of the fixed voter set,
     /// including itself, proved on authenticated peer connections. Transports
