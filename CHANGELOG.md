@@ -793,6 +793,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement, and repair waits for actual snapshot progress before fetching.
   (#1315)
 
+- `opc-session-testkit` and `opc-config-bus-consensus` fixtures synchronize
+  applied prefixes, old-leader RPC completion and real vote leases before one
+  designated successor campaign. Keep the existing 26 s and 30 s deadlines,
+  concurrent authenticated coverage, and automatic-election negative controls
+  for failed campaigns with unequal logs. Qualification recovery limits remain
+  acceptance SLOs with unchanged fail-closed, reconciliation and shutdown
+  behavior. (#1324)
+
 - `opc-proto-gtpv2c`: An empty Create Session Response APCO received before any
   retained APCO is discarded as malformed optional outer-IE data at every
   validation level, including under `Reject`, so a later populated APCO can

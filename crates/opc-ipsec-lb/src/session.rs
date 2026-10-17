@@ -2887,6 +2887,12 @@ mod tests {
         // Exercise production quorum semantics while one configured replica
         // is unavailable: both lease acquisition and CAS still require the
         // two-replica majority before a grant can be returned.
+        let unavailable = cluster.store(2).status();
+        assert_ne!(
+            unavailable.leader_id,
+            Some(unavailable.node_id),
+            "this quorum-write scenario isolates a follower and requires no election"
+        );
         cluster.set_node_online(2, false);
         cluster.wait_node_durable_ready(0).await;
         let quorum = EncryptingSessionBackend::new(

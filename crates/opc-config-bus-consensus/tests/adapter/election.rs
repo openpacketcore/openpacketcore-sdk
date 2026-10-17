@@ -201,6 +201,68 @@ impl SuccessfulElection {
     }
 }
 
+/// The four-worker functional scenario designates one real campaign after
+/// every admitted old-leader RPC has completed. Setup and this phase keep
+/// normal time, including the original 30-second diagnostic deadline.
+pub(super) async fn elect_survivor(quorum: &ProjectionCluster, old: usize) -> usize {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let previous = quorum.stores[old].status();
+        let committed = previous
+            .committed_index
+            .expect("committed projection prefix");
+        let survivors: Vec<_> = (0..quorum.stores.len())
+            .filter(|index| *index != old)
+            .collect();
+        let candidate = survivors[0];
+        for index in &survivors {
+            let status = quorum.stores[*index].status();
+            assert_eq!(status.leader_id, Some(previous.node_id));
+            assert_eq!(status.term, previous.term);
+            assert!(
+                status.applied_index >= Some(committed),
+                "successor applies the original committed prefix"
+            );
+        }
+        let gate = VoteGate::observe(previous.term + 1);
+        quorum.observe_votes(Some(gate.clone()));
+        for index in &survivors {
+            quorum.stores[*index]
+                .wait_for_vote_lease_expiry_for_test()
+                .await
+                .unwrap();
+        }
+        quorum.stores[candidate]
+            .trigger_election_for_test()
+            .await
+            .unwrap();
+        let promoted = quorum.wait_promoted(old).await;
+        assert_eq!(promoted, candidate);
+        let leader = quorum.stores[promoted].status().node_id;
+        for index in &survivors {
+            quorum.stores[*index]
+                .wait_for_raft_status_for_test(|status| {
+                    status.leader_id == Some(leader) && status.term == previous.term + 1
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            quorum.stores[promoted].ensure_local_authority().await,
+            ConfigLocalAuthorityOutcome::LocalAuthority
+        );
+        gate.assert_one_granted_vote(
+            leader,
+            quorum.stores[survivors[1]].status().node_id,
+            committed,
+        )
+        .await;
+        quorum.observe_votes(None);
+        promoted
+    })
+    .await
+    .expect("surviving quorum failed to acquire fresh authority within 30 seconds")
+}
+
 #[tokio::test(start_paused = true)]
 async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
     let runtime_origin = Instant::now();
@@ -246,7 +308,7 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
         }
     }
     election.pause_after_follower_tick().await;
-    let result = schedule::with_frozen_time(async {
+    schedule::with_frozen_time(async {
         let started = election.align_and_anchor(&quorum, old_leader).await;
         let gate = Arc::new(VoteGate {
             term: initial.term + 1,
@@ -366,11 +428,8 @@ async fn automatic_repeated_split_outlasts_thirty_second_acquisition() {
         for script in &election.scripts {
             script.finish();
         }
-        panic
     })
     .await;
-    // RED checkpoint: retain the original helper's exact panic after cleanup.
-    std::panic::resume_unwind(result);
 }
 
 pub(super) struct Election {

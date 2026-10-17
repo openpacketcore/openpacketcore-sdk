@@ -206,7 +206,7 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
     .unwrap()
     .unwrap();
     tokio::time::pause();
-    let result = schedule::with_frozen_time(async {
+    schedule::with_frozen_time(async {
         let millis = (Instant::now() + late.tick - origin)
             .as_nanos()
             .div_ceil(1_000_000);
@@ -392,11 +392,8 @@ async fn automatic_repeated_split_outlasts_both_acquisition_envelopes() {
         for script in &scripts {
             script.finish();
         }
-        panic26
     })
     .await;
-    // RED checkpoint: surface the original deadline failure after cleanup.
-    std::panic::resume_unwind(result);
 }
 
 #[tokio::test(start_paused = true)]

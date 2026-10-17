@@ -873,6 +873,8 @@ async fn consumer_void_drains_after_the_leader_loses_authority_during_the_origin
         let mut prepared = facade.prepare_fenced_transition(create(request_id(906), 906, PAYLOAD), budget(soon())).await.unwrap();
         let leader_id = fixture.cluster.store(0).status().leader_id.unwrap();
         let leader = fixture.cluster.stores.iter().position(|store| store.status().node_id == leader_id).unwrap();
+        let survivor = (leader + 1) % 3;
+        let mut election = fixture.cluster.prepare_election(survivor).await;
         stall_original(&fixture, true);
         let call = tokio::spawn(async move { let result = prepared.execute_once().await; (prepared, result) });
         let deadline = soon();
@@ -884,11 +886,14 @@ async fn consumer_void_drains_after_the_leader_loses_authority_during_the_origin
         let (mut prepared, result) = call.await.unwrap();
         assert!(matches!(result, Err(FencedTransitionExecuteError::OutcomeUnknown { .. })));
         assert!(!fixture.cluster.store(leader).probe_durable_readiness().await.is_ready());
-        let survivor = (leader + 1) % 3;
-        fixture.cluster.wait_node_durable_ready(survivor).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            election.elect_once().await;
+            fixture.cluster.wait_node_durable_ready(survivor).await;
+        }).await.expect("survivor acquisition keeps the original 30-second deadline");
         assert_ne!(fixture.cluster.store(survivor).status().leader_id, Some(leader_id));
         fixture.cluster.set_node_online(leader, true);
         fixture.cluster.wait_ready(true).await;
+        drop(election);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let progress = drain_void_rows(&facade, 8, deadline, |_| {}).await;
         assert_eq!(progress.voided(), 1, "{progress:?}");

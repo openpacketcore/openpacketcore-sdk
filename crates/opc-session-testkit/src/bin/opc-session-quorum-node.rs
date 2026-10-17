@@ -4506,6 +4506,9 @@ async fn refresh_traffic_status_authoritative_head<B: TrafficWatchBackend + ?Siz
     }
 }
 
+// A per-episode qualification SLO, not an election-completion guarantee.
+// Keep the episode's original start across request/record reconciliation and
+// never let recovery extend an already-established shutdown deadline.
 fn traffic_recovery_deadline(
     recovery_started_at: tokio::time::Instant,
     shutdown_deadline: Option<tokio::time::Instant>,
@@ -7595,6 +7598,43 @@ mod tests {
             }
         );
         assert!(!traffic_failure_is_recoverable(deadline_failure));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_recovery_slo_keeps_episode_and_shutdown_deadlines() {
+        let started = tokio::time::Instant::now();
+        let deadline = traffic_recovery_deadline(started, None);
+        assert_eq!(deadline - started, Duration::from_secs(26));
+        let shutdown = started + Duration::from_secs(9);
+        assert_eq!(traffic_recovery_deadline(started, Some(shutdown)), shutdown);
+        assert_eq!(
+            traffic_recovery_deadline(started, Some(deadline + Duration::from_secs(1))),
+            deadline
+        );
+        tokio::time::advance(Duration::from_secs(26)).await;
+        assert_eq!(
+            traffic_recovery_deadline(started, None),
+            deadline,
+            "retry and reconciliation retain the original episode start"
+        );
+        assert!(!wait_for_traffic_recovery_retry(deadline).await);
+        assert!(traffic_shutdown_deadline_reached(
+            Some(shutdown),
+            tokio::time::Instant::now()
+        ));
+        let failure = QualificationTrafficFailure::recovery_deadline_exceeded(
+            QualificationTrafficFailureStage::LeaseAcquire,
+            started,
+        );
+        assert_eq!(
+            failure.code,
+            QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+        );
+        assert_eq!(failure.recovery_elapsed_millis, Some(26_000));
+        assert!(
+            !traffic_failure_is_recoverable(failure),
+            "late legal elections fail the SLO without restarting its budget"
+        );
     }
 
     #[test]

@@ -453,6 +453,14 @@ async fn config_and_session_groups_are_scope_and_availability_isolated() {
         .expect("config head after full group restart");
     assert_config_head_unchanged(&config_after_write, &config_after_restart);
 
+    let old_session_leader_id = session_stores[0].status().leader_id.unwrap();
+    let old_session_leader = session_stores
+        .iter()
+        .position(|store| store.status().node_id == old_session_leader_id)
+        .unwrap();
+    let candidate = (old_session_leader + 1) % session_stores.len();
+    let mut session_election = session_cluster.prepare_election(candidate).await;
+
     // Taking every in-process session consensus path offline is a complete
     // quorum outage, not a process/engine shutdown. Each node must report the
     // same fail-closed readiness state while config consensus continues.
@@ -500,9 +508,16 @@ async fn config_and_session_groups_are_scope_and_availability_isolated() {
     );
 
     for index in 0..session_stores.len() {
-        session_cluster.set_node_online(index, true);
+        if index != old_session_leader {
+            session_cluster.set_node_online(index, true);
+        }
     }
+    // Enabling a member also enables incident paths; preserve the old leader's
+    // isolation until the designated survivor has fresh quorum authority.
+    session_cluster.set_node_online(old_session_leader, false);
     tokio::time::timeout(cluster_transition_timeout(), async {
+        session_election.elect_once().await;
+        session_cluster.set_node_online(old_session_leader, true);
         tokio::join!(
             session_cluster.wait_node_durable_ready(0),
             session_cluster.wait_node_durable_ready(1),
@@ -511,6 +526,7 @@ async fn config_and_session_groups_are_scope_and_availability_isolated() {
     })
     .await
     .expect("session quorum heal is bounded");
+    drop(session_election);
 
     assert_eq!(
         first_session_record,

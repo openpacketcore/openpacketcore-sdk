@@ -22,22 +22,37 @@ sequencing, or repair algorithm.
   `ConsensusSessionStore` adapter.
 - `set_node_online(index, online)` enables or disables every in-process
   consensus path to and from one member. `wait_node_durable_ready(index)` waits
-  for that member to complete a fresh Openraft linearizable barrier.
+  for that member to complete a fresh Openraft linearizable barrier. Its 30 s
+  limit diagnoses a fixture failure; randomized elections have no fixed
+  completion bound.
+- `prepare_election(candidate)` waits for the original committed prefix and
+  suppresses competing campaigns in a three-member functional fixture. Isolate
+  the old leader, then call the returned guard's `elect_once()` to quiesce RPCs,
+  observe real vote-lease expiry, and request one real campaign. Keep the guard
+  until rejoined members are ready; dropping it restores automatic elections.
+  The complete acquisition keeps the existing 30 s bound.
 - `RestoreEvidenceAsserter::new(block_reasons)` exposes fluent assertions for
   stale-owner rejection, traffic blocking, and redaction-safe messages.
+
+This example isolates a confirmed follower, so recovery does not require a new
+election. Use `prepare_election` before a bounded leader-loss scenario.
 
 ```rust,no_run
 use opc_session_testkit::ConsensusTestCluster;
 
 async fn partition_and_recover() {
     let cluster = ConsensusTestCluster::start(3).await;
+    let leader = cluster.store(0).status().leader_id.expect("initial leader");
+    let follower = (0..3)
+        .find(|index| cluster.store(*index).status().node_id != leader)
+        .expect("follower in a three-member fleet");
 
-    cluster.set_node_online(2, false);
+    cluster.set_node_online(follower, false);
     let store = cluster.store(0);
     assert_eq!(store.topology().configured_members(), 3);
 
-    cluster.set_node_online(2, true);
-    cluster.wait_node_durable_ready(2).await;
+    cluster.set_node_online(follower, true);
+    cluster.wait_node_durable_ready(follower).await;
 }
 ```
 
@@ -392,9 +407,13 @@ combined algorithm.
 The private schedule drops one successful
 release response
 per mutator to exercise that path, and is bound to eight outcomes per node, a
-fixed 26-second two-election-plus-operation transition envelope per episode,
+fixed 26-second qualification acceptance SLO per episode,
 and a fixed 50 ms retry delay; all three bounds and the
-total/recovered/consecutive counters are schedule evidence. Phase completion
+total/recovered/consecutive counters are schedule evidence. A legal failed
+campaign can exhaust this SLO, and repeated failed campaigns have no fixed
+completion bound. Late success fails qualification; retrying retained requests
+or reconciling exact records never resets the episode or shutdown deadline.
+Phase completion
 requires every interruption to be reconciled. A committed generation recovered
 after process restart does not rearm that once-per-logical-mutator synthetic
 fault. Lease loss, unexpected state, and invariant failures remain terminal.
@@ -409,7 +428,7 @@ fence under the `same-disk-exact-address-active-mutator/v3` stage-bounded
 profile. Its independent bounds are 5 seconds for termination/reaping, 26
 seconds for outage/survivor progress, 45 seconds for replacement-child startup,
 37 seconds for Openraft recovery and readiness observation (the existing
-26-second recovery envelope followed by one reserved 11-second final all-voter
+26-second recovery acceptance SLO followed by one reserved 11-second final all-voter
 readiness round: 10 seconds for the backend operation and 1 second for bounded
 local result delivery), 25 seconds for journal reconciliation, and 26 seconds
 for higher-fence mutation resume. Those sequential stages compose to a
