@@ -42,7 +42,7 @@ impl SnapshotBuildControl {
         *self.owner.lock().expect("snapshot owner observation") = Arc::downgrade(owner);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn owner(&self) -> SnapshotOwnerObservation {
         SnapshotOwnerObservation(
             self.owner
@@ -74,7 +74,7 @@ impl SnapshotBuildControl {
         self.retries.fetch_add(1, Ordering::AcqRel);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn set_limits(&self, attempt: Duration, pressure: Duration) {
         assert!(!attempt.is_zero() && attempt <= SNAPSHOT_BUILD_TIMEOUT);
         assert!(!pressure.is_zero() && pressure <= SNAPSHOT_PRESSURE_TIMEOUT);
@@ -84,12 +84,12 @@ impl SnapshotBuildControl {
             .store(pressure.as_millis() as u64, Ordering::Release);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn retries(&self) -> u64 {
         self.retries.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn pause_next_publication(&self, gate: std::sync::Arc<super::SnapshotArtifactGate>) {
         let mut next = self.next_publication.lock().expect("snapshot attempt gate");
         assert!(next.is_none(), "only one next-attempt gate");
@@ -109,10 +109,10 @@ impl SnapshotBuildControl {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) struct SnapshotOwnerObservation(std::sync::Weak<super::ConsensusStorageShutdownGuard>);
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl SnapshotOwnerObservation {
     pub(crate) fn is_retained(&self) -> bool {
         self.0.strong_count() != 0

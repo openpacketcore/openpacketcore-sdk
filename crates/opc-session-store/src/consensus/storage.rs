@@ -2880,7 +2880,7 @@ impl LiveTerminalRecoveryHandoffConsumer {
         FixedSnapshotReturnGateGuard::install(directory, gate)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn pause_snapshot_verification_for_test(
         &self,
         gate: Arc<SnapshotArtifactGate>,
@@ -2897,7 +2897,7 @@ impl LiveTerminalRecoveryHandoffConsumer {
         FixedPrepublicationScanGateGuard::install(directory, gate)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn snapshot_worker_is_active_for_test(&self) -> bool {
         self.core.snapshot_gate.try_lock().is_err()
     }
@@ -3246,7 +3246,7 @@ impl ConsensusStorageShutdownObserver {
         self.0.snapshot_build.pressure_timeout()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn set_snapshot_limits_for_test(
         &self,
         attempt: std::time::Duration,
@@ -3255,17 +3255,17 @@ impl ConsensusStorageShutdownObserver {
         self.0.snapshot_build.set_limits(attempt, pressure);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn pause_next_snapshot_publication_for_test(&self, gate: Arc<SnapshotArtifactGate>) {
         self.0.snapshot_build.pause_next_publication(gate);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn snapshot_retries_for_test(&self) -> u64 {
         self.0.snapshot_build.retries()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn snapshot_owner_for_test(&self) -> snapshot_build::SnapshotOwnerObservation {
         self.0.snapshot_build.owner()
     }
