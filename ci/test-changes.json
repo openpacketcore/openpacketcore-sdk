@@ -106,6 +106,19 @@
       "kind": "required-ci-removed",
       "issue": 1249,
       "reason": "Transfer misc library execution to the required rust-libraries matrix using the explicit --split-libraries precheck/plan mode. The logical coverage plan still owns every original command; live compiled-library inventories partition exact names across two required runners with identical workspace packages, features, profiles, ignored status and test-thread counts. Scope-payload and child-read contracts remain fresh serial processes before ordinary execution on library shard 0. Binary unit tests, examples, doctests and the heavy remainder stay on misc. The three full-bound proofs move to dedicated required native-log shards with unchanged O1 commands, input sizes and assertions. Planner regressions cover total/disjoint identity ownership, future siblings, wrong-profile and overlap mutations, real Cargo execution including test=false libraries, and missing workflow dependencies. Existing job budgets and all test deadlines are unchanged."
+    },
+    {
+      "test": "rust:crates/opc-netconf-server::lib=lib::server::tests::required_audit::leadership::election::split_vote_reproduces_authority_timeout",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-netconf-server::lib=lib::server::tests::required_audit::leadership::election::pre_vote_recovers_fresh_authority_with_divergent_survivor_logs",
+      "reason": "Pre-Vote and precise election evaluation prevent the stale survivor from consuming the next term. Replace the obsolete expected authority timeout with recovery through the unchanged 26-second helper. The replacement preserves divergent 12/13 log prefixes and checks both real Pre-Vote replies, the fresh survivor's one persisted vote, fresh local authority, and reconciliation of both survivors.",
+      "issue": 1333
+    },
+    {
+      "test": "rust:crates/opc-persist::test=consensus_openraft::history_retention_survives_natural_leader_change_and_member_snapshot_install",
+      "kind": "assertions-decreased",
+      "reason": "The precise election timer now recovers from the retained real split vote before the unchanged 26-second transition bound. Remove the obsolete checkpoint that expected both survivors to remain leaderless at that deadline; verify their split terms at the actual split and require recovery before the same bound instead. The history, retention, snapshot, reconciliation and durable-vote assertions remain. Local-helper assertion count changes from 163 to 162.",
+      "issue": 1333
     }
   ]
 }
