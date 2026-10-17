@@ -287,6 +287,9 @@ impl ConsensusConfigStore {
             // installed a snapshot on this initially empty repair root.
             if self.installed_repair_is_ready().await {
                 *progress = None;
+                if self.inner.voter_profile.is_some() {
+                    self.wake_replacement_after_download(deadline).await;
+                }
                 self.inner.repair_pending.store(false, Ordering::Release);
                 if self.inner.voter_profile.is_none() {
                     self.inner.raft.runtime_config().elect(true);

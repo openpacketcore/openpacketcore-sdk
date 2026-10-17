@@ -802,6 +802,28 @@ async fn authenticated_profile_forms_a_real_quorum_and_raw_vote_has_no_effect() 
         Err(VoterReplacementError::TargetStillLive)
     );
     assert_eq!(leader.voter_slot_state().await.unwrap().table(), &genesis());
+    let repair = ConsensusWireRequest::try_new(
+        store.inner.identity,
+        store.inner.local_node_id,
+        ConsensusRpcFamily::MemberRepair,
+        encode_config_wire(&()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .inner
+            .voter_profile
+            .as_ref()
+            .unwrap()
+            .transport
+            .peer(leader.inner.local_node_id)
+            .call_with_timeout(repair, Duration::from_secs(3))
+            .await
+            .unwrap()
+            .result,
+        Err(ConsensusPeerError::ScopeMismatch),
+        "authenticated voting members cannot enter the pending candidate download path"
+    );
     fleet.close().await;
 }
 

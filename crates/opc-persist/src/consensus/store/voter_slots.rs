@@ -31,6 +31,7 @@ pub(super) struct ConfigVoterProfile {
     core: super::super::sqlite::ConfigConsensusCore,
     incoming: tokio::sync::Mutex<Option<IncomingSnapshot>>,
     coordinator: std::sync::OnceLock<tokio::sync::watch::Receiver<()>>,
+    snapshot_ready: Arc<tokio::sync::Notify>,
 }
 
 // One coordinator owns accepted work through completion. This cache is keyed
@@ -103,6 +104,9 @@ enum ControlRequest {
     ReplacementSnapshot {
         request_digest: [u8; 32],
     },
+    SnapshotReady {
+        request_digest: [u8; 32],
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,6 +118,7 @@ enum ControlReply {
     SnapshotInstalled(VoterSnapshotEvidence),
     AppliedMarker(VoterSlotLogId),
     ReplacementSnapshot(SnapshotTransfer),
+    SnapshotReady,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -260,6 +265,7 @@ impl ConfigVoterProfile {
     async fn control(
         &self,
         store: &ConsensusConfigStore,
+        sender: ConsensusNodeId,
         request: ControlRequest,
     ) -> Result<ControlReply, VoterReplacementError> {
         match request {
@@ -295,6 +301,24 @@ impl ConfigVoterProfile {
                         SnapshotTransfer::LeaderPush
                     },
                 ))
+            }
+            ControlRequest::SnapshotReady { request_digest } => {
+                let state = self.admission.durable_view()?;
+                let operation = state
+                    .table()
+                    .replacement
+                    .as_ref()
+                    .ok_or(VoterReplacementError::InvalidTransition)?;
+                if operation.attestation.request_digest != request_digest
+                    || !state.table().slots.iter().any(|slot| {
+                        slot.member.identity.node_id() == sender
+                            && slot.member.identity.slot() == operation.attestation.slot
+                    })
+                {
+                    return Err(VoterReplacementError::UnauthorizedReplacement);
+                }
+                self.snapshot_ready.notify_one();
+                Ok(ControlReply::SnapshotReady)
             }
             ControlRequest::AppliedMarker {
                 request_digest,
@@ -364,6 +388,7 @@ impl ConfigVoterProfile {
             core,
             incoming: tokio::sync::Mutex::new(None),
             coordinator: std::sync::OnceLock::new(),
+            snapshot_ready: Arc::new(tokio::sync::Notify::new()),
         }))
     }
 
@@ -617,6 +642,31 @@ impl ConfigVoterProfile {
 }
 
 impl ConsensusConfigStore {
+    pub(super) async fn wake_replacement_after_download(&self, deadline: tokio::time::Instant) {
+        let Ok(state) = self.voter_slot_state().await else {
+            return;
+        };
+        let Some(operation) = state.table().replacement.as_ref() else {
+            return;
+        };
+        let vote = self.inner.raft.metrics().borrow().vote;
+        let Some(source) = vote.leader_id.voted_for() else {
+            return;
+        };
+        // The coordinator still verifies the installed artifact itself. This
+        // authenticated notice only wakes its retry wait, within this caller's
+        // unchanged deadline, after a potentially long checkpointed download.
+        let _ = self
+            .slot_control_call(
+                source,
+                &ControlRequest::SnapshotReady {
+                    request_digest: operation.attestation.request_digest,
+                },
+                deadline,
+            )
+            .await;
+    }
+
     /// Open the explicit Durable fixed-slot incarnation profile from a fresh installation.
     ///
     /// The resolver must prove both current workload credentials and the selected
@@ -1394,6 +1444,7 @@ pub(super) fn start_coordinator(store: &ConsensusConfigStore) {
         return;
     }
     let mut applied = store.inner.durable_progress.subscribe_applied();
+    let snapshot_ready = profile.snapshot_ready.clone();
     let weak = Arc::downgrade(&store.inner);
     let mut metrics = store.inner.raft.metrics();
     tokio::spawn(async move {
@@ -1443,6 +1494,7 @@ pub(super) fn start_coordinator(store: &ConsensusConfigStore) {
                 loop {
                     tokio::select! {
                         () = &mut retry => break,
+                        () = snapshot_ready.notified() => break,
                         changed = metrics.changed() => {
                             if changed.is_err() || metrics.borrow().running_state.is_err() {
                                 return;
@@ -1452,6 +1504,7 @@ pub(super) fn start_coordinator(store: &ConsensusConfigStore) {
                 }
             } else {
                 tokio::select! {
+                    () = snapshot_ready.notified() => {},
                     changed = applied.changed() => if changed.is_err() { return; },
                     changed = metrics.changed() => if changed.is_err() { return; },
                 }
@@ -1719,7 +1772,7 @@ pub(super) async fn handle(
                 ConsensusRpcFamily::TopologyAdmissionBarrier => {
                     let control = decode_config_wire(&request.payload)
                         .map_err(|_| VoterReplacementError::InvalidTransition)?;
-                    let response = profile.control(&store, control).await;
+                    let response = profile.control(&store, sender, control).await;
                     Ok(encode_config_wire(&response).map_or_else(
                         |_| rejected(ConsensusPeerError::Protocol),
                         |payload| ConsensusWireResponse {
