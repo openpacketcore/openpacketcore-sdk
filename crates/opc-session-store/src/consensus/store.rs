@@ -6120,6 +6120,11 @@ impl ConsensusSessionStore {
     }
 
     /// Read V2 history state at a linearized exact voter scope.
+    ///
+    /// History epochs and retention counters depend only on applied commands,
+    /// not on logical time or expiry. The fresh quorum read barrier in V2
+    /// capability admission waits for local application, so this read does not
+    /// propose a logical-time advance or wait for another durable write.
     pub async fn fenced_transition_v2_history_state(
         &self,
     ) -> Result<FencedTransitionV2HistoryState, StoreError> {
@@ -6128,7 +6133,6 @@ impl ConsensusSessionStore {
             .ok_or_else(consensus_unavailable)?;
         self.require_fenced_transition_v2_capability_before(deadline)
             .await?;
-        self.logical_read_time_before(None, deadline).await?;
         let (authority_identity, _) = self.current_scope()?;
         let state = self
             .inner
