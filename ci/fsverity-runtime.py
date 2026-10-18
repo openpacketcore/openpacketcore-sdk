@@ -138,7 +138,9 @@ class Guardian:
         return attached, mounted
 
     def sweep(self, root):
-        for directory in root.glob(PREFIX + "*"):
+        # Include images left by the former split-step setup helper, both
+        # directly under RUNNER_TEMP and inside an old runtime parent.
+        for directory in [*root.glob(PREFIX + "*"), *root.glob("opc-fsverity.*")]:
             try:
                 info = directory.lstat()
             except FileNotFoundError:
@@ -245,24 +247,30 @@ class Guardian:
                 raise InterruptedError("fs-verity owner exited during startup")
             directory = Path(tempfile.mkdtemp(prefix=PREFIX, dir=root))
             try:
+                directory.chmod(0o700)
                 descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
+                if descriptor is not None:
+                    os.close(descriptor)
                 shutil.rmtree(directory)
                 raise
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
         finally:
             os.close(root_descriptor)
         try:
             image = directory / "ext4.img"
             mountpoint = directory / "tmp"
-            mountpoint.mkdir()
+            mountpoint.mkdir(mode=0o700)
+            mountpoint.chmod(0o700)
             with image.open("xb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
                 stream.truncate(4 * 1024**3)
             self.run(["mkfs.ext4", "-q", "-b", "4096", "-O", "verity", str(image)])
             self.run(["sudo", "-n", "mount", "-o", "loop,nosuid,nodev", str(image), str(mountpoint)])
             self.run(["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(mountpoint)])
             snapshots = mountpoint / "snapshots"
             snapshots.mkdir(mode=0o700)
+            snapshots.chmod(0o700)
             info = snapshots.stat()
             if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
                 raise RuntimeError("fs-verity snapshot root must remain current-user private mode 0700")

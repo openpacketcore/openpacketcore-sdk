@@ -77,8 +77,9 @@ The owner sets `OPC_FS_VERITY_SNAPSHOT_ROOT` and
 `OPC_FS_VERITY_QUALIFICATION=required` for that command, then unmounts and removes
 its private image. It also cleans up on interruption, including a killed
 launcher, and sweeps unlocked, current-user, mode-0700 `fs-verity-runtime.*`
-directories below `RUNNER_TEMP` at startup. A directory still used by a loop
-device or mount is preserved. Inventory or cleanup errors fail the gate.
+directories below `RUNNER_TEMP` at startup, including the former
+`opc-fsverity.*` layout. A directory still used by a loop device or mount is
+preserved. Inventory or cleanup errors fail the gate.
 GitHub steps use this owner as their custom shell; running setup in an earlier
 step no longer exports a filesystem for subsequent steps. The real mount and
 interruption regressions are `python3 ci/test-fsverity-runtime.py -v` on Linux

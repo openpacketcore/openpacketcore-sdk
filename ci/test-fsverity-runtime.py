@@ -174,6 +174,14 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
         self.run_command("sh", "-c", "exit 37", expected=37)
         self.assertEqual(list(self.runner.iterdir()), [])
 
+    def test_restrictive_umask_preserves_private_root_and_cleanup(self):
+        result = subprocess.run(
+            [str(HARNESS), "--", "true"], env=self.environment,
+            capture_output=True, text=True, timeout=20, umask=0o777,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(list(self.runner.iterdir()), [])
+
     def test_cleanup_detaches_an_additional_binding_to_its_own_image(self):
         self.run_command("python3", "-c", """
 import os, pathlib, subprocess
@@ -330,19 +338,34 @@ while pathlib.Path(f'/proc/{child}').exists():
         self.assertFalse(stale.exists())
         self.assertEqual(set(self.runner.iterdir()), {active, unknown, public, symlink})
 
-    def test_startup_preserves_loop_backing_inode_even_through_other_path(self):
-        directory = self.runner / "fs-verity-runtime.attached"
-        directory.mkdir(mode=0o700)
-        image = directory / "ext4.img"
-        with image.open("xb") as stream:
-            stream.truncate(32 * 1024**2)
-        outside = self.root / "same-image-other-path"
-        os.link(image, outside)
-        self.extra_images.append(outside)
-        loop = privileged("losetup", "--find", "--show", outside).strip()
+    def test_startup_reclaims_legacy_unattached_images(self):
+        legacy = self.runner / "opc-fsverity.stale"
+        legacy.mkdir(mode=0o700)
+        (legacy / "ext4.img").write_bytes(b"old unattached image")
+        outer = self.runner / "fs-verity-runtime.older"
+        outer.mkdir(mode=0o700)
+        nested = outer / "opc-fsverity.nested"
+        nested.mkdir(mode=0o700)
+        (nested / "ext4.img").write_bytes(b"old nested unattached image")
         self.run_command("true")
-        self.assertTrue(image.is_file())
-        self.assertEqual(privileged("losetup", "--associated", outside, "--noheadings", "--output", "NAME").strip(), loop)
+        self.assertFalse(legacy.exists())
+        self.assertFalse(outer.exists())
+
+    def test_startup_preserves_loop_backing_inode_even_through_other_path(self):
+        for prefix in ("fs-verity-runtime.", "opc-fsverity."):
+            with self.subTest(prefix=prefix):
+                directory = self.runner / (prefix + "attached")
+                directory.mkdir(mode=0o700)
+                image = directory / "ext4.img"
+                with image.open("xb") as stream:
+                    stream.truncate(32 * 1024**2)
+                outside = self.root / (prefix + "same-image-other-path")
+                os.link(image, outside)
+                self.extra_images.append(outside)
+                loop = privileged("losetup", "--find", "--show", outside).strip()
+                self.run_command("true")
+                self.assertTrue(image.is_file())
+                self.assertEqual(privileged("losetup", "--associated", outside, "--noheadings", "--output", "NAME").strip(), loop)
 
     def test_startup_preserves_a_mounted_directory_without_an_image(self):
         directory = self.runner / "fs-verity-runtime.mounted"
