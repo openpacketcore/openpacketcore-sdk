@@ -376,6 +376,8 @@ impl Controls {
                     peer: Some(peer),
                     ..VoteState::default()
                 };
+                votes.pre_vote_requests_released.send_replace(true);
+                votes.pre_vote_replies_released.send_replace(true);
                 votes.released.send_replace(true);
                 ControlReply::Done
             }
@@ -619,17 +621,21 @@ impl Processes {
     async fn campaign(&self, indices: &[usize], old_term: u64) -> usize {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         self.listening(indices).await;
-        // The pinned engine's EngineConfig::new sets leader_lease to
-        // election_timeout_max. Even a forced campaign must respect that
-        // lease. With the old process confirmed exited and automatic
-        // elections disabled, let this known lease expire inside the same
-        // 30-second bound, then trigger exactly one ordinary campaign.
-        tokio::time::timeout_at(
-            deadline,
+        // A compacted restart may already have restored the former leader.
+        // Stop real replication and join its in-flight RPCs so neither voter
+        // can renew a follower lease or the leader's quorum acknowledgements.
+        // Keep election traffic connected, wait the fixed lease inside the
+        // same 30-second bound, then trigger one ordinary PreVote campaign.
+        tokio::time::timeout_at(deadline, async {
+            for index in indices {
+                self.control(*index, Request::ReplicationEnabled { enabled: false })
+                    .await;
+            }
             tokio::time::sleep(Duration::from_millis(
                 DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis,
-            )),
-        )
+            ))
+            .await;
+        })
         .await
         .unwrap();
         let mut positions = Vec::new();
@@ -638,8 +644,8 @@ impl Processes {
                 last_log, leader, ..
             } = call(self.addresses[*index], Request::Status).await.unwrap()
             {
-                // Prefer a follower on an equal log frontier. A recovered
-                // incumbent may already be leader and need no new campaign.
+                // Prefer a follower on an equal log frontier, including when
+                // a recovered incumbent was serving before replication loss.
                 positions.push((last_log, leader != Some(node(*index)), *index));
             }
         }
@@ -656,6 +662,7 @@ impl Processes {
         )
         .await;
         let result = tokio::time::timeout_at(deadline, async {
+            let mut replication_resumed = false;
             loop {
                 let mut agreed = true;
                 for index in indices {
@@ -663,6 +670,20 @@ impl Processes {
                         Ok(Reply::Status { leader: Some(leader), term, .. }) if leader == node(candidate) && term > old_term);
                 }
                 let votes = self.votes(candidate).await;
+                if !replication_resumed && votes.latest.as_ref().is_some_and(|exchange|
+                    exchange.request.vote.leader_id.term > old_term && exchange.response.as_ref().is_ok_and(|response| response.vote_granted)) {
+                    let inquiry = votes.pre_vote.as_ref().expect("ordinary speculative campaign");
+                    let response = votes.pre_vote_response.as_ref().unwrap().as_ref().expect("real speculative reply");
+                    assert!(response.vote_granted);
+                    assert!(response.vote.leader_id.term < inquiry.vote.leader_id.term);
+                    assert!(response.last_log_id <= inquiry.last_log_id);
+                    assert_eq!(votes.first.as_ref().unwrap().vote, inquiry.vote);
+                    assert_eq!(votes.first.as_ref().unwrap().last_log_id, inquiry.last_log_id);
+                    for index in indices {
+                        self.control(*index, Request::ReplicationEnabled { enabled: true }).await;
+                    }
+                    replication_resumed = true;
+                }
                 if agreed && votes.latest.as_ref().is_some_and(|exchange|
                     exchange.request.vote.leader_id.term > old_term && exchange.response.as_ref().is_ok_and(|response| response.vote_granted)) {
                     // All survivors observe a newer term and leader, and an

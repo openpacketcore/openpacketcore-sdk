@@ -766,7 +766,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-amf-lite` and `opc-session-store`: coordinate election regression
   fixtures through genuine PreVote grants before real votes, retaining split
   recovery, forgotten-vote safety, stale-completion rejection and their
-  existing timing bounds. (#1333)
+  existing timing bounds. Multi-process scope recovery also crosses genuine
+  speculative replies before split votes and expires renewed replication
+  leases before its post-restart campaign. (#1333)
 
 - `opc-persist`: snapshot reads pin the last durable publication independently
   of building or installing its successor, including a delayed SQLite commit.
