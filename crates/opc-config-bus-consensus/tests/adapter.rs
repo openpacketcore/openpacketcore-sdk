@@ -22,8 +22,8 @@ use opc_config_model::{
     WorkloadIdentity, YangPath,
 };
 use opc_consensus::{
-    ConsensusPeer, ConsensusPeerError, ConsensusRpcHandler, ConsensusWireRequest,
-    ConsensusWireResponse, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
+    ConsensusPeer, ConsensusPeerError, ConsensusRpcFamily, ConsensusRpcHandler,
+    ConsensusWireRequest, ConsensusWireResponse, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
 };
 use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
 use opc_persist::{
@@ -135,11 +135,13 @@ fn provider() -> Arc<MemoryKeyProvider> {
     provider
 }
 
-#[derive(Clone)]
 struct LoopbackPeer {
     target: ConfigConsensusNodeId,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
+    admitted: tokio::sync::RwLock<()>,
+    hold_log_entries: AtomicBool,
+    election_vote: std::sync::Mutex<Option<Arc<election::VoteGate>>>,
 }
 
 impl LoopbackPeer {
@@ -148,6 +150,9 @@ impl LoopbackPeer {
             target,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
+            admitted: tokio::sync::RwLock::new(()),
+            hold_log_entries: AtomicBool::new(false),
+            election_vote: std::sync::Mutex::new(None),
         }
     }
 
@@ -179,6 +184,7 @@ impl ConsensusPeer for LoopbackPeer {
         &self,
         request: ConsensusWireRequest,
     ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        let _admitted = self.admitted.read().await;
         if !self.enabled.load(Ordering::Acquire) {
             return Err(ConsensusPeerError::Unavailable);
         }
@@ -188,6 +194,16 @@ impl ConsensusPeer for LoopbackPeer {
             .await
             .clone()
             .ok_or(ConsensusPeerError::Unavailable)?;
+        if self.hold_log_entries.load(Ordering::Acquire)
+            && request.family == ConsensusRpcFamily::AppendEntries
+            && !ConsensusConfigStore::is_empty_append_entries_for_test(&request)
+        {
+            return Err(ConsensusPeerError::Unavailable);
+        }
+        let gate = self.election_vote.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            return Ok(gate.deliver(self.target, handler, request).await);
+        }
         Ok(handler.handle(request.sender, request).await)
     }
 }
@@ -325,6 +341,56 @@ impl ProjectionCluster {
             cluster.wait_ready().await;
         }
         cluster
+    }
+
+    async fn wait_promoted(&self, original_leader: usize) -> usize {
+        let original_leader_id = self.stores[original_leader].status().node_id;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let promoted = self
+                    .stores
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != original_leader)
+                    .find(|(_, store)| {
+                        store
+                            .status()
+                            .leader_id
+                            .is_some_and(|leader| leader != original_leader_id)
+                            && store.status().leader_id == Some(store.status().node_id)
+                    })
+                    .map(|(index, _)| index);
+                if let Some(promoted) = promoted {
+                    return promoted;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "surviving quorum failed to elect a new leader: {:?}",
+                self.stores
+                    .iter()
+                    .map(|store| store.status())
+                    .collect::<Vec<_>>()
+            )
+        })
+    }
+
+    async fn isolate_and_quiesce(&self, node: usize) {
+        self.isolate(node);
+        for ((source, target), path) in &self.paths {
+            if *source == node || *target == node {
+                let _quiesced = path.admitted.write().await;
+            }
+        }
+    }
+
+    fn observe_votes(&self, gate: Option<Arc<election::VoteGate>>) {
+        for path in self.paths.values() {
+            *path.election_vote.lock().unwrap() = gate.clone();
+        }
     }
 
     async fn wait_ready(&self) {

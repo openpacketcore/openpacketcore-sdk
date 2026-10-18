@@ -3,7 +3,7 @@
 //! is not a production consumer transport or an authentication implementation.
 
 use super::*;
-use opc_consensus::engine::raft::{VoteRequest, VoteResponse};
+use opc_consensus::engine::raft::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse};
 use opc_session_store::scope_batch::{
     ScopeBatchError, ScopeBatchOutcome, ScopeBatchRequest, ScopeBatchStore, ScopeChildKey,
     ScopeChildMutation, ScopeChildRecord, ScopeClaimKey, ScopeCounterMutation, ScopeSealedValue,
@@ -32,7 +32,13 @@ enum Request {
         peer: SessionConsensusNodeId,
     },
     VoteState,
+    WaitForVoteLeaseExpiry,
+    ReleasePreVoteRequests,
+    ReleasePreVoteReplies,
     ReleaseSplitVote,
+    ReplicationEnabled {
+        enabled: bool,
+    },
     ElectionControl {
         automatic: bool,
         campaign: bool,
@@ -98,6 +104,8 @@ struct VoteExchange {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct VoteState {
     peer: Option<SessionConsensusNodeId>,
+    pre_vote: Option<PreVoteRequest<SessionConsensusNodeId>>,
+    pre_vote_response: Option<Result<PreVoteResponse<SessionConsensusNodeId>, String>>,
     first: Option<VoteRequest<SessionConsensusNodeId>>,
     split: Option<VoteExchange>,
     latest: Option<VoteExchange>,
@@ -106,7 +114,10 @@ struct VoteState {
 #[derive(Debug)]
 struct VoteControl {
     state: StdMutex<VoteState>,
+    pre_vote_requests_released: tokio::sync::watch::Sender<bool>,
+    pre_vote_replies_released: tokio::sync::watch::Sender<bool>,
     released: tokio::sync::watch::Sender<bool>,
+    replication_enabled: tokio::sync::RwLock<bool>,
 }
 
 async fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> std::io::Result<()> {
@@ -159,6 +170,44 @@ impl SessionConsensusPeer for Peer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        // The writer used by the process control route waits for every
+        // admitted replication RPC to finish before acknowledging isolation.
+        // Election RPCs remain connected and always reach the real peer.
+        let _replication = if matches!(
+            request.family,
+            SessionConsensusRpcFamily::AppendEntries | SessionConsensusRpcFamily::InstallSnapshot
+        ) {
+            let enabled = self.votes.replication_enabled.read().await;
+            if !*enabled {
+                return Err(SessionConsensusPeerError::Unavailable);
+            }
+            Some(enabled)
+        } else {
+            None
+        };
+        let first_pre_vote = {
+            let mut state = self.votes.state.lock().unwrap();
+            if request.family == SessionConsensusRpcFamily::PreVote
+                && state.peer == Some(self.node)
+                && state.pre_vote.is_none()
+            {
+                state.pre_vote = Some(
+                    decode_bounded::<PreVoteRequest<SessionConsensusNodeId>>(&request.payload)
+                        .expect("decode controlled pre-vote"),
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if first_pre_vote {
+            self.votes
+                .pre_vote_requests_released
+                .subscribe()
+                .wait_for(|released| *released)
+                .await
+                .unwrap();
+        }
         let observed = {
             let mut state = self.votes.state.lock().unwrap();
             if request.family == SessionConsensusRpcFamily::Vote && state.peer == Some(self.node) {
@@ -196,6 +245,31 @@ impl SessionConsensusPeer for Peer {
             Ok(Reply::Rpc(reply)) => Ok(reply),
             _ => Err(SessionConsensusPeerError::Unavailable),
         };
+        if first_pre_vote {
+            let response = result
+                .as_ref()
+                .map_err(|error| format!("{error:?}"))
+                .and_then(|reply| reply.result.as_ref().map_err(|error| format!("{error:?}")))
+                .and_then(|payload| {
+                    decode_bounded::<
+                        Result<
+                            PreVoteResponse<SessionConsensusNodeId>,
+                            RaftError<SessionConsensusNodeId>,
+                        >,
+                    >(payload)
+                    .map_err(|error| format!("{error:?}"))
+                })
+                .and_then(|reply| reply.map_err(|error| format!("{error:?}")));
+            self.votes.state.lock().unwrap().pre_vote_response = Some(response);
+            // Neither process may persist its self-vote until both genuine
+            // speculative replies have been computed from the old term.
+            self.votes
+                .pre_vote_replies_released
+                .subscribe()
+                .wait_for(|released| *released)
+                .await
+                .unwrap();
+        }
         if let Some((request, first)) = observed {
             let response = result
                 .as_ref()
@@ -243,7 +317,10 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
         .collect::<Vec<_>>();
     let votes = Arc::new(VoteControl {
         state: StdMutex::new(VoteState::default()),
+        pre_vote_requests_released: tokio::sync::watch::channel(true).0,
+        pre_vote_replies_released: tokio::sync::watch::channel(true).0,
         released: tokio::sync::watch::channel(false).0,
+        replication_enabled: tokio::sync::RwLock::new(true),
     });
     let peers = (0..MEMBER_COUNT)
         .filter(|n| configuration.is_none() && *n != index)
@@ -351,14 +428,45 @@ async fn run_voter(index: usize, root: &Path, snapshots: &Path, addresses: &[Soc
                         peer: Some(peer),
                         ..VoteState::default()
                     };
+                    votes.pre_vote_requests_released.send_replace(false);
+                    votes.pre_vote_replies_released.send_replace(false);
                     votes.released.send_replace(false);
                     Reply::Controlled
                 }
                 Request::VoteState => {
                     Reply::VoteState(Box::new(votes.state.lock().unwrap().clone()))
                 }
+                Request::WaitForVoteLeaseExpiry => {
+                    let lease = Duration::from_millis(
+                        DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis,
+                    );
+                    loop {
+                        let modified = store
+                            .vote_updated_at_for_test()
+                            .await
+                            .unwrap()
+                            .expect("the initialized survivor has an actual vote");
+                        tokio::time::sleep_until(modified + lease).await;
+                        if store.vote_updated_at_for_test().await.unwrap() == Some(modified) {
+                            break;
+                        }
+                    }
+                    Reply::Controlled
+                }
+                Request::ReleasePreVoteRequests => {
+                    votes.pre_vote_requests_released.send_replace(true);
+                    Reply::Controlled
+                }
+                Request::ReleasePreVoteReplies => {
+                    votes.pre_vote_replies_released.send_replace(true);
+                    Reply::Controlled
+                }
                 Request::ReleaseSplitVote => {
                     votes.released.send_replace(true);
+                    Reply::Controlled
+                }
+                Request::ReplicationEnabled { enabled } => {
+                    *votes.replication_enabled.write().await = enabled;
                     Reply::Controlled
                 }
                 Request::ElectionControl {
@@ -699,6 +807,45 @@ impl Processes {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut states = Vec::new();
         let candidate = tokio::time::timeout_at(deadline, async {
+            // Preserve naturally timed campaigns. Only release their first
+            // inquiries after both real follower leases have expired, then
+            // cross the genuine replies before either persisted self-vote.
+            futures_util::future::join_all(
+                alive
+                    .iter()
+                    .map(|n| self.control(*n, Request::WaitForVoteLeaseExpiry)),
+            )
+            .await;
+            for index in alive {
+                self.control(*index, Request::ReleasePreVoteRequests).await;
+            }
+            loop {
+                states = futures_util::future::join_all(alive.iter().map(|n| self.votes(*n))).await;
+                if states.iter().all(|state| state.pre_vote_response.is_some()) {
+                    break;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            for state in &states {
+                let inquiry = state.pre_vote.as_ref().unwrap();
+                let response = state
+                    .pre_vote_response
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .expect("real survivor answers the speculative inquiry");
+                assert!(response.vote_granted);
+                assert!(response.vote.is_committed());
+                assert!(response.vote.leader_id.term < inquiry.vote.leader_id.term);
+                assert!(response.last_log_id <= inquiry.last_log_id);
+                assert!(
+                    state.first.is_none(),
+                    "speculation has not started a real vote"
+                );
+            }
+            for index in alive {
+                self.control(*index, Request::ReleasePreVoteReplies).await;
+            }
             loop {
                 states = futures_util::future::join_all(alive.iter().map(|n| self.votes(*n))).await;
                 if states.iter().all(|state| state.first.is_some()) {
@@ -710,6 +857,10 @@ impl Processes {
             let second = states[1].first.as_ref().unwrap();
             assert_eq!(first.vote.leader_id.term, second.vote.leader_id.term);
             for (index, state) in alive.iter().zip(&states) {
+                let inquiry = state.pre_vote.as_ref().unwrap();
+                let actual = state.first.as_ref().unwrap();
+                assert_eq!(actual.vote, inquiry.vote);
+                assert_eq!(actual.last_log_id, inquiry.last_log_id);
                 let vote = &state.first.as_ref().unwrap().vote;
                 assert!(vote.leader_id.term > old_term && !vote.committed);
                 match call(self.addresses[*index], Request::Status).await.unwrap() {

@@ -4,7 +4,7 @@ use super::*;
 
 use opc_consensus::engine::{
     error::RaftError,
-    raft::{VoteRequest, VoteResponse},
+    raft::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse},
     Vote,
 };
 use opc_consensus::test_runtime::{ElectionRngScript, ScriptedElectionRuntime};
@@ -43,10 +43,35 @@ pub(crate) struct VoteGate {
         )>,
     >,
     both_candidates: Barrier,
+    both_pre_votes: Barrier,
     replies: watch::Sender<Vec<Exchange>>,
 }
 
 impl VoteGate {
+    pub(crate) async fn after_pre_vote(
+        &self,
+        request: &ConsensusWireRequest,
+        response: &ConsensusWireResponse,
+    ) {
+        let (_, rpc): (u16, PreVoteRequest<ConfigConsensusNodeId>) =
+            opc_consensus::decode_bounded(&request.payload).unwrap();
+        let (_, reply): (
+            u16,
+            Result<PreVoteResponse<ConfigConsensusNodeId>, RaftError<ConfigConsensusNodeId>>,
+        ) = opc_consensus::decode_bounded(response.result.as_ref().unwrap()).unwrap();
+        assert!(
+            reply.unwrap().vote_granted,
+            "equal logs permit both inquiries"
+        );
+        if rpc.vote.leader_id.term < self.first_term + self.split_rounds {
+            eprintln!(
+                "rolling election: genuine Pre-Vote grant for {:?}",
+                rpc.vote
+            );
+            self.both_pre_votes.wait().await;
+        }
+    }
+
     pub(crate) async fn before_delivery(
         &self,
         target: ConfigConsensusNodeId,
@@ -234,6 +259,7 @@ impl RollingElection {
                 split_rounds: 0,
                 arrivals: watch::channel(Vec::new()).0,
                 both_candidates: Barrier::new(2),
+                both_pre_votes: Barrier::new(2),
                 replies: watch::channel(Vec::new()).0,
             });
             *fleet.paths[&(0, 1)].rolling_vote.lock().unwrap() = Some(gate.clone());
@@ -281,37 +307,70 @@ impl RollingElection {
         }
         self.leader_stops += 1;
         let split_rounds = if self.leader_stops == 2 { 2 } else { 1 };
+        // A retained leader starts before its peers reopen, so its replication
+        // streams can still be backing off even after a read fence succeeds.
+        // Complete an actual replay on every peer on normal time before the
+        // frozen replay that anchors all surviving follower leases.
+        eprintln!("rolling election: reading retained head before freezing time");
+        let stored = fleet.store(index).load_latest().await.unwrap().unwrap();
+        assert_eq!(stored.record.tx_id, fleet.head);
+        eprintln!("rolling election: retained head read completed");
+        let before = fleet.store(index).status().applied_index;
+        fleet
+            .store(index)
+            .append_attested_commit(attested(stored.record.clone(), audit(fleet.head)))
+            .await
+            .expect("healthy replay retires reopened-peer replication backoff");
+        tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
+            loop {
+                let anchor = fleet.store(index).status().applied_index;
+                if anchor > before
+                    && (0..3).all(|node| fleet.store(node).status().applied_index >= anchor)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("healthy replay reaches every retained voter before freezing time");
+        eprintln!("rolling election: healthy replay applied on every voter");
         tokio::time::pause();
         schedule::with_frozen_time(async {
+            eprintln!("rolling election: align healthy ticks before stopping voter {}", index + 1);
             // Delay each healthy ticker by at most one tick to align its next
             // wake. Completion is observed at the core, including the leader.
             self.advance(self.clock_slot(Instant::now() + self.late.tick), &[0, 1, 2])
                 .await;
+            eprintln!("rolling election: healthy ticks aligned");
             // Replay the existing request to give every follower the same
             // committed-vote instant without adding a configuration version.
-            let stored = fleet.store(index).load_latest().await.unwrap().unwrap();
-            assert_eq!(stored.record.tx_id, fleet.head);
             let before = fleet.store(index).status().applied_index;
             fleet
                 .store(index)
                 .append_attested_commit(attested(stored.record, audit(fleet.head)))
                 .await
                 .expect("head replay anchors retained voter leases");
+            eprintln!("rolling election: head replay returned");
             while fleet.store(index).status().applied_index <= before {
                 tokio::task::yield_now().await;
             }
             let anchor = fleet.store(index).status().applied_index;
+            eprintln!("rolling election: local replay applied at {anchor:?}");
             while !(0..3).all(|node| fleet.store(node).status().applied_index >= anchor) {
                 tokio::task::yield_now().await;
             }
+            eprintln!("rolling election: all voters applied replay");
             let old_term = fleet.store(index).status().term;
             fleet.stop_disconnected(index).await;
+            eprintln!("rolling election: disconnected leader joined");
             self.scripts[index].take().unwrap().finish();
             let gate = Arc::new(VoteGate {
                 first_term: old_term + 1,
                 split_rounds,
                 arrivals: watch::channel(Vec::new()).0,
                 both_candidates: Barrier::new(2),
+                both_pre_votes: Barrier::new(2),
                 replies: watch::channel(Vec::new()).0,
             });
             let paths = [(live[0], live[1]), (live[1], live[0])];
@@ -364,10 +423,10 @@ impl RollingElection {
                         .expect_err("two real split votes outlast the unchanged write deadline");
                     assert!(matches!(error.kind(), PersistErrorKind::OutcomeUnknown));
                     assert_eq!(Instant::now(), started + CLUSTER_TRANSITION_TIMEOUT);
-                    assert_eq!(gate.replies.borrow().len(), 2);
+                    assert_eq!(gate.replies.borrow().len(), 4);
                     for store in &stores {
                         assert_eq!(store.status().leader_id, None);
-                        assert_eq!(store.status().term, old_term + 1);
+                        assert_eq!(store.status().term, old_term + 2);
                     }
                     eprintln!("rolling write: OutcomeUnknown at {CLUSTER_TRANSITION_TIMEOUT:?} with both survivors leaderless");
                     expired.send(()).expect("election awaits the actual write result");
@@ -426,7 +485,8 @@ impl RollingElection {
         }
         if split_rounds == 2 {
             assert!(splits[0] < CLUSTER_TRANSITION_TIMEOUT);
-            assert!(CLUSTER_TRANSITION_TIMEOUT < splits[1]);
+            assert!(splits[1] < CLUSTER_TRANSITION_TIMEOUT);
+            assert!(CLUSTER_TRANSITION_TIMEOUT < bound);
             instants.push((CLUSTER_TRANSITION_TIMEOUT, false));
         } else {
             assert!(bound < CLUSTER_TRANSITION_TIMEOUT);

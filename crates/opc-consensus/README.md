@@ -82,7 +82,7 @@ Async support will require a new record version and a fresh install.
 
 `DURABLE_CONSENSUS_TIMING_PROFILE` is the sole timing authority for both
 durable domains: AppendEntries/Openraft read-index and heartbeat 2,000 ms,
-Vote 5,000 ms, elections `[5,000 ms, 8,000 ms)`, InstallSnapshot/forwarded
+Vote/Pre-Vote 5,000 ms, elections `[5,000 ms, 8,000 ms)`, InstallSnapshot/forwarded
 mutation/consumer ReadBarrier and operation default 10,000 ms, and listener
 idle/handler ceilings 30,000 ms. The 1,500 ms DNS/TCP/mTLS/bootstrap cold cap is
 contained inside the selected family deadline, never added to it.
@@ -146,11 +146,17 @@ signal; these helpers are scheduling and gating, not a parallel authority.
 
 ## Deterministic election fixtures
 
-Election regression tests control raw RNG samples and vote delivery while the
-unchanged engine performs each automatic campaign. Their protocol bounds include
-the committed-vote lease, sampled timeout, and heartbeat-derived tick rounding.
+Election regression tests control raw RNG samples and delivery of actual
+Pre-Vote and Vote RPCs while the production engine performs automatic campaigns.
+Their protocol bounds include the committed-vote lease, sampled timeout, and
+election evaluation at intervals of at most 100 ms.
 The one-split schedule verifies both survivors retain `[41, 42]`; it is not a
 fixed failover guarantee for randomized elections, which can split repeatedly.
+Separate three- and five-voter regressions stop the leader during sustained
+pipelined writes, with outstanding writes and divergent survivor logs at the
+fault. They require fresh quorum authority, a new write and survivor
+reconciliation within 26 seconds, preserving acknowledged writes. These paused
+engine regressions do not qualify process scheduling or disk latency.
 The `dangerous-test-hooks` feature exposes a scoped Tokio runtime adapter for
 these fixtures. Outside a script it uses Tokio's ordinary RNG, and production
 dependencies do not enable this feature. It uses the engine's existing rand 0.8
@@ -159,9 +165,28 @@ version so scripted samples pass through the same range sampler.
 ## Interim source-build gate
 
 Issue #143 remains open and the HA profile remains experimental. The workspace
-pins `https://github.com/openpacketcore/openraft` at the full verified revision
-`0be191c797fd8fab603474864ac8ba8211206dc2` (0.9.25 plus fork fixes). It retains the
-per-campaign election-timeout fix and preserves a recovering snapshot target's
+pins `https://github.com/openpacketcore/openraft` at the full revision
+`2e1fb7455752455a3505b354d003d6effa55985d` (0.9.25 plus fork fixes). The fork adds a distinct,
+authenticated Pre-Vote inquiry before ordinary elections and evaluates election
+deadlines at intervals of at most 100 ms. Speculative grants do not change the
+recipient's term, vote, lease timestamp or durable state. A majority of inquiries
+starts the existing persisted-vote election, including both majorities for joint
+membership. The 26-second and 30-second acceptance budgets are unchanged;
+repeated failed campaigns can still exhaust them. Planned exact-vote handoff
+retains its existing election path.
+
+During a mixed-version roll, an eligible legacy voter can send ordinary votes
+while being unable to answer Pre-Vote. When that voter's shorter log is refused,
+the upgraded engine can start an ordinary election after one bounded inquiry
+round, above the observed actual candidate term. It still persists its self-vote
+and obtains real quorum grants. A heartbeat, vote, log or membership change,
+retirement, or a fence for that peer discards the volatile observation. An
+unanswered inquiry alone does not trigger this fallback, and adapters never
+translate Pre-Vote into Vote. Upgrade and downgrade require no separate
+activation setting; compatibility is exercised against the actual preceding
+fork with divergent stored logs and leader loss.
+
+The fork also retains the per-campaign election-timeout fix and preserves a recovering snapshot target's
 required log suffix through successful handoff, while failed targets release
 their ownership before retrying. When a higher vote ends leadership, the core
 joins the former leader's replication readers before a conflicting suffix can

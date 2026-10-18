@@ -16,7 +16,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use opc_consensus::engine::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
+use opc_consensus::engine::raft::{
+    AppendEntriesRequest, InstallSnapshotRequest, PreVoteRequest, VoteRequest,
+};
 use opc_consensus::engine::{LogId, Vote};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock, Semaphore};
@@ -527,6 +529,17 @@ impl EngineAdmission {
     }
 
     pub(super) fn permits_vote(&self, rpc: &VoteRequest<SessionConsensusNodeId>) -> bool {
+        #[cfg(not(target_os = "linux"))]
+        let _ = rpc;
+        match &*self.guard {
+            Admission::Active => true,
+            #[cfg(target_os = "linux")]
+            Admission::Reforming { vote, .. } => rpc.vote == *vote,
+            _ => false,
+        }
+    }
+
+    pub(super) fn permits_pre_vote(&self, rpc: &PreVoteRequest<SessionConsensusNodeId>) -> bool {
         #[cfg(not(target_os = "linux"))]
         let _ = rpc;
         match &*self.guard {

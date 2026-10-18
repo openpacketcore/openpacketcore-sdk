@@ -84,9 +84,34 @@ impl ConsensusRpcHandler for LegacyHandler {
     ) -> ConsensusWireResponse {
         // Pre-extension receivers dispatched engine requests after scope and
         // sender validation. Retain that behavior while using the real engine.
-        self.0
+        let family = request.family;
+        let bytes = request.payload.len();
+        if family == ConsensusRpcFamily::AppendEntries {
+            eprintln!(
+                "rolling legacy append: sender={sender:?} bytes={bytes} dispatch at={:?}",
+                tokio::time::Instant::now()
+            );
+        }
+        let response = self
+            .0
             .handle_with_compatibility(sender, request, self.0.compatibility())
-            .await
+            .await;
+        if family == ConsensusRpcFamily::AppendEntries {
+            let reply = response.result.as_ref().map(|payload| {
+                opc_consensus::decode_bounded::<(
+                    u16,
+                    Result<
+                        opc_consensus::engine::raft::AppendEntriesResponse<ConfigConsensusNodeId>,
+                        opc_consensus::engine::error::RaftError<ConfigConsensusNodeId>,
+                    >,
+                )>(payload)
+            });
+            eprintln!(
+                "rolling legacy append: sender={sender:?} bytes={bytes} reply={reply:?} at={:?}",
+                tokio::time::Instant::now()
+            );
+        }
+        response
     }
 }
 

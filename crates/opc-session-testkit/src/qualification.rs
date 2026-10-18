@@ -942,11 +942,12 @@ pub const QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE: u64 =
 /// Ambiguous mutation outcomes resolve every retained acquisition before
 /// advancing same-owner fencing authority; read-only checkpoints retain the
 /// already-proven guard and validate its exact record.
-/// The bound covers the fixed two-election cluster transition plus one complete
-/// consensus operation and remains large enough for the reconciliation's
-/// sequential acquire and linearizable get plus one retry delay. An accepted
-/// backend operation is still allowed to reach its terminal outcome; a success
-/// observed after this deadline fails the qualification.
+/// This is a qualification acceptance SLO, not a bound on randomized elections.
+/// A legal failed campaign (including an unequal-log rejection) can exhaust it;
+/// repeated failed campaigns have no fixed completion bound. Each episode must
+/// still reconcile retained requests and exact records within this unchanged
+/// budget. An accepted backend operation reaches its terminal outcome; a success
+/// observed after the episode deadline fails the qualification.
 pub const QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
@@ -995,7 +996,8 @@ pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_PROFILE: &str =
 /// address is reused.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_TERMINATION_MILLIS: u64 = 5_000;
 /// Maximum time for the survivor majority to commit and expose semantic
-/// traffic progress while the selected member is absent.
+/// traffic progress while the selected member is absent. This acceptance SLO
+/// can fail under a legal election schedule; it is not an election guarantee.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
@@ -1004,7 +1006,8 @@ pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_OUTAGE_MILLIS: u64 =
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_STARTUP_MILLIS: u64 =
     QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS;
 /// Maximum time after replacement startup for Openraft to regain the committed
-/// state on the restarted member before the final readiness observation.
+/// state on the restarted member before the final readiness observation. This
+/// acceptance SLO does not guarantee convergence for every election schedule.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;
@@ -1026,7 +1029,8 @@ pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_CATCHUP_MILLIS: u64 =
     QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RECOVERY_MILLIS
         + QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_FINAL_READINESS_PROBE_MILLIS;
 /// Maximum time after journal reconciliation for the restarted mutator to
-/// commit under a strictly higher same-owner fence.
+/// commit under a strictly higher same-owner fence. Legal late convergence still
+/// fails this acceptance SLO; neither an operation nor a retry resets it.
 pub const QUALIFICATION_TRAFFIC_UNCLEAN_RESTART_RESUME_MILLIS: u64 =
     DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis * 2
         + DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout_millis;

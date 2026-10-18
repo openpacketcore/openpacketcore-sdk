@@ -9,7 +9,7 @@ use opc_session_store::{
     SessionConsensusWireResponse,
 };
 
-const FAMILIES: [&str; 11] = [
+const FAMILIES: [&str; 12] = [
     "vote",
     "append_entries",
     "append_entries_roster",
@@ -20,6 +20,7 @@ const FAMILIES: [&str; 11] = [
     "read_probe",
     "topology_admission_barrier",
     "leadership_transfer",
+    "pre_vote",
     "other",
 ];
 const OUTCOMES: [&str; 4] = [
@@ -65,7 +66,8 @@ impl Observations {
             SessionConsensusRpcFamily::ReadBarrier => 7,
             SessionConsensusRpcFamily::TopologyAdmissionBarrier => 8,
             SessionConsensusRpcFamily::LeadershipTransfer => 9,
-            _ => 10,
+            SessionConsensusRpcFamily::PreVote => 10,
+            _ => 11,
         };
         let family = &self.families[index];
         family.attempted.fetch_add(1, Ordering::Relaxed);

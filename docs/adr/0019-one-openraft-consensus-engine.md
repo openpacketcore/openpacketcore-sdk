@@ -95,7 +95,7 @@ consensus authority remain unchanged. Historical HA profiles still bind the
 original revision above; current manifest/lock/metadata checks independently
 bind the new candidate. This source change does not confer qualification.
 
-The shared dependency update advances the candidate to `0be191c797fd8fab603474864ac8ba8211206dc2`,
+The shared dependency update advances the candidate to `2e1fb7455752455a3505b354d003d6effa55985d`,
 which incorporates release-0.9 through v0.9.25 and the fork's bounded apply,
 joined replication retirement and fatal completion repairs. It also retires
 obsolete leadership and mismatched campaigns on an accepted newer self-vote,
@@ -113,6 +113,15 @@ observed-leader split-vote in the multi-process qualification harness: the
 registry implementation reused one sampled timeout across campaigns. The
 forked engine resamples every campaign without adding SDK election, vote,
 leader-lease, or quorum logic.
+
+Pre-Vote retains rolling-election compatibility in the fork. An eligible real
+campaign with a shorter log can allow an upgraded voter to start ordinary
+voting after a bounded inquiry round, using the observed actual candidate term.
+This does not grant a speculative vote or change the SDK transport contract.
+The self-vote must be durable, actual joint majorities remain necessary, and
+lease, context and peer-generation fences discard obsolete evidence. Silence
+alone does not cause fallback. The preceding fork is a test-only dependency of
+the fork's mixed-version regression; it is not another production engine.
 
 A published crates.io manifest cannot preserve this git revision. Therefore
 the exact 26-crate transitive normal reverse-dependency closure rooted at

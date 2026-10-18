@@ -187,3 +187,81 @@ fn append_entries_split_hint_never_retries_a_singleton_as_payload_too_large() {
     assert_eq!(append_entries_split_hint(2), Some(1));
     assert_eq!(append_entries_split_hint(64), Some(32));
 }
+
+#[derive(Debug)]
+struct PreVotePeer {
+    supported: bool,
+    requests: Mutex<Vec<ConsensusWireRequest>>,
+}
+
+#[async_trait]
+impl ConsensusPeer for PreVotePeer {
+    fn node_id(&self) -> ConsensusNodeId {
+        node(2)
+    }
+
+    async fn call(
+        &self,
+        request: ConsensusWireRequest,
+    ) -> Result<ConsensusWireResponse, ConsensusPeerError> {
+        assert_eq!(request.family, ConsensusRpcFamily::PreVote);
+        self.requests.lock().unwrap().push(request);
+        if !self.supported {
+            return Err(ConsensusPeerError::Rejected);
+        }
+        let response: Result<_, RaftError<ConsensusNodeId>> = Ok(PreVoteResponse::new(
+            Vote::new_committed(1, node(2)),
+            Some(log_id(1)),
+            true,
+        ));
+        Ok(ConsensusWireResponse {
+            result: Ok(encode_engine_result(&response).unwrap()),
+        })
+    }
+}
+
+#[tokio::test]
+async fn pre_vote_uses_its_own_authenticated_family_and_never_falls_back_to_vote() {
+    for supported in [true, false] {
+        let peer = Arc::new(PreVotePeer {
+            supported,
+            requests: Mutex::default(),
+        });
+        let route: Arc<dyn ConsensusPeer> = peer.clone();
+        let mut factory = ConfigRaftNetworkFactory::try_new(
+            identity(),
+            node(1),
+            BTreeMap::from([(node(2), route)]),
+        )
+        .unwrap();
+        let mut network = factory.new_client(node(2), &EmptyNode::default()).await;
+        let request = PreVoteRequest::new(Vote::new(2, node(1)), Some(log_id(1)));
+        let result = network.pre_vote(request.clone(), rpc_option()).await;
+        if supported {
+            assert_eq!(
+                result.unwrap(),
+                PreVoteResponse::new(Vote::new_committed(1, node(2)), Some(log_id(1)), true,)
+            );
+        } else {
+            assert!(matches!(result, Err(EngineRpcError::Unreachable(_))));
+        }
+        let received = peer.requests.lock().unwrap();
+        assert_eq!(received.len(), 1, "one inquiry without fallback");
+        assert_eq!(received[0].identity, identity());
+        assert_eq!(received[0].sender, node(1));
+        assert_eq!(
+            decode_and_bind_sender::<PreVoteRequest<ConsensusNodeId>>(
+                &received[0].payload,
+                node(1),
+            ),
+            Ok(request)
+        );
+        assert_eq!(
+            decode_and_bind_sender::<PreVoteRequest<ConsensusNodeId>>(
+                &received[0].payload,
+                node(2),
+            ),
+            Err(ConsensusPeerError::ScopeMismatch)
+        );
+    }
+}

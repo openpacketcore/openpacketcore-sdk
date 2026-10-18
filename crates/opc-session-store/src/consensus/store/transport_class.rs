@@ -11,6 +11,7 @@ pub fn session_consensus_work_class(
     match request.family {
         SessionConsensusRpcFamily::InstallSnapshot => Ok(ScopeWorkClass::Maintenance),
         SessionConsensusRpcFamily::Vote
+        | SessionConsensusRpcFamily::PreVote
         | SessionConsensusRpcFamily::AppendEntries
         | SessionConsensusRpcFamily::AppendEntriesRoster
         | SessionConsensusRpcFamily::ReadBarrier

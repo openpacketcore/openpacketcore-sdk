@@ -15,7 +15,7 @@ use opc_consensus::engine::error::{
 use opc_consensus::engine::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    TransferLeaderRequest, VoteRequest, VoteResponse,
+    PreVoteRequest, PreVoteResponse, TransferLeaderRequest, VoteRequest, VoteResponse,
 };
 use opc_consensus::engine::{EmptyNode, EntryPayload, Membership, StoredMembership, Vote};
 use opc_consensus::{
@@ -514,7 +514,12 @@ impl SessionRaftPeerDirectory {
         let staged = state
             .staged
             .as_ref()
-            .filter(|staged| family != SessionConsensusRpcFamily::Vote || staged.voting_admitted)
+            .filter(|staged| {
+                !matches!(
+                    family,
+                    SessionConsensusRpcFamily::Vote | SessionConsensusRpcFamily::PreVote
+                ) || staged.voting_admitted
+            })
             .and_then(|staged| staged.routes.get(&target));
         let route = if state.current_members.contains(&self.local_node_id) {
             active.or(staged)
@@ -542,7 +547,10 @@ impl SessionRaftPeerDirectory {
                         route.identity == identity && route.peer.node_id() == sender
                     }))
                     || state.staged.as_ref().is_some_and(|staged| {
-                        (family != SessionConsensusRpcFamily::Vote || staged.voting_admitted)
+                        (!matches!(
+                            family,
+                            SessionConsensusRpcFamily::Vote | SessionConsensusRpcFamily::PreVote
+                        ) || staged.voting_admitted)
                             && staged.routes.get(&sender).is_some_and(|route| {
                                 route.identity == identity && route.peer.node_id() == sender
                             })
@@ -1258,6 +1266,22 @@ impl RaftNetwork<SessionRaftTypeConfig> for SessionRaftNetwork {
         )
         .await
     }
+    async fn pre_vote(
+        &mut self,
+        rpc: PreVoteRequest<SessionConsensusNodeId>,
+        option: RPCOption,
+    ) -> Result<PreVoteResponse<SessionConsensusNodeId>, EngineRpcError> {
+        let payload = encode_bounded(&rpc).map_err(|error| {
+            EngineRpcError::Unreachable(Unreachable::new(&CodecTransportError(error)))
+        })?;
+        self.call(
+            SessionConsensusRpcFamily::PreVote,
+            opc_consensus::engine::RPCTypes::PreVote,
+            payload,
+            option,
+        )
+        .await
+    }
 }
 
 fn map_peer_error<E>(
@@ -1524,6 +1548,19 @@ impl SessionRaftRpcHandler {
                 }
                 encode_engine_result(&self.raft.vote(rpc).await)
             }
+            SessionConsensusRpcFamily::PreVote => {
+                let rpc = match decode_and_bind_sender::<PreVoteRequest<SessionConsensusNodeId>>(
+                    &request.payload,
+                    request.sender,
+                ) {
+                    Ok(rpc) => rpc,
+                    Err(error) => return rejected_response(error),
+                };
+                if !persistence.permits_pre_vote(&rpc) {
+                    return rejected_response(SessionConsensusPeerError::Rejected);
+                }
+                encode_engine_result(&self.raft.pre_vote(rpc).await)
+            }
             SessionConsensusRpcFamily::InstallSnapshot => {
                 let rpc = match decode_and_bind_sender::<
                     InstallSnapshotRequest<SessionRaftTypeConfig>,
@@ -1615,6 +1652,7 @@ fn is_engine_rpc_family(family: SessionConsensusRpcFamily) -> bool {
     matches!(
         family,
         SessionConsensusRpcFamily::Vote
+            | SessionConsensusRpcFamily::PreVote
             | SessionConsensusRpcFamily::AppendEntries
             | SessionConsensusRpcFamily::AppendEntriesRoster
             | SessionConsensusRpcFamily::InstallSnapshot
@@ -1639,6 +1677,12 @@ impl EngineRequestSender for AppendEntriesRequest<SessionRaftTypeConfig> {
 }
 
 impl EngineRequestSender for VoteRequest<SessionConsensusNodeId> {
+    fn vote(&self) -> &Vote<SessionConsensusNodeId> {
+        &self.vote
+    }
+}
+
+impl EngineRequestSender for PreVoteRequest<SessionConsensusNodeId> {
     fn vote(&self) -> &Vote<SessionConsensusNodeId> {
         &self.vote
     }
@@ -2922,6 +2966,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_pre_vote_leaves_engine_and_durable_vote_unchanged() {
+        use rusqlite::OptionalExtension;
+
+        let fixture =
+            fixed_follower_fixture(Duration::from_secs(1), true, FixedAuthorityBackend::Sqlite)
+                .await;
+        fixture.raft.runtime_config().elect(false);
+        let conn =
+            rusqlite::Connection::open(fixture._temp.path().join("sessions.sqlite")).unwrap();
+        let saved = || {
+            conn.query_row(
+                "SELECT vote_json FROM consensus_vote WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        let before_saved = saved();
+        let before = fixture
+            .raft
+            .with_raft_state(|state| (*state.vote_ref(), state.vote_last_modified()))
+            .await
+            .unwrap();
+        let proposed = Vote::new(42, fixture.leader);
+        let last_log_id = Some(LogId::new(CommittedLeaderId::new(1, fixture.leader), 0));
+        let wire = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::PreVote,
+            encode_bounded(&PreVoteRequest::new(proposed, last_log_id)).unwrap(),
+        )
+        .unwrap();
+        let response = fixture.handler.handle(fixture.leader, wire).await;
+        let response: Result<
+            PreVoteResponse<SessionConsensusNodeId>,
+            RaftError<SessionConsensusNodeId>,
+        > = opc_consensus::decode_bounded(&response.result.unwrap()).unwrap();
+        let response = response.unwrap();
+        assert!(response.vote_granted);
+        assert_eq!(response.vote, before.0);
+        assert_eq!(
+            fixture
+                .raft
+                .with_raft_state(|state| { (*state.vote_ref(), state.vote_last_modified()) })
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(saved(), before_saved);
+
+        let wire = SessionConsensusWireRequest::try_new(
+            fixture.scope,
+            fixture.leader,
+            SessionConsensusRpcFamily::Vote,
+            encode_bounded(&VoteRequest::new(proposed, last_log_id)).unwrap(),
+        )
+        .unwrap();
+        let response = fixture.handler.handle(fixture.leader, wire).await;
+        let response: Result<
+            VoteResponse<SessionConsensusNodeId>,
+            RaftError<SessionConsensusNodeId>,
+        > = opc_consensus::decode_bounded(&response.result.unwrap()).unwrap();
+        assert!(response.unwrap().vote_granted);
+        let persisted: Vote<SessionConsensusNodeId> =
+            serde_json::from_slice(&saved().unwrap()).unwrap();
+        assert_eq!(
+            persisted, proposed,
+            "real votes are durable before the reply"
+        );
+        drop(conn);
+        fixture.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn raw_fixed_handler_uses_one_durable_authority_check_for_each_engine_family() {
         for selected in [
             FixedAuthorityBackend::Sqlite,
@@ -2942,6 +3061,7 @@ mod tests {
         for family in [
             SessionConsensusRpcFamily::AppendEntries,
             SessionConsensusRpcFamily::Vote,
+            SessionConsensusRpcFamily::PreVote,
             SessionConsensusRpcFamily::InstallSnapshot,
         ] {
             let request = SessionConsensusWireRequest::try_new(
@@ -4243,6 +4363,11 @@ mod tests {
             SessionConsensusRpcFamily::InstallSnapshot
         ));
         assert!(!directory.authorizes_engine(added, desired, SessionConsensusRpcFamily::Vote));
+        assert!(directory
+            .resolve_engine_for(added, SessionConsensusRpcFamily::PreVote)
+            .expect("pre-vote route lookup")
+            .is_none());
+        assert!(!directory.authorizes_engine(added, desired, SessionConsensusRpcFamily::PreVote));
         assert_eq!(
             directory.admit_staged_voting(
                 transition_id(0xff),
@@ -4263,6 +4388,11 @@ mod tests {
             .expect("vote route lookup after admission")
             .is_some());
         assert!(directory.authorizes_engine(added, desired, SessionConsensusRpcFamily::Vote));
+        assert!(directory
+            .resolve_engine_for(added, SessionConsensusRpcFamily::PreVote)
+            .expect("pre-vote route lookup after admission")
+            .is_some());
+        assert!(directory.authorizes_engine(added, desired, SessionConsensusRpcFamily::PreVote));
     }
 
     #[test]
@@ -4973,8 +5103,29 @@ mod tests {
     }
 
     #[test]
+    fn speculative_vote_is_bound_to_the_authenticated_sender() {
+        let sender = node_id(1);
+        let request = PreVoteRequest::new(Vote::new(42, sender), None);
+        let mut payload = encode_bounded(&request).unwrap();
+        assert_eq!(
+            decode_and_bind_sender::<PreVoteRequest<SessionConsensusNodeId>>(&payload, sender),
+            Ok(request)
+        );
+        assert_eq!(
+            decode_and_bind_sender::<PreVoteRequest<SessionConsensusNodeId>>(&payload, node_id(2)),
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+        payload.push(0);
+        assert_eq!(
+            decode_and_bind_sender::<PreVoteRequest<SessionConsensusNodeId>>(&payload, sender),
+            Err(SessionConsensusPeerError::Protocol)
+        );
+    }
+
+    #[test]
     fn consumer_rpc_families_are_not_engine_authority() {
         assert!(is_engine_rpc_family(SessionConsensusRpcFamily::Vote));
+        assert!(is_engine_rpc_family(SessionConsensusRpcFamily::PreVote));
         assert!(is_engine_rpc_family(
             SessionConsensusRpcFamily::LeadershipTransfer
         ));

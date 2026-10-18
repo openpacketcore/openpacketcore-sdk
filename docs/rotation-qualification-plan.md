@@ -62,12 +62,17 @@ them is a requalification event.
 Derived campaign SLOs (the same derivation as the runbook restart-stage
 table):
 
-| SLO | Value | Derivation |
+| SLO | Value | Budget definition |
 | --- | --- | --- |
 | Member transition envelope | 26 s | 2 × election-max + operation timeout |
 | Member recovery envelope | 37 s | transition envelope + one backend operation (10 s) + one delivery second (1 s) |
 | Traffic round envelope | (N + 1) × 10 s | one committed write plus one linearizable read per reachable voter, each within the operation timeout |
 | Local fault/measurement action | 10 s | one operation timeout |
+
+These are acceptance budgets, not guaranteed election convergence bounds. The
+engine evaluates deadlines at most 100 ms apart and uses Pre-Vote before
+persisted voting; repeated failed campaigns can still exhaust the unchanged
+26-second recovery SLO.
 
 The deployed-campaign budgets (rollback budget 21240 s / 33560 s, hard span
 22560 s / 34880 s, forward campaign 57600 s / 91880 s, certificate horizon

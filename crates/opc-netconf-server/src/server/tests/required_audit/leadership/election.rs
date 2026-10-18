@@ -4,7 +4,7 @@ use super::*;
 use futures_util::FutureExt;
 use opc_consensus::engine::{
     error::RaftError,
-    raft::{VoteRequest, VoteResponse},
+    raft::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse},
     Vote,
 };
 use opc_consensus::test_runtime::{ElectionRngScript, ScriptedElectionRuntime};
@@ -29,11 +29,21 @@ struct VoteExchange {
     response: VoteResponse<ConfigConsensusNodeId>,
 }
 
+#[derive(Clone, Debug)]
+struct PreVoteExchange {
+    source: ConfigConsensusNodeId,
+    target: ConfigConsensusNodeId,
+    at: Instant,
+    request: PreVoteRequest<ConfigConsensusNodeId>,
+    response: PreVoteResponse<ConfigConsensusNodeId>,
+}
+
 #[derive(Debug)]
 pub(super) struct VoteGate {
     term: u64,
     arrivals: watch::Sender<Vec<(Instant, VoteRequest<ConfigConsensusNodeId>)>>,
-    both_candidates: Option<Barrier>,
+    both_pre_votes: Option<Barrier>,
+    pre_votes: watch::Sender<Vec<PreVoteExchange>>,
     replies: watch::Sender<Vec<VoteExchange>>,
 }
 
@@ -49,7 +59,8 @@ impl VoteGate {
         Arc::new(Self {
             term,
             arrivals: watch::channel(Vec::new()).0,
-            both_candidates: None,
+            both_pre_votes: None,
+            pre_votes: watch::channel(Vec::new()).0,
             replies: watch::channel(Vec::new()).0,
         })
     }
@@ -89,9 +100,35 @@ impl VoteGate {
             );
             arrivals.push((Instant::now(), vote));
         });
-        if let Some(barrier) = &self.both_candidates {
-            // Each request exists only after its sender has saved its own
-            // vote. Deliver both after that point, forcing exactly one split.
+    }
+
+    pub(super) async fn after_pre_vote(
+        &self,
+        target: ConfigConsensusNodeId,
+        request: &ConsensusWireRequest,
+        response: &ConsensusWireResponse,
+    ) {
+        let (_, vote): (u16, PreVoteRequest<ConfigConsensusNodeId>) =
+            opc_consensus::decode_bounded(&request.payload).expect("real Pre-Vote request");
+        let (_, reply): (
+            u16,
+            Result<PreVoteResponse<ConfigConsensusNodeId>, RaftError<ConfigConsensusNodeId>>,
+        ) = opc_consensus::decode_bounded(
+            response.result.as_ref().expect("Pre-Vote wire response"),
+        )
+        .expect("Pre-Vote response");
+        self.pre_votes.send_modify(|exchanges| {
+            exchanges.push(PreVoteExchange {
+                source: request.sender,
+                target,
+                at: Instant::now(),
+                request: vote,
+                response: reply.expect("real peer Pre-Vote"),
+            });
+        });
+        if let Some(barrier) = &self.both_pre_votes {
+            // Query both actual logs before either candidate can persist a
+            // real vote. Preserve each handler's grant or rejection unchanged.
             barrier.wait().await;
         }
     }
@@ -251,7 +288,8 @@ impl SuccessfulElection {
         let gate = Arc::new(VoteGate {
             term: old_term + 1,
             arrivals: watch::channel(Vec::new()).0,
-            both_candidates: None,
+            both_pre_votes: None,
+            pre_votes: watch::channel(Vec::new()).0,
             replies: watch::channel(Vec::new()).0,
         });
         quorum.observe_votes(Some(gate.clone()));
@@ -307,7 +345,7 @@ impl SuccessfulElection {
 }
 
 #[tokio::test(start_paused = true)]
-async fn split_vote_reproduces_authority_timeout() {
+async fn pre_vote_recovers_fresh_authority_with_divergent_survivor_logs() {
     let runtime_origin = Instant::now();
     tokio::time::resume();
     let mut election = SuccessfulElection::new(runtime_origin).await;
@@ -374,7 +412,8 @@ async fn split_vote_reproduces_authority_timeout() {
         let gate = Arc::new(VoteGate {
             term: initial.term + 1,
             arrivals: watch::channel(Vec::new()).0,
-            both_candidates: Some(Barrier::new(2)),
+            both_pre_votes: Some(Barrier::new(2)),
+            pre_votes: watch::channel(Vec::new()).0,
             replies: watch::channel(Vec::new()).0,
         });
         for path in [(1, 2), (2, 1)] {
@@ -382,82 +421,61 @@ async fn split_vote_reproduces_authority_timeout() {
         }
         quorum.isolate_and_quiesce(old_leader).await;
         assert_eq!(Instant::now(), started);
-        let split_at = schedule.campaign(Duration::ZERO, Duration::ZERO, true);
-        let retry_at = schedule.campaign(split_at, Duration::ZERO, false);
-        assert_eq!(split_at, Duration::from_secs(18));
-        assert_eq!(retry_at, Duration::from_secs(27));
-        assert!(retry_at > TRANSITION_TIMEOUT);
-
+        let elected_at = schedule.campaign(Duration::ZERO, Duration::ZERO, true);
+        assert!(elected_at < TRANSITION_TIMEOUT);
+        let stale = quorum.stores[1].status().node_id;
+        let fresh = quorum.stores[2].status().node_id;
+        let old = quorum.stores[old_leader].status().node_id;
         let driving = async {
             let mut tick = schedule.tick;
-            while tick < TRANSITION_TIMEOUT {
+            while tick <= elected_at {
                 tokio::time::advance(started + tick - Instant::now()).await;
                 for (index, script) in scripts.iter().enumerate() {
                     schedule::tick_registered(&mut script.sleeps(), started + tick, schedule.tick)
                         .await;
                     ticks.wait(index as u64 + 1, started + tick).await;
                 }
-                if tick == split_at {
-                    let replies = gate
-                        .replies
-                        .subscribe()
-                        .wait_for(|replies| replies.len() == 2)
-                        .await
-                        .unwrap()
-                        .clone();
-                    for exchange in replies {
-                        assert_ne!(exchange.source, exchange.target);
-                        assert_eq!(exchange.at, started + split_at);
-                        assert_eq!(
-                            exchange.response.vote,
-                            Vote::new(gate.term, exchange.target)
-                        );
-                        assert!(!exchange.response.vote_granted);
-                    }
-                    let arrivals = gate.arrivals.borrow().clone();
-                    assert_eq!(arrivals.len(), 2);
-                    for (at, vote) in arrivals {
-                        assert_eq!(at, started + split_at);
-                        let expected = if vote.vote
-                            == Vote::new(gate.term, ConfigConsensusNodeId::new(2).unwrap())
-                        {
-                            12
-                        } else {
-                            13
-                        };
-                        assert_eq!(vote.last_log_id.map(|id| id.index), Some(expected));
-                    }
-                }
                 tick += schedule.tick;
             }
-            for store in &quorum.stores[1..] {
-                let status = store.status();
-                assert_eq!(status.term, initial.term + 1);
-                assert_eq!(status.leader_id, None);
-            }
-            assert_eq!(gate.replies.borrow().len(), 2);
-            tokio::time::advance(started + TRANSITION_TIMEOUT - Instant::now()).await;
         };
-        // Keep the original helper and deadline as a negative control. A legal
-        // split cannot prove fresh authority before the next production tick.
-        let (result, ()) = tokio::join!(
-            AssertUnwindSafe(quorum.leader_except(Some(old_leader))).catch_unwind(),
-            driving
-        );
-        assert_eq!(Instant::now() - started, TRANSITION_TIMEOUT);
-        let panic = result.expect_err("the next campaign is outside the original bound");
-        let message = panic
-            .downcast_ref::<String>()
-            .expect("authority timeout panic");
-        assert!(message.starts_with("quorum did not establish fresh local authority: Elapsed(())"));
-        assert!(message.contains("excluded=Some(0)"));
-        assert!(message.contains("probes=0"));
-        for (index, expected) in [(1, 12), (2, 13)] {
-            let status = quorum.stores[index].status();
+        // The original helper still proves fresh authority within its 26 s
+        // limit. The stale survivor's rejected inquiry consumes no term.
+        let (leader, ()) = tokio::join!(quorum.leader_except(Some(old_leader)), driving);
+        assert_eq!(leader, 2);
+        assert_eq!(Instant::now() - started, elected_at);
+        let inquiries = gate.pre_votes.borrow().clone();
+        assert_eq!(inquiries.len(), 2);
+        for exchange in inquiries {
+            assert_ne!(exchange.source, exchange.target);
+            assert_eq!(exchange.at, started + elected_at);
+            assert_eq!(exchange.request.vote, Vote::new(gate.term, exchange.source));
+            assert_eq!(
+                exchange.request.last_log_id.map(|id| id.index),
+                Some(if exchange.source == stale { 12 } else { 13 })
+            );
+            assert_eq!(
+                exchange.response.vote,
+                Vote::new_committed(initial.term, old)
+            );
+            assert_eq!(exchange.response.vote_granted, exchange.source == fresh);
+        }
+        gate.assert_one_granted_vote(fresh, stale, 13).await;
+        assert_eq!(gate.replies.borrow()[0].at, started + elected_at);
+        for store in &quorum.stores[1..] {
+            store
+                .wait_for_raft_status_for_test(|status| {
+                    status.term == initial.term + 1
+                        && status.leader_id == Some(fresh)
+                        && status.applied_index >= Some(13)
+                        && status.committed_index >= Some(13)
+                })
+                .await
+                .unwrap();
+            let status = store.status();
             assert_eq!(status.term, initial.term + 1);
-            assert_eq!(status.leader_id, None);
-            assert_eq!(status.applied_index, Some(expected));
-            assert_eq!(status.committed_index, Some(expected));
+            assert_eq!(status.leader_id, Some(fresh));
+            assert!(status.applied_index >= Some(13));
+            assert!(status.committed_index >= Some(13));
         }
         quorum.shutdown().await;
         for script in scripts {

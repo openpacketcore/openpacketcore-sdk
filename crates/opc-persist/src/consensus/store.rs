@@ -2089,6 +2089,7 @@ impl ConfigConsensusService {
         }
         match request.family {
             ConsensusRpcFamily::Vote
+            | ConsensusRpcFamily::PreVote
             | ConsensusRpcFamily::AppendEntries
             | ConsensusRpcFamily::InstallSnapshot
             | ConsensusRpcFamily::LeadershipTransfer => {

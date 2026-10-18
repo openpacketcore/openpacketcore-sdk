@@ -1137,6 +1137,12 @@ async fn async_persistence_wire_bounds_full_lineage_and_attempt_replacement() {
     protocol.accept_cut_before(cut, deadline).await.unwrap();
     let guard = protocol.engine_before(deadline).await.unwrap();
     assert!(!guard.permits_vote(&VoteRequest::new(cut.vote, Some(cut.barrier))));
+    assert!(
+        !guard.permits_pre_vote(&opc_consensus::engine::raft::PreVoteRequest::new(
+            Vote::new(cut.vote.leader_id.term + 1, leader),
+            Some(cut.barrier)
+        ))
+    );
     assert!(guard.request_cold_repair());
     for wrong in [
         LogId::new(CommittedLeaderId::new(9, leader), 7),

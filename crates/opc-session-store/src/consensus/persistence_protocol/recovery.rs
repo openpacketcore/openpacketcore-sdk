@@ -253,6 +253,9 @@ impl EngineAdmission {
             SessionConsensusRpcFamily::Vote => {
                 opc_consensus::decode_bounded(payload).is_ok_and(|rpc| self.permits_vote(&rpc))
             }
+            SessionConsensusRpcFamily::PreVote => {
+                opc_consensus::decode_bounded(payload).is_ok_and(|rpc| self.permits_pre_vote(&rpc))
+            }
             SessionConsensusRpcFamily::AppendEntries => {
                 opc_consensus::decode_bounded(payload).is_ok_and(|rpc| self.permits_append(&rpc))
             }

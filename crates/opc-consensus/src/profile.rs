@@ -90,7 +90,7 @@ impl DurableConsensusTimingProfile {
     /// Return the complete deadline for one bounded RPC family.
     pub const fn rpc_timeout(self, family: ConsensusRpcFamily) -> Duration {
         Duration::from_millis(match family {
-            ConsensusRpcFamily::Vote => self.vote_timeout_millis,
+            ConsensusRpcFamily::Vote | ConsensusRpcFamily::PreVote => self.vote_timeout_millis,
             ConsensusRpcFamily::LeadershipTransfer => self.vote_timeout_millis,
             ConsensusRpcFamily::AppendEntries => self.append_entries_timeout_millis,
             ConsensusRpcFamily::AppendEntriesRoster => self.append_entries_timeout_millis,
@@ -349,6 +349,10 @@ mod tests {
         );
         assert_eq!(
             profile.rpc_timeout(ConsensusRpcFamily::Vote),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            profile.rpc_timeout(ConsensusRpcFamily::PreVote),
             Duration::from_millis(5_000)
         );
         assert_eq!(

@@ -1,7 +1,10 @@
 //! Real Raft completion, election and cached-response schedules.
 
 use super::*;
-use opc_consensus::{decode_roster_bounded, engine::raft::VoteResponse};
+use opc_consensus::{
+    decode_roster_bounded,
+    engine::raft::{PreVoteRequest, PreVoteResponse, VoteResponse},
+};
 
 struct CompletionHold(Arc<AcceptedClientWriteReceiverHoldForTest>);
 
@@ -28,12 +31,14 @@ impl Drop for CompletionHold {
 enum ReplyFilter {
     AppendAtOrAfter(u64),
     GrantedVote,
+    GrantedPreVote,
     ColdCut,
 }
 
 enum CapturedRequest {
     Append(AppendEntriesRequest<SessionRaftTypeConfig>),
     Vote(VoteRequest<SessionConsensusNodeId>),
+    PreVote(PreVoteRequest<SessionConsensusNodeId>),
     ColdCut(ColdQuorumCut),
 }
 
@@ -57,6 +62,10 @@ impl ReplyRelease {
 
     fn vote(peer: &Peer, sender: SessionConsensusNodeId) -> Self {
         Self::install(peer, sender, ReplyFilter::GrantedVote)
+    }
+
+    fn pre_vote(peer: &Peer, sender: SessionConsensusNodeId) -> Self {
+        Self::install(peer, sender, ReplyFilter::GrantedPreVote)
     }
 
     pub(super) fn cold_cut(peer: &Peer, sender: SessionConsensusNodeId) -> Self {
@@ -119,6 +128,13 @@ impl ReplyHold {
         }
     }
 
+    fn pre_vote(&self) -> PreVoteRequest<SessionConsensusNodeId> {
+        match self.captured.lock().unwrap().as_ref().unwrap() {
+            CapturedRequest::PreVote(request) => request.clone(),
+            _ => panic!("expected actual pre-vote request"),
+        }
+    }
+
     pub(super) async fn after_response(
         &self,
         request: SessionConsensusWireRequest,
@@ -171,6 +187,32 @@ impl ReplyHold {
                     return;
                 }
                 CapturedRequest::Vote(vote)
+            }
+            ReplyFilter::GrantedPreVote => {
+                if request.family != SessionConsensusRpcFamily::PreVote {
+                    return;
+                }
+                let wire = persistence_protocol::unwrap_payload(
+                    SessionPersistenceMode::Async,
+                    &request.payload,
+                )
+                .unwrap();
+                let inquiry: PreVoteRequest<SessionConsensusNodeId> = decode_bounded(wire).unwrap();
+                let Ok(Ok(response)) = decode_bounded::<
+                    Result<
+                        PreVoteResponse<SessionConsensusNodeId>,
+                        RaftError<SessionConsensusNodeId>,
+                    >,
+                >(payload) else {
+                    return;
+                };
+                if !response.vote_granted {
+                    return;
+                }
+                assert!(response.vote.is_committed());
+                assert!(response.vote.leader_id.term < inquiry.vote.leader_id.term);
+                assert!(response.last_log_id <= inquiry.last_log_id);
+                CapturedRequest::PreVote(inquiry)
             }
             ReplyFilter::ColdCut => {
                 if request.family != SessionConsensusRpcFamily::ReadBarrier {
@@ -318,10 +360,20 @@ pub(super) async fn wait_for_lease_expiry(store: &ConsensusSessionStore) {
         .await
         .unwrap()
         .unwrap();
-    // Fixture setup waits for the real pinned engine lease. No operation is
-    // in progress, and neither election settings nor the 800 ms API change.
+    // Callers quiesce leader traffic first. A leader's recent quorum ACKs
+    // also protect its lease, even when its own vote timestamp is old.
+    // The published ACK age may lag, which only makes this setup wait more
+    // conservative. No operation or its unchanged 800 ms bound is running.
     let lease = Duration::from_millis(session_raft_config().unwrap().election_timeout_max);
-    tokio::time::sleep_until(modified + lease + Duration::from_millis(1)).await;
+    let ack_deadline = store
+        .inner
+        .raft
+        .metrics()
+        .borrow()
+        .millis_since_quorum_ack
+        .map(|age| tokio::time::Instant::now() + lease.saturating_sub(Duration::from_millis(age)));
+    let deadline = ack_deadline.map_or(modified + lease, |ack| ack.max(modified + lease));
+    tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -355,7 +407,14 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
             let old_store = fleet.store(old).clone();
             let next_store = fleet.store(next).clone();
             let vote = old_store.inner.raft.metrics().borrow().vote;
-            wait_for_lease_expiry(&old_store).await;
+            for store in fleet.stores.iter().flatten() {
+                store.inner.raft.runtime_config().elect(false);
+            }
+            old_store.inner.raft.runtime_config().heartbeat(false);
+            tokio::join!(
+                wait_for_lease_expiry(&old_store),
+                wait_for_lease_expiry(&next_store)
+            );
             assert_eq!(old_store.inner.raft.metrics().borrow().vote, vote);
             let request = cold
                 .inner
@@ -412,7 +471,39 @@ async fn async_persistence_old_completion_cannot_certify_a_new_leader() {
                 old_applied.leader_id,
                 CommittedLeaderId::new(vote.leader_id.term, fleet.peers[old].node)
             );
+            // This write refreshed both the follower lease and leader quorum
+            // ACKs. Retire the actual leader and release exactly its lease;
+            // a healthy leader cannot be displaced inside the 800 ms bound.
+            // Trigger the successor normally through PreVote rather than the
+            // handoff API's direct-election path. All votes remain engine-made.
+            let resignation = old_store
+                .inner
+                .raft
+                .begin_leadership_transfer(fleet.peers[next].node)
+                .await
+                .unwrap();
+            assert_eq!(*resignation.from(), vote);
+            assert!(next_store
+                .inner
+                .raft
+                .release_leader_lease(
+                    fleet.peers[old].node,
+                    *resignation.from(),
+                    resignation.membership_log_id().copied(),
+                )
+                .await
+                .unwrap());
+            let inquiry = ReplyRelease::pre_vote(&fleet.peers[old], fleet.peers[next].node);
             next_store.inner.raft.trigger().elect().await.unwrap();
+            tokio::time::timeout(OPERATION_BOUND, inquiry.wait_started())
+                .await
+                .unwrap();
+            let proposed = inquiry.0.pre_vote();
+            assert!(proposed.vote.leader_id.term > vote.leader_id.term);
+            assert_eq!(old_store.inner.raft.metrics().borrow().vote, vote);
+            assert_eq!(next_store.inner.raft.metrics().borrow().vote, vote);
+            assert!(!*inquiry.0.delivered.borrow());
+            inquiry.release();
             until(
                 [
                     old_store.inner.raft.metrics(),
@@ -655,26 +746,51 @@ async fn async_persistence_forgotten_vote_cannot_finish_a_stale_five_voter_campa
             .unwrap()
             .completed_generation;
 
-        // A and B stop hearing the old leader; C/D/E remain a live majority.
-        // B's only reachable external voter is A, so even its real cached
-        // grant plus B's self-vote cannot elect B in this five-voter set.
+        // Obtain a genuine speculative quorum first. C/D/E retain their
+        // committed vote: D may answer PreVote, but none can receive B's
+        // real Vote. B's real cached grant plus self-vote still total only two.
+        live.inner.raft.runtime_config().heartbeat(false);
+        let witness = survivors[1];
         for survivor in survivors {
             fleet.set_link(survivor, forgotten, false);
             fleet.set_link(survivor, candidate, false);
-            fleet.set_link(candidate, survivor, false);
+            fleet.set_link(candidate, survivor, survivor == witness);
+            fleet.peers[survivor]
+                .blocked_votes
+                .store(true, Ordering::Release);
         }
-        tokio::join!(
-            wait_for_lease_expiry(fleet.store(forgotten)),
-            wait_for_lease_expiry(&contender)
-        );
+        join_all(fleet.stores.iter().flatten().map(wait_for_lease_expiry)).await;
+        let inquiry = ReplyRelease::pre_vote(&fleet.peers[witness], fleet.peers[candidate].node);
+        contender.inner.raft.trigger().elect().await.unwrap();
+        tokio::time::timeout(OPERATION_BOUND, inquiry.wait_started())
+            .await
+            .unwrap();
+        let proposed = inquiry.0.pre_vote();
+        assert_eq!(proposed.last_log_id, Some(retained));
+        assert!(proposed.vote.leader_id.term > retained_vote.leader_id.term);
+        for store in fleet.stores.iter().flatten() {
+            assert_eq!(store.inner.raft.metrics().borrow().vote, retained_vote);
+        }
+        assert!(!*inquiry.0.delivered.borrow());
         let hold = ReplyRelease::vote(&fleet.peers[forgotten], fleet.peers[candidate].node);
         faults[forgotten].store(true, Ordering::Release);
         let campaign_started = tokio::time::Instant::now();
-        contender.inner.raft.trigger().elect().await.unwrap();
+        inquiry.release();
         tokio::time::timeout(OPERATION_BOUND, hold.0.entered.notified())
             .await
             .unwrap();
         let campaign = hold.0.vote();
+        assert_eq!(campaign.vote, proposed.vote);
+        fleet.set_link(candidate, witness, false);
+        for survivor in survivors {
+            fleet.peers[survivor]
+                .blocked_votes
+                .store(false, Ordering::Release);
+            assert_eq!(
+                fleet.store(survivor).inner.raft.metrics().borrow().vote,
+                retained_vote
+            );
+        }
         assert_eq!(campaign.last_log_id, Some(retained));
         assert!(campaign.vote.leader_id.term > retained_vote.leader_id.term);
         assert!(!campaign.vote.is_committed());

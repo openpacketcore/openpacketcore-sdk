@@ -3356,6 +3356,30 @@ impl ConsensusSessionStore {
         self.inner.raft.runtime_config().elect(enabled);
     }
 
+    /// Inspect log replication while allowing real empty lease heartbeats.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn is_empty_append_entries_for_test(request: &SessionConsensusWireRequest) -> bool {
+        request.family == SessionConsensusRpcFamily::AppendEntries
+            && opc_consensus::decode_bounded::<
+                opc_consensus::engine::raft::AppendEntriesRequest<SessionRaftTypeConfig>,
+            >(&request.payload)
+            .is_ok_and(|append| append.entries.is_empty())
+    }
+
+    /// Observe the actual engine vote update without changing its lease.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub async fn vote_updated_at_for_test(
+        &self,
+    ) -> Result<Option<tokio::time::Instant>, StoreError> {
+        self.inner
+            .raft
+            .with_raft_state(|state| state.vote_last_modified())
+            .await
+            .map_err(|_| consensus_unavailable())
+    }
+
     /// Ask Openraft to start one normal campaign for deterministic integration
     /// qualification. Openraft owns vote creation, persistence, and transport.
     #[cfg(feature = "test-control")]
@@ -6580,8 +6604,10 @@ impl ConsensusSessionStore {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn wait_for_status_for_test(
+    /// Wait for an observed engine status; the fixture supplies its deadline.
+    #[cfg(any(test, feature = "test-control"))]
+    #[doc(hidden)]
+    pub async fn wait_for_status_for_test(
         &self,
         mut predicate: impl FnMut(&SessionConsensusStatus) -> bool,
     ) {
@@ -12536,6 +12562,7 @@ impl SessionConsensusRpcHandler for SessionConsensusService {
         if matches!(
             request.family,
             SessionConsensusRpcFamily::Vote
+                | SessionConsensusRpcFamily::PreVote
                 | SessionConsensusRpcFamily::AppendEntries
                 | SessionConsensusRpcFamily::AppendEntriesRoster
                 | SessionConsensusRpcFamily::InstallSnapshot

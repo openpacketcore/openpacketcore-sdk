@@ -8,7 +8,7 @@ use opc_consensus::engine::{
     Snapshot, SnapshotMeta, Vote,
 };
 use opc_consensus::engine::{
-    raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest},
+    raft::{AppendEntriesRequest, AppendEntriesResponse, PreVoteRequest, VoteRequest},
     EntryPayload,
 };
 use opc_consensus::voter_slots::*;
@@ -1476,6 +1476,29 @@ pub(super) async fn handle(
                             .map_err(|_| VoterReplacementError::UnauthorizedReplacement)?;
                     Ok(
                         encode_engine_result(&store.inner.raft.vote(rpc).await).map_or_else(
+                            rejected,
+                            |payload| ConsensusWireResponse {
+                                result: Ok(payload),
+                            },
+                        ),
+                    )
+                }
+                ConsensusRpcFamily::PreVote => {
+                    if !profile.admission.local_voting_admitted() {
+                        return Err(VoterReplacementError::UnauthorizedReplacement);
+                    }
+                    let state = profile.admission.durable_view()?;
+                    if !state.table().slots.iter().any(|slot| {
+                        slot.member.identity.node_id() == sender
+                            && slot.phase == VoterSlotPhase::Voting
+                    }) {
+                        return Err(VoterReplacementError::UnauthorizedReplacement);
+                    }
+                    let rpc: PreVoteRequest<ConsensusNodeId> =
+                        decode_and_bind_sender(&request.payload, sender)
+                            .map_err(|_| VoterReplacementError::UnauthorizedReplacement)?;
+                    Ok(
+                        encode_engine_result(&store.inner.raft.pre_vote(rpc).await).map_or_else(
                             rejected,
                             |payload| ConsensusWireResponse {
                                 result: Ok(payload),

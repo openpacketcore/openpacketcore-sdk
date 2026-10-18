@@ -763,6 +763,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `opc-types`; `opc-persist` reuses them without changing its existing bounds.
   The optional `async-time` feature enables those Tokio adapters. (#1304)
 
+- `opc-amf-lite` and `opc-session-store`: coordinate election regression
+  fixtures through genuine PreVote grants before real votes, retaining split
+  recovery, forgotten-vote safety, stale-completion rejection and their
+  existing timing bounds. Multi-process scope recovery also crosses genuine
+  speculative replies before split votes and expires renewed replication
+  leases before its post-restart campaign. (#1333)
+
 - `opc-persist`: snapshot reads pin the last durable publication independently
   of building or installing its successor, including a delayed SQLite commit.
   Publication holds only a brief gate; readers open independent descriptors and
@@ -792,6 +799,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot authority. Snapshot reads remain valid across concurrent snapshot
   replacement, and repair waits for actual snapshot progress before fetching.
   (#1315)
+
+- `opc-consensus`: the pinned OpenRaft fork uses a distinct authenticated
+  Pre-Vote inquiry before ordinary elections and checks election deadlines at
+  intervals of at most 100 ms. An isolated candidate's unanswered inquiries do
+  not consume a term. Inquiries leave the receiver's
+  vote and durable state unchanged; actual votes still persist through the
+  existing election path. Both SDK adapters enforce the existing voting and
+  membership admission rules for the new RPC. Automatic failover fixtures keep
+  their original helpers and 26 s/30 s limits; three- and five-voter regressions
+  kill the leader during sustained writes without first synchronizing survivor
+  logs. Repeated failed campaigns remain negative controls for these acceptance
+  SLOs. A live legacy voter's ordinary campaign permits bounded fallback to real
+  voting during a rolling upgrade or downgrade, retaining durable votes, log
+  checks, joint majorities and peer fences. Real preceding-version engines
+  exercise leader loss with divergent stored logs. Planned handoff and operator
+  timing profiles are unchanged. (#1333, #1324)
 
 - `opc-proto-gtpv2c`: An empty Create Session Response APCO received before any
   retained APCO is discarded as malformed optional outer-IE data at every

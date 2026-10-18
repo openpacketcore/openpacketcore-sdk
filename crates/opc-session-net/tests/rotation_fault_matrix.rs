@@ -29,7 +29,7 @@
 //! it with the independent stdlib checker
 //! `scripts/check-session-rotation-fleet-evidence.py`. The per-kind duration
 //! SLOs are the profile-derived envelopes documented in
-//! `docs/rotation-qualification-plan.md`: the 26-second two-election-plus-operation
+//! `docs/rotation-qualification-plan.md`: the 26-second recovery SLO
 //! transition envelope, the 37-second member-recovery stage, and the
 //! (members + 1) x operation-timeout traffic-round envelope.
 

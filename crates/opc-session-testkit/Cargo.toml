@@ -40,6 +40,9 @@ rcgen = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Scripted election negative controls are confined to this crate's tests.
+opc-session-store = { path = "../opc-session-store", version = "0.2.0", features = ["test-control"] }
+opc-consensus = { path = "../opc-consensus", version = "0.2.0", features = ["dangerous-test-hooks"] }
 # These integration tests compile under the default (no-fixture) feature set.
 # Keep the fixture's production-only dependencies optional above, while making
 # the test-only certificate helpers available to Cargo's default test target.

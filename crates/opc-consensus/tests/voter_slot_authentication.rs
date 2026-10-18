@@ -75,6 +75,9 @@ fn rpc_payload_commitments_cover_family_scope_and_both_response_outcomes() {
     .unwrap();
     let digest = voter_rpc_request_digest(&request).unwrap();
     let mut other = request.clone();
+    other.family = ConsensusRpcFamily::PreVote;
+    assert_ne!(digest, voter_rpc_request_digest(&other).unwrap());
+    other = request.clone();
     other.family = ConsensusRpcFamily::AppendEntries;
     assert_ne!(digest, voter_rpc_request_digest(&other).unwrap());
     other = request.clone();
