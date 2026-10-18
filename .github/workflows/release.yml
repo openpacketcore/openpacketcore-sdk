@@ -30,9 +30,6 @@ jobs:
       # The all-workspace gate includes the production fs-verity
       # qualification. Its tempfile-backed artifact must be on the dedicated
       # Linux filesystem prepared for sealing.
-      - name: Prepare fs-verity snapshot storage
-        run: ci/setup-fsverity-tmp.sh
-
       - name: Install Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -46,6 +43,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run Rust release gates
+        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           cargo fmt --all --check
           git diff --check

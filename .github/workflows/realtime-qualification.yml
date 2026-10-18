@@ -38,9 +38,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Prepare fs-verity snapshot storage
-        run: ci/setup-fsverity-tmp.sh
-
       - name: Prepare mutable disk scratch
         run: |
           scratch="$(mktemp -d "${RUNNER_TEMP}/realtime-qualification.XXXXXX")"
@@ -53,6 +50,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run every manifest test and preserve every failure
+        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           python3 ci/realtime_qualification.py \
             --repetitions "$REPETITIONS" --output qualification-results

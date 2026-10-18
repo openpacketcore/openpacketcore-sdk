@@ -777,6 +777,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Config bus adapters expose the same lifecycle through their consensus store.
   Planned shutdown keeps automatic bounded handoff. (#1370)
 
+- The Linux fs-verity test harness owns each gate's filesystem through command
+  exit and interruption, removes its loop mount and image, and sweeps stale
+  private runtime directories without deleting an attached or active runtime.
+  CI invokes each fs-verity test command through the owner. (#1312)
+
 - `opc-proto-gtpu`: encode and decode the PDU Session Container Paging Policy
   Indicator in bits 7..5, as specified by TS 38.415. Correct the independent
   reference corpus, catalog and forwarding fixtures. `opc-gtpu-dataplane`

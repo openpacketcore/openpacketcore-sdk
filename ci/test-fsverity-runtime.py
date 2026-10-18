@@ -6,6 +6,7 @@ umount and losetup privileges as the harness. Fixtures always clean their own
 resources, including the leftovers from a deliberately interrupted old helper.
 """
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -29,7 +30,7 @@ def privileged(*args):
 
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="fsverity-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="fsverity test-")
         self.root = Path(self.temporary.name)
         self.runner = self.root / "runner"
         self.runner.mkdir()
@@ -38,9 +39,11 @@ class RuntimeTests(unittest.TestCase):
             "GITHUB_ENV": str(self.root / "github-env"),
         }
         self.process = None
+        self.extra_mounts = []
+        self.extra_images = []
 
     def images(self):
-        return list(self.runner.glob("*/ext4.img"))
+        return list(self.runner.glob("*/ext4.img")) + self.extra_images
 
     def attached(self):
         resources = []
@@ -59,6 +62,13 @@ class RuntimeTests(unittest.TestCase):
             os.killpg(self.process.pid, signal.SIGKILL)
             self.process.wait(timeout=5)
         # Even the RED must not strand a loop mount on the shared host.
+        for mountpoint in reversed(self.extra_mounts):
+            mounted = subprocess.run(
+                ["findmnt", "--mountpoint", str(mountpoint), "--noheadings"],
+                capture_output=True, timeout=5,
+            )
+            if mounted.returncode == 0:
+                privileged("umount", mountpoint)
         for image in self.images():
             mountpoint = image.parent / "tmp"
             mounted = subprocess.run(
@@ -79,8 +89,7 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f"timed out waiting for {description}")
 
-    def test_interrupted_setup_releases_mount_loop_and_image(self):
-        """Interrupt after mount succeeds but before setup can export its root."""
+    def interrupted_setup(self, signum):
         ready = self.root / "mounted"
         shim = self.root / "bin"
         shim.mkdir()
@@ -91,8 +100,11 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-subprocess.run(['/usr/bin/sudo', '-n', *sys.argv[1:]], check=True)
-if sys.argv[1] == 'mount':
+arguments = sys.argv[1:]
+if arguments[:1] == ['-n']:
+    arguments = arguments[1:]
+subprocess.run(['/usr/bin/sudo', '-n', *arguments], check=True)
+if arguments[0] == 'mount':
     Path(os.environ['MOUNT_READY']).write_text(str(os.getpid()))
     while True:
         signal.pause()
@@ -105,7 +117,7 @@ if sys.argv[1] == 'mount':
         )
         self.wait_for(ready.exists, "the real loop mount")
         self.assertTrue(self.attached(), "fixture did not mount a real image")
-        os.killpg(self.process.pid, signal.SIGTERM)
+        os.killpg(self.process.pid, signum)
         self.process.wait(timeout=10)
         # Give an independent cleanup guardian time to finish after interruption.
         deadline = time.monotonic() + 10
@@ -114,6 +126,234 @@ if sys.argv[1] == 'mount':
         leftovers = {"directories": [str(p) for p in self.runner.iterdir()], "attached": self.attached()}
         print("interruption leftovers: " + json.dumps(leftovers), flush=True)
         self.assertEqual(leftovers, {"directories": [], "attached": []})
+
+    def test_interrupted_setup_releases_mount_loop_and_image(self):
+        """Interrupt after mount succeeds but before setup can export its root."""
+        self.interrupted_setup(signal.SIGTERM)
+
+    def test_killed_launcher_during_setup_releases_mount_loop_and_image(self):
+        self.interrupted_setup(signal.SIGKILL)
+
+    def run_command(self, *command, environment=None, expected=0):
+        result = subprocess.run(
+            [str(HARNESS), "--", *map(str, command)],
+            env=self.environment | (environment or {}),
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        return result
+
+    def test_normal_exit_scopes_environment_and_removes_runtime(self):
+        report = self.root / "report.json"
+        ordinary = self.root / "mutable"
+        ordinary.mkdir()
+        original = "PRESERVED=1\n"
+        Path(self.environment["GITHUB_ENV"]).write_text(original)
+        self.run_command("python3", "-c", """
+import json, os, pathlib, stat, sys
+root = pathlib.Path(os.environ['OPC_FS_VERITY_SNAPSHOT_ROOT'])
+info = root.stat()
+pathlib.Path(sys.argv[1]).write_text(json.dumps({
+    'required': os.environ['OPC_FS_VERITY_QUALIFICATION'],
+    'owner': info.st_uid, 'mode': stat.S_IMODE(info.st_mode),
+    'snapshot_device': info.st_dev,
+    'mutable_device': pathlib.Path(os.environ['TMPDIR']).stat().st_dev,
+    'tmpdir': os.environ['TMPDIR'], 'root': str(root),
+}))
+""", report, environment={"TMPDIR": str(ordinary)})
+        data = json.loads(report.read_text())
+        self.assertEqual(data["required"], "required")
+        self.assertEqual((data["owner"], data["mode"]), (os.getuid(), 0o700))
+        self.assertNotEqual(data["snapshot_device"], data["mutable_device"])
+        self.assertEqual(data["tmpdir"], str(ordinary))
+        self.assertFalse(Path(data["root"]).exists())
+        self.assertEqual(Path(self.environment["GITHUB_ENV"]).read_text(), original)
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_failing_command_keeps_exit_status_and_removes_runtime(self):
+        self.run_command("sh", "-c", "exit 37", expected=37)
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_cleanup_detaches_an_additional_binding_to_its_own_image(self):
+        self.run_command("python3", "-c", """
+import os, pathlib, subprocess
+image = pathlib.Path(os.environ['OPC_FS_VERITY_SNAPSHOT_ROOT']).parents[1] / 'ext4.img'
+subprocess.run(['sudo', '-n', 'losetup', '--find', '--show', str(image)], check=True)
+""")
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_detach_refuses_a_different_backing_file(self):
+        image = self.root / "image"
+        with image.open("xb") as stream:
+            stream.truncate(32 * 1024**2)
+        self.extra_images.append(image)
+        other = self.root / "other-image"
+        other.write_bytes(b"different inode")
+        loop = privileged("losetup", "--find", "--show", image).strip()
+        result = subprocess.run(
+            ["sudo", "-n", "python3", str(ROOT / "ci/fsverity-runtime.py"), "--detach-loop", str(other), loop],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing to detach", result.stderr)
+        self.assertEqual(privileged("losetup", "--associated", image, "--noheadings", "--output", "NAME").strip(), loop)
+
+    def test_preparation_failure_removes_runtime(self):
+        shim = self.root / "bin"
+        shim.mkdir()
+        sudo = shim / "sudo"
+        sudo.write_text("""#!/usr/bin/env python3
+import os, sys
+arguments = sys.argv[1:]
+if arguments[:1] == ['-n']:
+    arguments = arguments[1:]
+if arguments[0] == 'chown':
+    sys.exit(42)
+os.execv('/usr/bin/sudo', ['sudo', '-n', *arguments])
+""")
+        sudo.chmod(0o755)
+        self.run_command("true", environment={"PATH": str(shim) + ":" + os.environ["PATH"]}, expected=42)
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def failing_sudo(self, operation):
+        shim = self.root / ("bin-" + operation)
+        shim.mkdir()
+        sudo = shim / "sudo"
+        sudo.write_text("""#!/usr/bin/env python3
+import os, sys
+arguments = sys.argv[1:]
+if arguments[:1] == ['-n']:
+    arguments = arguments[1:]
+if arguments[0] == %r:
+    sys.exit(42)
+os.execv('/usr/bin/sudo', ['sudo', '-n', *arguments])
+""" % operation)
+        sudo.chmod(0o755)
+        return {"PATH": str(shim) + ":" + os.environ["PATH"]}
+
+    def test_cleanup_failure_fails_gate_and_next_sweep_preserves_attachment(self):
+        self.run_command("true", environment=self.failing_sudo("umount"), expected=1)
+        images = self.images()
+        self.assertEqual(len(images), 1)
+        self.assertTrue(self.attached())
+        self.run_command("true")
+        self.assertEqual(self.images(), images)
+        self.assertTrue(self.attached())
+
+    def test_inventory_failure_preserves_stale_directory(self):
+        stale = self.runner / "fs-verity-runtime.stale"
+        stale.mkdir(mode=0o700)
+        image = stale / "ext4.img"
+        image.write_bytes(b"retain without complete inventory")
+        self.run_command("true", environment=self.failing_sudo("losetup"), expected=1)
+        self.assertEqual(image.read_bytes(), b"retain without complete inventory")
+
+    def test_signal_and_kill_during_command_release_resources(self):
+        for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
+            with self.subTest(signal=signum):
+                ready = self.root / f"ready-{signum}"
+                self.process = subprocess.Popen(
+                    [str(HARNESS), "--", "python3", "-c", """
+import pathlib, signal, sys
+pathlib.Path(sys.argv[1]).touch()
+while True:
+    signal.pause()
+""", str(ready)], env=self.environment, start_new_session=True,
+                )
+                self.wait_for(ready.exists, "the wrapped command")
+                os.killpg(self.process.pid, signum)
+                self.process.wait(timeout=10)
+                self.wait_for(lambda: not list(self.runner.iterdir()), "guardian cleanup")
+                self.assertEqual(self.attached(), [])
+
+    def test_escaped_term_resistant_descendant_is_reaped_before_unmount(self):
+        report = self.root / "descendant"
+        self.run_command("python3", "-c", """
+import os, pathlib, subprocess, sys, time
+subprocess.Popen([sys.executable, '-c', '''
+import os, pathlib, signal, sys
+os.setsid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+os.chdir(os.environ['OPC_FS_VERITY_SNAPSHOT_ROOT'])
+pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+while True:
+    signal.pause()
+''', sys.argv[1]])
+deadline = time.monotonic() + 5
+while not pathlib.Path(sys.argv[1]).exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError('descendant did not start')
+    time.sleep(.01)
+""", report)
+        self.assertFalse(Path(f"/proc/{report.read_text()}").exists())
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_orphan_is_reaped_while_the_wrapped_command_is_still_running(self):
+        self.run_command("python3", "-c", """
+import os, pathlib, subprocess, sys, time
+parent = subprocess.Popen([sys.executable, '-c', '''
+import os, sys
+child = os.fork()
+if child == 0:
+    os._exit(0)
+print(child, flush=True)
+os._exit(0)
+'''], stdout=subprocess.PIPE, text=True)
+child = int(parent.stdout.read())
+parent.wait(timeout=5)
+deadline = time.monotonic() + 2
+while pathlib.Path(f'/proc/{child}').exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError('orphan zombie retained until the gate exits')
+    time.sleep(.01)
+""")
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_startup_sweeps_only_unattached_owned_unlocked_directories(self):
+        stale = self.runner / "fs-verity-runtime.stale"
+        stale.mkdir(mode=0o700)
+        (stale / "ext4.img").write_bytes(b"unattached image")
+        active = self.runner / "fs-verity-runtime.active"
+        active.mkdir(mode=0o700)
+        unknown = self.runner / "unrelated"
+        unknown.mkdir(mode=0o700)
+        public = self.runner / "fs-verity-runtime.public"
+        public.mkdir(mode=0o755)
+        symlink = self.runner / "fs-verity-runtime.symlink"
+        symlink.symlink_to(unknown, target_is_directory=True)
+        descriptor = os.open(active, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            self.run_command("true")
+        finally:
+            os.close(descriptor)
+        self.assertFalse(stale.exists())
+        self.assertEqual(set(self.runner.iterdir()), {active, unknown, public, symlink})
+
+    def test_startup_preserves_loop_backing_inode_even_through_other_path(self):
+        directory = self.runner / "fs-verity-runtime.attached"
+        directory.mkdir(mode=0o700)
+        image = directory / "ext4.img"
+        with image.open("xb") as stream:
+            stream.truncate(32 * 1024**2)
+        outside = self.root / "same-image-other-path"
+        os.link(image, outside)
+        self.extra_images.append(outside)
+        loop = privileged("losetup", "--find", "--show", outside).strip()
+        self.run_command("true")
+        self.assertTrue(image.is_file())
+        self.assertEqual(privileged("losetup", "--associated", outside, "--noheadings", "--output", "NAME").strip(), loop)
+
+    def test_startup_preserves_a_mounted_directory_without_an_image(self):
+        directory = self.runner / "fs-verity-runtime.mounted"
+        directory.mkdir(mode=0o700)
+        source = self.root / "bind-source"
+        source.mkdir(mode=0o700)
+        (source / "sentinel").write_text("preserve me")
+        privileged("mount", "--bind", source, directory)
+        self.extra_mounts.append(directory)
+        self.run_command("true")
+        self.assertEqual((directory / "sentinel").read_text(), "preserve me")
 
 
 if __name__ == "__main__":
