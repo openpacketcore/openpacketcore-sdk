@@ -70,24 +70,32 @@ the mutable databases or WALs out of `TMPDIR`.
 For required fs-verity qualification, run the gate inside the filesystem owner:
 
 ```bash
-RUNNER_TEMP=/existing/private/scratch ci/setup-fsverity-tmp.sh -- <gate-command> [arguments...]
+RUNNER_TEMP=/existing/private/scratch bash ci/setup-fsverity-tmp.sh -- <gate-command> [arguments...]
 ```
 
 The owner sets `OPC_FS_VERITY_SNAPSHOT_ROOT` and
 `OPC_FS_VERITY_QUALIFICATION=required` for that command, then unmounts and removes
 its private image. It also cleans up on interruption, including a killed
-launcher, and sweeps unlocked, current-user, mode-0700 `fs-verity-runtime.*`
-directories below `RUNNER_TEMP` at startup, including the former
-`opc-fsverity.*` layout. A directory still used by a loop device or mount is
-preserved. Inventory or cleanup errors fail the gate.
-Mounts are private to the owner and its commands, so another job cannot inherit
-one and keep its backing loop attached. Namespace setup also requires
+launcher. Startup reclaims only this checkout's marked, unlocked, current-user,
+mode-0700 `opc-sdk-fsverity-runtime.*` directories containing exactly `ext4.img`
+and an empty `tmp/`, with no loop or mount attachment. The root/runtime locks
+serialize attachment with deletion; an exclusive backing-file lease also
+excludes concurrent opens during inventory and removal. Legacy `opc-fsverity.*`
+and other tools' `fs-verity-runtime.*` directories are always preserved.
+Inventory or cleanup errors fail the gate.
+Mounts use a separate namespace with slave propagation: owner mounts cannot
+reach other jobs, and host unmounts propagate into the owner. Setup requires
 passwordless `unshare` and `setpriv`; commands retain the caller's identity,
 environment, stdin and inherited ownership locks.
-GitHub steps use this owner as their custom shell; running setup in an earlier
-step no longer exports a filesystem for subsequent steps. The real mount and
+GitHub steps use `shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}`
+so the runner resolves `bash` on PATH. Running setup in an earlier step no longer
+exports a filesystem for subsequent steps. Replace split setup/export/EXIT-trap
+recipes with the `-- <gate-command> [arguments...]` form before using this helper.
+The real mount and
 interruption regressions are `python3 ci/test-fsverity-runtime.py -v` on Linux
 with the same passwordless namespace, mount, chown, umount and losetup privileges.
+The narrow privileged Python helper also requires passwordless sudo: it passes
+pinned loop descriptors and disposes only of verified caller-owned descendants.
 
 ```bash
 cargo fmt --all --check

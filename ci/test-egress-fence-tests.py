@@ -2,7 +2,6 @@
 """Coverage, profile and required-check regressions for the egress job split."""
 
 import copy
-import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -591,15 +590,15 @@ class WorkflowTests(unittest.TestCase):
         host = jobs["host-tests"]
         self.assertIn("fail-fast: false\n", host)
         self.assertIn("shard: [0, 1, 2]\n", host)
-        self.assertIn("shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}\n", host)
+        self.assertIn("shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}\n", host)
         self.assertIn("--shard '${{ matrix.shard }}'", host)
         native = jobs["host-native-log-proofs"]
         self.assert_native_proof_matrix(native)
         self.assertIn("fail-fast: false\n", native)
-        self.assertIn("shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}\n", native)
+        self.assertIn("shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}\n", native)
         self.assertIn("--shard '${{ matrix.shard }}'", native)
         proofs = jobs["host-proofs"]
-        self.assertIn("shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}\n", proofs)
+        self.assertIn("shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}\n", proofs)
         self.assertIn(f"--shard {FENCE.PROOF_SHARD} \\\n", proofs)
         for name in ["oracles", "installer"]:
             self.assertIn("bash ci/egress-fence-kernel.sh", jobs[name])

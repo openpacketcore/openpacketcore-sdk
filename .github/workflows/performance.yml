@@ -59,7 +59,7 @@ jobs:
           shared-key: opc-performance-${{ matrix.profile }}
 
       - name: Qualify original latency limit
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           mkdir -p performance-results

@@ -68,7 +68,7 @@ jobs:
         run: cargo clippy --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --all-targets --all-features -- -D warnings
 
       - name: Run conformance tests
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           ordinary_timing_contracts=(

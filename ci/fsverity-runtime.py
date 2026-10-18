@@ -13,6 +13,7 @@ Cleanup errors fail the gate.
 
 import array
 import ctypes
+from contextlib import contextmanager
 import errno
 import fcntl
 import json
@@ -20,18 +21,19 @@ import os
 from pathlib import Path
 import select
 import secrets
-import shutil
 import signal
 import socket
 import stat
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 
 
-PREFIX = "fs-verity-runtime."
+PREFIX = "opc-sdk-fsverity-runtime."
+OWNER_ATTRIBUTE = "user.opc_sdk_fsverity_owner"
+GUARDIAN_ATTRIBUTE = "user.opc_sdk_fsverity_guardian"
+OWNER_ID = str(Path(__file__).resolve().parent.parent).encode()
 SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 
@@ -39,171 +41,292 @@ def within(path, directory):
     return Path(path).is_relative_to(directory)
 
 
-def walk_error(error):
-    raise error
+def identity(descriptor):
+    info = os.fstat(descriptor)
+    return info.st_dev, info.st_ino
 
 
-def detach_loop(image, loop):
-    """Pin the device while verifying its backing inode and clearing it.
+def mark_owned(descriptor):
+    os.setxattr(descriptor, OWNER_ATTRIBUTE, OWNER_ID)
 
-    A name-only inventory followed by losetup -d could detach a reused loop ID.
-    Holding the device open prevents autoclear/reuse between verification and
-    LOOP_CLR_FD. This small operation runs through sudo, like mount/umount.
-    """
-    descriptor = os.open(loop, os.O_RDONLY | os.O_CLOEXEC)
+
+def is_owned(descriptor):
+    info = os.fstat(descriptor)
     try:
-        try:
-            status = fcntl.ioctl(descriptor, 0x4C05, bytes(232))  # LOOP_GET_STATUS64
-        except OSError as error:
-            if error.errno == errno.ENXIO:
-                return  # Autoclear completed after the inventory was read.
-            raise
-        device, inode = struct.unpack_from("=QQ", status)
-        info = os.stat(image, follow_symlinks=False)
-        if not stat.S_ISREG(info.st_mode) or (device, inode) != (info.st_dev, info.st_ino):
-            raise RuntimeError("loop backing identity changed; refusing to detach")
-        fcntl.ioctl(descriptor, 0x4C01)  # LOOP_CLR_FD; closes after this descriptor.
+        return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700
+                and os.getxattr(descriptor, OWNER_ATTRIBUTE) == OWNER_ID)
+    except OSError as error:
+        if error.errno in (errno.ENODATA, errno.ENOTSUP):
+            return False
+        raise
+
+
+def remaining(deadline):
+    value = deadline - time.monotonic()
+    if value <= 0:
+        raise TimeoutError("fs-verity cleanup deadline expired")
+    return value
+
+
+def send_message(connection, message, descriptors=()):
+    ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", descriptors))] if descriptors else []
+    connection.sendmsg([json.dumps(message).encode()], ancillary)
+
+
+def receive_message(connection):
+    data, ancillary, flags, _address = connection.recvmsg(1024**2, socket.CMSG_SPACE(253 * 4))
+    descriptors = []
+    for level, kind, value in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            descriptors.extend(array.array("i", value))
+    try:
+        if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+            raise RuntimeError("incomplete fs-verity descriptor transfer")
+        for descriptor in descriptors:
+            os.set_inheritable(descriptor, False)
+        return json.loads(data), descriptors
+    except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+
+
+def verify_loop(image, descriptor):
+    if not stat.S_ISBLK(os.fstat(descriptor).st_mode):
+        raise RuntimeError("refusing to detach a non-device")
+    try:
+        status = fcntl.ioctl(descriptor, 0x4C05, bytes(232))  # LOOP_GET_STATUS64
+    except OSError as error:
+        if error.errno == errno.ENXIO:
+            return False
+        raise
+    if struct.unpack_from("=QQ", status) != identity(image):
+        raise RuntimeError("loop backing identity changed; refusing to detach")
+    return True
+
+
+def configure_loop(image, deadline):
+    control = os.open("/dev/loop-control", os.O_RDWR | os.O_CLOEXEC)
+    try:
+        while True:
+            remaining(deadline)
+            number = fcntl.ioctl(control, 0x4C82)  # LOOP_CTL_GET_FREE
+            descriptor = os.open(f"/dev/loop{number}", os.O_RDWR | os.O_CLOEXEC)
+            try:
+                config = bytearray(304)  # struct loop_config from linux/loop.h
+                struct.pack_into("=I", config, 0, image)
+                struct.pack_into("=I", config, 60, 4)  # LO_FLAGS_AUTOCLEAR
+                fcntl.ioctl(descriptor, 0x4C0A, config)  # LOOP_CONFIGURE, on the pinned FD
+                return descriptor
+            except OSError as error:
+                os.close(descriptor)
+                if error.errno != errno.EBUSY:
+                    raise
     finally:
-        os.close(descriptor)
+        os.close(control)
+
+
+def process_stat(pid):
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return int(fields[1]), int(fields[19])  # PPID, starttime
+
+
+def privileged_helper(address, parent, deadline):
+    """Only pinned caller-owned images/devices or the caller's own child pidfd."""
+    descriptors = []
+    result_fd = None
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+        connection.settimeout(remaining(deadline))
+        connection.connect("\0" + address)
+        peer, uid, _gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if peer != parent or uid != int(os.environ["SUDO_UID"]):
+            raise RuntimeError("unexpected privileged fs-verity caller")
+        request, descriptors = receive_message(connection)
+        try:
+            operation = request["operation"]
+            if operation == "kill-child":
+                owner_start = request["owner_start"]
+                if process_stat(parent)[1] != owner_start:
+                    raise RuntimeError("descendant owner changed identity")
+                pid = int(next(line.split()[1] for line in
+                               Path(f"/proc/self/fdinfo/{descriptors[0]}").read_text().splitlines()
+                               if line.startswith("Pid:")))
+                if pid > 0:
+                    try:
+                        if process_stat(pid) != (parent, request["child_start"]):
+                            raise RuntimeError("refusing to signal an unowned process")
+                        signal.pidfd_send_signal(descriptors[0], signal.SIGKILL)
+                    except (ProcessLookupError, FileNotFoundError):
+                        pass
+            else:
+                image = descriptors[0]
+                info = os.fstat(image)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+                    raise RuntimeError("privileged image is not owned by the caller")
+                if operation == "attach":
+                    if info.st_nlink != 1:
+                        raise RuntimeError("refusing to attach an unlinked or aliased image")
+                    result_fd = configure_loop(image, deadline)
+                elif operation == "pin":
+                    result_fd = os.open(request["loop"], os.O_RDONLY | os.O_CLOEXEC)
+                    if not verify_loop(image, result_fd):
+                        os.close(result_fd)
+                        result_fd = None
+                elif operation == "detach":
+                    if verify_loop(image, descriptors[1]):
+                        fcntl.ioctl(descriptors[1], 0x4C01)  # LOOP_CLR_FD, never by name
+                else:
+                    raise RuntimeError("unknown privileged fs-verity operation")
+            send_message(connection, {"ok": True}, [result_fd] if result_fd is not None else [])
+        except (OSError, ValueError, RuntimeError) as error:
+            send_message(connection, {"error": str(error)})
+        finally:
+            for descriptor in descriptors + ([result_fd] if result_fd is not None else []):
+                os.close(descriptor)
+
+
+def privileged_request(operation, descriptors, *, deadline=None, **parameters):
+    deadline = deadline or time.monotonic() + 5
+    address = "opc-sdk-fsverity-helper-" + secrets.token_hex(24)
+    returned = []
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
+        server.bind("\0" + address)
+        server.listen(1)
+        process = subprocess.Popen(["sudo", "-n", sys.executable, "-I", str(Path(__file__).resolve()),
+                                    "--privileged", address, str(os.getpid()),
+                                    str(deadline - min(.1, remaining(deadline) / 10))], start_new_session=True)
+        try:
+            while True:
+                server.settimeout(min(.05, remaining(deadline)))
+                try:
+                    connection, _ = server.accept()
+                except socket.timeout:
+                    if process.poll() is not None:
+                        raise RuntimeError("privileged fs-verity helper exited before connecting")
+                    continue
+                uid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+                if uid == 0:
+                    break
+                connection.close()
+            with connection:
+                connection.settimeout(remaining(deadline))
+                send_message(connection, {"operation": operation, "timeout": remaining(deadline), **parameters}, descriptors)
+                response, returned = receive_message(connection)
+                if "error" in response:
+                    raise RuntimeError(response["error"])
+            process.wait(timeout=remaining(deadline))
+            if process.returncode:
+                raise RuntimeError("privileged fs-verity helper failed")
+            return returned
+        except BaseException:
+            for descriptor in returned:
+                os.close(descriptor)
+            raise
+        finally:
+            # Closing the connection releases any helper-side pins. Helpers
+            # have their own finite socket/configuration bounds and no children.
+            if process.poll() is None:
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+
+
+def detach_verified_loop(image, loop):
+    image_fd = os.open(image, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    pinned = []
+    try:
+        if os.geteuid() == 0:
+            pinned = [os.open(loop, os.O_RDONLY | os.O_CLOEXEC)]
+            if verify_loop(image_fd, pinned[0]):
+                fcntl.ioctl(pinned[0], 0x4C01)
+        else:
+            pinned = privileged_request("pin", [image_fd], loop=loop)
+            if pinned:
+                privileged_request("detach", [image_fd, pinned[0]])
+    finally:
+        for descriptor in [image_fd, *pinned]:
+            os.close(descriptor)
 
 
 class Guardian:
     def __init__(self, owner):
         self.owner = owner
         self.interrupted = False
-        self.inherited_mounts = []
-
-    def discard_inherited_runtime_mounts(self):
-        # unshare initially clones the host's mounts. Drop our private copies
-        # of unrelated runtime mounts so we cannot pin an older job's image.
-        # Retain their inventory for the startup sweep: the original mounts
-        # outside this namespace may still be attached.
-        mounts = json.loads(self.run(
-            ["findmnt", "--json", "--list", "--output", "TARGET,SOURCE"],
-            capture=True, cleanup=True,
-        ))["filesystems"]
-        required = [Path.cwd().resolve(), Path(os.environ["RUNNER_TEMP"]).resolve()]
-        if os.environ.get("TMPDIR"):
-            required.append(Path(os.environ["TMPDIR"]).resolve())
-        for mount in sorted(mounts, key=lambda item: len(Path(item["target"]).parts), reverse=True):
-            target = Path(mount["target"])
-            if (not mount["source"].startswith("/dev/loop")
-                    or not any(part.startswith((PREFIX, "opc-fsverity.")) for part in target.parts)
-                    or any(within(path, target) for path in required)):
-                continue
-            self.inherited_mounts.append(mount)
-            self.run(["sudo", "-n", "umount", "--recursive", "--", str(target)], cleanup=True)
+        self.directory_fd = None
+        self.parent_fd = None
+        self.image_fd = None
+        self.loop_fd = None
 
     def stopping(self):
         if select.select([self.owner], [], [], 0)[0]:
-            self.interrupted = True  # The launcher exited or was killed.
+            self.interrupted = True
         return self.interrupted
 
-    def run(self, command, *, capture=False, cleanup=False, timeout=30, env=None):
-        process = subprocess.Popen(
-            command, env=env, start_new_session=True,
-            stdout=subprocess.PIPE if capture else None,
-            text=True,
-        )
-        deadline = None if timeout is None else time.monotonic() + timeout
+    def run(self, command, *, capture=False, cleanup=False, timeout=30, env=None, deadline=None):
+        if deadline is None and timeout is not None:
+            deadline = time.monotonic() + timeout
+        # Disposal fits inside a helper's absolute budget, including pipe EOF.
+        reserve = min(1, max(.01, remaining(deadline) / 4)) if deadline else 0
+        work_deadline = deadline - reserve if deadline else None
+        process = subprocess.Popen(command, env=env, start_new_session=True,
+                                   stdout=subprocess.PIPE if capture else None, text=True)
+        failed = True
         try:
-            while process.poll() is None:
+            while True:
                 self.reap_finished_adoptees(process.pid)
                 if not cleanup and self.stopping():
                     raise InterruptedError("fs-verity command owner interrupted")
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError(f"fs-verity helper timed out: {command[0]}")
+                interval = min(.05, remaining(work_deadline)) if work_deadline else .05
                 try:
-                    output, _ = process.communicate(timeout=0.05)
+                    output, _ = process.communicate(timeout=interval)
+                    break
                 except subprocess.TimeoutExpired:
-                    continue
-                break
-            else:
-                output, _ = process.communicate()
+                    continue  # An exited child may still have an orphan-held pipe.
             if process.returncode:
                 raise subprocess.CalledProcessError(process.returncode, command)
+            failed = False
             return output
         finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=5)
+            if failed:
+                disposal = deadline or time.monotonic() + 6
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except PermissionError:
+                        self.kill_child(process.pid, disposal)
+                    try:
+                        process.wait(timeout=min(1, remaining(disposal)))
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except PermissionError:
+                            self.kill_child(process.pid, disposal)
+                        process.wait(timeout=remaining(disposal))
+                self.reap_descendants(deadline=disposal)
+                if process.stdout:
+                    process.stdout.close()
 
     def reap_finished_adoptees(self, command_pid):
-        # A subreaper must collect orphan zombies during a long-running gate,
-        # not only when the gate exits. Popen retains its own child's status.
         children = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children").read_text().split()
         for child in children:
             if int(child) != command_pid:
                 os.waitpid(int(child), os.WNOHANG)
 
-    def inventory(self):
-        loops = json.loads(self.run(
-            ["sudo", "-n", "losetup", "--list", "--json", "--output", "NAME,BACK-FILE,BACK-INO,BACK-MAJ:MIN"],
-            capture=True, cleanup=True,
-        ))["loopdevices"]
-        mounts = json.loads(self.run(
-            ["findmnt", "--json", "--list", "--output", "TARGET,MAJ:MIN"],
-            capture=True, cleanup=True,
-        ))["filesystems"]
-        return loops, mounts
-
-    def attachments(self, directory):
-        """Fail closed on inventory errors; compare backing inode, not loop ID."""
-        loops, mounts = self.inventory()
-        mounted = [mount for mount in mounts + self.inherited_mounts if within(mount["target"], directory)]
-        if mounted:
-            # A startup sweep must not traverse a mounted filesystem either.
-            return [], mounted
-        files = set()
-        for root, _directories, names in os.walk(directory, followlinks=False, onerror=walk_error):
-            for name in names:
-                info = (Path(root) / name).lstat()
-                if stat.S_ISREG(info.st_mode):
-                    files.add((f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}", info.st_ino))
-        attached = [loop for loop in loops if
-                    (loop["back-maj:min"], loop["back-ino"]) in files
-                    or within(loop["back-file"], directory)]
-        return attached, mounted
-
-    def sweep(self, root):
-        # Include images left by the former split-step setup helper, both
-        # directly under RUNNER_TEMP and inside an old runtime parent.
-        for directory in [*root.glob(PREFIX + "*"), *root.glob("opc-fsverity.*")]:
+    def kill_child(self, child, deadline):
+        descriptor = os.pidfd_open(child)
+        try:
+            if process_stat(child)[0] != os.getpid():
+                raise RuntimeError("refusing to dispose of a non-child")
             try:
-                info = directory.lstat()
-            except FileNotFoundError:
-                continue  # Another owner completed cleanup during this scan.
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
-                continue
-            try:
-                descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            except FileNotFoundError:
-                continue
-            try:
-                opened = os.fstat(descriptor)
-                if not opened.st_nlink:
-                    continue
-                if (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_mode) != (info.st_dev, info.st_ino, info.st_uid, info.st_mode):
-                    raise RuntimeError("fs-verity runtime changed during startup inspection")
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    continue
-                attached, mounted = self.attachments(directory)
-                if attached or mounted:
-                    print(f"fs-verity: retaining attached runtime {directory}", file=sys.stderr)
-                    continue
-                shutil.rmtree(directory)
-            finally:
-                os.close(descriptor)
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            except PermissionError:
+                privileged_request("kill-child", [descriptor], deadline=deadline,
+                                   owner_start=process_stat(os.getpid())[1],
+                                   child_start=process_stat(child)[1])
+        finally:
+            os.close(descriptor)
 
-    def reap_descendants(self):
-        """Only this subreaper's own children may be signalled or waited for."""
-        deadline = time.monotonic() + 6
+    def reap_descendants(self, *, deadline=None):
+        deadline = deadline or time.monotonic() + 6
         while True:
             while True:
                 try:
@@ -215,118 +338,281 @@ class Guardian:
             children = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children").read_text().split()
             for child in children:
                 try:
-                    descriptor = os.pidfd_open(int(child))
-                except ProcessLookupError:
-                    continue
-                try:
-                    # A live, unreaped child cannot have its PID reused.
-                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-                except ProcessLookupError:
+                    self.kill_child(int(child), deadline)
+                except (ProcessLookupError, FileNotFoundError):
                     pass
-                finally:
-                    os.close(descriptor)
-            if time.monotonic() >= deadline:
-                raise TimeoutError("fs-verity command descendants did not exit")
-            time.sleep(0.02)
+            time.sleep(min(.02, remaining(deadline)))
+
+    def inventory(self, *, deadline=None):
+        loops = json.loads(self.run(
+            ["sudo", "-n", "losetup", "--list", "--json", "--output", "NAME,BACK-FILE,BACK-INO,BACK-MAJ:MIN"],
+            capture=True, cleanup=True, deadline=deadline,
+        ))["loopdevices"]
+        mounts = json.loads(self.run(
+            ["findmnt", "--json", "--list", "--output", "TARGET,MAJ:MIN"],
+            capture=True, cleanup=True, deadline=deadline,
+        ))["filesystems"]
+        return loops, mounts
+
+    def attachments(self, directory, descriptor, *, deadline=None):
+        loops, mounts = self.inventory(deadline=deadline)
+        mounted = [mount for mount in mounts if within(mount["target"], directory)]
+        info = os.stat("ext4.img", dir_fd=descriptor, follow_symlinks=False)
+        backing = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}", info.st_ino
+        return [loop for loop in loops if (loop["back-maj:min"], loop["back-ino"]) == backing], mounted
+
+    @contextmanager
+    def startup_lock(self, descriptor):
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if self.stopping():
+                    raise InterruptedError("fs-verity owner exited while waiting for startup lock")
+                time.sleep(min(.05, remaining(deadline)))
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+    @staticmethod
+    def same_binding(directory, descriptor, parent):
+        try:
+            info = os.stat(directory.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return (info.st_dev, info.st_ino) == identity(descriptor)
+
+    def remove_runtime(self, directory, descriptor, parent, *, deadline):
+        # New owner namespace + worktree marker + exact layout. Never traverse
+        # legacy directories or arbitrary contents below a familiar prefix.
+        if not directory.name.startswith(PREFIX) or not is_owned(descriptor):
+            return False
+        if set(os.listdir(descriptor)) != {"ext4.img", "tmp"}:
+            return False
+        image_info = os.stat("ext4.img", dir_fd=descriptor, follow_symlinks=False)
+        tmp_info = os.stat("tmp", dir_fd=descriptor, follow_symlinks=False)
+        if (not stat.S_ISREG(image_info.st_mode) or image_info.st_uid != os.getuid()
+                or not stat.S_ISDIR(tmp_info.st_mode) or tmp_info.st_uid != os.getuid()
+                or stat.S_IMODE(tmp_info.st_mode) != 0o700):
+            return False
+        image = os.open("ext4.img", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor)
+        try:
+            temporary = os.open("tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+        except BaseException:
+            os.close(image)
+            raise
+        leased = False
+        old_handler = signal.signal(signal.SIGIO, lambda *_args: None)
+        try:
+            info = os.fstat(image)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or os.listdir(temporary)):
+                return False
+            # A write lease refuses an already-open backing file and blocks
+            # fresh opens through inventory+unlink, including outside flocks.
+            # All owner attachment paths also hold the root/runtime locks.
+            try:
+                fcntl.fcntl(image, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+                leased = True
+            except OSError as error:
+                if error.errno in (errno.EAGAIN, errno.EINVAL, errno.ENOTSUP):
+                    return False
+                raise
+            attached, mounted = self.attachments(directory, descriptor, deadline=deadline)
+            if attached or mounted or not self.same_binding(directory, descriptor, parent):
+                return False
+            if (fcntl.fcntl(image, fcntl.F_GETLEASE) != fcntl.F_WRLCK
+                    or set(os.listdir(descriptor)) != {"ext4.img", "tmp"}
+                    or os.listdir(temporary)
+                    or identity(image) != self.entry_identity(descriptor, "ext4.img")
+                    or identity(temporary) != self.entry_identity(descriptor, "tmp")):
+                return False
+            remaining(deadline)
+            # Delete through the locked inode, never by a re-resolved tree.
+            os.unlink("ext4.img", dir_fd=descriptor)
+            os.rmdir("tmp", dir_fd=descriptor)
+            if not self.same_binding(directory, descriptor, parent):
+                raise RuntimeError("runtime parent binding changed during removal")
+            os.rmdir(directory.name, dir_fd=parent)
+            return True
+        finally:
+            if leased:
+                fcntl.fcntl(image, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+            signal.signal(signal.SIGIO, old_handler)
+            os.close(temporary)
+            os.close(image)
+
+    @staticmethod
+    def entry_identity(descriptor, name):
+        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        return info.st_dev, info.st_ino
+
+    def sweep(self, root):
+        parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.startup_lock(parent):
+                for name in os.listdir(parent):
+                    if not name.startswith(PREFIX):
+                        continue
+                    try:
+                        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                                or stat.S_IMODE(info.st_mode) != 0o700):
+                            continue
+                        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                    except (FileNotFoundError, NotADirectoryError):
+                        continue
+                    try:
+                        if not is_owned(descriptor):
+                            continue
+                        try:
+                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            continue
+                        if not self.remove_runtime(root / name, descriptor, parent, deadline=time.monotonic() + 5):
+                            print(f"fs-verity: retaining runtime {root / name}", file=sys.stderr)
+                    finally:
+                        os.close(descriptor)
+        finally:
+            os.close(parent)
 
     def release(self, directory):
-        self.reap_descendants()
-        attached, mounted = self.attachments(directory)
-        mountpoint = str(directory / "tmp")
-        if mounted:
-            if len(mounted) != 1 or mounted[0]["target"] != mountpoint:
-                raise RuntimeError("unexpected mounts in fs-verity runtime; retaining it")
-            self.run(["sudo", "-n", "umount", "--", mountpoint], cleanup=True)
-        # mount -o loop normally autoclears its loop on unmount. If it did not,
-        # detach only a currently verified binding to our own backing file.
-        attached, mounted = self.attachments(directory)
-        for loop in attached:
-            image = directory / "ext4.img"
-            info = image.stat()
-            if (loop["back-maj:min"], loop["back-ino"]) != (f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}", info.st_ino):
-                raise RuntimeError("unexpected loop backing file; retaining fs-verity runtime")
-            self.run(["sudo", "-n", sys.executable, str(Path(__file__).resolve()),
-                      "--detach-loop", str(image), loop["name"]], cleanup=True)
-        # LOOP_CLR_FD may defer autoclear until a device observer closes its
-        # descriptor. Keep the image and ownership lock until it really clears.
-        deadline = time.monotonic() + 5
-        while True:
-            attached, mounted = self.attachments(directory)
-            if not attached and not mounted:
-                break
-            if mounted or time.monotonic() >= deadline:
-                raise RuntimeError("fs-verity runtime still attached after cleanup")
-            time.sleep(0.05)
-        shutil.rmtree(directory)
+        descriptor = self.directory_fd
+        parent = self.parent_fd
+        borrowed = descriptor is None
+        if borrowed:
+            parent = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        errors = []
+        try:
+            try:
+                self.reap_descendants()
+            except (OSError, RuntimeError, TimeoutError) as error:
+                errors.append(error)
+            with self.startup_lock(parent):
+                attached, mounted = self.attachments(directory, descriptor)
+                if not self.same_binding(directory, descriptor, parent):
+                    raise RuntimeError("runtime parent binding changed before teardown")
+                if mounted:
+                    if len(mounted) != 1 or mounted[0]["target"] != str(directory / "tmp"):
+                        raise RuntimeError("unexpected mounts in fs-verity runtime; retaining it")
+                    self.run(["sudo", "-n", "umount", "--", str(directory / "tmp")], cleanup=True)
+                if self.loop_fd is not None:
+                    privileged_request("detach", [self.image_fd, self.loop_fd])
+                    os.close(self.loop_fd)
+                    self.loop_fd = None
+                # Extra bindings made by the wrapped command are pinned and
+                # verified against this same owned image before any detach.
+                attached, _mounted = self.attachments(directory, descriptor)
+                for loop in attached:
+                    detach_verified_loop(directory / "ext4.img", loop["name"])
+                if self.image_fd is not None:
+                    os.close(self.image_fd)
+                    self.image_fd = None
+                deadline = time.monotonic() + 5
+                while True:
+                    attached, mounted = self.attachments(directory, descriptor, deadline=deadline)
+                    if not attached and not mounted:
+                        break
+                    time.sleep(min(.05, remaining(deadline)))
+                if errors:
+                    raise RuntimeError(f"descendant cleanup failed: {errors}")
+                if not self.remove_runtime(directory, descriptor, parent, deadline=deadline):
+                    raise RuntimeError("runtime ownership/layout changed; retaining it")
+        finally:
+            if borrowed:
+                os.close(descriptor)
+                os.close(parent)
 
     def execute(self, command):
         libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        if libc.prctl(36, 1, 0, 0, 0) != 0:
             raise OSError(ctypes.get_errno(), "cannot become fs-verity subreaper")
         root = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+        self.sweep(root)
+        if self.stopping():
+            raise InterruptedError("fs-verity owner exited during startup")
+        self.parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         directory = None
-        descriptor = None
-        root_descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            # Creation and startup sweep share a directory lock. Runtime locks
-            # protect concurrent owners without PID files or age guesses.
-            deadline = time.monotonic() + 30
-            while True:
+            with self.startup_lock(self.parent_fd):
+                name = PREFIX + secrets.token_hex(16)
+                previous_umask = os.umask(0)
                 try:
-                    fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if self.stopping():
-                        raise InterruptedError("fs-verity owner exited while waiting for startup lock")
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("fs-verity startup lock timed out")
-                    time.sleep(0.05)
-            self.sweep(root)
-            if self.stopping():
-                raise InterruptedError("fs-verity owner exited during startup")
-            directory = Path(tempfile.mkdtemp(prefix=PREFIX, dir=root))
+                    os.mkdir(name, mode=0o700, dir_fd=self.parent_fd)
+                finally:
+                    os.umask(previous_umask)
+                directory = root / name
+                try:
+                    self.directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
+                    fcntl.flock(self.directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BaseException:
+                    if self.directory_fd is None or self.same_binding(directory, self.directory_fd, self.parent_fd):
+                        os.rmdir(name, dir_fd=self.parent_fd)
+                    raise
+                made_tmp = False
+                try:
+                    os.mkdir("tmp", mode=0o700, dir_fd=self.directory_fd)
+                    made_tmp = True
+                    os.chmod("tmp", 0o700, dir_fd=self.directory_fd)
+                    self.image_fd = os.open("ext4.img", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                            0o600, dir_fd=self.directory_fd)
+                    os.fchmod(self.image_fd, 0o600)
+                    os.ftruncate(self.image_fd, 4 * 1024**3)
+                    mark_owned(self.directory_fd)
+                    os.setxattr(self.directory_fd, GUARDIAN_ATTRIBUTE,
+                                f"{os.getpid()}:{process_stat(os.getpid())[1]}".encode())
+                except BaseException:
+                    # No attachment is possible before publishing the marker.
+                    # Roll back only the entries created with our open handles.
+                    if not self.same_binding(directory, self.directory_fd, self.parent_fd):
+                        raise RuntimeError("new runtime moved during initialization")
+                    if self.image_fd is not None:
+                        if identity(self.image_fd) != self.entry_identity(self.directory_fd, "ext4.img"):
+                            raise RuntimeError("new image changed during initialization")
+                        os.unlink("ext4.img", dir_fd=self.directory_fd)
+                    if made_tmp:
+                        os.rmdir("tmp", dir_fd=self.directory_fd)
+                    os.rmdir(name, dir_fd=self.parent_fd)
+                    raise
             try:
-                directory.chmod(0o700)
-                descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
+                image = directory / "ext4.img"
+                mountpoint = directory / "tmp"
+                self.run(["mkfs.ext4", "-q", "-b", "4096", "-O", "verity", str(image)])
+                with self.startup_lock(self.parent_fd):
+                    if not self.same_binding(directory, self.directory_fd, self.parent_fd):
+                        raise RuntimeError("runtime moved before attachment")
+                    if identity(self.image_fd) != self.entry_identity(self.directory_fd, "ext4.img"):
+                        raise RuntimeError("runtime image changed before attachment")
+                    self.loop_fd, = privileged_request("attach", [self.image_fd])
+                    device = os.fstat(self.loop_fd).st_rdev
+                    self.run(["sudo", "-n", "mount", "-o", "nosuid,nodev", f"/dev/loop{os.minor(device)}", str(mountpoint)])
+                self.run(["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(mountpoint)])
+                snapshots = mountpoint / "snapshots"
+                snapshots.mkdir(mode=0o700)
+                snapshots.chmod(0o700)
+                info = snapshots.stat()
+                if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                    raise RuntimeError("fs-verity snapshot root must remain current-user private mode 0700")
+                self.run(command, timeout=None, env=os.environ | {
+                    "OPC_FS_VERITY_SNAPSHOT_ROOT": str(snapshots),
+                    "OPC_FS_VERITY_QUALIFICATION": "required",
+                })
+                return 0
+            except subprocess.CalledProcessError as error:
+                return error.returncode if error.returncode > 0 else 128 - error.returncode
+            except InterruptedError:
+                return 143
+            finally:
+                self.release(directory)
+        finally:
+            for descriptor in (self.loop_fd, self.image_fd, self.directory_fd, self.parent_fd):
                 if descriptor is not None:
                     os.close(descriptor)
-                shutil.rmtree(directory)
-                raise
-        finally:
-            os.close(root_descriptor)
-        try:
-            image = directory / "ext4.img"
-            mountpoint = directory / "tmp"
-            mountpoint.mkdir(mode=0o700)
-            mountpoint.chmod(0o700)
-            with image.open("xb") as stream:
-                os.fchmod(stream.fileno(), 0o600)
-                stream.truncate(4 * 1024**3)
-            self.run(["mkfs.ext4", "-q", "-b", "4096", "-O", "verity", str(image)])
-            self.run(["sudo", "-n", "mount", "-o", "loop,nosuid,nodev", str(image), str(mountpoint)])
-            self.run(["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(mountpoint)])
-            snapshots = mountpoint / "snapshots"
-            snapshots.mkdir(mode=0o700)
-            snapshots.chmod(0o700)
-            info = snapshots.stat()
-            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
-                raise RuntimeError("fs-verity snapshot root must remain current-user private mode 0700")
-            self.run(command, timeout=None, env=os.environ | {
-                "OPC_FS_VERITY_SNAPSHOT_ROOT": str(snapshots.resolve(strict=True)),
-                "OPC_FS_VERITY_QUALIFICATION": "required",
-            })
-            return 0
-        except subprocess.CalledProcessError as error:
-            return error.returncode if error.returncode > 0 else 128 - error.returncode
-        except InterruptedError:
-            return 143
-        finally:
-            try:
-                self.release(directory)
-            finally:
-                os.close(descriptor)
 
 
 def receive_guardian(address, parent):
@@ -368,7 +654,6 @@ def receive_guardian(address, parent):
     guardian = Guardian(owner)
     for signum in SIGNALS:
         signal.signal(signum, lambda _signum, _frame: setattr(guardian, "interrupted", True))
-    guardian.discard_inherited_runtime_mounts()
     return guardian.execute(message["command"])
 
 
@@ -410,7 +695,7 @@ def launch(command):
             # otherwise inherit one and keep the loop pinned after our exit.
             # Drop privilege before executing Python or restoring user env.
             process = subprocess.Popen([
-                "/usr/bin/sudo", "-n", "/usr/bin/unshare", "--mount", "--propagation", "private", "--",
+                "/usr/bin/sudo", "-n", "/usr/bin/unshare", "--mount", "--propagation", "slave", "--",
                 "/usr/bin/setpriv", "--reuid", str(os.getuid()), "--regid", str(os.getgid()),
                 *group_args, "--", sys.executable, str(Path(__file__).resolve()),
                 "--guardian", address, str(os.getpid()),
@@ -419,7 +704,12 @@ def launch(command):
             while True:
                 try:
                     connection, _ = server.accept()
-                    break
+                    _peer, uid, _gid = struct.unpack("3i", connection.getsockopt(
+                        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+                    if uid == os.getuid():
+                        break
+                    connection.close()
+                    remaining(deadline)
                 except socket.timeout:
                     if process.poll() is not None:
                         raise subprocess.CalledProcessError(process.returncode or 1, "fs-verity namespace bootstrap")
@@ -427,10 +717,6 @@ def launch(command):
                         raise TimeoutError("fs-verity namespace bootstrap timed out")
             with connection:
                 connection.settimeout(30)
-                _peer, uid, _gid = struct.unpack("3i", connection.getsockopt(
-                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
-                if uid != os.getuid():
-                    raise RuntimeError("unexpected fs-verity guardian socket peer")
                 message = json.dumps({"targets": targets, "environment": dict(os.environ),
                                       "namespace": os.readlink("/proc/self/ns/mnt"), "command": command})
                 connection.sendmsg([message.encode()], [(
@@ -451,7 +737,10 @@ def launch(command):
 def main():
     command = sys.argv[1:]
     if len(command) == 3 and command[0] == "--detach-loop":
-        detach_loop(command[1], command[2])
+        detach_verified_loop(command[1], command[2])
+        return 0
+    if len(command) == 4 and command[0] == "--privileged":
+        privileged_helper(command[1], int(command[2]), float(command[3]))
         return 0
     if len(command) == 3 and command[0] == "--guardian":
         return receive_guardian(command[1], int(command[2]))

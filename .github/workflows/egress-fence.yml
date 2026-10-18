@@ -389,7 +389,7 @@ jobs:
           bash ci/egress-fence-tools.sh
 
       - name: Run exact host-test shard
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-host"
@@ -443,7 +443,7 @@ jobs:
           bash ci/egress-fence-tools.sh
 
       - name: Run one exact full-bound store proof
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-native-log"
@@ -490,7 +490,7 @@ jobs:
           bash ci/egress-fence-tools.sh
 
       - name: Run the six isolated and eight O1 proofs
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/egress-fence-proofs"

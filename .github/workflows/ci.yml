@@ -325,7 +325,7 @@ jobs:
         run: python3 ci/test-shards.py precheck --shard '${{ matrix.shard }}' --split-libraries
 
       - name: Run test shard
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' --split-libraries > shard-commands.txt
@@ -383,7 +383,7 @@ jobs:
         run: python3 ci/test-shards.py precheck --shard '${{ matrix.shard }}'
 
       - name: Run test shard
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' > shard-commands.txt
@@ -430,7 +430,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run exact library partition
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           python3 ci/test-shards.py run-libraries --shard '${{ matrix.shard }}' \
             --output "${RUNNER_TEMP}/library-test-map.json"
@@ -991,7 +991,7 @@ jobs:
         run: python3 ci/test-i686-target-selection.py
 
       - name: Run opc-session-net tests on i686
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         # The stateless three-voter consumer proofs retain literal authority
         # and snapshot budgets. Run every functional test exactly once,
         # but give each wall-time contract a fresh 32-bit process so completed

@@ -11,6 +11,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import select
+import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -75,9 +78,21 @@ class SafetyTests(unittest.TestCase):
         (foreign / "mutable").mkdir()
         sentinel = foreign / "mutable" / "database"
         sentinel.write_bytes(b"other tool's mutable state")
-        self.guardian().sweep(self.runner)
-        self.assertEqual((legacy / "ext4.img").read_bytes(), b"live pre-mount image")
-        self.assertEqual(sentinel.read_bytes(), b"other tool's mutable state")
+        legacy_process = subprocess.Popen(["python3", "-c", """
+import os, sys
+with open(sys.argv[1], 'rb') as stream:
+    print('live before attachment', flush=True)
+    sys.stdin.readline()
+    assert os.fstat(stream.fileno()).st_nlink > 0, 'live legacy image was removed'
+""", str(legacy / "ext4.img")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(legacy_process.stdout.readline().strip(), "live before attachment")
+            self.guardian().sweep(self.runner)
+            self.assertEqual((legacy / "ext4.img").read_bytes(), b"live pre-mount image")
+            self.assertEqual(sentinel.read_bytes(), b"other tool's mutable state")
+        finally:
+            legacy_process.communicate(input="finish\n", timeout=5)
+        self.assertEqual(legacy_process.returncode, 0)
 
     def renamed_during_inventory(self, release):
         stale = self.candidate("stale")
@@ -122,22 +137,37 @@ class SafetyTests(unittest.TestCase):
         previous = signal.signal(signal.SIGIO, lambda *_args: None)
 
         def inventory(**_kwargs):
-            try:
-                # Models the backing-file open that precedes LOOP_CONFIGURE.
-                opened.append(os.open(directory / "ext4.img", os.O_RDONLY | os.O_NONBLOCK))
-            except BlockingIOError:
-                pass  # An exclusive image lease serialized this open.
+            # A distinct process models the backing-file open preceding
+            # LOOP_CONFIGURE. It holds that FD across the deletion boundary.
+            child = subprocess.Popen(["python3", "-c", """
+import os, sys
+try:
+    descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+except BlockingIOError:
+    print('blocked', flush=True)
+else:
+    print('opened', flush=True)
+    sys.stdin.readline()
+    print(os.fstat(descriptor).st_nlink, flush=True)
+    os.close(descriptor)
+""", str(directory / "ext4.img")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            opened.append((child, child.stdout.readline().strip()))
             return [], []
 
         guardian.inventory = inventory
         try:
             guardian.sweep(self.runner)
-            for descriptor in opened:
-                self.assertGreater(os.fstat(descriptor).st_nlink, 0,
-                                   "deleted an image opened for concurrent attachment")
+            for child, state in opened:
+                output, _ = child.communicate(input="finish\n", timeout=5)
+                self.assertEqual(child.returncode, 0)
+                if state == "opened":
+                    self.assertGreater(int(output), 0, "deleted an image opened for concurrent attachment")
+                else:
+                    self.assertEqual(state, "blocked")
         finally:
-            for descriptor in opened:
-                os.close(descriptor)
+            for child, _state in opened:
+                if child.poll() is None:
+                    child.communicate(input="finish\n", timeout=5)
             signal.signal(signal.SIGIO, previous)
 
     def test_fallback_cleanup_never_detaches_an_inventory_name(self):
@@ -145,21 +175,27 @@ class SafetyTests(unittest.TestCase):
         fixture.root = self.root
         fixture.runner = self.runner
         fixture.process = None
+        fixture.guardians = {}
         fixture.extra_mounts = []
         fixture.extra_images = []
         fixture.temporary = unittest.mock.Mock()
         image = self.candidate("reuse") / "ext4.img"
         calls = []
+        released = False
 
         def fake_privileged(*arguments):
             calls.append(arguments)
             if arguments[:2] == ("losetup", "--associated"):
-                return "/dev/loop123456\n"  # A fixture name, never a real device.
+                return "" if released else "/dev/loop123456\n"
             return ""
 
+        def verified_detach(*_arguments):
+            nonlocal released
+            released = True
+
         with patch(__name__ + ".privileged", side_effect=fake_privileged), \
-                patch.object(RUNTIME, "detach_verified_loop", create=True) as detach, \
-                patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1)), \
+                patch.object(RUNTIME, "detach_verified_loop", create=True, side_effect=verified_detach) as detach, \
+                patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="")), \
                 patch.object(fixture, "wait_for_guardians", create=True):
             fixture.tearDown()
         self.assertNotIn(("losetup", "--detach", "/dev/loop123456"), calls)
@@ -168,13 +204,14 @@ class SafetyTests(unittest.TestCase):
     def test_captured_orphan_pipe_obeys_helper_deadline(self):
         # Keep subreaper state and finite descendants out of the test runner.
         program = '''
-import ctypes, importlib.util, sys
+import ctypes, importlib.util, sys, time
 spec = importlib.util.spec_from_file_location('runtime', sys.argv[1])
 runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
 assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
 guardian = runtime.Guardian(-1)
 expired = False
+started = time.monotonic()
 try:
     guardian.run([sys.executable, '-c', 'import os,time; child=os.fork(); os._exit(0) if child else time.sleep(.6)'],
                  capture=True, cleanup=True, timeout=.15)
@@ -183,10 +220,90 @@ except TimeoutError:
 finally:
     guardian.reap_descendants()
 assert expired, 'orphan-held output bypassed the helper deadline'
+assert time.monotonic() - started < .5, 'helper disposal exceeded its bounded budget'
 '''
         result = subprocess.run(["python3", "-c", program, str(HARNESS.with_name("fsverity-runtime.py"))],
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_sweep_requires_the_marker_and_exact_empty_layout(self):
+        stale = self.candidate("valid")
+        unmarked = self.candidate("unmarked")
+        descriptor = os.open(unmarked, os.O_RDONLY | os.O_DIRECTORY)
+        os.removexattr(descriptor, RUNTIME.OWNER_ATTRIBUTE)
+        os.close(descriptor)
+        other_owner = self.candidate("another-checkout")
+        os.setxattr(other_owner, RUNTIME.OWNER_ATTRIBUTE, b"another-checkout")
+        extra = self.candidate("extra")
+        (extra / "mutable").mkdir()
+        nonempty = self.candidate("nonempty")
+        (nonempty / "tmp" / "sentinel").write_text("preserve")
+        self.guardian().sweep(self.runner)
+        self.assertFalse(stale.exists())
+        self.assertEqual(set(self.runner.iterdir()), {unmarked, other_owner, extra, nonempty})
+        self.assertEqual((nonempty / "tmp" / "sentinel").read_text(), "preserve")
+
+    def test_sweep_preserves_an_image_already_open_for_attachment(self):
+        directory = self.candidate("preopened")
+        descriptor = os.open(directory / "ext4.img", os.O_RDONLY)
+        try:
+            self.guardian().sweep(self.runner)
+            self.assertTrue(directory.exists())
+            self.assertGreater(os.fstat(descriptor).st_nlink, 0)
+        finally:
+            os.close(descriptor)
+
+    def test_initialization_error_rolls_back_only_its_new_runtime(self):
+        reader, writer = os.pipe()
+        try:
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(self.runner)}), \
+                    patch.object(RUNTIME, "mark_owned", side_effect=OSError("marker failure")), \
+                    patch.object(RUNTIME.ctypes, "CDLL") as libc:
+                libc.return_value.prctl.return_value = 0
+                with self.assertRaisesRegex(OSError, "marker failure"):
+                    RUNTIME.Guardian(reader).execute(["true"])
+            self.assertEqual(list(self.runner.iterdir()), [])
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_expired_helper_budget_never_starts_a_process(self):
+        with patch("subprocess.Popen") as launch:
+            with self.assertRaises(TimeoutError):
+                self.guardian().run(["true"], cleanup=True, deadline=time.monotonic() - 1)
+            launch.assert_not_called()
+
+    def test_runtime_open_error_removes_its_new_empty_directory(self):
+        reader, writer = os.pipe()
+        original_open = os.open
+
+        def failed_open(path, *args, **kwargs):
+            if isinstance(path, str) and path.startswith(RUNTIME.PREFIX):
+                raise OSError("runtime open failed")
+            return original_open(path, *args, **kwargs)
+
+        try:
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(self.runner)}), \
+                    patch.object(RUNTIME.os, "open", side_effect=failed_open), \
+                    patch.object(RUNTIME.ctypes, "CDLL") as libc:
+                libc.return_value.prctl.return_value = 0
+                with self.assertRaisesRegex(OSError, "runtime open failed"):
+                    RUNTIME.Guardian(reader).execute(["true"])
+            self.assertEqual(list(self.runner.iterdir()), [])
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_every_workflow_owner_shell_resolves_bash_first(self):
+        shells = [line.strip().removeprefix("shell: ")
+                  for path in (ROOT / ".github/workflows").glob("*.yml")
+                  for line in path.read_text().splitlines()
+                  if "shell:" in line and "ci/setup-fsverity-tmp.sh" in line]
+        self.assertEqual(len(shells), 11)
+        for shell in shells:
+            arguments = shlex.split(shell)
+            self.assertEqual(arguments[:3], ["bash", "ci/setup-fsverity-tmp.sh", "--"])
+            self.assertIsNotNone(shutil.which(arguments[0]))
 
 
 class RuntimeTests(unittest.TestCase):
@@ -200,8 +317,20 @@ class RuntimeTests(unittest.TestCase):
             "GITHUB_ENV": str(self.root / "github-env"),
         }
         self.process = None
+        self.guardians = {}
         self.extra_mounts = []
         self.extra_images = []
+
+    def owned_directory(self, suffix):
+        directory = self.runner / (RUNTIME.PREFIX + suffix)
+        directory.mkdir(mode=0o700)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            RUNTIME.mark_owned(descriptor)
+        finally:
+            os.close(descriptor)
+        (directory / "tmp").mkdir(mode=0o700)
+        return directory
 
     def images(self):
         return list(self.runner.glob("*/ext4.img")) + self.extra_images
@@ -219,9 +348,14 @@ class RuntimeTests(unittest.TestCase):
         return resources
 
     def tearDown(self):
+        # Do not let TemporaryDirectory's finalizer delete an attached image
+        # if a failing guardian has not finished within the existing bound.
+        self.temporary._finalizer.detach()
+        self.guardian_locks = []
         if self.process is not None and self.process.poll() is None:
             os.killpg(self.process.pid, signal.SIGKILL)
             self.process.wait(timeout=5)
+        self.wait_for_guardians()
         # Even the RED must not strand a loop mount on the shared host.
         for mountpoint in reversed(self.extra_mounts):
             mounted = subprocess.run(
@@ -239,12 +373,58 @@ class RuntimeTests(unittest.TestCase):
             if mounted.returncode == 0:
                 privileged("umount", mountpoint)
             for loop in privileged("losetup", "--associated", image, "--noheadings", "--output", "NAME").split():
-                privileged("losetup", "--detach", loop)
+                RUNTIME.detach_verified_loop(image, loop)
+        self.assertEqual(self.attached(), [], "refusing to delete an attached fixture")
         self.temporary.cleanup()
+        for descriptor in self.guardian_locks:
+            os.close(descriptor)
+        for descriptor in self.guardians.values():
+            os.close(descriptor)
+
+    def observe_guardians(self):
+        for directory in self.runner.glob(RUNTIME.PREFIX + "*"):
+            descriptor = None
+            try:
+                value = os.getxattr(directory, RUNTIME.GUARDIAN_ATTRIBUTE)
+                pid, start = map(int, value.decode().split(":"))
+                if (pid, start) in self.guardians or RUNTIME.process_stat(pid)[1] != start:
+                    continue
+                descriptor = os.pidfd_open(pid)
+                if RUNTIME.process_stat(pid)[1] == start:
+                    self.guardians[pid, start] = descriptor
+                    descriptor = None
+            except (OSError, ValueError):
+                continue
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+
+    def wait_for_guardians(self):
+        deadline = time.monotonic() + 10
+        self.observe_guardians()
+        for descriptor in self.guardians.values():
+            ready, _, _ = select.select([descriptor], [], [], max(0, deadline - time.monotonic()))
+            self.assertTrue(ready, "guardian did not exit; retaining fixture")
+        for directory in self.runner.glob(RUNTIME.PREFIX + "*"):
+            try:
+                descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.guardian_locks.append(descriptor)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        os.close(descriptor)
+                        self.fail("guardian still owns fixture; retaining its files")
+                    time.sleep(.02)
 
     def wait_for(self, predicate, description, seconds=10):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
+            self.observe_guardians()
             if predicate():
                 return
             time.sleep(0.02)
@@ -314,12 +494,22 @@ if arguments[0] == 'mount':
 import json, os, pathlib, stat, sys
 root = pathlib.Path(os.environ['OPC_FS_VERITY_SNAPSHOT_ROOT'])
 info = root.stat()
+def loop_is_pinned():
+    for descriptor in pathlib.Path(f'/proc/{os.getppid()}/fd').iterdir():
+        try:
+            pinned = descriptor.stat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISBLK(pinned.st_mode) and pinned.st_rdev == info.st_dev:
+            return True
+    return False
 pathlib.Path(sys.argv[1]).write_text(json.dumps({
     'required': os.environ['OPC_FS_VERITY_QUALIFICATION'],
     'owner': info.st_uid, 'mode': stat.S_IMODE(info.st_mode),
     'snapshot_device': info.st_dev,
     'mutable_device': pathlib.Path(os.environ['TMPDIR']).stat().st_dev,
     'tmpdir': os.environ['TMPDIR'], 'root': str(root),
+    'loop_is_pinned': loop_is_pinned(),
 }))
 """, report, environment={"TMPDIR": str(ordinary)})
         data = json.loads(report.read_text())
@@ -327,6 +517,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
         self.assertEqual((data["owner"], data["mode"]), (os.getuid(), 0o700))
         self.assertNotEqual(data["snapshot_device"], data["mutable_device"])
         self.assertEqual(data["tmpdir"], str(ordinary))
+        self.assertTrue(data["loop_is_pinned"], "owner must retain the device it configured")
         self.assertFalse(Path(data["root"]).exists())
         self.assertEqual(Path(self.environment["GITHUB_ENV"]).read_text(), original)
         self.assertEqual(list(self.runner.iterdir()), [])
@@ -384,7 +575,7 @@ while not pathlib.Path(%r).exists():
         self.assertEqual(result.stdout, data)
         self.assertEqual(list(self.runner.iterdir()), [])
 
-    def test_private_namespace_does_not_pin_another_jobs_runtime_mount(self):
+    def test_slave_namespace_observes_another_jobs_unmount_without_pinning_it(self):
         other = self.root / "opc-fsverity.other-job"
         other.mkdir()
         image = other / "ext4.img"
@@ -396,18 +587,35 @@ while not pathlib.Path(%r).exists():
         self.extra_mounts.append(mountpoint)
         subprocess.run(["mkfs.ext4", "-q", str(image)], check=True, timeout=10)
         privileged("mount", "-o", "loop,nosuid,nodev", image, mountpoint)
-        self.run_command("python3", "-c", """
-import subprocess
+        privileged("mount", "--make-shared", mountpoint)
+        ready = self.root / "foreign-visible"
+        finish = self.root / "foreign-unmounted"
+        self.process = subprocess.Popen([str(HARNESS), "--", "python3", "-c", """
+import pathlib, subprocess, time
+result = subprocess.run(['findmnt', '--mountpoint', %r, '--noheadings'], capture_output=True)
+assert result.returncode == 0, result.stdout
+pathlib.Path(%r).touch()
+deadline = time.monotonic() + 5
+while not pathlib.Path(%r).exists():
+    assert time.monotonic() < deadline, 'parent did not unmount the foreign fixture'
+    time.sleep(.02)
 result = subprocess.run(['findmnt', '--mountpoint', %r, '--noheadings'], capture_output=True)
 assert result.returncode == 1, result.stdout
-""" % str(mountpoint))
-        # Dropping the copied mount must never unmount the original job's view.
+""" % (str(mountpoint), str(ready), str(finish), str(mountpoint))],
+            env=self.environment, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.wait_for(ready.exists, "foreign mount initially visible in slave namespace")
         parent = subprocess.run(
             ["findmnt", "--mountpoint", str(mountpoint), "--noheadings"],
             capture_output=True, text=True, timeout=5,
         )
         self.assertEqual(parent.returncode, 0, parent.stderr)
         self.assertTrue(image.exists())
+        privileged("umount", mountpoint)
+        finish.touch()
+        output, _ = self.process.communicate(timeout=10)
+        self.assertEqual(self.process.returncode, 0, output)
+        self.assertEqual(privileged("losetup", "--associated", image, "--noheadings", "--output", "NAME").strip(), "")
 
     def test_caller_lock_is_held_through_killed_launcher_cleanup(self):
         ready = self.root / "ready"
@@ -556,8 +764,7 @@ subprocess.run(['sudo', '-n', 'losetup', '--find', '--show', str(image)], check=
         self.assertTrue(self.attached())
 
     def test_inventory_failure_preserves_stale_directory(self):
-        stale = self.runner / "fs-verity-runtime.stale"
-        stale.mkdir(mode=0o700)
+        stale = self.owned_directory("stale")
         image = stale / "ext4.img"
         image.write_bytes(b"retain without complete inventory")
         self.run_command("true", environment=self.failing_sudo("losetup"), expected=1)
@@ -624,17 +831,62 @@ while pathlib.Path(f'/proc/{child}').exists():
 """)
         self.assertEqual(list(self.runner.iterdir()), [])
 
+    def test_privileged_escaped_descendant_is_reaped_before_unmount(self):
+        report = self.root / "privileged-descendant"
+        self.run_command("python3", "-c", """
+import pathlib, subprocess, sys, time
+subprocess.run(['sudo', '-n', sys.executable, '-c', '''
+import os, pathlib, signal, sys, time
+if os.fork():
+    os._exit(0)
+os.setsid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+time.sleep(2)
+os._exit(0)
+''', %r], check=True)
+deadline = time.monotonic() + 1
+while not pathlib.Path(%r).exists():
+    assert time.monotonic() < deadline, 'privileged fixture did not become ready'
+    time.sleep(.01)
+""" % (str(report), str(report)))
+        self.assertFalse(Path(f"/proc/{report.read_text()}").exists())
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_privileged_disposal_refuses_a_process_outside_its_direct_children(self):
+        parent = subprocess.Popen(["python3", "-c", """
+import os, sys, time
+child = os.fork()
+if not child:
+    time.sleep(1)
+    os._exit(0)
+print(child, flush=True)
+_, status = os.waitpid(child, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+"""], stdout=subprocess.PIPE, text=True)
+        descriptor = None
+        try:
+            child = int(parent.stdout.readline())
+            descriptor = os.pidfd_open(child)
+            with self.assertRaisesRegex(RuntimeError, "refusing to signal an unowned process"):
+                RUNTIME.privileged_request("kill-child", [descriptor],
+                                           owner_start=RUNTIME.process_stat(os.getpid())[1],
+                                           child_start=RUNTIME.process_stat(child)[1])
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            parent.communicate(timeout=5)
+        self.assertEqual(parent.returncode, 0, "privileged disposer signalled the unrelated fixture")
+
     def test_startup_sweeps_only_unattached_owned_unlocked_directories(self):
-        stale = self.runner / "fs-verity-runtime.stale"
-        stale.mkdir(mode=0o700)
+        stale = self.owned_directory("stale")
         (stale / "ext4.img").write_bytes(b"unattached image")
-        active = self.runner / "fs-verity-runtime.active"
-        active.mkdir(mode=0o700)
+        active = self.owned_directory("active")
         unknown = self.runner / "unrelated"
         unknown.mkdir(mode=0o700)
-        public = self.runner / "fs-verity-runtime.public"
-        public.mkdir(mode=0o755)
-        symlink = self.runner / "fs-verity-runtime.symlink"
+        public = self.owned_directory("public")
+        public.chmod(0o755)
+        symlink = self.runner / (RUNTIME.PREFIX + "symlink")
         symlink.symlink_to(unknown, target_is_directory=True)
         descriptor = os.open(active, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -645,7 +897,7 @@ while pathlib.Path(f'/proc/{child}').exists():
         self.assertFalse(stale.exists())
         self.assertEqual(set(self.runner.iterdir()), {active, unknown, public, symlink})
 
-    def test_startup_reclaims_legacy_unattached_images(self):
+    def test_startup_preserves_legacy_unattached_images(self):
         legacy = self.runner / "opc-fsverity.stale"
         legacy.mkdir(mode=0o700)
         (legacy / "ext4.img").write_bytes(b"old unattached image")
@@ -655,14 +907,21 @@ while pathlib.Path(f'/proc/{child}').exists():
         nested.mkdir(mode=0o700)
         (nested / "ext4.img").write_bytes(b"old nested unattached image")
         self.run_command("true")
-        self.assertFalse(legacy.exists())
-        self.assertFalse(outer.exists())
+        self.assertTrue(legacy.exists())
+        self.assertTrue(outer.exists())
+        self.assertEqual((legacy / "ext4.img").read_bytes(), b"old unattached image")
+        self.assertEqual((nested / "ext4.img").read_bytes(), b"old nested unattached image")
 
     def test_startup_preserves_loop_backing_inode_even_through_other_path(self):
-        for prefix in ("fs-verity-runtime.", "opc-fsverity."):
+        for prefix in (RUNTIME.PREFIX, "fs-verity-runtime.", "opc-fsverity."):
             with self.subTest(prefix=prefix):
                 directory = self.runner / (prefix + "attached")
                 directory.mkdir(mode=0o700)
+                if prefix == RUNTIME.PREFIX:
+                    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                    RUNTIME.mark_owned(descriptor)
+                    os.close(descriptor)
+                    (directory / "tmp").mkdir(mode=0o700)
                 image = directory / "ext4.img"
                 with image.open("xb") as stream:
                     stream.truncate(32 * 1024**2)

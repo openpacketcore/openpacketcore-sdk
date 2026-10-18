@@ -43,7 +43,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run Rust release gates
-        shell: ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           cargo fmt --all --check
           git diff --check
