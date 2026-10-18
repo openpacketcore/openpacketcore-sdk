@@ -516,3 +516,33 @@ async fn lost_surviving_quorum_retains_failed_preparation_without_readmission_or
     assert_eq!(renewed.fence(), lease.fence());
     close_cluster(&cluster).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unplanned_drain_cancels_explicit_preparation_and_joins_its_owner() {
+    let cluster =
+        TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
+            .await;
+    let (leader, _, _) = cluster.observed_leader();
+    let (mut captured, _release) = pause_leader_handoff(&cluster, leader);
+    let store = cluster.stores[leader].clone();
+    let preparation = tokio::spawn(async move { store.prepare_shutdown().await });
+    tokio::time::timeout(CALLER_RENEWAL_BUDGET, captured.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    cluster.stores[leader].shutdown_unplanned().await.unwrap();
+    assert!(preparation.await.unwrap().is_err());
+    assert_eq!(
+        cluster.stores[leader].shutdown_with_report().await.unwrap(),
+        opc_consensus::PlannedShutdownOutcome::Fallback {
+            reason: opc_consensus::PlannedShutdownFallback::Unplanned,
+        }
+    );
+    assert!(!cluster.stores[leader].status().admitted);
+    assert!(
+        captured.try_recv().is_err(),
+        "cancelled preparation cannot dispatch another handoff"
+    );
+    assert!(cluster.stores[leader].prepare_shutdown().await.is_err());
+    close_cluster(&cluster).await;
+}

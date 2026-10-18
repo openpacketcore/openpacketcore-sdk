@@ -880,6 +880,8 @@ impl<C> RaftManagedDatastore<C> {
 
     /// Return the sole underlying config consensus authority for lifecycle,
     /// RPC-handler, status, readiness, snapshot, and shutdown operations.
+    /// Use [`ConsensusConfigStore::shutdown_unplanned`] after an unplanned
+    /// replication-listener failure; ordinary shutdown retains planned handoff.
     pub fn consensus_store(&self) -> &Arc<ConsensusConfigStore> {
         self.adapter.inner().consensus_store()
     }

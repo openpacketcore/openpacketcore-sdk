@@ -4247,6 +4247,26 @@ impl ConsensusSessionStore {
         self.shutdown_with_closed_proof(true).await
     }
 
+    /// Drain after an unplanned loss, such as a failed replication listener.
+    ///
+    /// Revoke external admission, retain the listener failure diagnostic, and
+    /// join external transports before using this route. Local admission and
+    /// cached authority are revoked when this future is first polled. No new
+    /// handoff is prepared; an outstanding preparation is cancelled and joined
+    /// before the engine/storage drain. Already dispatched RPCs cannot be
+    /// retracted. All clones share this choice and the retained drain, including
+    /// subsequent calls to [`Self::shutdown`] or [`Self::prepare_shutdown`].
+    ///
+    /// Caller deadlines, cancellation safety, native storage joining, and close
+    /// proof/reopen authority checks are identical to [`Self::shutdown`]. A
+    /// timeout leaves the drain running; observe successful completion before
+    /// reopening. This route does not establish a writable successor and must
+    /// not replace planned shutdown for a voluntary stop.
+    pub async fn shutdown_unplanned(&self) -> Result<(), StoreError> {
+        self.inner.retirement.prevent_handoff(self);
+        self.shutdown().await
+    }
+
     /// Perform [`Self::shutdown`] and return its retained handoff result.
     ///
     /// A fallback still joins every engine and storage owner. Preparation and

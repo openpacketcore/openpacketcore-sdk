@@ -318,3 +318,69 @@ async fn accepted_prefix_catches_up_before_successor_campaigns() {
 async fn no_up_to_date_voter_has_a_typed_bounded_fallback() {
     with_wall_clock_watchdog(lagging_successor(false)).await;
 }
+
+#[tokio::test]
+async fn unplanned_shutdown_releases_owned_handles_before_retained_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = ConsensusNodeId::new(1).unwrap();
+    let identity = opc_consensus::ConsensusIdentity::new(
+        opc_consensus::ConsensusClusterId::new("unplanned-owned-handles").unwrap(),
+        opc_consensus::ConsensusConfigurationId::from_bytes([0x45; 32]),
+        opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap(),
+    );
+    let topology =
+        ConfigConsensusTopology::try_new(identity, node, BTreeSet::from([node])).unwrap();
+    let options = crate::RetainedConfigOptions::new(
+        directory.path().join("retained.sqlite"),
+        crate::RetainedConfigBinding::new(topology.clone(), [1; 32], [2; 32]).unwrap(),
+        crate::RetainedConfigDurability::Ephemeral,
+        64 * 1024 * 1024,
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let key = crate::AuditKey::new([0x55; 32]).unwrap();
+    let backend = SqliteBackend::provision_config_authority(options.clone(), key.clone())
+        .await
+        .unwrap();
+    let connection = Arc::downgrade(&backend.conn());
+    let store = ConsensusConfigStore::open(
+        topology,
+        backend,
+        directory.path().join("snapshots"),
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    let owner = Arc::downgrade(&store.inner);
+    store.initialize_cluster().await.unwrap();
+    store.trigger_snapshot().await.unwrap();
+    use futures_util::FutureExt;
+    assert!(store.shutdown_unplanned().now_or_never().is_none());
+    assert!(!store.status().admitted);
+    store.clone().shutdown_unplanned().await.unwrap();
+    assert_eq!(
+        store.shutdown_with_report().await.unwrap(),
+        PlannedShutdownOutcome::Fallback {
+            reason: PlannedShutdownFallback::Unplanned
+        }
+    );
+    drop(store);
+    eprintln!(
+        "shutdown completion: store_owners={}, connection_owners={}",
+        owner.strong_count(),
+        connection.strong_count()
+    );
+    assert_eq!(
+        owner.strong_count(),
+        0,
+        "unplanned drain released its store"
+    );
+    assert_eq!(
+        connection.strong_count(),
+        0,
+        "engine storage owners joined before completion"
+    );
+    SqliteBackend::reopen_config_authority(options, key)
+        .await
+        .expect("no shutdown-owned handle can retain the root after completion");
+}

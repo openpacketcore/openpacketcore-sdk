@@ -20,9 +20,9 @@ pub enum PlannedShutdownOutcome {
     },
     /// The engine atomically retired a follower or candidate from campaigning.
     FollowerRetired,
-    /// The bounded handoff failed; ordinary engine shutdown still proceeded.
+    /// Handoff was omitted or failed; ordinary engine shutdown still proceeded.
     Fallback {
-        /// Stable, payload-free explanation of the failed handoff.
+        /// Stable, payload-free explanation of the omitted or failed handoff.
         reason: PlannedShutdownFallback,
     },
 }
@@ -31,6 +31,9 @@ pub enum PlannedShutdownOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PlannedShutdownFallback {
+    /// The caller requested an unplanned drain without leadership transfer.
+    #[error("unplanned shutdown requested")]
+    Unplanned,
     /// Local durable authority was not admitted for a handoff.
     #[error("local voter is not admitted")]
     NotAdmitted,

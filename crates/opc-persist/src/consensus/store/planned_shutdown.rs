@@ -17,6 +17,7 @@ type Scope = (BTreeSet<ConsensusNodeId>, Option<LogId<ConsensusNodeId>>);
 
 pub(super) struct ConfigShutdownCoordinator {
     started: AtomicBool,
+    unplanned: watch::Sender<bool>,
     started_notify: tokio::sync::Notify,
     completion: std::sync::Mutex<Option<watch::Receiver<Completion>>>,
 }
@@ -25,6 +26,7 @@ impl ConfigShutdownCoordinator {
     pub(super) fn new() -> Self {
         Self {
             started: AtomicBool::new(false),
+            unplanned: watch::channel(false).0,
             started_notify: tokio::sync::Notify::new(),
             completion: std::sync::Mutex::new(None),
         }
@@ -44,6 +46,12 @@ impl ConfigShutdownCoordinator {
         }
     }
 
+    fn prevent_handoff(&self) {
+        self.started.store(true, Ordering::Release);
+        self.started_notify.notify_waiters();
+        self.unplanned.send_replace(true);
+    }
+
     fn start_or_subscribe(&self, store: ConsensusConfigStore) -> watch::Receiver<Completion> {
         let mut completion = self
             .completion
@@ -59,20 +67,28 @@ impl ConfigShutdownCoordinator {
         // application path before the engine can release a leader vote lease.
         self.started.store(true, Ordering::Release);
         self.started_notify.notify_waiters();
+        let mut unplanned = self.unplanned.subscribe();
         tokio::spawn(async move {
             // Active recovery observes the shutdown notification and drops
             // its local download. Also discard a checkpoint left by a prior
             // bounded attempt before publishing shutdown completion.
             drop(store.inner.repair_progress.lock().await.take());
             let mut timeout_reason = PlannedShutdownFallback::DeadlineElapsed;
-            let preparation = tokio::time::timeout_at(
-                deadline,
-                store.transfer_before_shutdown(deadline, &mut timeout_reason),
-            )
-            .await
-            .unwrap_or(Err(timeout_reason));
+            let preparation = tokio::select! {
+                biased;
+                _ = unplanned.wait_for(|requested| *requested) => {
+                    Err(PlannedShutdownFallback::Unplanned)
+                }
+                result = tokio::time::timeout_at(
+                    deadline,
+                    store.transfer_before_shutdown(deadline, &mut timeout_reason),
+                ) => result.unwrap_or(Err(timeout_reason)),
+            };
             let outcome = match preparation {
                 Ok(outcome) => outcome,
+                Err(PlannedShutdownFallback::Unplanned) => PlannedShutdownOutcome::Fallback {
+                    reason: PlannedShutdownFallback::Unplanned,
+                },
                 Err(reason) => {
                     tracing::warn!(?reason, "config consensus handoff fell back to shutdown");
                     PlannedShutdownOutcome::Fallback { reason }
@@ -101,6 +117,24 @@ impl ConfigShutdownCoordinator {
 }
 
 impl ConsensusConfigStore {
+    /// Drain after an unplanned loss, such as a failed replication listener.
+    ///
+    /// Revoke external admission, retain the failure diagnostic, and join
+    /// external transports before calling. First polling this future fences
+    /// local admission and suppresses handoff preparation across every clone.
+    /// An outstanding preparation is cancelled before the retained drain;
+    /// already dispatched RPCs cannot be retracted. Later planned shutdown
+    /// observers share the same result and cannot restart the handoff.
+    ///
+    /// The engine and storage drain, caller deadline, and cancellation safety
+    /// are identical to [`Self::shutdown`]. On timeout, a later clone must
+    /// observe successful drain before reopening storage. No successor is
+    /// certified; voluntary stops must continue to use planned shutdown.
+    pub async fn shutdown_unplanned(&self) -> Result<(), PersistError> {
+        self.inner.shutdown.prevent_handoff();
+        self.shutdown().await
+    }
+
     /// Perform [`Self::shutdown`] and return its retained, typed handoff result.
     ///
     /// `Fallback` still joins the engine. Keep replication transport available

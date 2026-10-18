@@ -337,3 +337,78 @@ async fn stalled_handoff_falls_back_once_within_the_original_shutdown_budget() {
     })
     .await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn failed_listener_drain_suppresses_handoff_across_cancelled_clones() {
+    use futures_util::FutureExt;
+    scripted_election::schedule::with_frozen_time(async {
+        let cluster = ThreeNodeCluster::start().await;
+        let leader = cluster.leader();
+        let (mut captured, release) = hold_transfer(&cluster, leader);
+        release.send_replace(true);
+        // Join/remove the failed inbound listener while leaving outbound calls
+        // visible, so a forbidden handoff cannot hide behind a blocked link.
+        for ((_, target), peer) in &cluster.paths {
+            if *target == leader {
+                *peer.handler.write().await = None;
+            }
+        }
+        assert!(cluster.stores[leader]
+            .shutdown_unplanned()
+            .now_or_never()
+            .is_none());
+        assert!(!cluster.stores[leader].status().admitted);
+        let observer = cluster.stores[leader].clone();
+        assert_eq!(
+            observer.shutdown_with_report().await.unwrap(),
+            PlannedShutdownOutcome::Fallback {
+                reason: PlannedShutdownFallback::Unplanned
+            }
+        );
+        assert!(
+            captured.try_recv().is_err(),
+            "failed listener drain sends no leadership transfer"
+        );
+        let tx = TxId::new();
+        assert!(observer
+            .append_attested_commit_local(attested(commit(tx, None, 1, 10), audit(tx)))
+            .await
+            .is_err());
+        observer.shutdown_unplanned().await.unwrap();
+        assert!(
+            captured.try_recv().is_err(),
+            "repeated observers cannot restart handoff"
+        );
+        cluster.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn unplanned_drain_cancels_an_outstanding_handoff_before_joining() {
+    scripted_election::schedule::with_frozen_time(async {
+        let cluster = ThreeNodeCluster::start().await;
+        let leader = cluster.leader();
+        let (mut captured, _release) = hold_transfer(&cluster, leader);
+        let store = cluster.stores[leader].clone();
+        let planned = tokio::spawn(async move { store.shutdown_with_report().await });
+        captured
+            .recv()
+            .await
+            .expect("original preparation reached transport");
+        cluster.stores[leader].shutdown_unplanned().await.unwrap();
+        assert_eq!(
+            planned.await.unwrap().unwrap(),
+            PlannedShutdownOutcome::Fallback {
+                reason: PlannedShutdownFallback::Unplanned
+            }
+        );
+        assert!(
+            captured.try_recv().is_err(),
+            "cancellation never starts the successor transfer"
+        );
+        assert!(!cluster.stores[leader].status().admitted);
+        cluster.shutdown().await;
+    })
+    .await;
+}

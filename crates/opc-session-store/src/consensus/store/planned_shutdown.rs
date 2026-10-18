@@ -10,21 +10,32 @@ use super::*;
 /// neither resume local admission nor select another successor.
 pub(super) struct ConsensusRetirementCoordinator {
     started: AtomicBool,
+    unplanned: tokio::sync::watch::Sender<bool>,
     completion: Mutex<Option<tokio::sync::watch::Receiver<Option<RetirementResult>>>>,
 }
 
 type RetirementResult = Result<PlannedShutdownOutcome, PlannedShutdownFallback>;
 
 impl ConsensusRetirementCoordinator {
-    pub(super) const fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             started: AtomicBool::new(false),
+            unplanned: tokio::sync::watch::channel(false).0,
             completion: Mutex::new(None),
         }
     }
 
     pub(super) fn is_started(&self) -> bool {
         self.started.load(Ordering::Acquire)
+    }
+
+    pub(super) fn prevent_handoff(&self, store: &ConsensusSessionStore) {
+        // Retain the failure-route choice even before a coordinator subscribes.
+        // Fence admission synchronously, before the caller can be cancelled.
+        store.inner.raw_v2_read_barrier.disable_lease_reuse();
+        store.inner.read_barrier.disable_lease_reuse();
+        self.started.store(true, Ordering::Release);
+        self.unplanned.send_replace(true);
     }
 
     fn start_or_subscribe(
@@ -42,17 +53,22 @@ impl ConsensusRetirementCoordinator {
         let deadline = tokio::time::Instant::now() + timeout;
         let (sender, receiver) = tokio::sync::watch::channel(None);
         *completion = Some(receiver.clone());
+        let mut unplanned = self.unplanned.subscribe();
         tokio::spawn(async move {
             // Explicit preparation keeps its complete-operation budget.
             // Automatic preparation reserves time for drain. Later callers
             // observe the first deadline and result, never extend or restart it.
             let mut timeout_reason = PlannedShutdownFallback::DeadlineElapsed;
-            let result = tokio::time::timeout_at(
-                deadline,
-                store.prepare_shutdown_before(deadline, &mut timeout_reason),
-            )
-            .await
-            .unwrap_or(Err(timeout_reason));
+            let result = tokio::select! {
+                biased;
+                _ = unplanned.wait_for(|requested| *requested) => {
+                    Err(PlannedShutdownFallback::Unplanned)
+                }
+                result = tokio::time::timeout_at(
+                    deadline,
+                    store.prepare_shutdown_before(deadline, &mut timeout_reason),
+                ) => result.unwrap_or(Err(timeout_reason)),
+            };
             sender.send_replace(Some(result));
         });
         receiver
@@ -110,6 +126,9 @@ impl ConsensusSessionStore {
         self.inner.retirement.started.store(true, Ordering::Release);
         match result {
             Ok(outcome) => outcome,
+            Err(PlannedShutdownFallback::Unplanned) => PlannedShutdownOutcome::Fallback {
+                reason: PlannedShutdownFallback::Unplanned,
+            },
             Err(reason) => {
                 tracing::warn!(?reason, "session consensus handoff fell back to shutdown");
                 PlannedShutdownOutcome::Fallback { reason }
