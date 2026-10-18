@@ -1270,6 +1270,9 @@ fn validate_key_exchange(
         Ikev2SelectedKeyExchangeError::GroupMismatch => {
             Ikev2ChildSaRekeyResponseError::KeyExchangeGroupMismatch
         }
+        Ikev2SelectedKeyExchangeError::ValueInvalid(error) => {
+            Ikev2ChildSaRekeyResponseError::KeyExchangeValueInvalid(error)
+        }
     })?;
     match (selected_group, response) {
         (Some(group), Some(response)) => {

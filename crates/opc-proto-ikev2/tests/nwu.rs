@@ -1038,3 +1038,131 @@ fn aead_selection_follows_caller_order_without_integrity_or_fallback() {
         encr(Ikev2EncryptionAlgorithm::AesGcm16_128);
     assert!(input.payloads().is_err());
 }
+const NWU_KE_WIDTHS: [(u16, usize); 6] =
+    [(1, 96), (2, 128), (14, 256), (19, 64), (20, 96), (21, 132)];
+
+fn nwu_ke_input(group: u16, width: usize) -> CreateRequestBuild<'static> {
+    let mut input = create_input();
+    input.security_association.proposals[0]
+        .transforms
+        .push(Ikev2SaTransformBuild {
+            transform_type: 4,
+            transform_id: group,
+            attributes: vec![],
+        });
+    input.key_exchange = Some(opc_proto_ikev2::Ikev2KeyExchangePayloadBuild {
+        dh_group: group,
+        key_exchange_data: vec![0x42; width],
+    });
+    input
+}
+
+fn replace_nwu_ke_width(first: PayloadType, bytes: &[u8], width: usize) -> Vec<u8> {
+    let mut found = false;
+    let entries: Vec<_> = PayloadChain::new(first, bytes)
+        .iter()
+        .map(|raw| {
+            let raw = must(raw);
+            let mut body = raw.body.to_vec();
+            if raw.payload_type == PayloadType::KeyExchange {
+                found = true;
+                body.truncate(4);
+                body.resize(4 + width, 0x42);
+            }
+            Ikev2IkeAuthPayloadBuild {
+                payload_type: raw.payload_type,
+                body,
+            }
+        })
+        .collect();
+    assert!(found);
+    must(encode_payloads(&entries)).1.to_vec()
+}
+
+#[test]
+fn nwu_ke_request_build_enforces_group_width() {
+    for (group, width) in NWU_KE_WIDTHS {
+        must(nwu_ke_input(group, width).payloads());
+        for actual in [1, width - 1, width + 1] {
+            assert_eq!(
+                nwu_ke_input(group, actual).payloads(),
+                Err(Error::InvalidValue),
+                "group {group}, width {actual}",
+            );
+        }
+    }
+}
+
+#[test]
+fn nwu_ke_request_decode_enforces_group_width() {
+    for (group, width) in NWU_KE_WIDTHS {
+        let (first, bytes) = must(encode_payloads(&must(
+            nwu_ke_input(group, width).payloads(),
+        )));
+        let header = create_header(Peer::Network, false);
+        must(CreateRequest::decode(
+            &header,
+            first,
+            &bytes,
+            AddressFamilies::Ipv4,
+            Limits::default(),
+        ));
+        for actual in [1, width - 1, width + 1] {
+            let malformed = replace_nwu_ke_width(first, &bytes, actual);
+            assert!(
+                matches!(
+                    CreateRequest::decode(
+                        &header,
+                        first,
+                        &malformed,
+                        AddressFamilies::Ipv4,
+                        Limits::default()
+                    ),
+                    Err(Error::Incompatible)
+                ),
+                "group {group}, width {actual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nwu_ke_response_correlation_enforces_group_width() {
+    for (group, width) in NWU_KE_WIDTHS {
+        let input = nwu_ke_input(group, width);
+        let (first, bytes) = must(encode_payloads(&must(input.payloads())));
+        let request = must(CreateRequest::decode(
+            &create_header(Peer::Network, false),
+            first,
+            &bytes,
+            AddressFamilies::Ipv4,
+            Limits::default(),
+        ));
+        let mut response_sa = input.security_association;
+        response_sa.proposals[0].spi = vec![1, 2, 3, 4];
+        let payloads = must(build_create_child_sa_rekey_response_payloads(
+            &Ikev2CreateChildSaRekeyResponseBuild {
+                security_association: response_sa,
+                nonce: Ikev2NoncePayloadBuild {
+                    nonce: vec![0x55; 16],
+                },
+                key_exchange: input.key_exchange,
+                traffic_selectors_initiator: all_packet_selectors(AddressFamilies::Ipv4),
+                traffic_selectors_responder: all_packet_selectors(AddressFamilies::Ipv4),
+            },
+        ));
+        let (first, bytes) = must(encode_payloads(&payloads.into_payloads()));
+        let header = create_header(Peer::Ue, true);
+        must(request.accepted_response(&header, first, &bytes, Limits::default()));
+        for actual in [1, width - 1, width + 1] {
+            let malformed = replace_nwu_ke_width(first, &bytes, actual);
+            assert!(
+                matches!(
+                    request.accepted_response(&header, first, &malformed, Limits::default()),
+                    Err(Error::Incompatible)
+                ),
+                "group {group}, width {actual}"
+            );
+        }
+    }
+}

@@ -2499,7 +2499,7 @@ define_modp_group!(
     MODP_2048_PRIME_HEX
 );
 
-fn validate_peer_public_len(
+pub(crate) fn validate_peer_public_len(
     group: Ikev2DhGroup,
     peer_public_value: &[u8],
 ) -> Result<(), Ikev2SaInitCryptoError> {

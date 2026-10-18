@@ -821,6 +821,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   storage drain with the original caller bounds and native reopen-proof checks.
   Config bus adapters expose the same lifecycle through their consensus store.
   Planned shutdown keeps automatic bounded handoff. (#1370)
+- `opc-proto-ikev2`: CREATE_CHILD_SA request/response construction, dedicated-bearer
+  decoding and response correlation, and NWu creation exchanges validate the
+  KE public-value width for the supplied DH group, including 96 octets for group 1.
 
 - `opc-proto-diameter`: SWm emergency identity recovery accepts ordinary root
   IMSI NAIs as a receive-side interoperability extension. The emergency

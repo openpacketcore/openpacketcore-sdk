@@ -25,7 +25,8 @@ use crate::{
         Ikev2SaTransformBuild,
     },
     sa_init_crypto::{
-        Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError,
+        validate_peer_public_len, Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm,
+        Ikev2SaInitCryptoError,
     },
 };
 
@@ -1263,6 +1264,12 @@ pub(crate) fn validate_ke_view(
         (true, Some(_), false) => {
             Err(Ikev2DedicatedBearerExchangeError::KeyExchangeDhGroupMismatch)
         }
+        (true, Some(key_exchange), true) => {
+            let group = Ikev2DhGroup::from_transform_id(key_exchange.dh_group)
+                .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
+            validate_peer_public_len(group, key_exchange.key_exchange_data)
+                .map_err(Ikev2DedicatedBearerExchangeError::Crypto)
+        }
         _ => Ok(()),
     }
 }
@@ -1486,7 +1493,7 @@ pub enum Ikev2DedicatedBearerExchangeError {
     Payload(Ikev2IkeAuthPayloadError),
     /// Typed Notify decode failed.
     Notify(Ikev2NotifyPayloadError),
-    /// Supported-algorithm or transform-attribute validation failed.
+    /// Supported-algorithm, transform-attribute, or KE public-value width validation failed.
     Crypto(Ikev2SaInitCryptoError),
     /// TS 24.302 typed Notify validation failed.
     ThreeGpp(Ikev2DedicatedBearerError),
@@ -2167,6 +2174,8 @@ pub fn validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
     else {
         return Ok(());
     };
+    validate_ke_view(&request.security_association, request.key_exchange.as_ref())
+        .map_err(|_| Ikev2DedicatedBearerExchangeError::ResponseKeyExchangeMismatch)?;
     let selected = security_association
         .proposals
         .first()
@@ -2240,6 +2249,7 @@ pub(crate) enum Ikev2SelectedKeyExchangeError {
     Unexpected,
     Required,
     GroupMismatch,
+    ValueInvalid(Ikev2SaInitCryptoError),
 }
 
 pub(crate) fn validate_selected_key_exchange(
@@ -2255,7 +2265,10 @@ pub(crate) fn validate_selected_key_exchange(
         (Some(group), Some(response))
             if request_group == Some(group) && response.dh_group == group =>
         {
-            Ok(())
+            let group = Ikev2DhGroup::from_transform_id(group)
+                .map_err(Ikev2SelectedKeyExchangeError::ValueInvalid)?;
+            validate_peer_public_len(group, response.key_exchange_data)
+                .map_err(Ikev2SelectedKeyExchangeError::ValueInvalid)
         }
         (Some(_), Some(_)) => Err(Ikev2SelectedKeyExchangeError::GroupMismatch),
     }

@@ -650,7 +650,7 @@ fn builds_create_child_sa_rekey_request_and_response_payloads() {
             },
             key_exchange: Some(Ikev2KeyExchangePayloadBuild {
                 dh_group: 19,
-                key_exchange_data: vec![0x22; 65],
+                key_exchange_data: vec![0x22; 64],
             }),
             traffic_selectors_initiator: ts_payload(),
             traffic_selectors_responder: ts_payload(),
@@ -1166,4 +1166,67 @@ fn traffic_selector_wildcard_and_opaque_port_semantics_are_canonical() {
     assert_eq!(decoded.ip_protocol_id, 6);
     assert_eq!(decoded.start_port, u16::MAX);
     assert_eq!(decoded.end_port, 0);
+}
+fn ke_width_request(group: u16, width: usize) -> Ikev2CreateChildSaRekeyRequestBuild {
+    Ikev2CreateChildSaRekeyRequestBuild {
+        rekeyed_protocol_id: IKEV2_SECURITY_PROTOCOL_ID_ESP,
+        rekeyed_spi: vec![1, 2, 3, 4],
+        security_association: child_sa_pfs_payload_build(group),
+        nonce: Ikev2NoncePayloadBuild {
+            nonce: vec![0x11; 32],
+        },
+        key_exchange: Some(Ikev2KeyExchangePayloadBuild {
+            dh_group: group,
+            key_exchange_data: vec![0x22; width],
+        }),
+        traffic_selectors_initiator: ts_payload(),
+        traffic_selectors_responder: ts_payload(),
+    }
+}
+
+#[test]
+fn generic_ke_request_build_enforces_group_width() {
+    // RFC 7296 section 3.4: fixed group widths, including 96 octets for group 1.
+    for (group, width) in [(1, 96), (2, 128), (14, 256), (19, 64), (20, 96), (21, 132)] {
+        assert!(
+            build_create_child_sa_rekey_request_payloads(&ke_width_request(group, width)).is_ok()
+        );
+        for actual in [1, width - 1, width + 1] {
+            assert!(
+                matches!(
+                    build_create_child_sa_rekey_request_payloads(&ke_width_request(group, actual)),
+                    Err(error) if error.as_str() == "ike_auth_build_ke_value_invalid"
+                ),
+                "group {group}, width {actual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn generic_ke_response_build_enforces_group_width() {
+    for (group, width) in [(1, 96), (2, 128), (14, 256), (19, 64), (20, 96), (21, 132)] {
+        let request = ke_width_request(group, width);
+        let mut response = Ikev2CreateChildSaRekeyResponseBuild {
+            security_association: request.security_association,
+            nonce: request.nonce,
+            key_exchange: request.key_exchange,
+            traffic_selectors_initiator: request.traffic_selectors_initiator,
+            traffic_selectors_responder: request.traffic_selectors_responder,
+        };
+        assert!(build_create_child_sa_rekey_response_payloads(&response).is_ok());
+        for actual in [1, width - 1, width + 1] {
+            response.key_exchange = Some(Ikev2KeyExchangePayloadBuild {
+                dh_group: group,
+                key_exchange_data: vec![0x22; actual],
+            });
+            assert!(
+                matches!(
+                    build_create_child_sa_rekey_response_payloads(&response),
+                    Err(error) if error.as_str() == "ike_auth_build_ke_value_invalid"
+                ),
+                "group {group}, width {actual}"
+            );
+        }
+    }
 }

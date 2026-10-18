@@ -43,6 +43,13 @@ redact formatting. See [ADR 0033](../../docs/adr/0033-n1-mode-codecs.md).
 
 ## Message-ID synchronization primitives and pure rules
 
+CREATE_CHILD_SA builders and the dedicated-bearer and NWu opened-message
+boundaries validate KE public-value widths against the supplied group on build,
+request/response decode and response correlation. Group 1 retains its
+96-octet MODP encoding; the other supported MODP and ECP groups retain their
+fixed-width encodings. Agreement continues to validate the mathematical public
+value through the admitted crypto module.
+
 `message_id_sync` provides RFC 6311 support and synchronization Notify codecs.
 `Ikev2NotifyPayloadBuild::message_id_sync_supported()` builds the IKE_AUTH
 advertisement; `Ikev2IkeAuthCleartextPayloads::message_id_sync_supported()`

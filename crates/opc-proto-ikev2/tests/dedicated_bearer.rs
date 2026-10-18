@@ -1874,3 +1874,228 @@ fn specification_authored_opened_payload_fixtures_are_byte_exact() {
         &deletion[1..],
     ));
 }
+// RFC 7296 section 3.4 and the fixed-width ECP encodings: these widths are
+// independent of the implementation's public_value_len() table.
+const CREATE_KE_WIDTHS: [(u16, usize); 6] =
+    [(1, 96), (2, 128), (14, 256), (19, 64), (20, 96), (21, 132)];
+
+fn create_ke_sa(sa: &mut Ikev2SaPayloadBuild, group: u16) {
+    sa.proposals[0].transforms.push(Ikev2SaTransformBuild {
+        transform_type: TRANSFORM_TYPE_DH,
+        transform_id: group,
+        attributes: vec![],
+    });
+}
+
+fn create_ke(group: u16, width: usize) -> Ikev2KeyExchangePayloadBuild {
+    Ikev2KeyExchangePayloadBuild {
+        dh_group: group,
+        key_exchange_data: vec![0x42; width],
+    }
+}
+
+fn replace_create_ke_width(first: PayloadType, bytes: &[u8], width: usize) -> Vec<u8> {
+    let mut found = false;
+    let entries: Vec<_> = PayloadChain::new(first, bytes)
+        .iter()
+        .map(|raw| {
+            let raw = must_ok(raw);
+            let mut body = raw.body.to_vec();
+            if raw.payload_type == PayloadType::KeyExchange {
+                found = true;
+                body.truncate(4);
+                body.resize(4 + width, 0x42);
+            }
+            Ikev2IkeAuthPayloadBuild {
+                payload_type: raw.payload_type,
+                body,
+            }
+        })
+        .collect();
+    assert!(found);
+    must_ok(build_ike_auth_cleartext_payload_chain(&entries))
+        .1
+        .to_vec()
+}
+
+#[test]
+fn dedicated_ke_request_build_enforces_group_width() {
+    for (group, width) in CREATE_KE_WIDTHS {
+        let mut input = create_request_build();
+        create_ke_sa(&mut input.security_association, group);
+        input.key_exchange = Some(create_ke(group, width));
+        must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(&input));
+        for actual in [1, width - 1, width + 1] {
+            input.key_exchange = Some(create_ke(group, actual));
+            assert!(
+                matches!(
+                    build_ikev2_dedicated_bearer_create_child_sa_request(&input),
+                    Err(Ikev2DedicatedBearerExchangeError::Build(error))
+                        if error.as_str() == "ike_auth_build_ke_value_invalid"
+                ),
+                "group {group}, width {actual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dedicated_ke_response_build_enforces_group_width() {
+    for (group, width) in CREATE_KE_WIDTHS {
+        let mut input = create_response_build();
+        create_ke_sa(&mut input.security_association, group);
+        input.key_exchange = Some(create_ke(group, width));
+        must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
+            &input,
+        ));
+        for actual in [1, width - 1, width + 1] {
+            input.key_exchange = Some(create_ke(group, actual));
+            assert!(
+                matches!(
+                    build_ikev2_dedicated_bearer_create_child_sa_response(&input),
+                    Err(Ikev2DedicatedBearerExchangeError::Build(error))
+                        if error.as_str() == "ike_auth_build_ke_value_invalid"
+                ),
+                "group {group}, width {actual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dedicated_ke_request_decode_enforces_group_width() {
+    for (group, width) in CREATE_KE_WIDTHS {
+        let mut input = create_request_build();
+        create_ke_sa(&mut input.security_association, group);
+        input.key_exchange = Some(create_ke(group, width));
+        let wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(&input));
+        let header = request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 71);
+        must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
+            &header,
+            wire.first_payload(),
+            wire.bytes(),
+        ));
+        for actual in [1, width - 1, width + 1] {
+            let bytes = replace_create_ke_width(wire.first_payload(), wire.bytes(), actual);
+            assert!(
+                matches!(
+                    decode_ikev2_dedicated_bearer_create_child_sa_request(
+                        &header, wire.first_payload(), &bytes,
+                    ),
+                    Err(Ikev2DedicatedBearerExchangeError::Crypto(
+                        Ikev2SaInitCryptoError::MalformedKeyExchange {
+                            group: received, expected_len, actual_len,
+                        }
+                    )) if received.transform_id() == group && expected_len == width && actual_len == actual
+                ),
+                "group {group}, width {actual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dedicated_ke_response_decode_enforces_group_width() {
+    for (group, width) in CREATE_KE_WIDTHS {
+        let mut input = create_response_build();
+        create_ke_sa(&mut input.security_association, group);
+        input.key_exchange = Some(create_ke(group, width));
+        let wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
+            &input,
+        ));
+        let header = response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 71);
+        must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
+            &header,
+            wire.first_payload(),
+            wire.bytes(),
+        ));
+        for actual in [1, width - 1, width + 1] {
+            let bytes = replace_create_ke_width(wire.first_payload(), wire.bytes(), actual);
+            assert!(
+                matches!(
+                    decode_ikev2_dedicated_bearer_create_child_sa_response(
+                        &header, wire.first_payload(), &bytes,
+                    ),
+                    Err(Ikev2DedicatedBearerExchangeError::Crypto(
+                        Ikev2SaInitCryptoError::MalformedKeyExchange {
+                            group: received, expected_len, actual_len,
+                        }
+                    )) if received.transform_id() == group && expected_len == width && actual_len == actual
+                ),
+                "group {group}, width {actual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dedicated_ke_response_correlation_enforces_both_public_value_widths() {
+    for (group, width) in CREATE_KE_WIDTHS {
+        let mut input = create_request_build();
+        create_ke_sa(&mut input.security_association, group);
+        input.key_exchange = Some(create_ke(group, width));
+        let request_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(&input));
+        let request_header = request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 71);
+        let request = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
+            &request_header,
+            request_wire.first_payload(),
+            request_wire.bytes(),
+        ));
+        let mut input = create_response_build();
+        create_ke_sa(&mut input.security_association, group);
+        input.key_exchange = Some(create_ke(group, width));
+        let response_wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_response(
+            &input,
+        ));
+        let response_header = response_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 71);
+        let response = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_response(
+            &response_header,
+            response_wire.first_payload(),
+            response_wire.bytes(),
+        ));
+        must_ok(
+            validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+                &request_header,
+                &response_header,
+                &request,
+                &response,
+            ),
+        );
+        for actual in [1, width - 1, width + 1] {
+            let public = vec![0x42; actual];
+            let mut malformed = response.clone();
+            match &mut malformed {
+                Ikev2DedicatedBearerCreateChildSaResponse::Success {
+                    key_exchange: Some(ke),
+                    ..
+                } => ke.key_exchange_data = &public,
+                _ => panic!("missing response KE"),
+            }
+            assert_eq!(
+                validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+                    &request_header,
+                    &response_header,
+                    &request,
+                    &malformed,
+                ),
+                Err(Ikev2DedicatedBearerExchangeError::ResponseKeyExchangeMismatch),
+                "response group {group}, width {actual}",
+            );
+            let mut malformed = request.clone();
+            match &mut malformed.key_exchange {
+                Some(ke) => ke.key_exchange_data = &public,
+                None => panic!("missing request KE"),
+            }
+            assert_eq!(
+                validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
+                    &request_header,
+                    &response_header,
+                    &malformed,
+                    &response,
+                ),
+                Err(Ikev2DedicatedBearerExchangeError::ResponseKeyExchangeMismatch),
+                "request group {group}, width {actual}",
+            );
+        }
+    }
+}

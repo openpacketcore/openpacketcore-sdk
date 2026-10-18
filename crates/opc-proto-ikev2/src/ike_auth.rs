@@ -30,7 +30,10 @@ use crate::{
         Ikev2SaTransformBuild, Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
         Ikev2TransformAttributeValue,
     },
-    sa_init_crypto::{Ikev2PrfAlgorithm, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial},
+    sa_init_crypto::{
+        validate_peer_public_len, Ikev2DhGroup, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError,
+        Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
+    },
     validation::Ikev2ValidationProfile,
 };
 
@@ -2108,7 +2111,12 @@ fn validate_rekey_key_exchange_shape(
         (false, None) => Ok(()),
         (false, Some(_)) => Err(Ikev2IkeAuthBuildError::UnexpectedKeyExchange),
         (true, None) => Err(Ikev2IkeAuthBuildError::KeyExchangeRequired),
-        (true, Some(_)) if key_exchange_group_offered => Ok(()),
+        (true, Some(key_exchange)) if key_exchange_group_offered => {
+            let group = Ikev2DhGroup::from_transform_id(key_exchange.dh_group)
+                .map_err(Ikev2IkeAuthBuildError::KeyExchangeValueInvalid)?;
+            validate_peer_public_len(group, &key_exchange.key_exchange_data)
+                .map_err(Ikev2IkeAuthBuildError::KeyExchangeValueInvalid)
+        }
         (true, Some(_)) => Err(Ikev2IkeAuthBuildError::KeyExchangeDhGroupMismatch),
     }
 }
@@ -2499,6 +2507,9 @@ pub enum Ikev2IkeAuthBuildError {
     UnexpectedKeyExchange,
     /// CREATE_CHILD_SA KE used a group not offered by the SA proposal.
     KeyExchangeDhGroupMismatch,
+    /// CREATE_CHILD_SA KE used an unsupported group or a public value whose
+    /// width did not match its group (RFC 7296 section 3.4).
+    KeyExchangeValueInvalid(Ikev2SaInitCryptoError),
     /// Child SA response builder was missing responder SPI bytes.
     ChildSaResponderSpiMissing,
 }
@@ -2541,6 +2552,7 @@ impl Ikev2IkeAuthBuildError {
             Self::KeyExchangeRequired => "ike_auth_build_ke_required",
             Self::UnexpectedKeyExchange => "ike_auth_build_ke_unexpected",
             Self::KeyExchangeDhGroupMismatch => "ike_auth_build_ke_dh_group_mismatch",
+            Self::KeyExchangeValueInvalid(_) => "ike_auth_build_ke_value_invalid",
             Self::ChildSaResponderSpiMissing => "ike_auth_build_child_sa_responder_spi_missing",
         }
     }
@@ -2558,6 +2570,7 @@ impl Error for Ikev2IkeAuthBuildError {
             Self::SecurityAssociation(error) => Some(error),
             Self::Nonce(error) => Some(error),
             Self::KeyExchange(error) => Some(error),
+            Self::KeyExchangeValueInvalid(error) => Some(error),
             _ => None,
         }
     }
