@@ -76,10 +76,9 @@ fn review_cohort_resolution_retirement_case(grouped: bool) {
         0,
     )
     .unwrap();
-    lifecycle_tests::seed(&mut storage, history, at(100_000), None, true);
-    let complete = command(3, &pending, at(100_001), false);
-    let retire =
-        lifecycle_tests::maintenance(&storage, 4, retention_deadline(at(100_001)).unwrap());
+    lifecycle_tests::seed(&mut storage, history, at(79), None, true);
+    let complete = command(3, &pending, at(80), false);
+    let retire = lifecycle_tests::maintenance(&storage, 4, retention_deadline(at(80)).unwrap());
     let responses = if grouped {
         apply(&mut storage, &[complete, retire]).responses
     } else {
@@ -168,7 +167,7 @@ pub(in crate::consensus::native) fn full_epoch_pending_fixture(
         0,
     )
     .unwrap();
-    lifecycle_tests::seed(&mut storage, history, at(100_000), None, false);
+    lifecycle_tests::seed(&mut storage, history, at(79), None, false);
     storage
         .business
         .receipts
@@ -258,9 +257,8 @@ fn native_lease_deferral_grouped_retirement_validates_a_surviving_resolution() {
     let ordinal = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64;
     let (mut storage, pending) = full_epoch_pending_fixture(ordinal);
     let sequence = storage.business.frontiers.sequence;
-    let complete = command(3, &pending, at(100_001), false);
-    let retire =
-        lifecycle_tests::maintenance(&storage, 4, retention_deadline(at(100_001)).unwrap());
+    let complete = command(3, &pending, at(80), false);
+    let retire = lifecycle_tests::maintenance(&storage, 4, retention_deadline(at(80)).unwrap());
     let delivery = apply(&mut storage, &[complete, retire]);
     assert!(matches!(
         delivery.responses[0].result,
@@ -274,7 +272,7 @@ fn native_lease_deferral_grouped_retirement_validates_a_surviving_resolution() {
     let row = &storage.business.receipts[&pending.request_id()];
     assert_eq!(row.ordinal, ordinal);
     assert!(!row.lease_deferred());
-    assert_eq!(row.retained_until, retention_deadline(at(100_001)).unwrap());
+    assert_eq!(row.retained_until, retention_deadline(at(80)).unwrap());
     assert_eq!(
         storage.business.history().unwrap().reclaimed_entries(),
         crate::fenced_transition::FENCED_TRANSITION_V2_RECLAIM_BATCH as u64
@@ -302,8 +300,7 @@ fn native_lease_deferral_expired_resolution_rejects_changed_binding_and_impossib
             1 => row.payload_digest[0] ^= 1,
             2 => row.retained_until = retention_deadline(time(1)).unwrap(),
             3 => {
-                row.retained_until =
-                    crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap()
+                row.retained_until = crate::fenced_transition::fenced_transition_v2_max_timestamp()
             }
             _ => row.retained_until = retention_deadline(at(81)).unwrap(),
         }
@@ -317,14 +314,16 @@ fn native_lease_deferral_expired_resolution_rejects_changed_binding_and_impossib
 }
 
 #[test]
-fn native_lease_deferral_retirement_rejects_unresolved_removed_and_surviving_receipts() {
+fn native_lease_deferral_retirement_rejects_unexpired_removed_and_surviving_receipts() {
     for ordinal in [1, FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64] {
         let (storage, pending) = full_epoch_pending_fixture(ordinal);
-        let complete = command(3, &pending, at(100_001), false);
-        let retire =
-            lifecycle_tests::maintenance(&storage, 4, retention_deadline(at(100_001)).unwrap());
+        let complete = command(3, &pending, at(80), false);
+        let retire = lifecycle_tests::maintenance(&storage, 4, retention_deadline(at(80)).unwrap());
         let entries = [complete, retire];
         let mut delta = storage.business.prepare(&entries).unwrap();
+        // The synthetic tombstones have expired, but the pending binding
+        // has not. Reject both a removed witness and a surviving pending row.
+        delta.frontiers.logical_time = Some(at(81));
         if ordinal == 1 {
             assert!(!delta.receipts.contains_key(&pending.request_id()));
             // Keep the legal retirement frontier and exact deletion IDs, but
@@ -359,8 +358,8 @@ fn native_lease_deferral_retirement_rejects_unresolved_removed_and_surviving_rec
 }
 
 #[test]
-fn native_lease_deferral_status_boundary_is_profile_specific_before_and_after_activation() {
-    let marker = crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap();
+fn native_lease_deferral_status_boundary_matches_finite_retention_before_and_after_activation() {
+    let marker = crate::fenced_transition::fenced_transition_v2_max_timestamp();
     let boundary = Timestamp::from_offset_datetime(
         *marker.as_offset_datetime() - FENCED_TRANSITION_OUTCOME_RETENTION,
     );
@@ -397,18 +396,21 @@ fn native_lease_deferral_status_boundary_is_profile_specific_before_and_after_ac
             storage.business.frontiers.logical_time = Some(boundary);
             assert_eq!(
                 storage.business.status(&fresh).unwrap(),
-                if profile.defers_live_leases() {
-                    FencedTransitionV2Status::RetentionExhausted
-                } else {
-                    FencedTransitionV2Status::NotFound
-                }
+                FencedTransitionV2Status::NotFound
+            );
+            storage.business.frontiers.logical_time = Some(Timestamp::from_offset_datetime(
+                *boundary.as_offset_datetime() + time::Duration::nanoseconds(1),
+            ));
+            assert_eq!(
+                storage.business.status(&fresh).unwrap(),
+                FencedTransitionV2Status::RetentionExhausted
             );
         }
     }
 }
 
 #[test]
-fn native_lease_deferral_reserved_retention_boundary_preserves_pending_and_reports_exhaustion() {
+fn native_lease_deferral_retention_horizon_expires_pending_and_reports_fresh_exhaustion() {
     let (mut storage, pending) = pending_fixture();
     let fresh = FencedTransitionV2Request::new(
         pending.request_id().epoch(),
@@ -417,11 +419,12 @@ fn native_lease_deferral_reserved_retention_boundary_preserves_pending_and_repor
         pending.mutation().clone(),
     )
     .unwrap();
-    let marker = crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap();
+    let marker = crate::fenced_transition::fenced_transition_v2_max_timestamp();
     let now = Timestamp::from_offset_datetime(
-        *marker.as_offset_datetime() - FENCED_TRANSITION_OUTCOME_RETENTION,
+        *marker.as_offset_datetime() - FENCED_TRANSITION_OUTCOME_RETENTION
+            + time::Duration::nanoseconds(1),
     );
-    assert_eq!(retention_deadline(now), Some(marker));
+    assert_eq!(retention_deadline(now), None);
     let sequence = storage.business.frontiers.sequence;
     let watch = storage.business.frontiers.watch_sequence;
     let response = apply(&mut storage, &[command(3, &pending, now, false)])
@@ -429,7 +432,7 @@ fn native_lease_deferral_reserved_retention_boundary_preserves_pending_and_repor
         .remove(0);
     assert_eq!(
         response.result,
-        Err(StoreError::FencedTransitionOutcomeUnknown)
+        Err(StoreError::FencedTransitionRequestExpired)
     );
     let rejected = apply(&mut storage, &[command(4, &fresh, now, false)])
         .responses
@@ -451,9 +454,7 @@ fn native_lease_deferral_reserved_retention_boundary_preserves_pending_and_repor
     );
     assert_eq!(
         storage.business.status(&pending).unwrap(),
-        FencedTransitionV2Status::LeaseDeferred {
-            request_id: pending.request_id()
-        }
+        FencedTransitionV2Status::Expired
     );
     assert_eq!(
         storage.business.status(&fresh).unwrap(),
@@ -630,7 +631,7 @@ fn native_lease_deferral_preserves_the_original_profiles_terminal_contention() {
 }
 
 #[test]
-fn native_lease_deferral_pins_a_full_closed_epoch_and_completion_restores_retirement() {
+fn native_lease_deferral_full_closed_epoch_retires_after_completion_or_abandonment() {
     let (mut storage, pending) = pending_fixture();
     let mut row = (**storage
         .business
@@ -654,30 +655,29 @@ fn native_lease_deferral_pins_a_full_closed_epoch_and_completion_restores_retire
         0,
     )
     .unwrap();
-    lifecycle_tests::seed(&mut storage, history, at(100_000), None, true);
+    lifecycle_tests::seed(&mut storage, history, at(79), None, true);
     let mut horizon = storage.clone();
-    let maximum = crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap();
+    let maximum = crate::fenced_transition::fenced_transition_v2_max_timestamp();
     let entry = lifecycle_tests::maintenance(&horizon, 3, maximum);
     apply(&mut horizon, &[entry]);
-    assert_eq!(horizon.business.history().unwrap().retired_through(), None);
+    assert_eq!(
+        horizon.business.history().unwrap().retired_through(),
+        Some(FencedTransitionV2HistoryEpoch::new(1).unwrap())
+    );
     assert_eq!(
         horizon.business.status(&pending).unwrap(),
-        FencedTransitionV2Status::LeaseDeferred {
-            request_id: pending.request_id()
-        }
+        FencedTransitionV2Status::Retired
     );
     assert_eq!(
         apply(&mut horizon, &[command(4, &pending, maximum, false)]).responses[0].result,
-        Err(StoreError::FencedTransitionOutcomeUnknown)
+        Err(StoreError::FencedTransitionHistoryEpochRetired)
     );
-    assert!(horizon
+    assert!(!horizon
         .business
         .receipts
-        .get(&pending.request_id())
-        .unwrap()
-        .retained());
+        .contains_key(&pending.request_id()));
     drop(horizon);
-    let completed = apply(&mut storage, &[command(3, &pending, at(100_001), false)])
+    let completed = apply(&mut storage, &[command(3, &pending, at(80), false)])
         .responses
         .remove(0);
     assert!(matches!(
@@ -688,11 +688,10 @@ fn native_lease_deferral_pins_a_full_closed_epoch_and_completion_restores_retire
         storage.business.history().unwrap().bound_entries(),
         FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
     );
-    let before_retention = lifecycle_tests::maintenance(&storage, 4, at(100_002));
+    let before_retention = lifecycle_tests::maintenance(&storage, 4, at(81));
     apply(&mut storage, &[before_retention]);
     assert_eq!(storage.business.history().unwrap().retired_through(), None);
-    let retire =
-        lifecycle_tests::maintenance(&storage, 5, retention_deadline(at(100_001)).unwrap());
+    let retire = lifecycle_tests::maintenance(&storage, 5, retention_deadline(at(80)).unwrap());
     apply(&mut storage, &[retire]);
     assert_eq!(
         storage.business.history().unwrap().retired_through(),
@@ -706,4 +705,66 @@ fn native_lease_deferral_pins_a_full_closed_epoch_and_completion_restores_retire
         storage.business.status(&pending).unwrap(),
         FencedTransitionV2Status::Retired
     );
+}
+
+#[test]
+fn native_lease_deferral_retries_never_extend_expiry_or_reenable_execution() {
+    let (mut storage, pending) = pending_fixture();
+    let deadline = retention_deadline(time(2)).unwrap();
+    let sequence = storage.business.frontiers.sequence;
+    let watch = storage.business.frontiers.watch_sequence;
+    let next_fence = storage.business.frontiers.next_fence;
+    let original = storage.business.get(pending.lease().key()).unwrap();
+    for index in 3..19 {
+        assert_eq!(
+            apply(&mut storage, &[command(index, &pending, time(3), false)]).responses[0].result,
+            Err(StoreError::FencedTransitionLeaseDeferred)
+        );
+        assert_eq!(
+            storage.business.receipts[&pending.request_id()].retained_until,
+            deadline
+        );
+    }
+    let mut bytes = Vec::new();
+    storage.write_image(&mut bytes, [0xB5; 32], 18).unwrap();
+    let mut storage = NativeStorage::read_image(
+        &mut bytes.as_slice(),
+        [0xB5; 32],
+        18,
+        storage.business.identity,
+    )
+    .unwrap();
+    // The predecessor lease is already available. Expiry must still prevent
+    // both dispatch and void from resolving the old pending binding anew.
+    let responses = apply(
+        &mut storage,
+        &[
+            command(19, &pending, deadline, false),
+            void_command(20, &pending, deadline, false),
+            command(21, &pending, deadline, false),
+        ],
+    );
+    assert_eq!(responses.responses.len(), 3);
+    assert!(responses
+        .responses
+        .iter()
+        .all(|response| response.result == Err(StoreError::FencedTransitionRequestExpired)));
+    assert!(responses.notifications.is_empty());
+    assert_eq!(storage.business.frontiers.sequence, sequence);
+    assert_eq!(storage.business.frontiers.watch_sequence, watch);
+    assert_eq!(storage.business.frontiers.next_fence, next_fence);
+    assert_eq!(
+        storage.business.get(pending.lease().key()).unwrap(),
+        original
+    );
+    assert_eq!(storage.business.history().unwrap().bound_entries(), 2);
+    assert_eq!(
+        storage.business.status(&pending).unwrap(),
+        FencedTransitionV2Status::Expired
+    );
+    let row = &storage.business.receipts[&pending.request_id()];
+    assert_eq!(row.ordinal, 2);
+    assert_eq!(row.retained_until, deadline);
+    assert!(!row.retained());
+    storage.validate_image().unwrap();
 }

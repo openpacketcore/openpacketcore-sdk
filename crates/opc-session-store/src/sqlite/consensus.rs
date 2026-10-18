@@ -28040,16 +28040,7 @@ fn read_fenced_transition_v2_receipt_sync(
             }
             Some(response)
         }
-        (None, None) => {
-            if fenced_transition_profile_in_sync(conn, false)?.defers_live_leases()
-                && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
-                    retained_until_timestamp,
-                )
-            {
-                return Err(invalid_data("persisted deferred response is missing"));
-            }
-            None
-        }
+        (None, None) => None,
         _ => {
             return Err(invalid_data(
                 "persisted fenced transition V2 response is invalid",
@@ -28188,16 +28179,11 @@ fn compact_fenced_transition_v2_receipt_sync(
     request: &FencedTransitionV2Request,
     logical_time: Timestamp,
 ) -> io::Result<()> {
-    let deferrals = fenced_transition_profile_in_sync(conn, false)?.defers_live_leases();
-    let pending = crate::fenced_transition::fenced_transition_v2_deferral_retention()
-        .map_err(|_| invalid_data("fenced transition deferral retention invalid"))?;
     conn.execute(
-        "UPDATE consensus_fenced_transition_v2_receipts SET response_json = NULL, response_digest = NULL WHERE request_id = ?1 AND retained_until <= ?2 AND response_json IS NOT NULL AND (NOT ?3 OR retained_until <> ?4)",
+        "UPDATE consensus_fenced_transition_v2_receipts SET response_json = NULL, response_digest = NULL WHERE request_id = ?1 AND retained_until <= ?2 AND response_json IS NOT NULL",
         params![
             request.request_id().to_bytes().as_slice(),
             ops::format_rfc3339_normalized(logical_time),
-            deferrals,
-            ops::format_rfc3339_normalized(pending),
         ],
     )
     .map_err(db_error)?;
@@ -28232,6 +28218,9 @@ fn bind_or_resolve_fenced_transition_v2_receipt_sync(
     if !profile.defers_live_leases()
         || before.ordinal != ordinal
         || before.payload_digest != payload_digest
+        || response
+            .logical_time
+            .is_none_or(|now| now >= before.retained_until)
         || !before.response.as_ref().is_some_and(|prior| {
             matches!(prior.result, Err(StoreError::FencedTransitionLeaseDeferred))
                 && prior.logical_time <= response.logical_time
@@ -28420,12 +28409,7 @@ fn maintain_fenced_transition_v2_history_sync(
             };
             let maximum_retained_until = Timestamp::from_str(&maximum_retained_until)
                 .map_err(|_| invalid_data("fenced transition V2 retention is invalid"))?;
-            if maximum_retained_until > effective_logical_time
-                || (fenced_transition_profile_in_sync(conn, false)?.defers_live_leases()
-                    && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
-                        maximum_retained_until,
-                    ))
-            {
+            if maximum_retained_until > effective_logical_time {
                 return Ok(FencedTransitionV2MaintenanceResult::Noop);
             }
             let remaining: u64 = conn
@@ -28593,27 +28577,6 @@ fn validate_fenced_transition_receipt_with_profile(
     let logical_time = response.logical_time.ok_or_else(|| {
         invalid_data("persisted fenced transition receipt logical time is invalid")
     })?;
-    if matches!(
-        response.result,
-        Err(StoreError::FencedTransitionLeaseDeferred)
-    ) {
-        if !profile.defers_live_leases()
-            || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(retained_until)
-            || !fenced_transition_v2_timestamp_is_in_range(logical_time)
-        {
-            return Err(invalid_data(
-                "persisted fenced transition deferral is invalid",
-            ));
-        }
-        return Ok(());
-    }
-    if profile.defers_live_leases()
-        && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(retained_until)
-    {
-        return Err(invalid_data(
-            "persisted fenced transition deferral response is missing",
-        ));
-    }
     let expected_retained_until =
         crate::ttl::checked_session_deadline(logical_time, FENCED_TRANSITION_OUTCOME_RETENTION)
             .map_err(|_| {
@@ -28636,6 +28599,7 @@ fn validate_fenced_transition_receipt_with_profile(
             }
         }
         Err(StoreError::FencedTransitionVoided) if profile.permits_void() => {}
+        Err(StoreError::FencedTransitionLeaseDeferred) if profile.defers_live_leases() => {}
         Err(error) if is_persistable_fenced_transition_error(error) => {}
         Err(_) => {
             return Err(invalid_data(
@@ -29340,13 +29304,6 @@ pub(crate) fn validate_fenced_transition_v2_receipts_sync(
                 }
             }
             (None, None) => {
-                if fenced_transition_profile_in_sync(conn, false)?.defers_live_leases()
-                    && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
-                        retained_until_timestamp,
-                    )
-                {
-                    return Err(invalid_data("persisted deferred response is missing"));
-                }
                 if !fenced_transition_v2_timestamp_is_in_range(retained_until_timestamp) {
                     return Err(invalid_data(
                         "persisted fenced transition V2 retention is invalid",
@@ -29851,6 +29808,11 @@ pub(crate) fn read_fenced_transition_v2_status_sync(
         .map_err(|_| {
             StoreError::BackendUnavailable("fenced transition V2 status is unavailable".into())
         })?;
+        if receipt.response.is_none()
+            || machine.2.is_some_and(|time| receipt.retained_until <= time)
+        {
+            return Ok(FencedTransitionV2Status::Expired);
+        }
         if receipt.response.as_ref().is_some_and(|response| {
             matches!(
                 response.result,
@@ -29860,11 +29822,6 @@ pub(crate) fn read_fenced_transition_v2_status_sync(
             return Ok(FencedTransitionV2Status::LeaseDeferred {
                 request_id: request.request_id(),
             });
-        }
-        if receipt.response.is_none()
-            || machine.2.is_some_and(|time| receipt.retained_until <= time)
-        {
-            return Ok(FencedTransitionV2Status::Expired);
         }
         return match receipt.response.expect("checked above").result {
             Ok(SessionMutationOutcome::FencedTransition(outcome)) => {
@@ -29897,11 +29854,11 @@ pub(crate) fn read_fenced_transition_v2_status_sync(
 /// Report whether a fresh V2 request cannot bind its exact-result window at
 /// the persisted logical time. The fixed V2 timestamp profile is stricter
 /// than the optional local parser range, so status follows the same check as
-/// the unbound apply and follower-projection paths. The deferral profile also
-/// reserves its pending marker, which cannot retain a terminal result.
+/// the unbound apply and follower-projection paths. Every profile uses the same
+/// finite window for its first binding.
 fn fenced_transition_v2_retention_is_exhausted(
     logical_time: Option<Timestamp>,
-    profile: crate::FencedTransitionV2Profile,
+    _profile: crate::FencedTransitionV2Profile,
 ) -> bool {
     logical_time.is_some_and(|logical_time| {
         !fenced_transition_v2_timestamp_is_in_range(logical_time)
@@ -29909,13 +29866,7 @@ fn fenced_transition_v2_retention_is_exhausted(
                 logical_time,
                 FENCED_TRANSITION_OUTCOME_RETENTION,
             )
-            .is_ok_and(|until| {
-                fenced_transition_v2_timestamp_is_in_range(until)
-                    && (!profile.defers_live_leases()
-                        || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
-                            until,
-                        ))
-            })
+            .is_ok_and(fenced_transition_v2_timestamp_is_in_range)
     })
 }
 
@@ -30517,8 +30468,12 @@ fn apply_fenced_transition_v2_command_sync(
     }
     let profile = fenced_transition_profile_in_sync(tx, false)?;
     let mut deferred_ordinal = None;
+    let replay_time = machine
+        .2
+        .map_or(command.logical_time, |time| time.max(command.logical_time));
     if let Some(receipt) = read_fenced_transition_v2_receipt_sync(tx, storage_identity, request)? {
         if receipt.payload_digest == payload_digest
+            && receipt.retained_until > replay_time
             && receipt.response.as_ref().is_some_and(|response| {
                 matches!(
                     response.result,
@@ -30528,9 +30483,6 @@ fn apply_fenced_transition_v2_command_sync(
         {
             deferred_ordinal = Some(receipt.ordinal);
         } else {
-            let replay_time = machine
-                .2
-                .map_or(command.logical_time, |time| time.max(command.logical_time));
             let response = if receipt.payload_digest != payload_digest {
                 replay_conflict_response(
                     machine,
@@ -30602,19 +30554,11 @@ fn apply_fenced_transition_v2_command_sync(
     let logical_time = machine
         .2
         .map_or(command.logical_time, |time| time.max(command.logical_time));
-    let mut retained_until = match crate::ttl::checked_session_deadline(
+    let retained_until = match crate::ttl::checked_session_deadline(
         logical_time,
         FENCED_TRANSITION_OUTCOME_RETENTION,
     ) {
-        Ok(until)
-            if fenced_transition_v2_timestamp_is_in_range(until)
-                && (!profile.defers_live_leases()
-                    || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
-                        until,
-                    )) =>
-        {
-            until
-        }
+        Ok(until) if fenced_transition_v2_timestamp_is_in_range(until) => until,
         Ok(_) | Err(_) => {
             advance_fenced_replay_logical_time_sync(tx, storage_identity, logical_time, machine)?;
             return Ok(replay_conflict_response(
@@ -30682,8 +30626,6 @@ fn apply_fenced_transition_v2_command_sync(
                 ));
             }
             result = Err(StoreError::FencedTransitionLeaseDeferred);
-            retained_until = crate::fenced_transition::fenced_transition_v2_deferral_retention()
-                .map_err(|_| invalid_data("fenced transition deferral retention invalid"))?;
         }
         let response = SessionConsensusResponse {
             result,
@@ -30751,8 +30693,6 @@ fn apply_fenced_transition_v2_command_sync(
             ));
         }
         result = Err(StoreError::FencedTransitionLeaseDeferred);
-        retained_until = crate::fenced_transition::fenced_transition_v2_deferral_retention()
-            .map_err(|_| invalid_data("fenced transition deferral retention invalid"))?;
     }
     let response = SessionConsensusResponse {
         result,

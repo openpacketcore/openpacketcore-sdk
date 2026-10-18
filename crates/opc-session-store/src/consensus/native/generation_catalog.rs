@@ -1028,7 +1028,9 @@ impl Rows {
                     let resolving = validation::receipt_resolves_deferral(
                         old.row.facts.lease_deferred,
                         old.row.facts.response,
+                        old.row.facts.retained_until,
                         until,
+                        None,
                         &self.context.business.frontiers,
                         frontiers,
                     )?;
@@ -1038,7 +1040,12 @@ impl Rows {
                         return Err(invalid("native catalog deletion changes its exact binding"));
                     }
                     if resolving {
-                        ordinals.resolve_deferred(id.epoch().get(), ordinal, until)?;
+                        ordinals.resolve_deferred(
+                            id.epoch().get(),
+                            ordinal,
+                            old.row.facts.retained_until,
+                            until,
+                        )?;
                     }
                     ordinals.remove(id.epoch().get(), ordinal, until)?;
                     removed += 1;
@@ -1072,7 +1079,9 @@ impl Rows {
                 let resolving = validation::receipt_resolves_deferral(
                     old.row.facts.lease_deferred,
                     old.row.facts.response,
+                    old.row.facts.retained_until,
                     row.facts.retained_until,
+                    row.facts.response.map(|_| row.facts.lease_deferred),
                     &self.context.business.frontiers,
                     frontiers,
                 )?;
@@ -1082,8 +1091,10 @@ impl Rows {
                         && (row.facts.retained_until != old.row.facts.retained_until
                             || (row.content != old.row.content
                                 && !(old.row.facts.response.is_some()
-                                    && !old.row.facts.lease_deferred
-                                    && row.facts.response.is_none()))))
+                                    && row.facts.response.is_none()
+                                    && frontiers
+                                        .logical_time
+                                        .is_some_and(|now| now >= row.facts.retained_until)))))
                 {
                     return Err(invalid(
                         "native catalog receipt changes its immutable binding",
@@ -1093,6 +1104,7 @@ impl Rows {
                     ordinals.resolve_deferred(
                         id.epoch().get(),
                         row.facts.ordinal,
+                        old.row.facts.retained_until,
                         row.facts.retained_until,
                     )?;
                 }

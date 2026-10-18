@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted contract. Implementation validation is pending.
+Accepted.
 
 ## Decision
 
@@ -21,7 +21,8 @@ advance the application sequence or watch sequence. They are distinct from
 an unknown outcome: they conclusively report no business effect for that
 committed attempt while preserving the original request's ability to execute.
 
-An exact subsequent submission atomically rechecks the original expected
+An exact subsequent submission before the pending lifetime expires atomically
+rechecks the original expected
 fence and generation and the current lease. A renewed predecessor lease keeps
 the request deferred. A newer owner or changed generation produces the
 ordinary terminal fencing or conflict result. An available lease permits
@@ -32,26 +33,31 @@ acquires a lease or mutates a session.
 
 ## History and persistence
 
-The pending response uses codec error tag 27 and reserves
-`9999-12-31T23:59:59.999999999Z` as its retention marker. The marker and typed
-response must agree; a response-free pending marker is corrupt. The response
-retains the actual consensus time at which deferral first bound. Pending work
-never expires or compacts, even at the clock horizon. If terminal retention
-cannot be represented, execution preserves pending and returns unknown.
+The pending response uses codec error tag 27 and retains the consensus time
+at which deferral first bound. Its fixed lifetime is the existing 24-hour
+outcome-retention window from that first binding. Repeated refusals do not
+extend it, even when the predecessor keeps renewing its lease. Once consensus
+logical time reaches the deadline, status reports `Expired`; exact execution
+and void return `RequestExpired` without any lease, session, watch, sequence,
+or history-allocation effect. The expired response can compact to its ordinary
+identity tombstone. Expiry cannot re-enable the original request.
 
 Pending work may outlive epoch closure. Receipt lookup precedes active-epoch
-and capacity checks, so that exact request can finish while new work remains
-bounded by the existing history limits. Retirement cannot pass an epoch with
-pending work. Resolving it starts the ordinary 24-hour terminal retention
-window. Because completion can change retention out of ordinal order, the new
-profile uses the maximum retention across the epoch, with pending counted
-separately in the native index. Completion removes the pending pin; it cannot
-leave the maximum timestamp cached forever.
+and capacity checks, so an unexpired exact request can finish while new work
+remains bounded by the existing retained-history limits. A terminal resolution
+starts the ordinary 24-hour terminal retention window at resolution, replacing
+the pending response at the same ordinal. Because completion can change
+retention out of ordinal order, the new profile uses the maximum finite
+retention across the epoch. After that maximum expires, ordinary ordered
+maintenance retires and reclaims the epoch, including abandoned pending rows.
+This requires neither a sealed original request nor a surviving caller journal.
+Losing a worker or its storage therefore cannot turn the retained-history
+window into a lifetime limit on subsequent bindings.
 
 SQLite, native images, generation bases and deltas, cold receipt reads, and
 offline recovery retain and validate the selected profile. The one permitted
-retained-row replacement is exact pending-to-terminal with a nonregressing
-response time. Cold metadata includes the pending response's actual time and
+retained-row replacement is exact unexpired pending-to-terminal with a
+nonregressing response time before the original pending deadline. Cold metadata includes the pending response's actual time and
 checks it against the decoded response. A concurrent read can refresh that
 one terminal successor; it cannot refresh back to pending or repeatedly
 replace terminal receipts. No migration or alternate-format fallback exists.
@@ -61,8 +67,11 @@ deadline preserves its exact resolution time even after the response expires.
 Validation checks that time against the pending binding and the captured
 interval before evaluating retirement. A deletion in this profile carries
 its original before-row hash, full ID, ordinal and final retention deadline;
-replay validates that witness before removing the row. Remaining pending
-rows still block retirement. This deletion vocabulary is part of the profile
+replay validates that witness before removing the row. Unexpired pending
+rows still block retirement; expired pending rows retain their original
+deadline and retire without a fabricated resolution time. Captures require a
+deletion witness for every removal, including a row introduced and reclaimed
+within one capture interval. This deletion vocabulary is part of the profile
 digest, so crossing from an earlier experimental profile requires a fresh
 install and its stored profile is refused.
 
@@ -112,8 +121,11 @@ previous call's dispatch guard. An inherited row can resume after the same
 fresh status proof. Process exit releases the existing ownership lock;
 restart needs no new identity, manual cleanup, or journal repair. Abandoned
 pending work remains eligible for consensus void under the existing owned
-journal lifetime rules. Terminal receipts are released normally, making the
-bounded journal capacity reusable.
+journal lifetime rules. Inherited pending rows are immediately eligible for
+that sweep, so callers intending to continue them must resume before sweeping.
+If the journal is never reopened or is lost, store-side expiry independently
+closes the pending binding and lets history retire. Terminal and expired
+receipts are released normally, making bounded journal capacity reusable.
 
 ## Validation scope
 
@@ -121,7 +133,10 @@ The acceptance cases cover sixteen refusals without growth, one completion
 after store-clock expiry, caller restart, predecessor renewal and newer-owner
 races, an interrupted completion followed by unavailable or absent status,
 and repeated release and reuse. Additional tests cover wire correlation,
-profile isolation, pending retirement pins, grouped expiry and retirement,
-reclaimed resolution witnesses, cold persistence, and caller
-lifetime exclusion. These are synthetic SDK contracts; they establish no
+profile isolation, unexpired pending retirement guards, grouped expiry and
+retirement, reclaimed resolution witnesses, cold persistence, and caller
+lifetime exclusion. Both storage backends abandon a real pending row, fill all
+1,048,576 retained slots, reclaim without the caller journal, and admit binding
+1,048,577. Boundary tests verify that retries never renew the pending deadline
+and late execution or void cannot revive it. These are synthetic SDK contracts; they establish no
 deployment, live traffic, continuity or performance qualification.

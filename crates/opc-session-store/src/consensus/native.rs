@@ -1261,11 +1261,6 @@ impl NativeState {
                 return Ok(FencedTransitionV2Status::RequestConflict);
             }
             validate_receipt_frontier(receipt, &self.frontiers).map_err(|_| unavailable())?;
-            if receipt.lease_deferred() {
-                return Ok(FencedTransitionV2Status::LeaseDeferred {
-                    request_id: request.request_id(),
-                });
-            }
             if !receipt.retained()
                 || self
                     .frontiers
@@ -1273,6 +1268,11 @@ impl NativeState {
                     .is_some_and(|now| receipt.retained_until <= now)
             {
                 return Ok(FencedTransitionV2Status::Expired);
+            }
+            if receipt.lease_deferred() {
+                return Ok(FencedTransitionV2Status::LeaseDeferred {
+                    request_id: request.request_id(),
+                });
             }
             let response = receipt.response.as_ref().ok_or_else(unavailable)?;
             match &response.result {
@@ -1785,7 +1785,10 @@ impl NativeDelta<'_> {
         )?;
         let mut deferred = false;
         if let Some(receipt) = self.receipt(&request.request_id()) {
-            if receipt.payload_digest == digest && receipt.lease_deferred() {
+            if receipt.payload_digest == digest
+                && receipt.lease_deferred()
+                && receipt.retained_until > now
+            {
                 deferred = true;
             } else {
                 let response = if receipt.payload_digest != digest {
@@ -1822,13 +1825,7 @@ impl NativeDelta<'_> {
         if !deferred && history.bound_entries() >= FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
             return Ok(self.clock_response(now, index, StoreError::FencedTransitionHistoryFull));
         }
-        let Some(mut until) = retention_deadline(now).filter(|until| {
-            !self
-                .frontiers
-                .fenced_transition_profile
-                .defers_live_leases()
-                || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(*until)
-        }) else {
+        let Some(until) = retention_deadline(now) else {
             return Ok(self.clock_response(
                 now,
                 index,
@@ -1864,8 +1861,6 @@ impl NativeDelta<'_> {
                 ));
             }
             result = Err(StoreError::FencedTransitionLeaseDeferred);
-            until = crate::fenced_transition::fenced_transition_v2_deferral_retention()
-                .map_err(|_| invalid("native deferral retention invalid"))?;
         }
         if self.frontiers.sequence < COUNTER_MAX {
             self.frontiers.sequence += 1;
@@ -2093,6 +2088,9 @@ impl NativeDelta<'_> {
                 .defers_live_leases()
                 || !before.lease_deferred()
                 || before.payload_digest != payload_digest
+                || response
+                    .logical_time
+                    .is_none_or(|now| now >= before.retained_until)
                 || matches!(
                     response.result,
                     Err(StoreError::FencedTransitionLeaseDeferred)
@@ -2101,8 +2099,13 @@ impl NativeDelta<'_> {
                 return Err(invalid("native duplicate receipt binding"));
             }
             let ordinal = before.ordinal;
-            self.receipt_order
-                .resolve_deferred(request.request_id(), ordinal, until)?;
+            let before_until = before.retained_until;
+            self.receipt_order.resolve_deferred(
+                request.request_id(),
+                ordinal,
+                before_until,
+                until,
+            )?;
             self.receipts.insert(
                 request.request_id(),
                 NativeReceipt {
@@ -2168,15 +2171,8 @@ fn retention_deadline(now: Timestamp) -> Option<Timestamp> {
         })
 }
 
-fn retention_exhausted(now: Option<Timestamp>, profile: FencedTransitionV2Profile) -> bool {
-    now.is_some_and(|now| {
-        retention_deadline(now)
-            .filter(|until| {
-                !profile.defers_live_leases()
-                    || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(*until)
-            })
-            .is_none()
-    })
+fn retention_exhausted(now: Option<Timestamp>, _profile: FencedTransitionV2Profile) -> bool {
+    now.is_some_and(|now| retention_deadline(now).is_none())
 }
 
 fn replay_outcome(

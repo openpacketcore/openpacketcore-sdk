@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
+  `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
+  must handle both variants. The opt-in lease-deferral profile gives pending
+  bindings a fixed 24-hour lifetime from their first binding, allowing history
+  to retire even if the caller journal is lost. Its profile digest changes;
+  crossing the experimental profile change requires a fresh install. (#1334)
+
 - `opc-session-net`: the first fenced roster reconcile closes prepare and
   execute for the entire admission, including older handles and equal-fence
   readback. Providers must durably exclude the exact binding before signing

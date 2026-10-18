@@ -74,17 +74,11 @@ pub(super) fn validate_receipt(
         ));
     }
     validate_receipt_frontier(receipt, frontiers)?;
-    let deferred = receipt.lease_deferred();
-    if deferred
-        != (frontiers.fenced_transition_profile.defers_live_leases()
-            && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
-                receipt.retained_until,
-            ))
-    {
+    if receipt.lease_deferred() && !frontiers.fenced_transition_profile.defers_live_leases() {
         return Err(invalid("native image deferral profile or response differs"));
     }
     if let Some(response) = receipt.response_facts()? {
-        if !deferred && retention_deadline(response.logical_time) != Some(receipt.retained_until) {
+        if retention_deadline(response.logical_time) != Some(receipt.retained_until) {
             return Err(invalid("native image receipt retention differs"));
         }
     }
@@ -108,18 +102,25 @@ pub(super) fn validate_receipt(
 pub(super) fn receipt_resolves_deferral(
     was_deferred: bool,
     response: Option<generation::facts::Response>,
+    bound_until: Timestamp,
     until: Timestamp,
+    final_response_is_deferred: Option<bool>,
     before: &NativeFrontiers,
     after: &NativeFrontiers,
 ) -> io::Result<bool> {
     if !after.fenced_transition_profile.defers_live_leases()
         || !was_deferred
-        || crate::fenced_transition::fenced_transition_v2_is_deferral_retention(until)
+        || final_response_is_deferred == Some(true)
+        || (until == bound_until && final_response_is_deferred.is_none())
     {
+        // An expired pending response may compact or retire without ever
+        // executing. Its unchanged deadline is checked by the ordinary
+        // compaction and deletion predicates; it is not a resolution.
         return Ok(false);
     }
     let resolved_at = resident::receipt_response_time(until)?;
     if response.is_none_or(|response| resolved_at < response.logical_time)
+        || resolved_at >= bound_until
         || before.logical_time.is_some_and(|time| resolved_at < time)
         || after.logical_time.is_none_or(|time| resolved_at > time)
     {
@@ -131,8 +132,8 @@ pub(super) fn receipt_resolves_deferral(
 }
 
 // Removed rows no longer participate in the final ordinal index. Check their
-// retirement eligibility before dropping them, including the pending marker
-// at the timestamp horizon. Explicit asynchronous recovery keeps its existing
+// retirement eligibility before dropping them, including an abandoned pending
+// binding's fixed lifetime. Explicit asynchronous recovery keeps its existing
 // separate authority to retire an unavailable epoch.
 pub(super) fn validate_removed_retention(
     id: FencedTransitionV2RequestId,
@@ -147,9 +148,7 @@ pub(super) fn validate_removed_retention(
     }
     if id.epoch().get() > lifecycle::floor(before.history)
         && id.epoch().get() > after.async_fence_floor()
-        && (after.logical_time.is_none_or(|now| until > now)
-            || (after.fenced_transition_profile.defers_live_leases()
-                && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(until)))
+        && after.logical_time.is_none_or(|now| until > now)
     {
         return Err(invalid("native history removed an unexpired exact receipt"));
     }

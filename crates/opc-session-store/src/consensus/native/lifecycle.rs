@@ -257,7 +257,7 @@ fn planned_history(
     sequence: u64,
     command: &SessionConsensusCommand,
     now: Timestamp,
-    profile: FencedTransitionV2Profile,
+    _profile: FencedTransitionV2Profile,
     last: impl Fn(u64) -> Option<Timestamp>,
 ) -> io::Result<Result<Option<FencedTransitionV2HistoryState>, StoreError>> {
     let SessionMutationIntent::MaintainFencedTransitionV2History {
@@ -331,11 +331,7 @@ fn planned_history(
             FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
         };
         let last = last(epoch).ok_or_else(|| invalid("native retiring epoch is missing"))?;
-        if history.reclaim_epoch().is_none()
-            && (last > now
-                || (profile.defers_live_leases()
-                    && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(last)))
-        {
+        if history.reclaim_epoch().is_none() && last > now {
             None
         } else {
             let count = remaining.min(FENCED_TRANSITION_V2_RECLAIM_BATCH);

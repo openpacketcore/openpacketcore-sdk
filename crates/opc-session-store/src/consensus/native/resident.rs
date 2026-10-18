@@ -140,8 +140,8 @@ pub(super) struct ColdReceipt {
     content: [u8; 32],
     response_sequence: u64,
     response_raft_index: u64,
-    // A deferral uses the reserved retention marker, so its actual consensus
-    // time cannot be reconstructed by subtracting the terminal window.
+    // The optional first-binding time identifies a deferred cold response
+    // and binds the metadata to its decoded pending response.
     deferred_at: Option<Timestamp>,
 }
 
@@ -329,13 +329,7 @@ impl NativeReceipt {
             cold: None,
         };
         if let Some(response) = facts.facts.response {
-            if (facts.facts.lease_deferred
-                && !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
-                    row.retained_until,
-                ))
-                || (!facts.facts.lease_deferred
-                    && receipt_response_time(row.retained_until)? != response.logical_time)
-            {
+            if receipt_response_time(row.retained_until)? != response.logical_time {
                 return Err(invalid("native admitted receipt retention differs"));
             }
             row.cold = Some(ColdReceipt {

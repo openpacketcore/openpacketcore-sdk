@@ -1614,8 +1614,9 @@ fn native_deferral_capture_rejects_transient_removals_without_witnesses() {
         captured.business.receipts.len(),
         FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
     );
-    assert!(
-        captured.validate(&|| Ok(())).is_err(),
+    assert_eq!(
+        captured.validate(&|| Ok(())).unwrap_err().to_string(),
+        "native deferral capture removal lacks its deletion witness",
         "deferral removals require deletion witnesses even when both endpoint images are valid"
     );
 }

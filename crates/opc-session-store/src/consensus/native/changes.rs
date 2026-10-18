@@ -565,7 +565,8 @@ impl BusinessChanges {
         let mut tables = self.base.tables;
         Self::check_rows(0, &self.keys, &mut tables[0], check)?;
         Self::check_rows(1, &self.receipts, &mut tables[1], check)?;
-        let (deleted_before, deleted_transient) = self.check_deletions(&mut tables[1], check)?;
+        let (deleted_before, deleted_transient, witnessed_journal_removals) =
+            self.check_deletions(&mut tables[1], check)?;
         Self::check_rows(2, &self.generic, &mut tables[2], check)?;
         let start = self.base.tables[3].count;
         for row in &self.notifications {
@@ -607,6 +608,7 @@ impl BusinessChanges {
         let mut added = 0usize;
         let mut removed = deleted_before;
         let mut transient = deleted_transient;
+        let mut journal_removals = 0usize;
         for (id, change) in &self.receipts {
             check()?;
             if change.before.is_none()
@@ -636,6 +638,7 @@ impl BusinessChanges {
                 })?;
                 added += usize::from(change.before.is_none());
             } else {
+                journal_removals += 1;
                 lifecycle::removed_is_retired(
                     *id,
                     change.before.as_ref().map(|row| row.ordinal),
@@ -647,6 +650,20 @@ impl BusinessChanges {
                     transient += 1;
                 }
             }
+        }
+        // Deletion IDs are strictly ordered and unique, and each counted
+        // overlap was matched to this journal above. Equal counts therefore
+        // prove that every absent-after row has its exact deletion witness.
+        if self
+            .target
+            .frontiers
+            .fenced_transition_profile
+            .defers_live_leases()
+            && journal_removals != witnessed_journal_removals
+        {
+            return Err(invalid(
+                "native deferral capture removal lacks its deletion witness",
+            ));
         }
         // A create-then-reclaim entry has no endpoint row or checksum. Count
         // the actual detached inventory, independently of both certificates,
@@ -708,9 +725,10 @@ impl BusinessChanges {
         &self,
         table: &mut TableSummary,
         check: &impl Fn() -> io::Result<()>,
-    ) -> io::Result<(usize, usize)> {
+    ) -> io::Result<(usize, usize, usize)> {
         let mut removed = 0;
         let mut transient = 0;
+        let mut witnessed_journal_removals = 0;
         let mut previous = None;
         for deletion in &self.deletions {
             deletion.for_each(|id, ordinal, until, before, expected| {
@@ -740,6 +758,7 @@ impl BusinessChanges {
                     if change.after.is_some() || change.after_hash.is_some() {
                         return Err(invalid("native captured deletion overlaps a retained row"));
                     }
+                    witnessed_journal_removals += 1;
                     // The ordinary journal owns the original predecessor of
                     // a create/update-then-delete identity. Its latest before
                     // revision above is still independently fingerprinted.
@@ -768,7 +787,7 @@ impl BusinessChanges {
                 "native captured deletion count differs from its inventory",
             ));
         }
-        Ok((removed, transient))
+        Ok((removed, transient, witnessed_journal_removals))
     }
 }
 
@@ -1029,7 +1048,9 @@ impl Publication {
                 let resolving = validation::receipt_resolves_deferral(
                     before.lease_deferred(),
                     before.response_facts()?,
+                    before.retained_until,
                     row.retained_until,
+                    row.retained().then(|| row.lease_deferred()),
                     &predecessor.frontiers,
                     &frontiers,
                 )?;
@@ -1040,7 +1061,6 @@ impl Publication {
                             || (resident::RowFingerprint::row_fingerprint(row, 1, id)?
                                 != resident::RowFingerprint::row_fingerprint(&**before, 1, id)?
                                 && !(before.retained()
-                                    && !before.lease_deferred()
                                     && !row.retained()
                                     && frontiers
                                         .logical_time
@@ -1051,7 +1071,12 @@ impl Publication {
                     ));
                 }
                 if resolving {
-                    receipt_order.resolve_deferred(*id, row.ordinal, row.retained_until)?;
+                    receipt_order.resolve_deferred(
+                        *id,
+                        row.ordinal,
+                        before.retained_until,
+                        row.retained_until,
+                    )?;
                 }
             } else {
                 // One atomic apply can bind and then expire this ID. The
@@ -1078,7 +1103,9 @@ impl Publication {
                 let resolving = validation::receipt_resolves_deferral(
                     before.lease_deferred(),
                     before.response_facts()?,
+                    before.retained_until,
                     until,
+                    None,
                     &predecessor.frontiers,
                     &frontiers,
                 )?;
@@ -1086,7 +1113,7 @@ impl Publication {
                     return Err(invalid("native deletion differs from its exact binding"));
                 }
                 if resolving {
-                    receipt_order.resolve_deferred(id, ordinal, until)?;
+                    receipt_order.resolve_deferred(id, ordinal, before.retained_until, until)?;
                 }
                 receipt_order.remove_prefix(id, ordinal)?;
                 deleted += 1;

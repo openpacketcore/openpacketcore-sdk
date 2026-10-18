@@ -91,7 +91,7 @@ fn catalog_retirement_schedule(grouped: bool, separate_checkpoint: bool) {
         let mut cold = catalog.into_storage(&|| Ok(())).unwrap();
         hot.begin_changes().unwrap();
         let resolved_at = Timestamp::from_offset_datetime(
-            *time(0).as_offset_datetime() + time::Duration::seconds(100_001),
+            *time(0).as_offset_datetime() + time::Duration::seconds(80),
         );
         let entries = [
             command(3, &pending, resolved_at, false),
@@ -188,7 +188,7 @@ fn native_catalog_lease_deferral_retirement_rejects_false_deletion_witnesses() {
     let prefix = files.bytes();
     hot.begin_changes().unwrap();
     let resolved_at = Timestamp::from_offset_datetime(
-        *time(0).as_offset_datetime() + time::Duration::seconds(100_001),
+        *time(0).as_offset_datetime() + time::Duration::seconds(80),
     );
     let retire = crate::consensus::native::lifecycle_tests::maintenance(
         &hot,
@@ -238,10 +238,7 @@ fn native_catalog_lease_deferral_retirement_rejects_false_deletion_witnesses() {
         let mut wire = Wire::<Header>::read(&payload);
         let mut witness = witness;
         match kind {
-            0 => {
-                witness.1 =
-                    crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap()
-            }
+            0 => witness.1 = crate::fenced_transition::fenced_transition_v2_max_timestamp(),
             1 => {
                 witness.1 = Timestamp::from_offset_datetime(
                     *witness.1.as_offset_datetime() + time::Duration::nanoseconds(1),
@@ -369,8 +366,7 @@ fn native_catalog_lease_deferral_expired_resolution_rejects_rebound_corruption()
                 .unwrap()
             }
             4 => {
-                row.retained_until =
-                    crate::fenced_transition::fenced_transition_v2_deferral_retention().unwrap()
+                row.retained_until = crate::fenced_transition::fenced_transition_v2_max_timestamp()
             }
             _ => {
                 row.retained_until = Timestamp::from_offset_datetime(
@@ -540,5 +536,58 @@ fn native_catalog_lease_deferral_rejects_forged_resident_response_facts() {
                     )
                     .unwrap()
         );
+    }
+}
+
+#[test]
+fn native_catalog_lease_deferral_expiry_survives_cold_reads_and_compaction() {
+    let (mut hot, pending) = pending_fixture();
+    let deadline = retention_deadline(time(2)).unwrap();
+    let (mut files, catalog) = Files::new(&hot);
+    let mut cold = catalog.into_storage(&|| Ok(())).unwrap();
+    hot.begin_changes().unwrap();
+    let clock = crate::consensus::native::changes::tests::clock(3, deadline);
+    assert_eq!(
+        apply(&mut hot, std::slice::from_ref(&clock)).responses,
+        apply_cold_lifecycle(&mut cold, &[clock]).responses
+    );
+    // Status alone observes the original expiry before either response has
+    // compacted, including a response available only from the cold catalog.
+    for storage in [&hot, &cold] {
+        assert!(storage.business.receipts[&pending.request_id()].retained());
+        assert!(storage.business.receipts[&pending.request_id()].lease_deferred());
+        assert_eq!(
+            storage.business.status(&pending).unwrap(),
+            FencedTransitionV2Status::Expired
+        );
+    }
+    let sequence = hot.business.frontiers.sequence;
+    let watch = hot.business.frontiers.watch_sequence;
+    let entries = [
+        command(4, &pending, deadline, false),
+        crate::consensus::native::changes::tests::void_command(5, &pending, deadline, false),
+    ];
+    let actual = apply(&mut hot, &entries);
+    let restored = apply_cold_lifecycle(&mut cold, &entries);
+    assert_eq!(actual.responses, restored.responses);
+    assert!(actual
+        .responses
+        .iter()
+        .all(|response| response.result == Err(StoreError::FencedTransitionRequestExpired)));
+    assert!(actual.notifications.is_empty() && restored.notifications.is_empty());
+    let reopened = files.append(&mut hot, 19).into_storage(&|| Ok(())).unwrap();
+    for storage in [&hot, &cold, &reopened] {
+        assert_eq!(storage.business.frontiers.sequence, sequence);
+        assert_eq!(storage.business.frontiers.watch_sequence, watch);
+        assert_eq!(storage.business.history().unwrap().bound_entries(), 2);
+        assert_eq!(
+            storage.business.status(&pending).unwrap(),
+            FencedTransitionV2Status::Expired
+        );
+        let row = &storage.business.receipts[&pending.request_id()];
+        assert_eq!(row.ordinal, 2);
+        assert_eq!(row.retained_until, deadline);
+        assert!(!row.retained());
+        storage.validate_image().unwrap();
     }
 }

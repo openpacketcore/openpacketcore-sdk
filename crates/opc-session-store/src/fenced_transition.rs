@@ -478,7 +478,8 @@ pub enum FencedTransitionV2Profile {
     ///
     /// A deferral binds the original request once. Repeating that request
     /// consumes no further history entry, and a deferred binding survives
-    /// epoch rotation and restart until execution or void resolves it.
+    /// epoch rotation and restart until execution, void, or its fixed 24-hour
+    /// lifetime resolves it. Retries never extend that lifetime.
     /// This is a creation-time profile; crossing profiles requires a fresh install.
     V2WithLeaseDeferral,
 }
@@ -489,15 +490,15 @@ const FENCED_TRANSITION_V2_LEASE_DEFERRAL_PROFILE_DESCRIPTOR: &str = concat!(
     "response-codec=append-error-tag:27:FencedTransitionLeaseDeferred;",
     "status=append:LeaseDeferred(full-id:bytes56);wire-response=append:FencedTransitionV2Deferred(full-id:bytes56);",
     "deferral=exact-live-predecessor-lease|same-full-id-and-body|one-bound-ordinal;",
-    "pending-retention=9999-12-31T23:59:59.999999999Z;pending-never-expires;",
+    "pending-retention=24h-from-first-binding|retry-never-extends|expiry-is-terminal-no-effect;",
     "retry=atomic-original-fence-generation-and-lease-check|no-new-history-credit;",
-    "resolution=same-ordinal|replace-pending-once|fixed-retention-from-resolution;",
+    "resolution=same-ordinal|replace-unexpired-pending-once|fixed-retention-from-resolution;",
     "native-delta-deletion=exact-before-hash|full-id|postcard(ordinal:u64,final-retained-until:Timestamp);",
     "coalesced-resolution=validate-inverse-retention-time-within-interval-before-retirement;",
     "batch=ordered-singleton-sequences-and-digests-in-one-transaction;",
     "recertification=exact-current-scope-and-profile|independent-of-request-epoch-after-initialization;",
     "log-projection=validate-scope-and-profile|history-and-effects-decided-at-ordered-apply;",
-    "retirement=max-retention-across-epoch|pending-blocks-retirement;",
+    "retirement=max-finite-retention-across-epoch|expired-pending-needs-no-journal;",
     "void=pending-to-terminal-no-effect|original-authority-and-fence-checks;",
     "unknown=status-only|NotFound-and-Unavailable-never-authorize-retry"
 );
@@ -551,20 +552,14 @@ impl FencedTransitionV2Profile {
     }
 }
 
-/// The extended profile reserves one timestamp for a live deferred binding.
-/// It is never a terminal-result deadline in that profile.
-pub(crate) fn fenced_transition_v2_deferral_retention() -> Result<Timestamp, StoreError> {
-    time::OffsetDateTime::from_unix_timestamp(FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS)
-        .and_then(|time| time.replace_nanosecond(999_999_999))
-        .map(Timestamp::from_offset_datetime)
-        .map_err(|_| {
-            StoreError::BackendUnavailable("fenced transition deferral time invalid".into())
-        })
-}
-
-pub(crate) fn fenced_transition_v2_is_deferral_retention(until: Timestamp) -> bool {
-    until.as_offset_datetime().unix_timestamp() == FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS
-        && until.as_offset_datetime().nanosecond() == 999_999_999
+#[cfg(test)]
+pub(crate) fn fenced_transition_v2_max_timestamp() -> Timestamp {
+    Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS)
+            .unwrap()
+            .replace_nanosecond(999_999_999)
+            .unwrap(),
+    )
 }
 
 /// Derive the independent consensus identity of a void for one original ID.

@@ -1444,10 +1444,14 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// must be in
     /// `1..=FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX`.
     ///
-    /// For an exclusively owned journal, exact `NotFound` permits one void
-    /// attempt after a known return, cancellation, drop, or the original
-    /// in-memory deadline. An unknown attempt return continues to wait for
-    /// that deadline. Inherited and unregistered rows are immediately eligible.
+    /// For an exclusively owned journal, exact `NotFound` or `LeaseDeferred`
+    /// permits one void attempt after a known return, cancellation, drop, or
+    /// the original in-memory deadline. An unknown attempt return continues to wait for
+    /// that deadline. Inherited and unregistered rows are immediately eligible,
+    /// including inherited deferrals. To continue an inherited deferral, call
+    /// `resume_deferred_fenced_transition` before running this sweep; the sweep
+    /// can otherwise void it. Store-side pending expiry also makes abandoned
+    /// deferrals reclaimable when no caller journal survives.
     /// A reachable voter proves the separately admitted immutable void profile.
     /// Waiting callers and unsupported peers retain the row and are counted
     /// in the report. An unavailable or unknown void advances past the retained

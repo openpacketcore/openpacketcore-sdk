@@ -46,8 +46,7 @@ struct Epoch {
     first: u64,
     filled: usize,
     rows: ResidentVector<Option<IndexedReceipt>>,
-    deferred: usize,
-    terminal_max: Option<Timestamp>,
+    retention_max: Option<Timestamp>,
 }
 
 #[derive(Clone, Default)]
@@ -66,13 +65,8 @@ impl ReceiptOrder {
         Ok(order)
     }
 
-    fn retain(epoch: &mut Epoch, until: Timestamp, deferrals: bool) {
-        if deferrals && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(until)
-        {
-            epoch.deferred += 1;
-        } else {
-            epoch.terminal_max = Some(epoch.terminal_max.map_or(until, |old| old.max(until)));
-        }
+    fn retain(epoch: &mut Epoch, until: Timestamp) {
+        epoch.retention_max = Some(epoch.retention_max.map_or(until, |old| old.max(until)));
     }
 
     pub(super) fn retirement_deadline(&self, number: u64) -> Option<Timestamp> {
@@ -81,28 +75,23 @@ impl ReceiptOrder {
             .iter()
             .find(|epoch| epoch.epoch.get() == number)?;
         if self.deferrals {
-            if epoch.deferred != 0 {
-                crate::fenced_transition::fenced_transition_v2_deferral_retention().ok()
-            } else {
-                epoch.terminal_max
-            }
+            epoch.retention_max
         } else {
             self.last(number).map(|row| row.retained_until)
         }
     }
 
-    /// Only the one transition from deferred to terminal may replace a slot.
-    /// The maximum excludes pending markers, so resolving the final live
-    /// deferral restores retirement without a permanent maximum-time pin.
+    /// A caller-validated pending-to-terminal replacement may extend exactly
+    /// one slot. Both pending and terminal deadlines are finite; their maximum
+    /// lets an epoch retire even if the caller and its journal are lost.
     pub(super) fn resolve_deferred(
         &mut self,
         id: FencedTransitionV2RequestId,
         ordinal: u64,
+        before_until: Timestamp,
         until: Timestamp,
     ) -> io::Result<()> {
-        if !self.deferrals
-            || crate::fenced_transition::fenced_transition_v2_is_deferral_retention(until)
-        {
+        if !self.deferrals || until < before_until {
             return Err(invalid("native deferral resolution profile invalid"));
         }
         let epoch = self
@@ -120,19 +109,11 @@ impl ReceiptOrder {
             .copied()
             .flatten()
             .ok_or_else(|| invalid("native deferred ordinal absent"))?;
-        if previous.expand(epoch.epoch).id != id
-            || !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
-                previous.retained_until,
-            )
-        {
+        if previous.expand(epoch.epoch).id != id || previous.retained_until != before_until {
             return Err(invalid("native deferred identity differs"));
         }
-        epoch.deferred = epoch
-            .deferred
-            .checked_sub(1)
-            .ok_or_else(|| invalid("native deferred count invalid"))?;
         epoch.rows[index] = Some(IndexedReceipt::new(id, until));
-        Self::retain(epoch, until, true);
+        Self::retain(epoch, until);
         Ok(())
     }
 
@@ -158,8 +139,7 @@ impl ReceiptOrder {
                     first: range.first,
                     filled: 0,
                     rows: std::iter::repeat_n(None, range.count).collect(),
-                    deferred: 0,
-                    terminal_max: None,
+                    retention_max: None,
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -203,7 +183,7 @@ impl ReceiptOrder {
             return Err(invalid("native receipt retention order regressed"));
         }
         epoch.rows[index] = Some(IndexedReceipt::new(id, retained_until));
-        Self::retain(epoch, retained_until, self.deferrals);
+        Self::retain(epoch, retained_until);
         epoch.filled += 1;
         Ok(())
     }
@@ -273,8 +253,7 @@ impl ReceiptOrder {
                 first,
                 filled: 0,
                 rows: ResidentVector::new(),
-                deferred: 0,
-                terminal_max: None,
+                retention_max: None,
             });
         }
         let epoch = self
@@ -291,7 +270,7 @@ impl ReceiptOrder {
         epoch
             .rows
             .push_back(Some(IndexedReceipt::new(id, retained_until)));
-        Self::retain(epoch, retained_until, self.deferrals);
+        Self::retain(epoch, retained_until);
         epoch.filled += 1;
         Ok(())
     }
@@ -412,10 +391,9 @@ impl ReceiptOrder {
             if epoch.epoch.get() > recovered_floor
                 && epoch.epoch.get() > previous
                 && epoch.epoch.get() <= next
-                && (epoch.deferred != 0
-                    || self
-                        .retirement_deadline(epoch.epoch.get())
-                        .is_none_or(|until| now.is_none_or(|now| until > now)))
+                && self
+                    .retirement_deadline(epoch.epoch.get())
+                    .is_none_or(|until| now.is_none_or(|now| until > now))
             {
                 return Err(invalid("native history retired an unexpired exact epoch"));
             }
@@ -434,8 +412,7 @@ impl ReceiptOrder {
         let mut count = 0usize;
         let mut previous_until = None;
         for epoch in &self.epochs {
-            let mut deferred = 0usize;
-            let mut terminal_max = None;
+            let mut retention_max = None;
             for (index, slot) in epoch.rows.iter().enumerate() {
                 let ordered = slot
                     .as_ref()
@@ -456,27 +433,18 @@ impl ReceiptOrder {
                     ));
                 }
                 previous_until = Some(ordered.retained_until);
-                if self.deferrals
-                    && crate::fenced_transition::fenced_transition_v2_is_deferral_retention(
-                        ordered.retained_until,
-                    )
-                {
-                    deferred += 1;
-                } else {
-                    terminal_max = Some(
-                        terminal_max.map_or(ordered.retained_until, |old: Timestamp| {
-                            old.max(ordered.retained_until)
-                        }),
-                    );
-                }
+                retention_max = Some(
+                    retention_max.map_or(ordered.retained_until, |old: Timestamp| {
+                        old.max(ordered.retained_until)
+                    }),
+                );
                 count += 1;
             }
             // A retired prefix may retain its old maximum: every remaining
             // row is already closed, and removal never grants execution.
-            if deferred != epoch.deferred
-                || (epoch.first == 1 && terminal_max != epoch.terminal_max)
-                || terminal_max
-                    .is_some_and(|maximum| epoch.terminal_max.is_none_or(|bound| bound < maximum))
+            if (epoch.first == 1 && retention_max != epoch.retention_max)
+                || retention_max
+                    .is_some_and(|maximum| epoch.retention_max.is_none_or(|bound| bound < maximum))
             {
                 return Err(invalid(
                     "native receipt retention summary differs from full rows",

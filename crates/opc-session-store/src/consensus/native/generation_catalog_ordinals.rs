@@ -30,6 +30,7 @@ impl Ordinals {
         &mut self,
         number: u64,
         ordinal: u64,
+        before_until: Timestamp,
         until: Timestamp,
     ) -> io::Result<()> {
         let index = Self::index(ordinal)?;
@@ -39,10 +40,8 @@ impl Ordinals {
             .find(|epoch| epoch.epoch == number)
             .ok_or_else(|| invalid("native catalog deferred epoch absent"))?;
         if !self.deferrals
-            || crate::fenced_transition::fenced_transition_v2_is_deferral_retention(until)
-            || epoch.times.get(index).copied().flatten().is_none_or(|old| {
-                !crate::fenced_transition::fenced_transition_v2_is_deferral_retention(old)
-            })
+            || until < before_until
+            || epoch.times.get(index).copied().flatten() != Some(before_until)
         {
             return Err(invalid("native catalog deferred resolution is not exact"));
         }
@@ -206,10 +205,11 @@ impl Ordinals {
                 && epoch.epoch > lifecycle::floor(before)
                 && epoch.epoch <= lifecycle::floor(after)
                 && if self.deferrals {
-                    epoch.times.iter().flatten().any(|until| {
-                        crate::fenced_transition::fenced_transition_v2_is_deferral_retention(*until)
-                            || now.is_none_or(|now| *until > now)
-                    })
+                    epoch
+                        .times
+                        .iter()
+                        .flatten()
+                        .any(|until| now.is_none_or(|now| *until > now))
                 } else {
                     epoch.times[epoch.last].is_none_or(|until| now.is_none_or(|now| until > now))
                 }

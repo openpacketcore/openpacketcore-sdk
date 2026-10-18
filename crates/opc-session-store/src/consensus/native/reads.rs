@@ -259,7 +259,8 @@ fn resolves_deferred_revision(previous: &NativeReceipt, next: &NativeReceipt) ->
         && previous.ordinal == next.ordinal
         && previous.payload_digest == next.payload_digest
         && matches!((previous.response_facts(), next.response_facts()),
-            (Ok(Some(before)), Ok(Some(after))) if after.logical_time >= before.logical_time)
+            (Ok(Some(before)), Ok(Some(after))) if after.logical_time >= before.logical_time
+                && after.logical_time < previous.retained_until)
 }
 
 impl ReceiptCopies {
