@@ -505,16 +505,10 @@ async fn held_directory_validation(root: &Path, publication: bool) {
         .expect("arm exact-inode directory read hold");
         let namespace_owner = Arc::downgrade(&lease);
         let gate = Arc::clone(&core.snapshot_gate);
-        let snapshot_guard = LiveTerminalRecoveryHandoffGate {
+        let mut snapshot_guard = LiveTerminalRecoveryHandoffGate {
             snapshot_gate: Arc::clone(&gate),
             _guard: Arc::new(Arc::clone(&gate).lock_owned().await),
-            serving_guard: if publication {
-                Some(Arc::new(
-                    Arc::clone(&core.snapshot_serving_gate).lock_owned().await,
-                ))
-            } else {
-                None
-            },
+            serving_guard: None,
         };
         let owner = ConsensusStorageShutdownGuard::tracked();
         let shutdown = owner.observer().expect("shutdown observer");
@@ -523,7 +517,7 @@ async fn held_directory_validation(root: &Path, publication: bool) {
         let cancel = CancelSnapshotAttempt(Arc::clone(&attempt));
         let work = SnapshotIntegrityWork {
             _gate: SnapshotIntegrityGate::Mutation {
-                _guard: snapshot_guard,
+                _guard: snapshot_guard.clone(),
             },
             _lease: Arc::clone(&lease),
             attempt: Some(Arc::clone(&attempt)),
@@ -532,15 +526,19 @@ async fn held_directory_validation(root: &Path, publication: bool) {
         let validation_core = core.clone();
         let mut validation = tokio::spawn(async move {
             if publication {
+                // The builder adds serving exclusion after creating its
+                // mutation-only work bundle. The fence must retain this gate.
+                snapshot_guard.serving_guard = Some(Arc::new(
+                    Arc::clone(&validation_core.snapshot_serving_gate)
+                        .lock_owned()
+                        .await,
+                ));
                 let consumer = LiveTerminalRecoveryHandoffConsumer::from_live_snapshot_owner(
                     &validation_core,
                     &lease,
                 );
-                let SnapshotIntegrityGate::Mutation { _guard: guard } = &work._gate else {
-                    unreachable!("mutation ownership fixture")
-                };
                 let result = consumer
-                    .acquire_publication_connection(guard, work.clone())
+                    .acquire_publication_connection(&snapshot_guard, work.clone())
                     .await
                     .map(|_| 0);
                 drop(work);

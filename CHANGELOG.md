@@ -1152,12 +1152,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build triggers even when a maintenance build completes at the same cut,
   without polling snapshot contents on unrelated engine updates.
 
-- `opc-session-store`: let progressing consensus snapshots finish across stall
-  intervals, size opaque work budgets to their input, and preserve physical worker
-  ownership on expiry.
-  Keep pressure handoff targets only after engine acceptance, restore lease reuse
-  in a later term, wait for V2 status capacity within its deadline, and terminate
-  retries when the local engine stops (#1249).
+- `opc-session-store`: let progressing consensus snapshots finish across
+  stall intervals, size opaque work budgets to their input, and preserve
+  physical worker ownership on expiry. Keep pressure handoff targets only
+  after engine acceptance, restore lease reuse in a later term, wait for V2
+  status capacity within its deadline, and terminate retries when the local
+  engine stops (#1249).
 
 - `opc-consensus`: align every Openraft revision assertion and operator document
   with `6e90e9736cc6`, including the former-leader purge retry after replication

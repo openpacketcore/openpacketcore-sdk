@@ -300,8 +300,8 @@ mod tests {
         assert!(futures_util::poll!(&mut stalled).is_pending());
         assert!(!attempt.cancelled());
         attempt.progress().unwrap();
-        // Completing the large phase shortens its outstanding timer. A later
-        // stalled publication still gets only the ordinary stall grace.
+        // Completing the large phase shortens its outstanding timer back to
+        // the stall grace.
         assert!(futures_util::poll!(&mut stalled).is_pending());
         tokio::time::advance(Duration::from_millis(101)).await;
         stalled.await;
