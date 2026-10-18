@@ -1101,6 +1101,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Legacy and foreign runtime directories are preserved. CI invokes each
   fs-verity test command through the owner. Refs #1312.
 
+- `opc-session-store`: snapshot hash, footer, fsync and verification workers
+  retain their mutation gate, exact unpublished artifact, namespace lease and
+  shutdown owner after an attempt expires or its observer is cancelled. A retry
+  waits for physical completion, and shutdown retains its existing bounded
+  drain. Fixed verification keeps its input-sized allowance. (#1249)
+
 - `opc-proto-gtpu`: encode and decode the PDU Session Container Paging Policy
   Indicator in bits 7..5, as specified by TS 38.415. Correct the independent
   reference corpus, catalog and forwarding fixtures. `opc-gtpu-dataplane`

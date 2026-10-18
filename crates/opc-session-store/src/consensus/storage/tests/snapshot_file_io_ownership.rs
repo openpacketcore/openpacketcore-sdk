@@ -26,6 +26,14 @@ fn timed_out_snapshot_fsync_retains_file_work_ownership() {
     );
 }
 
+#[test]
+fn timed_out_snapshot_verification_retains_file_work_ownership() {
+    run_file_io_probe(
+        "timed_out_snapshot_verification_retains_file_work_ownership",
+        "verify",
+    );
+}
+
 fn run_file_io_probe(test: &str, operation: &str) {
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         tokio::runtime::Builder::new_current_thread()
@@ -76,7 +84,8 @@ fn run_file_io_probe(test: &str, operation: &str) {
     );
 }
 
-async fn held_file_work(root: &Path, operation: &str) {
+async fn held_file_work(root: &Path, phase: &str) {
+    let operation = if phase == "verify" { "read" } else { phase };
     let address =
         std::os::unix::net::SocketAddr::from_abstract_name(root.file_name().unwrap().as_bytes())
             .expect("abstract I/O progress address");
@@ -87,7 +96,13 @@ async fn held_file_work(root: &Path, operation: &str) {
         .expect("nonblocking listener");
     let listener = tokio::net::UnixListener::from_std(listener).expect("async I/O listener");
     let backend = SqliteSessionBackend::open(root.join("sessions.sqlite")).expect("probe backend");
-    for (index, fixed_profile) in (0..4).flat_map(|index| [false, true].map(|fixed| (index, fixed)))
+    let profiles: &[bool] = if phase == "verify" {
+        &[false]
+    } else {
+        &[false, true]
+    };
+    for (index, fixed_profile) in
+        (0..4).flat_map(|index| profiles.iter().map(move |&fixed| (index, fixed)))
     {
         let directory = root.join(format!("snapshots-{index}-{fixed_profile}"));
         let lease = acquire_snapshot_directory_lease(&backend, &directory)
@@ -105,9 +120,25 @@ async fn held_file_work(root: &Path, operation: &str) {
         .expect("compacted payload");
         raw = raw.refresh_identity().expect("compacted identity");
         let raw_path = directory.join(raw_name);
+        let (raw, sealed) = if phase == "verify" {
+            let sealed = seal_snapshot_database_in_place_sync(
+                raw,
+                false,
+                SnapshotIntegrityPolicy::FsVerity,
+                None,
+            )
+            .expect("prepare verification envelope before arming the hold");
+            (None, Some(sealed))
+        } else {
+            (Some(raw), None)
+        };
+        let held_descriptor = raw
+            .as_ref()
+            .map(|raw| raw.file().as_raw_fd())
+            .unwrap_or_else(|| sealed.as_ref().unwrap().0.as_raw_fd());
         std::fs::write(
             root.join("target"),
-            format!("{} {operation}\n", raw.file().as_raw_fd()),
+            format!("{held_descriptor} {operation}\n"),
         )
         .expect("arm exact-descriptor syscall hold");
         let gate = Arc::new(tokio::sync::Mutex::new(()));
@@ -130,15 +161,23 @@ async fn held_file_work(root: &Path, operation: &str) {
             _shutdown: Some(Arc::new(owner)),
         };
         let final_path = directory.join("snapshot.opc");
+        let verify_path = raw_path.clone();
         let mut seal = tokio::spawn(async move {
-            seal_snapshot_database_in_place(
-                raw,
-                &final_path,
-                fixed_profile,
-                SnapshotIntegrityPolicy::FsVerity,
-                Some(work),
-            )
-            .await
+            if let Some((file, pin, checksum, length, cleanup)) = sealed {
+                verify_built_snapshot(file, pin, verify_path, checksum, length, cleanup, work)
+                    .await
+                    .map(|_| ())
+            } else {
+                seal_snapshot_database_in_place(
+                    raw.expect("unsealed probe input"),
+                    &final_path,
+                    fixed_profile,
+                    SnapshotIntegrityPolicy::FsVerity,
+                    Some(work),
+                )
+                .await
+                .map(|_| ())
+            }
         });
         let (mut channel, _) = tokio::select! {
             biased;
