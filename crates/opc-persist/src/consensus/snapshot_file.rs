@@ -8,14 +8,13 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 /// Seekable snapshot staging file. Its path is never exposed in diagnostics.
 pub(crate) struct ConfigSnapshotFile {
-    file: tokio::fs::File,
+    file: super::snapshot_io::SnapshotIo,
     path: PathBuf,
     cleanup_on_drop: bool,
-    _owner: Option<std::sync::Arc<super::storage::SnapshotDirectoryOwner>>,
 }
 
 impl ConfigSnapshotFile {
@@ -44,10 +43,9 @@ impl ConfigSnapshotFile {
             options.mode(0o600);
             let file = options.open(&path)?;
             let staged = Self {
-                file: tokio::fs::File::from_std(file),
+                file: super::snapshot_io::SnapshotIo::new(file, owner),
                 path,
                 cleanup_on_drop: true,
-                _owner: owner,
             };
             #[cfg(unix)]
             std::fs::set_permissions(&staged.path, std::fs::Permissions::from_mode(0o600))?;
@@ -59,19 +57,16 @@ impl ConfigSnapshotFile {
 
     pub(crate) async fn open(path: PathBuf) -> io::Result<Self> {
         #[cfg(unix)]
-        let file = tokio::fs::File::from_std(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&path)?,
-        );
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
         #[cfg(not(unix))]
-        let file = tokio::fs::File::from_std(std::fs::OpenOptions::new().read(true).open(&path)?);
+        let file = std::fs::OpenOptions::new().read(true).open(&path)?;
         Ok(Self {
-            file,
+            file: super::snapshot_io::SnapshotIo::new(file, None),
             path,
             cleanup_on_drop: false,
-            _owner: None,
         })
     }
 
@@ -85,7 +80,6 @@ impl ConfigSnapshotFile {
     }
 
     pub(crate) async fn sync_all(&mut self) -> io::Result<()> {
-        self.file.flush().await?;
         self.file.sync_all().await
     }
 }

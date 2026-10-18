@@ -384,3 +384,89 @@ async fn unplanned_shutdown_releases_owned_handles_before_retained_reopen() {
         .await
         .expect("no shutdown-owned handle can retain the root after completion");
 }
+
+#[tokio::test]
+async fn standard_shutdown_discards_partial_snapshot_with_old_handles_alive() {
+    use opc_consensus::engine::raft::{InstallSnapshotRequest, InstallSnapshotResponse};
+    use opc_consensus::engine::{SnapshotMeta, Vote};
+    let directory = tempfile::tempdir().unwrap();
+    let local = ConsensusNodeId::new(1).unwrap();
+    let source = ConsensusNodeId::new(2).unwrap();
+    let identity = opc_consensus::ConsensusIdentity::new(
+        opc_consensus::ConsensusClusterId::new("standard-partial-shutdown").unwrap(),
+        opc_consensus::ConsensusConfigurationId::from_bytes([0x46; 32]),
+        opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap(),
+    );
+    let topology =
+        ConfigConsensusTopology::try_new(identity, local, BTreeSet::from([local])).unwrap();
+    let backend = SqliteBackend::in_memory_for_test().await.unwrap();
+    let snapshots = directory.path().join("snapshots");
+    let store = ConsensusConfigStore::open(
+        topology.clone(),
+        backend.clone(),
+        &snapshots,
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    let rpc = InstallSnapshotRequest::<ConfigRaftTypeConfig> {
+        vote: Vote::new_committed(1, source),
+        meta: SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "unfinished-standard-transfer".into(),
+        },
+        offset: 0,
+        data: b"partial snapshot".to_vec(),
+        done: false,
+    };
+    let request = ConsensusWireRequest::try_new(
+        identity,
+        source,
+        ConsensusRpcFamily::InstallSnapshot,
+        encode_config_wire(&rpc).unwrap(),
+    )
+    .unwrap();
+    let response = store
+        .inner
+        .raft_handler
+        .handle(source, request.clone())
+        .await;
+    let result: Result<
+        InstallSnapshotResponse<ConsensusNodeId>,
+        RaftError<ConsensusNodeId, opc_consensus::engine::error::InstallSnapshotError>,
+    > = decode_config_wire(&response.result.unwrap()).unwrap();
+    result.unwrap();
+    let partials = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "part")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        partials.len(),
+        1,
+        "one unfinished chunk owns one partial file"
+    );
+    tokio::time::timeout(Duration::from_secs(10), store.shutdown())
+        .await
+        .expect("shutdown must release its partial transfer within the existing budget")
+        .expect("shutdown must finish while old handles stay alive");
+    assert!(
+        !partials[0].exists(),
+        "shutdown removes the interrupted transfer"
+    );
+    assert!(store
+        .inner
+        .raft_handler
+        .handle(source, request)
+        .await
+        .result
+        .is_err());
+    let reopened = ConsensusConfigStore::open(topology, backend, &snapshots, BTreeMap::new())
+        .await
+        .expect("restart must not require dropping old public store handles");
+    reopened.shutdown().await.unwrap();
+}

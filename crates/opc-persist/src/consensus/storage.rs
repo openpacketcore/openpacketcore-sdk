@@ -154,7 +154,7 @@ impl StagingArtifact {
         path: PathBuf,
         sqlite_sidecars: bool,
         owner: Arc<SnapshotDirectoryOwner>,
-    ) -> io::Result<(tokio::fs::File, Self)> {
+    ) -> io::Result<(super::snapshot_io::SnapshotIo, Self)> {
         Self::create_with_hook(
             path,
             sqlite_sidecars,
@@ -170,7 +170,7 @@ impl StagingArtifact {
         sqlite_sidecars: bool,
         owner: Arc<SnapshotDirectoryOwner>,
         #[cfg(test)] before_create: Option<Box<dyn FnOnce() + Send>>,
-    ) -> io::Result<(tokio::fs::File, Self)> {
+    ) -> io::Result<(super::snapshot_io::SnapshotIo, Self)> {
         // Opening a file can outlive cancellation of its async caller. The
         // blocking task must own both cleanup and admission before it opens.
         let worker = tokio::task::spawn_blocking(move || {
@@ -190,7 +190,10 @@ impl StagingArtifact {
             options.mode(0o600);
             let file = options.open(&cleanup.path)?;
             cleanup.armed = true;
-            Ok((tokio::fs::File::from_std(file), cleanup))
+            Ok((
+                super::snapshot_io::SnapshotIo::new(file, cleanup._owner.clone()),
+                cleanup,
+            ))
         });
         tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, worker)
             .await
@@ -595,9 +598,9 @@ async fn stage_legacy_recovery_snapshot(
         return Err(ConfigConsensusStorageError::InvalidIdentity);
     }
     let staged_path = snapshot_dir.join(format!("approved-legacy-{}.sqlite", uuid::Uuid::new_v4()));
-    let mut input = tokio::fs::File::from_std(source_file);
+    let mut input = super::snapshot_io::SnapshotIo::new(source_file, Some(owner.clone()));
     let (mut output, mut staged_cleanup) =
-        StagingArtifact::create(staged_path.clone(), true, owner)
+        StagingArtifact::create(staged_path.clone(), true, owner.clone())
             .await
             .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?;
     let mut hasher = Sha256::new();
@@ -651,6 +654,7 @@ async fn stage_legacy_recovery_snapshot(
     Ok(sqlite::StagedLegacyRecovery {
         path: staged_path,
         approval,
+        _owner: owner,
     })
 }
 
@@ -1789,7 +1793,8 @@ async fn envelope_snapshot_database(
     output: &Path,
     owner: Arc<SnapshotDirectoryOwner>,
 ) -> io::Result<([u8; 32], u64, StagingArtifact)> {
-    let mut source = tokio::fs::File::from_std(open_read_nofollow(raw)?);
+    let mut source =
+        super::snapshot_io::SnapshotIo::new(open_read_nofollow(raw)?, Some(owner.clone()));
     let metadata = source.metadata().await?;
     if metadata.len() == 0 || metadata.len() > SNAPSHOT_MAX_BYTES {
         return Err(sqlite::invalid_data(
@@ -1988,7 +1993,8 @@ async fn extract_snapshot_database(
     payload_length: u64,
     owner: Arc<SnapshotDirectoryOwner>,
 ) -> io::Result<StagingArtifact> {
-    let mut source = tokio::fs::File::from_std(open_read_nofollow(envelope)?);
+    let mut source =
+        super::snapshot_io::SnapshotIo::new(open_read_nofollow(envelope)?, Some(owner.clone()));
     let (mut output, cleanup) =
         StagingArtifact::create(destination.to_path_buf(), true, owner).await?;
     let mut remaining = payload_length;
@@ -2017,7 +2023,8 @@ async fn copy_and_promote(
     final_path: &Path,
     owner: Arc<SnapshotDirectoryOwner>,
 ) -> io::Result<StagingArtifact> {
-    let mut input = tokio::fs::File::from_std(open_read_nofollow(source)?);
+    let mut input =
+        super::snapshot_io::SnapshotIo::new(open_read_nofollow(source)?, Some(owner.clone()));
     let (mut output, mut cleanup) =
         StagingArtifact::create(staging.to_path_buf(), false, owner.clone()).await?;
     tokio::io::copy(&mut input, &mut output).await?;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use opc_consensus::engine::error::{
     InstallSnapshotError, PayloadTooLarge, RPCError, RaftError, RemoteError, Timeout, Unreachable,
 };
+use opc_consensus::engine::network::snapshot_transport::{Chunked, SnapshotTransport, Streaming};
 use opc_consensus::engine::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -307,21 +308,70 @@ where
 #[derive(Clone)]
 pub(crate) struct ConfigRaftRpcHandler {
     raft: ConfigRaft,
+    incoming: Arc<tokio::sync::Mutex<Option<Streaming<ConfigRaftTypeConfig>>>>,
+    snapshot_shutdown: tokio::sync::watch::Sender<bool>,
     identity: ConsensusIdentity,
     local_node_id: ConsensusNodeId,
 }
 
 impl ConfigRaftRpcHandler {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         raft: ConfigRaft,
         identity: ConsensusIdentity,
         local_node_id: ConsensusNodeId,
     ) -> Self {
         Self {
             raft,
+            incoming: Arc::new(tokio::sync::Mutex::new(None)),
+            snapshot_shutdown: tokio::sync::watch::channel(false).0,
             identity,
             local_node_id,
         }
+    }
+
+    pub(crate) fn stop_snapshot_reception(&self) {
+        self.snapshot_shutdown.send_replace(true);
+    }
+
+    pub(crate) async fn discard_snapshot_receiver(&self) {
+        // Reception is fenced and cancelled before joining the engine. The
+        // store owns this slot, so retained Raft/public handles cannot keep a
+        // partial transfer's directory admission in the shutdown drain.
+        drop(self.incoming.lock().await.take());
+    }
+
+    async fn receive_snapshot_chunk(
+        &self,
+        rpc: InstallSnapshotRequest<ConfigRaftTypeConfig>,
+    ) -> Result<
+        InstallSnapshotResponse<ConsensusNodeId>,
+        Box<RaftError<ConsensusNodeId, InstallSnapshotError>>,
+    > {
+        let vote = rpc.vote;
+        let current_vote = self
+            .raft
+            .with_raft_state(|state| *state.vote_ref())
+            .await
+            .map_err(|error| Box::new(RaftError::Fatal(error)))?;
+        if vote < current_vote {
+            return Ok(InstallSnapshotResponse { vote: current_vote });
+        }
+        let finished = {
+            let mut incoming = self.incoming.lock().await;
+            // Reuse the engine's chunk protocol with a store-owned lifetime.
+            Chunked::receive_snapshot(&mut *incoming, &self.raft, rpc)
+                .await
+                .map_err(Box::new)?
+        };
+        if let Some(snapshot) = finished {
+            return Ok(self
+                .raft
+                .install_full_snapshot(vote, snapshot)
+                .await
+                .map_err(|error| Box::new(RaftError::Fatal(error)))?
+                .into());
+        }
+        Ok(InstallSnapshotResponse { vote: current_vote })
     }
 }
 
@@ -394,7 +444,14 @@ impl ConsensusRpcHandler for ConfigRaftRpcHandler {
                     Ok(rpc) => rpc,
                     Err(error) => return rejected_response(error),
                 };
-                encode_engine_result(&self.raft.install_snapshot(rpc).await)
+                let mut shutdown = self.snapshot_shutdown.subscribe();
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait_for(|started| *started) => {
+                        return rejected_response(ConsensusPeerError::Unavailable);
+                    }
+                    result = self.receive_snapshot_chunk(rpc) => encode_engine_result(&result),
+                }
             }
             _ => return rejected_response(ConsensusPeerError::Rejected),
         };

@@ -615,3 +615,313 @@ async fn refused_staging_creation_preserves_an_existing_file() {
         b"existing owner"
     );
 }
+
+#[cfg(unix)]
+fn queued_snapshot_write_retains_owner(runtime_drop: bool, staging: bool) {
+    use std::io::{Read as _, Seek as _};
+    const BYTES: &[u8] = b"write queued before owner cancellation";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("incoming-queued.part");
+    let old_runtime = Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let (task, blocker, resume, mut receiver, mut observed) = old_runtime.block_on(async {
+        let dir = Arc::new(std::fs::File::open(directory.path()).unwrap());
+        let lock =
+            crate::local_sqlite::AdmissionFileLock::acquire(dir.try_clone().unwrap()).unwrap();
+        let (sender, receiver) = tokio::sync::watch::channel(());
+        let owner = Arc::new(SnapshotDirectoryOwner::new(dir, Arc::new(lock), sender));
+        let (file, cleanup): (Box<dyn tokio::io::AsyncWrite + Unpin + Send>, _) = if staging {
+            let (file, cleanup) = StagingArtifact::create(path.clone(), false, owner)
+                .await
+                .unwrap();
+            (Box::new(file), Some(cleanup))
+        } else {
+            (
+                Box::new(
+                    ConfigSnapshotFile::create_owned(path.clone(), owner)
+                        .await
+                        .unwrap(),
+                ),
+                None,
+            )
+        };
+        let observed = std::fs::File::open(&path).unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            paused
+                .recv_timeout(WATCHDOG)
+                .expect("release the sole blocking worker");
+        });
+        tokio::time::timeout(WATCHDOG, started)
+            .await
+            .unwrap()
+            .unwrap();
+        let (queued, queued_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            let mut file = file;
+            file.write_all(BYTES).await.unwrap();
+            queued.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(WATCHDOG, queued_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.metadata().unwrap().len(),
+            0,
+            "physical write is still queued"
+        );
+        (task, blocker, resume, receiver, observed)
+    });
+    let next_runtime = if runtime_drop {
+        old_runtime.shutdown_background();
+        runtime()
+    } else {
+        task.abort();
+        old_runtime
+    };
+    next_runtime.block_on(async {
+        assert!(tokio::time::timeout(WATCHDOG, task)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
+    });
+    let closed_while_queued = receiver.has_changed().is_err();
+    let admitted_while_queued = crate::local_sqlite::AdmissionFileLock::acquire(
+        std::fs::File::open(directory.path()).unwrap(),
+    )
+    .is_ok();
+    assert_eq!(
+        observed.metadata().unwrap().len(),
+        0,
+        "write remains causally blocked"
+    );
+    resume.send(()).unwrap();
+    next_runtime.block_on(async {
+        tokio::time::timeout(WATCHDOG, blocker)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(WATCHDOG, async {
+            while receiver.changed().await.is_ok() {}
+        })
+        .await
+        .unwrap();
+    });
+    // Tokio's original queued write also executes after owner release. Wait for
+    // it before the RED assertion so the failed test leaves no blocked worker.
+    let deadline = std::time::Instant::now() + WATCHDOG;
+    while observed.metadata().unwrap().len() == 0 && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    observed.rewind().unwrap();
+    let mut bytes = Vec::new();
+    observed.read_to_end(&mut bytes).unwrap();
+    assert_eq!(
+        bytes, BYTES,
+        "the queued physical write completed after cancellation"
+    );
+    assert!(!path.exists(), "cancelled unpublished artifact is removed");
+    assert!(crate::local_sqlite::AdmissionFileLock::acquire(
+        std::fs::File::open(directory.path()).unwrap()
+    )
+    .is_ok());
+    assert!(
+        !closed_while_queued,
+        "shutdown accounting must retain queued file work"
+    );
+    assert!(
+        !admitted_while_queued,
+        "queued file work must retain directory admission"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_snapshot_receiver_write_retains_owner_after_task_abort() {
+    queued_snapshot_write_retains_owner(false, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_snapshot_receiver_write_retains_owner_after_runtime_drop() {
+    queued_snapshot_write_retains_owner(true, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_snapshot_staging_write_retains_owner_after_task_abort() {
+    queued_snapshot_write_retains_owner(false, true);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_snapshot_staging_write_retains_owner_after_runtime_drop() {
+    queued_snapshot_write_retains_owner(true, true);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_snapshot_staging_file_operations_retain_owner_after_cancellation() {
+    use std::future::Future as _;
+    use std::task::Poll;
+    for runtime_drop in [false, true] {
+        for operation in ["sync", "metadata", "permissions"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("staged-operation.part");
+            let old_runtime = Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            let (task, blocker, resume, mut receiver) = old_runtime.block_on(async {
+                let dir = Arc::new(std::fs::File::open(directory.path()).unwrap());
+                let lock =
+                    crate::local_sqlite::AdmissionFileLock::acquire(dir.try_clone().unwrap())
+                        .unwrap();
+                let (sender, receiver) = tokio::sync::watch::channel(());
+                let owner = Arc::new(SnapshotDirectoryOwner::new(dir, Arc::new(lock), sender));
+                let (mut file, cleanup) = StagingArtifact::create(path.clone(), false, owner)
+                    .await
+                    .unwrap();
+                let permissions = std::fs::metadata(&path).unwrap().permissions();
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let (resume, paused) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    paused
+                        .recv_timeout(WATCHDOG)
+                        .expect("release the sole blocking worker");
+                });
+                tokio::time::timeout(WATCHDOG, started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (queued, queued_rx) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(async move {
+                    let _cleanup = cleanup;
+                    let mut work = Box::pin(async {
+                        match operation {
+                            "sync" => file.sync_all().await,
+                            "metadata" => file.metadata().await.map(|_| ()),
+                            "permissions" => file.set_permissions(permissions).await,
+                            _ => unreachable!(),
+                        }
+                    });
+                    std::future::poll_fn(|cx| {
+                        assert!(
+                            work.as_mut().poll(cx).is_pending(),
+                            "operation must queue behind the blocker"
+                        );
+                        Poll::Ready(())
+                    })
+                    .await;
+                    queued.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                });
+                tokio::time::timeout(WATCHDOG, queued_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (task, blocker, resume, receiver)
+            });
+            let next_runtime = if runtime_drop {
+                old_runtime.shutdown_background();
+                runtime()
+            } else {
+                task.abort();
+                old_runtime
+            };
+            next_runtime.block_on(async {
+                assert!(tokio::time::timeout(WATCHDOG, task)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled());
+            });
+            let closed_while_queued = receiver.has_changed().is_err();
+            let admitted_while_queued = crate::local_sqlite::AdmissionFileLock::acquire(
+                std::fs::File::open(directory.path()).unwrap(),
+            )
+            .is_ok();
+            resume.send(()).unwrap();
+            next_runtime.block_on(async {
+                tokio::time::timeout(WATCHDOG, blocker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tokio::time::timeout(WATCHDOG, async {
+                    while receiver.changed().await.is_ok() {}
+                })
+                .await
+                .unwrap();
+            });
+            assert!(!path.exists());
+            assert!(
+                !closed_while_queued,
+                "queued {operation} must remain in the shutdown drain"
+            );
+            assert!(
+                !admitted_while_queued,
+                "queued {operation} must retain directory admission"
+            );
+            assert!(crate::local_sqlite::AdmissionFileLock::acquire(
+                std::fs::File::open(directory.path()).unwrap()
+            )
+            .is_ok());
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn staged_legacy_cleanup_retains_its_own_directory_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = Arc::new(std::fs::File::open(directory.path()).unwrap());
+    let lock = crate::local_sqlite::AdmissionFileLock::acquire(dir.try_clone().unwrap()).unwrap();
+    let (sender, receiver) = tokio::sync::watch::channel(());
+    let owner = Arc::new(SnapshotDirectoryOwner::new(dir, Arc::new(lock), sender));
+    let path = directory.path().join("approved-legacy-owned.sqlite");
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        std::fs::write(format!("{}{suffix}", path.display()), b"staging").unwrap();
+    }
+    let recovery = sqlite::StagedLegacyRecovery {
+        approval: ApprovedLegacyConfigRecovery::new(
+            &path,
+            [1; 32],
+            opc_types::TxId::new(),
+            opc_types::ConfigVersion::new(1),
+            crate::LegacyConfigTailDisposition::DiscardUnknownAppendedSuffix,
+        )
+        .unwrap(),
+        path: path.clone(),
+        _owner: owner.clone(),
+    };
+    drop(owner);
+    assert!(
+        receiver.has_changed().is_ok(),
+        "cleanup guard owns shutdown accounting"
+    );
+    assert!(crate::local_sqlite::AdmissionFileLock::acquire(
+        std::fs::File::open(directory.path()).unwrap()
+    )
+    .is_err());
+    drop(recovery);
+    assert!(
+        files(directory.path()).is_empty(),
+        "guard removes database and all sidecars"
+    );
+    assert!(receiver.has_changed().is_err());
+    assert!(crate::local_sqlite::AdmissionFileLock::acquire(
+        std::fs::File::open(directory.path()).unwrap()
+    )
+    .is_ok());
+}

@@ -41,6 +41,8 @@ use crate::types::{AuditKey, AuditOpType, CommitSource};
 pub(crate) struct StagedLegacyRecovery {
     pub(crate) path: PathBuf,
     pub(crate) approval: ApprovedLegacyConfigRecovery,
+    // Cleanup owns admission even if its enclosing worker never starts.
+    pub(crate) _owner: Arc<super::storage::SnapshotDirectoryOwner>,
 }
 
 impl Drop for StagedLegacyRecovery {

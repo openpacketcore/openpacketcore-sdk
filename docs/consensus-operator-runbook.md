@@ -413,8 +413,9 @@ workers retain the admitted directory descriptor through file cleanup, including
 runtime teardown. After the final owner exits, the next open preserves the
 durably published snapshot and sweeps recognized stale artifacts automatically.
 Directory scan I/O uses the existing 60-second stall bound. Planned shutdown
-discards partial voter transfers before reporting the storage drain complete;
-keeping an old closed store handle does not retain snapshot admission. No manual
+fences snapshot reception in both standard and voter profiles, joins the engine,
+and discards unfinished transfers before draining storage, including queued file
+I/O. Once shutdown completes, old closed store handles do not retain admission. No manual
 staging cleanup is needed after a crash or restart.
 
 An identity, schema, checksum, or snapshot failure is not a rebootstrap signal.
