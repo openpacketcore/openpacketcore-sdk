@@ -88,19 +88,21 @@ class SafetyTests(unittest.TestCase):
     def deletion_boundary_race(self, kind):
         directory = self.candidate("boundary")
         foreign = self.candidate("foreign", self.root)
-        if kind == "directory":
+        if kind in ("directory", "staging"):
             (foreign / "ext4.img").unlink()
             (foreign / "tmp").rmdir()
         event = "fsverity-test-" + RUNTIME.secrets.token_hex(16)
+        parked = (self.runner if kind == "staging" else self.root) / "parked"
         # A separate, finite same-UID actor holds the foreign object throughout
         # the actual deletion. In particular, an image lease on our inode does
         # not protect the foreign image that this actor can substitute.
         program = '''
 import fcntl,json,os,signal,socket,sys
 signal.alarm(10)
-kind,event,directory,foreign,parked=sys.argv[1:]
+kind,event,directory,foreign,parked,directory_fd=sys.argv[1:]
+directory_fd=int(directory_fd)
 fd=os.open(foreign + ('/ext4.img' if kind == 'image' else ''), os.O_RDONLY)
-if kind == 'directory': fcntl.flock(fd, fcntl.LOCK_EX)
+if kind != 'image': fcntl.flock(fd, fcntl.LOCK_EX)
 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
     server.bind('\\0'+event); server.listen(1)
     print('ready',flush=True)
@@ -109,8 +111,8 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
         connection.recv(1024)
         try:
             if kind == 'image':
-                os.rename(directory+'/ext4.img',parked)
-                os.rename(foreign+'/ext4.img',directory+'/ext4.img')
+                os.rename('ext4.img',parked,src_dir_fd=directory_fd)
+                os.rename(foreign+'/ext4.img','ext4.img',dst_dir_fd=directory_fd)
             else:
                 try: os.rename(directory,parked)
                 except FileNotFoundError: pass
@@ -122,9 +124,10 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
     print(json.dumps({'links':os.fstat(fd).st_nlink,'outcome':outcome}),flush=True)
 os.close(fd)
 '''
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
         actor = subprocess.Popen(["python3", "-c", program, kind, event, str(directory),
-                                  str(foreign), str(self.root / "parked")],
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                                  str(foreign), str(parked), str(directory_fd)],
+                                 pass_fds=(directory_fd,), stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         original_unlink, original_rmdir, original_popen = os.unlink, os.rmdir, subprocess.Popen
         injected = False
 
@@ -157,6 +160,7 @@ path,event,kind,*arguments=sys.argv[1:]
 spec=importlib.util.spec_from_file_location('runtime',path)
 runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
 unlink,rmdir=runtime.os.unlink,runtime.os.rmdir
+rename=runtime.rename_new
 injected=False
 def notify():
     global injected
@@ -171,7 +175,11 @@ def remove_image(name,*args,**kwargs):
 def remove_directory(name,*args,**kwargs):
     if kind=='directory' and name=='runtime': notify()
     return rmdir(name,*args,**kwargs)
+def move_directory(source,name,destination,new_name):
+    if kind=='staging' and new_name=='runtime': notify()
+    return rename(source,name,destination,new_name)
 runtime.os.unlink=remove_image;runtime.os.rmdir=remove_directory
+runtime.rename_new=move_directory
 sys.argv=[path,*arguments]
 runtime.main()
 '''
@@ -189,7 +197,11 @@ runtime.main()
             with patch.object(RUNTIME.os, "unlink", side_effect=unlink), \
                     patch.object(RUNTIME.os, "rmdir", side_effect=rmdir), \
                     patch.object(RUNTIME.subprocess, "Popen", side_effect=popen):
-                self.guardian().sweep(self.runner)
+                if kind == "staging":
+                    with self.assertRaisesRegex(RuntimeError, "binding changed"):
+                        self.guardian().sweep(self.runner)
+                else:
+                    self.guardian().sweep(self.runner)
             output, _ = actor.communicate(input="finish\n", timeout=5)
             self.assertEqual(actor.returncode, 0, output)
             state = json.loads(output)
@@ -197,16 +209,23 @@ runtime.main()
             # including when the helper executes the syscall in another process.
             self.assertIn(state["outcome"], ("replaced", "protected"))
             self.assertGreater(state["links"], 0, "deleted a substituted live object")
+            if kind == "staging":
+                self.assertEqual((parked / "ext4.img").read_bytes(), b"fixture-owned image")
+                self.assertEqual(parked.stat().st_uid, os.getuid())
         finally:
             if actor.poll() is None:
                 actor.communicate(input="finish\n", timeout=5)
             actor.stdout.close()
+            os.close(directory_fd)
 
     def test_image_substitution_at_unlink_preserves_the_live_foreign_inode(self):
         self.deletion_boundary_race("image")
 
     def test_directory_substitution_at_rmdir_preserves_the_locked_foreign_inode(self):
         self.deletion_boundary_race("directory")
+
+    def test_directory_substitution_before_staging_is_restored_without_deletion(self):
+        self.deletion_boundary_race("staging")
 
     def test_active_runtime_case_detects_disabled_sweep_locks(self):
         fixture = RuntimeTests("test_startup_sweeps_only_unattached_owned_unlocked_directories")
@@ -221,6 +240,10 @@ runtime.main()
         try:
             with self.assertRaises(AssertionError, msg="active-runtime case accepted disabled locks"):
                 fixture.test_startup_sweeps_only_unattached_owned_unlocked_directories()
+            self.assertFalse((fixture.runner / (RUNTIME.PREFIX + "active")).exists(),
+                             "mutation did not remove the otherwise eligible active runtime")
+            self.assertFalse((fixture.runner / (RUNTIME.PREFIX + "stale")).exists())
+            self.assertTrue((fixture.runner / (RUNTIME.PREFIX + "public")).exists())
         finally:
             fixture.temporary.cleanup()  # The mutation runs no command/mount.
 
@@ -304,6 +327,90 @@ runtime.main()
             guardian.release(directory)
         guardian.run.assert_called_once_with(
             ["sudo", "-n", "umount", "--", str(directory / "tmp")], cleanup=True)
+        self.assertTrue(directory.exists())
+
+    def test_cleanup_lock_wait_does_not_stop_with_the_command_owner(self):
+        guardian = self.guardian()
+        guardian.stopping = unittest.mock.Mock(return_value=True)
+        with patch.object(RUNTIME.fcntl, "flock", side_effect=[BlockingIOError(), None, None]):
+            with guardian.startup_lock(-1, cleanup=True):
+                pass
+        guardian.stopping.assert_not_called()
+
+    def test_slow_unmount_does_not_hold_the_shared_startup_lock(self):
+        directory = self.candidate("unmount-lock")
+        guardian = self.guardian()
+        guardian.reap_descendants = unittest.mock.Mock()
+        guardian.attachments = unittest.mock.Mock(side_effect=[
+            ([], [{"target": str(directory / "tmp")}]), ([], []), ([], []),
+        ])
+        guardian.remove_runtime = unittest.mock.Mock(return_value=True)
+        parent = os.open(self.runner, os.O_RDONLY | os.O_DIRECTORY)
+
+        def unmount(*_args, **_kwargs):
+            fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(parent, fcntl.LOCK_UN)
+
+        guardian.run = unmount
+        try:
+            guardian.release(directory)
+        finally:
+            os.close(parent)
+
+    def test_reused_inventory_loop_is_gone_but_explicit_detach_still_refuses_it(self):
+        image = self.candidate("reused-loop") / "ext4.img"
+        descriptor = os.open(image, os.O_RDONLY)
+        other = type("LoopStat", (), {"st_mode": stat.S_IFBLK, "st_rdev": os.makedev(7, 1)})()
+        real_fstat = os.fstat
+        try:
+            with patch.object(RUNTIME.os, "fstat", side_effect=lambda fd: other if fd == -1 else real_fstat(fd)), \
+                    patch.object(RUNTIME.fcntl, "ioctl", return_value=bytes(232)):
+                self.assertFalse(RUNTIME.verify_loop(descriptor, -1, missing_ok=True))
+                with self.assertRaisesRegex(RuntimeError, "refusing to detach"):
+                    RUNTIME.verify_loop(descriptor, -1)
+        finally:
+            os.close(descriptor)
+
+    def test_attachment_inventory_uses_the_pinned_image_after_name_substitution(self):
+        directory = self.candidate("inventory-image")
+        image = directory / "ext4.img"
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        image_fd = os.open(image, os.O_RDWR)
+        guardian = self.guardian()
+        guardian.image_identity = RUNTIME.identity(image_fd)
+        image.rename(self.root / "original-image")
+        image.write_bytes(b"foreign replacement")
+
+        def loop(name, info):
+            return {"name": name, "back-maj:min": f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}",
+                    "back-ino": info.st_ino}
+
+        original, foreign = loop("owned", os.fstat(image_fd)), loop("foreign", image.stat())
+        guardian.inventory = lambda **_kwargs: ([original, foreign], [])
+        try:
+            self.assertEqual(guardian.attachments(directory, descriptor), ([original], []))
+            self.assertEqual(image.read_bytes(), b"foreign replacement")
+        finally:
+            os.close(image_fd)
+            os.close(descriptor)
+
+    def test_mount_inventory_precedes_incomplete_owned_layout_checks(self):
+        directory = self.candidate("mounted")
+        (directory / "ext4.img").unlink()
+        guardian = self.guardian()
+        guardian.inventory = unittest.mock.Mock(return_value=([], [{"target": str(directory / "tmp")}]))
+        real_listdir = os.listdir
+        expected = directory.stat()
+
+        def listdir(descriptor):
+            info = os.fstat(descriptor)
+            if (info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino):
+                self.fail("mounted runtime reached layout/deletion checks")
+            return real_listdir(descriptor)
+
+        with patch.object(RUNTIME.os, "listdir", side_effect=listdir):
+            guardian.sweep(self.runner)
+        guardian.inventory.assert_called_once()
         self.assertTrue(directory.exists())
 
     def test_pin_checks_the_node_without_opening_a_fifo_for_io(self):
@@ -391,8 +498,13 @@ with open(sys.argv[1], 'rb') as stream:
         guardian = self.guardian()
         opened = []
         previous = signal.signal(signal.SIGIO, lambda *_args: None)
+        inventories = 0
 
         def inventory(**_kwargs):
+            nonlocal inventories
+            inventories += 1
+            if inventories == 1:
+                return [], []  # Mount preflight; inject at the leased inventory.
             # A distinct process models the backing-file open preceding
             # LOOP_CONFIGURE. It holds that FD across the deletion boundary.
             child = subprocess.Popen(["python3", "-c", """
@@ -413,6 +525,8 @@ else:
         guardian.inventory = inventory
         try:
             guardian.sweep(self.runner)
+            self.assertGreaterEqual(inventories, 2)
+            self.assertTrue(opened, "did not reach the attachment/deletion boundary")
             for child, state in opened:
                 output, _ = child.communicate(input="finish\n", timeout=5)
                 self.assertEqual(child.returncode, 0)
@@ -531,16 +645,31 @@ assert time.monotonic() - started < .5, 'helper disposal exceeded its bounded bu
 
     def test_runtime_open_error_removes_its_new_empty_directory(self):
         reader, writer = os.pipe()
-        original_open = os.open
+        original_popen = subprocess.Popen
+        program = '''
+import importlib.util,sys
+path,*arguments=sys.argv[1:]
+spec=importlib.util.spec_from_file_location('runtime',path)
+runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
+original_open=runtime.os.open
+def failed_open(path,*args,**kwargs):
+    if path=='runtime': raise OSError('runtime open failed')
+    return original_open(path,*args,**kwargs)
+runtime.os.open=failed_open
+sys.argv=[path,*arguments]
+runtime.main()
+'''
 
-        def failed_open(path, *args, **kwargs):
-            if isinstance(path, str) and path.startswith(RUNTIME.PREFIX):
-                raise OSError("runtime open failed")
-            return original_open(path, *args, **kwargs)
+        def failed_open(command, *args, **kwargs):
+            if "--privileged" in command:
+                command = ["sudo", "-n", "python3", "-I", "-c", program,
+                           str(HARNESS.with_name("fsverity-runtime.py")),
+                           *command[command.index("--privileged"):]]
+            return original_popen(command, *args, **kwargs)
 
         try:
             with patch.dict(os.environ, {"RUNNER_TEMP": str(self.runner)}), \
-                    patch.object(RUNTIME.os, "open", side_effect=failed_open), \
+                    patch.object(RUNTIME.subprocess, "Popen", side_effect=failed_open), \
                     patch.object(RUNTIME.ctypes, "CDLL") as libc:
                 libc.return_value.prctl.return_value = 0
                 with self.assertRaisesRegex(OSError, "runtime open failed"):
@@ -1168,9 +1297,11 @@ sys.exit(os.waitstatus_to_exitcode(status))
         stale = self.owned_directory("stale")
         (stale / "ext4.img").write_bytes(b"unattached image")
         active = self.owned_directory("active")
+        (active / "ext4.img").write_bytes(b"unattached active image")
         unknown = self.runner / "unrelated"
         unknown.mkdir(mode=0o700)
         public = self.owned_directory("public")
+        (public / "ext4.img").write_bytes(b"unattached public image")
         public.chmod(0o755)
         symlink = self.runner / (RUNTIME.PREFIX + "symlink")
         symlink.symlink_to(unknown, target_is_directory=True)
@@ -1220,15 +1351,15 @@ sys.exit(os.waitstatus_to_exitcode(status))
                 self.assertEqual(privileged("losetup", "--associated", outside, "--noheadings", "--output", "NAME").strip(), loop)
 
     def test_startup_preserves_a_mounted_directory_without_an_image(self):
-        directory = self.runner / "fs-verity-runtime.mounted"
-        directory.mkdir(mode=0o700)
+        directory = self.owned_directory("mounted")
+        mountpoint = directory / "tmp"
         source = self.root / "bind-source"
         source.mkdir(mode=0o700)
         (source / "sentinel").write_text("preserve me")
-        privileged("mount", "--bind", source, directory)
-        self.extra_mounts.append(directory)
+        privileged("mount", "--bind", source, mountpoint)
+        self.extra_mounts.append(mountpoint)
         self.run_command("true")
-        self.assertEqual((directory / "sentinel").read_text(), "preserve me")
+        self.assertEqual((mountpoint / "sentinel").read_text(), "preserve me")
 
 
 if __name__ == "__main__":

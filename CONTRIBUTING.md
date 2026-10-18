@@ -83,8 +83,18 @@ serialize attachment with deletion; an exclusive backing-file lease also
 excludes concurrent opens during inventory and removal. Legacy `opc-fsverity.*`
 and other tools' `fs-verity-runtime.*` directories are always preserved.
 Inventory or cleanup errors fail the gate.
+The scratch parent must be owned and writable by the caller, and its filesystem
+must support `user.*` xattrs and file leases. This can exclude older tmpfs
+implementations. Creation and removal use a root-only staging directory under
+a root-owned, non-writable or sticky ancestor on that same filesystem; if none
+exists the gate fails closed. Removal freezes the pinned directory inodes,
+moves the runtime into that protected namespace, verifies its identity there,
+and only then removes its checked entries. Failed identity checks preserve the
+objects and restore their ownership.
 Mounts use a separate namespace with slave propagation: owner mounts cannot
-reach other jobs, and host unmounts propagate into the owner. Setup requires
+reach other jobs. Host unmounts propagate into the owner when the upstream host
+mount is shared, as on the hosted runners and standard systemd hosts; a private
+upstream mount cannot provide that propagation. Setup requires
 passwordless `unshare` and `setpriv`; commands retain the caller's identity,
 environment, stdin and inherited ownership locks.
 GitHub steps use `shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}`
@@ -95,7 +105,8 @@ The real mount and
 interruption regressions are `python3 ci/test-fsverity-runtime.py -v` on Linux
 with the same passwordless namespace, mount, chown, umount and losetup privileges.
 The narrow privileged Python helper also requires passwordless sudo: it passes
-pinned loop descriptors and disposes only of verified caller-owned descendants.
+pinned loop descriptors, creates/removes verified caller-owned runtimes in a
+protected namespace, and disposes only of verified caller-owned descendants.
 
 ```bash
 cargo fmt --all --check

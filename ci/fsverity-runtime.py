@@ -5,7 +5,8 @@ Usage: ci/setup-fsverity-tmp.sh -- COMMAND [ARG ...]
 
 Only the command receives the snapshot environment. Mutable TMPDIR, databases,
 WALs and build output stay on ordinary storage. A detached child owns the mount
-in a private mount namespace and watches a pipe held only by the launcher, so
+in a separate mount namespace with slave propagation and watches a pipe held
+only by the launcher, so
 even SIGKILL of the launcher initiates cleanup. The guardian is a subreaper:
 escaped command descendants are disposed of before releasing their filesystem.
 Cleanup errors fail the gate.
@@ -50,10 +51,10 @@ def mark_owned(descriptor):
     os.setxattr(descriptor, OWNER_ATTRIBUTE, OWNER_ID)
 
 
-def is_owned(descriptor):
+def is_owned(descriptor, *, uid=None):
     info = os.fstat(descriptor)
     try:
-        return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+        return (stat.S_ISDIR(info.st_mode) and info.st_uid == (os.getuid() if uid is None else uid)
                 and stat.S_IMODE(info.st_mode) == 0o700
                 and os.getxattr(descriptor, OWNER_ATTRIBUTE) == OWNER_ID)
     except OSError as error:
@@ -92,8 +93,9 @@ def receive_message(connection):
         raise
 
 
-def verify_loop(image, descriptor):
-    if not stat.S_ISBLK(os.fstat(descriptor).st_mode):
+def verify_loop(image, descriptor, *, missing_ok=False):
+    info = os.fstat(descriptor)
+    if not stat.S_ISBLK(info.st_mode) or os.major(info.st_rdev) != 7:
         raise RuntimeError("refusing to detach a non-device")
     try:
         status = fcntl.ioctl(descriptor, 0x4C05, bytes(232))  # LOOP_GET_STATUS64
@@ -102,6 +104,8 @@ def verify_loop(image, descriptor):
             return False
         raise
     if struct.unpack_from("=QQ", status) != identity(image):
+        if missing_ok:
+            return False  # An inventory name was already cleared and reused.
         raise RuntimeError("loop backing identity changed; refusing to detach")
     return True
 
@@ -118,7 +122,7 @@ def configure_loop(image, deadline):
                 struct.pack_into("=I", config, 0, image)
                 struct.pack_into("=I", config, 60, 4)  # LO_FLAGS_AUTOCLEAR
                 fcntl.ioctl(descriptor, 0x4C0A, config)  # LOOP_CONFIGURE, on the pinned FD
-                return descriptor
+                return descriptor, number
             except OSError as error:
                 os.close(descriptor)
                 if error.errno != errno.EBUSY:
@@ -132,10 +136,170 @@ def process_stat(pid):
     return int(fields[1]), int(fields[19])  # PPID, starttime
 
 
+def open_loop(path):
+    # O_PATH cannot block on a FIFO or activate a device. Reopen this same
+    # checked inode through procfs, never by resolving the caller's name again.
+    node = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(node)
+        if not stat.S_ISBLK(info.st_mode) or os.major(info.st_rdev) != 7:
+            raise RuntimeError("refusing to open a non-loop device")
+        descriptor = os.open(f"/proc/self/fd/{node}", os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        if identity(descriptor) != identity(node) or os.fstat(descriptor).st_rdev != info.st_rdev:
+            os.close(descriptor)
+            raise RuntimeError("loop device identity changed while pinning")
+        return descriptor
+    finally:
+        os.close(node)
+
+
+def rename_new(source, name, destination, new_name):
+    """Move without ever replacing a destination that another actor created."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.renameat2(source, os.fsencode(name), destination, os.fsencode(new_name), 1) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+@contextmanager
+def protected_directory(parent, deadline):
+    """A same-filesystem namespace the caller cannot rename entries inside.
+
+    Directory descriptors alone cannot make unlinkat/rmdir conditional on an
+    inode. Their parent must also exclude untrusted writers. Find a root-owned
+    ancestor (or a root-owned sticky directory), then create our root-only
+    staging directory there. Never delete a nonempty staging directory on error.
+    """
+    ancestor = os.dup(parent)
+    descriptor = None
+    name = ".opc-sdk-fsverity-remove." + secrets.token_hex(16)
+    try:
+        device = os.fstat(parent).st_dev
+        while True:
+            remaining(deadline)
+            info = os.fstat(ancestor)
+            if info.st_uid == 0 and (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX):
+                break
+            above = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=ancestor)
+            if os.fstat(above).st_dev != device or identity(above) == identity(ancestor):
+                os.close(above)
+                raise RuntimeError("no protected ancestor on runtime filesystem; retaining runtime")
+            os.close(ancestor)
+            ancestor = above
+        os.mkdir(name, mode=0o700, dir_fd=ancestor)
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=ancestor)
+        os.fchmod(descriptor, 0o700)
+        yield descriptor
+    finally:
+        if descriptor is not None:
+            try:
+                if not os.listdir(descriptor):
+                    os.rmdir(name, dir_fd=ancestor)
+                else:
+                    print(f"fs-verity: retaining protected staging directory {name}", file=sys.stderr)
+            finally:
+                os.close(descriptor)
+        os.close(ancestor)
+
+
+def create_runtime(parent, name, uid, gid, deadline):
+    info = os.fstat(parent)
+    if info.st_uid != uid or not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o300 != 0o300:
+        raise RuntimeError("runtime parent must be writable and owned by the caller")
+    directory = image = temporary = None
+    published = False
+    try:
+        with protected_directory(parent, deadline) as staging:
+            os.mkdir("runtime", mode=0o700, dir_fd=staging)
+            try:
+                directory = os.open("runtime", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=staging)
+                os.fchmod(directory, 0o700)
+                os.mkdir("tmp", mode=0o700, dir_fd=directory)
+                temporary = os.open("tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                os.fchmod(temporary, 0o700)
+                image = os.open("ext4.img", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                0o600, dir_fd=directory)
+                os.fchmod(image, 0o600)
+                os.ftruncate(image, 4 * 1024**3)
+                mark_owned(directory)
+                fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                for descriptor in (temporary, image, directory):
+                    os.fchown(descriptor, uid, gid)
+                remaining(deadline)
+                rename_new(staging, "runtime", parent, name)
+                published = True
+                return [directory, image]
+            finally:
+                if not published:
+                    # Nothing has been published or handed to the caller: only
+                    # root can address these entries in the protected parent.
+                    if directory is not None:
+                        if "ext4.img" in os.listdir(directory):
+                            os.unlink("ext4.img", dir_fd=directory)
+                        if "tmp" in os.listdir(directory):
+                            os.rmdir("tmp", dir_fd=directory)
+                    os.rmdir("runtime", dir_fd=staging)
+    finally:
+        if temporary is not None:
+            os.close(temporary)
+        if not published:
+            for descriptor in (image, directory):
+                if descriptor is not None:
+                    os.close(descriptor)
+
+
+def remove_verified_runtime(parent, directory, image, temporary, name, uid, deadline):
+    if not is_owned(directory, uid=uid):
+        return False
+    image_info, tmp_info = os.fstat(image), os.fstat(temporary)
+    if (not stat.S_ISREG(image_info.st_mode) or image_info.st_uid != uid or image_info.st_nlink != 1
+            or not stat.S_ISDIR(tmp_info.st_mode) or tmp_info.st_uid != uid
+            or stat.S_IMODE(tmp_info.st_mode) != 0o700
+            or fcntl.fcntl(image, fcntl.F_GETLEASE) != fcntl.F_WRLCK):
+        return False
+    moved = False
+    with protected_directory(parent, deadline) as staging:
+        try:
+            # Freeze precisely the pinned directories. Even an actor that
+            # opened these directories before staging cannot replace entries
+            # via its old dirfds after their ownership changes to root.
+            os.fchown(directory, 0, -1)
+            os.fchmod(directory, 0o700)
+            os.fchown(temporary, 0, -1)
+            os.fchmod(temporary, 0o700)
+            if (set(os.listdir(directory)) != {"ext4.img", "tmp"} or os.listdir(temporary)
+                    or Guardian.entry_identity(directory, "ext4.img") != identity(image)
+                    or Guardian.entry_identity(directory, "tmp") != identity(temporary)):
+                return False
+            remaining(deadline)
+            rename_new(parent, name, staging, "runtime")
+            moved = True
+            # renameat2 may have moved a replacement: check AFTER the move into
+            # the protected namespace, before any unlink or rmdir. No caller
+            # can change these bindings between this check and deletion.
+            if Guardian.entry_identity(staging, "runtime") != identity(directory):
+                raise RuntimeError("runtime binding changed before protected removal")
+            os.unlink("ext4.img", dir_fd=directory)
+            os.rmdir("tmp", dir_fd=directory)
+            os.rmdir("runtime", dir_fd=staging)
+            moved = False
+            return True
+        finally:
+            try:
+                if moved:
+                    rename_new(staging, "runtime", parent, name)
+            finally:
+                # Restore only our pinned inodes, including on a refused move;
+                # never chown an entry looked up again by name.
+                os.fchown(temporary, tmp_info.st_uid, tmp_info.st_gid)
+                os.fchown(directory, uid, -1)
+
+
 def privileged_helper(address, parent, deadline):
-    """Only pinned caller-owned images/devices or the caller's own child pidfd."""
+    """Pinned caller-owned resources; destructive operations exclude writers."""
     descriptors = []
-    result_fd = None
+    result_fds = []
+    response = {"ok": True}
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
         connection.settimeout(remaining(deadline))
         connection.connect("\0" + address)
@@ -145,7 +309,15 @@ def privileged_helper(address, parent, deadline):
         request, descriptors = receive_message(connection)
         try:
             operation = request["operation"]
-            if operation == "kill-child":
+            if operation in ("create", "remove"):
+                name = request["name"]
+                if not name.startswith(PREFIX) or "/" in name:
+                    raise RuntimeError("invalid owned runtime name")
+                if operation == "create":
+                    result_fds = create_runtime(descriptors[0], name, uid, int(os.environ["SUDO_GID"]), deadline)
+                else:
+                    response["removed"] = remove_verified_runtime(*descriptors, name, uid, deadline)
+            elif operation == "kill-child":
                 owner_start = request["owner_start"]
                 if process_stat(parent)[1] != owner_start:
                     raise RuntimeError("descendant owner changed identity")
@@ -167,26 +339,30 @@ def privileged_helper(address, parent, deadline):
                 if operation == "attach":
                     if info.st_nlink != 1:
                         raise RuntimeError("refusing to attach an unlinked or aliased image")
-                    result_fd = configure_loop(image, deadline)
+                    result_fd, response["loop_index"] = configure_loop(image, deadline)
+                    result_fds = [result_fd]
                 elif operation == "pin":
-                    result_fd = os.open(request["loop"], os.O_RDONLY | os.O_CLOEXEC)
-                    if not verify_loop(image, result_fd):
+                    result_fd = open_loop(request["loop"])
+                    result_fds = [result_fd]
+                    if not verify_loop(image, result_fd, missing_ok=request.get("missing_ok", False)):
                         os.close(result_fd)
-                        result_fd = None
+                        result_fds = []
                 elif operation == "detach":
                     if verify_loop(image, descriptors[1]):
                         fcntl.ioctl(descriptors[1], 0x4C01)  # LOOP_CLR_FD, never by name
                 else:
                     raise RuntimeError("unknown privileged fs-verity operation")
-            send_message(connection, {"ok": True}, [result_fd] if result_fd is not None else [])
+            send_message(connection, response, result_fds)
         except (OSError, ValueError, RuntimeError) as error:
-            send_message(connection, {"error": str(error)})
+            send_message(connection, {"error": str(error),
+                                      "os_error": isinstance(error, OSError),
+                                      "errno": getattr(error, "errno", None)})
         finally:
-            for descriptor in descriptors + ([result_fd] if result_fd is not None else []):
+            for descriptor in descriptors + result_fds:
                 os.close(descriptor)
 
 
-def privileged_request(operation, descriptors, *, deadline=None, **parameters):
+def privileged_request(operation, descriptors, *, deadline=None, result=None, **parameters):
     deadline = deadline or time.monotonic() + 5
     address = "opc-sdk-fsverity-helper-" + secrets.token_hex(24)
     returned = []
@@ -214,32 +390,41 @@ def privileged_request(operation, descriptors, *, deadline=None, **parameters):
                 send_message(connection, {"operation": operation, "timeout": remaining(deadline), **parameters}, descriptors)
                 response, returned = receive_message(connection)
                 if "error" in response:
+                    if response.get("os_error"):
+                        raise OSError(response["errno"], response["error"])
                     raise RuntimeError(response["error"])
             process.wait(timeout=remaining(deadline))
             if process.returncode:
                 raise RuntimeError("privileged fs-verity helper failed")
+            if result is not None:
+                result.update(response)
             return returned
-        except BaseException:
+        except BaseException as error:
             for descriptor in returned:
                 os.close(descriptor)
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise TimeoutError("privileged fs-verity helper deadline expired") from error
             raise
         finally:
             # Closing the connection releases any helper-side pins. Helpers
             # have their own finite socket/configuration bounds and no children.
             if process.poll() is None:
-                process.wait(timeout=max(0, deadline - time.monotonic()))
+                try:
+                    process.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired as error:
+                    raise TimeoutError("privileged fs-verity helper deadline expired") from error
 
 
-def detach_verified_loop(image, loop):
-    image_fd = os.open(image, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+def detach_verified_loop(image, loop, *, missing_ok=False):
+    image_fd = os.dup(image) if isinstance(image, int) else os.open(image, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     pinned = []
     try:
         if os.geteuid() == 0:
-            pinned = [os.open(loop, os.O_RDONLY | os.O_CLOEXEC)]
-            if verify_loop(image_fd, pinned[0]):
+            pinned = [open_loop(loop)]
+            if verify_loop(image_fd, pinned[0], missing_ok=missing_ok):
                 fcntl.ioctl(pinned[0], 0x4C01)
         else:
-            pinned = privileged_request("pin", [image_fd], loop=loop)
+            pinned = privileged_request("pin", [image_fd], loop=loop, missing_ok=missing_ok)
             if pinned:
                 privileged_request("detach", [image_fd, pinned[0]])
     finally:
@@ -254,6 +439,7 @@ class Guardian:
         self.directory_fd = None
         self.parent_fd = None
         self.image_fd = None
+        self.image_identity = None
         self.loop_fd = None
 
     def stopping(self):
@@ -357,19 +543,23 @@ class Guardian:
     def attachments(self, directory, descriptor, *, deadline=None):
         loops, mounts = self.inventory(deadline=deadline)
         mounted = [mount for mount in mounts if within(mount["target"], directory)]
-        info = os.stat("ext4.img", dir_fd=descriptor, follow_symlinks=False)
-        backing = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}", info.st_ino
+        if self.image_identity is None:
+            info = os.stat("ext4.img", dir_fd=descriptor, follow_symlinks=False)
+            device, inode = info.st_dev, info.st_ino
+        else:
+            device, inode = self.image_identity
+        backing = f"{os.major(device)}:{os.minor(device)}", inode
         return [loop for loop in loops if (loop["back-maj:min"], loop["back-ino"]) == backing], mounted
 
     @contextmanager
-    def startup_lock(self, descriptor):
+    def startup_lock(self, descriptor, *, cleanup=False):
         deadline = time.monotonic() + 30
         while True:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if self.stopping():
+                if not cleanup and self.stopping():
                     raise InterruptedError("fs-verity owner exited while waiting for startup lock")
                 time.sleep(min(.05, remaining(deadline)))
         try:
@@ -390,6 +580,11 @@ class Guardian:
         # legacy directories or arbitrary contents below a familiar prefix.
         if not directory.name.startswith(PREFIX) or not is_owned(descriptor):
             return False
+        # Observe mounts before layout checks: an owned runtime can have no
+        # image, or a nonempty tmp because another filesystem is mounted there.
+        _loops, mounts = self.inventory(deadline=deadline)
+        if any(within(mount["target"], directory) for mount in mounts):
+            return False
         if set(os.listdir(descriptor)) != {"ext4.img", "tmp"}:
             return False
         image_info = os.stat("ext4.img", dir_fd=descriptor, follow_symlinks=False)
@@ -409,7 +604,8 @@ class Guardian:
         try:
             info = os.fstat(image)
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_nlink != 1 or os.listdir(temporary)):
+                    or info.st_nlink != 1 or os.listdir(temporary)
+                    or self.image_identity is not None and identity(image) != self.image_identity):
                 return False
             # A write lease refuses an already-open backing file and blocks
             # fresh opens through inventory+unlink, including outside flocks.
@@ -431,13 +627,10 @@ class Guardian:
                     or identity(temporary) != self.entry_identity(descriptor, "tmp")):
                 return False
             remaining(deadline)
-            # Delete through the locked inode, never by a re-resolved tree.
-            os.unlink("ext4.img", dir_fd=descriptor)
-            os.rmdir("tmp", dir_fd=descriptor)
-            if not self.same_binding(directory, descriptor, parent):
-                raise RuntimeError("runtime parent binding changed during removal")
-            os.rmdir(directory.name, dir_fd=parent)
-            return True
+            result = {}
+            privileged_request("remove", [parent, descriptor, image, temporary],
+                               name=directory.name, deadline=deadline, result=result)
+            return result["removed"]
         finally:
             if leased:
                 fcntl.fcntl(image, fcntl.F_SETLEASE, fcntl.F_UNLCK)
@@ -491,28 +684,29 @@ class Guardian:
         try:
             try:
                 self.reap_descendants()
-            except (OSError, RuntimeError, TimeoutError) as error:
+            except (OSError, RuntimeError, TimeoutError, subprocess.TimeoutExpired) as error:
                 errors.append(error)
-            with self.startup_lock(parent):
-                attached, mounted = self.attachments(directory, descriptor)
-                if not self.same_binding(directory, descriptor, parent):
-                    raise RuntimeError("runtime parent binding changed before teardown")
-                if mounted:
-                    if len(mounted) != 1 or mounted[0]["target"] != str(directory / "tmp"):
-                        raise RuntimeError("unexpected mounts in fs-verity runtime; retaining it")
-                    self.run(["sudo", "-n", "umount", "--", str(directory / "tmp")], cleanup=True)
-                if self.loop_fd is not None:
-                    privileged_request("detach", [self.image_fd, self.loop_fd])
-                    os.close(self.loop_fd)
-                    self.loop_fd = None
-                # Extra bindings made by the wrapped command are pinned and
-                # verified against this same owned image before any detach.
-                attached, _mounted = self.attachments(directory, descriptor)
-                for loop in attached:
-                    detach_verified_loop(directory / "ext4.img", loop["name"])
-                if self.image_fd is not None:
-                    os.close(self.image_fd)
-                    self.image_fd = None
+            # The lifetime runtime lock protects this owner during slow child,
+            # unmount and detach work; do not block other owners' startup lock.
+            attached, mounted = self.attachments(directory, descriptor)
+            if not self.same_binding(directory, descriptor, parent):
+                raise RuntimeError("runtime parent binding changed before teardown")
+            if mounted:
+                if len(mounted) != 1 or mounted[0]["target"] != str(directory / "tmp"):
+                    raise RuntimeError("unexpected mounts in fs-verity runtime; retaining it")
+                self.run(["sudo", "-n", "umount", "--", str(directory / "tmp")], cleanup=True)
+            if self.loop_fd is not None:
+                privileged_request("detach", [self.image_fd, self.loop_fd])
+                os.close(self.loop_fd)
+                self.loop_fd = None
+            attached, _mounted = self.attachments(directory, descriptor)
+            for loop in attached:
+                detach_verified_loop(self.image_fd if self.image_fd is not None else directory / "ext4.img",
+                                     loop["name"], missing_ok=True)
+            if self.image_fd is not None:
+                os.close(self.image_fd)
+                self.image_fd = None
+            with self.startup_lock(parent, cleanup=True):
                 deadline = time.monotonic() + 5
                 while True:
                     attached, mounted = self.attachments(directory, descriptor, deadline=deadline)
@@ -541,56 +735,42 @@ class Guardian:
         try:
             with self.startup_lock(self.parent_fd):
                 name = PREFIX + secrets.token_hex(16)
-                previous_umask = os.umask(0)
-                try:
-                    os.mkdir(name, mode=0o700, dir_fd=self.parent_fd)
-                finally:
-                    os.umask(previous_umask)
+                # Initialize under a protected parent too: creation rollback
+                # must not have the same name-substitution bug as final removal.
+                self.directory_fd, self.image_fd = privileged_request("create", [self.parent_fd], name=name)
+                self.image_identity = identity(self.image_fd)
                 directory = root / name
                 try:
-                    self.directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.parent_fd)
                     fcntl.flock(self.directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BaseException:
-                    if self.directory_fd is None or self.same_binding(directory, self.directory_fd, self.parent_fd):
-                        os.rmdir(name, dir_fd=self.parent_fd)
-                    raise
-                made_tmp = False
-                try:
-                    os.mkdir("tmp", mode=0o700, dir_fd=self.directory_fd)
-                    made_tmp = True
-                    os.chmod("tmp", 0o700, dir_fd=self.directory_fd)
-                    self.image_fd = os.open("ext4.img", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                            0o600, dir_fd=self.directory_fd)
-                    os.fchmod(self.image_fd, 0o600)
-                    os.ftruncate(self.image_fd, 4 * 1024**3)
                     mark_owned(self.directory_fd)
                     os.setxattr(self.directory_fd, GUARDIAN_ATTRIBUTE,
                                 f"{os.getpid()}:{process_stat(os.getpid())[1]}".encode())
                 except BaseException:
-                    # No attachment is possible before publishing the marker.
-                    # Roll back only the entries created with our open handles.
-                    if not self.same_binding(directory, self.directory_fd, self.parent_fd):
-                        raise RuntimeError("new runtime moved during initialization")
-                    if self.image_fd is not None:
-                        if identity(self.image_fd) != self.entry_identity(self.directory_fd, "ext4.img"):
-                            raise RuntimeError("new image changed during initialization")
-                        os.unlink("ext4.img", dir_fd=self.directory_fd)
-                    if made_tmp:
-                        os.rmdir("tmp", dir_fd=self.directory_fd)
-                    os.rmdir(name, dir_fd=self.parent_fd)
+                    os.close(self.image_fd)
+                    self.image_fd = None
+                    if not self.remove_runtime(directory, self.directory_fd, self.parent_fd,
+                                               deadline=time.monotonic() + 5):
+                        raise RuntimeError("new runtime changed during initialization; retaining it")
                     raise
             try:
-                image = directory / "ext4.img"
                 mountpoint = directory / "tmp"
-                self.run(["mkfs.ext4", "-q", "-b", "4096", "-O", "verity", str(image)])
+                self.run(["mkfs.ext4", "-q", "-b", "4096", "-O", "verity",
+                          f"/proc/{os.getpid()}/fd/{self.image_fd}"])
                 with self.startup_lock(self.parent_fd):
                     if not self.same_binding(directory, self.directory_fd, self.parent_fd):
                         raise RuntimeError("runtime moved before attachment")
                     if identity(self.image_fd) != self.entry_identity(self.directory_fd, "ext4.img"):
                         raise RuntimeError("runtime image changed before attachment")
-                    self.loop_fd, = privileged_request("attach", [self.image_fd])
+                    result = {}
+                    self.loop_fd, = privileged_request("attach", [self.image_fd], result=result)
                     device = os.fstat(self.loop_fd).st_rdev
-                    self.run(["sudo", "-n", "mount", "-o", "nosuid,nodev", f"/dev/loop{os.minor(device)}", str(mountpoint)])
+                    loop = f"/dev/loop{result['loop_index']}"
+                    node = os.stat(loop, follow_symlinks=False)
+                    if not stat.S_ISBLK(node.st_mode) or node.st_rdev != device:
+                        raise RuntimeError("loop device node mismatch before mount")
+                    self.run(["sudo", "-n", "mount", "-o", "nosuid,nodev", loop, str(mountpoint)])
+                if mountpoint.stat().st_dev != device:
+                    raise RuntimeError("mounted device mismatch before chown")
                 self.run(["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(mountpoint)])
                 snapshots = mountpoint / "snapshots"
                 snapshots.mkdir(mode=0o700)
@@ -649,7 +829,7 @@ def receive_guardian(address, parent):
     os.environ.clear()
     os.environ.update(message["environment"])
     if os.readlink("/proc/self/ns/mnt") == message["namespace"]:
-        raise RuntimeError("fs-verity guardian did not enter a private mount namespace")
+        raise RuntimeError("fs-verity guardian did not enter a separate mount namespace")
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     guardian = Guardian(owner)
     for signum in SIGNALS:
