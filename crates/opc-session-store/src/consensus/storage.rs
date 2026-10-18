@@ -9087,6 +9087,8 @@ mod tests {
     mod scope_scans;
     #[cfg(all(target_os = "linux", feature = "test-control"))]
     mod scope_snapshot_rows;
+    #[cfg(target_os = "linux")]
+    mod snapshot_file_io_ownership;
 
     use crate::test_process::CommandExt as _;
     use std::str::FromStr;
