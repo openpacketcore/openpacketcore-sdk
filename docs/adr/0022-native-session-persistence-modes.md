@@ -691,17 +691,21 @@ one second per MiB of the actual pinned image and per 1,000 captured native rows
 Native export includes its compatibility basis, growing output, and immutable
 capture cardinalities; SQLite capture uses its reader's page extent including
 WAL-resident pages. Finalization, sync, sealing and current/predecessor verification
-use the actual descriptor length. Completing a sized phase restores ordinary
-stall grace before waiting to publish. These conservative allowances are progress
-budgets, not measured throughput guarantees or a cap on cumulative business state.
+use the actual descriptor length. Waiting to publish receives the selected
+snapshot's size allowance because a serving reader holds exclusion through a full
+admission scan; without a selected snapshot it receives ordinary stall grace.
+These conservative allowances are progress budgets, not measured throughput
+guarantees or a cap on cumulative business state.
 Expired attempts retry after one second. Cancellation is fenced immediately
 before publication, and an expired native export observes it cooperatively. Blocking I/O retains the actual
 worker gate, descriptors, namespace and shutdown owner until it really exits;
 expiry cannot start a second worker or publish a stale attempt. Once metadata
 publication commits, its owner finishes delivering that exact cut to Raft rather
-than discarding committed progress at the deadline. Shutdown also retains this
-completion owner; its existing public deadline bounds the caller while the
-shared background drain joins the actual work. Genuine storage errors are not
+than discarding committed progress at the deadline. An independently owned
+completion task retains predecessor cleanup and return-stream preparation even
+when its observer is cancelled. Shutdown also retains this completion owner; its
+existing public deadline bounds the caller while the shared background drain
+joins the actual work. Genuine storage errors are not
 treated as attempt expiry.
 
 An active leader that remains full for five seconds without snapshot or purge

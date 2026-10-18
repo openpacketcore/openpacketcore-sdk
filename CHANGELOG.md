@@ -1101,11 +1101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Legacy and foreign runtime directories are preserved. CI invokes each
   fs-verity test command through the owner. Refs #1312.
 
-- `opc-session-store`: snapshot hash, footer, fsync and verification workers
-  retain their mutation gate, exact unpublished artifact, namespace lease and
-  shutdown owner after an attempt expires or its observer is cancelled. A retry
-  waits for physical completion, and shutdown retains its existing bounded
-  drain. Fixed verification keeps its input-sized allowance. (#1249)
+- `opc-session-store`: snapshot file workers, including directory validation and
+  the publication fence, retain their mutation gate, namespace lease and shutdown
+  owner after an attempt expires or its observer is cancelled. Unpublished
+  artifacts remain owned until physical work finishes. Committed cleanup and
+  return-stream preparation retain their completion owner when a caller leaves.
+  A retry waits for physical completion, and shutdown keeps its bounded drain.
+  Fixed verification and publication contention use input-sized allowances. (#1249)
 
 - `opc-proto-gtpu`: encode and decode the PDU Session Container Paging Policy
   Indicator in bits 7..5, as specified by TS 38.415. Correct the independent
@@ -1150,8 +1152,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build triggers even when a maintenance build completes at the same cut,
   without polling snapshot contents on unrelated engine updates.
 
-- Let progressing consensus snapshots finish across stall intervals, size opaque
-  work budgets to their input, and preserve physical worker ownership on expiry.
+- `opc-session-store`: let progressing consensus snapshots finish across stall
+  intervals, size opaque work budgets to their input, and preserve physical worker
+  ownership on expiry.
   Keep pressure handoff targets only after engine acceptance, restore lease reuse
   in a later term, wait for V2 status capacity within its deadline, and terminate
   retries when the local engine stops (#1249).

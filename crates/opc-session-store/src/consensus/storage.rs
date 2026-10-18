@@ -3122,6 +3122,7 @@ impl LiveTerminalRecoveryHandoffConsumer {
     async fn acquire_publication_connection(
         &self,
         gate: &LiveTerminalRecoveryHandoffGate,
+        mut retention: SnapshotIntegrityWork,
     ) -> Result<tokio::sync::OwnedMutexGuard<rusqlite::Connection>, SessionConsensusStorageError>
     {
         if !Arc::ptr_eq(&self.core.snapshot_gate, &gate.snapshot_gate)
@@ -3132,7 +3133,14 @@ impl LiveTerminalRecoveryHandoffConsumer {
         let core = self.core.clone();
         let namespace = Arc::clone(&self.snapshot_directory_lease.namespace);
         let conn = Arc::clone(&core.conn).lock_owned().await;
-        tokio::task::spawn_blocking(move || {
+        // A builder acquired serving exclusion after creating its original
+        // work bundle. Retain both gates through this physical fence, including
+        // a caller cancelled while open or recovery classification is running.
+        retention._gate = SnapshotIntegrityGate::Mutation {
+            _guard: gate.clone(),
+        };
+        let work = retention.clone();
+        snapshot_blocking_with_retention(Some(retention), move || {
             if core.terminal_recovery_handoff_pending()? {
                 return Err(SessionConsensusStorageError::BackendUnavailable);
             }
@@ -3140,7 +3148,9 @@ impl LiveTerminalRecoveryHandoffConsumer {
                 .read_selected_snapshot(&conn)
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
             let (selected_name, admitted_snapshot_file) = match current {
-                Some((_, file_name, _, _)) => {
+                Some((_, file_name, _, length)) => {
+                    work.sized_phase(length)
+                        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
                     let file = namespace
                         .open_read(std::ffi::OsStr::new(&file_name))
                         .map_err(|_| SessionConsensusStorageError::CorruptState)?;
@@ -3148,7 +3158,7 @@ impl LiveTerminalRecoveryHandoffConsumer {
                 }
                 None => (None, None),
             };
-            match core
+            let conn = match core
                 .install_live_terminal_recovery_handoff_from_admitted_snapshot_with_connection(
                     &conn,
                     selected_name.as_deref(),
@@ -3160,7 +3170,10 @@ impl LiveTerminalRecoveryHandoffConsumer {
                 | consensus::LiveTerminalRecoveryHandoffInstallOutcome::Installed => {
                     Err(SessionConsensusStorageError::BackendUnavailable)
                 }
-            }
+            }?;
+            work.progress()
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+            Ok(conn)
         })
         .await
         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
@@ -4546,19 +4559,21 @@ async fn validate_and_clean_snapshot_directory_with_retention(
                         .and_then(std::fs::File::try_clone),
                 }
                 .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-                if let Some(work) = &retention {
-                    work.sized_phase(
-                        file.metadata()
-                            .map_err(|_| SessionConsensusStorageError::CorruptState)?
-                            .len(),
-                    )
-                    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-                }
-                let mut snapshot = SessionSnapshotFile::from_std(file, path.clone())
+                let work = retention.clone();
+                let scan_lease = Arc::clone(lease);
+                let (_, checksum, length) =
+                    snapshot_blocking_with_retention(retention.clone(), move || {
+                        // Opens outside an attempt still retain the admitted
+                        // namespace until this descriptor scan physically ends.
+                        let _lease = scan_lease;
+                        let mut file = file;
+                        if let Some(work) = &work {
+                            work.sized_phase(file.metadata()?.len())?;
+                        }
+                        verify_snapshot_envelope_file(&mut file, &path, work.as_ref())
+                    })
                     .await
-                    .map_err(|_| SessionConsensusStorageError::CorruptState)?;
-                let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot)
-                    .await
+                    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?
                     .map_err(|_| SessionConsensusStorageError::CorruptState)?;
                 (checksum, length)
             };
@@ -6584,7 +6599,7 @@ impl SqliteConsensusStateMachine {
         };
         let mut prune_preemption = Some(self.core.request_consensus_log_prune_preemption().await);
         let conn = live_terminal_consumer
-            .acquire_publication_connection(&snapshot_gate)
+            .acquire_publication_connection(&snapshot_gate, integrity_work.clone())
             .await
             .map_err(|error| {
                 storage_error(
@@ -7716,9 +7731,15 @@ impl SqliteConsensusSnapshotBuilder {
                 )
             })?
         };
-        integrity_work.progress().map_err(|error| {
-            storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-        })?;
+        // A current-snapshot admission can hold the serving gate for a full
+        // image scan. Charge this wait to that authenticated image's length,
+        // just like its scan, rather than discarding a finished large build
+        // after a size-independent stall grace. An empty store keeps the grace.
+        integrity_work
+            .sized_phase(previous.as_ref().map_or(0, |(_, _, _, length)| *length))
+            .map_err(|error| {
+                storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
+            })?;
         #[cfg(test)]
         if let Some(completion) = self._shutdown_guard.0.as_ref() {
             completion.snapshot_build.before_publication().await;
@@ -7737,7 +7758,7 @@ impl SqliteConsensusSnapshotBuilder {
         ));
         let prune_preemption = self.core.request_consensus_log_prune_preemption().await;
         let conn = live_terminal_consumer
-            .acquire_publication_connection(&snapshot_guard)
+            .acquire_publication_connection(&snapshot_guard, integrity_work.clone())
             .await
             .map_err(|error| {
                 storage_error(
@@ -7856,123 +7877,147 @@ impl SqliteConsensusSnapshotBuilder {
         drop(prune_preemption);
         #[cfg(test)]
         drop(fixed_prepublication_scan_boundary);
-        // Every raw/vacuum staging pin either dropped during SQLite
-        // finalization or transferred its exact cleanup guard to
-        // `published_cleanup`; no separate pathname artifact may race it.
-        if !legacy_reseed_predecessor {
-            remove_old_snapshot(&self.core, previous, &file_name, previous_artifact)
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Write,
-                        error,
-                    )
-                })?;
-        }
-        // The new current descriptor is durable and its predecessor retired.
-        // Returning a stream need not exclude another admission of that same
-        // immutable current descriptor while the builder prepares its result.
-        drop(snapshot_guard.serving_guard.take());
-        #[cfg(feature = "test-control")]
-        self.core
-            .snapshot_observation
-            .record_phase_for_test("preparing_return");
-        #[cfg(test)]
-        wait_before_fixed_snapshot_return(&final_path).await;
-        let snapshot = if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-            // The descriptor was sealed, measured, scanned, and bound before
-            // metadata publication. Return that exact descriptor: reopening
-            // `final_path` here could substitute a byte-identical, unsealed
-            // inode after the final authority check.
-            let published_pin = published_pin.ok_or_else(|| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    io::Error::other("fixed snapshot publication lost its pinned descriptor"),
-                )
-            })?;
-            let mut snapshot = SessionSnapshotFile::from_pinned(published_pin, final_path.clone())
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-            // `PinnedSqliteFile` verifies through a cloned descriptor. Unix
-            // descriptor clones share their file offset, so transfer remains
-            // exact-handle but may arrive at EOF after the bounded scan.
-            // Rewind the same sealed descriptor before OpenRaft consumes it.
-            snapshot.rewind().await.map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
-            snapshot
-        } else {
-            let file = open_snapshot_child_in_namespace_with_retention(
-                Arc::clone(&self._snapshot_directory_lease.namespace),
-                std::ffi::OsString::from(&file_name),
-                Some(integrity_work.clone()),
-            )
-            .await
-            .map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
-            let mut snapshot = SessionSnapshotFile::from_std(file, final_path.clone())
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-            let (_, observed_checksum, observed_length) =
-                verify_snapshot_envelope_reader(&mut snapshot)
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
+        // Publication is irreversible. The completion task owns every later
+        // cleanup, descriptor conversion, scan and rewind even if its caller
+        // disappears. It never checks the expired attempt again; shutdown keeps
+        // observing its physical completion through the retained work bundle.
+        let core = self.core.clone();
+        let (result, _snapshot_guard, _integrity_work) = tokio::spawn(async move {
+            let result = async {
+                // Every raw/vacuum staging pin either dropped during SQLite
+                // finalization or transferred its exact cleanup guard to
+                // `published_cleanup`; no separate pathname artifact may race it.
+                if !legacy_reseed_predecessor {
+                    remove_old_snapshot(&core, previous, &file_name, previous_artifact)
+                        .await
+                        .map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Write,
+                                error,
+                            )
+                        })?;
+                }
+                // The new current descriptor is durable and its predecessor retired.
+                // Returning a stream need not exclude another admission of that same
+                // immutable current descriptor while the builder prepares its result.
+                drop(snapshot_guard.serving_guard.take());
+                #[cfg(feature = "test-control")]
+                core.snapshot_observation
+                    .record_phase_for_test("preparing_return");
+                #[cfg(test)]
+                wait_before_fixed_snapshot_return(&final_path).await;
+                let snapshot =
+                    if core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
+                        // The descriptor was sealed, measured, scanned, and bound before
+                        // metadata publication. Return that exact descriptor: reopening
+                        // `final_path` here could substitute a byte-identical, unsealed
+                        // inode after the final authority check.
+                        let published_pin = published_pin.ok_or_else(|| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                io::Error::other(
+                                    "fixed snapshot publication lost its pinned descriptor",
+                                ),
+                            )
+                        })?;
+                        let mut snapshot =
+                            SessionSnapshotFile::from_pinned(published_pin, final_path.clone())
+                                .await
+                                .map_err(|error| {
+                                    storage_error(
+                                        ErrorSubject::Snapshot(Some(meta.signature())),
+                                        ErrorVerb::Read,
+                                        error,
+                                    )
+                                })?;
+                        // `PinnedSqliteFile` verifies through a cloned descriptor. Unix
+                        // descriptor clones share their file offset, so transfer remains
+                        // exact-handle but may arrive at EOF after the bounded scan.
+                        // Rewind the same sealed descriptor before OpenRaft consumes it.
+                        snapshot.rewind().await.map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?;
+                        snapshot
+                    } else {
+                        let file = open_snapshot_child_in_namespace_with_retention(
+                            Arc::clone(&integrity_work._lease.namespace),
+                            std::ffi::OsString::from(&file_name),
+                            Some(integrity_work.clone()),
                         )
-                    })?;
-            if observed_checksum != checksum || observed_length != byte_length {
-                return Err(storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    consensus::invalid_data("session consensus sealed snapshot is inconsistent"),
-                ));
+                        .await
+                        .map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?;
+                        let mut snapshot = SessionSnapshotFile::from_std(file, final_path.clone())
+                            .await
+                            .map_err(|error| {
+                                storage_error(
+                                    ErrorSubject::Snapshot(Some(meta.signature())),
+                                    ErrorVerb::Read,
+                                    error,
+                                )
+                            })?;
+                        let (_, observed_checksum, observed_length) =
+                            verify_snapshot_envelope_reader(&mut snapshot)
+                                .await
+                                .map_err(|error| {
+                                    storage_error(
+                                        ErrorSubject::Snapshot(Some(meta.signature())),
+                                        ErrorVerb::Read,
+                                        error,
+                                    )
+                                })?;
+                        if observed_checksum != checksum || observed_length != byte_length {
+                            return Err(storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                consensus::invalid_data(
+                                    "session consensus sealed snapshot is inconsistent",
+                                ),
+                            ));
+                        }
+                        snapshot.rewind().await.map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?;
+                        snapshot
+                    };
+                #[cfg(feature = "test-control")]
+                core.snapshot_observation.record_phase_for_test("completed");
+                core.snapshot_observation
+                    .record_published(captured_wal_bytes.unwrap_or(0), snapshot_started.elapsed());
+                Ok(Snapshot {
+                    meta,
+                    snapshot: Box::new(snapshot),
+                })
             }
-            snapshot.rewind().await.map_err(|error| {
-                storage_error(
-                    ErrorSubject::Snapshot(Some(meta.signature())),
-                    ErrorVerb::Read,
-                    error,
-                )
-            })?;
-            snapshot
-        };
-        #[cfg(feature = "test-control")]
-        self.core
-            .snapshot_observation
-            .record_phase_for_test("completed");
-        self.core
-            .snapshot_observation
-            .record_published(captured_wal_bytes.unwrap_or(0), snapshot_started.elapsed());
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(snapshot),
+            .await;
+            // Keep the complete guards captured and retire the result first
+            // when an abandoned join drops this task's output.
+            (result, snapshot_guard, integrity_work)
         })
+        .await
+        .map_err(|_| {
+            storage_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Read,
+                io::Error::other("snapshot publication completion worker unavailable"),
+            )
+        })?;
+        result
     }
 }
 
@@ -8237,7 +8282,7 @@ async fn verify_built_snapshot(
             Some(pinned)
         } else {
             let (_, observed_checksum, observed_length) =
-                verify_snapshot_envelope_file(&mut file, &path, &work)?;
+                verify_snapshot_envelope_file(&mut file, &path, Some(&work))?;
             if observed_checksum != checksum || observed_length != length {
                 return Err(consensus::invalid_data(
                     "session consensus sealed snapshot is inconsistent",
@@ -8259,11 +8304,13 @@ async fn verify_built_snapshot(
 fn verify_snapshot_envelope_file(
     file: &mut std::fs::File,
     path: &Path,
-    work: &SnapshotIntegrityWork,
+    work: Option<&SnapshotIntegrityWork>,
 ) -> io::Result<(u64, [u8; 32], u64)> {
     use std::io::{Read as _, Seek as _};
 
-    work.progress()?;
+    if let Some(work) = work {
+        work.progress()?;
+    }
     #[cfg(not(test))]
     let _ = path;
     let total_length = file.seek(io::SeekFrom::End(0))?;
@@ -8281,8 +8328,17 @@ fn verify_snapshot_envelope_file(
     let mut encoded_length = [0_u8; 8];
     let mut expected_checksum = [0_u8; 32];
     file.read_exact(&mut magic)?;
+    if let Some(work) = work {
+        work.progress()?;
+    }
     file.read_exact(&mut encoded_length)?;
+    if let Some(work) = work {
+        work.progress()?;
+    }
     file.read_exact(&mut expected_checksum)?;
+    if let Some(work) = work {
+        work.progress()?;
+    }
     if &magic != SNAPSHOT_FOOTER_MAGIC {
         return Err(consensus::invalid_data(
             "session consensus snapshot magic is invalid",
@@ -8313,7 +8369,9 @@ fn verify_snapshot_envelope_file(
             })?)
             .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
         hasher.update(&buffer[..read]);
-        work.progress()?;
+        if let Some(work) = work {
+            work.progress()?;
+        }
     }
     let actual_checksum: [u8; 32] = hasher.finalize().into();
     #[cfg(test)]
@@ -8322,6 +8380,9 @@ fn verify_snapshot_envelope_file(
         return Err(consensus::invalid_data(
             "session consensus snapshot checksum mismatch",
         ));
+    }
+    if let Some(work) = work {
+        work.progress()?;
     }
     Ok((payload_length, actual_checksum, total_length))
 }
@@ -8958,7 +9019,7 @@ async fn track_previous_snapshot_artifact(
             let mut file = file;
             integrity_work.sized_phase(file.metadata()?.len())?;
             let (_, checksum, length) =
-                verify_snapshot_envelope_file(&mut file, &path, &integrity_work)?;
+                verify_snapshot_envelope_file(&mut file, &path, Some(&integrity_work))?;
             integrity_work.progress()?;
             if checksum != expected_checksum || length != expected_length {
                 return Err(consensus::invalid_data(

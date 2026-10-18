@@ -1645,11 +1645,15 @@ cancelled admission workers retain publication exclusion through their last
 read. Snapshot integrity checks and operation deadlines are unchanged.
 
 A snapshot attempt that stalls before publication can stop waiting without
-releasing its physical file worker. Hashing, footer writes, fsync and envelope
-verification retain the mutation gate, exact artifact cleanup, namespace lease
-and shutdown ownership until the worker exits. A successor cannot enter that
-gate while the old I/O runs. Shutdown waits under its existing drain deadline;
-an unfinished worker prevents successful drain and keeps its resources owned.
+releasing its physical file worker. Directory validation, hashing, footer writes,
+fsync, envelope verification and the publication fence retain the mutation gate,
+exact artifact cleanup, namespace lease and shutdown ownership until physical
+work finishes. A successor cannot enter that gate while the old I/O runs. The
+publication wait includes the selected snapshot's size allowance because a
+serving reader can hold exclusion through its full admission scan. After metadata
+commits, an owned completion finishes predecessor cleanup and prepares the return
+stream even if its caller leaves. Shutdown waits under its existing drain
+deadline; unfinished work prevents successful drain and keeps its resources owned.
 
 The pinned Openraft implementation also retains the donor's required log
 suffix while a snapshot transfer owns it. Successful snapshot or log

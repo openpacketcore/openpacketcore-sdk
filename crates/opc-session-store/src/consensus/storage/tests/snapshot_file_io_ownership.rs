@@ -540,7 +540,7 @@ async fn held_directory_validation(root: &Path, publication: bool) {
                     unreachable!("mutation ownership fixture")
                 };
                 let result = consumer
-                    .acquire_publication_connection(guard)
+                    .acquire_publication_connection(guard, work.clone())
                     .await
                     .map(|_| 0);
                 drop(work);
