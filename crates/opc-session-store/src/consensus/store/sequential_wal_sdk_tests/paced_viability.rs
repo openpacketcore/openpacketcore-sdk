@@ -6,6 +6,7 @@
 use super::*;
 use crate::fenced_transition::FencedTransitionV2Effect;
 use crate::StoreError;
+use opc_types::deadline::sleep_until as wait_for_paced_deadline;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::task::JoinSet;
@@ -16,6 +17,24 @@ const CLIENTS: usize = 8;
 const SESSIONS: usize = 65;
 const WINDOW: Duration = Duration::from_secs(60);
 const DEADLINE: Duration = Duration::from_millis(800);
+
+#[tokio::test(start_paused = true)]
+async fn std_deadline_pacing_and_window_ends_keep_remaining_budget() {
+    // Item pacing, admission-window expiry and the post-drain wait share
+    // this boundary; preserve the original deadline at every use.
+    tokio::time::advance(Duration::from_secs(120)).await;
+    let started = tokio::time::Instant::now();
+    wait_for_paced_deadline(Instant::now() + WINDOW).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= WINDOW - Duration::from_secs(1),
+        "early paced deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= WINDOW + Duration::from_secs(1),
+        "late paced deadline: {elapsed:?}"
+    );
+}
 const UPDATE_PLAINTEXT: &[u8] = b"private WAL paced update";
 type BatchEffect =
     FencedTransitionV2Effect<Result<Vec<Result<FencedTransitionOutcome, StoreError>>, StoreError>>;
@@ -367,7 +386,7 @@ async fn measure(
             for offset in 0..BATCH {
                 let item = index * BATCH + offset;
                 let due = start + Duration::from_millis(item as u64);
-                tokio::time::sleep_until(due.into()).await;
+                wait_for_paced_deadline(due).await;
                 if Instant::now() >= end {
                     break;
                 }
@@ -411,7 +430,7 @@ async fn measure(
                     let (index, completion) = result.expect("active tasks").expect("owned task joined");
                     stop_admission = !accept_completion(index, completion, attempts, sessions, &mut busy);
                 }
-                _ = tokio::time::sleep_until(end.into()) => { break; }
+                _ = wait_for_paced_deadline(end) => { break; }
             }
         }
     }
@@ -423,7 +442,7 @@ async fn measure(
         accept_completion(index, completion, attempts, sessions, &mut busy);
     }
     let completions_drained_ns = ns(start.elapsed());
-    tokio::time::sleep_until(end.into()).await;
+    wait_for_paced_deadline(end).await;
     eprintln!(
         "private_wal_paced_admission_end={}",
         serde_json::json!({"offered": OPERATIONS, "admitted": counters.admitted.load(Ordering::Relaxed), "stop_admission_on_error": stop_admission, "peak_unjoined_client_tasks": peak_unjoined, "client_limit": CLIENTS, "drained_at_ns": completions_drained_ns, "interval_elapsed_ns": ns(start.elapsed())})
@@ -767,7 +786,7 @@ async fn paced_three_voter_sdk_1000_ops_per_second_for_60s() {
         }
     }
     if let Some(start) = workload_start {
-        tokio::time::sleep_until((start + WINDOW).into()).await;
+        wait_for_paced_deadline(start + WINDOW).await;
     }
     counters.stage.store(3, Ordering::Relaxed);
     let summary = std::panic::catch_unwind(AssertUnwindSafe(|| {

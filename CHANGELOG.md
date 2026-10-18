@@ -757,6 +757,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports `UnsupportedQosMonitoring` for QMP packets, including packets without
   a T-PDU. (#1310)
 
+- Standard-clock deadlines in scope reads, redirect receipt retries and DTLS
+  engine timers retain their remaining budget when Tokio time is advanced.
+  Qualification pacing and DTLS test peers use the same shared adapters in
+  `opc-types`; `opc-persist` reuses them without changing its existing bounds.
+  The optional `async-time` feature enables those Tokio adapters. (#1304)
+
 - `opc-persist`: snapshot reads pin the last durable publication independently
   of building or installing its successor, including a delayed SQLite commit.
   Publication holds only a brief gate; readers open independent descriptors and

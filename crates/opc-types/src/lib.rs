@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod deadline;
 mod error;
 mod identity;
 pub mod n1_mode;

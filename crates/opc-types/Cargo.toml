@@ -13,11 +13,17 @@ readme = "README.md"
 documentation = "https://docs.rs/opc-types"
 keywords = ["5g", "cnf", "types", "telecom", "packet-core"]
 categories = ["network-programming", "data-structures"]
+
+[features]
+default = []
+async-time = ["dep:tokio"]
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing"] }
 uuid = { workspace = true }
+tokio = { workspace = true, features = ["time"], optional = true }
 
 [dev-dependencies]
 serde_json = "1.0"

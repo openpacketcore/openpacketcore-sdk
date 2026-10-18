@@ -31,7 +31,7 @@ base64 = { workspace = true }
 hex = "0.4.3"
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
-opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0", features = ["async-time"] }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-config-model = { path = "../opc-config-model", version = "0.2.0" }

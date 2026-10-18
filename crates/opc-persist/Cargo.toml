@@ -36,7 +36,7 @@ rustix = { version = "1", features = ["fs"] }
 tempfile = "3"
 
 # Shared types across the SDK
-opc-types = { path = "../opc-types", version = "0.2.0" }
+opc-types = { path = "../opc-types", version = "0.2.0", features = ["async-time"] }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-data-governance = { path = "../opc-data-governance", version = "0.2.0" }
 opc-nacm = { path = "../opc-nacm", version = "0.2.0" }
