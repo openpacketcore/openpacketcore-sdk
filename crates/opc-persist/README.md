@@ -347,6 +347,17 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   drain: observe its completion from a later clone before reopening storage.
   Restart each voter normally and preserve a surviving quorum. Abrupt loss
   still uses ordinary elections, and no storage format or timer changes.
+- An embedder with a failed replication listener revokes external admission,
+  retains its failure diagnostic, joins transports, and calls
+  `ConsensusConfigStore::shutdown_unplanned()`. It suppresses new handoff
+  preparation and cancels an outstanding preparation before the same owned
+  engine/storage drain; already dispatched RPCs cannot be retracted.
+  `PlannedShutdownFallback::Unplanned` distinguishes suppressed preparation
+  from handoff failure. Completed reports remain unchanged. Caller cancellation
+  or timeout cannot reopen admission or abandon the drain. Config bus adapters
+  use this route through `RaftManagedDatastore::consensus_store()`; they own no
+  separate consensus lifecycle. Surviving voters use ordinary elections, and
+  restart requires no manual cleanup. Voluntary stops retain planned handoff.
 - `ensure_local_authority` is deliberately distinct from routed durable reads:
   only the current local leader can pass it. Unknown leadership, quorum loss,
   membership drift, or apply timeout is an unavailable result, never

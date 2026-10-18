@@ -50,6 +50,19 @@ persistence authority.
   standalone consensus-node binary are removed rather than retained as a
   compatibility engine.
 
+Both store adapters distinguish planned retirement from unplanned drain.
+Ordinary `shutdown()` retains the automatic bounded leadership handoff.
+`shutdown_unplanned()` is the explicit route for an embedder with a failed
+replication listener: revoke admission, retain the failure diagnostic, join
+transports, then drain without starting a handoff. It cancels outstanding
+preparation without retracting already dispatched RPCs. Every clone observes
+one retained engine/storage drain despite caller cancellation or timeout.
+Session native close proofs retain their existing active-incarnation, normal
+engine-stop and durable-cut checks; reopen never grants traffic authority by
+itself. No election, emergency-session, storage-format or operator-cleanup
+policy changes. Voluntary retirement remains subject to the consumer's
+emergency hold.
+
 The shared engine also has one runtime and complete-call profile.
 `opc-consensus` owns the 2,000 ms heartbeat/AppendEntries/read-index ceiling,
 5,000 ms Vote ceiling, `[5,000 ms, 8,000 ms)` election range, 10,000 ms

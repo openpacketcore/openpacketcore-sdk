@@ -694,6 +694,17 @@ and half the configured complete-operation budget, reserving time for drain.
 A caller timeout leaves the same owned drain running; a later clone must
 observe completion before storage is reopened.
 
+An embedder with a failed replication listener instead revokes external
+admission, retains the failure diagnostic, joins its transports, and calls
+`shutdown_unplanned()`. This route fences local admission and suppresses new
+handoff preparation across clones. It cancels and joins outstanding preparation;
+already dispatched RPCs cannot be retracted. The retained report uses
+`PlannedShutdownFallback::Unplanned` when preparation is suppressed. A completed
+handoff result remains unchanged. The same bounded observation, retained engine
+and native storage drain, and close-proof/reopen checks apply. Surviving voters
+recover through ordinary elections; no operator cleanup is needed. Voluntary
+stops still require the consumer's emergency hold and planned handoff.
+
 Call `prepare_shutdown()` explicitly when a separate preparation phase is
 needed before removing the listener. The store closes local consumer admission and
 atomically asks the engine to retire from campaigning. A retiring leader hands
