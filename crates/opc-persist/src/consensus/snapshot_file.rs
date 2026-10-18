@@ -66,7 +66,7 @@ impl ConfigSnapshotFile {
                 .open(&path)?,
         );
         #[cfg(not(unix))]
-        let file = tokio::fs::OpenOptions::new().read(true).open(&path).await?;
+        let file = tokio::fs::File::from_std(std::fs::OpenOptions::new().read(true).open(&path)?);
         Ok(Self {
             file,
             path,

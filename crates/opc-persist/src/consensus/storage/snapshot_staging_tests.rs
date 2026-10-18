@@ -361,6 +361,163 @@ async fn stalled_snapshot_directory_io_remains_bounded() {
     assert_eq!(SNAPSHOT_OPERATION_TIMEOUT, started.elapsed());
 }
 
+async fn interrupt_startup_sweep_repeatedly(expire: bool) {
+    let temp = tempfile::tempdir().expect("snapshot fixture");
+    let backend_a = backend(&temp.path().join("a.sqlite")).await;
+    let backend_b = backend(&temp.path().join("b.sqlite")).await;
+    let snapshots_a = temp.path().join("a-snapshots");
+    let snapshots_b = temp.path().join("b-snapshots");
+    let (log, mut machine, _) = open(&backend_b, &snapshots_b, identity(), members())
+        .await
+        .expect("initial B owner");
+    machine
+        .apply([membership(), blank()])
+        .await
+        .expect("published state");
+    let published = machine
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .expect("published B snapshot");
+    let filename = published
+        .snapshot
+        .path()
+        .file_name()
+        .expect("published name")
+        .to_owned();
+    let expected_bytes = std::fs::read(snapshots_b.join(&filename)).expect("published bytes");
+    let expected_meta = published.meta.clone();
+    drop(published);
+    drop(log);
+    drop(machine);
+
+    for _ in 0..3 {
+        // Initialize exactly as open does, then pause its real startup sweep
+        // immediately before the blocking unlink. No global hook or FD changes.
+        let admitted = admit_snapshot_directory(&backend_a, snapshots_a.clone())
+            .expect("A directory admission");
+        std::fs::write(snapshots_a.join(&filename), &expected_bytes).expect("orphan in A");
+        let core = sqlite::ConfigConsensusCore::initialize(
+            &backend_a,
+            admitted,
+            identity(),
+            members(),
+            Arc::new(ConfigDurableProgress::default()),
+            None,
+        )
+        .await
+        .expect("A initialization before startup sweep");
+        let mut released = core.storage_shutdown_observer();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *core
+            .snapshot_test_hooks
+            .before_snapshot_remove
+            .lock()
+            .expect("unlink hook") = Some(Box::new(move || {
+            entered.send(()).expect("unlink started");
+            paused.recv_timeout(WATCHDOG).expect("resume unlink");
+        }));
+        let task = tokio::spawn(async move { validate_and_clean_snapshot_directory(&core).await });
+        tokio::time::timeout(WATCHDOG, started)
+            .await
+            .expect("startup unlink starts within watchdog")
+            .expect("unlink hook entered");
+        if expire {
+            tokio::time::pause();
+            // Cross the timer's millisecond rounding: the blocked filesystem
+            // worker intentionally prevents Tokio's automatic clock advance.
+            tokio::time::advance(SNAPSHOT_OPERATION_TIMEOUT + Duration::from_millis(1)).await;
+            let result = task.await.expect("timed out startup task");
+            tokio::time::resume();
+            assert_eq!(Err(ConfigConsensusStorageError::BackendUnavailable), result);
+        } else {
+            task.abort();
+            assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        }
+
+        // Reopening B exercises normal descriptor allocation while A's actual
+        // filesystem operation is still in flight after its caller has gone.
+        let (live_log, mut live_b, _) = open(&backend_b, &snapshots_b, identity(), members())
+            .await
+            .expect("B can reopen while A's unlink is pending");
+        let competing_a = tokio::time::timeout(
+            WATCHDOG,
+            open(&backend_a, &snapshots_a, identity(), members()),
+        )
+        .await
+        .expect("A admission remains bounded");
+        assert!(
+            matches!(
+                competing_a,
+                Err(ConfigConsensusStorageError::BackendUnavailable)
+            ),
+            "cancelled startup must retain A admission until its actual unlink finishes"
+        );
+        assert!(
+            matches!(
+                open(&backend_b, &snapshots_b, identity(), members()).await,
+                Err(ConfigConsensusStorageError::BackendUnavailable)
+            ),
+            "B is a live owner"
+        );
+        assert!(
+            released.has_changed().is_ok(),
+            "the detached unlink remains an owner"
+        );
+        resume.send(()).expect("release cancelled startup unlink");
+        assert!(tokio::time::timeout(WATCHDOG, released.changed())
+            .await
+            .expect("actual unlink finishes within watchdog")
+            .is_err());
+        assert!(
+            !snapshots_a.join(&filename).exists(),
+            "late unlink cleans A's orphan"
+        );
+        assert_eq!(
+            expected_bytes,
+            std::fs::read(snapshots_b.join(&filename))
+                .expect("A's cancelled sweep must preserve B's published snapshot")
+        );
+        let current = live_b
+            .get_current_snapshot()
+            .await
+            .expect("live B read")
+            .expect("live B publication");
+        assert_eq!(expected_meta, current.meta);
+        drop(current);
+        drop(live_log);
+        drop(live_b);
+        let (_, mut reopened_b, _) = open(&backend_b, &snapshots_b, identity(), members())
+            .await
+            .expect("B reopens after A's late unlink");
+        assert_eq!(
+            expected_meta,
+            reopened_b
+                .get_current_snapshot()
+                .await
+                .expect("reopened B read")
+                .expect("reopened B publication")
+                .meta
+        );
+        open(&backend_a, &snapshots_a, identity(), members())
+            .await
+            .expect("A restarts without manual cleanup");
+        assert!(files(&snapshots_a).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn cancelled_startup_sweeps_keep_ownership_and_other_published_snapshots() {
+    interrupt_startup_sweep_repeatedly(false).await;
+}
+
+#[tokio::test]
+async fn timed_out_startup_sweeps_keep_ownership_and_other_published_snapshots() {
+    interrupt_startup_sweep_repeatedly(true).await;
+}
+
 #[tokio::test]
 async fn admission_reader_does_not_retain_a_retired_snapshot_owner() {
     let temp = tempfile::tempdir().expect("snapshot fixture");

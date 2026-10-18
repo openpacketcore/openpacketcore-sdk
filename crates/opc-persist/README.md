@@ -336,7 +336,10 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   guards even when the async runtime disappears. A committed artifact remains
   published; the next open verifies it and sweeps recognized stale artifacts.
   Nonblocking exclusive directory admission prevents a second opener from
-  sweeping a live receiver or worker. Shutdown discards partial voter transfers
+  sweeping a live receiver or worker. Blocking filesystem work retains that
+  admission and the directory descriptor through completion, even after startup
+  cleanup is cancelled or times out; a reused descriptor cannot redirect a late
+  operation into another store. Shutdown discards partial voter transfers
   and releases admission after cleanup; retained admission readers do not hold
   that lock. No manual staging cleanup is required.
 - `probe_durable_readiness` uses Openraft's linearizable path; listener bind or

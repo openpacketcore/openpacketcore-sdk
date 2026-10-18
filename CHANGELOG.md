@@ -1098,7 +1098,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-persist`: retain snapshot staging ownership through file creation and
   SQLite commit when an async runtime is dropped. Committed build/install
   artifacts survive teardown, and the next open removes stale artifacts while
-  excluding live owners. Planned shutdown removes partial voter transfers and
+  excluding live owners. Cancelled or timed-out startup filesystem work keeps
+  its directory descriptor and admission until completion, preventing late
+  cleanup from deleting another store's published snapshot through descriptor
+  reuse. Planned shutdown removes partial voter transfers and
   permits restart with old closed handles still alive. (#1340)
 
 - `opc-persist`: snapshot reads pin the last durable publication independently
