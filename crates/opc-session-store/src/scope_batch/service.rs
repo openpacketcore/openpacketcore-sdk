@@ -516,18 +516,28 @@ impl ScopeBatchStore {
         match self.store.commit_scope_batch(command, class).await {
             Ok(outcome) => Ok(outcome),
             Err(
-                ScopeBatchError::OutcomeUnknown
+                _error @ (ScopeBatchError::OutcomeUnknown
                 | ScopeBatchError::Unavailable
                 | ScopeBatchError::Scope(
                     ScopeAuthorityError::Unavailable | ScopeAuthorityError::OutcomeUnknown,
-                ),
+                )),
             ) => {
+                #[cfg(all(test, feature = "test-control"))]
+                if matches!(_error, ScopeBatchError::OutcomeUnknown) {
+                    crate::consensus::store::recovery_test_control::record(
+                        crate::consensus::store::recovery_test_control::Event::ScopeBatchOutcomeUnknown,
+                    );
+                }
                 if let Ok(current) = self
                     .store
                     .scope_batch_checkpoint(self.namespace.scope())
                     .await
                 {
                     if current.replay(request) == Ok(true) {
+                        #[cfg(all(test, feature = "test-control"))]
+                        crate::consensus::store::recovery_test_control::record(
+                            crate::consensus::store::recovery_test_control::Event::CheckpointResolved,
+                        );
                         return current
                             .outcome(request.lane())
                             .cloned()

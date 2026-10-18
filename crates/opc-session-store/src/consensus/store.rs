@@ -167,6 +167,8 @@ mod log_recovery;
 mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
+#[cfg(all(test, feature = "test-control"))]
+pub(crate) mod recovery_test_control;
 mod scheduling;
 mod scope_authority;
 mod transport_class;
@@ -9839,7 +9841,12 @@ impl ConsensusSessionStore {
             drop(proposal_permit);
             drop(operation_guard);
         });
-        match tokio::time::timeout_at(deadline, completion_rx).await {
+        let completion = tokio::time::timeout_at(deadline, completion_rx).await;
+        #[cfg(all(test, feature = "test-control"))]
+        if completion.is_err() {
+            recovery_test_control::record(recovery_test_control::Event::DeadlineExpired);
+        }
+        match completion {
             Err(_) | Ok(Err(_)) => {
                 #[cfg(test)]
                 eprintln!(

@@ -22,6 +22,8 @@ impl ConsensusSessionStore {
         F: FnMut(tokio::time::Instant) -> Fut + Send + 'static,
         Fut: Future<Output = Option<T>> + Send,
     {
+        #[cfg(all(test, feature = "test-control"))]
+        let retry_clock = recovery_test_control::current_pacer();
         if self.inner.raft.metrics().borrow().running_state.is_err() {
             return Err(PressureRetryFailure::NotTransmitted);
         }
@@ -46,6 +48,8 @@ impl ConsensusSessionStore {
                     let current = metrics.borrow();
                     (current.vote, current.current_leader)
                 };
+                #[cfg(all(test, feature = "test-control"))]
+                let clock_idle = retry_clock.as_ref().map(|clock| clock.idle());
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_millis(100)) => {},
                     _ = metrics.wait_for(|current| {
@@ -53,6 +57,8 @@ impl ConsensusSessionStore {
                             || current.running_state.is_err()
                     }) => {},
                 }
+                #[cfg(all(test, feature = "test-control"))]
+                drop(clock_idle);
                 if metrics.borrow().running_state.is_err()
                     || store.inner.retirement.is_started()
                     || store

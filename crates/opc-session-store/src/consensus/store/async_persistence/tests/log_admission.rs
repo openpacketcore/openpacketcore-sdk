@@ -20,12 +20,30 @@ const WAIT: Duration = Duration::from_secs(60);
 struct SlowAcceptedReply {
     stores: Vec<ConsensusSessionStore>,
     holds: Vec<Arc<AcceptedClientWriteReceiverHoldForTest>>,
-    release: tokio::task::JoinHandle<()>,
+    release: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[cfg(feature = "test-control")]
 impl SlowAcceptedReply {
     fn arm(fleet: &Fleet) -> Self {
+        let mut held = Self::hold(fleet);
+        let releasing = held.holds.clone();
+        held.release = Some(tokio::spawn(async move {
+            futures_util::future::select_all(
+                releasing
+                    .iter()
+                    .map(|hold| Box::pin(hold.entered.notified())),
+            )
+            .await;
+            tokio::time::sleep(OPERATION_BOUND + Duration::from_millis(100)).await;
+            for hold in releasing {
+                hold.release.notify_one();
+            }
+        }));
+        held
+    }
+
+    fn hold(fleet: &Fleet) -> Self {
         let stores = fleet.stores.iter().flatten().cloned().collect::<Vec<_>>();
         let holds = stores
             .iter()
@@ -37,23 +55,10 @@ impl SlowAcceptedReply {
                 hold
             })
             .collect::<Vec<_>>();
-        let releasing = holds.clone();
-        let release = tokio::spawn(async move {
-            futures_util::future::select_all(
-                releasing
-                    .iter()
-                    .map(|hold| Box::pin(hold.entered.notified())),
-            )
-            .await;
-            tokio::time::sleep(OPERATION_BOUND + Duration::from_millis(100)).await;
-            for hold in releasing {
-                hold.release.notify_one();
-            }
-        });
         Self {
             stores,
             holds,
-            release,
+            release: None,
         }
     }
 }
@@ -61,7 +66,9 @@ impl SlowAcceptedReply {
 #[cfg(feature = "test-control")]
 impl Drop for SlowAcceptedReply {
     fn drop(&mut self) {
-        self.release.abort();
+        if let Some(release) = &self.release {
+            release.abort();
+        }
         for hold in &self.holds {
             hold.release.notify_one();
         }
@@ -1220,6 +1227,19 @@ async fn blocked_transfer(
             // The fill command deliberately replays one receipt. Recovery
             // needs a fresh identity once, then retains it across every route.
             let request_id = SessionConsensusRequestId::new();
+            let submitter = store.clone();
+            let (write, _) = recovery_test_control::run(
+                deadline.into_std(),
+                Duration::from_millis(100),
+                async move {
+                    submitter.submit_request_before(
+                        request_id,
+                        SessionMutationIntent::AdvanceLogicalTime,
+                        None,
+                        tokio::time::Instant::now() + WAIT,
+                    ).await
+                },
+            );
             tokio::time::timeout_at(deadline, async {
                 let handoff = async {
                     let mut metrics = store.inner.raft.metrics();
@@ -1234,12 +1254,7 @@ async fn blocked_transfer(
                     drop(hold);
                 };
                 let (reply, ()) = tokio::join!(
-                    store.submit_request_before(
-                        request_id,
-                        SessionMutationIntent::AdvanceLogicalTime,
-                        None,
-                        deadline,
-                    ),
+                    write,
                     handoff,
                 );
                 assert!(matches!(&reply, Ok(response) if response.result.is_ok()),

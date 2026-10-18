@@ -140,8 +140,18 @@ async fn retained_batch(
         let request_bytes = postcard::to_allocvec(&request).unwrap();
         let attempt = request.attempt().unwrap();
         let _slow_reply = slow_reply.then(|| SlowAcceptedReply::arm(&fleet));
-        let mut write =
-            Box::pin(batches.execute_classified(&identity, &request, ScopeWorkClass::Normal));
+        let service = batches.clone();
+        let authenticated = identity.clone();
+        let retained = request.clone();
+        let (write, mut pressure_clock_advanced) = recovery_test_control::run(
+            std::time::Instant::now() + OPERATION_BOUND
+                + Duration::from_millis(100) + Duration::from_secs(10),
+            OPERATION_BOUND + Duration::from_millis(100),
+            async move {
+                service.execute_classified(&authenticated, &retained, ScopeWorkClass::Normal).await
+            },
+        );
+        let mut write = Box::pin(write);
         assert!(
             tokio::time::timeout(OPERATION_BOUND + Duration::from_millis(100), &mut write)
                 .await
@@ -156,6 +166,12 @@ async fn retained_batch(
             SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS,
             "pressure keeps no running proposal credit"
         );
+        let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        tokio::time::timeout_at(
+            recovery_deadline,
+            pressure_clock_advanced.wait_for(|advanced| *advanced),
+        ).await.expect("pressure owner crosses the original protocol deadline")
+            .expect("pressure clock remains owned");
         if revoke {
             admission.allowed.store(false, Ordering::Release);
         }
@@ -166,7 +182,7 @@ async fn retained_batch(
             if !handoff {
                 drop(hold.take());
             }
-            let result = tokio::time::timeout(Duration::from_secs(10), &mut write)
+            let result = tokio::time::timeout_at(recovery_deadline, &mut write)
                 .await
                 .unwrap();
             if revoke {
@@ -199,7 +215,12 @@ async fn retained_batch(
             }
             drop(hold.take());
         }
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let lookup_deadline = if cancel_observer {
+            recovery_deadline
+        } else {
+            tokio::time::Instant::now() + Duration::from_secs(10)
+        };
+        tokio::time::timeout_at(lookup_deadline, async {
             loop {
                 if let ScopeBatchLookup::Applied(outcome) =
                     batches.lookup(&identity, &attempt).await.unwrap()
@@ -228,6 +249,56 @@ async fn log_admission_review_public_write_retains_local_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_admission_review_public_write_retains_request_with_slow_reply() {
     retained_batch(false, false, false, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_public_batch_deadline_resolves_committed_checkpoint() {
+    let mut fleet = fleet(SessionPersistenceMode::Durable).await;
+    let result = AssertUnwindSafe(async {
+        let leader = fleet.leader();
+        let store = fleet.store(leader).clone();
+        let (batches, identity, request, _) =
+            batch_fixture(&store, ScopeWorkClass::Normal).await;
+        let held = SlowAcceptedReply::hold(&fleet);
+        let before = store.inner.raft.metrics().borrow().last_log_index.unwrap();
+        clock::run(async move {
+            let started = tokio::time::Instant::now();
+            let mut write = Box::pin(recovery_test_control::observe(
+                batches.execute_classified(&identity, &request, ScopeWorkClass::Normal),
+            ));
+            {
+                let entered = held.holds[leader].entered.notified();
+                tokio::pin!(entered);
+                tokio::select! {
+                    () = &mut entered => {},
+                    result = &mut write => panic!("batch completed before its accepted reply was held: {result:?}"),
+                }
+            }
+            // The real Raft runtime commits the command while its reply stays
+            // held. The public operation must still observe its own deadline.
+            let mut metrics = store.inner.raft.metrics();
+            metrics.wait_for(|current| current.last_applied.is_some_and(|log| log.index >= before + 1))
+                .await.unwrap();
+            tokio::time::advance(OPERATION_BOUND - Duration::from_millis(1)).await;
+            assert!(write.as_mut().now_or_never().is_none(), "the 800ms deadline has not fired at 799ms");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let (outcome, events) = write.await;
+            assert_eq!(started.elapsed(), OPERATION_BOUND);
+            assert_eq!(events, vec![
+                recovery_test_control::Event::DeadlineExpired,
+                recovery_test_control::Event::ScopeBatchOutcomeUnknown,
+                recovery_test_control::Event::CheckpointResolved,
+            ], "expiry returns unknown before the service resolves the committed checkpoint");
+            let outcome = outcome.unwrap();
+            assert!(outcome.matches_request(&request));
+            assert_eq!(outcome.counters()[0], 7);
+            assert_eq!(store.inner.raft.metrics().borrow().last_log_index, Some(before + 1),
+                "checkpoint resolution must not replay the ambiguous mutation");
+            drop(held);
+        }).await;
+    }).catch_unwind().await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1175,7 +1175,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the original voter's automatic purge within the existing bounds, including
   a held-builder case that forces leadership transfer before release. Failure
   diagnostics distinguish setup leadership changes, forwarding ambiguity, and
-  accepted-proposal completion deadlines. (#1249)
+  accepted-proposal completion deadlines. Successful transfer and retained-write
+  recovery control protocol time while preserving real retry pacing and the
+  existing physical watchdogs. An explicit 800 ms expiry test observes the
+  unknown outcome and checkpoint resolution without replaying the mutation.
+  (#1249)
 
 - `opc-session-store`: apply retained-log backpressure before ordinary leader
   proposals. Followers always deliver complete authenticated replicated batches
