@@ -1,11 +1,14 @@
 #define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -23,8 +26,16 @@ static int hold_call(int fd, const char *operation) {
     syscall(SYS_close, marker);
     int expected = -1;
     char selected[16] = {0};
-    if (count <= 0 || sscanf(text, "%d %15s", &expected, selected) != 2 ||
-        expected != fd || strcmp(selected, operation) != 0) return -1;
+    if (count <= 0 || sscanf(text, "%d %15s", &expected, selected) != 2) return -1;
+    if (strncmp(selected, "inode-", 6) == 0 && strcmp(selected + 6, operation) == 0) {
+        /* Directory validation opens its own descriptor. Match the still-open
+         * fixture inode, including its device, without relying on fd reuse. */
+        struct stat actual, wanted;
+        if (fstat(fd, &actual) != 0 || fstat(expected, &wanted) != 0 ||
+            actual.st_dev != wanted.st_dev || actual.st_ino != wanted.st_ino) return -1;
+    } else if (expected != fd || strcmp(selected, operation) != 0) {
+        return -1;
+    }
 
     int channel = syscall(SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (channel < 0) _exit(90);
@@ -50,6 +61,37 @@ static void finish_call(int channel, int saved_errno) {
         syscall(SYS_close, channel);
     }
     errno = saved_errno;
+}
+
+static int held_openat(int directory, const char *path, int flags, va_list args) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE)
+        mode = va_arg(args, mode_t);
+    int result = syscall(SYS_openat, directory, path, flags, mode);
+    int saved_errno = errno;
+    int channel = result < 0 ? -1 : hold_call(result, "open");
+    finish_call(channel, saved_errno);
+    return result;
+}
+
+/* Explicit symbols keep the 32-bit large-file redirects independent of the
+ * fixture's own 64-bit stat declarations. Both call the real syscall once. */
+int probe_openat(int directory, const char *path, int flags, ...) __asm__("openat");
+int probe_openat(int directory, const char *path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    int result = held_openat(directory, path, flags, args);
+    va_end(args);
+    return result;
+}
+
+int probe_openat64(int directory, const char *path, int flags, ...) __asm__("openat64");
+int probe_openat64(int directory, const char *path, int flags, ...) {
+    va_list args;
+    va_start(args, flags);
+    int result = held_openat(directory, path, flags | O_LARGEFILE, args);
+    va_end(args);
+    return result;
 }
 
 ssize_t read(int fd, void *buffer, size_t length) {

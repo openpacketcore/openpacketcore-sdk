@@ -7878,13 +7878,13 @@ impl SqliteConsensusSnapshotBuilder {
         self.core
             .snapshot_observation
             .record_phase_for_test("preparing_return");
+        #[cfg(test)]
+        wait_before_fixed_snapshot_return(&final_path).await;
         let snapshot = if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
             // The descriptor was sealed, measured, scanned, and bound before
             // metadata publication. Return that exact descriptor: reopening
             // `final_path` here could substitute a byte-identical, unsealed
             // inode after the final authority check.
-            #[cfg(test)]
-            wait_before_fixed_snapshot_return(&final_path).await;
             let published_pin = published_pin.ok_or_else(|| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
