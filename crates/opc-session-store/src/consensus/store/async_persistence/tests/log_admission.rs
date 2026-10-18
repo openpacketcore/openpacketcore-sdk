@@ -847,7 +847,12 @@ async fn log_admission_cancelled_follower_append_owns_real_flush_and_authority()
 }
 
 #[cfg(feature = "test-control")]
-async fn blocked_build(mode: SessionPersistenceMode, window: u64, cycles: usize) {
+async fn blocked_build(
+    mode: SessionPersistenceMode,
+    window: u64,
+    cycles: usize,
+    handoff_before_release: bool,
+) {
     let mut fleet = fleet(mode).await;
     let result = AssertUnwindSafe(async {
         let leader = fleet.leader();
@@ -881,6 +886,18 @@ async fn blocked_build(mode: SessionPersistenceMode, window: u64, cycles: usize)
             assert!(store.inner.raft.metrics().borrow().running_state.is_ok());
             assert_eq!(store.inner.raft.metrics().borrow().snapshot, before.snapshot);
             assert_eq!(store.inner.proposal_admission.available_permits(), SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS);
+            if handoff_before_release {
+                let mut metrics = store.inner.raft.metrics();
+                let elected = tokio::time::timeout(WAIT, metrics.wait_for(|current| {
+                    current.vote.is_committed()
+                        && current.vote.leader_id.term > before.vote.leader_id.term
+                        && current.current_leader.is_some_and(|node| node != store.inner.local_node_id)
+                })).await.expect("held builder must trigger automatic pressure handoff")
+                    .unwrap().clone();
+                assert_ne!(elected.current_leader, Some(store.inner.local_node_id));
+                assert_eq!(store.log_pressure_snapshot().retained_rows, window);
+                assert_eq!(elected.snapshot, before.snapshot);
+            }
             // Releasing the stalled build is the only intervention. The engine
             // and SDK must select the next snapshot and purge without a manual trigger.
             drop(guard);
@@ -906,7 +923,7 @@ async fn log_admission_blocked_build_recovers_three_cycles_durable() {
     let window = DURABLE_OPENRAFT_PROFILE.retained_logs
         + 2 * DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
         + 64;
-    blocked_build(SessionPersistenceMode::Durable, window, 3).await;
+    blocked_build(SessionPersistenceMode::Durable, window, 3, false).await;
 }
 
 #[cfg(feature = "test-control")]
@@ -915,7 +932,16 @@ async fn log_admission_blocked_build_recovers_three_cycles_async() {
     let window = DURABLE_OPENRAFT_PROFILE.retained_logs
         + 2 * DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
         + 64;
-    blocked_build(SessionPersistenceMode::Async, window, 3).await;
+    blocked_build(SessionPersistenceMode::Async, window, 3, false).await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_blocked_build_recovers_after_pressure_handoff() {
+    let window = DURABLE_OPENRAFT_PROFILE.retained_logs
+        + 2 * DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
+        + 64;
+    blocked_build(SessionPersistenceMode::Async, window, 1, true).await;
 }
 
 #[cfg(feature = "test-control")]
@@ -1198,6 +1224,7 @@ async fn log_admission_full_window_blocked_build_durable() {
         SessionPersistenceMode::Durable,
         crate::consensus::SESSION_CONSENSUS_LOG_HIGH_WATER_ROWS,
         1,
+        false,
     )
     .await;
 }
@@ -1209,6 +1236,7 @@ async fn log_admission_full_window_blocked_build_async() {
         SessionPersistenceMode::Async,
         crate::consensus::SESSION_CONSENSUS_LOG_HIGH_WATER_ROWS,
         1,
+        false,
     )
     .await;
 }
