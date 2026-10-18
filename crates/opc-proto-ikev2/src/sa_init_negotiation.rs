@@ -28,8 +28,9 @@ const TRANSFORM_ATTRIBUTE_KEY_LENGTH: u16 = 14;
 
 /// Ordered, executable IKE-SA capabilities accepted by a responder.
 ///
-/// Profiles are tried in caller preference order. Proposal order breaks ties
-/// between two offers of the same profile. Construction validates every
+/// Group-1 profiles follow every other group. Caller preference order among
+/// other profiles is preserved; proposal order breaks ties for the same
+/// profile. Construction validates every
 /// profile up front so configuration can fail before traffic is accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ikev2SaInitNegotiationPolicy {
@@ -47,12 +48,15 @@ impl Ikev2SaInitNegotiationPolicy {
     pub fn new(
         preferred_profiles: Vec<Ikev2SaInitCryptoProfile>,
     ) -> Result<Self, Ikev2SaInitNegotiationError> {
-        let policy = Self { preferred_profiles };
+        let mut policy = Self { preferred_profiles };
         policy.validate_capabilities()?;
+        policy
+            .preferred_profiles
+            .sort_by_key(|profile| profile.dh_group().transform_id() == 1);
         Ok(policy)
     }
 
-    /// Profiles in responder preference order.
+    /// Profiles in effective preference order, with group 1 last.
     pub fn preferred_profiles(&self) -> &[Ikev2SaInitCryptoProfile] {
         &self.preferred_profiles
     }
@@ -250,6 +254,16 @@ pub fn negotiate_ike_sa_init(
 
     let mut mismatched_preferred_group = None;
     for profile in policy.preferred_profiles.iter().copied() {
+        // A legacy KE must not hide a stronger common suite. Ask the peer to
+        // retry that suite's KE instead of falling back to group 1.
+        if profile.dh_group().transform_id() == 1 {
+            if let Some(preferred) = mismatched_preferred_group {
+                return Err(Ikev2SaInitNegotiationError::KeyExchangeDhGroupMismatch {
+                    received: payloads.key_exchange.dh_group,
+                    preferred,
+                });
+            }
+        }
         for proposal in &payloads.security_association.proposals {
             let Some(selected_indices) = select_profile_transforms(profile, proposal) else {
                 continue;
@@ -296,6 +310,23 @@ pub fn negotiate_ike_sa_init(
         });
     }
     Err(Ikev2SaInitNegotiationError::NoAcceptableProposal)
+}
+
+pub(crate) fn prefer_stronger_dh_groups(offer: &mut Ikev2SaPayloadBuild) {
+    for proposal in &mut offer.proposals {
+        proposal.transforms.sort_by_key(|transform| {
+            transform.transform_type == TRANSFORM_TYPE_DH && transform.transform_id == 1
+        });
+    }
+    offer.proposals.sort_by_key(|proposal| {
+        !proposal.transforms.iter().any(|transform| {
+            transform.transform_type == TRANSFORM_TYPE_DH && transform.transform_id != 1
+        })
+    });
+    for (number, proposal) in (1..=u8::MAX).zip(&mut offer.proposals) {
+        // The caller already validated the 255-proposal wire bound.
+        proposal.proposal_number = number;
+    }
 }
 
 fn validate_proposals(

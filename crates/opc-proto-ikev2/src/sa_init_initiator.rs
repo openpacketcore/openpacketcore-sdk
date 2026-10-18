@@ -256,11 +256,12 @@ impl fmt::Debug for Ikev2SaInitResponse<'_> {
 
 /// Build a non-testkit IKE_SA_INIT request using a caller-held live DH key.
 ///
-/// Proposal and transform order are preserved. Proposals must be numbered
+/// Group-1 alternatives/proposals follow stronger groups; other caller order
+/// is preserved and proposal numbers are consecutive. Input proposals must be numbered
 /// consecutively from one and contain complete SDK-supported IKE suites with
 /// no proposal SPI. Alternatives of the same transform type are permitted;
 /// AEAD and separate-integrity ciphers need separate proposals. Ni must be
-/// 16..=256 octets and at least half the preferred key length of every offered
+/// 32..=256 octets and at least half the preferred key length of every offered
 /// PRF (RFC 7296 §2.10). The caller supplies unpredictable fresh Ni and SPIi.
 ///
 /// Notifications follow Ni in caller order, except one valid COOKIE is moved
@@ -292,10 +293,12 @@ pub fn build_ike_sa_init_request(
     if !(nonce_minimum..=256).contains(&nonce.len()) {
         return Err(Ikev2SaInitInitiatorError::InvalidInitiatorNonce);
     }
+    let mut offer = offer.clone();
+    crate::sa_init_negotiation::prefer_stronger_dh_groups(&mut offer);
     let mut entries = vec![
         (
             PayloadType::SecurityAssociation,
-            encode_sa_payload_build(offer).map_err(|_| Ikev2SaInitInitiatorError::Encoding)?,
+            encode_sa_payload_build(&offer).map_err(|_| Ikev2SaInitInitiatorError::Encoding)?,
         ),
         (
             PayloadType::KeyExchange,
@@ -463,9 +466,6 @@ pub fn admit_ike_sa_init_response<'a>(
     validate_dh_public_value(profile.dh_group(), ke.key_exchange_data)
         .map_err(|_| Ikev2SaInitInitiatorError::InvalidKeyExchange)?;
     let nonce = nonce.ok_or(Ikev2SaInitInitiatorError::MissingPayload)?;
-    if nonce.nonce.len() < profile.prf().output_len().div_ceil(2) {
-        return Err(Ikev2SaInitInitiatorError::InvalidResponderNonce);
-    }
     Ok(Ikev2SaInitResponse::Accepted(Ikev2SaInitAccepted {
         profile,
         responder_spi: header.responder_spi,
@@ -522,7 +522,7 @@ fn validate_offer(offer: &Ikev2SaPayloadBuild) -> Result<usize, Ikev2SaInitIniti
     if offer.proposals.is_empty() || offer.proposals.len() > 255 {
         return Err(Ikev2SaInitInitiatorError::InvalidOffer);
     }
-    let mut nonce_minimum = 16;
+    let mut nonce_minimum = 32;
     for (index, proposal) in offer.proposals.iter().enumerate() {
         if usize::from(proposal.proposal_number) != index + 1
             || proposal.protocol_id != 1

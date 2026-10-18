@@ -540,7 +540,7 @@ fn enforces_prf_specific_initiator_and_responder_nonce_floors() {
         .find(|entry| entry.payload_type == PayloadType::Nonce)
         .expect("nonce entry")
         .body
-        .truncate(16);
+        .truncate(15);
     let (first, bytes) = chain(&entries);
     let mut boundary = Ikev2ChildSaRekeyResponseBoundary::new(
         &request_header(),
@@ -553,12 +553,36 @@ fn enforces_prf_specific_initiator_and_responder_nonce_floors() {
         boundary
             .commit_response(&response_header(), first, &bytes)
             .expect_err("short Nr must not commit"),
-        Ikev2ChildSaRekeyResponseError::ResponderNonceTooShortForPrf {
-            actual: 16,
-            minimum: 32,
-        }
+        Ikev2ChildSaRekeyResponseError::Nonce(
+            opc_proto_ikev2::Ikev2NoncePayloadError::NonceTooShort
+        )
     );
     assert!(!boundary.terminal_committed());
+}
+
+#[test]
+fn accepts_a_16_octet_received_sha512_nonce() {
+    let request = request_build(false);
+    let mut entries = response_entries(&request, vec![0x61, 0x62, 0x63, 0x64]);
+    entries
+        .iter_mut()
+        .find(|entry| entry.payload_type == PayloadType::Nonce)
+        .unwrap()
+        .body
+        .truncate(16);
+    let (first, bytes) = chain(&entries);
+    let mut boundary = Ikev2ChildSaRekeyResponseBoundary::new(
+        &request_header(),
+        request,
+        current_traffic_selectors(),
+        Ikev2PrfAlgorithm::HmacSha2_512,
+    )
+    .unwrap();
+    let response = boundary
+        .commit_response(&response_header(), first, &bytes)
+        .unwrap();
+    assert_eq!(response.nonce().nonce.len(), 16);
+    assert!(boundary.terminal_committed());
 }
 
 #[test]

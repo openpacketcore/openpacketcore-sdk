@@ -882,6 +882,27 @@ pub struct Ikev2NoncePayloadBuild {
     pub nonce: Vec<u8>,
 }
 
+impl Ikev2NoncePayloadBuild {
+    /// Generate a fresh local nonce through the admitted entropy provider.
+    ///
+    /// For either role, initial exchanges and rekeys, the length is at least
+    /// 32 octets and half the PRF's preferred key length. Peer nonces may be
+    /// shorter; decoding and transcript KDFs accept 16..=256 octets.
+    ///
+    /// # Errors
+    /// Returns a typed crypto error if entropy admission or generation fails.
+    pub fn generate(
+        prf: crate::sa_init_crypto::Ikev2PrfAlgorithm,
+    ) -> Result<Self, crate::sa_init_crypto::Ikev2SaInitCryptoError> {
+        let mut nonce = vec![0; prf.output_len().div_ceil(2).max(32)];
+        crate::crypto_module::with_entropy_operation(|module| module.fill_random(&mut nonce))
+            .map_err(|error| {
+                crate::sa_init_crypto::Ikev2SaInitCryptoError::CryptoModuleFailure { error }
+            })?;
+        Ok(Self { nonce })
+    }
+}
+
 impl fmt::Debug for Ikev2NoncePayloadBuild {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ikev2NoncePayloadBuild")

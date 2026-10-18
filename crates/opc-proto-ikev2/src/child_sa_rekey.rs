@@ -410,8 +410,7 @@ pub enum Ikev2ChildSaRekeyResponseError {
     InitiatorTrafficSelectorOfferNarrowerThanCurrent,
     /// The request TSr offer did not cover the current Child-SA TSr floor.
     ResponderTrafficSelectorOfferNarrowerThanCurrent,
-    /// Initiator nonce was shorter than half the negotiated PRF preferred key
-    /// length.
+    /// Local initiator nonce was shorter than 32 octets or half the PRF key.
     InitiatorNonceTooShortForPrf {
         /// Received nonce length.
         actual: usize,
@@ -511,8 +510,8 @@ pub enum Ikev2ChildSaRekeyResponseError {
     KeyExchangeGroupMismatch,
     /// KEr public value was invalid for the selected group.
     KeyExchangeValueInvalid(Ikev2SaInitCryptoError),
-    /// Responder nonce was shorter than half the negotiated PRF preferred key
-    /// length.
+    /// Retained legacy diagnostic; peer decoding now enforces the absolute
+    /// 16-octet receive floor through [`Ikev2ChildSaRekeyResponseError::Nonce`].
     ResponderNonceTooShortForPrf {
         /// Received nonce length.
         actual: usize,
@@ -966,15 +965,6 @@ impl Ikev2ChildSaRekeyResponseBoundary {
             parts.key_exchange.as_ref(),
             selection.pfs_group,
         )?;
-        let minimum_nonce_len = prf_nonce_minimum(self.ike_sa_prf);
-        if nonce.nonce.len() < minimum_nonce_len {
-            return Err(
-                Ikev2ChildSaRekeyResponseError::ResponderNonceTooShortForPrf {
-                    actual: nonce.nonce.len(),
-                    minimum: minimum_nonce_len,
-                },
-            );
-        }
         if traffic_selectors_initiator.selectors.is_empty()
             || !traffic_selector_payload_is_narrowed(&request_tsi, &traffic_selectors_initiator)
         {
@@ -1438,7 +1428,7 @@ fn invalid_peer_error_notify(
 }
 
 fn prf_nonce_minimum(ike_sa_prf: Ikev2PrfAlgorithm) -> usize {
-    ike_sa_prf.output_len().div_ceil(2)
+    ike_sa_prf.output_len().div_ceil(2).max(32)
 }
 
 fn set_once<T>(

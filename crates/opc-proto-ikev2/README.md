@@ -1366,11 +1366,26 @@ public profile constructors already enforce the same contract.
 
 MODP-768, MODP-1024, PRF-HMAC-SHA1, and AUTH-HMAC-SHA1-96 exist only to
 interoperate with peers that cannot negotiate the stronger profiles above.
-RFC 8247 marks MODP group 1 as `MUST NOT`, group 2 as `SHOULD NOT`, and the
-SHA-1 PRF/integrity transforms for deprecation; RFC 9395 also deprecates group
-1. The SDK deliberately has no default proposal policy, and recognizing these
-typed algorithms does not offer or select them. A product must explicitly add
-the exact compatibility profile to its `Ikev2SaInitNegotiationPolicy`:
+The SDK deliberately retains group 1 for legacy peer compatibility despite
+RFC 8247 section 2.4's `MUST NOT` and RFC 9395's deprecation. Default software
+requirements include group 1, and every existing executable, provider and
+checkpoint path supports it. The caller's explicit profile allowlist remains
+authoritative; no new configuration switch is added.
+
+Every other admitted common DH group is preferred over group 1. The existing
+ordered policy moves group-1 profiles last while preserving caller order among
+other profiles. Initial initiator offers likewise place group-1 alternatives
+and group-1-only proposals last. Responder selection, including IKE-SA rekey in
+either original IKE role, requests a stronger KE with `INVALID_KE_PAYLOAD` when
+necessary instead of accepting a group-1 KE while a stronger common suite exists.
+This changes main's previous caller/wire preference and matching-KE fallback
+order. Group 1 remains usable when it is the only common group. The single-profile
+rekey initiator builder encodes an already-selected profile; choose from the
+existing policy's ordered common profiles when more than one is available.
+
+The SDK has no implicit proposal list. A product adds its exact compatibility
+profile to `Ikev2SaInitNegotiationPolicy` as before. Group 2 and SHA1 remain
+explicit compatibility choices under RFC 8247's recommendations:
 
 ```rust
 use opc_proto_ikev2::{
@@ -1395,6 +1410,21 @@ fn compatibility_policy(
 Keep stronger profiles earlier in the caller-owned preference list. No DES,
 3DES, MD5, unauthenticated CBC, or other legacy algorithm is enabled by this
 compatibility boundary.
+
+### Local and received nonces
+
+`Ikev2NoncePayloadBuild::generate(prf)` uses admitted entropy for fresh local
+nonces of at least 32 octets and half the PRF's preferred key length, for both
+roles and initial/rekey exchanges. The initial initiator builder and retained
+local Child-SA rekey boundary enforce that local floor. Raw payload encoders
+accept caller-supplied wire fixtures and do not generate randomness.
+
+Peer decoding, initial/rekey transcript KDFs and XFRM mapping accept 16..=256
+octets for every PRF and reject shorter input with typed errors. Accepting a
+16-octet SHA2-512 peer nonce deliberately relaxes RFC 7296 section 2.10's
+half-PRF-key requirement for legacy compatibility. Both initial nonce-policy
+names retain this receive behavior. Original group-1/SHA2-512/16-octet Ni vectors
+remain positive. The exact deviations are recorded in `CONFORMANCE.md`.
 
 ## Authenticated-only ESP Child SAs
 

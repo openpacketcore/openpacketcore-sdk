@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
   `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
   must handle both variants. (#1334)
+- `opc-proto-ikev2`: local handshake nonce generation and initial initiator
+  requests use at least 32 octets and half the selected/offered PRF's preferred
+  key length. The retained local Child-SA rekey nonce check uses the same floor.
+  Received and transcript nonces accept the existing 16..=256-octet range for
+  every PRF, including SHA2-512, through both initial policy names and XFRM mapping.
 
 - `opc-session-net`: the first fenced roster reconcile closes prepare and
   execute for the entire admission, including older handles and equal-fence
@@ -560,6 +565,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-sorted.
 
 ### Changed
+
+- `opc-proto-ikev2`: prefer other common DH groups over group 1 in ordered
+  policies and initial initiator offers; initial/rekey selection requests a
+  stronger KE instead of accepting a group-1 fallback. Group 1 remains supported
+  for legacy peers, including default software requirements and checkpoint restore.
 
 - `opc-mgmt-authz`, `opc-gnmi-server`, `opc-netconf-server` and `opc-yanggen`: reads authorize each requested node with every composite and ancestor-list key in one policy context, using the Read or Subscribe action. An entry with a denied or unknown key is omitted before stored rows or providers are read, in gNMI Get and Subscribe and in NETCONF `<get>`, `<get-config>` and `<get-data>`; NETCONF previously failed with `operation-failed` when such an entry existed. NETCONF list-child selections now carry their keys. gNMI reads lists whose sensitive keys allow cleartext; security-secret, lawful-intercept and secret-name keys keep the fixed gNMI refusal and masked NETCONF elements. NETCONF XPath filters accept equalities on configuration list keys whose data class allows cleartext. ON_CHANGE compares authorized content without timestamps, `updates_only` seeds that comparison without sending it, and a lag resync sends `sync_response` only when that content changed. (#1269)
 

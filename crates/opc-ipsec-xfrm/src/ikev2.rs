@@ -528,13 +528,11 @@ pub fn derive_child_sa_xfrm_keys(
 
 /// Derive the mandatory initial Child SA KEYMAT and map it into XFRM keys.
 ///
-/// This is the only XFRM helper that accepts
-/// [`Ikev2InitialExchangeNoncePolicy`]. Callers opting into its legacy variant
-/// must pass the same policy to the parent IKE SA through
-/// [`opc_proto_ikev2::derive_ike_sa_init_key_material_with_nonce_policy`].
-/// [`derive_child_sa_xfrm_keys`] intentionally remains strict for
-/// CREATE_CHILD_SA and Child-SA rekey. This helper always derives without a
-/// new DH secret, so it cannot be used for PFS or replacement Child SAs.
+/// Every initial policy name accepts 16..=256-octet transcript nonces for
+/// either peer and every PRF, matching [`derive_child_sa_xfrm_keys`]. Local
+/// nonce generation uses [`opc_proto_ikev2::Ikev2NoncePayloadBuild::generate`]
+/// for the stronger send floor. This helper derives without a new DH secret;
+/// PFS and replacement Child SAs use the generic helper.
 ///
 /// # Errors
 ///
@@ -1826,19 +1824,18 @@ mod tests {
         );
         let initiator_nonce: Vec<u8> = (0x00..0x10).collect();
         let responder_nonce: Vec<u8> = (0xa0..0xc0).collect();
-        // The existing generic helper remains the strict CREATE_CHILD_SA
-        // boundary even though the initial-only helper below is opted in.
+        // Both derivation helpers reject a peer below the absolute nonce floor.
         let strict_error = match derive_child_sa_xfrm_keys(
             profile,
             &[0x1e; 64],
-            &initiator_nonce,
+            &initiator_nonce[..15],
             &responder_nonce,
             None,
         ) {
             Ok(value) => panic!("strict Child-SA rekey unexpectedly derived keys: {value:?}"),
             Err(error) => error,
         };
-        assert_invalid_nonce_diagnostic(strict_error, Ikev2ChildSaNonceRole::Initiator, 16);
+        assert_invalid_nonce_diagnostic(strict_error, Ikev2ChildSaNonceRole::Initiator, 15);
 
         let keys = match derive_initial_child_sa_xfrm_keys(
             profile,
