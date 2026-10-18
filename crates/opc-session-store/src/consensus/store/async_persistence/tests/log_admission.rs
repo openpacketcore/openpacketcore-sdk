@@ -855,11 +855,10 @@ async fn blocked_build(
 ) {
     let mut fleet = fleet(mode).await;
     let result = AssertUnwindSafe(async {
-        let leader = fleet.leader();
-        let store = fleet.store(leader);
-        let command = repeated_command(store);
-        store.inner.raft_handler.set_log_admission_window_for_test(window);
+        let command = repeated_command(fleet.store(fleet.leader()));
         for _ in 0..cycles {
+            let store = fleet.store(fleet.leader());
+            store.inner.raft_handler.set_log_admission_window_for_test(window);
             let gate = Arc::new(SnapshotArtifactGate::new());
             let guard = store.inner.terminal_recovery_handoff_consumer
                 .pause_snapshot_publication_for_test(gate.clone());
@@ -875,7 +874,7 @@ async fn blocked_build(
             // The last eight entries go through both SDK admission boundaries.
             for _ in 0..8 {
                 let reply = propose(store, &command, tokio::time::Instant::now() + WAIT).await;
-                assert!(matches!(&reply, ForwardMutationReply::Applied(response) if response.result.is_ok()), "window fill: {reply:?}");
+                assert!(matches!(&reply, ForwardMutationReply::Applied(response) if response.result.is_ok()), "window fill: {reply:?}; kind={}", recovery_reply_kind(&reply));
             }
             store.inner.raft.wait(Some(WAIT))
                 .applied_index_at_least(Some(target + 8), "admitted window applied").await.unwrap();
@@ -902,8 +901,19 @@ async fn blocked_build(
             // and SDK must select the next snapshot and purge without a manual trigger.
             drop(guard);
             let resumed = std::time::Instant::now();
-            let reply = propose(store, &command, tokio::time::Instant::now() + WAIT).await;
-            assert!(matches!(&reply, ForwardMutationReply::Applied(response) if response.result.is_ok()), "automatic recovery: {reply:?}; kind={}; elapsed={:?}; active={}; snapshot-phase={:?}; pressure: {:?}; metrics: {:?}", recovery_reply_kind(&reply), resumed.elapsed(), store.inner.persistence_protocol.is_active(), store.inner.backend.snapshot_observation().phase_for_test(), store.log_pressure_snapshot(), store.inner.raft.metrics().borrow());
+            let deadline = tokio::time::Instant::now() + WAIT;
+            // Pressure may already have transferred the vote while the builder
+            // was held. The supported write keeps one fresh identity across
+            // that reroute; a local-only proposal cannot recover on a follower.
+            let reply = tokio::time::timeout_at(deadline, store.submit_request_before(
+                SessionConsensusRequestId::new(),
+                SessionMutationIntent::AdvanceLogicalTime,
+                None,
+                deadline,
+            )).await.expect("automatic recovery retains its original deadline");
+            assert!(matches!(&reply, Ok(response) if response.result.is_ok()), "automatic recovery: {reply:?}; elapsed={:?}; active={}; snapshot-phase={:?}; pressure: {:?}; metrics: {:?}", resumed.elapsed(), store.inner.persistence_protocol.is_active(), store.inner.backend.snapshot_observation().phase_for_test(), store.log_pressure_snapshot(), store.inner.raft.metrics().borrow());
+            assert!(reply.unwrap().raft_log_index > target + 8,
+                "recovery must commit a fresh request after the full window");
             let mut metrics = store.inner.raft.metrics();
             tokio::time::timeout(WAIT, async {
                 while store.log_pressure_snapshot().retained_rows >= window {
