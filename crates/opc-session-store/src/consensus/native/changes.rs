@@ -492,7 +492,7 @@ impl BusinessChanges {
         current(&self.keys, &state.keys)?;
         current(&self.receipts, &state.receipts)?;
         for deleted in &self.deletions {
-            deleted.for_each(|id, _, _, _| {
+            deleted.for_each(|id, _, _, _, _| {
                 if state.receipts.contains_key(&id) {
                     return Err(invalid("native captured deletion is still live"));
                 }
@@ -565,7 +565,8 @@ impl BusinessChanges {
         let mut tables = self.base.tables;
         Self::check_rows(0, &self.keys, &mut tables[0], check)?;
         Self::check_rows(1, &self.receipts, &mut tables[1], check)?;
-        let (deleted_before, deleted_transient) = self.check_deletions(&mut tables[1], check)?;
+        let (deleted_before, deleted_transient, witnessed_journal_removals) =
+            self.check_deletions(&mut tables[1], check)?;
         Self::check_rows(2, &self.generic, &mut tables[2], check)?;
         let start = self.base.tables[3].count;
         for row in &self.notifications {
@@ -607,6 +608,7 @@ impl BusinessChanges {
         let mut added = 0usize;
         let mut removed = deleted_before;
         let mut transient = deleted_transient;
+        let mut journal_removals = 0usize;
         for (id, change) in &self.receipts {
             check()?;
             if change.before.is_none()
@@ -636,6 +638,7 @@ impl BusinessChanges {
                 })?;
                 added += usize::from(change.before.is_none());
             } else {
+                journal_removals += 1;
                 lifecycle::removed_is_retired(
                     *id,
                     change.before.as_ref().map(|row| row.ordinal),
@@ -647,6 +650,20 @@ impl BusinessChanges {
                     transient += 1;
                 }
             }
+        }
+        // Deletion IDs are strictly ordered and unique, and each counted
+        // overlap was matched to this journal above. Equal counts therefore
+        // prove that every absent-after row has its exact deletion witness.
+        if self
+            .target
+            .frontiers
+            .fenced_transition_profile
+            .defers_live_leases()
+            && journal_removals != witnessed_journal_removals
+        {
+            return Err(invalid(
+                "native deferral capture removal lacks its deletion witness",
+            ));
         }
         // A create-then-reclaim entry has no endpoint row or checksum. Count
         // the actual detached inventory, independently of both certificates,
@@ -708,12 +725,13 @@ impl BusinessChanges {
         &self,
         table: &mut TableSummary,
         check: &impl Fn() -> io::Result<()>,
-    ) -> io::Result<(usize, usize)> {
+    ) -> io::Result<(usize, usize, usize)> {
         let mut removed = 0;
         let mut transient = 0;
+        let mut witnessed_journal_removals = 0;
         let mut previous = None;
         for deletion in &self.deletions {
-            deletion.for_each(|id, ordinal, before, expected| {
+            deletion.for_each(|id, ordinal, until, before, expected| {
                 check()?;
                 if previous.is_some_and(|previous| previous >= (id.epoch(), ordinal)) {
                     return Err(invalid(
@@ -730,10 +748,17 @@ impl BusinessChanges {
                     before.map(|row| row.ordinal),
                     self.target.frontiers.history,
                 )?;
+                validation::validate_removed_retention(
+                    id,
+                    until,
+                    &self.base.frontiers,
+                    &self.target.frontiers,
+                )?;
                 if let Some(change) = self.receipts.get(&id) {
                     if change.after.is_some() || change.after_hash.is_some() {
                         return Err(invalid("native captured deletion overlaps a retained row"));
                     }
+                    witnessed_journal_removals += 1;
                     // The ordinary journal owns the original predecessor of
                     // a create/update-then-delete identity. Its latest before
                     // revision above is still independently fingerprinted.
@@ -762,7 +787,7 @@ impl BusinessChanges {
                 "native captured deletion count differs from its inventory",
             ));
         }
-        Ok((removed, transient))
+        Ok((removed, transient, witnessed_journal_removals))
     }
 }
 
@@ -1011,14 +1036,6 @@ impl Publication {
         let mut deleted = 0usize;
         let mut transient = 0usize;
         let mut receipt_order = predecessor.receipt_order.clone();
-        predecessor
-            .receipt_order
-            .validate_retirement_with_recovery(
-                predecessor.frontiers.history,
-                frontiers.history,
-                frontiers.logical_time,
-                frontiers.async_fence_floor(),
-            )?;
         for (id, row) in &receipts {
             if receipt_removals.contains(id, row.ordinal) {
                 return Err(invalid("native receipt is both retained and removed"));
@@ -1028,20 +1045,38 @@ impl Publication {
                 .ok_or_else(|| invalid("native changed receipt history absent"))?;
             validation::validate_receipt(base.identity, id, row, &frontiers, history)?;
             if let Some(before) = base.receipts.get(id) {
+                let resolving = validation::receipt_resolves_deferral(
+                    before.lease_deferred(),
+                    before.response_facts()?,
+                    before.retained_until,
+                    row.retained_until,
+                    row.retained().then(|| row.lease_deferred()),
+                    &predecessor.frontiers,
+                    &frontiers,
+                )?;
                 if row.ordinal != before.ordinal
                     || row.payload_digest != before.payload_digest
-                    || row.retained_until != before.retained_until
-                    || (resident::RowFingerprint::row_fingerprint(row, 1, id)?
-                        != resident::RowFingerprint::row_fingerprint(&**before, 1, id)?
-                        && !(before.retained()
-                            && !row.retained()
-                            && frontiers
-                                .logical_time
-                                .is_some_and(|now| now >= row.retained_until)))
+                    || (!resolving
+                        && (row.retained_until != before.retained_until
+                            || (resident::RowFingerprint::row_fingerprint(row, 1, id)?
+                                != resident::RowFingerprint::row_fingerprint(&**before, 1, id)?
+                                && !(before.retained()
+                                    && !row.retained()
+                                    && frontiers
+                                        .logical_time
+                                        .is_some_and(|now| now >= row.retained_until)))))
                 {
                     return Err(invalid(
                         "native receipt replacement changes its immutable binding",
                     ));
+                }
+                if resolving {
+                    receipt_order.resolve_deferred(
+                        *id,
+                        row.ordinal,
+                        before.retained_until,
+                        row.retained_until,
+                    )?;
                 }
             } else {
                 // One atomic apply can bind and then expire this ID. The
@@ -1060,12 +1095,25 @@ impl Publication {
             }
         }
         for entry in receipt_removals.iter() {
-            let (id, ordinal) = entry?;
+            let (id, ordinal, until) = entry?;
             let before = base.receipts.get(&id);
             lifecycle::removed_is_retired(id, before.map(|row| row.ordinal), frontiers.history)?;
+            validation::validate_removed_retention(id, until, &predecessor.frontiers, &frontiers)?;
             if let Some(before) = before {
-                if before.ordinal != ordinal {
-                    return Err(invalid("native deletion ordinal differs from its row"));
+                let resolving = validation::receipt_resolves_deferral(
+                    before.lease_deferred(),
+                    before.response_facts()?,
+                    before.retained_until,
+                    until,
+                    None,
+                    &predecessor.frontiers,
+                    &frontiers,
+                )?;
+                if before.ordinal != ordinal || (!resolving && before.retained_until != until) {
+                    return Err(invalid("native deletion differs from its exact binding"));
+                }
+                if resolving {
+                    receipt_order.resolve_deferred(id, ordinal, before.retained_until, until)?;
                 }
                 receipt_order.remove_prefix(id, ordinal)?;
                 deleted += 1;
@@ -1094,6 +1142,12 @@ impl Publication {
         for (id, ordinal, until) in introduced {
             receipt_order.append_captured(id, ordinal, until, frontiers.history)?;
         }
+        receipt_order.validate_retirement_with_recovery(
+            predecessor.frontiers.history,
+            frontiers.history,
+            frontiers.logical_time,
+            frontiers.async_fence_floor(),
+        )?;
         receipt_order.validate(frontiers.history)?;
         for (id, row) in &generic_receipts {
             validation::validate_generic(id, row, &frontiers)?;
@@ -1222,7 +1276,7 @@ impl Publication {
             &state.receipts,
             state.changes.as_ref().map(|dirty| &dirty.receipts),
         )?;
-        self.deletions.for_each(|id, _, before, before_hash| {
+        self.deletions.for_each(|id, _, _, before, before_hash| {
             if !same_row(before, state.receipts.get(&id))
                 || state
                     .changes

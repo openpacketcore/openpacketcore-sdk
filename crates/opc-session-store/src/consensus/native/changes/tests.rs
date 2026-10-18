@@ -1511,3 +1511,112 @@ pub(in crate::consensus::native) fn omit_transient_history_receipt(captured: &mu
     let omitted = captured.business.receipts.remove(&id).unwrap();
     assert!(omitted.before.is_none() && omitted.after.is_none());
 }
+
+#[test]
+fn native_deferral_capture_rejects_transient_removals_without_witnesses() {
+    use crate::test_process::CommandExt as _;
+    const CHILD: &str = "OPC_NATIVE_DEFERRAL_TRANSIENT_CHILD";
+    const TEST: &str = "consensus::native::changes::tests::native_deferral_capture_rejects_transient_removals_without_witnesses";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .test_output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains(&format!("test {TEST} ... ok")));
+        assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+        return;
+    }
+    let (mut storage, _, _) = fixture_with_profile(FencedTransitionV2Profile::V2WithLeaseDeferral);
+    let history = FencedTransitionV2HistoryState::new(
+        Some(FencedTransitionV2HistoryEpoch::new(1).unwrap()),
+        None,
+        None,
+        0,
+        0,
+        0,
+        0,
+    )
+    .unwrap();
+    lifecycle_tests::seed(&mut storage, history, time(20), None, false);
+    storage.begin_changes().unwrap();
+
+    let count = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES;
+    assert_eq!(count, 131_072);
+    let before = Arc::clone(storage.business.require_business_proof().unwrap());
+    assert_eq!(before.frontiers.history.unwrap().bound_entries(), 0);
+    assert!(storage.business.receipts.is_empty());
+    let mut frontiers = before.frontiers.clone();
+    frontiers.history = Some(
+        FencedTransitionV2HistoryState::new(
+            Some(FencedTransitionV2HistoryEpoch::new(2).unwrap()),
+            Some(FencedTransitionV2HistoryEpoch::new(1).unwrap()),
+            None,
+            0,
+            1 + (count as u64)
+                .div_ceil(crate::fenced_transition::FENCED_TRANSITION_V2_RECLAIM_BATCH as u64),
+            0,
+            count as u64,
+        )
+        .unwrap(),
+    );
+    validate_frontier_transition(&before.frontiers, &frontiers, true).unwrap();
+    let mut endpoint = storage.business.clone();
+    endpoint.frontiers = frontiers.clone();
+    endpoint.admit_business().unwrap();
+    let order = endpoint
+        .require_business_proof()
+        .unwrap()
+        .receipt_order
+        .clone();
+    let target = BusinessProof::new(
+        &storage.business,
+        &frontiers,
+        before.tables,
+        before.revision + 1,
+        before.expiry.clone(),
+        order,
+        &storage.business.roster,
+    )
+    .unwrap();
+    let memory = Arc::new(
+        VerificationMemory::reserve(
+            count * 4 * (size_of::<(FencedTransitionV2RequestId, RowChange<NativeReceipt>)>() + 1),
+        )
+        .unwrap(),
+    );
+    let dirty = storage.business.changes.as_mut().unwrap();
+    assert!(Arc::ptr_eq(&dirty.base, &before) && Arc::ptr_eq(&dirty.target, &before));
+    dirty.receipts.try_reserve(count).unwrap();
+    for ordinal in 1..=count as u64 {
+        let id = lifecycle_tests::synthetic_id(1, ordinal);
+        dirty.receipts.insert(
+            id,
+            RowChange {
+                before: None,
+                after: None,
+                before_hash: None,
+                after_hash: None,
+            },
+        );
+    }
+    dirty.memory.push(memory);
+    dirty.target = Arc::clone(&target);
+    storage.business.frontiers = frontiers;
+    storage.business.proof = Some(target);
+    storage.validate_image().unwrap();
+    let captured = storage.take_changes().unwrap();
+    assert!(captured.business.deletions.is_empty());
+    assert_eq!(
+        captured.business.receipts.len(),
+        FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+    );
+    assert_eq!(
+        captured.validate(&|| Ok(())).unwrap_err().to_string(),
+        "native deferral capture removal lacks its deletion witness",
+        "deferral removals require deletion witnesses even when both endpoint images are valid"
+    );
+}

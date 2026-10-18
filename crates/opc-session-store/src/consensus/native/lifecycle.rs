@@ -257,6 +257,7 @@ fn planned_history(
     sequence: u64,
     command: &SessionConsensusCommand,
     now: Timestamp,
+    _profile: FencedTransitionV2Profile,
     last: impl Fn(u64) -> Option<Timestamp>,
 ) -> io::Result<Result<Option<FencedTransitionV2HistoryState>, StoreError>> {
     let SessionMutationIntent::MaintainFencedTransitionV2History {
@@ -368,7 +369,8 @@ impl NativeDelta<'_> {
             self.frontiers.sequence,
             command,
             now,
-            |epoch| self.receipt_order.last(epoch).map(|row| row.retained_until),
+            self.frontiers.fenced_transition_profile,
+            |epoch| self.receipt_order.retirement_deadline(epoch),
         )? {
             Ok(updated) => updated,
             Err(error) => return Ok(self.clock_response(now, index, error)),
@@ -449,9 +451,14 @@ impl NativeState {
                 command.intent,
                 SessionMutationIntent::MaintainFencedTransitionV2History { .. }
             ) {
-                if let Ok(updated) = planned_history(history, sequence, command, now, |epoch| {
-                    order.last(epoch).map(|row| row.retained_until)
-                })? {
+                if let Ok(updated) = planned_history(
+                    history,
+                    sequence,
+                    command,
+                    now,
+                    self.frontiers.fenced_transition_profile,
+                    |epoch| order.retirement_deadline(epoch),
+                )? {
                     if let Some(updated) = updated {
                         count += (updated.reclaimed_entries()
                             - history.unwrap().reclaimed_entries())

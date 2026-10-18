@@ -2796,6 +2796,10 @@ fn v2_response_matches_operation(
             SessionConsumerV2Response::FencedTransitionV2(_),
         )
         | (
+            SessionConsumerV2Operation::FencedTransitionV2 { .. },
+            SessionConsumerV2Response::FencedTransitionV2Deferred { .. },
+        )
+        | (
             SessionConsumerV2Operation::FencedTransitionV2Batch { .. },
             SessionConsumerV2Response::FencedTransitionV2Batch(_),
         )
@@ -2843,6 +2847,16 @@ fn v2_response_matches_request(
             SessionConsumerV2Operation::FencedTransitionV2 { request },
             SessionConsumerV2Response::FencedTransitionV2(Ok(outcome)),
         ) => outcome.matches_v2_request(request),
+        (
+            SessionConsumerV2Operation::FencedTransitionV2 { request },
+            SessionConsumerV2Response::FencedTransitionV2Deferred { request_id },
+        ) => {
+            *request_id == request.request_id()
+                && matches!(
+                    request.lease(),
+                    opc_session_store::FencedTransitionLease::Acquire { .. }
+                )
+        }
         // A singleton error carries no complete V2 request identity or body
         // witness. After Call transmission it could be substituted from any
         // request, so only an exact outcome can complete this mutation.
@@ -2867,6 +2881,8 @@ fn v2_response_matches_request(
                             Err(error) => {
                                 error.is_pre_dispatch_deterministic()
                                     || error.is_recorded_deterministic()
+                                    || (error.is_lease_deferred()
+                                        && matches!(request.lease(), opc_session_store::FencedTransitionLease::Acquire { .. }))
                             }
                         }
                 })
@@ -2903,6 +2919,20 @@ fn v2_response_matches_request(
             // one of the fixed V2 receipt errors.
             Err(error) => error.is_recorded_deterministic(),
         },
+        (
+            SessionConsumerV2Operation::FencedTransitionV2Status { request },
+            SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+                opc_session_store::SessionConsumerV2FencedTransitionStatus::LeaseDeferred {
+                    request_id,
+                },
+            )),
+        ) => {
+            *request_id == request.request_id()
+                && matches!(
+                    request.lease(),
+                    opc_session_store::FencedTransitionLease::Acquire { .. }
+                )
+        }
         // Error and status variants are closed by their V2-specific wire
         // discriminators. The authoritative service validates the complete
         // request body before producing them; no response is a license to
@@ -21703,6 +21733,7 @@ mod payload_profile;
 
 #[cfg(test)]
 mod tests {
+    mod lease_deferral_wire_tests;
     #[path = "prewarm_batch.rs"]
     mod prewarm_batch;
     #[path = "void_alpn_tests.rs"]

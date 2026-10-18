@@ -24,7 +24,7 @@ duplicate execution. Live inventories reject missing, ignored or ambiguous names
 The tests retain their four Tokio workers, all assertions and ten-second bounds.
 Successful runs print elapsed time and decode/audit counts for hosted validation.
 
-The full-bound native log reclamation proofs listed in
+The full-bound native log and receipt-history proofs listed in
 [`native_log_bound.py`](native_log_bound.py) each have a dedicated parallel runner:
 
 | Proof | Core shard | Egress shard |
@@ -32,6 +32,17 @@ The full-bound native log reclamation proofs listed in
 | Leader idempotent request and reopen | `native-log-0` | `4` |
 | Durable snapshot, purge and restart | `native-log-1` | `5` |
 | Async snapshot, purge and restart | `native-log-2` | `6` |
+| Native abandoned deferral beyond the full retained window | `native-log-3` | `7` |
+| SQLite abandoned deferral beyond the full retained window | `native-log-4` | `8` |
+| Native grouped retirement with a surviving resolution | `native-log-5` | `9` |
+| Native rejection of unexpired removed and surviving receipts | `native-log-6` | `10` |
+| Native closed epoch after completion or abandonment | `native-log-7` | `11` |
+| Native grouped resolution and retirement | `native-log-8` | `12` |
+| Native separate resolution and retirement | `native-log-9` | `13` |
+| Catalog grouped apply and checkpoint | `native-log-10` | `14` |
+| Catalog separate apply, one checkpoint | `native-log-11` | `15` |
+| Catalog separate checkpoints | `native-log-12` | `16` |
+| Catalog rejection of false deletion witnesses | `native-log-13` | `17` |
 
 Each runs in its own serial test process at test O1, with debug assertions and
 overflow checks enabled, preserving the original package/feature selection.
@@ -52,6 +63,20 @@ This changes only the leader's job budget. The whole proof, reopen, test deadlin
 and assertions remain intact. A hosted run must confirm the resulting margin.
 The dedicated matrices compile only their proof profile; ordinary heavy-1 and
 egress shards do not pay for that compilation.
+
+The eleven lease-deferral proofs use the full 1,048,576-entry history, including
+the grouped/separate retirement and checkpoint cases. They follow the same
+one-proof-per-runner O1 plan. Their core jobs retain 90 minutes and their egress
+jobs use the existing 75-minute proof budget; no existing budget changes.
+In [egress job 117733900399, attempt 2](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/39142587245/job/117733900399),
+the ordinary shard 0 store harness started at 17:03:44Z and was still running
+when the job was cancelled at 17:43:12Z. Its live map assigned five of these
+million-entry proofs to shard 0, with the SQLite counterpart on shard 1 and the
+remaining proofs on shards 1 and 2. Moving all eleven to exact dedicated owners
+removes that work from the ordinary shards without reducing their inputs,
+maintenance batches, persistence operations, assertions or deadlines. The hosted
+rerun must establish the resulting margin; the cancelled log does not provide
+individual completion times for these proofs.
 
 The required i686 matrix separates session-net library tests from executable
 unit tests, integration tests and doctests. The integration runner exercises the

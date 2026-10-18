@@ -74,6 +74,9 @@ pub(super) fn validate_receipt(
         ));
     }
     validate_receipt_frontier(receipt, frontiers)?;
+    if receipt.lease_deferred() && !frontiers.fenced_transition_profile.defers_live_leases() {
+        return Err(invalid("native image deferral profile or response differs"));
+    }
     if let Some(response) = receipt.response_facts()? {
         if retention_deadline(response.logical_time) != Some(receipt.retained_until) {
             return Err(invalid("native image receipt retention differs"));
@@ -88,6 +91,66 @@ pub(super) fn validate_receipt(
     if receipt.cold.is_some() {
         use resident::RowFingerprint;
         receipt.row_fingerprint(1, id)?;
+    }
+    Ok(())
+}
+
+// A coalesced interval may already have expired or reclaimed the terminal
+// response. Its fixed retention deadline still preserves the exact resolution
+// time. Validate that time against both the pending receipt and the interval,
+// rather than requiring an intermediate response to survive aggregation.
+pub(super) fn receipt_resolves_deferral(
+    was_deferred: bool,
+    response: Option<generation::facts::Response>,
+    bound_until: Timestamp,
+    until: Timestamp,
+    final_response_is_deferred: Option<bool>,
+    before: &NativeFrontiers,
+    after: &NativeFrontiers,
+) -> io::Result<bool> {
+    if !after.fenced_transition_profile.defers_live_leases()
+        || !was_deferred
+        || final_response_is_deferred == Some(true)
+        || (until == bound_until && final_response_is_deferred.is_none())
+    {
+        // An expired pending response may compact or retire without ever
+        // executing. Its unchanged deadline is checked by the ordinary
+        // compaction and deletion predicates; it is not a resolution.
+        return Ok(false);
+    }
+    let resolved_at = resident::receipt_response_time(until)?;
+    if response.is_none_or(|response| resolved_at < response.logical_time)
+        || resolved_at >= bound_until
+        || before.logical_time.is_some_and(|time| resolved_at < time)
+        || after.logical_time.is_none_or(|time| resolved_at > time)
+    {
+        return Err(invalid(
+            "native receipt resolution time is outside its interval",
+        ));
+    }
+    Ok(true)
+}
+
+// Removed rows no longer participate in the final ordinal index. Check their
+// retirement eligibility before dropping them, including an abandoned pending
+// binding's fixed lifetime. Explicit asynchronous recovery keeps its existing
+// separate authority to retire an unavailable epoch.
+pub(super) fn validate_removed_retention(
+    id: FencedTransitionV2RequestId,
+    until: Timestamp,
+    before: &NativeFrontiers,
+    after: &NativeFrontiers,
+) -> io::Result<()> {
+    if !fenced_transition_v2_timestamp_is_in_range(until) {
+        return Err(invalid(
+            "native removed receipt retention is outside profile",
+        ));
+    }
+    if id.epoch().get() > lifecycle::floor(before.history)
+        && id.epoch().get() > after.async_fence_floor()
+        && after.logical_time.is_none_or(|now| until > now)
+    {
+        return Err(invalid("native history removed an unexpired exact receipt"));
     }
     Ok(())
 }
@@ -352,7 +415,10 @@ impl NativeState {
             .and_then(|_| self.require_business_proof().ok());
         let mut receipt_order = match admitted {
             Some(proof) => proof.receipt_order.clone(),
-            None => history_order::ReceiptOrder::preparing(frontiers.history)?,
+            None => history_order::ReceiptOrder::preparing_with_profile(
+                frontiers.history,
+                frontiers.fenced_transition_profile,
+            )?,
         };
         if let Some(history) = frontiers.history {
             for (id, row) in &self.receipts {

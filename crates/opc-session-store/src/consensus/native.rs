@@ -34,6 +34,8 @@ mod scope_records;
 pub(crate) use scope_records::ScopeRecordCapture;
 mod shared;
 use row_map::RowMap;
+#[cfg(test)]
+mod lease_deferral_tests;
 mod v1;
 mod validation;
 #[cfg(test)]
@@ -1230,7 +1232,10 @@ impl NativeState {
                 } else if request.request_id().epoch().get() != self.frontiers.async_history_epoch()
                 {
                     FencedTransitionV2Status::EpochNotActive
-                } else if retention_exhausted(self.frontiers.logical_time) {
+                } else if retention_exhausted(
+                    self.frontiers.logical_time,
+                    self.frontiers.fenced_transition_profile,
+                ) {
                     FencedTransitionV2Status::RetentionExhausted
                 } else {
                     FencedTransitionV2Status::NotFound
@@ -1264,6 +1269,11 @@ impl NativeState {
             {
                 return Ok(FencedTransitionV2Status::Expired);
             }
+            if receipt.lease_deferred() {
+                return Ok(FencedTransitionV2Status::LeaseDeferred {
+                    request_id: request.request_id(),
+                });
+            }
             let response = receipt.response.as_ref().ok_or_else(unavailable)?;
             match &response.result {
                 Ok(SessionMutationOutcome::FencedTransition(outcome))
@@ -1289,7 +1299,10 @@ impl NativeState {
                 FencedTransitionV2Status::EpochNotActive
             } else if history.bound_entries() >= FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
                 FencedTransitionV2Status::HistoryFull
-            } else if retention_exhausted(self.frontiers.logical_time) {
+            } else if retention_exhausted(
+                self.frontiers.logical_time,
+                self.frontiers.fenced_transition_profile,
+            ) {
                 FencedTransitionV2Status::RetentionExhausted
             } else {
                 FencedTransitionV2Status::NotFound
@@ -1681,8 +1694,7 @@ impl NativeDelta<'_> {
         index: u64,
     ) -> io::Result<SessionConsensusResponse> {
         let void = command.intent.contains_fenced_transition_v2_void();
-        if void && self.frontiers.fenced_transition_profile != FencedTransitionV2Profile::V2WithVoid
-        {
+        if void && !self.frontiers.fenced_transition_profile.permits_void() {
             return Err(invalid("native store profile does not permit void"));
         }
         if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
@@ -1737,12 +1749,16 @@ impl NativeDelta<'_> {
                 .frontiers
                 .history
                 .ok_or_else(|| invalid("native history absent"))?;
-            if history
-                .retired_through()
-                .is_none_or(|floor| request.request_id().epoch().get() > floor.get())
-                && history
-                    .active_epoch()
-                    .is_some_and(|active| request.request_id().epoch().get() <= active.get())
+            if self
+                .frontiers
+                .fenced_transition_profile
+                .defers_live_leases()
+                || (history
+                    .retired_through()
+                    .is_none_or(|floor| request.request_id().epoch().get() > floor.get())
+                    && history
+                        .active_epoch()
+                        .is_some_and(|active| request.request_id().epoch().get() <= active.get()))
             {
                 self.frontiers.activation = Some(activation);
             }
@@ -1767,48 +1783,60 @@ impl NativeDelta<'_> {
             self.base.identity,
             request,
         )?;
+        let mut deferred = false;
         if let Some(receipt) = self.receipt(&request.request_id()) {
-            let response = if receipt.payload_digest != digest {
-                self.response(index, Err(StoreError::FencedTransitionRequestConflict))
-            } else if !receipt.retained() || receipt.retained_until <= now {
-                let expired = NativeReceipt {
-                    ordinal: receipt.ordinal,
-                    payload_digest: receipt.payload_digest,
-                    retained_until: receipt.retained_until,
-                    response: None,
-                    cold: None,
-                };
-                self.receipts.insert(request.request_id(), expired);
-                self.response(index, Err(StoreError::FencedTransitionRequestExpired))
+            if receipt.payload_digest == digest
+                && receipt.lease_deferred()
+                && receipt.retained_until > now
+            {
+                deferred = true;
             } else {
-                cold::copy_response(
-                    receipt
-                        .response
-                        .as_deref()
-                        .ok_or_else(|| invalid("native retained response absent"))?,
-                )?
-            };
-            self.frontiers.logical_time = Some(now);
-            return Ok(response);
+                let response = if receipt.payload_digest != digest {
+                    self.response(index, Err(StoreError::FencedTransitionRequestConflict))
+                } else if !receipt.retained() || receipt.retained_until <= now {
+                    let expired = NativeReceipt {
+                        ordinal: receipt.ordinal,
+                        payload_digest: receipt.payload_digest,
+                        retained_until: receipt.retained_until,
+                        response: None,
+                        cold: None,
+                    };
+                    self.receipts.insert(request.request_id(), expired);
+                    self.response(index, Err(StoreError::FencedTransitionRequestExpired))
+                } else {
+                    cold::copy_response(
+                        receipt
+                            .response
+                            .as_deref()
+                            .ok_or_else(|| invalid("native retained response absent"))?,
+                    )?
+                };
+                self.frontiers.logical_time = Some(now);
+                return Ok(response);
+            }
         }
-        if history.active_epoch() != Some(request.request_id().epoch()) {
+        if !deferred && history.active_epoch() != Some(request.request_id().epoch()) {
             return Ok(self.clock_response(
                 now,
                 index,
                 StoreError::FencedTransitionHistoryEpochNotActive,
             ));
         }
-        if history.bound_entries() >= FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
+        if !deferred && history.bound_entries() >= FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
             return Ok(self.clock_response(now, index, StoreError::FencedTransitionHistoryFull));
         }
         let Some(until) = retention_deadline(now) else {
             return Ok(self.clock_response(
                 now,
                 index,
-                StoreError::FencedTransitionRetentionExhausted,
+                if deferred {
+                    StoreError::FencedTransitionOutcomeUnknown
+                } else {
+                    StoreError::FencedTransitionRetentionExhausted
+                },
             ));
         };
-        let result = if void {
+        let mut result = if void {
             let current = self.key(request.lease().key());
             match business::transition(request, &current, &self.frontiers, now) {
                 Ok(_) => Err(StoreError::FencedTransitionVoided),
@@ -1818,6 +1846,22 @@ impl NativeDelta<'_> {
         } else {
             self.effect(request, now, self.frontiers.sequence >= COUNTER_MAX)?
         };
+        if !void
+            && self
+                .frontiers
+                .fenced_transition_profile
+                .defers_live_leases()
+            && matches!(result, Err(StoreError::LeaseHeld))
+        {
+            if deferred {
+                return Ok(self.clock_response(
+                    now,
+                    index,
+                    StoreError::FencedTransitionLeaseDeferred,
+                ));
+            }
+            result = Err(StoreError::FencedTransitionLeaseDeferred);
+        }
         if self.frontiers.sequence < COUNTER_MAX {
             self.frontiers.sequence += 1;
             self.frontiers.digest = command
@@ -1842,6 +1886,42 @@ impl NativeDelta<'_> {
             .map_err(|_| invalid("native V2 batch invalid"))?;
         if !fenced_transition_v2_timestamp_is_in_range(command.logical_time) {
             return Err(invalid("native V2 batch time outside profile"));
+        }
+        if self
+            .frontiers
+            .fenced_transition_profile
+            .defers_live_leases()
+        {
+            if authorized && !self.activation_exact() {
+                return Err(invalid("native V2 batch activation missing"));
+            }
+            let mut outcomes = Vec::with_capacity(requests.len());
+            for request in requests {
+                let singleton = SessionConsensusCommand {
+                    schema_version: command.schema_version,
+                    identity: command.identity,
+                    request_id: SessionConsensusRequestId::from_bytes(
+                        fenced_transition_v2_outer_request_id(request.request_id()),
+                    ),
+                    logical_time: command.logical_time,
+                    intent: crate::sqlite::consensus::fenced_transition_v2_singleton_intent(
+                        &command.intent,
+                        request,
+                    )?,
+                };
+                let response = self.singleton(&singleton, request, None, authorized, now, index)?;
+                outcomes.push(match response.result {
+                    Ok(SessionMutationOutcome::FencedTransition(outcome)) => Ok(outcome),
+                    Err(error) => Err(error),
+                    _ => return Err(invalid("native V2 batch result invalid")),
+                });
+            }
+            validate_fenced_transition_v2_batch_outcomes(&outcomes)
+                .map_err(|_| invalid("native V2 batch outcomes invalid"))?;
+            return Ok(self.response(
+                index,
+                Ok(SessionMutationOutcome::FencedTransitionV2Batch(outcomes)),
+            ));
         }
         let mut outcomes = vec![None; requests.len()];
         if !authorized {
@@ -2001,6 +2081,43 @@ impl NativeDelta<'_> {
         until: Timestamp,
         response: SessionConsensusResponse,
     ) -> io::Result<()> {
+        if let Some(before) = self.receipt(&request.request_id()) {
+            if !self
+                .frontiers
+                .fenced_transition_profile
+                .defers_live_leases()
+                || !before.lease_deferred()
+                || before.payload_digest != payload_digest
+                || response
+                    .logical_time
+                    .is_none_or(|now| now >= before.retained_until)
+                || matches!(
+                    response.result,
+                    Err(StoreError::FencedTransitionLeaseDeferred)
+                )
+            {
+                return Err(invalid("native duplicate receipt binding"));
+            }
+            let ordinal = before.ordinal;
+            let before_until = before.retained_until;
+            self.receipt_order.resolve_deferred(
+                request.request_id(),
+                ordinal,
+                before_until,
+                until,
+            )?;
+            self.receipts.insert(
+                request.request_id(),
+                NativeReceipt {
+                    ordinal,
+                    payload_digest,
+                    retained_until: until,
+                    response: Some(Arc::new(response)),
+                    cold: None,
+                },
+            );
+            return Ok(());
+        }
         let history = self
             .frontiers
             .history
@@ -2054,7 +2171,7 @@ fn retention_deadline(now: Timestamp) -> Option<Timestamp> {
         })
 }
 
-fn retention_exhausted(now: Option<Timestamp>) -> bool {
+fn retention_exhausted(now: Option<Timestamp>, _profile: FencedTransitionV2Profile) -> bool {
     now.is_some_and(|now| retention_deadline(now).is_none())
 }
 

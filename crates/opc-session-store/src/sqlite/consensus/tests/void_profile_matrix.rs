@@ -133,6 +133,7 @@ fn every_fenced_and_roster_profile_combination_snapshots_restores_and_reopens() 
     for profile in [
         FencedTransitionV2Profile::V2,
         FencedTransitionV2Profile::V2WithVoid,
+        FencedTransitionV2Profile::V2WithLeaseDeferral,
     ] {
         for authority in [
             ConsensusAuthorityProfile::Dynamic,
@@ -145,8 +146,7 @@ fn every_fenced_and_roster_profile_combination_snapshots_restores_and_reopens() 
                 for history_first in [false, true] {
                     let admission_index = 4
                         + u64::from(lanes & 1 != 0)
-                        + u64::from(lanes & 2 != 0)
-                            * (1 + u64::from(profile == FencedTransitionV2Profile::V2WithVoid));
+                        + u64::from(lanes & 2 != 0) * (1 + u64::from(profile.permits_void()));
                     let fixture =
                         crate::consensus::types::roster_v2_aborted_persistence_fixture_for_history(
                             [0x91; 16],
@@ -273,7 +273,7 @@ fn every_fenced_and_roster_profile_combination_snapshots_restores_and_reopens() 
                             .write(SessionMutationIntent::FencedTransitionV2(Box::new(request)))
                             .result
                             .is_ok());
-                        if profile == FencedTransitionV2Profile::V2WithVoid {
+                        if profile.permits_void() {
                             let request = matrix_request(0x33);
                             let request = FencedTransitionV2Request::new(
                                 FencedTransitionV2HistoryEpoch::new(1).unwrap(),
@@ -379,7 +379,7 @@ fn every_fenced_and_roster_profile_combination_snapshots_restores_and_reopens() 
                         33 + scan_index_count
                             + usize::from(lanes & 2 != 0) * 5
                             + usize::from(lanes & 8 != 0) * 6
-                            + usize::from(profile == FencedTransitionV2Profile::V2WithVoid)
+                            + usize::from(profile != FencedTransitionV2Profile::V2)
                     );
                     validate_existing_schema(&conn, fixture.identity).unwrap_or_else(|error| panic!("source profile={profile:?} authority={authority:?} lanes={lanes} history_first={history_first}: {error}"));
                     let (last_log_id, last_membership) = build_snapshot_database_sync(&conn, fixture.identity, &snapshot).unwrap_or_else(|error| panic!("profile={profile:?} authority={authority:?} lanes={lanes} history_first={history_first}: {error}"));

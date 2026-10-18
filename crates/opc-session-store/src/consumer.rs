@@ -2399,6 +2399,7 @@ impl From<StoreError> for SessionConsumerStoreError {
             // them with `SessionConsumerV2FencedTransitionError` instead.
             | StoreError::FencedTransitionHistoryEpochRetired
             | StoreError::FencedTransitionVoided
+            | StoreError::FencedTransitionLeaseDeferred
             | StoreError::FencedTransitionHistoryEpochNotActive => Self::CapabilityNotSupported,
             StoreError::CasIdempotencyOutcomeUnavailable
             | StoreError::FencedTransitionOutcomeUnknown
@@ -2666,6 +2667,8 @@ pub enum SessionConsumerV2FencedTransitionError {
     StorageExhausted,
     /// The extended profile bound a terminal no-effect void receipt.
     Voided,
+    /// The exact identity is still pending on a conclusively live lease.
+    LeaseDeferred,
 }
 
 impl From<StoreError> for SessionConsumerV2FencedTransitionError {
@@ -2689,12 +2692,18 @@ impl From<StoreError> for SessionConsumerV2FencedTransitionError {
             StoreError::FencedTransitionRetentionExhausted => Self::RetentionExhausted,
             StoreError::FencedTransitionStorageExhausted => Self::StorageExhausted,
             StoreError::FencedTransitionVoided => Self::Voided,
+            StoreError::FencedTransitionLeaseDeferred => Self::LeaseDeferred,
             error => Self::Store(SessionConsumerStoreError::from(error)),
         }
     }
 }
 
 impl SessionConsumerV2FencedTransitionError {
+    /// A nonterminal result, admitted only with the complete request identity.
+    pub fn is_lease_deferred(self) -> bool {
+        matches!(self, Self::LeaseDeferred)
+    }
+
     /// Whether this error has the fixed revision-5 wire representation.
     ///
     /// All closed discriminants are wire-valid. The payload-too-large form is
@@ -2802,6 +2811,7 @@ impl SessionConsumerV2FencedTransitionError {
             Self::RetentionExhausted => StoreError::FencedTransitionRetentionExhausted,
             Self::StorageExhausted => StoreError::FencedTransitionStorageExhausted,
             Self::Voided => StoreError::FencedTransitionVoided,
+            Self::LeaseDeferred => StoreError::FencedTransitionLeaseDeferred,
         }
     }
 }
@@ -2998,6 +3008,11 @@ pub enum SessionConsumerV2FencedTransitionStatus {
     EpochNotActive,
     /// Logical time cannot retain a complete result window.
     RetentionExhausted,
+    /// The complete request remains bound without a business effect.
+    LeaseDeferred {
+        /// Original self-authenticating request identity.
+        request_id: FencedTransitionV2RequestId,
+    },
 }
 
 impl TryFrom<FencedTransitionV2Status> for SessionConsumerV2FencedTransitionStatus {
@@ -3022,6 +3037,9 @@ impl TryFrom<FencedTransitionV2Status> for SessionConsumerV2FencedTransitionStat
             FencedTransitionV2Status::NotFound => Ok(Self::NotFound),
             FencedTransitionV2Status::EpochNotActive => Ok(Self::EpochNotActive),
             FencedTransitionV2Status::RetentionExhausted => Ok(Self::RetentionExhausted),
+            FencedTransitionV2Status::LeaseDeferred { request_id } => {
+                Ok(Self::LeaseDeferred { request_id })
+            }
         }
     }
 }
@@ -3358,6 +3376,11 @@ pub enum SessionConsumerV2Response {
     },
     /// Exact proof of the separately activated void profile.
     FencedTransitionV2VoidCapability(Result<(), SessionConsumerStoreError>),
+    /// Correlated nonterminal result of the immutable lease-deferral profile.
+    FencedTransitionV2Deferred {
+        /// Complete original identity; an uncorrelated error grants no retry authority.
+        request_id: FencedTransitionV2RequestId,
+    },
 }
 
 impl fmt::Debug for SessionConsumerV2Response {
@@ -3365,6 +3388,7 @@ impl fmt::Debug for SessionConsumerV2Response {
         let name = match self {
             Self::FencedTransitionV2Capability(_) => "FencedTransitionV2Capability",
             Self::FencedTransitionV2VoidCapability(_) => "FencedTransitionV2VoidCapability",
+            Self::FencedTransitionV2Deferred { .. } => "FencedTransitionV2Deferred",
             Self::FencedTransitionV2HistoryState(_) => "FencedTransitionV2HistoryState",
             Self::FencedTransitionV2(_) => "FencedTransitionV2",
             Self::FencedTransitionV2Batch(_) => "FencedTransitionV2Batch",

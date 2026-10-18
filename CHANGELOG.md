@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
+  `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
+  must handle both variants. (#1334)
+
 - `opc-session-net`: the first fenced roster reconcile closes prepare and
   execute for the entire admission, including older handles and equal-fence
   readback. Providers must durably exclude the exact binding before signing
@@ -81,6 +85,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error for Configuration Update Command/Complete bodies.
 
 ### Added
+
+- `opc-session-store` and `opc-session-net`: add the immutable
+  `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
+  Live predecessor-lease contention retains one nonterminal binding with a
+  fixed 24-hour lifetime from first binding. Retries do not extend that lifetime;
+  expiry allows history to retire even if the caller journal is lost. Every
+  retry keeps the original sealed body, request identity, epoch, history
+  ordinal and caller journal row; ordered apply rechecks the original fence,
+  generation and current lease before one acquisition and mutation. Restart
+  recovery requires fresh, fully correlated `LeaseDeferred` status to resume;
+  unknown, unavailable and absent reads grant no dispatch authority. The
+  original profiles retain terminal `LeaseHeld`. Crossing profiles requires
+  a fresh install. Native apply and checkpoint replay preserve resolution
+  through grouped expiry and retirement, including a reclaimed receipt;
+  deletion witnesses remain bound to the immutable profile digest. (#1334)
 
 - `opc-types`, `opc-proto-ikev2` and `opc-proto-gtpv2c`: add shared checked
   N1-mode wire values, the three TS 24.302 N1 Notify codecs, directional

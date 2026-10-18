@@ -466,6 +466,12 @@ where
             .inner
             .fenced_transition_v2_status(prepared.physical_request())
             .await?;
+        if matches!(&status, FencedTransitionV2Status::LeaseDeferred { request_id }
+            if *request_id != prepared.physical_request().request_id()
+                || !matches!(prepared.physical_request().lease(), crate::FencedTransitionLease::Acquire { .. }))
+        {
+            return Err(StoreError::FencedTransitionOutcomeUnknown);
+        }
         if matches!(&status, FencedTransitionV2Status::Recorded(result) if matches!(result.as_ref(), Err(StoreError::FencedTransitionVoided)))
         {
             journal.record_terminal(

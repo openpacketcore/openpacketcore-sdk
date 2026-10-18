@@ -46,14 +46,77 @@ struct Epoch {
     first: u64,
     filled: usize,
     rows: ResidentVector<Option<IndexedReceipt>>,
+    retention_max: Option<Timestamp>,
 }
 
 #[derive(Clone, Default)]
 pub(super) struct ReceiptOrder {
     epochs: Vec<Epoch>,
+    deferrals: bool,
 }
 
 impl ReceiptOrder {
+    pub(super) fn preparing_with_profile(
+        history: Option<FencedTransitionV2HistoryState>,
+        profile: FencedTransitionV2Profile,
+    ) -> io::Result<Self> {
+        let mut order = Self::preparing(history)?;
+        order.deferrals = profile.defers_live_leases();
+        Ok(order)
+    }
+
+    fn retain(epoch: &mut Epoch, until: Timestamp) {
+        epoch.retention_max = Some(epoch.retention_max.map_or(until, |old| old.max(until)));
+    }
+
+    pub(super) fn retirement_deadline(&self, number: u64) -> Option<Timestamp> {
+        let epoch = self
+            .epochs
+            .iter()
+            .find(|epoch| epoch.epoch.get() == number)?;
+        if self.deferrals {
+            epoch.retention_max
+        } else {
+            self.last(number).map(|row| row.retained_until)
+        }
+    }
+
+    /// A caller-validated pending-to-terminal replacement may extend exactly
+    /// one slot. Both pending and terminal deadlines are finite; their maximum
+    /// lets an epoch retire even if the caller and its journal are lost.
+    pub(super) fn resolve_deferred(
+        &mut self,
+        id: FencedTransitionV2RequestId,
+        ordinal: u64,
+        before_until: Timestamp,
+        until: Timestamp,
+    ) -> io::Result<()> {
+        if !self.deferrals || until < before_until {
+            return Err(invalid("native deferral resolution profile invalid"));
+        }
+        let epoch = self
+            .epochs
+            .iter_mut()
+            .find(|epoch| epoch.epoch == id.epoch())
+            .ok_or_else(|| invalid("native deferred epoch absent"))?;
+        let index = ordinal
+            .checked_sub(epoch.first)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| invalid("native deferred ordinal invalid"))?;
+        let previous = epoch
+            .rows
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| invalid("native deferred ordinal absent"))?;
+        if previous.expand(epoch.epoch).id != id || previous.retained_until != before_until {
+            return Err(invalid("native deferred identity differs"));
+        }
+        epoch.rows[index] = Some(IndexedReceipt::new(id, until));
+        Self::retain(epoch, until);
+        Ok(())
+    }
+
     pub(super) const fn clone_metadata_bytes() -> usize {
         (crate::fenced_transition::FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1)
             * std::mem::size_of::<Epoch>()
@@ -76,10 +139,14 @@ impl ReceiptOrder {
                     first: range.first,
                     filled: 0,
                     rows: std::iter::repeat_n(None, range.count).collect(),
+                    retention_max: None,
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        Ok(Self { epochs })
+        Ok(Self {
+            epochs,
+            deferrals: false,
+        })
     }
 
     // Cold admission fills exact pre-sized ordinal slots in any input order.
@@ -109,12 +176,14 @@ impl ReceiptOrder {
             .and_then(|index| epoch.rows.get(index))
             .and_then(Option::as_ref);
         let next = epoch.rows.get(index + 1).and_then(Option::as_ref);
-        if previous.is_some_and(|row| row.retained_until > retained_until)
-            || next.is_some_and(|row| row.retained_until < retained_until)
+        if !self.deferrals
+            && (previous.is_some_and(|row| row.retained_until > retained_until)
+                || next.is_some_and(|row| row.retained_until < retained_until))
         {
             return Err(invalid("native receipt retention order regressed"));
         }
         epoch.rows[index] = Some(IndexedReceipt::new(id, retained_until));
+        Self::retain(epoch, retained_until);
         epoch.filled += 1;
         Ok(())
     }
@@ -152,11 +221,12 @@ impl ReceiptOrder {
     ) -> io::Result<()> {
         let number = id.epoch();
         if let Some(previous) = self.epochs.last() {
-            if previous
-                .rows
-                .back()
-                .and_then(Option::as_ref)
-                .is_some_and(|row| row.retained_until > retained_until)
+            if !self.deferrals
+                && previous
+                    .rows
+                    .back()
+                    .and_then(Option::as_ref)
+                    .is_some_and(|row| row.retained_until > retained_until)
             {
                 return Err(invalid("native appended receipt retention regressed"));
             }
@@ -183,6 +253,7 @@ impl ReceiptOrder {
                 first,
                 filled: 0,
                 rows: ResidentVector::new(),
+                retention_max: None,
             });
         }
         let epoch = self
@@ -199,6 +270,7 @@ impl ReceiptOrder {
         epoch
             .rows
             .push_back(Some(IndexedReceipt::new(id, retained_until)));
+        Self::retain(epoch, retained_until);
         epoch.filled += 1;
         Ok(())
     }
@@ -288,7 +360,7 @@ impl ReceiptOrder {
                 .copied()
                 .flatten()
                 .ok_or_else(|| invalid("native receipt index has a trailing hole"))?;
-            if previous_until.is_some_and(|until| until > first.retained_until) {
+            if !self.deferrals && previous_until.is_some_and(|until| until > first.retained_until) {
                 return Err(invalid("native receipt retention regressed across epochs"));
             }
             previous_until = Some(last.retained_until);
@@ -319,12 +391,9 @@ impl ReceiptOrder {
             if epoch.epoch.get() > recovered_floor
                 && epoch.epoch.get() > previous
                 && epoch.epoch.get() <= next
-                && epoch
-                    .rows
-                    .back()
-                    .copied()
-                    .flatten()
-                    .is_none_or(|row| now.is_none_or(|now| row.retained_until > now))
+                && self
+                    .retirement_deadline(epoch.epoch.get())
+                    .is_none_or(|until| now.is_none_or(|now| until > now))
             {
                 return Err(invalid("native history retired an unexpired exact epoch"));
             }
@@ -343,6 +412,7 @@ impl ReceiptOrder {
         let mut count = 0usize;
         let mut previous_until = None;
         for epoch in &self.epochs {
+            let mut retention_max = None;
             for (index, slot) in epoch.rows.iter().enumerate() {
                 let ordered = slot
                     .as_ref()
@@ -355,14 +425,30 @@ impl ReceiptOrder {
                 if ordered.id.epoch() != epoch.epoch
                     || epoch.first.checked_add(index as u64) != Some(row.ordinal)
                     || row.retained_until != ordered.retained_until
-                    || previous_until.is_some_and(|until| until > ordered.retained_until)
+                    || (!self.deferrals
+                        && previous_until.is_some_and(|until| until > ordered.retained_until))
                 {
                     return Err(invalid(
                         "native reused receipt index differs from complete rows",
                     ));
                 }
                 previous_until = Some(ordered.retained_until);
+                retention_max = Some(
+                    retention_max.map_or(ordered.retained_until, |old: Timestamp| {
+                        old.max(ordered.retained_until)
+                    }),
+                );
                 count += 1;
+            }
+            // A retired prefix may retain its old maximum: every remaining
+            // row is already closed, and removal never grants execution.
+            if (epoch.first == 1 && retention_max != epoch.retention_max)
+                || retention_max
+                    .is_some_and(|maximum| epoch.retention_max.is_none_or(|bound| bound < maximum))
+            {
+                return Err(invalid(
+                    "native receipt retention summary differs from full rows",
+                ));
             }
         }
         if count != receipts.len() {

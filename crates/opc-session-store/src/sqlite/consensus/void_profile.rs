@@ -40,13 +40,17 @@ fn selected(conn: &Connection, attached: bool) -> io::Result<(FencedTransitionV2
         &format!("SELECT (SELECT COUNT(*) FROM {source}), profile_digest, layout_version FROM {source} WHERE singleton=1"),
         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).map_err(db_error)?;
-    if count != 1
-        || digest != FencedTransitionV2Profile::V2WithVoid.digest()
-        || !(1..=5).contains(&layout)
-    {
+    if count != 1 || !(1..=5).contains(&layout) {
         return Err(invalid_data("fenced transition store profile mismatch"));
     }
-    Ok((FencedTransitionV2Profile::V2WithVoid, layout))
+    let profile = [
+        FencedTransitionV2Profile::V2WithVoid,
+        FencedTransitionV2Profile::V2WithLeaseDeferral,
+    ]
+    .into_iter()
+    .find(|profile| digest == profile.digest())
+    .ok_or_else(|| invalid_data("fenced transition store profile mismatch"))?;
+    Ok((profile, layout))
 }
 
 pub(crate) fn fenced_transition_profile_in_sync(
@@ -126,7 +130,7 @@ pub(super) fn set_layout(
     }
     let version = match profile {
         FencedTransitionV2Profile::V2 => layout,
-        FencedTransitionV2Profile::V2WithVoid => {
+        FencedTransitionV2Profile::V2WithVoid | FencedTransitionV2Profile::V2WithLeaseDeferral => {
             let changed = conn.execute(
                 "UPDATE consensus_fenced_transition_profile SET layout_version=?1 WHERE singleton=1 AND layout_version=?2 AND profile_digest=?3 AND EXISTS (SELECT 1 FROM consensus_identity WHERE singleton=1 AND schema_version=6 AND fenced_transition_receipt_ledger_activated=?4)",
                 params![layout, previous_layout, profile.digest().as_slice(), previous_activation],
@@ -150,7 +154,7 @@ pub(super) fn copy_snapshot_layout(conn: &Connection) -> io::Result<()> {
             "snapshot cannot convert fenced transition store profile",
         ));
     }
-    if local == FencedTransitionV2Profile::V2WithVoid {
+    if local.permits_void() {
         conn.execute(
             "UPDATE main.consensus_fenced_transition_profile SET layout_version=(SELECT layout_version FROM consensus_incoming.consensus_fenced_transition_profile WHERE singleton=1) WHERE singleton=1",
             [],

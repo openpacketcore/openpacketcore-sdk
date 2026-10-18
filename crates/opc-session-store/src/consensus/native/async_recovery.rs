@@ -493,7 +493,10 @@ impl NativeDelta<'_> {
             }
         }
         self.receipts.clear();
-        self.receipt_order = history_order::ReceiptOrder::default();
+        self.receipt_order = history_order::ReceiptOrder::preparing_with_profile(
+            None,
+            self.frontiers.fenced_transition_profile,
+        )?;
         Ok(accounting)
     }
 }

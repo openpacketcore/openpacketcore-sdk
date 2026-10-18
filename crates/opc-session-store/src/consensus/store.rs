@@ -5027,8 +5027,7 @@ impl ConsensusSessionStore {
         if !expected_scope.1.contains(&self.inner.local_node_id) {
             return Err(consensus_unavailable());
         }
-        let void_profile = self.inner.backend.fenced_transition_profile
-            == crate::FencedTransitionV2Profile::V2WithVoid;
+        let void_profile = self.inner.backend.fenced_transition_profile.permits_void();
         let has_cached_proof = || {
             self.inner
                 .fenced_transition_profile_admission
@@ -6162,8 +6161,7 @@ impl ConsensusSessionStore {
     ) -> Result<FencedTransitionV2Status, StoreError> {
         request.validate()?;
         if self.local_fenced_transition_v2_capability().is_none()
-            || self.inner.backend.fenced_transition_profile
-                != crate::FencedTransitionV2Profile::V2WithVoid
+            || !self.inner.backend.fenced_transition_profile.permits_void()
         {
             return Err(unsupported_fenced_transition_v2());
         }
@@ -7402,9 +7400,7 @@ impl ConsensusSessionStore {
         }
         match self.linearizable_barrier_before(deadline).await {
             Ok(log_id) => {
-                if self.inner.backend.fenced_transition_profile
-                    == crate::FencedTransitionV2Profile::V2WithVoid
-                {
+                if self.inner.backend.fenced_transition_profile.permits_void() {
                     // Baseline readiness has no V2 profile work. The opt-in
                     // cached proof avoids storage. An uncached activation
                     // lookup uses the original deadline; only subsequent
@@ -9102,9 +9098,7 @@ impl ConsensusSessionStore {
             // fenced this leader and checked exact membership on both sides.
             // Keep the full helper for any future non-raw V2 caller.
             let admission = if request.intent.contains_fenced_transition_v2_void() {
-                if self.inner.backend.fenced_transition_profile
-                    != crate::FencedTransitionV2Profile::V2WithVoid
-                {
+                if !self.inner.backend.fenced_transition_profile.permits_void() {
                     Err(unsupported_fenced_transition_v2())
                 } else {
                     self.require_fenced_transition_v2_profile_after_barrier(deadline)
@@ -12089,6 +12083,7 @@ fn committed_error_matches_intent(intent: &SessionMutationIntent, error: &StoreE
         | SessionMutationIntent::ActivateFencedTransitionV2 { .. } => matches!(
             error,
             StoreError::FencedTransitionVoided
+                | StoreError::FencedTransitionLeaseDeferred
                 | StoreError::NotFound
                 | StoreError::StaleFence
                 | StoreError::CasConflict
@@ -14214,8 +14209,11 @@ impl ConsensusSessionConsumerService {
 #[async_trait]
 impl SessionQuorumConsumer for ConsensusSessionConsumerService {
     fn fenced_transition_v2_void_transport_enabled(&self) -> bool {
-        self.store.inner.backend.fenced_transition_profile
-            == crate::FencedTransitionV2Profile::V2WithVoid
+        self.store
+            .inner
+            .backend
+            .fenced_transition_profile
+            .permits_void()
     }
 
     async fn execute(
@@ -14676,8 +14674,12 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
             }
             SessionConsumerV2Operation::FencedTransitionV2VoidCapability => {
                 let proof = if self.store.local_fenced_transition_v2_capability().is_some()
-                    && self.store.inner.backend.fenced_transition_profile
-                        == crate::FencedTransitionV2Profile::V2WithVoid
+                    && self
+                        .store
+                        .inner
+                        .backend
+                        .fenced_transition_profile
+                        .permits_void()
                 {
                     self.store
                         .require_fenced_transition_v2_capability_before(deadline)
@@ -14701,6 +14703,7 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
             SessionConsumerV2Operation::FencedTransitionV2 {
                 request: transition,
             } => {
+                let request_id = transition.request_id();
                 let result = match self
                     .store
                     .consumer_fenced_transition_v2_before(request.scope(), *transition, deadline)
@@ -14712,7 +14715,14 @@ impl SessionQuorumConsumer for ConsensusSessionConsumerService {
                     }
                     Err(error) => Err(error.into()),
                 };
-                SessionConsumerV2Response::FencedTransitionV2(result)
+                if matches!(
+                    result,
+                    Err(SessionConsumerV2FencedTransitionError::LeaseDeferred)
+                ) {
+                    SessionConsumerV2Response::FencedTransitionV2Deferred { request_id }
+                } else {
+                    SessionConsumerV2Response::FencedTransitionV2(result)
+                }
             }
             SessionConsumerV2Operation::FencedTransitionV2Batch { requests } => {
                 let request_ids = requests

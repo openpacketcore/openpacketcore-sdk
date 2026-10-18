@@ -725,7 +725,8 @@ impl Rows {
             rosters: Rosters::new(),
             _memory: memory,
         };
-        let mut ordinals = Ordinals::new()?;
+        let mut ordinals =
+            Ordinals::with_profile(base.context.business.frontiers.fenced_transition_profile)?;
         let counts = [
             base.context.business.counts[0],
             base.context.business.counts[1],
@@ -837,12 +838,6 @@ impl Rows {
                 }
             }
             roster_index::transition(&delta.before, &delta.after)?;
-            ordinals.validate_retirement_with_recovery(
-                delta.before.business.frontiers.history,
-                delta.after.business.frontiers.history,
-                delta.after.business.frontiers.logical_time,
-                delta.after.business.frontiers.async_fence_floor(),
-            )?;
             rows.read_rows(
                 &mut reader,
                 &delta.after,
@@ -1003,17 +998,56 @@ impl Rows {
                     ));
                 }
                 let old = self.receipts.get(&id);
+                let removal = if frontiers.fenced_transition_profile.defers_live_leases() {
+                    let (_, input) = reader.bytes(128)?;
+                    let (ordinal, until): (u64, Timestamp) = binary::decode(input.bytes())?;
+                    binary::compare(&(ordinal, until), input.bytes())?;
+                    if ordinal == 0 || ordinal > FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64 {
+                        return Err(invalid("native removed receipt ordinal is outside profile"));
+                    }
+                    Some((ordinal, until))
+                } else {
+                    old.map(|row| (row.row.facts.ordinal, row.row.facts.retained_until))
+                };
                 lifecycle::removed_is_retired(
                     id,
-                    old.map(|row| row.row.facts.ordinal),
+                    removal.map(|(ordinal, _)| ordinal),
                     frontiers.history,
                 )?;
-                if let Some(old) = old {
-                    ordinals.remove(
-                        id.epoch().get(),
-                        old.row.facts.ordinal,
-                        old.row.facts.retained_until,
+                if let Some((_, until)) = removal {
+                    validation::validate_removed_retention(
+                        id,
+                        until,
+                        &self.context.business.frontiers,
+                        frontiers,
                     )?;
+                }
+                if let Some(old) = old {
+                    let (ordinal, until) =
+                        removal.ok_or_else(|| invalid("native removed receipt witness absent"))?;
+                    let resolving = validation::receipt_resolves_deferral(
+                        old.row.facts.lease_deferred,
+                        old.row.facts.response,
+                        old.row.facts.retained_until,
+                        until,
+                        None,
+                        &self.context.business.frontiers,
+                        frontiers,
+                    )?;
+                    if ordinal != old.row.facts.ordinal
+                        || (!resolving && until != old.row.facts.retained_until)
+                    {
+                        return Err(invalid("native catalog deletion changes its exact binding"));
+                    }
+                    if resolving {
+                        ordinals.resolve_deferred(
+                            id.epoch().get(),
+                            ordinal,
+                            old.row.facts.retained_until,
+                            until,
+                        )?;
+                    }
+                    ordinals.remove(id.epoch().get(), ordinal, until)?;
                     removed += 1;
                 } else {
                     if self
@@ -1042,14 +1076,37 @@ impl Rows {
                 check,
             )?;
             if let Some(old) = self.receipts.get(&id) {
+                let resolving = validation::receipt_resolves_deferral(
+                    old.row.facts.lease_deferred,
+                    old.row.facts.response,
+                    old.row.facts.retained_until,
+                    row.facts.retained_until,
+                    row.facts.response.map(|_| row.facts.lease_deferred),
+                    &self.context.business.frontiers,
+                    frontiers,
+                )?;
                 if row.facts.ordinal != old.row.facts.ordinal
-                    || row.facts.retained_until != old.row.facts.retained_until
-                    || (row.content != old.row.content
-                        && !(old.row.facts.response.is_some() && row.facts.response.is_none()))
+                    || row.facts.payload_digest != old.row.facts.payload_digest
+                    || (!resolving
+                        && (row.facts.retained_until != old.row.facts.retained_until
+                            || (row.content != old.row.content
+                                && !(old.row.facts.response.is_some()
+                                    && row.facts.response.is_none()
+                                    && frontiers
+                                        .logical_time
+                                        .is_some_and(|now| now >= row.facts.retained_until)))))
                 {
                     return Err(invalid(
                         "native catalog receipt changes its immutable binding",
                     ));
+                }
+                if resolving {
+                    ordinals.resolve_deferred(
+                        id.epoch().get(),
+                        row.facts.ordinal,
+                        old.row.facts.retained_until,
+                        row.facts.retained_until,
+                    )?;
                 }
             } else {
                 if !base
@@ -1095,6 +1152,14 @@ impl Rows {
                 added,
                 removed,
                 transient,
+            )?;
+            // Surviving rows now include every validated resolution in the
+            // delta. Removed rows were individually checked before deletion.
+            ordinals.validate_retirement_with_recovery(
+                self.context.business.frontiers.history,
+                frontiers.history,
+                frontiers.logical_time,
+                frontiers.async_fence_floor(),
             )?;
         }
         ordinals.validate(frontiers.history)?;

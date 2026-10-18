@@ -2683,7 +2683,7 @@ fn hash_current_checkpoint(
     hasher.update(schema_version.to_be_bytes());
     if consensus::fenced_transition_profile_in_sync(conn, false)
         .map_err(|_| RecoveryError::CorruptReplica)?
-        == crate::FencedTransitionV2Profile::V2WithVoid
+        .permits_void()
     {
         hasher.update(b"openpacketcore/session-recovery/fenced-transition-void-profile/v1\0");
         let query = "SELECT * FROM consensus_fenced_transition_profile ORDER BY singleton";
@@ -3284,7 +3284,7 @@ fn validate_exact_recovery_schema(
         .ok_or(RecoveryError::DatabaseUnavailable)?;
 
     let mut observed = recovery_schema_manifest(conn)?;
-    if profile == crate::FencedTransitionV2Profile::V2WithVoid {
+    if profile.permits_void() {
         // The profile reader above checks the exact DDL, singleton, digest and
         // inner layout. It is the only extra object in an extended store.
         observed

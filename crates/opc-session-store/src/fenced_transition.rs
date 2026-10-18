@@ -474,7 +474,34 @@ pub enum FencedTransitionV2Profile {
     V2,
     /// Original request identities with an independently certified void contract.
     V2WithVoid,
+    /// The void contract plus durable, nonterminal live-lease deferrals.
+    ///
+    /// A deferral binds the original request once. Repeating that request
+    /// consumes no further history entry, and a deferred binding survives
+    /// epoch rotation and restart until execution, void, or its fixed 24-hour
+    /// lifetime resolves it. Retries never extend that lifetime.
+    /// This is a creation-time profile; crossing profiles requires a fresh install.
+    V2WithLeaseDeferral,
 }
+
+const FENCED_TRANSITION_V2_LEASE_DEFERRAL_PROFILE_DESCRIPTOR: &str = concat!(
+    "base=v2-with-void;store-profile=immutable-at-creation;",
+    "native-frontiers=named:fenced_transition_profile=V2WithLeaseDeferral;",
+    "response-codec=append-error-tag:27:FencedTransitionLeaseDeferred;",
+    "status=append:LeaseDeferred(full-id:bytes56);wire-response=append:FencedTransitionV2Deferred(full-id:bytes56);",
+    "deferral=exact-live-predecessor-lease|same-full-id-and-body|one-bound-ordinal;",
+    "pending-retention=24h-from-first-binding|retry-never-extends|expiry-is-terminal-no-effect;",
+    "retry=atomic-original-fence-generation-and-lease-check|no-new-history-credit;",
+    "resolution=same-ordinal|replace-unexpired-pending-once|fixed-retention-from-resolution;",
+    "native-delta-deletion=exact-before-hash|full-id|postcard(ordinal:u64,final-retained-until:Timestamp);",
+    "coalesced-resolution=validate-inverse-retention-time-within-interval-before-retirement;",
+    "batch=ordered-singleton-sequences-and-digests-in-one-transaction;",
+    "recertification=exact-current-scope-and-profile|independent-of-request-epoch-after-initialization;",
+    "log-projection=validate-scope-and-profile|history-and-effects-decided-at-ordered-apply;",
+    "retirement=max-finite-retention-across-epoch|expired-pending-needs-no-journal;",
+    "void=pending-to-terminal-no-effect|original-authority-and-fence-checks;",
+    "unknown=status-only|NotFound-and-Unavailable-never-authorize-retry"
+);
 
 const FENCED_TRANSITION_V2_VOID_PROFILE_DESCRIPTOR: &str = concat!(
     "base=original-v2-profile;store-profile=immutable-at-creation;database-format=6;",
@@ -506,8 +533,33 @@ impl FencedTransitionV2Profile {
                 hash.update(FENCED_TRANSITION_V2_VOID_PROFILE_DESCRIPTOR.as_bytes());
                 hash.finalize().into()
             }
+            Self::V2WithLeaseDeferral => {
+                let mut hash = Sha256::new();
+                hash.update(b"openpacketcore/session-store/fenced-transition/v2/lease-deferral-profile/v1\0");
+                hash.update(Self::V2WithVoid.digest());
+                hash.update(FENCED_TRANSITION_V2_LEASE_DEFERRAL_PROFILE_DESCRIPTOR.as_bytes());
+                hash.finalize().into()
+            }
         }
     }
+
+    pub(crate) const fn permits_void(self) -> bool {
+        matches!(self, Self::V2WithVoid | Self::V2WithLeaseDeferral)
+    }
+
+    pub(crate) const fn defers_live_leases(self) -> bool {
+        matches!(self, Self::V2WithLeaseDeferral)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fenced_transition_v2_max_timestamp() -> Timestamp {
+    Timestamp::from_offset_datetime(
+        time::OffsetDateTime::from_unix_timestamp(FENCED_TRANSITION_V2_MAX_TIMESTAMP_UNIX_SECONDS)
+            .unwrap()
+            .replace_nanosecond(999_999_999)
+            .unwrap(),
+    )
 }
 
 /// Derive the independent consensus identity of a void for one original ID.
@@ -1219,6 +1271,11 @@ pub enum FencedTransitionExecuteError {
     /// A confirmed validation, authority, conflict, or store rejection.
     #[error(transparent)]
     Rejected(StoreError),
+    /// The immutable lease-deferral profile conclusively retained this exact
+    /// request without a business effect. Retry requires the SDK's deferral
+    /// resume path and fresh execution admission, never a new request ID.
+    #[error("fenced transition is deferred by a live lease")]
+    LeaseDeferred,
 }
 
 /// Result of one V2 operation at its effect boundary.
@@ -1227,6 +1284,10 @@ pub enum FencedTransitionExecuteError {
 /// proved not to have crossed a proposal boundary from one whose outcome is
 /// ambiguous. `Resolved` is generic so the same boundary preserves both the
 /// singleton and batch APIs' existing committed-or-rejected result shapes.
+/// Under `V2WithLeaseDeferral`, a resolved `FencedTransitionLeaseDeferred`
+/// confirms a durable pending binding, not a terminal result. Its exact ID and
+/// body may be submitted again; consumers use the correlated deferral resume
+/// API rather than treating this result as an ordinary retryable error.
 /// V1 deliberately continues to use [`FencedTransitionExecuteError`].
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1274,6 +1335,7 @@ impl fmt::Debug for FencedTransitionExecuteError {
             Self::NotTransmitted => "not_transmitted",
             Self::OutcomeUnknown { .. } => "outcome_unknown",
             Self::Rejected(_) => "rejected",
+            Self::LeaseDeferred => "lease_deferred",
         };
         formatter
             .debug_struct("FencedTransitionExecuteError")
@@ -1288,7 +1350,7 @@ impl FencedTransitionExecuteError {
     pub const fn exact_retry_id(&self) -> Option<FencedTransitionRequestId> {
         match self {
             Self::OutcomeUnknown { request_id } => Some(*request_id),
-            Self::NotTransmitted | Self::Rejected(_) => None,
+            Self::NotTransmitted | Self::Rejected(_) | Self::LeaseDeferred => None,
         }
     }
 }
@@ -2855,6 +2917,13 @@ pub enum FencedTransitionV2Status {
     /// The committed logical clock cannot retain a newly bound result for the
     /// mandatory recovery window. The request was not applied or bound.
     RetentionExhausted,
+    /// This exact request is durably bound but has made no business effect
+    /// because a predecessor lease was conclusively live. This nonterminal
+    /// state permits only the SDK's exact-request deferral resume path.
+    LeaseDeferred {
+        /// Complete request identity whose deferred binding was observed.
+        request_id: FencedTransitionV2RequestId,
+    },
 }
 
 impl fmt::Debug for FencedTransitionV2Status {

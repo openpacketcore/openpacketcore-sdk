@@ -51,7 +51,7 @@ impl ReceiptReads {
                 continue;
             }
             if let Some(resolved) = resolved {
-                if resolved.covers(id, row)? {
+                if resolved.covers(state, id, row)? {
                     continue;
                 }
             }
@@ -115,8 +115,16 @@ impl ReceiptReads {
 }
 
 impl ResolvedReceipts {
+    fn revision(&self, id: FencedTransitionV2RequestId) -> Option<&SharedRow<NativeReceipt>> {
+        self.rows
+            .get(&id)
+            .map(cold::ResolvedReceipt::captured_revision)
+            .or_else(|| self.resident.get(&id).map(|resident| &resident.row))
+    }
+
     fn covers(
         &self,
+        state: &NativeState,
         id: FencedTransitionV2RequestId,
         row: &SharedRow<NativeReceipt>,
     ) -> io::Result<bool> {
@@ -131,6 +139,20 @@ impl ResolvedReceipts {
             });
         match matches {
             Some(true) => Ok(true),
+            Some(false)
+                if state
+                    .frontiers
+                    .fenced_transition_profile
+                    .defers_live_leases()
+                    && self
+                        .revision(id)
+                        .is_some_and(|previous| resolves_deferred_revision(previous, row)) =>
+            {
+                // A pending binding has exactly one terminal successor. Read
+                // that successor instead of treating the prior deferral as a
+                // terminal receipt or a corrupt immutable-row replacement.
+                Ok(false)
+            }
             // Within one live owner a complete request ID binds once. Its
             // retained revision may relocate, expire or retire; it cannot
             // become another retained revision. Authority replacement must
@@ -153,9 +175,9 @@ impl ResolvedReceipts {
     }
 
     pub(crate) fn extend(&mut self, additional: Self) -> io::Result<()> {
-        // Every additional detached pass contains a previously unseen cold
-        // ID. A request cohort therefore takes at most its distinct ID count
-        // of passes; neither relocation nor unrelated commits restart it.
+        // Each additional pass contains an unseen cold ID or its one allowed
+        // pending-to-terminal successor. Deferral cannot be reintroduced, so
+        // a cohort takes at most twice its distinct ID count in this profile.
         if additional.rows.is_empty() {
             return Err(invalid("native receipt resolution made no progress"));
         }
@@ -163,7 +185,13 @@ impl ResolvedReceipts {
             .rows
             .keys()
             .chain(additional.resident.keys())
-            .any(|id| self.rows.contains_key(id) || self.resident.contains_key(id))
+            .any(|id| {
+                self.revision(*id).is_some_and(|previous| {
+                    additional
+                        .revision(*id)
+                        .is_none_or(|next| !resolves_deferred_revision(previous, next))
+                })
+            })
         {
             return Err(invalid("native receipt resolution repeated an ID"));
         }
@@ -173,6 +201,10 @@ impl ResolvedReceipts {
         self.resident
             .try_reserve(additional.resident.len())
             .map_err(|_| invalid("native resident receipt extension allocation failed"))?;
+        for id in additional.rows.keys().chain(additional.resident.keys()) {
+            self.rows.remove(id);
+            self.resident.remove(id);
+        }
         self.rows.extend(additional.rows);
         self.resident.extend(additional.resident);
         Ok(())
@@ -218,6 +250,17 @@ impl ResolvedReceipts {
             _memory: memory,
         })
     }
+}
+
+fn resolves_deferred_revision(previous: &NativeReceipt, next: &NativeReceipt) -> bool {
+    previous.lease_deferred()
+        && !next.lease_deferred()
+        && next.retained()
+        && previous.ordinal == next.ordinal
+        && previous.payload_digest == next.payload_digest
+        && matches!((previous.response_facts(), next.response_facts()),
+            (Ok(Some(before)), Ok(Some(after))) if after.logical_time >= before.logical_time
+                && after.logical_time < previous.retained_until)
 }
 
 impl ReceiptCopies {

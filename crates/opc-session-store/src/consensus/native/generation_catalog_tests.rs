@@ -23,6 +23,9 @@ mod header_budget_tests;
 #[path = "generation_roster_tests.rs"]
 mod roster_tests;
 
+#[path = "generation_catalog_lease_deferral_tests.rs"]
+mod lease_deferral_tests;
+
 const BLOCK: usize = 64 * 1024;
 const MAXIMUM: u64 = 32 * BLOCK as u64;
 const ROOT: [u8; 32] = [0xBD; 32];
@@ -411,10 +414,15 @@ struct Files {
     owner: VerifiedAppendOwner,
     version: Version,
     cut: [u8; 32],
+    maximum: u64,
 }
 
 impl Files {
     fn new(storage: &NativeStorage) -> (Self, Catalog) {
+        Self::with_maximum(storage, MAXIMUM)
+    }
+
+    fn with_maximum(storage: &NativeStorage, maximum: u64) -> (Self, Catalog) {
         storage.validate_image().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("catalog.opc");
@@ -432,18 +440,18 @@ impl Files {
                 operation_sequence: 18,
                 cut_binding: CUT,
                 block_bytes: BLOCK,
-                maximum: MAXIMUM,
+                maximum,
             },
             &|| Ok(()),
         )
         .unwrap();
         let identity = prepared.write_to(&mut file, &|| Ok(())).unwrap();
         file.sync_all().unwrap();
-        preflight_format(&path, identity, MAXIMUM, CUT, &|| Ok(())).unwrap();
+        preflight_format(&path, identity, maximum, CUT, &|| Ok(())).unwrap();
         let (owner, catalog) = Catalog::open(
             &path,
             identity,
-            MAXIMUM,
+            maximum,
             crate::consensus::native::generation::CatalogScope {
                 identity: storage.business.identity,
                 members: &storage.business.members,
@@ -459,6 +467,7 @@ impl Files {
             owner,
             version: Version::capture(storage).unwrap(),
             cut: CUT,
+            maximum,
         };
         exact(&catalog, storage);
         (files, catalog)
@@ -486,7 +495,7 @@ impl Files {
         preflight_format(
             &self.path,
             self.owner.current().identity(),
-            MAXIMUM,
+            self.maximum,
             self.cut,
             &|| Ok(()),
         )
@@ -494,7 +503,7 @@ impl Files {
         let (_, catalog) = Catalog::open(
             &self.path,
             self.owner.current().identity(),
-            MAXIMUM,
+            self.maximum,
             crate::consensus::native::generation::CatalogScope {
                 identity: storage.business.identity,
                 members: &storage.business.members,

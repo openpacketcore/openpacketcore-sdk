@@ -2195,6 +2195,20 @@ unresolved requests. Missing, mixed, legacy, wrong-key, wrong-scope, or
 corrupt V2 journal state fails closed rather than falling back to V1 or
 resealing a caller request.
 
+For durable nonterminal lease contention, create the store with
+`FencedTransitionV2Profile::V2WithLeaseDeferral`. The profile retains the exact
+acquire request once and returns `FencedTransitionLeaseDeferred` while the
+predecessor lease is live. Exact retries recheck the original fence and
+generation without consuming another history entry; completion or void
+replaces pending once. Pending work survives restart and epoch closure until
+resolved or until its fixed 24-hour lifetime from first binding expires.
+Expired deferrals report `Expired`, return `RequestExpired` on execute or void,
+and become reclaimable with their epoch through history maintenance.
+The original profiles retain terminal `LeaseHeld`. See
+[ADR 0034](../../docs/adr/0034-fenced-transition-lease-deferral.md)
+for profile admission, retention, persistence and consumer recovery. Crossing
+profiles requires a fresh install.
+
 `SessionBackend::fenced_transition_v2_batch` coalesces 1 through 256 ordered
 requests from one epoch into one physical backend batch while preserving one
 full-ID result per submitted item. It is not a cross-item conditional or
