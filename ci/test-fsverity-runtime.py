@@ -36,6 +36,23 @@ def privileged(*args):
     ).stdout
 
 
+def parent_death_guard():
+    parent = os.getpid()
+    libc = RUNTIME.ctypes.CDLL(None, use_errno=True)
+
+    def arm():
+        if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            raise OSError(RUNTIME.ctypes.get_errno(), "cannot bind fixture launcher to test runner")
+        if os.getppid() != parent:
+            os.kill(os.getpid(), signal.SIGKILL)
+
+    return arm
+
+
+def start_owner(*arguments, **options):
+    return subprocess.Popen(*arguments, preexec_fn=parent_death_guard(), **options)
+
+
 class SafetyTests(unittest.TestCase):
     """Controlled races use ordinary fixture files, never shared devices."""
 
@@ -451,7 +468,7 @@ if arguments[0] == 'mount':
         signal.pause()
 """)
         sudo.chmod(0o755)
-        self.process = subprocess.Popen(
+        self.process = start_owner(
             [str(HARNESS), "--", "true"],
             env=self.environment | {"PATH": str(shim) + ":" + os.environ["PATH"], "MOUNT_READY": str(ready)},
             start_new_session=True,
@@ -478,7 +495,7 @@ if arguments[0] == 'mount':
     def run_command(self, *command, environment=None, expected=0):
         result = subprocess.run(
             [str(HARNESS), "--", *map(str, command)],
-            env=self.environment | (environment or {}),
+            env=self.environment | (environment or {}), preexec_fn=parent_death_guard(),
             capture_output=True, text=True, timeout=20,
         )
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
@@ -529,7 +546,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
     def test_runtime_mount_is_not_visible_to_other_jobs(self):
         report = self.root / "snapshot-root"
         finish = self.root / "finish"
-        self.process = subprocess.Popen(
+        self.process = start_owner(
             [str(HARNESS), "--", "python3", "-c", """
 import os, pathlib, time
 pathlib.Path(%r).write_text(os.environ['OPC_FS_VERITY_SNAPSHOT_ROOT'])
@@ -560,7 +577,7 @@ while not pathlib.Path(%r).exists():
     def test_restrictive_umask_preserves_private_root_and_cleanup(self):
         result = subprocess.run(
             [str(HARNESS), "--", "true"], env=self.environment,
-            capture_output=True, text=True, timeout=20, umask=0o777,
+            capture_output=True, text=True, timeout=20, umask=0o777, preexec_fn=parent_death_guard(),
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(list(self.runner.iterdir()), [])
@@ -569,11 +586,41 @@ while not pathlib.Path(%r).exists():
         data = b"caller input\x00\n"
         result = subprocess.run(
             [str(HARNESS), "--", "python3", "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
-            env=self.environment, input=data, capture_output=True, timeout=20,
+            env=self.environment, input=data, preexec_fn=parent_death_guard(), capture_output=True, timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, data)
         self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_test_runner_death_kills_launcher_and_waits_for_guardian(self):
+        ready = self.root / "runner-death-ready"
+        launcher = self.root / "fixture-launcher"
+        program = """
+import importlib.util, os, pathlib, subprocess
+spec = importlib.util.spec_from_file_location('fixtures', %r)
+fixtures = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixtures)
+start = getattr(fixtures, 'start_owner', subprocess.Popen)
+process = start([%r, '--', 'python3', '-c', %r], env=os.environ, start_new_session=True)
+pathlib.Path(%r).write_text(str(process.pid))
+process.wait()
+""" % (str(Path(__file__).resolve()), str(HARNESS),
+       "import pathlib,time; pathlib.Path(%r).touch(); time.sleep(2)" % str(ready), str(launcher))
+        self.process = start_owner(["python3", "-c", program], env=self.environment,
+                                        start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.wait_for(ready.exists, "fixture command ready before test runner dies")
+        descriptor = os.pidfd_open(int(launcher.read_text()))
+        try:
+            self.process.kill()
+            self.process.wait(timeout=5)
+            exited, _, _ = select.select([descriptor], [], [], 1)
+            self.assertTrue(exited, "dead test runner left its detached launcher alive")
+        finally:
+            os.close(descriptor)
+        self.wait_for_guardians()
+        self.process.communicate(timeout=5)
+        self.assertEqual(list(self.runner.iterdir()), [])
+        self.assertEqual(self.attached(), [])
 
     def test_slave_namespace_observes_another_jobs_unmount_without_pinning_it(self):
         other = self.root / "opc-fsverity.other-job"
@@ -590,7 +637,7 @@ while not pathlib.Path(%r).exists():
         privileged("mount", "--make-shared", mountpoint)
         ready = self.root / "foreign-visible"
         finish = self.root / "foreign-unmounted"
-        self.process = subprocess.Popen([str(HARNESS), "--", "python3", "-c", """
+        self.process = start_owner([str(HARNESS), "--", "python3", "-c", """
 import pathlib, subprocess, time
 result = subprocess.run(['findmnt', '--mountpoint', %r, '--noheadings'], capture_output=True)
 assert result.returncode == 0, result.stdout
@@ -622,7 +669,7 @@ assert result.returncode == 1, result.stdout
         lock = self.root / "caller-lock"
         with lock.open("w") as stream:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.process = subprocess.Popen(
+            self.process = start_owner(
                 [str(HARNESS), "--", "python3", "-c", """
 import pathlib, signal, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -679,7 +726,7 @@ subprocess.run(['sudo', '-n', 'losetup', '--find', '--show', str(image)], check=
         ready = self.root / "ready"
         finish = self.root / "finish"
         held = self.root / "device-held"
-        self.process = subprocess.Popen(
+        self.process = start_owner(
             [str(HARNESS), "--", "python3", "-c", """
 import pathlib, time
 pathlib.Path(%r).touch()
@@ -774,7 +821,7 @@ subprocess.run(['sudo', '-n', 'losetup', '--find', '--show', str(image)], check=
         for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
             with self.subTest(signal=signum):
                 ready = self.root / f"ready-{signum}"
-                self.process = subprocess.Popen(
+                self.process = start_owner(
                     [str(HARNESS), "--", "python3", "-c", """
 import pathlib, signal, sys
 pathlib.Path(sys.argv[1]).touch()
