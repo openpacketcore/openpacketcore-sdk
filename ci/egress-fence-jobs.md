@@ -13,7 +13,9 @@ not cancel the others. No branch-protection context needs renaming: each new
 workload blocks the same existing required check. Existing workloads retain their
 45-minute limit. The full-bound leader proof on shard 4 has a 120-minute
 compilation/run budget; the Durable and Async proofs on shards 5 and 6 retain
-75 minutes. The decision and aggregate jobs retain their 10-minute limits.
+75 minutes. The eleven receipt-history proofs use that same 75-minute budget
+on dedicated shards 7 through 17. The decision and aggregate jobs retain their
+10-minute limits.
 
 ## Original step ownership
 
@@ -38,6 +40,7 @@ the split requires them; each privileged runner verifies its own cleanup.
 | Gate host sources: warnings-denied six-package all-feature rustdoc | `sources` |
 | Gate host sources: eight isolated O1 SQLite proofs | `host-proofs` |
 | Full-bound native leader, Durable and Async log proofs | `host-native-log-proofs (4, 5, 6)`, one proof per runner at O1 |
+| Full-bound lease-deferral receipt-history proofs | `host-native-log-proofs (7–17)`, one proof per runner at O1 |
 | Gate every eBPF feature surface: pinned fmt and all four Clippy commands | `sources` |
 | Rebuild production and test-only objects: all four independent double builds and production byte comparison | `sources` |
 | Build and gate independent host oracles: all bin tests, build, Clippy and redaction check | `oracles` |
@@ -79,7 +82,9 @@ the three ordinary test shards.
 
 The two serial scope-payload/child-read contracts retain owner 1 and run in
 fresh processes before its ordinary suite. The three full-bound native log
-proofs instead have owners 4 (leader), 5 (Durable) and 6 (Async). They run at O1
+proofs instead have owners 4 (leader), 5 (Durable) and 6 (Async). The eleven
+lease-deferral receipt-history proofs have owners 7 through 17, as listed in
+the [full-bound proof mapping](README.md). All fourteen run at O1
 with the original six-package selection, one exact proof and one test thread
 per dedicated runner. Their live O1 precheck rejects missing, ignored or
 ambiguous names; they need no ordinary-profile build. All ordinary inventories
@@ -96,8 +101,8 @@ general-CI real-time exclusion list.
 
 Each ordinary shard uploads `egress-fence-test-map-N`, containing
 `egress-fence-test-map.json`: revision, every harness test name, ignored status,
-owner (0–2 for ordinary shards, 3 for `host-proofs`, or 4–6 for full-bound
-proofs) and all seven plans. Each full-bound runner uploads its own exact
+owner (0–2 for ordinary shards, 3 for `host-proofs`, or 4–17 for full-bound
+proofs) and all eighteen plans. Each full-bound runner uploads its own exact
 command map. Console output names the current invocation; the artifacts retain
 the complete exclusion arguments without emitting a single oversized log line.
 Generate the same map locally without executing tests with:

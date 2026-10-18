@@ -707,6 +707,28 @@ class LibraryGroupPlanTests(unittest.TestCase):
         "native_log_retained_bound_survives_snapshot_purge_and_restart",
         "consensus::storage::tests::native_log_retained_bound::"
         "native_log_retained_bound_survives_snapshot_purge_and_restart_async",
+        "consensus::native::lease_deferral_tests::"
+        "native_lease_deferral_lost_journal_cannot_pin_the_full_retained_window",
+        "sqlite::consensus::tests::lease_deferral::"
+        "sqlite_lease_deferral_lost_journal_cannot_pin_the_full_retained_window",
+        "consensus::native::lease_deferral_tests::"
+        "native_lease_deferral_grouped_retirement_validates_a_surviving_resolution",
+        "consensus::native::lease_deferral_tests::"
+        "native_lease_deferral_retirement_rejects_unexpired_removed_and_surviving_receipts",
+        "consensus::native::lease_deferral_tests::"
+        "native_lease_deferral_full_closed_epoch_retires_after_completion_or_abandonment",
+        "consensus::native::lease_deferral_tests::"
+        "review_cohort_native_resolution_retirement_grouped",
+        "consensus::native::lease_deferral_tests::"
+        "review_cohort_native_resolution_retirement_separate",
+        "consensus::native::generation::catalog::tests::lease_deferral_tests::"
+        "native_catalog_lease_deferral_retirement_grouped_apply_and_checkpoint",
+        "consensus::native::generation::catalog::tests::lease_deferral_tests::"
+        "native_catalog_lease_deferral_retirement_separate_apply_one_checkpoint",
+        "consensus::native::generation::catalog::tests::lease_deferral_tests::"
+        "native_catalog_lease_deferral_retirement_separate_checkpoints",
+        "consensus::native::generation::catalog::tests::lease_deferral_tests::"
+        "native_catalog_lease_deferral_retirement_rejects_false_deletion_witnesses",
     )
 
     def setUp(self) -> None:
@@ -1019,9 +1041,13 @@ class HostedLibraryTransferTests(unittest.TestCase):
 
     def test_missing_matrix_execution_or_required_dependency_cannot_strand_the_transfer(self):
         text = TEST_SHARDS.WORKFLOW.read_text()
+        native_shards = TEST_SHARDS.native_log_bound.CORE_SHARDS
+        native_matrix = "shard: [" + ", ".join(native_shards) + "]"
         replacements = (
             ("shard: [0, 1]", "shard: [0]"),
-            ("shard: [native-log-0, native-log-1, native-log-2]", "shard: [native-log-0, native-log-1]"),
+            *((native_matrix, "shard: [" + ", ".join(
+                shard for shard in native_shards if shard != missing
+            ) + "]") for missing in native_shards),
             ("      - rust-libraries\n", ""),
             ("      - rust-native-log-proofs\n", ""),
             ("test-shards.py run-libraries --shard", "test-shards.py verify --shard"),

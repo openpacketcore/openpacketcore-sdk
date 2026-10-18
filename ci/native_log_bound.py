@@ -1,4 +1,4 @@
-"""Full-size native log proofs run at test O1 with debug checks still enabled.
+"""Full-size store history and native log proofs run at test O1 with debug checks still enabled.
 
 Keep exact names: neither the million-entry bound nor the default three-cycle
 regressions changes when the expensive proofs run in separate test processes.
@@ -11,6 +11,28 @@ TESTS = (
     "native_log_retained_bound_survives_snapshot_purge_and_restart",
     "consensus::storage::tests::native_log_retained_bound::"
     "native_log_retained_bound_survives_snapshot_purge_and_restart_async",
+    "consensus::native::lease_deferral_tests::"
+    "native_lease_deferral_lost_journal_cannot_pin_the_full_retained_window",
+    "sqlite::consensus::tests::lease_deferral::"
+    "sqlite_lease_deferral_lost_journal_cannot_pin_the_full_retained_window",
+    "consensus::native::lease_deferral_tests::"
+    "native_lease_deferral_grouped_retirement_validates_a_surviving_resolution",
+    "consensus::native::lease_deferral_tests::"
+    "native_lease_deferral_retirement_rejects_unexpired_removed_and_surviving_receipts",
+    "consensus::native::lease_deferral_tests::"
+    "native_lease_deferral_full_closed_epoch_retires_after_completion_or_abandonment",
+    "consensus::native::lease_deferral_tests::"
+    "review_cohort_native_resolution_retirement_grouped",
+    "consensus::native::lease_deferral_tests::"
+    "review_cohort_native_resolution_retirement_separate",
+    "consensus::native::generation::catalog::tests::lease_deferral_tests::"
+    "native_catalog_lease_deferral_retirement_grouped_apply_and_checkpoint",
+    "consensus::native::generation::catalog::tests::lease_deferral_tests::"
+    "native_catalog_lease_deferral_retirement_separate_apply_one_checkpoint",
+    "consensus::native::generation::catalog::tests::lease_deferral_tests::"
+    "native_catalog_lease_deferral_retirement_separate_checkpoints",
+    "consensus::native::generation::catalog::tests::lease_deferral_tests::"
+    "native_catalog_lease_deferral_retirement_rejects_false_deletion_witnesses",
 )
 
 # One expensive proof per hosted runner. Keep these separate from the ordinary
