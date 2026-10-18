@@ -7,6 +7,7 @@ resources, including the leftovers from a deliberately interrupted old helper.
 """
 
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,10 +16,14 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parent.parent
 HARNESS = ROOT / "ci/setup-fsverity-tmp.sh"
+SPEC = importlib.util.spec_from_file_location("fsverity_runtime", HARNESS.with_name("fsverity-runtime.py"))
+RUNTIME = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(RUNTIME)
 
 
 def privileged(*args):
@@ -26,6 +31,162 @@ def privileged(*args):
         ["/usr/bin/sudo", "-n", *map(str, args)], check=True,
         capture_output=True, text=True, timeout=10,
     ).stdout
+
+
+class SafetyTests(unittest.TestCase):
+    """Controlled races use ordinary fixture files, never shared devices."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="fsverity-safety-")
+        self.root = Path(self.temporary.name)
+        self.runner = self.root / "runner"
+        self.runner.mkdir(mode=0o700)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def candidate(self, name, parent=None):
+        path = (parent or self.runner) / (RUNTIME.PREFIX + name)
+        path.mkdir(mode=0o700)
+        (path / "ext4.img").write_bytes(b"fixture-owned image")
+        (path / "tmp").mkdir(mode=0o700)
+        if hasattr(RUNTIME, "mark_owned"):
+            descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                RUNTIME.mark_owned(descriptor)
+            finally:
+                os.close(descriptor)
+        return path
+
+    def guardian(self):
+        guardian = RUNTIME.Guardian(-1)
+        guardian.inventory = lambda **_kwargs: ([], [])
+        return guardian
+
+    def test_live_legacy_and_foreign_prefixes_are_preserved(self):
+        # Both are legitimate pre-attachment layouts of other tools. Neither
+        # participates in this owner's locks, even when its image is unopened.
+        legacy = self.runner / "opc-fsverity.live"
+        foreign = self.runner / "fs-verity-runtime.other-tool"
+        for directory in (legacy, foreign):
+            directory.mkdir(mode=0o700)
+            (directory / "ext4.img").write_bytes(b"live pre-mount image")
+            (directory / "tmp").mkdir(mode=0o700)
+        (foreign / "mutable").mkdir()
+        sentinel = foreign / "mutable" / "database"
+        sentinel.write_bytes(b"other tool's mutable state")
+        self.guardian().sweep(self.runner)
+        self.assertEqual((legacy / "ext4.img").read_bytes(), b"live pre-mount image")
+        self.assertEqual(sentinel.read_bytes(), b"other tool's mutable state")
+
+    def renamed_during_inventory(self, release):
+        stale = self.candidate("stale")
+        active = self.candidate("active", self.root)
+        sentinel = active / "must-survive"
+        sentinel.write_text("locked active inode")
+        descriptor = os.open(active, os.O_RDONLY | os.O_DIRECTORY)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guardian = self.guardian()
+        parked = self.root / "parked-stale-inode"
+
+        def inventory(**_kwargs):
+            if not parked.exists():
+                stale.rename(parked)
+                active.rename(stale)
+            return [], []
+
+        guardian.inventory = inventory
+        try:
+            try:
+                if release:
+                    guardian.release(stale)
+                else:
+                    guardian.sweep(self.runner)
+            except RuntimeError:
+                pass  # Rejecting a changed name is the safe outcome.
+            self.assertEqual((stale / "must-survive").read_text(), "locked active inode")
+            self.assertGreater(os.fstat(descriptor).st_nlink, 0)
+        finally:
+            os.close(descriptor)
+
+    def test_sweep_never_deletes_a_replacement_locked_inode(self):
+        self.renamed_during_inventory(release=False)
+
+    def test_release_never_deletes_a_replacement_locked_inode(self):
+        self.renamed_during_inventory(release=True)
+
+    def test_attachment_open_cannot_cross_inventory_and_delete(self):
+        directory = self.candidate("attach-race")
+        guardian = self.guardian()
+        opened = []
+        previous = signal.signal(signal.SIGIO, lambda *_args: None)
+
+        def inventory(**_kwargs):
+            try:
+                # Models the backing-file open that precedes LOOP_CONFIGURE.
+                opened.append(os.open(directory / "ext4.img", os.O_RDONLY | os.O_NONBLOCK))
+            except BlockingIOError:
+                pass  # An exclusive image lease serialized this open.
+            return [], []
+
+        guardian.inventory = inventory
+        try:
+            guardian.sweep(self.runner)
+            for descriptor in opened:
+                self.assertGreater(os.fstat(descriptor).st_nlink, 0,
+                                   "deleted an image opened for concurrent attachment")
+        finally:
+            for descriptor in opened:
+                os.close(descriptor)
+            signal.signal(signal.SIGIO, previous)
+
+    def test_fallback_cleanup_never_detaches_an_inventory_name(self):
+        fixture = RuntimeTests()
+        fixture.root = self.root
+        fixture.runner = self.runner
+        fixture.process = None
+        fixture.extra_mounts = []
+        fixture.extra_images = []
+        fixture.temporary = unittest.mock.Mock()
+        image = self.candidate("reuse") / "ext4.img"
+        calls = []
+
+        def fake_privileged(*arguments):
+            calls.append(arguments)
+            if arguments[:2] == ("losetup", "--associated"):
+                return "/dev/loop123456\n"  # A fixture name, never a real device.
+            return ""
+
+        with patch(__name__ + ".privileged", side_effect=fake_privileged), \
+                patch.object(RUNTIME, "detach_verified_loop", create=True) as detach, \
+                patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1)), \
+                patch.object(fixture, "wait_for_guardians", create=True):
+            fixture.tearDown()
+        self.assertNotIn(("losetup", "--detach", "/dev/loop123456"), calls)
+        detach.assert_called_once_with(image, "/dev/loop123456")
+
+    def test_captured_orphan_pipe_obeys_helper_deadline(self):
+        # Keep subreaper state and finite descendants out of the test runner.
+        program = '''
+import ctypes, importlib.util, sys
+spec = importlib.util.spec_from_file_location('runtime', sys.argv[1])
+runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runtime)
+assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+guardian = runtime.Guardian(-1)
+expired = False
+try:
+    guardian.run([sys.executable, '-c', 'import os,time; child=os.fork(); os._exit(0) if child else time.sleep(.6)'],
+                 capture=True, cleanup=True, timeout=.15)
+except TimeoutError:
+    expired = True
+finally:
+    guardian.reap_descendants()
+assert expired, 'orphan-held output bypassed the helper deadline'
+'''
+        result = subprocess.run(["python3", "-c", program, str(HARNESS.with_name("fsverity-runtime.py"))],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class RuntimeTests(unittest.TestCase):
