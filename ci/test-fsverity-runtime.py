@@ -15,6 +15,8 @@ import select
 import shlex
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -82,6 +84,243 @@ class SafetyTests(unittest.TestCase):
         guardian = RUNTIME.Guardian(-1)
         guardian.inventory = lambda **_kwargs: ([], [])
         return guardian
+
+    def deletion_boundary_race(self, kind):
+        directory = self.candidate("boundary")
+        foreign = self.candidate("foreign", self.root)
+        if kind == "directory":
+            (foreign / "ext4.img").unlink()
+            (foreign / "tmp").rmdir()
+        event = "fsverity-test-" + RUNTIME.secrets.token_hex(16)
+        # A separate, finite same-UID actor holds the foreign object throughout
+        # the actual deletion. In particular, an image lease on our inode does
+        # not protect the foreign image that this actor can substitute.
+        program = '''
+import fcntl,json,os,signal,socket,sys
+signal.alarm(10)
+kind,event,directory,foreign,parked=sys.argv[1:]
+fd=os.open(foreign + ('/ext4.img' if kind == 'image' else ''), os.O_RDONLY)
+if kind == 'directory': fcntl.flock(fd, fcntl.LOCK_EX)
+with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
+    server.bind('\\0'+event); server.listen(1)
+    print('ready',flush=True)
+    connection,_=server.accept()
+    with connection:
+        connection.recv(1024)
+        try:
+            if kind == 'image':
+                os.rename(directory+'/ext4.img',parked)
+                os.rename(foreign+'/ext4.img',directory+'/ext4.img')
+            else:
+                try: os.rename(directory,parked)
+                except FileNotFoundError: pass
+                os.rename(foreign,directory)
+            outcome='replaced'
+        except PermissionError: outcome='protected'
+        connection.send(outcome.encode())
+    sys.stdin.readline()
+    print(json.dumps({'links':os.fstat(fd).st_nlink,'outcome':outcome}),flush=True)
+os.close(fd)
+'''
+        actor = subprocess.Popen(["python3", "-c", program, kind, event, str(directory),
+                                  str(foreign), str(self.root / "parked")],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        original_unlink, original_rmdir, original_popen = os.unlink, os.rmdir, subprocess.Popen
+        injected = False
+
+        def notify():
+            nonlocal injected
+            if not injected:
+                injected = True
+                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+                    connection.settimeout(5)
+                    connection.connect("\0" + event)
+                    connection.send(b"delete")
+                    connection.recv(1024)
+
+        def unlink(path, *args, **kwargs):
+            if kind == "image" and path == "ext4.img":
+                notify()
+            return original_unlink(path, *args, **kwargs)
+
+        def rmdir(path, *args, **kwargs):
+            if kind == "directory" and path == directory.name:
+                notify()
+            return original_rmdir(path, *args, **kwargs)
+
+        # New production performs deletion in the privileged helper's protected
+        # directory. Inject at that helper's real syscall boundary too; the
+        # actor above still runs as the caller, never as root.
+        instrumentation = '''
+import importlib.util,socket,sys
+path,event,kind,*arguments=sys.argv[1:]
+spec=importlib.util.spec_from_file_location('runtime',path)
+runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
+unlink,rmdir=runtime.os.unlink,runtime.os.rmdir
+injected=False
+def notify():
+    global injected
+    if not injected:
+        injected=True
+        with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET) as connection:
+            connection.settimeout(5);connection.connect('\\0'+event)
+            connection.send(b'delete');connection.recv(1024)
+def remove_image(name,*args,**kwargs):
+    if kind=='image' and name=='ext4.img': notify()
+    return unlink(name,*args,**kwargs)
+def remove_directory(name,*args,**kwargs):
+    if kind=='directory' and name=='runtime': notify()
+    return rmdir(name,*args,**kwargs)
+runtime.os.unlink=remove_image;runtime.os.rmdir=remove_directory
+sys.argv=[path,*arguments]
+runtime.main()
+'''
+
+        def popen(command, *args, **kwargs):
+            if "--privileged" in command:
+                index = command.index("--privileged")
+                command = ["sudo", "-n", "python3", "-I", "-c", instrumentation,
+                           str(HARNESS.with_name("fsverity-runtime.py")), event, kind,
+                           *command[index:]]
+            return original_popen(command, *args, **kwargs)
+
+        try:
+            self.assertEqual(actor.stdout.readline().strip(), "ready")
+            with patch.object(RUNTIME.os, "unlink", side_effect=unlink), \
+                    patch.object(RUNTIME.os, "rmdir", side_effect=rmdir), \
+                    patch.object(RUNTIME.subprocess, "Popen", side_effect=popen):
+                self.guardian().sweep(self.runner)
+            output, _ = actor.communicate(input="finish\n", timeout=5)
+            self.assertEqual(actor.returncode, 0, output)
+            state = json.loads(output)
+            # A response from the actor proves the actual boundary was reached,
+            # including when the helper executes the syscall in another process.
+            self.assertIn(state["outcome"], ("replaced", "protected"))
+            self.assertGreater(state["links"], 0, "deleted a substituted live object")
+        finally:
+            if actor.poll() is None:
+                actor.communicate(input="finish\n", timeout=5)
+            actor.stdout.close()
+
+    def test_image_substitution_at_unlink_preserves_the_live_foreign_inode(self):
+        self.deletion_boundary_race("image")
+
+    def test_directory_substitution_at_rmdir_preserves_the_locked_foreign_inode(self):
+        self.deletion_boundary_race("directory")
+
+    def test_active_runtime_case_detects_disabled_sweep_locks(self):
+        fixture = RuntimeTests("test_startup_sweeps_only_unattached_owned_unlocked_directories")
+        fixture.setUp()
+
+        def mutated_gate(*_args, **_kwargs):
+            # Mutation: turn off both parent and runtime flock operations.
+            with patch.object(RUNTIME.fcntl, "flock", return_value=None):
+                self.guardian().sweep(fixture.runner)
+
+        fixture.run_command = mutated_gate
+        try:
+            with self.assertRaises(AssertionError, msg="active-runtime case accepted disabled locks"):
+                fixture.test_startup_sweeps_only_unattached_owned_unlocked_directories()
+        finally:
+            fixture.temporary.cleanup()  # The mutation runs no command/mount.
+
+    def mount_with_partition_minors(self, mismatch=None):
+        reader, writer = os.pipe()
+        guardian = self.guardian()
+        guardian.owner = reader
+        guardian.sweep = lambda _root: None
+        guardian.release = lambda _directory: None
+        run = unittest.mock.Mock()
+        guardian.run = run
+        real_request, real_fstat, real_stat = RUNTIME.privileged_request, os.fstat, os.stat
+        pinned = os.open(os.devnull, os.O_RDONLY)
+        device = os.makedev(7, 16)  # loop1 with max_part=15, not loop16.
+
+        def request(operation, *args, result=None, **kwargs):
+            if operation == "attach":
+                if result is not None:
+                    result["loop_index"] = 1
+                return [pinned]
+            return real_request(operation, *args, **kwargs)
+
+        def fstat(descriptor):
+            info = real_fstat(descriptor)
+            if descriptor == pinned:
+                values = list(info)
+                values[0] = stat.S_IFBLK | 0o600
+                return type("LoopStat", (), {"st_mode": values[0], "st_rdev": device})()
+            return info
+
+        def inspect(path, *args, **kwargs):
+            if str(path).startswith("/dev/loop"):
+                return type("LoopStat", (), {"st_mode": stat.S_IFBLK,
+                           "st_rdev": os.makedev(7, 256) if mismatch == "node" else device})()
+            info = real_stat(path, *args, **kwargs)
+            if isinstance(path, Path) and path.name == "tmp":
+                values = list(info)
+                values[2] = os.makedev(7, 256) if mismatch == "mount" else device
+                return os.stat_result(values)
+            return info
+
+        try:
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(self.runner)}), \
+                    patch.object(RUNTIME, "privileged_request", side_effect=request), \
+                    patch.object(RUNTIME.os, "fstat", side_effect=fstat), \
+                    patch.object(RUNTIME.os, "stat", side_effect=inspect):
+                if mismatch:
+                    with self.assertRaisesRegex(RuntimeError, "device.*mismatch"):
+                        guardian.execute(["true"])
+                else:
+                    self.assertEqual(guardian.execute(["true"]), 0)
+            mounts = [call.args[0] for call in run.call_args_list if "mount" in call.args[0]]
+            chowns = [call for call in run.call_args_list if "chown" in call.args[0]]
+            if mismatch == "node":
+                self.assertEqual(mounts, [])
+            else:
+                self.assertEqual(mounts[0][-2], "/dev/loop1")
+            self.assertEqual(len(chowns), 0 if mismatch else 1)
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_loop_index_is_independent_of_partition_minor_numbers(self):
+        self.mount_with_partition_minors()
+
+    def test_device_node_mismatch_is_refused_before_mount(self):
+        self.mount_with_partition_minors("node")
+
+    def test_mounted_device_mismatch_is_refused_before_chown(self):
+        self.mount_with_partition_minors("mount")
+
+    def test_reaper_helper_timeout_still_attempts_unmount(self):
+        directory = self.candidate("timeout")
+        guardian = self.guardian()
+        guardian.reap_descendants = unittest.mock.Mock(side_effect=subprocess.TimeoutExpired("helper", .1))
+        guardian.attachments = unittest.mock.Mock(side_effect=[
+            ([], [{"target": str(directory / "tmp")}]), ([], []), ([], []),
+        ])
+        guardian.run = unittest.mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, "descendant cleanup failed"):
+            guardian.release(directory)
+        guardian.run.assert_called_once_with(
+            ["sudo", "-n", "umount", "--", str(directory / "tmp")], cleanup=True)
+        self.assertTrue(directory.exists())
+
+    def test_pin_checks_the_node_without_opening_a_fifo_for_io(self):
+        image = self.candidate("pin") / "ext4.img"
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        real_open = os.open
+
+        def checked_open(path, flags, *args, **kwargs):
+            if path == str(fifo) and not flags & os.O_PATH:
+                self.fail("pin attempted I/O before verifying a loop device")
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(RUNTIME.os, "geteuid", return_value=0), \
+                patch.object(RUNTIME.os, "open", side_effect=checked_open):
+            with self.assertRaisesRegex(RuntimeError, "non-loop device"):
+                RUNTIME.detach_verified_loop(image, str(fifo))
 
     def test_live_legacy_and_foreign_prefixes_are_preserved(self):
         # Both are legitimate pre-attachment layouts of other tools. Neither
