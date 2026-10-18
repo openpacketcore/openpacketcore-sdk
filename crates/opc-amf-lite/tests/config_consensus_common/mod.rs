@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use opc_consensus::engine::raft::{VoteRequest, VoteResponse};
+use opc_consensus::engine::raft::{PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse};
 use opc_consensus::{
     ConsensusPeer, ConsensusPeerError, ConsensusRpcHandler, ConsensusWireRequest,
     ConsensusWireResponse, DURABLE_CONSENSUS_TIMING_PROFILE,
@@ -55,12 +55,16 @@ pub enum ConfigClusterLifecycleError {
 
 #[derive(Clone, Debug, Default)]
 struct SplitVoteProgress {
+    pre_votes: BTreeMap<ConfigConsensusNodeId, PreVoteRequest<ConfigConsensusNodeId>>,
+    pre_vote_grants: usize,
     votes: BTreeMap<ConfigConsensusNodeId, VoteRequest<ConfigConsensusNodeId>>,
     rejected: usize,
     failure: Option<String>,
 }
 
 pub struct SplitVoteGate {
+    pre_vote_release: tokio::sync::watch::Sender<bool>,
+    pre_vote_replies: tokio::sync::Barrier,
     requests: tokio::sync::Barrier,
     progress: tokio::sync::watch::Sender<SplitVoteProgress>,
 }
@@ -68,6 +72,8 @@ pub struct SplitVoteGate {
 impl SplitVoteGate {
     fn new() -> Self {
         Self {
+            pre_vote_release: tokio::sync::watch::channel(false).0,
+            pre_vote_replies: tokio::sync::Barrier::new(2),
             requests: tokio::sync::Barrier::new(2),
             progress: tokio::sync::watch::channel(SplitVoteProgress::default()).0,
         }
@@ -167,6 +173,7 @@ struct LoopbackPeer {
     enabled: Arc<AtomicBool>,
     captured_frames: Arc<StdMutex<Vec<Vec<u8>>>>,
     first_vote_gate: Arc<StdMutex<Option<Arc<SplitVoteGate>>>>,
+    first_pre_vote_gate: Arc<StdMutex<Option<Arc<SplitVoteGate>>>>,
 }
 
 impl LoopbackPeer {
@@ -177,6 +184,7 @@ impl LoopbackPeer {
             enabled: Arc::new(AtomicBool::new(true)),
             captured_frames,
             first_vote_gate: Arc::new(StdMutex::new(None)),
+            first_pre_vote_gate: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -227,6 +235,32 @@ impl ConsensusPeer for LoopbackPeer {
         self.captured_frames.lock().expect("capture mutex").push(
             opc_consensus::encode_bounded(&request).map_err(|_| ConsensusPeerError::Protocol)?,
         );
+        let mut first_pre_vote = if request.family == opc_consensus::ConsensusRpcFamily::PreVote {
+            self.first_pre_vote_gate
+                .lock()
+                .expect("pre-vote gate")
+                .take()
+                .map(|gate| SplitVoteAttempt::new(gate, request.sender, self.target))
+        } else {
+            None
+        };
+        if let Some(attempt) = &mut first_pre_vote {
+            let (_, inquiry): (u16, PreVoteRequest<ConfigConsensusNodeId>) =
+                opc_consensus::decode_bounded(&request.payload).expect("decode actual pre-vote");
+            attempt.gate.progress.send_modify(|progress| {
+                assert!(progress.pre_votes.insert(request.sender, inquiry).is_none());
+            });
+            // Keep the naturally timed inquiries in flight until both actual
+            // follower leases expire. A real Vote still uses its original
+            // two-arrival barrier below; no speculative reply is a real vote.
+            attempt.phase = "pre-vote lease expiry";
+            let mut released = attempt.gate.pre_vote_release.subscribe();
+            released
+                .wait_for(|released| *released)
+                .await
+                .expect("pre-vote release");
+            attempt.phase = "pre-vote handler";
+        }
         let vote_sender =
             (request.family == opc_consensus::ConsensusRpcFamily::Vote).then_some(request.sender);
         let mut first_vote = None;
@@ -268,6 +302,34 @@ impl ConsensusPeer for LoopbackPeer {
             return Err(ConsensusPeerError::Unavailable);
         };
         let response = handler.handle(request.sender, request).await;
+        if let Some(attempt) = &mut first_pre_vote {
+            type Reply = Result<
+                PreVoteResponse<ConfigConsensusNodeId>,
+                opc_consensus::engine::error::RaftError<ConfigConsensusNodeId>,
+            >;
+            let (_, reply): (u16, Reply) = opc_consensus::decode_bounded(
+                response.result.as_ref().expect("actual pre-vote response"),
+            )
+            .expect("decode actual pre-vote response");
+            let reply = reply.expect("actual pre-vote handler succeeds");
+            assert!(
+                reply.vote_granted,
+                "both survivors must grant the speculative inquiry"
+            );
+            let proposed = attempt.gate.progress.borrow().pre_votes[&attempt.sender].clone();
+            assert!(reply.vote.is_committed());
+            assert!(reply.vote.leader_id.term < proposed.vote.leader_id.term);
+            assert!(reply.last_log_id <= proposed.last_log_id);
+            attempt
+                .gate
+                .progress
+                .send_modify(|progress| progress.pre_vote_grants += 1);
+            // Both genuine replies must be computed from the old term before
+            // either sender can start its persisted, self-voted campaign.
+            attempt.phase = "pre-vote reply barrier";
+            attempt.gate.pre_vote_replies.wait().await;
+            attempt.completed = true;
+        }
         if let Some(sender) = vote_sender {
             type Reply = Result<
                 VoteResponse<ConfigConsensusNodeId>,
@@ -796,6 +858,10 @@ impl ConfigCluster {
                 .first_vote_gate
                 .lock()
                 .expect("vote gate") = Some(gate.clone());
+            *self.paths[&(source, target)]
+                .first_pre_vote_gate
+                .lock()
+                .expect("pre-vote gate") = Some(gate.clone());
         }
         gate
     }
@@ -807,12 +873,32 @@ impl ConfigCluster {
     ) -> usize {
         let deadline = tokio::time::Instant::now() + cluster_transition_timeout();
         tokio::time::timeout_at(deadline, async {
+            // Automatic election timing remains active. Wait only for the
+            // actual old-leader leases, within the unchanged transition bound.
+            for (index, store) in self.stores.iter().enumerate() {
+                if index != excluded {
+                    store
+                        .wait_for_vote_lease_expiry_for_test()
+                        .await
+                        .expect("survivor lease expires without leader traffic");
+                }
+            }
+            split.pre_vote_release.send_replace(true);
             let split_progress = split.wait_for_rejections().await.unwrap_or_else(|error| {
                 panic!(
                     "split survivor election: {error}; state={:?}",
                     split.progress.borrow()
                 )
             });
+            assert_eq!(split_progress.pre_votes.len(), 2);
+            assert_eq!(split_progress.pre_vote_grants, 2);
+            assert_eq!(split_progress.votes.len(), 2);
+            assert_eq!(split_progress.rejected, 2);
+            for (sender, vote) in &split_progress.votes {
+                let inquiry = &split_progress.pre_votes[sender];
+                assert_eq!(vote.vote, inquiry.vote);
+                assert_eq!(vote.last_log_id, inquiry.last_log_id);
+            }
             // This fixture proves recovery through a real elected quorum.
             // Force the split first, then start one normal campaign rather
             // than letting repeated random election samples decide whether

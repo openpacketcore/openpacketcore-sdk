@@ -763,6 +763,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `opc-types`; `opc-persist` reuses them without changing its existing bounds.
   The optional `async-time` feature enables those Tokio adapters. (#1304)
 
+- `opc-amf-lite` and `opc-session-store`: coordinate election regression
+  fixtures through genuine PreVote grants before real votes, retaining split
+  recovery, forgotten-vote safety, stale-completion rejection and their
+  existing timing bounds. (#1333)
+
 - `opc-persist`: snapshot reads pin the last durable publication independently
   of building or installing its successor, including a delayed SQLite commit.
   Publication holds only a brief gate; readers open independent descriptors and
