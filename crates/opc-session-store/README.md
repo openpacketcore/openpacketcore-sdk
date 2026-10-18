@@ -2189,9 +2189,12 @@ For durable nonterminal lease contention, create the store with
 acquire request once and returns `FencedTransitionLeaseDeferred` while the
 predecessor lease is live. Exact retries recheck the original fence and
 generation without consuming another history entry; completion or void
-replaces pending once. Pending work survives restart and epoch closure and
-prevents retirement until resolved. The original profiles retain terminal
-`LeaseHeld`. See [ADR 0034](../../docs/adr/0034-fenced-transition-lease-deferral.md)
+replaces pending once. Pending work survives restart and epoch closure until
+resolved or until its fixed 24-hour lifetime from first binding expires.
+Expired deferrals report `Expired`, return `RequestExpired` on execute or void,
+and become reclaimable with their epoch through history maintenance.
+The original profiles retain terminal `LeaseHeld`. See
+[ADR 0034](../../docs/adr/0034-fenced-transition-lease-deferral.md)
 for profile admission, retention, persistence and consumer recovery. Crossing
 profiles requires a fresh install.
 

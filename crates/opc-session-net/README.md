@@ -717,7 +717,8 @@ request identity before this method returns an affine handle for the same
 sealed body. It never prepares another identity or journal row, and current
 execution admission still applies. Unknown, unavailable and absent status
 grant no retry authority. A deferral keeps the row unresolved; restart recovery
-uses the same method and original caller ID. See
+uses the same method and original caller ID. Resumption stops when the store's
+fixed 24-hour lifetime from first binding expires. See
 [ADR 0034](../../docs/adr/0034-fenced-transition-lease-deferral.md).
 
 Only `NotTransmitted` may be automatically retried, and only with the identical

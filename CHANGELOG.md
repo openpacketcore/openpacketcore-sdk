@@ -11,10 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
   `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
-  must handle both variants. The opt-in lease-deferral profile gives pending
-  bindings a fixed 24-hour lifetime from their first binding, allowing history
-  to retire even if the caller journal is lost. Its profile digest changes;
-  crossing the experimental profile change requires a fresh install. (#1334)
+  must handle both variants. (#1334)
 
 - `opc-session-net`: the first fenced roster reconcile closes prepare and
   execute for the entire admission, including older handles and equal-fence
@@ -91,7 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
-  Live predecessor-lease contention retains one nonterminal binding. Every
+  Live predecessor-lease contention retains one nonterminal binding with a
+  fixed 24-hour lifetime from first binding. Retries do not extend that lifetime;
+  expiry allows history to retire even if the caller journal is lost. Every
   retry keeps the original sealed body, request identity, epoch, history
   ordinal and caller journal row; ordered apply rechecks the original fence,
   generation and current lease before one acquisition and mutation. Restart
