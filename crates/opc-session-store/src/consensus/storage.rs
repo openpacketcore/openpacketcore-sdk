@@ -8046,19 +8046,21 @@ fn create_unpublished_snapshot_output_in_namespace(
     Ok((tokio::fs::File::from_std(output), cleanup))
 }
 
+type SealedSnapshotOutput = (
+    std::fs::File,
+    Option<PinnedSqliteFile>,
+    [u8; 32],
+    u64,
+    UnpublishedSnapshotArtifact,
+);
+
 async fn seal_snapshot_database_in_place(
     raw_snapshot: PinnedSqliteFile,
     _final_path: &Path,
     fixed_profile: bool,
     snapshot_integrity: SnapshotIntegrityPolicy,
     integrity_work: Option<SnapshotIntegrityWork>,
-) -> io::Result<(
-    std::fs::File,
-    Option<PinnedSqliteFile>,
-    [u8; 32],
-    u64,
-    UnpublishedSnapshotArtifact,
-)> {
+) -> io::Result<SealedSnapshotOutput> {
     #[cfg(test)]
     wait_after_in_place_seal_cleanup_is_armed(_final_path).await;
     snapshot_blocking_with_retention(integrity_work.clone(), move || {
@@ -8078,13 +8080,7 @@ fn seal_snapshot_database_in_place_sync(
     fixed_profile: bool,
     snapshot_integrity: SnapshotIntegrityPolicy,
     integrity_work: Option<&SnapshotIntegrityWork>,
-) -> io::Result<(
-    std::fs::File,
-    Option<PinnedSqliteFile>,
-    [u8; 32],
-    u64,
-    UnpublishedSnapshotArtifact,
-)> {
+) -> io::Result<SealedSnapshotOutput> {
     use std::io::{Read as _, Seek as _, Write as _};
 
     raw_snapshot.verify_identity()?;
@@ -8203,13 +8199,7 @@ async fn seal_snapshot_database_in_place_in_namespace(
     fixed_profile: bool,
     snapshot_integrity: SnapshotIntegrityPolicy,
     integrity_work: SnapshotIntegrityWork,
-) -> io::Result<(
-    std::fs::File,
-    Option<PinnedSqliteFile>,
-    [u8; 32],
-    u64,
-    UnpublishedSnapshotArtifact,
-)> {
+) -> io::Result<SealedSnapshotOutput> {
     raw_snapshot.bind_cleanup_to_namespace(Arc::clone(&namespace), raw_name)?;
     let final_path = namespace.sqlite_child_path(final_name)?;
     seal_snapshot_database_in_place(
