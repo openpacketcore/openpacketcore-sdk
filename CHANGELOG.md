@@ -777,6 +777,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Config bus adapters expose the same lifecycle through their consensus store.
   Planned shutdown keeps automatic bounded handoff. (#1370)
 
+- `opc-proto-diameter`: SWm emergency identity recovery accepts ordinary root
+  IMSI NAIs as a receive-side interoperability extension. The emergency
+  indication remains mandatory, and recovery preserves the original identity
+  and EAP payload exactly while adding the received IMEI. Conforming IMSI
+  emergency NAIs and every other authorization check retain their behavior.
+
 - `opc-proto-gtpu`: encode and decode the PDU Session Container Paging Policy
   Indicator in bits 7..5, as specified by TS 38.415. Correct the independent
   reference corpus, catalog and forwarding fixtures. `opc-gtpu-dataplane`

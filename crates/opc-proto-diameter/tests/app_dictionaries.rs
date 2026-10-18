@@ -3302,6 +3302,89 @@ fn swm_identity_recovery_accepts_root_imsi_nai_without_rewriting() {
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_root_imsi_recovery_requires_emergency_and_unchanged_requests() {
+    let imei = emergency_imei();
+    let identity = "0234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org";
+    let mut initial = sample_swm_request();
+    prepare_recovery_request(&mut initial);
+    initial.user_name = Some(identity.into());
+    initial.eap_payload = eap_response_identity(0x17, identity).into();
+    let mut retry = initial.clone();
+    retry.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: None,
+    });
+    let identity_response = sample_identity_recovery_answer();
+    let final_answer = sample_final_emergency_answer(&imei);
+    let verify = |initial: &SwmDiameterEapRequest, retry: &SwmDiameterEapRequest| {
+        SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            correlate_exchange(initial, &identity_response, 1, 2)?,
+            correlate_exchange(retry, &final_answer, 3, 4)?,
+            &imei,
+        )
+    };
+
+    for indication in [None, Some(SwmEmergencyServices::new(false))] {
+        let mut non_emergency_initial = initial.clone();
+        non_emergency_initial.emergency_services = indication;
+        let mut non_emergency_retry = retry.clone();
+        non_emergency_retry.emergency_services = indication;
+        assert_eq!(
+            verify(&non_emergency_initial, &non_emergency_retry)
+                .expect_err("a root NAI does not grant emergency authority"),
+            SwmEmergencyAuthorizationError::InitialRequestNotEmergency
+        );
+        assert_eq!(
+            verify(&initial, &non_emergency_retry)
+                .expect_err("the retry must retain the emergency indication"),
+            SwmEmergencyAuthorizationError::RetryRequestMismatch
+        );
+    }
+
+    let mut changed = retry.clone();
+    changed.user_name = Some(emergency_imsi_nai().into());
+    changed.eap_payload = eap_response_identity(0x17, emergency_imsi_nai()).into();
+    assert_eq!(
+        verify(&initial, &changed).expect_err("recovery must not insert the sos label"),
+        SwmEmergencyAuthorizationError::RetryUserIdentityMismatch
+    );
+    changed = retry.clone();
+    changed.eap_payload = eap_response_identity(0x18, identity).into();
+    assert_eq!(
+        verify(&initial, &changed).expect_err("the complete EAP payload must be retained"),
+        SwmEmergencyAuthorizationError::RetryRequestMismatch
+    );
+    changed = retry.clone();
+    changed.terminal_information = None;
+    assert_eq!(
+        verify(&initial, &changed).expect_err("root recovery still needs the recovered IMEI"),
+        SwmEmergencyAuthorizationError::RetryTerminalInformationMissing
+    );
+    changed = retry.clone();
+    changed.terminal_information.as_mut().unwrap().imei =
+        Imei::new("356938035643709").expect("synthetic alternate IMEI");
+    assert_eq!(
+        verify(&initial, &changed).expect_err("root recovery still binds the exact IMEI"),
+        SwmEmergencyAuthorizationError::RetryDeviceIdentityMismatch
+    );
+    let mut changed_initial = initial.clone();
+    changed_initial.eap_payload = eap_response_identity(0x17, emergency_imsi_nai()).into();
+    assert_eq!(
+        verify(&changed_initial, &retry).expect_err("User-Name and EAP identity must match"),
+        SwmEmergencyAuthorizationError::InitialEapIdentityMismatch
+    );
+    assert_eq!(
+        SwmEmergencyAuthorizationEvidence::verify_direct(
+            correlate_exchange(&initial, &final_answer, 1, 2).expect("Diameter correlation"),
+            &imei,
+        )
+        .expect_err("a root IMSI NAI must complete identity recovery"),
+        SwmEmergencyAuthorizationError::InitialIdentityMismatch
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_identity_recovery_evidence_fails_closed_at_every_boundary() {
     let imei = emergency_imei();
     let other_imei = Imei::new("356938035643709").expect("valid alternate IMEI");
@@ -3612,7 +3695,16 @@ fn swm_emergency_evidence_binds_diameter_eap_and_imsi_emergency_nai() {
     );
 
     for invalid_nai in [
-        "0234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "1234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "0234150999999999@nai.epc.mnc016.mcc234.3gppnetwork.org",
+        "0234150999999999@nai.epc.mnc015.mcc235.3gppnetwork.org",
+        "0234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org.extra",
+        "0234150999999999@nai.epc.mnc15.mcc234.3gppnetwork.org",
+        "0234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org@extra",
+        "023415099999999a@nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "02341509999999999@nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "02341@nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "0234150999999999@sos.sos.nai.epc.mnc015.mcc234.3gppnetwork.org",
         "1234150999999999@sos.nai.epc.mnc015.mcc234.3gppnetwork.org",
         "0234150999999999@sos.nai.epc.mnc016.mcc234.3gppnetwork.org",
         "0234150999999999@sos.nai.epc.mnc015.mcc235.3gppnetwork.org",
