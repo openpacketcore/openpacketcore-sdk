@@ -3232,6 +3232,76 @@ fn swm_identity_recovery_evidence_accepts_only_the_complete_correlated_sequence(
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_identity_recovery_accepts_root_imsi_nai_without_rewriting() {
+    let imei = emergency_imei();
+    let identity_response = sample_identity_recovery_answer();
+    let final_answer = sample_final_emergency_answer(&imei);
+    for identity in [
+        "0234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "6234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "0234150999999999@nai.epc.mnc150.mcc234.3gppnetwork.org",
+        "6234150999999999@NAI.EPC.MNC150.MCC234.3GPPNETWORK.ORG",
+    ] {
+        let mut initial = sample_swm_request();
+        prepare_recovery_request(&mut initial);
+        initial.user_name = Some(identity.into());
+        let payload = eap_response_identity(0x17, identity);
+        initial.eap_payload = payload.clone().into();
+        let mut retry = initial.clone();
+        retry.terminal_information = Some(SwmTerminalInformation {
+            imei: Imei::from(&imei),
+            software_version: None,
+        });
+
+        let receive = |request: &SwmDiameterEapRequest, hop, end| {
+            let message = apps::swm::build_swm_diameter_eap_request(
+                request,
+                hop,
+                end,
+                EncodeContext::default(),
+            )
+            .expect("synthetic DER");
+            let wire = encode_message(&message);
+            let decoded = decode_message(&wire);
+            apps::swm::parse_swm_diameter_eap_request_envelope(
+                &decoded,
+                DecodeContext::conservative(),
+            )
+            .expect("received root IMSI DER")
+        };
+        let initial_exchange = receive(&initial, 1, 2)
+            .correlate_answer(answer_envelope(&identity_response, 1, 2))
+            .expect("initial Diameter correlation");
+        let retry_exchange = receive(&retry, 3, 4)
+            .correlate_answer(answer_envelope(&final_answer, 3, 4))
+            .expect("retry Diameter correlation");
+        for exchange in [&initial_exchange, &retry_exchange] {
+            assert_eq!(
+                exchange.request().user_name.as_ref().unwrap().as_ref(),
+                identity
+            );
+            assert_eq!(exchange.request().eap_payload.as_ref(), &payload);
+            assert!(exchange.request().requests_emergency_services());
+        }
+        let evidence = SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+        .unwrap_or_else(|error| panic!("root IMSI emergency recovery: {}", error.as_str()));
+        assert_eq!(
+            evidence.path(),
+            SwmEmergencyAuthorizationPath::RecoveredDeviceIdentity
+        );
+        assert_eq!(
+            evidence.msk().as_bytes(),
+            apps::swm::derive_unauthenticated_emergency_msk(&imei).as_bytes()
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_identity_recovery_evidence_fails_closed_at_every_boundary() {
     let imei = emergency_imei();
     let other_imei = Imei::new("356938035643709").expect("valid alternate IMEI");
