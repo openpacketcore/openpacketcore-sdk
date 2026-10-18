@@ -95,7 +95,13 @@ async fn batch_fixture(
     (batches, identity, request, admission)
 }
 
-async fn retained_batch(remote: bool, cancel_observer: bool, revoke: bool, handoff: bool) {
+async fn retained_batch(
+    remote: bool,
+    cancel_observer: bool,
+    revoke: bool,
+    handoff: bool,
+    slow_reply: bool,
+) {
     let mut fleet = fleet(SessionPersistenceMode::Durable).await;
     let result = AssertUnwindSafe(async {
         let leader = fleet.leader();
@@ -133,6 +139,7 @@ async fn retained_batch(remote: bool, cancel_observer: bool, revoke: bool, hando
             .set_log_admission_window_for_test(window);
         let request_bytes = postcard::to_allocvec(&request).unwrap();
         let attempt = request.attempt().unwrap();
+        let _slow_reply = slow_reply.then(|| SlowAcceptedReply::arm(&fleet));
         let mut write =
             Box::pin(batches.execute_classified(&identity, &request, ScopeWorkClass::Normal));
         assert!(
@@ -215,22 +222,27 @@ async fn retained_batch(remote: bool, cancel_observer: bool, revoke: bool, hando
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_admission_review_public_write_retains_local_request() {
-    retained_batch(false, false, false, false).await;
+    retained_batch(false, false, false, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_public_write_retains_request_with_slow_reply() {
+    retained_batch(false, false, false, false, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_admission_review_public_write_retains_forwarded_request() {
-    retained_batch(true, false, false, false).await;
+    retained_batch(true, false, false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_admission_review_public_write_retains_cancelled_observer_request() {
-    retained_batch(false, true, false, false).await;
+    retained_batch(false, true, false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_admission_review_public_write_rechecks_authority_after_pressure() {
-    retained_batch(false, false, true, false).await;
+    retained_batch(false, false, true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -350,5 +362,5 @@ async fn log_admission_review_public_v2_write_retains_exact_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_admission_review_public_write_retains_request_across_pressure_handoff() {
-    retained_batch(false, false, false, true).await;
+    retained_batch(false, false, false, true, false).await;
 }

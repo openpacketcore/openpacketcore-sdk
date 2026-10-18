@@ -17,6 +17,66 @@ mod pressure_round;
 const WAIT: Duration = Duration::from_secs(60);
 
 #[cfg(feature = "test-control")]
+struct SlowAcceptedReply {
+    stores: Vec<ConsensusSessionStore>,
+    holds: Vec<Arc<AcceptedClientWriteReceiverHoldForTest>>,
+    release: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(feature = "test-control")]
+impl SlowAcceptedReply {
+    fn arm(fleet: &Fleet) -> Self {
+        let stores = fleet.stores.iter().flatten().cloned().collect::<Vec<_>>();
+        let holds = stores
+            .iter()
+            .map(|store| {
+                let hold = Arc::new(AcceptedClientWriteReceiverHoldForTest::default());
+                store.inject_accepted_client_write_receiver_outcome(
+                    AcceptedClientWriteReceiverTestOutcome::HoldUntilReleased(Arc::clone(&hold)),
+                );
+                hold
+            })
+            .collect::<Vec<_>>();
+        let releasing = holds.clone();
+        let release = tokio::spawn(async move {
+            futures_util::future::select_all(
+                releasing
+                    .iter()
+                    .map(|hold| Box::pin(hold.entered.notified())),
+            )
+            .await;
+            tokio::time::sleep(OPERATION_BOUND + Duration::from_millis(100)).await;
+            for hold in releasing {
+                hold.release.notify_one();
+            }
+        });
+        Self {
+            stores,
+            holds,
+            release,
+        }
+    }
+}
+
+#[cfg(feature = "test-control")]
+impl Drop for SlowAcceptedReply {
+    fn drop(&mut self) {
+        self.release.abort();
+        for hold in &self.holds {
+            hold.release.notify_one();
+        }
+        for store in &self.stores {
+            store
+                .inner
+                .accepted_receiver_test_outcomes
+                .lock()
+                .unwrap()
+                .clear();
+        }
+    }
+}
+
+#[cfg(feature = "test-control")]
 fn recovery_reply_kind(reply: &ForwardMutationReply) -> &'static str {
     match reply {
         ForwardMutationReply::Applied(response) if response.result.is_ok() => "applied",
@@ -1087,7 +1147,12 @@ async fn select_snapshot(store: &ConsensusSessionStore) {
 }
 
 #[cfg(feature = "test-control")]
-async fn blocked_transfer(mode: SessionPersistenceMode, window: u64, cycles: usize) {
+async fn blocked_transfer(
+    mode: SessionPersistenceMode,
+    window: u64,
+    cycles: usize,
+    slow_reply: bool,
+) {
     let mut fleet = fleet(mode).await;
     let result = AssertUnwindSafe(async {
         for _ in 0..cycles {
@@ -1151,6 +1216,7 @@ async fn blocked_transfer(mode: SessionPersistenceMode, window: u64, cycles: usi
             let resumed = std::time::Instant::now();
             let deadline = tokio::time::Instant::now() + WAIT;
             let original_vote = store.inner.raft.metrics().borrow().vote;
+            let _slow_reply = slow_reply.then(|| SlowAcceptedReply::arm(&fleet));
             // The fill command deliberately replays one receipt. Recovery
             // needs a fresh identity once, then retains it across every route.
             let request_id = SessionConsensusRequestId::new();
@@ -1221,7 +1287,7 @@ async fn log_admission_blocked_transfer_recovers_three_cycles_durable() {
     let window = DURABLE_OPENRAFT_PROFILE.retained_logs
         + 2 * DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
         + 64;
-    blocked_transfer(SessionPersistenceMode::Durable, window, 3).await;
+    blocked_transfer(SessionPersistenceMode::Durable, window, 3, false).await;
 }
 
 #[cfg(feature = "test-control")]
@@ -1230,7 +1296,16 @@ async fn log_admission_blocked_transfer_recovers_three_cycles_async() {
     let window = DURABLE_OPENRAFT_PROFILE.retained_logs
         + 2 * DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
         + 64;
-    blocked_transfer(SessionPersistenceMode::Async, window, 3).await;
+    blocked_transfer(SessionPersistenceMode::Async, window, 3, false).await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_blocked_transfer_recovers_with_slow_reply() {
+    let window = DURABLE_OPENRAFT_PROFILE.retained_logs
+        + 2 * DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
+        + 64;
+    blocked_transfer(SessionPersistenceMode::Durable, window, 1, true).await;
 }
 
 #[cfg(feature = "test-control")]
@@ -1264,6 +1339,7 @@ async fn log_admission_full_window_blocked_transfer_durable() {
         SessionPersistenceMode::Durable,
         crate::consensus::SESSION_CONSENSUS_LOG_HIGH_WATER_ROWS,
         1,
+        false,
     )
     .await;
 }
@@ -1275,6 +1351,7 @@ async fn log_admission_full_window_blocked_transfer_async() {
         SessionPersistenceMode::Async,
         crate::consensus::SESSION_CONSENSUS_LOG_HIGH_WATER_ROWS,
         1,
+        false,
     )
     .await;
 }
