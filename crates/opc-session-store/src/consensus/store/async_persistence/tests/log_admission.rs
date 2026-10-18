@@ -16,6 +16,20 @@ mod pressure_round;
 
 const WAIT: Duration = Duration::from_secs(60);
 
+#[cfg(feature = "test-control")]
+fn recovery_reply_kind(reply: &ForwardMutationReply) -> &'static str {
+    match reply {
+        ForwardMutationReply::Applied(response) if response.result.is_ok() => "applied",
+        ForwardMutationReply::Applied(_) => "rejected",
+        ForwardMutationReply::RecordExpiryPreflight(_) => "record-expiry-preflight",
+        ForwardMutationReply::NotLeader { .. } => "not-leader",
+        ForwardMutationReply::Unavailable => "unavailable",
+        ForwardMutationReply::OutcomeUnknown => "outcome-unknown",
+        ForwardMutationReply::FencedTransitionActivation(_) => "activation",
+        ForwardMutationReply::LogPressure => "log-pressure",
+    }
+}
+
 async fn fleet(mode: SessionPersistenceMode) -> Fleet {
     let mut fleet = Fleet::new(3);
     for index in 0..3 {
@@ -870,8 +884,9 @@ async fn blocked_build(mode: SessionPersistenceMode, window: u64, cycles: usize)
             // Releasing the stalled build is the only intervention. The engine
             // and SDK must select the next snapshot and purge without a manual trigger.
             drop(guard);
+            let resumed = std::time::Instant::now();
             let reply = propose(store, &command, tokio::time::Instant::now() + WAIT).await;
-            assert!(matches!(&reply, ForwardMutationReply::Applied(response) if response.result.is_ok()), "automatic recovery: {reply:?}; pressure: {:?}; metrics: {:?}", store.log_pressure_snapshot(), store.inner.raft.metrics().borrow());
+            assert!(matches!(&reply, ForwardMutationReply::Applied(response) if response.result.is_ok()), "automatic recovery: {reply:?}; kind={}; elapsed={:?}; active={}; snapshot-phase={:?}; pressure: {:?}; metrics: {:?}", recovery_reply_kind(&reply), resumed.elapsed(), store.inner.persistence_protocol.is_active(), store.inner.backend.snapshot_observation().phase_for_test(), store.log_pressure_snapshot(), store.inner.raft.metrics().borrow());
             let mut metrics = store.inner.raft.metrics();
             tokio::time::timeout(WAIT, async {
                 while store.log_pressure_snapshot().retained_rows >= window {

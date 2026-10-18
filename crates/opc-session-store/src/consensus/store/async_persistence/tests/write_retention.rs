@@ -176,7 +176,13 @@ async fn retained_batch(remote: bool, cancel_observer: bool, revoke: bool, hando
                 );
                 return;
             }
-            let outcome = result.unwrap();
+            let outcome = result.unwrap_or_else(|error| {
+                panic!(
+                    "retained write failed: {error}; pressure: {:?}; metrics: {:?}",
+                    store.log_pressure_snapshot(),
+                    store.inner.raft.metrics().borrow(),
+                )
+            });
             assert!(outcome.matches_request(&request));
             assert_eq!(outcome.counters()[0], 7);
             if handoff {
