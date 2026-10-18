@@ -778,7 +778,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Planned shutdown keeps automatic bounded handoff. (#1370)
 
 - The Linux fs-verity test harness owns each gate's filesystem through command
-  exit and interruption, removes its loop mount and image, and sweeps stale
+  exit and interruption, isolates its mounts from other jobs, removes its loop
+  mount and image, and sweeps stale
   private runtime directories without deleting an attached or active runtime.
   CI invokes each fs-verity test command through the owner. (#1312)
 

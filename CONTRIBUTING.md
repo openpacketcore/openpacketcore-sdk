@@ -80,10 +80,14 @@ launcher, and sweeps unlocked, current-user, mode-0700 `fs-verity-runtime.*`
 directories below `RUNNER_TEMP` at startup, including the former
 `opc-fsverity.*` layout. A directory still used by a loop device or mount is
 preserved. Inventory or cleanup errors fail the gate.
+Mounts are private to the owner and its commands, so another job cannot inherit
+one and keep its backing loop attached. Namespace setup also requires
+passwordless `unshare` and `setpriv`; commands retain the caller's identity,
+environment, stdin and inherited ownership locks.
 GitHub steps use this owner as their custom shell; running setup in an earlier
 step no longer exports a filesystem for subsequent steps. The real mount and
 interruption regressions are `python3 ci/test-fsverity-runtime.py -v` on Linux
-with the same passwordless mount, chown, umount and losetup privileges.
+with the same passwordless namespace, mount, chown, umount and losetup privileges.
 
 ```bash
 cargo fmt --all --check

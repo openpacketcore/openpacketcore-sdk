@@ -5,19 +5,24 @@ Usage: ci/setup-fsverity-tmp.sh -- COMMAND [ARG ...]
 
 Only the command receives the snapshot environment. Mutable TMPDIR, databases,
 WALs and build output stay on ordinary storage. A detached child owns the mount
-and watches a pipe held only by the launcher, so even SIGKILL of the launcher
-initiates cleanup. The guardian is a subreaper: escaped command descendants are
-disposed of before releasing their filesystem. Cleanup errors fail the gate.
+in a private mount namespace and watches a pipe held only by the launcher, so
+even SIGKILL of the launcher initiates cleanup. The guardian is a subreaper:
+escaped command descendants are disposed of before releasing their filesystem.
+Cleanup errors fail the gate.
 """
 
+import array
 import ctypes
+import errno
 import fcntl
 import json
 import os
 from pathlib import Path
 import select
+import secrets
 import shutil
 import signal
+import socket
 import stat
 import struct
 import subprocess
@@ -47,7 +52,12 @@ def detach_loop(image, loop):
     """
     descriptor = os.open(loop, os.O_RDONLY | os.O_CLOEXEC)
     try:
-        status = fcntl.ioctl(descriptor, 0x4C05, bytes(232))  # LOOP_GET_STATUS64
+        try:
+            status = fcntl.ioctl(descriptor, 0x4C05, bytes(232))  # LOOP_GET_STATUS64
+        except OSError as error:
+            if error.errno == errno.ENXIO:
+                return  # Autoclear completed after the inventory was read.
+            raise
         device, inode = struct.unpack_from("=QQ", status)
         info = os.stat(image, follow_symlinks=False)
         if not stat.S_ISREG(info.st_mode) or (device, inode) != (info.st_dev, info.st_ino):
@@ -61,6 +71,28 @@ class Guardian:
     def __init__(self, owner):
         self.owner = owner
         self.interrupted = False
+        self.inherited_mounts = []
+
+    def discard_inherited_runtime_mounts(self):
+        # unshare initially clones the host's mounts. Drop our private copies
+        # of unrelated runtime mounts so we cannot pin an older job's image.
+        # Retain their inventory for the startup sweep: the original mounts
+        # outside this namespace may still be attached.
+        mounts = json.loads(self.run(
+            ["findmnt", "--json", "--list", "--output", "TARGET,SOURCE"],
+            capture=True, cleanup=True,
+        ))["filesystems"]
+        required = [Path.cwd().resolve(), Path(os.environ["RUNNER_TEMP"]).resolve()]
+        if os.environ.get("TMPDIR"):
+            required.append(Path(os.environ["TMPDIR"]).resolve())
+        for mount in sorted(mounts, key=lambda item: len(Path(item["target"]).parts), reverse=True):
+            target = Path(mount["target"])
+            if (not mount["source"].startswith("/dev/loop")
+                    or not any(part.startswith((PREFIX, "opc-fsverity.")) for part in target.parts)
+                    or any(within(path, target) for path in required)):
+                continue
+            self.inherited_mounts.append(mount)
+            self.run(["sudo", "-n", "umount", "--recursive", "--", str(target)], cleanup=True)
 
     def stopping(self):
         if select.select([self.owner], [], [], 0)[0]:
@@ -122,7 +154,7 @@ class Guardian:
     def attachments(self, directory):
         """Fail closed on inventory errors; compare backing inode, not loop ID."""
         loops, mounts = self.inventory()
-        mounted = [mount for mount in mounts if within(mount["target"], directory)]
+        mounted = [mount for mount in mounts + self.inherited_mounts if within(mount["target"], directory)]
         if mounted:
             # A startup sweep must not traverse a mounted filesystem either.
             return [], mounted
@@ -215,9 +247,16 @@ class Guardian:
                 raise RuntimeError("unexpected loop backing file; retaining fs-verity runtime")
             self.run(["sudo", "-n", sys.executable, str(Path(__file__).resolve()),
                       "--detach-loop", str(image), loop["name"]], cleanup=True)
-        attached, mounted = self.attachments(directory)
-        if attached or mounted:
-            raise RuntimeError("fs-verity runtime still attached after cleanup")
+        # LOOP_CLR_FD may defer autoclear until a device observer closes its
+        # descriptor. Keep the image and ownership lock until it really clears.
+        deadline = time.monotonic() + 5
+        while True:
+            attached, mounted = self.attachments(directory)
+            if not attached and not mounted:
+                break
+            if mounted or time.monotonic() >= deadline:
+                raise RuntimeError("fs-verity runtime still attached after cleanup")
+            time.sleep(0.05)
         shutil.rmtree(directory)
 
     def execute(self, command):
@@ -290,16 +329,50 @@ class Guardian:
                 os.close(descriptor)
 
 
-def main():
-    command = sys.argv[1:]
-    if len(command) == 3 and command[0] == "--detach-loop":
-        detach_loop(command[1], command[2])
-        return 0
-    if command[:1] == ["--"]:
-        command = command[1:]
-    if sys.platform != "linux" or not os.environ.get("RUNNER_TEMP") or not command:
-        print("usage: RUNNER_TEMP=<private scratch root> ci/setup-fsverity-tmp.sh -- COMMAND [ARG ...] (Linux)", file=sys.stderr)
-        return 2
+def receive_guardian(address, parent):
+    # sudo closes inherited descriptors. Transfer the owner pipe, original
+    # stdin and caller-owned locks only after returning to the caller's UID.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+        connection.connect("\0" + address)
+        peer, uid, _gid = struct.unpack("3i", connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        if peer != parent or uid != os.getuid():
+            raise RuntimeError("unexpected fs-verity owner socket peer")
+        data, ancillary, flags, _address = connection.recvmsg(
+            1024**2, socket.CMSG_SPACE(253 * array.array("i").itemsize))
+    if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+        raise RuntimeError("incomplete fs-verity owner descriptor transfer")
+    message = json.loads(data)
+    descriptors = array.array("i")
+    for level, kind, value in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            descriptors.frombytes(value)
+    targets = message["targets"]
+    if len(descriptors) != len(targets) + 1:
+        raise RuntimeError("missing fs-verity owner descriptors")
+    # Copy above every source/target first, so restoring an inherited FD cannot
+    # overwrite another received descriptor that has not been restored yet.
+    minimum = max([*descriptors, *targets]) + 1
+    copies = [fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, minimum) for fd in descriptors]
+    for fd in descriptors:
+        os.close(fd)
+    owner = copies[0]
+    for source, target in zip(copies[1:], targets):
+        os.dup2(source, target, inheritable=True)
+        os.close(source)
+    os.environ.clear()
+    os.environ.update(message["environment"])
+    if os.readlink("/proc/self/ns/mnt") == message["namespace"]:
+        raise RuntimeError("fs-verity guardian did not enter a private mount namespace")
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    guardian = Guardian(owner)
+    for signum in SIGNALS:
+        signal.signal(signum, lambda _signum, _frame: setattr(guardian, "interrupted", True))
+    guardian.discard_inherited_runtime_mounts()
+    return guardian.execute(message["command"])
+
+
+def launch(command):
     reader, writer = os.pipe()
     interrupted = None
 
@@ -312,32 +385,87 @@ def main():
 
     for signum in SIGNALS:
         signal.signal(signum, interrupt)
-    child = os.fork()
-    if child == 0:
-        if writer is not None:
-            os.close(writer)
-        os.setsid()
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-        guardian = Guardian(reader)
-        for signum in SIGNALS:
-            signal.signal(signum, lambda _signum, _frame: setattr(guardian, "interrupted", True))
-        try:
-            result = guardian.execute(command)
-        except Exception as error:
-            print(f"fs-verity: {error}", file=sys.stderr, flush=True)
-            result = 1
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(result)
-    os.close(reader)
+    process = None
     try:
-        _, status = os.waitpid(child, 0)
-        result = os.waitstatus_to_exitcode(status)
+        # Abstract sockets leave no filesystem entry after an interrupted
+        # bootstrap, and do not depend on RUNNER_TEMP's pathname length.
+        address = "fs-verity-owner-" + secrets.token_hex(24)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
+            server.bind("\0" + address)
+            server.listen(1)
+            server.settimeout(0.05)
+            targets = [0]
+            for name in Path("/proc/self/fd").iterdir():
+                fd = int(name.name)
+                try:
+                    if fd > 2 and os.get_inheritable(fd):
+                        targets.append(fd)
+                except OSError:
+                    continue  # The directory iterator's transient descriptor.
+            if len(targets) + 1 > 253:
+                raise RuntimeError("too many inherited fs-verity owner descriptors")
+            groups = ",".join(map(str, os.getgroups()))
+            group_args = ["--groups", groups] if groups else ["--clear-groups"]
+            # Mounts must not enter the host namespace: an unrelated job could
+            # otherwise inherit one and keep the loop pinned after our exit.
+            # Drop privilege before executing Python or restoring user env.
+            process = subprocess.Popen([
+                "/usr/bin/sudo", "-n", "/usr/bin/unshare", "--mount", "--propagation", "private", "--",
+                "/usr/bin/setpriv", "--reuid", str(os.getuid()), "--regid", str(os.getgid()),
+                *group_args, "--", sys.executable, str(Path(__file__).resolve()),
+                "--guardian", address, str(os.getpid()),
+            ], start_new_session=True)
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    connection, _ = server.accept()
+                    break
+                except socket.timeout:
+                    if process.poll() is not None:
+                        raise subprocess.CalledProcessError(process.returncode or 1, "fs-verity namespace bootstrap")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("fs-verity namespace bootstrap timed out")
+            with connection:
+                connection.settimeout(30)
+                _peer, uid, _gid = struct.unpack("3i", connection.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+                if uid != os.getuid():
+                    raise RuntimeError("unexpected fs-verity guardian socket peer")
+                message = json.dumps({"targets": targets, "environment": dict(os.environ),
+                                      "namespace": os.readlink("/proc/self/ns/mnt"), "command": command})
+                connection.sendmsg([message.encode()], [(
+                    socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [reader, *targets]))])
+        os.close(reader)
+        reader = None
+        result = process.wait()
         return 128 + interrupted if interrupted else (result if result >= 0 else 128 - result)
     finally:
         if writer is not None:
             os.close(writer)
+        if reader is not None:
+            os.close(reader)
+        if process is not None:
+            process.wait()  # The guardian retains caller locks through cleanup.
+
+
+def main():
+    command = sys.argv[1:]
+    if len(command) == 3 and command[0] == "--detach-loop":
+        detach_loop(command[1], command[2])
+        return 0
+    if len(command) == 3 and command[0] == "--guardian":
+        return receive_guardian(command[1], int(command[2]))
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if sys.platform != "linux" or not os.environ.get("RUNNER_TEMP") or not command:
+        print("usage: RUNNER_TEMP=<private scratch root> ci/setup-fsverity-tmp.sh -- COMMAND [ARG ...] (Linux)", file=sys.stderr)
+        return 2
+    return launch(command)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print(f"fs-verity: {error}", file=sys.stderr, flush=True)
+        sys.exit(1)

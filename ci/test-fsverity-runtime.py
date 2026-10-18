@@ -174,6 +174,37 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
         self.run_command("sh", "-c", "exit 37", expected=37)
         self.assertEqual(list(self.runner.iterdir()), [])
 
+    def test_runtime_mount_is_not_visible_to_other_jobs(self):
+        report = self.root / "snapshot-root"
+        finish = self.root / "finish"
+        self.process = subprocess.Popen(
+            [str(HARNESS), "--", "python3", "-c", """
+import os, pathlib, time
+pathlib.Path(%r).write_text(os.environ['OPC_FS_VERITY_SNAPSHOT_ROOT'])
+deadline = time.monotonic() + 10
+while not pathlib.Path(%r).exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError('parent did not finish mount visibility check')
+    time.sleep(0.02)
+""" % (str(report), str(finish))],
+            env=self.environment, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            self.wait_for(report.exists, "wrapped command snapshot root")
+            mountpoint = Path(report.read_text()).parent
+            outside = subprocess.run(
+                ["findmnt", "--mountpoint", str(mountpoint), "--noheadings"],
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(outside.returncode, 1, outside.stdout + outside.stderr)
+        finally:
+            finish.touch()
+            output, _ = self.process.communicate(timeout=10)
+        self.assertEqual(self.process.returncode, 0, output)
+        self.assertEqual(self.attached(), [])
+        self.assertEqual(list(self.runner.iterdir()), [])
+
     def test_restrictive_umask_preserves_private_root_and_cleanup(self):
         result = subprocess.run(
             [str(HARNESS), "--", "true"], env=self.environment,
@@ -181,6 +212,75 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_wrapped_command_retains_original_stdin(self):
+        data = b"caller input\x00\n"
+        result = subprocess.run(
+            [str(HARNESS), "--", "python3", "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+            env=self.environment, input=data, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, data)
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_private_namespace_does_not_pin_another_jobs_runtime_mount(self):
+        other = self.root / "opc-fsverity.other-job"
+        other.mkdir()
+        image = other / "ext4.img"
+        with image.open("xb") as stream:
+            stream.truncate(32 * 1024**2)
+        mountpoint = other / "tmp"
+        mountpoint.mkdir()
+        self.extra_images.append(image)
+        self.extra_mounts.append(mountpoint)
+        subprocess.run(["mkfs.ext4", "-q", str(image)], check=True, timeout=10)
+        privileged("mount", "-o", "loop,nosuid,nodev", image, mountpoint)
+        self.run_command("python3", "-c", """
+import subprocess
+result = subprocess.run(['findmnt', '--mountpoint', %r, '--noheadings'], capture_output=True)
+assert result.returncode == 1, result.stdout
+""" % str(mountpoint))
+        # Dropping the copied mount must never unmount the original job's view.
+        parent = subprocess.run(
+            ["findmnt", "--mountpoint", str(mountpoint), "--noheadings"],
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(parent.returncode, 0, parent.stderr)
+        self.assertTrue(image.exists())
+
+    def test_caller_lock_is_held_through_killed_launcher_cleanup(self):
+        ready = self.root / "ready"
+        lock = self.root / "caller-lock"
+        with lock.open("w") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.process = subprocess.Popen(
+                [str(HARNESS), "--", "python3", "-c", """
+import pathlib, signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pathlib.Path(%r).touch()
+time.sleep(10)
+""" % str(ready)],
+                env=self.environment, pass_fds=(stream.fileno(),), start_new_session=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+        self.wait_for(ready.exists, "TERM-resistant command")
+        self.process.kill()
+        self.process.wait(timeout=5)
+        with lock.open("w") as observer:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(observer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.wait_for(lambda: not list(self.runner.iterdir()), "guardian cleanup")
+            self.wait_for(lambda: self.lock_available(observer), "caller lock release")
+        self.process.communicate(timeout=5)
+        self.assertEqual(self.attached(), [])
+
+    @staticmethod
+    def lock_available(stream):
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
 
     def test_cleanup_detaches_an_additional_binding_to_its_own_image(self):
         self.run_command("python3", "-c", """
@@ -205,6 +305,45 @@ subprocess.run(['sudo', '-n', 'losetup', '--find', '--show', str(image)], check=
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("refusing to detach", result.stderr)
         self.assertEqual(privileged("losetup", "--associated", image, "--noheadings", "--output", "NAME").strip(), loop)
+
+    def test_cleanup_waits_for_pending_loop_autoclear(self):
+        ready = self.root / "ready"
+        finish = self.root / "finish"
+        held = self.root / "device-held"
+        self.process = subprocess.Popen(
+            [str(HARNESS), "--", "python3", "-c", """
+import pathlib, time
+pathlib.Path(%r).touch()
+deadline = time.monotonic() + 10
+while not pathlib.Path(%r).exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError('parent did not release command')
+    time.sleep(0.02)
+""" % (str(ready), str(finish))],
+            env=self.environment, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        self.wait_for(ready.exists, "mounted runtime")
+        image = self.images()[0]
+        loop = privileged("losetup", "--associated", image, "--noheadings", "--output", "NAME").strip()
+        # Model a device observer such as udev: LOOP_CLR_FD marks autoclear,
+        # but the binding remains until this separate process closes its FD.
+        observer = subprocess.Popen(["/usr/bin/sudo", "-n", "python3", "-c", """
+import os, pathlib, time
+descriptor = os.open(%r, os.O_RDONLY)
+pathlib.Path(%r).touch()
+time.sleep(1.5)
+os.close(descriptor)
+""" % (loop, str(held))])
+        try:
+            self.wait_for(held.exists, "external loop descriptor")
+            finish.touch()
+            output, _ = self.process.communicate(timeout=10)
+        finally:
+            observer.wait(timeout=5)
+        self.assertEqual(self.process.returncode, 0, output)
+        self.assertEqual(self.attached(), [])
+        self.assertEqual(list(self.runner.iterdir()), [])
 
     def test_preparation_failure_removes_runtime(self):
         shim = self.root / "bin"
@@ -232,7 +371,8 @@ import os, sys
 arguments = sys.argv[1:]
 if arguments[:1] == ['-n']:
     arguments = arguments[1:]
-if arguments[0] == %r:
+if arguments[0] == %r and (arguments[0] != 'umount' or
+        arguments[-1].startswith(os.environ['RUNNER_TEMP'] + '/')):
     sys.exit(42)
 os.execv('/usr/bin/sudo', ['sudo', '-n', *arguments])
 """ % operation)
@@ -240,7 +380,13 @@ os.execv('/usr/bin/sudo', ['sudo', '-n', *arguments])
         return {"PATH": str(shim) + ":" + os.environ["PATH"]}
 
     def test_cleanup_failure_fails_gate_and_next_sweep_preserves_attachment(self):
-        self.run_command("true", environment=self.failing_sudo("umount"), expected=1)
+        # An explicit extra binding survives destruction of the owner's private
+        # mount namespace, keeping this an actually attached startup-sweep case.
+        self.run_command("python3", "-c", """
+import os, pathlib, subprocess
+image = pathlib.Path(os.environ['OPC_FS_VERITY_SNAPSHOT_ROOT']).parents[1] / 'ext4.img'
+subprocess.run(['sudo', '-n', 'losetup', '--find', '--show', str(image)], check=True)
+""", environment=self.failing_sudo("umount"), expected=1)
         images = self.images()
         self.assertEqual(len(images), 1)
         self.assertTrue(self.attached())
