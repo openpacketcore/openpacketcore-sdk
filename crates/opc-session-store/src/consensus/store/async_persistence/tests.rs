@@ -31,6 +31,7 @@ mod authority_reservation;
 mod bootstrap;
 mod clock;
 mod closed;
+mod failed_drain;
 mod history_read;
 mod initialization;
 mod majority_authority;
@@ -53,6 +54,7 @@ struct Peer {
     handler: tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>,
     engine_calls: Mutex<BTreeMap<SessionConsensusNodeId, u64>>,
     successful_appends: AtomicU64,
+    leadership_transfers: AtomicU64,
     last_cut: Mutex<Option<ColdQuorumCut>>,
     changed: tokio::sync::watch::Sender<()>,
     blocked_senders: Mutex<BTreeSet<SessionConsensusNodeId>>,
@@ -82,6 +84,9 @@ impl SessionConsensusPeer for Peer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if request.family == SessionConsensusRpcFamily::LeadershipTransfer {
+            self.leadership_transfers.fetch_add(1, Ordering::AcqRel);
+        }
         if request.family == SessionConsensusRpcFamily::Vote
             && self.blocked_votes.load(Ordering::Acquire)
         {
@@ -242,6 +247,7 @@ impl Fleet {
                     handler: tokio::sync::RwLock::new(None),
                     engine_calls: Mutex::new(BTreeMap::new()),
                     successful_appends: AtomicU64::new(0),
+                    leadership_transfers: AtomicU64::new(0),
                     last_cut: Mutex::new(None),
                     changed: tokio::sync::watch::Sender::default(),
                     blocked_senders: Mutex::new(BTreeSet::new()),
