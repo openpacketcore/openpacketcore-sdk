@@ -184,6 +184,76 @@ pub(in crate::consensus::native) fn full_epoch_pending_fixture(
 }
 
 #[test]
+fn native_lease_deferral_lost_journal_cannot_pin_the_full_retained_window() {
+    // The caller disappears after its first deferral. Fill the real eight-epoch
+    // window with the existing fully validated ordinal fixture; no original
+    // request or caller journal is supplied to any maintenance command.
+    let (mut storage, abandoned) = full_epoch_pending_fixture(2);
+    assert_eq!(storage.business.receipts.len(), 1_048_576);
+    let watch_sequence = storage.business.frontiers.watch_sequence;
+    let next_fence = storage.business.frontiers.next_fence;
+    let now = at(200_000);
+    let retire = lifecycle_tests::maintenance(&storage, 3, now);
+    assert_eq!(
+        apply(&mut storage, &[retire]).responses[0].result,
+        Ok(SessionMutationOutcome::Unit)
+    );
+    assert_eq!(
+        storage.business.history().unwrap().retired_through(),
+        Some(FencedTransitionV2HistoryEpoch::new(1).unwrap()),
+        "an abandoned deferral must not permanently pin the oldest epoch"
+    );
+    let mut index = 4;
+    while storage
+        .business
+        .history()
+        .unwrap()
+        .reclaim_epoch()
+        .is_some()
+    {
+        assert!(
+            index <= 131,
+            "the original fixed reclaim batches must finish"
+        );
+        let reclaim = lifecycle_tests::maintenance(&storage, index, now);
+        assert_eq!(
+            apply(&mut storage, &[reclaim]).responses[0].result,
+            Ok(SessionMutationOutcome::Unit)
+        );
+        index += 1;
+    }
+    let rotate = lifecycle_tests::maintenance(&storage, index, now);
+    assert_eq!(
+        apply(&mut storage, &[rotate]).responses[0].result,
+        Ok(SessionMutationOutcome::Unit)
+    );
+    assert_eq!(
+        storage.business.history().unwrap().active_epoch(),
+        Some(FencedTransitionV2HistoryEpoch::new(9).unwrap())
+    );
+    assert_eq!(storage.business.frontiers.watch_sequence, watch_sequence);
+    assert_eq!(storage.business.frontiers.next_fence, next_fence);
+    assert_eq!(
+        storage.business.status(&abandoned).unwrap(),
+        FencedTransitionV2Status::Retired
+    );
+    // This is binding 1,048,577, beyond the former permanent lifetime limit.
+    let fresh = FencedTransitionV2Request::new(
+        FencedTransitionV2HistoryEpoch::new(9).unwrap(),
+        FencedTransitionV2CallerNonce::from_bytes([0xB4; 16]),
+        abandoned.lease().clone(),
+        abandoned.mutation().clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        apply(&mut storage, &[command(index + 1, &fresh, now, false)]).responses[0].result,
+        Ok(SessionMutationOutcome::FencedTransition(_))
+    ));
+    assert_eq!(storage.business.history().unwrap().bound_entries(), 1);
+    storage.validate_image().unwrap();
+}
+
+#[test]
 fn native_lease_deferral_grouped_retirement_validates_a_surviving_resolution() {
     let ordinal = FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES as u64;
     let (mut storage, pending) = full_epoch_pending_fixture(ordinal);
