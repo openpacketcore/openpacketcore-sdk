@@ -8138,6 +8138,13 @@ impl ConsensusSessionStore {
                     Ok(reply) => reply,
                     Err(ConsensusPeerCallFailure::AfterTransmission)
                     | Err(ConsensusPeerCallFailure::AuthenticatedRejection(_)) => {
+                        #[cfg(test)]
+                        eprintln!(
+                            "mutation_forward_ambiguous source={} target={leader} deadline_expired={} metrics={:?}",
+                            self.inner.local_node_id,
+                            tokio::time::Instant::now() >= deadline,
+                            self.inner.raft.metrics().borrow(),
+                        );
                         // The peer abstraction cannot prove that a failed call
                         // stopped before delivery. Retrying this same durable
                         // request ID is safe; returning a generic unavailable
@@ -9790,7 +9797,11 @@ impl ConsensusSessionStore {
                 log_growth.complete(response.log_id.index);
             }
             let (reply, applied_observation) = match result {
-                Err(_) => (ForwardMutationReply::OutcomeUnknown, None),
+                Err(_error) => {
+                    #[cfg(test)]
+                    eprintln!("mutation_receiver_closed: {_error}");
+                    (ForwardMutationReply::OutcomeUnknown, None)
+                }
                 Ok(Ok(response)) => {
                     if let Some(completion) = cold_completion {
                         let _ = completion.send(async_persistence::ColdProposalCompletion {
@@ -9803,10 +9814,19 @@ impl ConsensusSessionStore {
                         roster_response_observation,
                     )
                 }
-                Ok(Err(error)) => (
-                    client_write_receiver_error_reply(error, reroute_receiver_forward_to_leader),
-                    None,
-                ),
+                Ok(Err(error)) => {
+                    #[cfg(test)]
+                    eprintln!(
+                        "mutation_receiver_error reroute_allowed={reroute_receiver_forward_to_leader}: {error:?}"
+                    );
+                    (
+                        client_write_receiver_error_reply(
+                            error,
+                            reroute_receiver_forward_to_leader,
+                        ),
+                        None,
+                    )
+                }
             };
             let attached = completion_tx.send(reply).is_ok();
             if let Some((diagnostics, terminal, started)) = applied_observation {
@@ -9820,7 +9840,16 @@ impl ConsensusSessionStore {
             drop(operation_guard);
         });
         match tokio::time::timeout_at(deadline, completion_rx).await {
-            Err(_) | Ok(Err(_)) => ForwardMutationReply::OutcomeUnknown,
+            Err(_) | Ok(Err(_)) => {
+                #[cfg(test)]
+                eprintln!(
+                    "mutation_completion_unavailable node={} deadline_expired={} metrics={:?}",
+                    self.inner.local_node_id,
+                    tokio::time::Instant::now() >= deadline,
+                    self.inner.raft.metrics().borrow(),
+                );
+                ForwardMutationReply::OutcomeUnknown
+            }
             Ok(Ok(reply)) => reply,
         }
     }

@@ -1173,7 +1173,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-store` tests: recover blocked builds through the supported write
   route after automatic pressure handoff. Require a fresh post-window commit
   and the original voter's automatic purge within the existing bounds, including
-  a held-builder case that forces leadership transfer before release. (#1249)
+  a held-builder case that forces leadership transfer before release. Failure
+  diagnostics distinguish setup leadership changes, forwarding ambiguity, and
+  accepted-proposal completion deadlines. (#1249)
 
 - `opc-session-store`: apply retained-log backpressure before ordinary leader
   proposals. Followers always deliver complete authenticated replicated batches

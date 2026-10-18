@@ -398,7 +398,13 @@ async fn seed_to(store: &ConsensusSessionStore, command: &SessionConsensusComman
         .await
         .unwrap();
         for reply in replies {
-            let reply = reply.unwrap();
+            let reply = reply.unwrap_or_else(|error| {
+                panic!(
+                    "seed failed: {error:?}; last={last} target={target}; pressure={:?}; metrics={:?}",
+                    store.log_pressure_snapshot(),
+                    store.inner.raft.metrics().borrow(),
+                )
+            });
             assert!(reply.data.result.is_ok());
             assert!(reply.log_id.index > last);
             last = reply.log_id.index;
