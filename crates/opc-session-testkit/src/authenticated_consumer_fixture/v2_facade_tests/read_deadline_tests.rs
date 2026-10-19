@@ -10,6 +10,7 @@ use opc_session_store::{
 };
 use opc_types::Timestamp;
 
+mod contention_tests;
 mod handoff_tests;
 
 const HOLDS: [u64; 3] = [200, 500, 700];
