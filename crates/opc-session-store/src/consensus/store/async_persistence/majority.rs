@@ -456,7 +456,7 @@ impl ConsensusSessionStore {
                 .await
                 .map(Reply::Committed),
             Action::CommitStatus(selection) => self
-                .protected_commit_status(&selection, deadline)
+                .recovery_commit_status(&selection, deadline)
                 .await
                 .map(Reply::CommitStatus),
             Action::Ready {
@@ -807,20 +807,13 @@ impl ConsensusSessionStore {
         }
     }
 
-    async fn protected_commit_status(
+    async fn recovery_commit_status(
         &self,
         selection: &Selection,
         deadline: tokio::time::Instant,
     ) -> PeerResult<bool> {
         validate_selection(selection)?;
-        if selection.leader != self.inner.local_node_id
-            || self
-                .inner
-                .persistence_protocol
-                .protected_recovery
-                .get()
-                .is_none()
-        {
+        if selection.leader != self.inner.local_node_id {
             return Ok(false);
         }
         let protocol = &self.inner.persistence_protocol;
@@ -1040,14 +1033,11 @@ impl ConsensusSessionStore {
             *current = None;
         }
         if let Some(prior) = current.as_mut().filter(|prior| prior.restart) {
-            let can_resume = if let Some(selection) = prior.selection.as_ref().filter(|selection| {
-                prior.resume_owned_commit
-                    && selection
-                        .round
-                        .participants
-                        .values()
-                        .all(|status| status.protected_inventory.is_some())
-            }) {
+            let can_resume = if let Some(selection) = prior
+                .selection
+                .as_ref()
+                .filter(|_| prior.resume_owned_commit)
+            {
                 match self
                     .recovery_call(
                         selection.leader,
@@ -1175,7 +1165,7 @@ impl ConsensusSessionStore {
                     // A triggered election makes one real vote attempt. It
                     // cannot safely reuse its term after a lost response, and
                     // an accepted proposal may still finish. The next drive
-                    // must either verify that the exact protected election
+                    // must either verify that the exact committed election
                     // still owns resumable work, or prepare a strictly newer
                     // range. That preparation drains and supersedes old effects.
                     current.restart = true;
