@@ -982,8 +982,10 @@ interoperability regressions, not independent-peer conformance evidence. See
 
 Consumers construct the direct IMEI identity with the public `emergency_nai`
 helper and pass its exact bytes to the public `build_eap_response_identity`
-helper. The same EAP helper accepts a canonical IMSI Emergency NAI for the
-identity-recovery path. It preserves opaque identity octets and rejects an
+helper. For identity recovery, pass the exact IMSI identity received from the UE:
+an IMSI emergency NAI, or a root IMSI NAI under the receive-side extension above.
+The retry preserves the original identity and complete EAP payload without
+rewriting the realm. The helper preserves opaque identity octets and rejects an
 identity larger than 65,530 octets before allocation because the complete EAP
 packet cannot fit its two-octet Length field. This is construction safety and
 wire-drift coverage, not validation that arbitrary input is a canonical NAI;

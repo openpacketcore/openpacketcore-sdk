@@ -1970,8 +1970,12 @@ is not valid on a DEA.
 requests TS 33.402 device-identity recovery; it is not authorization. After
 the UE returns a TS 24.302 `DEVICE_IDENTITY`, the retry DER carries the
 recovered exact 15-digit IMEI in `Terminal-Information`. The recovery branch
-accepts only the TS 23.003 IMSI emergency NAI forms for AKA/AKA-prime and an
-exact EAP-Response/Identity whose bytes equal User-Name.
+accepts the TS 23.003 IMSI emergency NAI forms for AKA/AKA-prime and, for
+emergency-indicated requests, ordinary root IMSI NAIs as a receive-side
+interoperability extension. Conforming UEs must still use the IMSI emergency
+NAI. Both forms require an exact EAP-Response/Identity whose bytes equal
+User-Name; the retry preserves the original identity and complete EAP payload.
+See [RFC 005 §10.1](../../docs/rfc/005-protocol-framework.md#101-swm-emergency-identity-receive-interoperability).
 
 For an ordinary base result, use
 `SwmDiameterResult::is_diameter_authorization_rejected()` to identify exact
@@ -1983,9 +1987,11 @@ policy; this crate does not translate between protocols.
 
 Emergency DER builders should use `emergency_nai(&imei)` for the direct IMEI
 path and pass the exact resulting bytes to `build_eap_response_identity`;
-recovery DER builders use the same EAP helper with their canonical IMSI
-Emergency NAI. The returned IMEI NAI is sensitive equipment identity and must
-not be logged.
+recovery DER builders use the same EAP helper with the exact IMSI identity
+received from the UE (an IMSI emergency NAI, or a root IMSI NAI under the
+receive-side extension). Never rewrite that identity or the EAP payload in
+the retry. The returned IMEI NAI is sensitive equipment identity and must not
+be logged.
 Identity octets are copied verbatim, including an RFC-permitted empty body, and
 only inputs that cannot fit EAP's two-octet packet length are rejected before
 allocation. The emergency verifier still rejects empty or mismatched identity

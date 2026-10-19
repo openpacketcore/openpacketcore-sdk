@@ -3385,6 +3385,63 @@ fn swm_root_imsi_recovery_requires_emergency_and_unchanged_requests() {
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_identity_recovery_rejects_retry_user_name_case_change() {
+    let imei = emergency_imei();
+    let identity = "0234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org";
+    let mut initial = sample_swm_request();
+    prepare_recovery_request(&mut initial);
+    initial.user_name = Some(identity.into());
+    initial.eap_payload = eap_response_identity(0x17, identity).into();
+    let mut retry = initial.clone();
+    retry.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: None,
+    });
+    retry.user_name = Some(identity.to_ascii_uppercase().into());
+    assert_eq!(retry.eap_payload, initial.eap_payload);
+
+    assert_eq!(
+        SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            correlate_exchange(&initial, &sample_identity_recovery_answer(), 1, 2)
+                .expect("initial Diameter correlation"),
+            correlate_exchange(&retry, &sample_final_emergency_answer(&imei), 3, 4)
+                .expect("retry Diameter correlation"),
+            &imei,
+        )
+        .expect_err("retry User-Name must retain the original realm case"),
+        SwmEmergencyAuthorizationError::RetryUserIdentityMismatch
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_identity_recovery_rejects_retry_user_name_sos_removal() {
+    let imei = emergency_imei();
+    let mut initial = sample_swm_request();
+    prepare_recovery_request(&mut initial);
+    let mut retry = initial.clone();
+    retry.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: None,
+    });
+    retry.user_name = Some(emergency_imsi_nai().replacen("@sos.", "@", 1).into());
+    assert_eq!(retry.eap_payload, initial.eap_payload);
+
+    assert_eq!(
+        SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            correlate_exchange(&initial, &sample_identity_recovery_answer(), 1, 2)
+                .expect("initial Diameter correlation"),
+            correlate_exchange(&retry, &sample_final_emergency_answer(&imei), 3, 4)
+                .expect("retry Diameter correlation"),
+            &imei,
+        )
+        .expect_err("retry User-Name must retain the original sos label"),
+        SwmEmergencyAuthorizationError::RetryUserIdentityMismatch
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_identity_recovery_evidence_fails_closed_at_every_boundary() {
     let imei = emergency_imei();
     let other_imei = Imei::new("356938035643709").expect("valid alternate IMEI");
@@ -3695,6 +3752,8 @@ fn swm_emergency_evidence_binds_diameter_eap_and_imsi_emergency_nai() {
     );
 
     for invalid_nai in [
+        "0234150999999999@xyz.nai.epc.mnc015.mcc234.3gppnetwork.org",
+        "0234150999999999@sas.nai.epc.mnc015.mcc234.3gppnetwork.org",
         "1234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org",
         "0234150999999999@nai.epc.mnc016.mcc234.3gppnetwork.org",
         "0234150999999999@nai.epc.mnc015.mcc235.3gppnetwork.org",
