@@ -1314,6 +1314,101 @@ fn child_group_offer(separate: bool) -> Ikev2SaPayloadBuild {
     }
     sa
 }
+
+fn assert_child_pfs_ke_guess_retry(guessed_group: u16, guessed_width: usize) {
+    let mut offer = child_sa_pfs_payload_build(guessed_group);
+    offer.proposals[0].transforms.push(Ikev2SaTransformBuild {
+        transform_type: 4,
+        transform_id: 14,
+        attributes: vec![],
+    });
+    let sa_wire = build_ike_auth_sa_payload(&offer).expect("peer SA offer");
+    let sa = Ikev2SaPayload::decode_body(&sa_wire).expect("received SA");
+    let ts_wire = build_ike_auth_traffic_selector_payload(&ts_payload()).expect("TS");
+    let ts =
+        opc_proto_ikev2::Ikev2TrafficSelectorPayload::decode_body(&ts_wire).expect("received TS");
+    let policy = Ikev2ChildSaNegotiationPolicy {
+        accepted_protocol_ids: vec![IKEV2_SECURITY_PROTOCOL_ID_ESP],
+        required_transforms: vec![
+            Ikev2ChildSaTransformRequirement {
+                transform_type: 1,
+                accepted_transform_ids: vec![20],
+            },
+            Ikev2ChildSaTransformRequirement {
+                transform_type: 4,
+                accepted_transform_ids: vec![14],
+            },
+        ],
+        accepted_initiator_traffic_selectors: vec![],
+        accepted_responder_traffic_selectors: vec![],
+    };
+    // Use received wire rather than the local builder, which requires an
+    // implemented group. Group 31's 32-octet X25519 value is RFC 8031 section 3.1.
+    let mut ke_wire = guessed_group.to_be_bytes().to_vec();
+    ke_wire.extend_from_slice(&[0, 0]);
+    ke_wire.resize(4 + guessed_width, 0);
+    ke_wire[4] = 9;
+    let ke = opc_proto_ikev2::Ikev2KeyExchangePayload::decode_body(&ke_wire)
+        .expect("structurally valid received KE");
+    // RFC 7296 section 1.3.1 requires the selected-group retry before
+    // interpreting a KE for a different group, including an unimplemented one.
+    let retry = negotiate_child_sa(Some(&ke), &sa, &ts, &ts, &policy)
+        .expect_err("different KE group requests a retry");
+    assert_eq!(
+        retry,
+        Ikev2ChildSaNegotiationError::KeyExchangeDhGroupMismatch {
+            received: guessed_group,
+            preferred: 14,
+        }
+    );
+    let notify = retry.invalid_ke_notify().expect("selected-group retry");
+    assert_eq!(notify.protocol_id, 0);
+    assert!(notify.spi.is_empty());
+    assert_eq!(notify.notify_message_type, 17);
+    assert_eq!(notify.notification_data, [0, 14]);
+    assert_eq!(
+        opc_proto_ikev2::build_ike_auth_notify_payload(&notify).expect("retry wire"),
+        [0, 0, 0, 17, 0, 14]
+    );
+
+    let mut retry_wire = vec![0, 14, 0, 0];
+    retry_wire.extend_from_slice(&[2; 256]);
+    let ke = opc_proto_ikev2::Ikev2KeyExchangePayload::decode_body(&retry_wire)
+        .expect("received group-14 retry");
+    let selected = negotiate_child_sa(Some(&ke), &sa, &ts, &ts, &policy)
+        .expect("selected group's correctly sized retry succeeds");
+    assert_eq!(
+        selected
+            .transforms
+            .iter()
+            .find(|transform| transform.transform_type == 4)
+            .expect("selected DH transform")
+            .transform_id,
+        14
+    );
+    for width in [1, 255, 257] {
+        retry_wire.resize(4 + width, 2);
+        let ke = opc_proto_ikev2::Ikev2KeyExchangePayload::decode_body(&retry_wire)
+            .expect("structurally valid matching-group KE");
+        let error = negotiate_child_sa(Some(&ke), &sa, &ts, &ts, &policy)
+            .expect_err("matching-group malformed width is rejected");
+        assert_eq!(error, Ikev2ChildSaNegotiationError::InvalidKeyExchange);
+        assert!(error.invalid_ke_notify().is_none());
+    }
+}
+
+#[test]
+fn child_pfs_retries_an_unsupported_ke_guess_with_the_selected_group() {
+    assert_child_pfs_ke_guess_retry(31, 32);
+}
+
+#[test]
+fn child_pfs_retries_a_different_supported_ke_guess_before_width_validation() {
+    for width in [64, 63, 65] {
+        assert_child_pfs_ke_guess_retry(19, width);
+    }
+}
+
 #[test]
 fn child_pfs_prefers_stronger_common_groups_over_group_one() {
     for separate in [false, true] {
