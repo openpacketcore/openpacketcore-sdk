@@ -26,6 +26,7 @@ fn cbc_iv_key_is_separate_from_every_ike_key_and_child_keymat_for_test_nonces() 
             }
             for nonce in [0x11, 0x22, 0x80, 0xff] {
                 let child = derive_child_sa_key_material(
+                    crate::Ikev2NonceLocalRole::Responder,
                     Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
                         profile.prf(),
                         profile.encryption(),

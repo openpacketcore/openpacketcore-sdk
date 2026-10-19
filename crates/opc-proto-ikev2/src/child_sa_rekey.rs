@@ -512,6 +512,9 @@ pub enum Ikev2ChildSaRekeyResponseError {
     KeyExchangeValueInvalid(Ikev2SaInitCryptoError),
     /// Retained legacy diagnostic; peer decoding now enforces the absolute
     /// 16-octet receive floor through [`Ikev2ChildSaRekeyResponseError::Nonce`].
+    #[deprecated(
+        note = "Unconstructed compatibility variant; received nonces use Nonce and the 16-octet floor"
+    )]
     ResponderNonceTooShortForPrf {
         /// Received nonce length.
         actual: usize,
@@ -541,6 +544,7 @@ pub enum Ikev2ChildSaRekeyResponseError {
 impl Ikev2ChildSaRekeyResponseError {
     /// Stable machine-readable error code.
     #[must_use]
+    #[allow(deprecated)]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::RequestHeaderInvalid => "child_sa_rekey_response_request_header_invalid",
@@ -689,6 +693,15 @@ impl Ikev2ChildSaRekeyResponseBoundary {
         validate_request_header(request_header)?;
         validate_sa_build(&request.security_association, false)
             .map_err(|_| Ikev2ChildSaRekeyResponseError::RequestOfferInvalid)?;
+        let minimum_nonce_len = prf_nonce_minimum(ike_sa_prf);
+        if request.nonce.nonce.len() < minimum_nonce_len {
+            return Err(
+                Ikev2ChildSaRekeyResponseError::InitiatorNonceTooShortForPrf {
+                    actual: request.nonce.nonce.len(),
+                    minimum: minimum_nonce_len,
+                },
+            );
+        }
         let built = build_create_child_sa_rekey_request_payloads(&request)
             .map_err(Ikev2ChildSaRekeyResponseError::RequestBuild)?;
         let request_sa_body = built.security_association.body;
@@ -722,15 +735,6 @@ impl Ikev2ChildSaRekeyResponseBoundary {
         if !traffic_selector_payload_is_narrowed(&request_tsr, &current_tsr) {
             return Err(
                 Ikev2ChildSaRekeyResponseError::ResponderTrafficSelectorOfferNarrowerThanCurrent,
-            );
-        }
-        let minimum_nonce_len = prf_nonce_minimum(ike_sa_prf);
-        if request.nonce.nonce.len() < minimum_nonce_len {
-            return Err(
-                Ikev2ChildSaRekeyResponseError::InitiatorNonceTooShortForPrf {
-                    actual: request.nonce.nonce.len(),
-                    minimum: minimum_nonce_len,
-                },
             );
         }
         let request_key_exchange_group = request

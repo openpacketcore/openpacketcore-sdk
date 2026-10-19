@@ -29,6 +29,7 @@ fn expected_keys(
 ) -> Keys {
     let secret = dh.agree(remote).unwrap();
     derive_ike_sa_rekey_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         row.profile.prf(),
         row.keys.sk_d(),
         row.profile,

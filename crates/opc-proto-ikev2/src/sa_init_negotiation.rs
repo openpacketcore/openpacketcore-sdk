@@ -319,9 +319,14 @@ pub(crate) fn prefer_stronger_dh_groups(offer: &mut Ikev2SaPayloadBuild) {
         });
     }
     offer.proposals.sort_by_key(|proposal| {
-        !proposal.transforms.iter().any(|transform| {
-            transform.transform_type == TRANSFORM_TYPE_DH && transform.transform_id != 1
-        })
+        let groups = || {
+            proposal
+                .transforms
+                .iter()
+                .filter(|transform| transform.transform_type == TRANSFORM_TYPE_DH)
+        };
+        groups().any(|transform| transform.transform_id == 1)
+            && !groups().any(|transform| transform.transform_id != 1)
     });
     for (number, proposal) in (1..=u8::MAX).zip(&mut offer.proposals) {
         // The caller already validated the 255-proposal wire bound.

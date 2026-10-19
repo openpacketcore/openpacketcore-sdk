@@ -286,7 +286,7 @@ fn admission_rejects_ke_group_and_public_value_and_nonce_mismatches() {
                 .map(|_| ())
                 .unwrap(),
             3 => payloads.key_exchange.key_exchange_data.fill(0),
-            _ => payloads.nonce.nonce = vec![0x72; 16],
+            _ => payloads.nonce.nonce = vec![0x72; 32],
         }
         if mutation == 4 {
             // A received SHA-512 nonce may retain the legacy 16-octet size.
@@ -294,10 +294,19 @@ fn admission_rejects_ke_group_and_public_value_and_nonce_mismatches() {
             offered.proposals[0].transforms[1].transform_id = 7;
             let request = self::request(&offered);
             payloads.security_association = offered;
+            let mut peer_response = response(&request, &payloads);
+            peer_response.raw_payloads = support::nonce::replace_nonce(
+                peer_response.header.next_payload,
+                &peer_response.raw_payloads,
+                &[0x72; 16],
+            )
+            .into();
+            peer_response.header.length =
+                28 + u32::try_from(peer_response.raw_payloads.len()).expect("fixture length");
             assert!(matches!(
                 admit_ike_sa_init_response(
                     &request,
-                    &response(&request, &payloads).as_borrowed(),
+                    &peer_response.as_borrowed(),
                     DecodeContext::default()
                 )
                 .unwrap(),

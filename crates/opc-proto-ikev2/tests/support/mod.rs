@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+pub mod nonce;
+
 use std::sync::OnceLock;
 
 use opc_crypto_provider::ProviderPolicy;

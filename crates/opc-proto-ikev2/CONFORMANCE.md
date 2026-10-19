@@ -6,18 +6,19 @@
   including default software requirements, negotiation, providers and checkpoint
   restore. Existing explicit allowlists remain authoritative. Other admitted
   common groups are preferred; group 1 is selected only when it is the only
-  common group. Initial offers and the shared initial/rekey selection policy
-  move it last; a stronger common group with a different KE requests a retry.
-  Caller order among other groups remains unchanged.
+  common group. IKE and Child-SA PFS offers and policies move it last;
+  a stronger common suite with a different KE produces an `INVALID_KE_PAYLOAD`
+  retry Notify through the typed error helper. Caller/wire order and existing
+  matching-KE fallback among other groups remain unchanged; this is not a global
+  group-strength ranking.
 - **RFC 7296 §§2.10/2.13:** local generation uses admitted entropy and at least
-  32 octets and half the PRF's preferred key length in both roles and initial/rekey
-  exchanges. Received nonces retain the absolute 16-octet floor for every PRF;
-  below-floor input returns typed errors. Accepting received nonces below half
-  the PRF key size is deliberate legacy compatibility. The existing 256-octet
-  input bound remains. Transcript KDFs have no local-role parameter and apply
-  receive validation; callers use `Ikev2NoncePayloadBuild::generate` for local
-  values. Raw wire fixture encoders remain independent of random generation.
-
+  32 octets and half the PRF's preferred key length (32 for all supported PRFs).
+  Every typed outgoing nonce builder enforces 32..=256 octets. Every public
+  IKE/Child-SA KDF requires `Ikev2NonceLocalRole`, the role in the nonce-producing
+  exchange, and enforces 32..=256 locally and 16..=256 for the peer. XFRM mapping
+  helpers derive as local responder. Accepting received nonces below half the
+  PRF key size is deliberate legacy compatibility. Below-floor inputs return
+  typed errors. Raw nonce encoders retain the 16-octet wire floor for fixtures.
 
 This document defines the current conformance boundary for the experimental
 `opc-proto-ikev2` crate. Its typed IKE-SA profile, KDF, proposal-selection, and

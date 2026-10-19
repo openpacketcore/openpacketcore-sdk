@@ -21,11 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
   `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
   must handle both variants. (#1334)
-- `opc-proto-ikev2`: local handshake nonce generation and initial initiator
-  requests use at least 32 octets and half the selected/offered PRF's preferred
-  key length. The retained local Child-SA rekey nonce check uses the same floor.
-  Received and transcript nonces accept the existing 16..=256-octet range for
-  every PRF, including SHA2-512, through both initial policy names and XFRM mapping.
+- `opc-proto-ikev2`: every typed IKE and Child-SA outgoing nonce builder now
+  requires at least 32 octets. Public IKE/Child-SA key-derivation functions require
+  an explicit `Ikev2NonceLocalRole`, enforce 32..=256 locally, and accept
+  16..=256 from peers for every PRF. XFRM derivation maps the local responder role.
+- `opc-proto-ikev2`: `Ikev2IkeAuthBuildError` adds `KeyExchangeValueInvalid`;
+  exhaustive matches must handle it. Generic CREATE_CHILD_SA builders now reject
+  unsupported DH groups and KE public values whose width does not match the group.
+- `opc-proto-ikev2`: `negotiate_child_sa` now requires the peer KE context for PFS.
+  `Ikev2ChildSaNegotiationError` adds `KeyExchangeRequired`,
+  `InvalidKeyExchange` and `KeyExchangeDhGroupMismatch`, and `nwu::Error` adds `KeyExchangeDhGroupMismatch`;
+  exhaustive matches must handle them. Retry errors expose `invalid_ke_notify()`.
+  Group 1 follows stronger common Child-SA PFS groups in policies and offers.
+  `ResponderNonceTooShortForPrf` is deprecated as an unconstructed compatibility
+  diagnostic; peer nonce errors use the absolute 16-octet floor.
 
 - `opc-session-net`: the first fenced roster reconcile closes prepare and
   execute for the entire admission, including older handles and equal-fence

@@ -32,6 +32,7 @@ fn profile() -> Ikev2SaInitCryptoProfile {
 fn key_material() -> Ikev2SaInitKeyMaterial {
     support::ensure_ike_crypto();
     derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile(),
         [0x11; 8],
         [0x22; 8],

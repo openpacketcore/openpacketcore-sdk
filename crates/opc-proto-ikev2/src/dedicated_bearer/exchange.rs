@@ -390,6 +390,8 @@ impl fmt::Debug for Ikev2DedicatedBearerCreateChildSaResponse<'_> {
 pub fn build_ikev2_dedicated_bearer_create_child_sa_request(
     input: &Ikev2DedicatedBearerCreateChildSaRequestBuild,
 ) -> Result<Ikev2DedicatedBearerCleartextPayloads, Ikev2DedicatedBearerExchangeError> {
+    let mut input = input.clone();
+    crate::sa_init_negotiation::prefer_stronger_dh_groups(&mut input.security_association);
     validate_sa_build(&input.security_association, false)?;
     validate_create_tft(&input.tft)?;
     validate_extended_ambr_dependency(input.apn_ambr, input.extended_apn_ambr)?;

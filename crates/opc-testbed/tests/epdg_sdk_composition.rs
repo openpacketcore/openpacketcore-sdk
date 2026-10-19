@@ -651,6 +651,7 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         Ikev2EncryptionAlgorithm::AesGcm16_128,
     )?;
     let key_material = derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile,
         [0x11; 8],
         [0x22; 8],

@@ -1,3 +1,6 @@
+#[path = "support/nonce.rs"]
+mod support_peer_nonce;
+
 use opc_proto_ikev2::nwu::{Notify, QosInfo};
 
 #[test]
@@ -788,7 +791,7 @@ fn create_input() -> CreateRequestBuild<'static> {
             }],
         },
         nonce: Ikev2NoncePayloadBuild {
-            nonce: vec![0x55; 16],
+            nonce: vec![0x55; 32],
         },
         key_exchange: None,
         inner_families: AddressFamilies::Ipv4,
@@ -818,8 +821,9 @@ fn independent_full_create_vector_uses_network_initiator_and_all_packet_selector
     wire[last] = 41;
     wire.extend(fixture("create-child-sa"));
     let input = create_input();
+    let generated = must(encode_payloads(&must(input.payloads())));
     assert_eq!(
-        must(encode_payloads(&must(input.payloads()))).1.as_ref(),
+        support_peer_nonce::replace_nonce(generated.0.as_u8(), &generated.1, &nonce),
         wire
     );
     let request = must(CreateRequest::decode(
@@ -981,7 +985,7 @@ fn aead_selection_follows_caller_order_without_integrity_or_fallback() {
             &Ikev2CreateChildSaRekeyResponseBuild {
                 security_association: sa,
                 nonce: Ikev2NoncePayloadBuild {
-                    nonce: vec![0x66; 16],
+                    nonce: vec![0x66; 32],
                 },
                 key_exchange: None,
                 traffic_selectors_initiator: all_packet_selectors(AddressFamilies::Ipv4),
@@ -1144,7 +1148,7 @@ fn nwu_ke_response_correlation_enforces_group_width() {
             &Ikev2CreateChildSaRekeyResponseBuild {
                 security_association: response_sa,
                 nonce: Ikev2NoncePayloadBuild {
-                    nonce: vec![0x55; 16],
+                    nonce: vec![0x55; 32],
                 },
                 key_exchange: input.key_exchange,
                 traffic_selectors_initiator: all_packet_selectors(AddressFamilies::Ipv4),
@@ -1205,13 +1209,21 @@ fn nwu_pfs_requires_stronger_ke_instead_of_group_one_fallback() {
         }
         let (first, wire) = must(encode_payloads(&must(input.payloads())));
         for peer in [Peer::Network, Peer::Ue] {
-            let request = must(CreateRequest::decode(
+            let decoded = CreateRequest::decode(
                 &create_header(peer, false),
                 first,
                 &wire,
                 AddressFamilies::Ipv4,
                 Limits::default(),
-            ));
+            );
+            if peer == Peer::Ue {
+                assert!(
+                    decoded.is_err(),
+                    "new NWu Child-SA creation remains network initiated"
+                );
+                continue;
+            }
+            let request = must(decoded);
             let policy = must(AeadPolicy::new(vec![
                 must(AeadSuite::new(
                     Ikev2EncryptionAlgorithm::AesGcm16_128,
@@ -1224,9 +1236,24 @@ fn nwu_pfs_requires_stronger_ke_instead_of_group_one_fallback() {
                     false,
                 )),
             ]));
-            assert!(
-                policy.select(&request).is_err(),
-                "a stronger common PFS group must request a KE retry"
+            let retry = policy
+                .select(&request)
+                .expect_err("a stronger common PFS group must request a KE retry");
+            assert_eq!(
+                retry,
+                Error::KeyExchangeDhGroupMismatch {
+                    received: 1,
+                    preferred: 14
+                }
+            );
+            let notify = retry.invalid_ke_notify().expect("retry notify");
+            assert_eq!(notify.notify_message_type, 17);
+            assert_eq!(notify.notification_data, [0, 14]);
+            assert_eq!(notify.protocol_id, 0);
+            assert!(notify.spi.is_empty());
+            assert_eq!(
+                must(opc_proto_ikev2::build_ike_auth_notify_payload(&notify)),
+                [0, 0, 0, 17, 0, 14]
             );
         }
     }
@@ -1253,4 +1280,53 @@ fn outgoing_nwu_offer_puts_group_one_last() {
         .map(|t| t.transform_id)
         .collect();
     assert_eq!(groups, [14, 1]);
+}
+
+#[test]
+fn nwu_pfs_ke_guess_keeps_other_caller_order_and_legacy_only_common_group() {
+    let mut input = nwu_ke_input(2, 128);
+    input.nonce.nonce.resize(32, 3);
+    for group in [14, 1] {
+        input.security_association.proposals[0]
+            .transforms
+            .push(Ikev2SaTransformBuild {
+                transform_type: 4,
+                transform_id: group,
+                attributes: vec![],
+            });
+    }
+    let suites = [14, 2, 1].map(|id| {
+        must(AeadSuite::new(
+            Ikev2EncryptionAlgorithm::AesGcm16_128,
+            Some(must(opc_proto_ikev2::Ikev2DhGroup::from_transform_id(id))),
+            false,
+        ))
+    });
+    let policy = must(AeadPolicy::new(suites.to_vec()));
+    let (first, wire) = must(encode_payloads(&must(input.payloads())));
+    let request = must(CreateRequest::decode(
+        &create_header(Peer::Network, false),
+        first,
+        &wire,
+        AddressFamilies::Ipv4,
+        Limits::default(),
+    ));
+    assert_eq!(
+        must(policy.select(&request)).suite().dh_group(),
+        Some(opc_proto_ikev2::Ikev2DhGroup::Modp1024)
+    );
+    let mut legacy = nwu_ke_input(1, 96);
+    legacy.nonce.nonce.resize(32, 3);
+    let (first, wire) = must(encode_payloads(&must(legacy.payloads())));
+    let request = must(CreateRequest::decode(
+        &create_header(Peer::Network, false),
+        first,
+        &wire,
+        AddressFamilies::Ipv4,
+        Limits::default(),
+    ));
+    assert_eq!(
+        must(policy.select(&request)).suite().dh_group(),
+        Some(opc_proto_ikev2::Ikev2DhGroup::Modp768)
+    );
 }

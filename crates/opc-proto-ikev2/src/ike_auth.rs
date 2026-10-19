@@ -23,12 +23,12 @@ use crate::{
     },
     payload::{PayloadChain, PayloadType, RawPayload, GENERIC_PAYLOAD_HEADER_LEN},
     sa_init::{
-        encode_ke_payload_build, encode_nonce_payload_build, encode_notify_payload_build,
-        encode_sa_payload_build, Ikev2KeyExchangePayloadBuild, Ikev2NoncePayloadBuild,
-        Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError, Ikev2SaPayload, Ikev2SaPayloadBuild,
-        Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild, Ikev2SaTransform,
-        Ikev2SaTransformBuild, Ikev2TransformAttributeBuild, Ikev2TransformAttributeBuildValue,
-        Ikev2TransformAttributeValue,
+        encode_ke_payload_build, encode_notify_payload_build, encode_outgoing_nonce_payload_build,
+        encode_sa_payload_build, Ikev2KeyExchangePayload, Ikev2KeyExchangePayloadBuild,
+        Ikev2NoncePayloadBuild, Ikev2NotifyPayloadBuild, Ikev2SaInitBuildError, Ikev2SaPayload,
+        Ikev2SaPayloadBuild, Ikev2SaPayloadError, Ikev2SaProposal, Ikev2SaProposalBuild,
+        Ikev2SaTransform, Ikev2SaTransformBuild, Ikev2TransformAttributeBuild,
+        Ikev2TransformAttributeBuildValue, Ikev2TransformAttributeValue,
     },
     sa_init_crypto::{
         validate_peer_public_len, Ikev2DhGroup, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError,
@@ -1839,11 +1839,21 @@ impl fmt::Debug for Ikev2CreateChildSaRekeyResponsePayloads {
     }
 }
 
-/// Select the first Child SA proposal and traffic selectors matching policy.
+/// Select a Child SA and selectors, preferring a stronger common PFS group
+/// over group 1. Other accepted alternatives retain wire order.
+///
+/// Supply `key_exchange` for PFS; a different common group returns a typed
+/// retry whose `invalid_ke_notify()` produces the response Notify.
 ///
 /// This helper deliberately stops at product-neutral negotiation intent. It does
 /// not choose subscriber policy, allocate responder SPIs, or install XFRM state.
+///
+/// # Errors
+///
+/// Returns [`Ikev2ChildSaNegotiationError`] for incomplete or incompatible policy,
+/// proposals or selectors, a missing/invalid PFS KE, or a common-group KE retry.
 pub fn negotiate_child_sa(
+    key_exchange: Option<&Ikev2KeyExchangePayload<'_>>,
     sa: &Ikev2SaPayload<'_>,
     tsi: &Ikev2TrafficSelectorPayload<'_>,
     tsr: &Ikev2TrafficSelectorPayload<'_>,
@@ -1877,8 +1887,16 @@ pub fn negotiate_child_sa(
         if let Some(transforms) =
             select_transforms_for_policy(proposal, &policy.required_transforms)
         {
-            selected = Some((proposal, transforms));
-            break;
+            let group = selected_child_dh(&transforms);
+            if selected.is_none() {
+                selected = Some((proposal, transforms));
+                if group != Some(1) {
+                    break;
+                }
+            } else if group.is_some_and(|group| group > 1) {
+                selected = Some((proposal, transforms));
+                break;
+            }
         }
     }
     let (proposal, transforms) = match selected {
@@ -1892,6 +1910,20 @@ pub fn negotiate_child_sa(
         }
         None => return Err(Ikev2ChildSaNegotiationError::NoSupportedProposal),
     };
+
+    if let Some(preferred) = selected_child_dh(&transforms).filter(|group| *group != 0) {
+        let key_exchange = key_exchange.ok_or(Ikev2ChildSaNegotiationError::KeyExchangeRequired)?;
+        let group = Ikev2DhGroup::from_transform_id(key_exchange.dh_group)
+            .map_err(|_| Ikev2ChildSaNegotiationError::InvalidKeyExchange)?;
+        validate_peer_public_len(group, key_exchange.key_exchange_data)
+            .map_err(|_| Ikev2ChildSaNegotiationError::InvalidKeyExchange)?;
+        if key_exchange.dh_group != preferred {
+            return Err(Ikev2ChildSaNegotiationError::KeyExchangeDhGroupMismatch {
+                received: key_exchange.dh_group,
+                preferred,
+            });
+        }
+    }
 
     let initiator_traffic_selector =
         select_traffic_selector(&tsi.selectors, &policy.accepted_initiator_traffic_selectors)
@@ -1966,7 +1998,9 @@ pub fn build_child_sa_response_payloads(
 /// # Errors
 ///
 /// Returns [`Ikev2IkeAuthBuildError`] when any payload cannot be encoded or the
-/// REKEY_SA protocol/SPI shape is invalid.
+/// REKEY_SA protocol/SPI shape is invalid, local nonce is below 32 octets,
+/// or KE is absent, unsupported, inconsistent with the proposal, or has a
+/// public-value width that does not match its group.
 pub fn build_create_child_sa_rekey_request_payloads(
     input: &Ikev2CreateChildSaRekeyRequestBuild,
 ) -> Result<Ikev2CreateChildSaRekeyRequestPayloads, Ikev2IkeAuthBuildError> {
@@ -1979,9 +2013,11 @@ pub fn build_create_child_sa_rekey_request_payloads(
         notify_message_type: IKEV2_NOTIFY_REKEY_SA,
         notification_data: Vec::new(),
     })?;
-    let sa_body = build_ike_auth_sa_payload(&input.security_association)?;
+    let mut offer = input.security_association.clone();
+    crate::sa_init_negotiation::prefer_stronger_dh_groups(&mut offer);
+    let sa_body = build_ike_auth_sa_payload(&offer)?;
     let nonce_body =
-        encode_nonce_payload_build(&input.nonce).map_err(Ikev2IkeAuthBuildError::Nonce)?;
+        encode_outgoing_nonce_payload_build(&input.nonce).map_err(Ikev2IkeAuthBuildError::Nonce)?;
     let key_exchange = input
         .key_exchange
         .as_ref()
@@ -2030,14 +2066,16 @@ pub fn build_create_child_sa_rekey_request_payloads(
 ///
 /// # Errors
 ///
-/// Returns [`Ikev2IkeAuthBuildError`] when any payload cannot be encoded.
+/// Returns [`Ikev2IkeAuthBuildError`] for an unencodable payload, a local
+/// nonce below 32 octets, or an absent, unsupported, proposal-inconsistent or
+/// incorrectly sized KE public value.
 pub fn build_create_child_sa_rekey_response_payloads(
     input: &Ikev2CreateChildSaRekeyResponseBuild,
 ) -> Result<Ikev2CreateChildSaRekeyResponsePayloads, Ikev2IkeAuthBuildError> {
     validate_rekey_key_exchange_shape(&input.security_association, input.key_exchange.as_ref())?;
     let sa_body = build_ike_auth_sa_payload(&input.security_association)?;
     let nonce_body =
-        encode_nonce_payload_build(&input.nonce).map_err(Ikev2IkeAuthBuildError::Nonce)?;
+        encode_outgoing_nonce_payload_build(&input.nonce).map_err(Ikev2IkeAuthBuildError::Nonce)?;
     let key_exchange = input
         .key_exchange
         .as_ref()
@@ -2138,6 +2176,13 @@ fn validate_child_sa_transform_requirements(
     Ok(())
 }
 
+fn selected_child_dh(transforms: &[Ikev2SaTransformBuild]) -> Option<u16> {
+    transforms
+        .iter()
+        .find(|t| t.transform_type == IKEV2_TRANSFORM_TYPE_DH)
+        .map(|t| t.transform_id)
+}
+
 fn select_transforms_for_policy(
     proposal: &Ikev2SaProposal<'_>,
     requirements: &[Ikev2ChildSaTransformRequirement],
@@ -2145,17 +2190,27 @@ fn select_transforms_for_policy(
     requirements
         .iter()
         .map(|requirement| {
-            proposal
-                .transforms
-                .iter()
-                .find(|transform| {
-                    transform.transform_type == requirement.transform_type
-                        && (requirement.accepted_transform_ids.is_empty()
-                            || requirement
-                                .accepted_transform_ids
-                                .contains(&transform.transform_id))
-                })
-                .map(transform_build_from_view)
+            let accepted = |transform: &&Ikev2SaTransform<'_>| {
+                transform.transform_type == requirement.transform_type
+                    && (requirement.accepted_transform_ids.is_empty()
+                        || requirement
+                            .accepted_transform_ids
+                            .contains(&transform.transform_id))
+            };
+            let first = proposal.transforms.iter().find(accepted);
+            let selected = if requirement.transform_type == IKEV2_TRANSFORM_TYPE_DH
+                && first.is_some_and(|t| t.transform_id == 1)
+            {
+                proposal
+                    .transforms
+                    .iter()
+                    .filter(accepted)
+                    .find(|t| t.transform_id > 1)
+                    .or(first)
+            } else {
+                first
+            };
+            selected.map(transform_build_from_view)
         })
         .collect()
 }
@@ -2708,6 +2763,17 @@ pub enum Ikev2ChildSaNegotiationError {
     /// An accepted-protocol proposal offered a transform type that policy did
     /// not constrain, so echoing only policy-selected types would alter it.
     UnconstrainedTransformType,
+    /// PFS negotiation requires the peer's KE payload.
+    KeyExchangeRequired,
+    /// The peer KE group is unsupported or its public value has the wrong width.
+    InvalidKeyExchange,
+    /// A common PFS suite needs a different KE. Return `INVALID_KE_PAYLOAD`.
+    KeyExchangeDhGroupMismatch {
+        /// Peer-supplied group.
+        received: u16,
+        /// Common group requested for the retry.
+        preferred: u16,
+    },
     /// TSi or TSr was empty.
     TrafficSelectorMissing,
     /// No offered TSi or TSr matched the supplied selector policy.
@@ -2715,6 +2781,17 @@ pub enum Ikev2ChildSaNegotiationError {
 }
 
 impl Ikev2ChildSaNegotiationError {
+    /// Build the RFC 7296 `INVALID_KE_PAYLOAD` Notify for a KE retry.
+    /// Other failures have no KE-retry payload.
+    pub fn invalid_ke_notify(self) -> Option<Ikev2NotifyPayloadBuild> {
+        match self {
+            Self::KeyExchangeDhGroupMismatch { preferred, .. } => {
+                Some(child_sa_invalid_ke_notify(preferred))
+            }
+            _ => None,
+        }
+    }
+
     /// Stable machine-readable error code.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -2724,9 +2801,21 @@ impl Ikev2ChildSaNegotiationError {
             Self::NoSupportedProposal => "ike_child_sa_no_supported_proposal",
             Self::NoTransforms => "ike_child_sa_no_transforms",
             Self::UnconstrainedTransformType => "ike_child_sa_unconstrained_transform_type",
+            Self::KeyExchangeRequired => "ike_child_sa_key_exchange_required",
+            Self::InvalidKeyExchange => "ike_child_sa_invalid_key_exchange",
+            Self::KeyExchangeDhGroupMismatch { .. } => "ike_child_sa_ke_dh_group_mismatch",
             Self::TrafficSelectorMissing => "ike_child_sa_traffic_selector_missing",
             Self::TrafficSelectorMismatch => "ike_child_sa_traffic_selector_mismatch",
         }
+    }
+}
+
+pub(crate) fn child_sa_invalid_ke_notify(preferred: u16) -> Ikev2NotifyPayloadBuild {
+    Ikev2NotifyPayloadBuild {
+        protocol_id: 0,
+        spi: Vec::new(),
+        notify_message_type: crate::IKEV2_NOTIFY_INVALID_KE_PAYLOAD,
+        notification_data: preferred.to_be_bytes().to_vec(),
     }
 }
 

@@ -1,3 +1,6 @@
+#[path = "../../tests/support/nonce.rs"]
+mod peer_nonce_fixture;
+
 use super::*;
 use crate::*;
 use opc_crypto_provider::{IkeDhGroup, IkeDiffieHellmanOperations};
@@ -101,6 +104,11 @@ fn transcript_nonce_floor_accepts_legacy_peers_for_every_prf_role_and_exchange()
                 };
                 let mut results = vec![
                     derive_ike_sa_rekey_key_material(
+                        if role == "initiator" {
+                            Ikev2NonceLocalRole::Responder
+                        } else {
+                            Ikev2NonceLocalRole::Initiator
+                        },
                         prf,
                         &sk_d,
                         parent,
@@ -111,7 +119,19 @@ fn transcript_nonce_floor_accepts_legacy_peers_for_every_prf_role_and_exchange()
                         &[0x33; 96],
                     )
                     .map(|_| ()),
-                    derive_child_sa_key_material(child, &sk_d, ni, nr, None).map(|_| ()),
+                    derive_child_sa_key_material(
+                        if role == "initiator" {
+                            Ikev2NonceLocalRole::Responder
+                        } else {
+                            Ikev2NonceLocalRole::Initiator
+                        },
+                        child,
+                        &sk_d,
+                        ni,
+                        nr,
+                        None,
+                    )
+                    .map(|_| ()),
                 ];
                 for policy in [
                     Ikev2InitialExchangeNoncePolicy::Strict,
@@ -119,6 +139,11 @@ fn transcript_nonce_floor_accepts_legacy_peers_for_every_prf_role_and_exchange()
                 ] {
                     results.push(
                         derive_ike_sa_init_key_material_with_nonce_policy(
+                            if role == "initiator" {
+                                Ikev2NonceLocalRole::Responder
+                            } else {
+                                Ikev2NonceLocalRole::Initiator
+                            },
                             parent,
                             [0x11; 8],
                             [0x22; 8],
@@ -131,8 +156,19 @@ fn transcript_nonce_floor_accepts_legacy_peers_for_every_prf_role_and_exchange()
                         .map(|_| ()),
                     );
                     results.push(
-                        derive_initial_child_sa_key_material(child, &sk_d, ni, nr, policy)
-                            .map(|_| ()),
+                        derive_initial_child_sa_key_material(
+                            if role == "initiator" {
+                                Ikev2NonceLocalRole::Responder
+                            } else {
+                                Ikev2NonceLocalRole::Initiator
+                            },
+                            child,
+                            &sk_d,
+                            ni,
+                            nr,
+                            policy,
+                        )
+                        .map(|_| ()),
                     );
                 }
                 for result in results {
@@ -328,11 +364,20 @@ fn initiator_offers_stronger_groups_first_and_keeps_group_one_fallback() {
                     key_exchange_data: responder_key.public_value().to_vec(),
                 },
                 nonce: Ikev2NoncePayloadBuild {
-                    nonce: vec![0x33; 16],
+                    nonce: vec![0x33; 32],
                 },
                 notifies: vec![],
             },
         ));
+        let mut response = response;
+        response.raw_payloads = peer_nonce_fixture::replace_nonce(
+            response.header.next_payload,
+            &response.raw_payloads,
+            &[0x33; 16],
+        )
+        .into();
+        response.header.length =
+            28 + u32::try_from(response.raw_payloads.len()).expect("fixture length");
         let accepted = ok(admit_ike_sa_init_response(
             &request,
             &response.as_borrowed(),
@@ -474,7 +519,7 @@ fn rekey_initiator_accepts_legacy_peer_nonce_and_generates_a_long_local_nonce() 
                 negotiation,
                 new_responder_spi: [0x66; 8],
                 nonce: Ikev2NoncePayloadBuild {
-                    nonce: vec![0x33; 16],
+                    nonce: vec![0x33; 32],
                 },
                 key_exchange: Ikev2KeyExchangePayloadBuild {
                     dh_group: group.transform_id(),
@@ -489,6 +534,11 @@ fn rekey_initiator_accepts_legacy_peer_nonce_and_generates_a_long_local_nonce() 
                 HeaderFlags::from_bits(!original_initiator, true, false),
                 7,
             );
+            let peer_wire = peer_nonce_fixture::replace_nonce(
+                response.first_payload().as_u8(),
+                response.bytes(),
+                &[0x33; 16],
+            );
             let context = Ikev2IkeSaRekeySentRequest {
                 old_initiator_spi: 11,
                 old_responder_spi: 22,
@@ -498,10 +548,11 @@ fn rekey_initiator_accepts_legacy_peer_nonce_and_generates_a_long_local_nonce() 
                 &header,
                 &context,
                 response.first_payload(),
-                response.bytes(),
+                &peer_wire,
             ));
             assert_eq!(accepted.nonce().nonce.len(), 16);
             let material = ok(derive_ike_sa_rekey_key_material(
+                crate::Ikev2NonceLocalRole::Initiator,
                 prf,
                 &[0x44; 64],
                 profile,
@@ -512,7 +563,7 @@ fn rekey_initiator_accepts_legacy_peer_nonce_and_generates_a_long_local_nonce() 
                 &ok(local.agree(peer.public_value())),
             ));
             assert_eq!(material.sk_d().len(), 64);
-            let mut short = response.bytes().to_vec();
+            let mut short = peer_wire.clone();
             let nonce = ok(PayloadChain::new(response.first_payload(), &short)
                 .iter()
                 .find(|p| {
@@ -662,15 +713,57 @@ fn key_derivation_rejects_short_local_nonces_in_each_exchange_role() {
                 } else {
                     (peer.as_slice(), local.as_slice(), "responder")
                 };
-                let results = [
-                    derive_ike_sa_init_key_material(parent, [1; 8], [2; 8], ni, nr, &[2; 96], None)
-                        .map(|_| ()),
-                    derive_ike_sa_rekey_key_material(
-                        prf, &sk_d, parent, [1; 8], [2; 8], ni, nr, &[2; 96],
+                let mut results = vec![
+                    derive_ike_sa_init_key_material(
+                        if local_initiator {
+                            Ikev2NonceLocalRole::Initiator
+                        } else {
+                            Ikev2NonceLocalRole::Responder
+                        },
+                        parent,
+                        [1; 8],
+                        [2; 8],
+                        ni,
+                        nr,
+                        &[2; 96],
+                        None,
                     )
                     .map(|_| ()),
-                    derive_child_sa_key_material(child, &sk_d, ni, nr, None).map(|_| ()),
+                    derive_ike_sa_rekey_key_material(
+                        if local_initiator {
+                            Ikev2NonceLocalRole::Initiator
+                        } else {
+                            Ikev2NonceLocalRole::Responder
+                        },
+                        prf,
+                        &sk_d,
+                        parent,
+                        [1; 8],
+                        [2; 8],
+                        ni,
+                        nr,
+                        &[2; 96],
+                    )
+                    .map(|_| ()),
+                    derive_child_sa_key_material(
+                        if local_initiator {
+                            Ikev2NonceLocalRole::Initiator
+                        } else {
+                            Ikev2NonceLocalRole::Responder
+                        },
+                        child,
+                        &sk_d,
+                        ni,
+                        nr,
+                        None,
+                    )
+                    .map(|_| ()),
                     derive_initial_child_sa_key_material(
+                        if local_initiator {
+                            Ikev2NonceLocalRole::Initiator
+                        } else {
+                            Ikev2NonceLocalRole::Responder
+                        },
                         child,
                         &sk_d,
                         ni,
@@ -679,6 +772,28 @@ fn key_derivation_rejects_short_local_nonces_in_each_exchange_role() {
                     )
                     .map(|_| ()),
                 ];
+                for policy in [
+                    Ikev2InitialExchangeNoncePolicy::Strict,
+                    Ikev2InitialExchangeNoncePolicy::AllowLegacyInitiatorPrfHmacSha2_512Minimum,
+                ] {
+                    let local_role = if local_initiator {
+                        Ikev2NonceLocalRole::Initiator
+                    } else {
+                        Ikev2NonceLocalRole::Responder
+                    };
+                    results.push(
+                        derive_ike_sa_init_key_material_with_nonce_policy(
+                            local_role, parent, [1; 8], [2; 8], ni, nr, &[2; 96], None, policy,
+                        )
+                        .map(|_| ()),
+                    );
+                    results.push(
+                        derive_initial_child_sa_key_material(
+                            local_role, child, &sk_d, ni, nr, policy,
+                        )
+                        .map(|_| ()),
+                    );
+                }
                 for result in results {
                     assert_eq!(
                         result,

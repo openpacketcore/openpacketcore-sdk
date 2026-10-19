@@ -69,7 +69,9 @@
 //! MODP-768, MODP-1024, PRF-HMAC-SHA1, and AUTH-HMAC-SHA1-96 are executable
 //! interoperability mechanisms only: callers must put their exact typed suite
 //! into [`Ikev2SaInitNegotiationPolicy`]. The SDK has no default proposal list
-//! and never automatically enables or prefers these legacy transforms.
+//! while default software admission retains these capabilities. Group 1 stays
+//! available for legacy peers and follows stronger common groups. Other caller
+//! preference order remains authoritative.
 //!
 //! [`protocol_key`] adds volatile, consume-once K_N3IWF custody bound to an
 //! opaque association and pending IKE_AUTH operation. It computes both peers'
@@ -363,8 +365,8 @@ pub use sa_init_crypto::{
     derive_ike_sa_init_key_material_with_nonce_policy, derive_ike_sa_rekey_key_material,
     derive_initial_child_sa_key_material, Ikev2ChildSaCryptoProfile, Ikev2ChildSaKeyMaterial,
     Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2EphemeralDhKey, Ikev2InitialExchangeNoncePolicy,
-    Ikev2IntegrityAlgorithm, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
-    Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
+    Ikev2IntegrityAlgorithm, Ikev2NonceLocalRole, Ikev2PrfAlgorithm, Ikev2SaInitCryptoError,
+    Ikev2SaInitCryptoErrorCode, Ikev2SaInitCryptoProfile, Ikev2SaInitKeyMaterial,
 };
 pub use sa_init_initiator::{
     admit_ike_sa_init_response, build_ike_sa_init_request, Ikev2SaInitAccepted,

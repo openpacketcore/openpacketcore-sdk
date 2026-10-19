@@ -433,6 +433,7 @@ pub fn derive(
     let mut bytes = Zeroizing::new(Vec::with_capacity(1024));
     if kind == KeKind::IkeRekey {
         let keys = derive_ike_sa_rekey_key_material(
+            opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
             row.profile.prf(),
             row.keys.sk_d(),
             row.profile,
@@ -462,9 +463,15 @@ pub fn derive(
             row.profile.integrity().map(|i| i.transform_id()),
         )
         .unwrap();
-        let keys =
-            derive_child_sa_key_material(profile, row.keys.sk_d(), nonce_i, nonce_r, Some(secret))
-                .unwrap();
+        let keys = derive_child_sa_key_material(
+            opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
+            profile,
+            row.keys.sk_d(),
+            nonce_i,
+            nonce_r,
+            Some(secret),
+        )
+        .unwrap();
         for key in [
             keys.initiator_to_responder_encryption(),
             keys.initiator_to_responder_integrity(),

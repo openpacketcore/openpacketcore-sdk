@@ -1322,7 +1322,7 @@ pub fn build_ike_sa_init_response(
     ));
     entries.push((
         PayloadType::Nonce,
-        encode_nonce_payload_build(&payloads.nonce)?,
+        encode_outgoing_nonce_payload_build(&payloads.nonce)?,
     ));
     for notify in &payloads.notifies {
         entries.push((PayloadType::Notify, encode_notify_payload_build(notify)?));
@@ -1694,12 +1694,22 @@ pub(crate) fn encode_ke_payload_build(
     Ok(out)
 }
 
-/// Encode an IKEv2 Nonce payload body from a typed builder.
+/// Encode a local nonce, enforcing the 32-to-256-octet send range.
+pub(crate) fn encode_outgoing_nonce_payload_build(
+    payload: &Ikev2NoncePayloadBuild,
+) -> Result<Vec<u8>, Ikev2SaInitBuildError> {
+    if payload.nonce.len() < 32 {
+        return Err(Ikev2SaInitBuildError::NonceTooShort);
+    }
+    encode_nonce_payload_build(payload)
+}
+
+/// Encode caller-supplied wire nonce bytes, including legacy peer fixtures.
+/// Typed send builders separately enforce the 32-octet local minimum.
 ///
 /// # Errors
 ///
-/// Returns [`Ikev2SaInitBuildError`] when the nonce is outside the RFC 7296
-/// 16-to-256-octet range.
+/// Returns [`Ikev2SaInitBuildError`] outside the 16-to-256-octet wire range.
 pub fn encode_nonce_payload_build(
     payload: &Ikev2NoncePayloadBuild,
 ) -> Result<Vec<u8>, Ikev2SaInitBuildError> {

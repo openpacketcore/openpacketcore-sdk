@@ -230,6 +230,7 @@ fn case(row: Row, minimum: usize, cut: Cut) {
     let secret = peer_initiator_dh.agree(&fields.public).unwrap();
     let peer_spis: (u64, u64) = (0x7172_7374_7576_7778, fields.spi);
     let peer_keys = derive_ike_sa_rekey_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         row.profile.prf(),
         row.keys.sk_d(),
         row.profile,
@@ -254,6 +255,7 @@ fn case(row: Row, minimum: usize, cut: Cut) {
     let secret = peer_responder_dh.agree(&fields.public).unwrap();
     let local_spis: (u64, u64) = (fields.spi, 0x6162_6364_6566_6768);
     let local_keys = derive_ike_sa_rekey_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         row.profile.prf(),
         row.keys.sk_d(),
         row.profile,

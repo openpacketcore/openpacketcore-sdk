@@ -766,6 +766,7 @@ fn new_child_sa_build_decode_and_response_correlation_succeed() {
         }
     };
     let key_material = must_ok(derive_child_sa_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         Ikev2ChildSaCryptoProfile::new_aead(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesGcm16_256,
@@ -2097,5 +2098,73 @@ fn dedicated_ke_response_correlation_enforces_both_public_value_widths() {
                 "request group {group}, width {actual}",
             );
         }
+    }
+}
+
+#[test]
+fn outgoing_dedicated_requests_and_responses_enforce_local_nonce_floor() {
+    for len in [16, 24, 31, 32] {
+        let mut request = create_request_build();
+        request.nonce.nonce.resize(len, 3);
+        let mut response = create_response_build();
+        response.nonce.nonce.resize(len, 4);
+        let request = build_ikev2_dedicated_bearer_create_child_sa_request(&request);
+        let response = build_ikev2_dedicated_bearer_create_child_sa_response(&response);
+        if len < 32 {
+            assert!(matches!(
+                request,
+                Err(Ikev2DedicatedBearerExchangeError::Build(
+                    opc_proto_ikev2::Ikev2IkeAuthBuildError::Nonce(
+                        opc_proto_ikev2::Ikev2SaInitBuildError::NonceTooShort
+                    )
+                ))
+            ));
+            assert!(matches!(
+                response,
+                Err(Ikev2DedicatedBearerExchangeError::Build(
+                    opc_proto_ikev2::Ikev2IkeAuthBuildError::Nonce(
+                        opc_proto_ikev2::Ikev2SaInitBuildError::NonceTooShort
+                    )
+                ))
+            ));
+        } else {
+            assert!(request.is_ok());
+            assert!(response.is_ok());
+        }
+    }
+}
+
+#[test]
+fn outgoing_dedicated_offer_puts_group_one_last_without_reordering_other_groups() {
+    for separate in [false, true] {
+        let mut input = create_request_build();
+        for group in [1, 19, 14] {
+            if separate && group != 1 {
+                let mut proposal = sa([1, 2, 3, 4]).proposals.remove(0);
+                proposal.proposal_number = input.security_association.proposals.len() as u8 + 1;
+                proposal.transforms.push(Ikev2SaTransformBuild {
+                    transform_type: TRANSFORM_TYPE_DH,
+                    transform_id: group,
+                    attributes: vec![],
+                });
+                input.security_association.proposals.push(proposal);
+            } else {
+                create_ke_sa(&mut input.security_association, group);
+            }
+        }
+        input.key_exchange = Some(create_ke(19, 64));
+        let wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(&input));
+        let chain = PayloadChain::new(wire.first_payload(), wire.bytes());
+        let raw = must_ok(chain.iter().next().expect("SA payload"));
+        assert_eq!(raw.payload_type, PayloadType::SecurityAssociation);
+        let sa = must_ok(opc_proto_ikev2::Ikev2SaPayload::decode_body(raw.body));
+        let groups: Vec<_> = sa
+            .proposals
+            .iter()
+            .flat_map(|p| &p.transforms)
+            .filter(|t| t.transform_type == TRANSFORM_TYPE_DH)
+            .map(|t| t.transform_id)
+            .collect();
+        assert_eq!(groups, [19, 14, 1]);
     }
 }

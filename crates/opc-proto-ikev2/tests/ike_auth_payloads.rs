@@ -113,6 +113,7 @@ fn profile() -> Ikev2SaInitCryptoProfile {
 fn key_material() -> Ikev2SaInitKeyMaterial {
     support::ensure_ike_crypto();
     derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile(),
         [0x11; 8],
         [0x22; 8],
@@ -402,6 +403,7 @@ fn sha1_compatibility_profile_computes_and_verifies_ike_auth_mic() {
     )
     .expect("explicit SHA1 compatibility profile is executable");
     let material = derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile,
         [0x11; 8],
         [0x22; 8],
@@ -508,6 +510,7 @@ fn negotiates_child_sa_intent_and_builds_response_payloads() {
     let decoded = decode_ike_auth_cleartext_payloads(first, &bytes).expect("decode IKE_AUTH");
 
     let selected = negotiate_child_sa(
+        None,
         &decoded.security_associations[0],
         &decoded.traffic_selectors_initiator[0],
         &decoded.traffic_selectors_responder[0],
@@ -577,6 +580,7 @@ fn child_sa_negotiation_never_silently_drops_pfs_transform_type() {
     let decoded = decode_ike_auth_cleartext_payloads(first, &bytes).expect("decode PFS offer");
 
     let unconstrained = negotiate_child_sa(
+        None,
         &decoded.security_associations[0],
         &decoded.traffic_selectors_initiator[0],
         &decoded.traffic_selectors_responder[0],
@@ -597,6 +601,10 @@ fn child_sa_negotiation_never_silently_drops_pfs_transform_type() {
     );
 
     let selected = negotiate_child_sa(
+        Some(&opc_proto_ikev2::Ikev2KeyExchangePayload {
+            dh_group: 19,
+            key_exchange_data: &[2; 64],
+        }),
         &decoded.security_associations[0],
         &decoded.traffic_selectors_initiator[0],
         &decoded.traffic_selectors_responder[0],
@@ -805,6 +813,7 @@ fn rejects_child_sa_selector_mismatch_and_missing_responder_spi() {
     let decoded = decode_ike_auth_cleartext_payloads(first, &bytes).expect("decode IKE_AUTH");
 
     let selector_mismatch = negotiate_child_sa(
+        None,
         &decoded.security_associations[0],
         &decoded.traffic_selectors_initiator[0],
         &decoded.traffic_selectors_responder[0],
@@ -832,6 +841,7 @@ fn rejects_child_sa_selector_mismatch_and_missing_responder_spi() {
     );
 
     let selected = negotiate_child_sa(
+        None,
         &decoded.security_associations[0],
         &decoded.traffic_selectors_initiator[0],
         &decoded.traffic_selectors_responder[0],
@@ -850,6 +860,7 @@ fn rejects_child_sa_selector_mismatch_and_missing_responder_spi() {
     assert_eq!(spi_err, Ikev2IkeAuthBuildError::ChildSaResponderSpiMissing);
 
     let missing_transform_policy = negotiate_child_sa(
+        None,
         &decoded.security_associations[0],
         &decoded.traffic_selectors_initiator[0],
         &decoded.traffic_selectors_responder[0],
@@ -867,6 +878,7 @@ fn rejects_child_sa_selector_mismatch_and_missing_responder_spi() {
     );
 
     let duplicate_transform_policy = negotiate_child_sa(
+        None,
         &decoded.security_associations[0],
         &decoded.traffic_selectors_initiator[0],
         &decoded.traffic_selectors_responder[0],
@@ -893,6 +905,7 @@ fn rejects_child_sa_selector_mismatch_and_missing_responder_spi() {
     );
 
     let unsupported_protocol = negotiate_child_sa(
+        None,
         &decoded.security_associations[0],
         &decoded.traffic_selectors_initiator[0],
         &decoded.traffic_selectors_responder[0],
@@ -923,6 +936,7 @@ fn rejects_child_sa_selector_mismatch_and_missing_responder_spi() {
         }],
     };
     let empty_transforms = negotiate_child_sa(
+        None,
         &empty_transform_sa,
         &decoded.traffic_selectors_initiator[0],
         &decoded.traffic_selectors_responder[0],
@@ -1322,8 +1336,59 @@ fn child_pfs_prefers_stronger_common_groups_over_group_one() {
             accepted_initiator_traffic_selectors: vec![],
             accepted_responder_traffic_selectors: vec![],
         };
-        let selected =
-            negotiate_child_sa(&sa, &ts, &ts, &policy).expect("common stronger PFS suite");
+        let retry = negotiate_child_sa(
+            Some(&opc_proto_ikev2::Ikev2KeyExchangePayload {
+                dh_group: 1,
+                key_exchange_data: &[2; 96],
+            }),
+            &sa,
+            &ts,
+            &ts,
+            &policy,
+        )
+        .expect_err("strong common group requests KE retry");
+        assert_eq!(
+            retry,
+            Ikev2ChildSaNegotiationError::KeyExchangeDhGroupMismatch {
+                received: 1,
+                preferred: 14
+            }
+        );
+        let notify = retry.invalid_ke_notify().expect("retry notify");
+        assert_eq!(notify.notify_message_type, 17);
+        assert_eq!(notify.protocol_id, 0);
+        assert!(notify.spi.is_empty());
+        assert_eq!(notify.notification_data, [0, 14]);
+        assert_eq!(
+            opc_proto_ikev2::build_ike_auth_notify_payload(&notify).expect("encoded KE retry"),
+            [0, 0, 0, 17, 0, 14]
+        );
+        for width in [1, 255, 257] {
+            assert_eq!(
+                negotiate_child_sa(
+                    Some(&opc_proto_ikev2::Ikev2KeyExchangePayload {
+                        dh_group: 14,
+                        key_exchange_data: &vec![2; width],
+                    }),
+                    &sa,
+                    &ts,
+                    &ts,
+                    &policy,
+                ),
+                Err(Ikev2ChildSaNegotiationError::InvalidKeyExchange)
+            );
+        }
+        let selected = negotiate_child_sa(
+            Some(&opc_proto_ikev2::Ikev2KeyExchangePayload {
+                dh_group: 14,
+                key_exchange_data: &[2; 256],
+            }),
+            &sa,
+            &ts,
+            &ts,
+            &policy,
+        )
+        .expect("common stronger PFS suite");
         assert_eq!(
             selected
                 .transforms
@@ -1332,6 +1397,33 @@ fn child_pfs_prefers_stronger_common_groups_over_group_one() {
                 .expect("DH")
                 .transform_id,
             14
+        );
+        let legacy_wire =
+            build_ike_auth_sa_payload(&child_sa_pfs_payload_build(1)).expect("legacy SA");
+        let legacy = Ikev2SaPayload::decode_body(&legacy_wire).expect("legacy SA view");
+        let selected_legacy = negotiate_child_sa(
+            Some(&opc_proto_ikev2::Ikev2KeyExchangePayload {
+                dh_group: 1,
+                key_exchange_data: &[2; 96],
+            }),
+            &legacy,
+            &ts,
+            &ts,
+            &policy,
+        )
+        .expect("legacy-only common group");
+        assert_eq!(
+            selected_legacy
+                .transforms
+                .iter()
+                .find(|t| t.transform_type == 4)
+                .expect("DH")
+                .transform_id,
+            1
+        );
+        assert_eq!(
+            negotiate_child_sa(None, &sa, &ts, &ts, &policy),
+            Err(Ikev2ChildSaNegotiationError::KeyExchangeRequired)
         );
     }
 }
@@ -1354,5 +1446,38 @@ fn outgoing_child_offer_puts_group_one_last() {
             .map(|t| t.transform_id)
             .collect();
         assert_eq!(groups, [14, 1]);
+    }
+}
+
+#[test]
+fn outgoing_child_offer_preserves_nonlegacy_and_no_pfs_proposal_order() {
+    for groups in [[0, 14, 1], [19, 14, 1]] {
+        let mut input = outgoing_child_request();
+        input.security_association.proposals.clear();
+        for (index, group) in groups.into_iter().enumerate() {
+            let mut proposal = child_sa_pfs_payload_build(group).proposals.remove(0);
+            proposal.proposal_number = (index + 1) as u8;
+            if group == 0 {
+                proposal.transforms.retain(|t| t.transform_type != 4);
+            }
+            input.security_association.proposals.push(proposal);
+        }
+        input.key_exchange = Some(Ikev2KeyExchangePayloadBuild {
+            dh_group: 14,
+            key_exchange_data: vec![2; 256],
+        });
+        let built = build_create_child_sa_rekey_request_payloads(&input).expect("ordered offer");
+        let sa = Ikev2SaPayload::decode_body(&built.security_association.body).expect("SA view");
+        let ordered_groups: Vec<_> = sa
+            .proposals
+            .iter()
+            .map(|p| {
+                p.transforms
+                    .iter()
+                    .find(|t| t.transform_type == 4)
+                    .map_or(0, |t| t.transform_id)
+            })
+            .collect();
+        assert_eq!(ordered_groups, groups);
     }
 }

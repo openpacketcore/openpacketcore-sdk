@@ -179,7 +179,7 @@ fn builds_canonical_sa_init_response_chain() {
                 key_exchange_data: vec![0xcc; 32],
             },
             nonce: Ikev2NoncePayloadBuild {
-                nonce: vec![0xdd; 16],
+                nonce: vec![0xdd; 32],
             },
             notifies: vec![Ikev2NotifyPayloadBuild {
                 protocol_id: 0,
@@ -269,7 +269,7 @@ fn builder_rejects_missing_responder_spi_without_leaking_material() {
                 key_exchange_data: vec![0xaa; 32],
             },
             nonce: Ikev2NoncePayloadBuild {
-                nonce: vec![0xbb; 16],
+                nonce: vec![0xbb; 32],
             },
             notifies: Vec::new(),
         },

@@ -43,13 +43,6 @@ redact formatting. See [ADR 0033](../../docs/adr/0033-n1-mode-codecs.md).
 
 ## Message-ID synchronization primitives and pure rules
 
-CREATE_CHILD_SA builders and the dedicated-bearer and NWu opened-message
-boundaries validate KE public-value widths against the supplied group on build,
-request/response decode and response correlation. Group 1 retains its
-96-octet MODP encoding; the other supported MODP and ECP groups retain their
-fixed-width encodings. Agreement continues to validate the mathematical public
-value through the admitted crypto module.
-
 `message_id_sync` provides RFC 6311 support and synchronization Notify codecs.
 `Ikev2NotifyPayloadBuild::message_id_sync_supported()` builds the IKE_AUTH
 advertisement; `Ikev2IkeAuthCleartextPayloads::message_id_sync_supported()`
@@ -1385,10 +1378,14 @@ other profiles. Initial initiator offers likewise place group-1 alternatives
 and group-1-only proposals last. Responder selection, including IKE-SA rekey in
 either original IKE role, requests a stronger KE with `INVALID_KE_PAYLOAD` when
 necessary instead of accepting a group-1 KE while a stronger common suite exists.
-This changes main's previous caller/wire preference and matching-KE fallback
-order. Group 1 remains usable when it is the only common group. The single-profile
-rekey initiator builder encodes an already-selected profile; choose from the
-existing policy's ordered common profiles when more than one is available.
+Caller order and existing matching-KE fallback among non-group-1 groups remain
+unchanged; there is no global group-strength ranking. Group 1 remains usable
+when it is the only common group. Generic Child-SA PFS negotiation and NWu AEAD
+policy apply the same group-1-last rule and expose a typed retry Notify. Generic,
+dedicated-bearer and NWu Child-SA request offers put group 1 last while preserving
+other proposal order. The single-profile rekey initiator builder encodes an
+already-selected profile; choose from the existing policy's ordered common
+profiles when more than one is available.
 
 The SDK has no implicit proposal list. A product adds its exact compatibility
 profile to `Ikev2SaInitNegotiationPolicy` as before. Group 2 and SHA1 remain
@@ -1421,17 +1418,41 @@ compatibility boundary.
 ### Local and received nonces
 
 `Ikev2NoncePayloadBuild::generate(prf)` uses admitted entropy for fresh local
-nonces of at least 32 octets and half the PRF's preferred key length, for both
-roles and initial/rekey exchanges. The initial initiator builder and retained
-local Child-SA rekey boundary enforce that local floor. Raw payload encoders
-accept caller-supplied wire fixtures and do not generate randomness.
+nonces of at least 32 octets and half the PRF's preferred key length (32 octets
+for every supported PRF). Every typed outgoing IKE_SA_INIT, IKE-SA rekey and
+Child-SA creation/rekey builder enforces a flat 32-octet local floor. Raw payload
+encoders remain available for caller-supplied wire fixtures.
 
-Peer decoding, initial/rekey transcript KDFs and XFRM mapping accept 16..=256
-octets for every PRF and reject shorter input with typed errors. Accepting a
-16-octet SHA2-512 peer nonce deliberately relaxes RFC 7296 section 2.10's
-half-PRF-key requirement for legacy compatibility. Both initial nonce-policy
-names retain this receive behavior. Original group-1/SHA2-512/16-octet Ni vectors
-remain positive. The exact deviations are recorded in `CONFORMANCE.md`.
+All public IKE/Child-SA KDFs require `Ikev2NonceLocalRole`. It identifies the
+initiator or responder of the exchange that produced Ni and Nr, independently
+of the original IKE-SA role during rekey. The local nonce must be 32..=256
+octets; the peer nonce may be 16..=256 for every PRF. XFRM derivation helpers use
+the local-responder mapping: Ni is received and Nr is local. Below-floor inputs
+return typed errors before cryptographic derivation.
+
+Accepting a 16-octet SHA2-512 peer nonce deliberately relaxes RFC 7296 section
+2.10's half-PRF-key requirement for legacy compatibility. Both initial
+nonce-policy names use the same role-aware bounds. Existing group-1/SHA2-512/
+16-octet Ni reference vectors remain positive with the local responder's
+32-octet Nr. The deviations are recorded in `CONFORMANCE.md`.
+
+## Child-SA key exchange validation
+
+CREATE_CHILD_SA builders and the dedicated-bearer and NWu opened-message
+boundaries validate KE public-value widths against the supplied group on build,
+request/response decode and response correlation. Group 1 retains its
+96-octet MODP encoding; the other supported MODP and ECP groups retain their
+fixed-width encodings. Agreement continues to validate the mathematical public
+value through the admitted crypto module.
+
+Generic Child-SA negotiation and NWu AEAD policy put group 1 after stronger
+common PFS groups. SDK-built Child-SA offers apply the same stable ordering.
+`negotiate_child_sa` takes the peer KE alongside the SA and selectors. A stronger
+common suite with a different KE produces a typed `KeyExchangeDhGroupMismatch`;
+`invalid_ke_notify()` constructs the `INVALID_KE_PAYLOAD` response Notify.
+A group-1-only common offer remains usable. Non-group-1 choices retain caller
+or wire order and existing matching-KE fallback, with no global strength ranking.
+Selected response proposal numbers retain their request correlation.
 
 ## Authenticated-only ESP Child SAs
 

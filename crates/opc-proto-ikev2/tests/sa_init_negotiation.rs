@@ -359,6 +359,7 @@ fn capture_shaped_responder_proof_reaches_bidirectional_protected_ike_auth() {
         .try_fill_bytes(&mut responder_nonce)
         .expect("responder nonce CSPRNG succeeds");
     let material = derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         selection.profile(),
         INITIATOR_SPI.to_be_bytes(),
         RESPONDER_SPI.to_be_bytes(),

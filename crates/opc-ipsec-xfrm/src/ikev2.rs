@@ -495,8 +495,10 @@ impl Error for Ikev2ChildSaXfrmError {}
 ///
 /// # Errors
 ///
-/// Returns [`Ikev2ChildSaKeyMaterialError`] when KEYMAT derivation fails or the
-/// selected profile has no SDK XFRM algorithm-name mapping.
+/// Derivation is local-responder shaped: local Nr requires 32..=256 octets,
+/// while peer Ni accepts 16..=256. Returns [`Ikev2ChildSaKeyMaterialError`] when
+/// role-aware KEYMAT derivation fails or the selected profile has no SDK XFRM
+/// algorithm-name mapping.
 pub fn derive_child_sa_xfrm_keys(
     profile: Ikev2ChildSaCryptoProfile,
     sk_d: &[u8],
@@ -505,6 +507,7 @@ pub fn derive_child_sa_xfrm_keys(
     new_dh_shared_secret: Option<&[u8]>,
 ) -> Result<Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError> {
     let key_material = derive_child_sa_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile,
         sk_d,
         initiator_nonce,
@@ -528,10 +531,9 @@ pub fn derive_child_sa_xfrm_keys(
 
 /// Derive the mandatory initial Child SA KEYMAT and map it into XFRM keys.
 ///
-/// Every initial policy name accepts 16..=256-octet transcript nonces for
-/// either peer and every PRF, matching [`derive_child_sa_xfrm_keys`]. Local
-/// nonce generation uses [`opc_proto_ikev2::Ikev2NoncePayloadBuild::generate`]
-/// for the stronger send floor. This helper derives without a new DH secret;
+/// This directional mapper is local-responder shaped: Nr must have 32..=256
+/// octets and peer Ni may have 16..=256, independently of PRF. Both initial
+/// policy names enforce these bounds. This helper derives without new DH;
 /// PFS and replacement Child SAs use the generic helper.
 ///
 /// # Errors
@@ -546,6 +548,7 @@ pub fn derive_initial_child_sa_xfrm_keys(
     nonce_policy: Ikev2InitialExchangeNoncePolicy,
 ) -> Result<Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError> {
     let key_material = derive_initial_child_sa_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile,
         sk_d,
         initiator_nonce,
@@ -1704,7 +1707,7 @@ mod tests {
             Ikev2EncryptionAlgorithm::AesGcm16_256,
         );
         let keys =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 16], None) {
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 32], None) {
                 Ok(keys) => keys,
                 Err(error) => panic!("child SA XFRM key derivation failed: {error:?}"),
             };
@@ -1720,7 +1723,7 @@ mod tests {
         assert_eq!(
             inbound.1.as_bytes(),
             hex_to_bytes(
-                "7ae50b9713ddfd346dbb3cfbe8b8d45a34c79925bedb4f4ae6a5ad6bc76d8ab578ea306c"
+                "d3c8b8c867400af5f091198a99f2f78c1571125586f6df486d40821e80c3717944abbd71"
             )
         );
 
@@ -1733,7 +1736,7 @@ mod tests {
         assert_eq!(
             outbound.1.as_bytes(),
             hex_to_bytes(
-                "e36f6fde3c1f71951c1fe8c6d7477a4a2adfe9b746fd3c6fd6be52da8c2afd17eeff3e2a"
+                "59bf54971a1057d4ea883f60dc46464fdfeccfa9b2b9c6e6b1c01a5b9345bc2d748d1608"
             )
         );
 
@@ -1781,7 +1784,7 @@ mod tests {
             Ikev2IntegrityAlgorithm::HmacSha2_256_128,
         );
         let keys =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 16], None) {
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 32], None) {
                 Ok(keys) => keys,
                 Err(error) => panic!("child SA XFRM key derivation failed: {error:?}"),
             };
@@ -1794,7 +1797,7 @@ mod tests {
         assert_eq!(inbound_crypt.0.name, XFRM_ENCR_CBC_AES);
         assert_eq!(
             inbound_crypt.1.as_bytes(),
-            hex_to_bytes("7ae50b9713ddfd346dbb3cfbe8b8d45a34c79925bedb4f4ae6a5ad6bc76d8ab5")
+            hex_to_bytes("d3c8b8c867400af5f091198a99f2f78c1571125586f6df486d40821e80c37179")
         );
         let inbound_auth = match &keys.inbound.auth {
             Some(value) => value,
@@ -1810,7 +1813,7 @@ mod tests {
         };
         assert_eq!(
             outbound_crypt.1.as_bytes(),
-            hex_to_bytes("8c2afd17eeff3e2a77f1c49d07cb5a9456546102f02fe52ee641dd4e3bc207ce")
+            hex_to_bytes("9345bc2d748d16089c6f07a060f29607b304279cfa1b205f3627fb39ec167e5f")
         );
     }
 
@@ -1832,7 +1835,9 @@ mod tests {
             &responder_nonce,
             None,
         ) {
-            Ok(value) => panic!("strict Child-SA rekey unexpectedly derived keys: {value:?}"),
+            Ok(value) => {
+                panic!("below-floor peer nonce unexpectedly derived Child-SA keys: {value:?}")
+            }
             Err(error) => error,
         };
         assert_invalid_nonce_diagnostic(strict_error, Ikev2ChildSaNonceRole::Initiator, 15);
@@ -1907,7 +1912,7 @@ mod tests {
             profile,
             &[0x0f; 20],
             &[0xa1; 16],
-            &[0xb2; 16],
+            &[0xb2; 32],
             Some(&[0xc3; 96]),
         ) {
             Ok(keys) => keys,
@@ -1941,7 +1946,7 @@ mod tests {
             Ikev2IntegrityAlgorithm::HmacSha2_256_128,
         );
         let keys =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 16], None) {
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 32], None) {
                 Ok(keys) => keys,
                 Err(error) => panic!("ENCR_NULL Child SA XFRM key derivation failed: {error:?}"),
             };
@@ -1949,11 +1954,11 @@ mod tests {
         for (direction, expected) in [
             (
                 &keys.inbound,
-                "7ae50b9713ddfd346dbb3cfbe8b8d45a34c79925bedb4f4ae6a5ad6bc76d8ab5",
+                "d3c8b8c867400af5f091198a99f2f78c1571125586f6df486d40821e80c37179",
             ),
             (
                 &keys.outbound,
-                "78ea306ce36f6fde3c1f71951c1fe8c6d7477a4a2adfe9b746fd3c6fd6be52da",
+                "44abbd7159bf54971a1057d4ea883f60dc46464fdfeccfa9b2b9c6e6b1c01a5b",
             ),
         ] {
             assert!(direction.aead.is_none());
@@ -1999,7 +2004,7 @@ mod tests {
             Ikev2EncryptionAlgorithm::AesGcm16_128,
         );
         let error =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 15], &[0xb2; 16], None) {
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 15], &[0xb2; 32], None) {
                 Ok(value) => panic!("short initiator nonce unexpectedly derived keys: {value:?}"),
                 Err(error) => error,
             };
@@ -2041,7 +2046,7 @@ mod tests {
             Ikev2EncryptionAlgorithm::AesGcm16_128,
         );
         let error =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 31], &[0xa1; 16], &[0xb2; 16], None) {
+            match derive_child_sa_xfrm_keys(profile, &[0x0f; 31], &[0xa1; 16], &[0xb2; 32], None) {
                 Ok(value) => panic!("invalid SK_d unexpectedly derived keys: {value:?}"),
                 Err(error) => error,
             };

@@ -38,6 +38,7 @@ pub fn keys() -> Ikev2SaInitKeyMaterial {
         let _ = install_ikev2_software_crypto_module(policy, requirements).unwrap();
     });
     derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile(),
         SPIS[0].to_be_bytes(),
         SPIS[1].to_be_bytes(),

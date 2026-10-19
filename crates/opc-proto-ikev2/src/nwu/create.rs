@@ -105,9 +105,11 @@ impl CreateRequestBuild<'_> {
     pub fn payloads(&self) -> Result<Vec<Ikev2IkeAuthPayloadBuild>, Error> {
         address_applicable(self.inner_families, self.up_address)?;
         validate_sa_build(&self.security_association, false).map_err(|_| Error::InvalidValue)?;
+        let mut offer = self.security_association.clone();
+        crate::sa_init_negotiation::prefer_stronger_dh_groups(&mut offer);
         let common =
             build_create_child_sa_rekey_response_payloads(&Ikev2CreateChildSaRekeyResponseBuild {
-                security_association: self.security_association.clone(),
+                security_association: offer,
                 nonce: self.nonce.clone(),
                 key_exchange: self.key_exchange.clone(),
                 traffic_selectors_initiator: all_packet_selectors(self.inner_families),

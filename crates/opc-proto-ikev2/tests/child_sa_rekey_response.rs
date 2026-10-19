@@ -1408,3 +1408,35 @@ fn valid_success_cannot_commit_twice_and_wrong_exchange_does_not_poison_state() 
         Ikev2ChildSaRekeyResponseError::TerminalResponseAlreadyCommitted
     );
 }
+
+#[test]
+fn local_child_rekey_nonce_floor_is_32_for_every_prf() {
+    for prf in [
+        Ikev2PrfAlgorithm::HmacSha1,
+        Ikev2PrfAlgorithm::HmacSha2_256,
+        Ikev2PrfAlgorithm::HmacSha2_384,
+        Ikev2PrfAlgorithm::HmacSha2_512,
+    ] {
+        for len in [16, 24, 31, 32] {
+            let mut request = request_build(false);
+            request.nonce.nonce.resize(len, 0x41);
+            let result = Ikev2ChildSaRekeyResponseBoundary::new(
+                &request_header(),
+                request,
+                current_traffic_selectors(),
+                prf,
+            );
+            if len < 32 {
+                assert_eq!(
+                    result.expect_err("local nonce floor"),
+                    Ikev2ChildSaRekeyResponseError::InitiatorNonceTooShortForPrf {
+                        actual: len,
+                        minimum: 32
+                    }
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+}
