@@ -135,7 +135,7 @@ fn create_public_anchor(
 
 // Pure storage fixtures seed only the public projection. Public store tests
 // exercise real file-backed enrollment and proof of the SDK-generated key.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn enroll_projection_for_test(
     conn: &Connection,
     table: &opc_consensus::voter_slots::VoterSlotTable,

@@ -119,6 +119,114 @@
       "kind": "assertions-decreased",
       "reason": "The precise election timer now recovers from the retained real split vote before the unchanged 26-second transition bound. Replace the obsolete leaderless-at-deadline checkpoint with actual split-term checks and recovery before the same bound. Normal-time setup can also collapse 100 ms ticker phases: replace the distinct-phase setup assertions with observed aligned tick registrations and distinct finite RNG samples that order two genuine inquiries, crossed persisted votes, and one automatic retry. The history, retention, snapshot, reconciliation and durable-vote assertions remain. The measured assertion count including repeated local-helper call paths changes from 163 to 133; simplified tick alignment removes repeated phase-adjustment calls as well as replacing their setup checks.",
       "issue": 1333
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::authenticated_loss_claim_for_a_live_voter_has_no_effect",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::fixed_slot_five_and_nine_voter_quorums_refuse_raw_high_term_traffic",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::lifecycle_tests::disconnect_drains_an_rpc_handler_before_the_store_reopens",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Reopen uses the retained manifest and topology through fixture accessors. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consensus",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Candidate setup now consumes its previously enrolled volume instead of creating an unbound directory at open. Reopen uses the retained manifest and topology through fixture accessors. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound. Snapshot/reopen additionally checks that the successor retained its own enrolled key.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::progress_tests::voter_absent_candidate_reuses_one_snapshot_for_two_minutes",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Candidate setup now consumes its previously enrolled volume instead of creating an unbound directory at open. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::progress_tests::voter_snapshot_transfer_exceeds_ten_seconds_and_resumes_its_offset",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Candidate setup now consumes its previously enrolled volume instead of creating an unbound directory at open. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::progress_tests::voter_unreachable_learner_reuses_one_marker_for_two_minutes",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Candidate setup now consumes its previously enrolled volume instead of creating an unbound directory at open. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::publication_tests::voter_status_waits_for_a_survivors_strict_wal_publication",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::publication_tests::voter_status_waits_for_the_leaders_strict_wal_publication",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::retry_tests::voter_retry_reports_an_attempt_waiting_for_peer_drain",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::retry_tests::voter_retry_reports_pending_prepare_when_target_returns",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::review_tests::voter_candidate_withholds_joint_append_success_until_durable_joint_apply",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Candidate setup now consumes its previously enrolled volume instead of creating an unbound directory at open. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::review_tests::voter_remote_survivor_live_target_veto_has_no_effect",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::voter_higher_term_target_leader_truncates_reopened_prepare",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Reopen uses the retained manifest and topology through fixture accessors. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::voter_higher_term_target_leader_truncates_vetoed_prepare",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::voter_provisional_prepare_reinstalls_the_engine_fence_before_reopened_rpc_admission",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Reopen uses the retained manifest and topology through fixture accessors. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::voter_snapshot_barrier_closes_local_application_admission_before_dispatch",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::voter_survivor_leader_truncates_vetoed_prepare",
+      "kind": "assertions-decreased",
+      "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
+      "issue": 1330
     }
   ]
 }
