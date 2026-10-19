@@ -630,7 +630,7 @@ async fn each_voter_including_the_leader_fails_closed_when_a_written_read_is_sil
 }
 
 #[tokio::test]
-async fn concurrent_slow_receipts_use_one_call_each_without_overload() {
+async fn concurrent_slow_receipts_use_one_call_each_with_v2_wait_counters() {
     let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
         .await
         .unwrap();
@@ -663,11 +663,11 @@ async fn concurrent_slow_receipts_use_one_call_each_without_overload() {
         .iter()
         .map(|client| client.v2_diagnostics().setup_attempts)
         .sum();
-    let mut overload = 0;
+    let mut current_waiters = 0;
     let mut max_waiters = 0;
     for client in &clients {
-        let diagnostics = client.diagnostics().await;
-        overload += diagnostics.overload;
+        let diagnostics = client.v2_diagnostics();
+        current_waiters += diagnostics.pool_wait_current;
         max_waiters = max_waiters.max(diagnostics.pool_wait_max);
     }
     let exact = |result: &Result<FencedTransitionV2Status, _>,
@@ -690,7 +690,7 @@ async fn concurrent_slow_receipts_use_one_call_each_without_overload() {
         held(&fixture, STATUS),
         fixture.diagnostics().fenced_transition_v2_calls(),
         setups_after - setups_before,
-        overload,
+        current_waiters,
         max_waiters,
     );
     drop(first);
@@ -707,10 +707,7 @@ async fn concurrent_slow_receipts_use_one_call_each_without_overload() {
         evidence.7 <= 2,
         "each logical read may establish at most one lane"
     );
-    assert_eq!(
-        evidence.8, 0,
-        "slow replies must not introduce Overloaded refusals"
-    );
+    assert_eq!(evidence.8, 0, "all V2 pool waiters have completed");
     assert!(
         evidence.9 <= 2,
         "two logical callers never fan out into more waiters"

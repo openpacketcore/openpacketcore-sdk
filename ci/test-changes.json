@@ -269,6 +269,13 @@
       "renamed_to": "rust:crates/opc-session-net::lib=lib::consumer::tests::public_protected_fenced_transition_exhausts_replying_voters_then_waits_for_silent_a",
       "reason": "Keep traversal after completed unavailable replies, then require the unanswered written A read to consume the remaining original three-second deadline without another voter round. The replacement checks exact B/C/A order and call counts, the unchanged single mutation on A, the typed deadline result and a retained journal row. Completed NotFound retry rounds remain covered separately; no caller bound is increased.",
       "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::concurrent_slow_receipts_use_one_call_each_without_overload",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::concurrent_slow_receipts_use_one_call_each_with_v2_wait_counters",
+      "reason": "Measure V2 wait counters for V2 traffic and remove the unsupported overload claim from the two-caller test. Exact successful receipts, physical calls, setup bounds and waiter bounds remain. The new matched three-caller contention test separately measures actual ordinary and emergency-shaped admission outcomes.",
+      "issue": 1328
     }
   ]
 }
