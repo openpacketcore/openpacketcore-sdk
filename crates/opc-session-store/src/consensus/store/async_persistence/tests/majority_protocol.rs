@@ -184,9 +184,13 @@ impl RecoveryInitializationControl {
 }
 
 async fn recover_with_control(fleet: &Fleet, control: &RecoveryInitializationControl) {
+    let started = std::time::Instant::now();
+    let mut attempts = 0;
+    let mut last_initializations = Vec::new();
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let _ = join_all(
+            attempts += 1;
+            last_initializations = join_all(
                 fleet
                     .stores
                     .iter()
@@ -195,7 +199,9 @@ async fn recover_with_control(fleet: &Fleet, control: &RecoveryInitializationCon
                     // admission, including its authority to certify a cold peer.
                     // Activated but not yet admitted members still need retries.
                     .filter(|store| !store.exact_membership_is_admitted())
-                    .map(|store| control.initialize(store)),
+                    .map(|store| async move {
+                        (store.inner.local_node_id, control.initialize(store).await)
+                    }),
             )
             .await;
             let reports = join_all(
@@ -217,15 +223,52 @@ async fn recover_with_control(fleet: &Fleet, control: &RecoveryInitializationCon
     .await;
     if result.is_err() {
         eprintln!(
-            "recovery_fixture_survivor_initializations={}",
-            control.survivor_initializations.load(Ordering::Acquire)
+            "recovery_fixture_elapsed={:?} attempts={attempts} last_initializations={last_initializations:?} survivor_initializations={}",
+            started.elapsed(), control.survivor_initializations.load(Ordering::Acquire)
         );
         for store in fleet.stores.iter().flatten() {
+            let protocol = &store.inner.persistence_protocol;
+            let metrics = store.inner.raft.metrics().borrow().clone();
             eprintln!(
-                "recovery_fixture_progress stage={:?} active={}",
+                "recovery_fixture_progress node={:?} stage={:?} active={} metrics={metrics:?}",
+                store.inner.local_node_id,
                 store.persistence_health().recovery,
-                store.inner.persistence_protocol.is_active()
+                protocol.is_active()
             );
+            if let Some(wal) = store.inner.private_wal.as_ref() {
+                eprintln!(
+                    "recovery_fixture_retained={}",
+                    wal.async_retained()
+                        .map(|retained| serde_json::to_string(&retained).unwrap())
+                        .unwrap_or_else(|error| error.to_string())
+                );
+            }
+            match protocol.recovery_coordinator.try_lock() {
+                Ok(coordinator) => {
+                    if let Some(current) = coordinator.as_ref() {
+                        eprintln!(
+                            "recovery_fixture_coordinator era={} selected={} boundary={:?} ready={} restart={} resume={}",
+                            current.round.era, current.selection.is_some(), current.boundary,
+                            current.ready.len(), current.restart, current.resume_owned_commit
+                        );
+                    }
+                }
+                Err(_) => eprintln!("recovery_fixture_coordinator=busy"),
+            }
+            match protocol.recovery_local.try_lock() {
+                Ok(local) => {
+                    if let Some(current) = local.as_ref() {
+                        eprintln!(
+                            "recovery_fixture_local era={} prepared={} selected={} proposal={}",
+                            current.round.era,
+                            current.prepared.is_some(),
+                            current.selection.is_some(),
+                            current.proposal.is_some()
+                        );
+                    }
+                }
+                Err(_) => eprintln!("recovery_fixture_local=busy"),
+            }
         }
     }
     result.expect("complete recovery and usable application authority");
@@ -574,6 +617,7 @@ async fn exercise_five_voters_repeat_boundary_and_sequential_rejoin(protected: b
         let mut prior_era = 1;
         for turn in 0..2 {
             cold(&mut fleet).await;
+            eprintln!("recovery_fixture_phase turn={turn} cold");
             recover(&fleet).await;
             let store = fleet.store(fleet.leader());
             let (_, bound) = store
@@ -605,6 +649,7 @@ async fn exercise_five_voters_repeat_boundary_and_sequential_rejoin(protected: b
                     .open(target, SessionPersistenceMode::Async)
                     .await
                     .unwrap();
+                eprintln!("recovery_fixture_phase turn={turn} rejoin={target}");
                 recover(&fleet).await;
                 assert_eq!(
                     fleet
@@ -622,6 +667,7 @@ async fn exercise_five_voters_repeat_boundary_and_sequential_rejoin(protected: b
                 );
             }
             fleet.open(4, SessionPersistenceMode::Async).await.unwrap();
+            eprintln!("recovery_fixture_phase turn={turn} rejoin=4");
             recover(&fleet).await;
         }
     })
