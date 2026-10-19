@@ -71,11 +71,15 @@ fn retained_enrollment_cannot_reseed_missing_consensus_tables(erase_seed: bool) 
     initial.slots[0].member.key_digest = signer.key_digest();
     let conn = backend.conn.blocking_lock();
     initialize(&conn, &initial, true).unwrap();
+    // Model storage loss, which can remove referenced tables independently of
+    // SQL constraints. Restore normal enforcement before exercising open.
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
     conn.execute_batch("DROP TABLE consensus_identity").unwrap();
     if erase_seed {
         conn.execute_batch("DROP TABLE consensus_voter_slots")
             .unwrap();
     }
+    conn.pragma_update(None, "foreign_keys", true).unwrap();
     let schema: u64 = conn
         .query_row("PRAGMA schema_version", [], |row| row.get(0))
         .unwrap();
