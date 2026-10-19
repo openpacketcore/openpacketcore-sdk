@@ -779,6 +779,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: synchronize unit-test snapshot namespace reopen with
+  child descriptor retirement, preventing inherited sockets from causing
+  spurious `EADDRINUSE` while preserving live-owner exclusion checks.
+
 - `opc-session-store`: wait for the initial record on every replica before
   injecting owner or fence drift in the renewal fixture. Exercise a lagging
   follower deterministically so quorum acknowledgement cannot race the direct

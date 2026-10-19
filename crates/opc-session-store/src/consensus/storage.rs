@@ -648,6 +648,13 @@ fn bind_snapshot_directory_socket(configured_path: &Path) -> io::Result<Arc<std:
     )
     .map_err(io::Error::from)?;
     let address = UnixAddr::new_abstract(&name).map_err(io::Error::from)?;
+    // A test child can retain the previous owner's CLOEXEC socket between
+    // fork and descriptor retirement. Wait for that retirement before binding;
+    // a genuine live owner must still fail the unchanged bind with EADDRINUSE.
+    #[cfg(test)]
+    let _child_retirement = crate::test_process::SNAPSHOT_PROCESS_FD_GATE
+        .read()
+        .expect("test child-launch gate remains available");
     bind(socket.as_raw_fd(), &address).map_err(io::Error::from)?;
     Ok(Arc::new(socket))
 }
@@ -21942,6 +21949,77 @@ mod tests {
         );
         drop(first);
         drop(second);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_namespace_reopen_waits_for_child_descriptor_retirement() {
+        const CHILD: &str = "OPC_SNAPSHOT_NAMESPACE_RETIREMENT_CHILD";
+        const TEST: &str = "consensus::storage::tests::snapshot_namespace_reopen_waits_for_child_descriptor_retirement";
+        if std::env::var_os(CHILD).is_none() {
+            // This fixture deliberately holds the child-launch gate. Keep its
+            // scheduling control out of unrelated storage fixtures.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=4", "--nocapture"])
+                .env(CHILD, "1")
+                .test_output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "isolated namespace descriptor retirement: {stdout}\n{stderr}"
+            );
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let snapshots = directory.path().join("snapshots");
+        let original = bind_snapshot_directory_socket(&snapshots).unwrap();
+        assert_eq!(
+            bind_snapshot_directory_socket(&snapshots)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrInUse,
+            "a live namespace owner still excludes another binder"
+        );
+
+        // Model a child paused before descriptor retirement: its duplicate
+        // keeps the actual abstract socket bound after the parent closes it.
+        let inherited = original.as_ref().try_clone().unwrap();
+        let launch = crate::test_process::SNAPSHOT_PROCESS_FD_GATE
+            .write()
+            .unwrap();
+        drop(original);
+        let (started, starting) = std::sync::mpsc::channel();
+        let (finished, finishing) = std::sync::mpsc::channel();
+        let reopen_path = snapshots.clone();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            finished
+                .send(bind_snapshot_directory_socket(&reopen_path))
+                .unwrap();
+        });
+        starting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let premature = finishing.recv_timeout(Duration::from_millis(100)).ok();
+        drop(inherited);
+        drop(launch);
+        let result =
+            premature.unwrap_or_else(|| finishing.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+        let reopened = result.expect("reopen waits for inherited namespace descriptor retirement");
+        assert_eq!(
+            bind_snapshot_directory_socket(&snapshots)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrInUse,
+            "the reopened namespace retains exclusive ownership"
+        );
+        drop(reopened);
+        assert!(
+            bind_snapshot_directory_socket(&snapshots).is_ok(),
+            "dropping the final owner releases the namespace"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -1,12 +1,14 @@
-//! Coordinate child launches with fs-verity in the shared unit-test process.
+//! Coordinate child launches with snapshot descriptors in unit tests.
 //!
 //! CLOEXEC descriptors still exist in a forked child until exec. A concurrent
-//! fixture can therefore close its last writer and get ETXTBSY while that child
-//! retains an inherited writer. The exec handshake can finish before the kernel
-//! has retired those file references. Seals take a shared gate; child launches
-//! hold the exclusive gate through completion, or through an explicit userspace
-//! readiness signal for a child that stays running. Actual writers still cause
-//! the unchanged kernel validation to fail. None of this is production code.
+//! fixture can therefore close its last writer and get ETXTBSY, or close its
+//! namespace socket and get EADDRINUSE on reopen, while that child retains the
+//! inherited descriptor. The exec handshake can finish before the kernel has
+//! retired those file references. Seals and namespace binds take a shared gate;
+//! child launches hold the exclusive gate through completion, or through an
+//! explicit userspace readiness signal for a child that stays running. Actual
+//! writers and namespace owners still fail the unchanged kernel checks. None
+//! of this coordination is production code.
 
 use std::io;
 #[cfg(target_os = "linux")]
@@ -39,7 +41,8 @@ impl Drop for PendingChild {
 
 /// Use for every child launch in this crate's shared unit-test process.
 pub(crate) trait CommandExt {
-    /// Wait for a signal from the executed child before allowing snapshot seals.
+    /// Wait for a signal from the executed child before allowing snapshot seals
+    /// or namespace binds.
     /// The readiness callback must have its own hang guard.
     fn test_spawn(&mut self, ready: impl FnOnce(&mut Child) -> io::Result<()>)
         -> io::Result<Child>;
