@@ -770,6 +770,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-proto-diameter`: require request-bound authenticated peer evidence for
+  SWm emergency authorization, including both answers in identity recovery.
+  `correlate_answer_from_connection` retains the existing wire checks and
+  verifies the dispatched connection and trusted answer-Origin policy.
+  Codec-only `correlate_answer` exchanges no longer authorize emergency access.
+
 - `opc-session-store` and `opc-persist`: add `shutdown_unplanned()` for an
   embedder with a failed replication listener. It fences admission, suppresses
   leadership handoff, and retains clone-wide, cancellation-safe engine and

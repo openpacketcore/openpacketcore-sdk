@@ -1997,15 +1997,21 @@ only inputs that cannot fit EAP's two-octet packet length are rejected before
 allocation. The emergency verifier still rejects empty or mismatched identity
 material.
 
-Emergency authorization consumes request/answer envelopes that retain both
-Diameter transaction identifiers; the final DEA must have exact base
+Emergency authorization requires `correlate_answer_from_connection` with the
+transport's authenticated connection token and the trusted `SwmExpectedAnswerPeer`
+bound to the request before dispatch. This applies to both answers in recovery
+and to the direct IMEI path. Codec-only `correlate_answer` exchanges are refused.
+Connection generation and the configured direct or routed Origin policy must
+match; a routed AAA Origin need not equal the authenticated agent's identity.
+All existing request/answer checks, including both Diameter transaction
+identifiers, remain mandatory; the final DEA must have exact base
 `DIAMETER_SUCCESS` (2001), an exact EAP Success with the matching Response
 identifier, a nonempty TS 33.402 Annex A.4 MSK derived from the exact received
 IMEI digits, and the same permanent identity in `Mobile-Node-Identifier`. A
 live transport must also consume its matching pending request before invoking
-the evidence API; `correlate_answer` consumes both envelopes and produces the
-only opaque exchange accepted by the evidence constructor, but codec equality
-does not make a replay live. The resulting
+the evidence API; `correlate_answer_from_connection` consumes both envelopes
+and produces the opaque exchange accepted by the evidence constructor, but
+codec equality does not make a replay live. The resulting
 MSK feeds ordinary IKEv2 method-2 AUTH. No no-MSK or IKEv2 NULL-auth shortcut
 is modeled or authorized.
 

@@ -948,8 +948,11 @@ separate exact-15-digit type, so the received spare/check digit is neither
 normalized nor silently replaced.
 
 A terminal emergency-success observation is issued only after correlating the
-exchange and checking all of the following: the initial payload is an exact
-EAP-Response/Identity bound byte-for-byte to an IMSI emergency NAI or the
+exchange with `correlate_answer_from_connection` and checking all of the
+following: each answer arrived on the authenticated connection bound to its
+request before dispatch and matches that request's trusted Origin policy;
+the initial payload is an exact EAP-Response/Identity bound byte-for-byte to
+an IMSI emergency NAI or the
 receive-side root IMSI NAI extension described below;
 each DEA preserves its DER's Hop-by-Hop and End-to-End identifiers; the final
 DEA has exact base `DIAMETER_SUCCESS` (2001); its EAP payload is exactly an EAP
@@ -959,7 +962,15 @@ exact 15 received IMEI digits; and `Mobile-Node-Identifier` contains that same
 IMEI Emergency NAI. A live Diameter transport must consume the matching
 pending request before invoking the codec evidence API. The verified MSK is
 then used for ordinary IKEv2 method-2 AUTH. Evidence accepts only the opaque
-exchange produced by consuming and correlating the two transaction envelopes.
+exchange produced by consuming and correlating the transaction envelopes with
+their authenticated connection evidence. Both the 5001 response and final
+answer require this binding; the direct IMEI path does too. Codec-only
+`correlate_answer` cannot establish it. The transport supplies the connection
+token from authenticated state, never from answer AVPs. Existing routed-peer
+policies still permit a final AAA Origin different from the authenticated
+agent; Destination AVPs are not authentication evidence. These bindings follow
+RFC 6733 §§2.2, 5.1 and 6.2–6.2.2 and TS 29.273 §§7.2.1/7.2.2.1.2; the recovery
+sequence remains as specified in TS 29.273 §7.1.2.1.4.
 A standalone answer, stale or
 out-of-order transaction, experimental result, absent MSK, mismatched identity,
 or IKEv2 NULL-auth path cannot produce this evidence.
