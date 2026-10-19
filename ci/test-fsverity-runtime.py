@@ -1289,21 +1289,52 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
         hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
         soft = 65536 if hard == resource.RLIM_INFINITY else min(65536, hard)
         arm = parent_death_guard()
+        for mask in (0o002, 0o027, 0o777):
+            with self.subTest(umask=oct(mask)):
+                def configure_caller():
+                    arm()
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+                    os.umask(mask)
 
-        def configure_caller():
-            arm()
-            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
-            os.umask(0o027)
+                result = subprocess.run(
+                    [str(HARNESS), "--", sys.executable, "-c",
+                     "import json,os,resource; print(json.dumps({"
+                     "'nofile': resource.getrlimit(resource.RLIMIT_NOFILE), 'umask': os.umask(0)}))"],
+                    env=self.environment, preexec_fn=configure_caller,
+                    capture_output=True, text=True, timeout=20,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"nofile": [soft, hard], "umask": mask})
+                self.assertEqual(list(self.runner.iterdir()), [])
 
+    def test_low_bootstrap_file_limit_does_not_cap_the_command(self):
+        program = '''
+import importlib.util,resource,sys
+spec=importlib.util.spec_from_file_location('runtime',sys.argv[1])
+runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
+original=runtime.subprocess.Popen
+hits=0
+def bootstrap(command,*args,**kwargs):
+    global hits
+    if command[:3]==['/usr/bin/sudo','-n','/usr/bin/unshare']:
+        hits+=1
+        hard=resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        hard='unlimited' if hard==resource.RLIM_INFINITY else str(hard)
+        command=command[:2]+['/usr/bin/prlimit','--nofile=1024:'+hard,'--']+command[2:]
+    return original(command,*args,**kwargs)
+runtime.subprocess.Popen=bootstrap
+result=runtime.launch([sys.executable,'-c',
+    "import os; fds=[os.open('/dev/null',os.O_RDONLY) for _ in range(2048)]; "
+    "[os.close(fd) for fd in fds]"])
+assert hits==1, 'the low-limit bootstrap mutation must take effect'
+sys.exit(result)
+'''
         result = subprocess.run(
-            [str(HARNESS), "--", sys.executable, "-c",
-             "import json,os,resource; print(json.dumps({"
-             "'nofile': resource.getrlimit(resource.RLIMIT_NOFILE), 'umask': os.umask(0)}))"],
-            env=self.environment, preexec_fn=configure_caller,
+            [sys.executable, "-c", program, str(HARNESS.with_name("fsverity-runtime.py"))],
+            env=self.environment, preexec_fn=parent_death_guard(),
             capture_output=True, text=True, timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(json.loads(result.stdout), {"nofile": [soft, hard], "umask": 0o027})
         self.assertEqual(list(self.runner.iterdir()), [])
 
     def test_runtime_mount_is_not_visible_to_other_jobs(self):
