@@ -254,7 +254,7 @@ async fn split_deadline_v2_transport_rejects_non_receipt_operations_before_admis
             })
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let diagnostics = voters.router.clients[0].v2_diagnostics().await;
+        let diagnostics = voters.router.clients[0].v2_diagnostics();
         assert_eq!(diagnostics.setup_attempts, 0);
         assert_eq!(diagnostics.pool_wait_max, 0);
     }

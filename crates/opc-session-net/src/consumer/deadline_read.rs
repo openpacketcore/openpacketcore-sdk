@@ -218,6 +218,17 @@ impl PersistentSessionConsumerClient {
                 },
             )
             .await;
+        if result.is_ok()
+            && !prepared_fenced_v2::v2_authority_revoked(&result)
+            && tokio::time::Instant::now() >= budget.original_deadline()
+        {
+            // The actor can publish before D while this caller is not polled
+            // until D or later. Such a completion cannot establish history,
+            // a receipt, or cached authority. Revocation remains terminal.
+            return Err(PersistentSessionConsumerV2ExecuteError::ReadUnavailable {
+                cause: SessionConsumerClientError::Deadline,
+            });
+        }
         if matches!(
             result,
             Err(PersistentSessionConsumerV2ExecuteError::ReadUnavailable { cause })

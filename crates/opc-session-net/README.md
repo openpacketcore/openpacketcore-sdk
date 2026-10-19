@@ -605,6 +605,12 @@ reads preserve their legacy wire-rejection mapping, including `Unauthorized`
 to `BackendUnavailable`. Both split-deadline transports reject operations
 outside their closed set of reads before admission or setup.
 
+Background reclamation keeps its bounded per-voter wait and can advance past
+a silent voter within the original sweep budget. It has no ingress caller's
+response deadline to preserve. Activation's optional history-cache priming
+uses the configured operation timeout. Caller-driven preparation, recovery
+and deferred resume retain the caller's original read deadline.
+
 The local protected V2 journal reports
 `StoreError::FencedTransitionRecoveryJournalUnavailable`. It remains distinct
 from a journal held by another live owner and from remote unavailability; wire

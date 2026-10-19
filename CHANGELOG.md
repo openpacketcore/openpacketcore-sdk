@@ -825,7 +825,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight
   and V2 history methods also bypass the ordinary response timeout. Setup and
   Call write keep their existing caps, mutations keep their physical budgets,
-  and an unanswered written read cannot trigger speculative voter failover.
+  and an unanswered written caller read cannot trigger speculative voter
+  failover. Reject successful V2 replies delivered to the caller at or after
+  its original deadline, while preserving terminal authority revocation.
+  Background reclamation keeps bounded per-voter waits and failover;
+  activation history priming uses the configured operation timeout.
   Prepared CAS/lease receipts classify authenticated authority rejection as
   terminal `TopologyAuthorityRevoked` and cache it. Budget-bearing GET/expiry
   reads preserve the legacy wire-rejection mapping. Both split-deadline
