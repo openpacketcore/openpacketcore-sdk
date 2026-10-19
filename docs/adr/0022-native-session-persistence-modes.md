@@ -522,8 +522,10 @@ retain their admission owner through definitive completion. Disk sync runs
 under a joined owner without holding the passive-health state mutex. Shutdown
 cannot release a root with an accepted promise still writing. Cancellation
 ends the caller's wait, not these responsibilities. A replaced boot rejects old
-rounds and completion replies; retry after an interrupted election prepares a
-new durable range instead of replaying a guessed vote.
+rounds and completion replies. Retry prepares a new durable range when an
+election did not commit, failed or lost its recovery ownership. An intact
+committed election with matching recovery ownership and no failed proposal
+resumes in every configuration. Neither path replays a guessed vote.
 
 Every RPC, lock wait, election wait, persistence drain and activation consumes
 the existing complete-operation deadline. A timed-out call can leave safe,
