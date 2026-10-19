@@ -295,6 +295,25 @@ pub enum ValidationLevel {
 Data-plane fast paths SHOULD use the minimum level needed for safe routing and
 leave expensive semantic validation to control-plane paths where appropriate.
 
+### 10.1 SWm emergency identity receive interoperability
+
+For an emergency-indicated attach, the SWm identity-recovery evidence verifier
+accepts both the IMSI emergency NAI and an ordinary root IMSI NAI. Root-NAI
+acceptance is a receive-side interoperability extension for existing UEs.
+TS 23.003 §§19.3.1/19.3.9 and TS 24.302 §4.4.1 require UEs to use the
+`sos.nai.epc` emergency realm; neither requires a receiver to reject an
+otherwise valid root identity. This extension does not change the required UE
+format or the treatment of conforming UEs.
+
+The verifier MUST require the emergency indication in both requests. It MUST
+preserve the original identity and EAP payload byte-for-byte, including realm
+case, and permit only the addition of the recovered Terminal-Information as
+specified by TS 33.402 §13.3 step 8 and TS 29.273 §7.1.2.1.4. It MUST NOT
+insert or remove `sos` to make a retry match. IMSI syntax and PLMN consistency,
+IMEI validation, Diameter transaction and session binding, the 3GPP recovery
+response, and final EAP/MSK/permanent-identity verification remain mandatory.
+A root NAI without the emergency indication grants no emergency authorization.
+
 ## 11. Unknown and Duplicate Elements
 
 Protocol crates MUST define:

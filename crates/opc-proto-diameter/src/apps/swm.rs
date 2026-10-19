@@ -3457,6 +3457,11 @@ impl SwmEmergencyAuthorizationEvidence {
 
     /// Verify the IMSI-to-IMEI recovery sequence defined by TS 33.402 §13.3.
     ///
+    /// An emergency-indicated request may use an IMSI emergency NAI or, as a
+    /// receive-side interoperability extension, an ordinary root IMSI NAI.
+    /// The retry must preserve the original identity and EAP payload exactly.
+    /// TS 23.003 §19.3.9 still requires conforming UEs to use the `sos` realm.
+    ///
     /// Class-free retained top-level and grouped extensions are compared
     /// byte-exactly. If either DER recursively contains IETF Class, verification
     /// returns [`SwmEmergencyAuthorizationError::RetryRequestMismatch`] before
@@ -3479,7 +3484,7 @@ impl SwmEmergencyAuthorizationEvidence {
             .map(Redacted::as_ref)
             .map(String::as_str)
             .ok_or(SwmEmergencyAuthorizationError::IdentityRecoveryInitialIdentityInvalid)?;
-        if !is_imsi_emergency_nai(initial_identity) {
+        if !is_imsi_identity_recovery_nai(initial_identity) {
             return Err(SwmEmergencyAuthorizationError::IdentityRecoveryInitialIdentityInvalid);
         }
         ensure_eap_response_identity(initial_request, initial_identity.as_bytes())?;
@@ -3572,7 +3577,7 @@ pub enum SwmEmergencyAuthorizationError {
     InitialEapIdentityMismatch,
     /// The first DER already contained Terminal-Information.
     InitialTerminalInformationUnexpected,
-    /// Recovery did not begin with an exact IMSI-based emergency NAI.
+    /// Recovery did not begin with a valid IMSI emergency or root NAI.
     IdentityRecoveryInitialIdentityInvalid,
     /// Request and answer Session-Id values differ.
     SessionMismatch,
@@ -11584,10 +11589,12 @@ pub fn emergency_nai(imei: &Imei15) -> String {
 ///
 /// `identity` is copied verbatim into the Type-Data field. Callers building a
 /// SWm emergency DER must also place those exact bytes in `User-Name` (normally
-/// by passing [`emergency_nai`] for the direct IMEI path or the canonical IMSI
-/// Emergency NAI for identity recovery). The helper accepts an empty identity,
-/// as RFC 3748 permits, but the SWm emergency verifier rejects it because it
-/// cannot match a required emergency identity.
+/// by passing [`emergency_nai`] for the direct IMEI path). For identity recovery,
+/// use the exact IMSI identity received from the UE: an IMSI emergency NAI, or a
+/// root IMSI NAI under the receive-side interoperability extension. Preserve the
+/// original identity and complete EAP payload in the retry without rewriting
+/// the realm. The helper accepts an empty identity, as RFC 3748 permits, but the
+/// SWm emergency verifier rejects it because it cannot match a required identity.
 ///
 /// # Errors
 ///
@@ -11636,7 +11643,7 @@ impl fmt::Display for SwmEapResponseIdentityBuildError {
 
 impl Error for SwmEapResponseIdentityBuildError {}
 
-fn is_imsi_emergency_nai(identity: &str) -> bool {
+fn is_imsi_identity_recovery_nai(identity: &str) -> bool {
     let Some((username, realm)) = identity.split_once('@') else {
         return false;
     };
@@ -11651,29 +11658,26 @@ fn is_imsi_emergency_nai(identity: &str) -> bool {
         return false;
     }
 
-    let mut labels = realm.split('.');
-    let (
-        Some(sos),
-        Some(nai),
-        Some(epc),
-        Some(mnc_label),
-        Some(mcc_label),
-        Some(network),
-        Some(org),
-    ) = (
+    // The caller requires an emergency-indicated DER. Accept a root NAI on
+    // receive without rewriting the identity retained for the recovery retry.
+    let mut labels = realm.split('.').peekable();
+    if labels
+        .peek()
+        .is_some_and(|label| label.eq_ignore_ascii_case("sos"))
+    {
+        labels.next();
+    }
+    let (Some(nai), Some(epc), Some(mnc_label), Some(mcc_label), Some(network), Some(org)) = (
         labels.next(),
         labels.next(),
         labels.next(),
         labels.next(),
         labels.next(),
         labels.next(),
-        labels.next(),
-    )
-    else {
+    ) else {
         return false;
     };
     if labels.next().is_some()
-        || !sos.eq_ignore_ascii_case("sos")
         || !nai.eq_ignore_ascii_case("nai")
         || !epc.eq_ignore_ascii_case("epc")
         || !network.eq_ignore_ascii_case("3gppnetwork")

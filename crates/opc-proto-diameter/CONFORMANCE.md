@@ -949,7 +949,8 @@ normalized nor silently replaced.
 
 A terminal emergency-success observation is issued only after correlating the
 exchange and checking all of the following: the initial payload is an exact
-EAP-Response/Identity bound byte-for-byte to a TS 23.003 IMSI emergency NAI;
+EAP-Response/Identity bound byte-for-byte to an IMSI emergency NAI or the
+receive-side root IMSI NAI extension described below;
 each DEA preserves its DER's Hop-by-Hop and End-to-End identifiers; the final
 DEA has exact base `DIAMETER_SUCCESS` (2001); its EAP payload is exactly an EAP
 Success with the correlated Response identifier; its EAP-Master-Session-Key is
@@ -963,10 +964,28 @@ A standalone answer, stale or
 out-of-order transaction, experimental result, absent MSK, mismatched identity,
 or IKEv2 NULL-auth path cannot produce this evidence.
 
+For emergency-indicated identity recovery, the verifier also accepts an
+ordinary root IMSI NAI (`nai.epc` realm). This is receive-side interoperability
+for existing UEs, not a claim that this is a conforming UE emergency identity.
+TS 23.003 §§19.3.1/19.3.9 and TS 24.302 §4.4.1 require the UE's IMSI emergency
+NAI to use `sos.nai.epc`; neither mandates receiver rejection of a root NAI.
+Conforming UEs are unaffected. Both forms retain the same AKA/AKA' prefix,
+IMSI digit/length and MCC/MNC consistency checks. Both requests must indicate
+emergency services. The retry preserves the received identity and complete EAP
+payload exactly and adds Terminal-Information; it never rewrites the realm,
+as required by TS 33.402 §13.3 step 8 and TS 29.273 §7.1.2.1.4. Every other
+recovery and authorization check remains in force. Synthetic regressions in
+`app_dictionaries.rs` exercise root-NAI reception and unchanged recovery,
+non-emergency rejection, malformed identities and altered retries. These are
+interoperability regressions, not independent-peer conformance evidence. See
+[RFC 005 §10.1](../../docs/rfc/005-protocol-framework.md#101-swm-emergency-identity-receive-interoperability).
+
 Consumers construct the direct IMEI identity with the public `emergency_nai`
 helper and pass its exact bytes to the public `build_eap_response_identity`
-helper. The same EAP helper accepts a canonical IMSI Emergency NAI for the
-identity-recovery path. It preserves opaque identity octets and rejects an
+helper. For identity recovery, pass the exact IMSI identity received from the UE:
+an IMSI emergency NAI, or a root IMSI NAI under the receive-side extension above.
+The retry preserves the original identity and complete EAP payload without
+rewriting the realm. The helper preserves opaque identity octets and rejects an
 identity larger than 65,530 octets before allocation because the complete EAP
 packet cannot fit its two-octet Length field. This is construction safety and
 wire-drift coverage, not validation that arbitrary input is a canonical NAI;
