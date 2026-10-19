@@ -13,7 +13,12 @@ tokio::task_local! {
     static TRACK_LAGGING_FOLLOWER: Cell<Option<usize>>;
 }
 
-pub(super) async fn after_batch(fleet: &Fleet, last: u64, deadline: tokio::time::Instant) {
+pub(super) async fn after_batch(
+    fleet: &Fleet,
+    last: u64,
+    target: u64,
+    deadline: tokio::time::Instant,
+) {
     let connected = FORCE_CONNECTED_HANDOFF
         .try_with(|force| force.replace(false))
         .unwrap_or(false);
@@ -67,6 +72,11 @@ pub(super) async fn after_batch(fleet: &Fleet, last: u64, deadline: tokio::time:
             .expect("follower observation retains the seed batch deadline")
             .unwrap();
         }
+    }
+    if last >= target {
+        // Observe only initial seeding. Later seed calls intentionally retain
+        // the follower behind the held snapshot transfer until recovery.
+        let _ = TRACK_LAGGING_FOLLOWER.try_with(|tracked| tracked.set(None));
     }
 }
 

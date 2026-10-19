@@ -547,7 +547,7 @@ async fn seed_with_owner(
                 last = last.max(writer.inner.raft.metrics().borrow().last_log_index.unwrap());
             }
         }
-        seed::after_batch(fleet, last, deadline).await;
+        seed::after_batch(fleet, last, target, deadline).await;
     }
     store
         .inner
