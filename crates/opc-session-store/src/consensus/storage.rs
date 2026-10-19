@@ -11128,6 +11128,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_place_seal_gate_ignores_unrelated_snapshot_paths() {
+        let directory = tempfile::tempdir().expect("independent seal gate directory");
+        let compacted_path = directory.path().join("unrelated.sqlite");
+        let final_path = directory.path().join("unrelated.opc");
+        let mut compacted = PinnedSqliteFile::from_new_file(
+            secure_snapshot_create_file(&compacted_path).expect("create unrelated compacted inode"),
+            compacted_path.clone(),
+        )
+        .expect("pin unrelated compacted inode");
+        {
+            let mut file = compacted
+                .file()
+                .try_clone()
+                .expect("clone unrelated compacted inode");
+            std::io::Write::write_all(&mut file, b"unrelated compacted snapshot")
+                .expect("write unrelated compacted payload");
+            file.sync_all().expect("sync unrelated compacted payload");
+        }
+        compacted = compacted
+            .refresh_identity()
+            .expect("refresh unrelated compacted identity");
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        *seal_in_place_gate()
+            .lock()
+            .expect("install other fixture seal gate") = Some(Arc::clone(&gate));
+        let mut seal = Box::pin(seal_snapshot_database_in_place(
+            compacted,
+            &final_path,
+            false,
+            SnapshotIntegrityPolicy::FsVerity,
+            None,
+        ));
+        let captured = tokio::select! {
+            result = &mut seal => {
+                drop(result.expect("unrelated seal completes"));
+                false
+            }
+            () = gate.wait_started() => true,
+        };
+        *seal_in_place_gate()
+            .lock()
+            .expect("clear other fixture seal gate") = None;
+        gate.release();
+        if captured {
+            drop(seal.await.expect("release wrongly captured seal"));
+        }
+        assert!(
+            !captured,
+            "an unrelated snapshot must not enter another fixture's seal gate"
+        );
+        assert!(
+            !compacted_path.exists(),
+            "the unpublished unrelated inode is cleaned"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_in_place_seal_removes_the_compacted_inode() {
         let _serial = in_place_seal_test_lock().lock().await;
         let directory = tempfile::tempdir().expect("in-place seal cancellation directory");
@@ -21594,6 +21652,46 @@ mod tests {
             second,
             Err(SessionConsensusStorageError::BackendUnavailable)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_database_lease_barrier_ignores_unrelated_databases() {
+        let directory = tempfile::tempdir().expect("database barrier isolation directory");
+        let _intended_backend =
+            SqliteSessionBackend::open(directory.path().join("intended.sqlite"))
+                .expect("intended database backend");
+        let unrelated_backend =
+            SqliteSessionBackend::open(directory.path().join("unrelated.sqlite"))
+                .expect("unrelated database backend");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *snapshot_database_lease_admission_barrier()
+            .lock()
+            .expect("install intended database barrier") = Some(Arc::clone(&barrier));
+
+        // Reserve one party for the intended fixture before opening an
+        // unrelated database. That open must not provide its missing peer.
+        let mut intended_wait = Box::pin(barrier.wait());
+        assert!(futures_util::poll!(&mut intended_wait).is_pending());
+        let unrelated = acquire_snapshot_directory_lease(
+            &unrelated_backend,
+            &directory.path().join("unrelated-snapshots"),
+        )
+        .await
+        .expect("unrelated database obtains its own lease");
+        let paired_with_unrelated = futures_util::poll!(&mut intended_wait).is_ready();
+        *snapshot_database_lease_admission_barrier()
+            .lock()
+            .expect("clear intended database barrier") = None;
+        if !paired_with_unrelated {
+            let (first, second) = tokio::join!(intended_wait, barrier.wait());
+            assert_ne!(first.is_leader(), second.is_leader());
+        }
+        drop(unrelated);
+        assert!(
+            !paired_with_unrelated,
+            "an unrelated database must not satisfy the intended fixture's barrier"
+        );
     }
 
     #[cfg(target_os = "linux")]
