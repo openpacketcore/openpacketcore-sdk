@@ -953,22 +953,36 @@ fn emergency_retry_preserves_extensions_and_all_non_terminal_access_context() {
     });
 
     let verify = |initial_request: &SwmDiameterEapRequest, retry: &SwmDiameterEapRequest| {
-        let initial_exchange = SwmDiameterEapRequestEnvelope::for_outbound(
+        let connection = swm::SwmDiameterConnectionToken::new(std::num::NonZeroU64::MIN);
+        let expected_peer = swm::SwmExpectedAnswerPeer::direct(
+            connection,
+            "aaa.synthetic.example",
+            "home.synthetic.example",
+        );
+        let initial_exchange = SwmDiameterEapRequestEnvelope::for_outbound_on(
             initial_request.clone(),
             SwmDiameterTransaction::new(1, 2),
+            expected_peer.clone(),
         )
-        .correlate_answer(SwmDiameterEapAnswerEnvelope::for_outbound(
-            identity_answer.clone(),
-            SwmDiameterTransaction::new(1, 2),
-        ))?;
-        let retry_exchange = SwmDiameterEapRequestEnvelope::for_outbound(
+        .correlate_answer_from_connection(
+            SwmDiameterEapAnswerEnvelope::for_outbound(
+                identity_answer.clone(),
+                SwmDiameterTransaction::new(1, 2),
+            ),
+            connection,
+        )?;
+        let retry_exchange = SwmDiameterEapRequestEnvelope::for_outbound_on(
             retry.clone(),
             SwmDiameterTransaction::new(3, 4),
+            expected_peer,
         )
-        .correlate_answer(SwmDiameterEapAnswerEnvelope::for_outbound(
-            final_answer.clone(),
-            SwmDiameterTransaction::new(3, 4),
-        ))?;
+        .correlate_answer_from_connection(
+            SwmDiameterEapAnswerEnvelope::for_outbound(
+                final_answer.clone(),
+                SwmDiameterTransaction::new(3, 4),
+            ),
+            connection,
+        )?;
         SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
             initial_exchange,
             retry_exchange,

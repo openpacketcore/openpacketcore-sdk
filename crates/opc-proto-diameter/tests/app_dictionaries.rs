@@ -89,9 +89,25 @@ fn correlate_exchange(
     hop_by_hop_identifier: u32,
     end_to_end_identifier: u32,
 ) -> Result<SwmCorrelatedDiameterEapExchange, SwmEmergencyAuthorizationError> {
-    request_envelope(request, hop_by_hop_identifier, end_to_end_identifier).correlate_answer(
+    correlate_authenticated_exchange(
+        request_envelope(request, hop_by_hop_identifier, end_to_end_identifier),
         answer_envelope(answer, hop_by_hop_identifier, end_to_end_identifier),
     )
+}
+
+#[cfg(feature = "app-swm")]
+fn correlate_authenticated_exchange(
+    request: SwmDiameterEapRequestEnvelope,
+    answer: SwmDiameterEapAnswerEnvelope,
+) -> Result<SwmCorrelatedDiameterEapExchange, SwmEmergencyAuthorizationError> {
+    let connection = apps::swm::SwmDiameterConnectionToken::new(std::num::NonZeroU64::MIN);
+    request
+        .with_expected_answer_peer(apps::swm::SwmExpectedAnswerPeer::direct(
+            connection,
+            "aaa.home.example",
+            "home.example",
+        ))
+        .correlate_answer_from_connection(answer, connection)
 }
 
 #[cfg(feature = "app-swm")]
@@ -3117,8 +3133,7 @@ fn swm_direct_emergency_evidence_requires_correlated_exact_success() {
     )
     .expect("final emergency DEA parse");
 
-    let exchange = parsed_request
-        .correlate_answer(parsed_answer)
+    let exchange = correlate_authenticated_exchange(parsed_request, parsed_answer)
         .expect("Diameter transaction correlation");
     let evidence = SwmEmergencyAuthorizationEvidence::verify_direct(exchange, &imei)
         .expect("exact direct emergency exchange");
@@ -3165,7 +3180,7 @@ fn swm_emergency_subscription_apn_preserves_terminal_eap_validation() {
             DecodeContext::conservative(),
         )
         .expect("received answer");
-        request_envelope(&request, 1, 2).correlate_answer(parsed)
+        correlate_authenticated_exchange(request_envelope(&request, 1, 2), parsed)
     };
     for pdn_type in [PdnType::Ipv4, PdnType::Ipv6] {
         let mut answer = sample_final_emergency_answer(&imei);
@@ -3211,12 +3226,10 @@ fn swm_identity_recovery_evidence_accepts_only_the_complete_correlated_sequence(
     let identity_response = answer_envelope(&identity_response, 1, 2);
     let retry = request_envelope(&retry, 3, 4);
     let final_answer = answer_envelope(&final_answer, 3, 4);
-    let initial_exchange = initial
-        .correlate_answer(identity_response)
+    let initial_exchange = correlate_authenticated_exchange(initial, identity_response)
         .expect("initial Diameter correlation");
-    let retry_exchange = retry
-        .correlate_answer(final_answer)
-        .expect("retry Diameter correlation");
+    let retry_exchange =
+        correlate_authenticated_exchange(retry, final_answer).expect("retry Diameter correlation");
 
     let evidence = SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
         initial_exchange,
@@ -3269,12 +3282,16 @@ fn swm_identity_recovery_accepts_root_imsi_nai_without_rewriting() {
             )
             .expect("received root IMSI DER")
         };
-        let initial_exchange = receive(&initial, 1, 2)
-            .correlate_answer(answer_envelope(&identity_response, 1, 2))
-            .expect("initial Diameter correlation");
-        let retry_exchange = receive(&retry, 3, 4)
-            .correlate_answer(answer_envelope(&final_answer, 3, 4))
-            .expect("retry Diameter correlation");
+        let initial_exchange = correlate_authenticated_exchange(
+            receive(&initial, 1, 2),
+            answer_envelope(&identity_response, 1, 2),
+        )
+        .expect("initial Diameter correlation");
+        let retry_exchange = correlate_authenticated_exchange(
+            receive(&retry, 3, 4),
+            answer_envelope(&final_answer, 3, 4),
+        )
+        .expect("retry Diameter correlation");
         for exchange in [&initial_exchange, &retry_exchange] {
             assert_eq!(
                 exchange.request().user_name.as_ref().unwrap().as_ref(),
@@ -3385,6 +3402,191 @@ fn swm_root_imsi_recovery_requires_emergency_and_unchanged_requests() {
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_identity_recovery_rejects_answer_without_authenticated_peer_binding() {
+    let imei = emergency_imei();
+    let mut initial = sample_swm_request();
+    prepare_recovery_request(&mut initial);
+    let mut retry = initial.clone();
+    retry.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: None,
+    });
+    let connection = apps::swm::SwmDiameterConnectionToken::new(std::num::NonZeroU64::MIN);
+    for origin_host in ["aaa.home.example", "other.home.example"] {
+        let initial_exchange =
+            correlate_exchange(&initial, &sample_identity_recovery_answer(), 1, 2)
+                .expect("initial Diameter correlation");
+        let mut answer = sample_final_emergency_answer(&imei);
+        answer.origin_host = origin_host.into();
+        let retry_exchange = request_envelope(&retry, 3, 4)
+            .with_expected_answer_peer(apps::swm::SwmExpectedAnswerPeer::direct(
+                connection,
+                "aaa.home.example",
+                "home.example",
+            ))
+            .correlate_answer(answer_envelope(&answer, 3, 4))
+            .expect("wire facts alone correlate without authenticating the sender");
+        let error = SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+        .expect_err("recovery must bind the completing answer to its authenticated peer");
+        assert_eq!(error.as_str(), "swm_emergency_answer_peer_binding_missing");
+    }
+
+    let initial_exchange = request_envelope(&initial, 1, 2)
+        .correlate_answer(answer_envelope(&sample_identity_recovery_answer(), 1, 2))
+        .expect("wire correlation without initial peer evidence");
+    let retry_exchange = correlate_exchange(&retry, &sample_final_emergency_answer(&imei), 3, 4)
+        .expect("authenticated retry correlation");
+    assert_eq!(
+        SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+        .expect_err("the 5001 response must also have authenticated peer evidence"),
+        SwmEmergencyAuthorizationError::AnswerPeerBindingMissing
+    );
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_identity_recovery_binds_each_answer_to_its_authenticated_request_peer() {
+    use apps::swm::{SwmDiameterConnectionToken, SwmExpectedAnswerPeer};
+    use std::num::NonZeroU64;
+
+    let imei = emergency_imei();
+    let mut initial = sample_swm_request();
+    prepare_recovery_request(&mut initial);
+    let mut retry = initial.clone();
+    retry.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: None,
+    });
+    let identity_answer = sample_identity_recovery_answer();
+    let final_answer = sample_final_emergency_answer(&imei);
+    let first_connection = SwmDiameterConnectionToken::new(NonZeroU64::MIN);
+    let next_connection = SwmDiameterConnectionToken::new(NonZeroU64::new(2).unwrap());
+    let direct =
+        |connection| SwmExpectedAnswerPeer::direct(connection, "aaa.home.example", "home.example");
+    let receive =
+        |request: SwmDiameterEapRequestEnvelope, answer: &SwmDiameterEapAnswer, connection| {
+            let transaction = request.transaction();
+            let message = apps::swm::build_swm_diameter_eap_answer(
+                answer,
+                transaction.hop_by_hop_identifier(),
+                transaction.end_to_end_identifier(),
+                EncodeContext::default(),
+            )
+            .expect("synthetic peer answer");
+            let wire = encode_message(&message);
+            let parsed = apps::swm::parse_swm_diameter_eap_answer_envelope(
+                &decode_message(&wire),
+                DecodeContext::conservative(),
+            )
+            .expect("received application answer");
+            request.correlate_answer_from_connection(parsed, connection)
+        };
+
+    for (request, answer, hop, end) in [
+        (&initial, &identity_answer, 1, 2),
+        (&retry, &final_answer, 3, 4),
+    ] {
+        let unbound = request_envelope(request, hop, end);
+        assert_eq!(
+            receive(unbound.clone(), answer, first_connection)
+                .expect_err("the connection must be bound before dispatch"),
+            SwmEmergencyAuthorizationError::AnswerPeerBindingMissing
+        );
+        let bound = unbound.with_expected_answer_peer(direct(first_connection));
+        assert_eq!(
+            receive(bound.clone(), answer, next_connection)
+                .expect_err("an answer on another authenticated connection must be refused"),
+            SwmEmergencyAuthorizationError::AnswerPeerConnectionMismatch
+        );
+        for (host, realm) in [
+            ("other.home.example", "home.example"),
+            ("aaa.home.example", "other.example"),
+        ] {
+            let mut changed = answer.clone();
+            changed.origin_host = host.into();
+            changed.origin_realm = realm.into();
+            assert_eq!(
+                receive(bound.clone(), &changed, first_connection)
+                    .expect_err("the answer Origin must match the trusted direct peer identity"),
+                SwmEmergencyAuthorizationError::AnswerPeerIdentityMismatch
+            );
+        }
+        let mut failed_over = bound;
+        failed_over.mark_for_failover_retransmission(hop + 10, direct(next_connection));
+        assert_eq!(
+            receive(failed_over.clone(), answer, first_connection)
+                .expect_err("the previous connection cannot answer the new attempt"),
+            SwmEmergencyAuthorizationError::AnswerPeerConnectionMismatch
+        );
+        receive(failed_over, answer, next_connection)
+            .expect("the rebound connection can answer the new attempt");
+    }
+
+    for routed in [false, true] {
+        let initial_exchange = receive(
+            request_envelope(&initial, 1, 2).with_expected_answer_peer(direct(first_connection)),
+            &identity_answer,
+            first_connection,
+        )
+        .expect("authenticated initial answer");
+        let expected_peer = if routed {
+            SwmExpectedAnswerPeer::routed_via(
+                next_connection,
+                "dra.visited.example",
+                "visited.example",
+            )
+        } else {
+            direct(next_connection)
+        };
+        let mut answer = final_answer.clone();
+        // DiameterIdentity comparison is case-insensitive, unlike User-Name.
+        answer.origin_host = "AAA.HOME.EXAMPLE".into();
+        let retry_exchange = receive(
+            request_envelope(&retry, 3, 4).with_expected_answer_peer(expected_peer),
+            &answer,
+            next_connection,
+        )
+        .expect("authenticated direct or routed final answer");
+        let evidence = SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+        .expect("each answer matched its own request's authenticated peer");
+        assert_eq!(
+            evidence.path(),
+            SwmEmergencyAuthorizationPath::RecoveredDeviceIdentity
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_direct_emergency_rejects_answer_without_authenticated_peer_binding() {
+    let imei = emergency_imei();
+    let mut request = sample_swm_request();
+    request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+    let identity = apps::swm::emergency_nai(&imei);
+    request.user_name = Some(identity.clone().into());
+    request.eap_payload = eap_response_identity(0x17, &identity).into();
+    let exchange = request_envelope(&request, 1, 2)
+        .correlate_answer(answer_envelope(&sample_final_emergency_answer(&imei), 1, 2))
+        .expect("wire facts alone correlate without authenticating the sender");
+    let error = SwmEmergencyAuthorizationEvidence::verify_direct(exchange, &imei)
+        .expect_err("direct emergency evidence must also bind the authenticated answer peer");
+    assert_eq!(error.as_str(), "swm_emergency_answer_peer_binding_missing");
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_identity_recovery_rejects_retry_user_name_case_change() {
     let imei = emergency_imei();
     let identity = "0234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org";
@@ -3462,8 +3664,8 @@ fn swm_identity_recovery_evidence_fails_closed_at_every_boundary() {
         let identity_response = answer_envelope(identity_response, 1, 2);
         let retry = request_envelope(retry, 3, 4);
         let final_answer = answer_envelope(final_answer, 3, 4);
-        let initial_exchange = initial.correlate_answer(identity_response)?;
-        let retry_exchange = retry.correlate_answer(final_answer)?;
+        let initial_exchange = correlate_authenticated_exchange(initial, identity_response)?;
+        let retry_exchange = correlate_authenticated_exchange(retry, final_answer)?;
         SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
             initial_exchange,
             retry_exchange,
@@ -3593,12 +3795,16 @@ fn swm_identity_recovery_evidence_fails_closed_at_every_boundary() {
     let mut changed_initial = initial.clone();
     changed_initial.user_name = None;
     let changed_initial = request_envelope(&changed_initial, 1, 2);
-    let initial_exchange = changed_initial
-        .correlate_answer(answer_envelope(&identity_response, 1, 2))
-        .expect("Diameter correlation");
-    let retry_exchange = request_envelope(&retry, 3, 4)
-        .correlate_answer(answer_envelope(&changed_final, 3, 4))
-        .expect("Diameter correlation");
+    let initial_exchange = correlate_authenticated_exchange(
+        changed_initial,
+        answer_envelope(&identity_response, 1, 2),
+    )
+    .expect("Diameter correlation");
+    let retry_exchange = correlate_authenticated_exchange(
+        request_envelope(&retry, 3, 4),
+        answer_envelope(&changed_final, 3, 4),
+    )
+    .expect("Diameter correlation");
     assert_eq!(
         SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
             initial_exchange,
@@ -3613,12 +3819,16 @@ fn swm_identity_recovery_evidence_fails_closed_at_every_boundary() {
     changed_initial.user_name = Some(direct_identity.clone().into());
     changed_initial.eap_payload = eap_response_identity(0x17, &direct_identity).into();
     let changed_initial = request_envelope(&changed_initial, 1, 2);
-    let initial_exchange = changed_initial
-        .correlate_answer(answer_envelope(&identity_response, 1, 2))
-        .expect("Diameter correlation");
-    let retry_exchange = request_envelope(&retry, 3, 4)
-        .correlate_answer(answer_envelope(&changed_final, 3, 4))
-        .expect("Diameter correlation");
+    let initial_exchange = correlate_authenticated_exchange(
+        changed_initial,
+        answer_envelope(&identity_response, 1, 2),
+    )
+    .expect("Diameter correlation");
+    let retry_exchange = correlate_authenticated_exchange(
+        request_envelope(&retry, 3, 4),
+        answer_envelope(&changed_final, 3, 4),
+    )
+    .expect("Diameter correlation");
     assert_eq!(
         SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
             initial_exchange,
@@ -3635,12 +3845,16 @@ fn swm_identity_recovery_evidence_fails_closed_at_every_boundary() {
         software_version: None,
     });
     let changed_initial = request_envelope(&changed_initial, 1, 2);
-    let initial_exchange = changed_initial
-        .correlate_answer(answer_envelope(&identity_response, 1, 2))
-        .expect("Diameter correlation");
-    let retry_exchange = request_envelope(&retry, 3, 4)
-        .correlate_answer(answer_envelope(&changed_final, 3, 4))
-        .expect("Diameter correlation");
+    let initial_exchange = correlate_authenticated_exchange(
+        changed_initial,
+        answer_envelope(&identity_response, 1, 2),
+    )
+    .expect("Diameter correlation");
+    let retry_exchange = correlate_authenticated_exchange(
+        request_envelope(&retry, 3, 4),
+        answer_envelope(&changed_final, 3, 4),
+    )
+    .expect("Diameter correlation");
     assert_eq!(
         SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
             initial_exchange,

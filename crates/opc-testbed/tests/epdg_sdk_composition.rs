@@ -459,8 +459,12 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         raw_avps: &initial_owned.raw_avps,
         tail: &[],
     };
+    let connection = SwmDiameterConnectionToken::new(NonZeroU64::MIN);
+    let expected_peer =
+        SwmExpectedAnswerPeer::direct(connection, "aaa.redacted.example", "home.redacted.example");
     let initial_request_envelope =
-        parse_swm_diameter_eap_request_envelope(&initial_message, DecodeContext::conservative())?;
+        parse_swm_diameter_eap_request_envelope(&initial_message, DecodeContext::conservative())?
+            .with_expected_answer_peer(expected_peer.clone());
     initial_request = initial_request_envelope.request().clone();
 
     let identity_answer = SwmDiameterEapAnswer {
@@ -545,7 +549,8 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
         tail: &[],
     };
     let retry_request_envelope =
-        parse_swm_diameter_eap_request_envelope(&retry_message, DecodeContext::conservative())?;
+        parse_swm_diameter_eap_request_envelope(&retry_message, DecodeContext::conservative())?
+            .with_expected_answer_peer(expected_peer);
     let retry_request = retry_request_envelope.request();
 
     let derived_msk = derive_unauthenticated_emergency_msk(&imei);
@@ -625,8 +630,10 @@ fn epdg_unauthenticated_emergency_identity_recovery_components_compose(
             .map(SwmMpsPriority::has_eps_priority),
         Some(true)
     );
-    let initial_exchange = initial_request_envelope.correlate_answer(identity_answer_envelope)?;
-    let retry_exchange = retry_request_envelope.correlate_answer(final_answer_envelope)?;
+    let initial_exchange = initial_request_envelope
+        .correlate_answer_from_connection(identity_answer_envelope, connection)?;
+    let retry_exchange = retry_request_envelope
+        .correlate_answer_from_connection(final_answer_envelope, connection)?;
 
     let evidence = SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
         initial_exchange,
