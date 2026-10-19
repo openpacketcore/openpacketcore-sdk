@@ -21,8 +21,7 @@ async fn voter_opener_refuses_missing_or_mismatched_enrollment_before_raft() {
                 .unwrap(),
             2 => {
                 backend
-                    .conn
-                    .lock()
+                    .lock_connection_for_test()
                     .await
                     .execute(
                         "UPDATE consensus_voter_anchor SET key_digest = ?1",
