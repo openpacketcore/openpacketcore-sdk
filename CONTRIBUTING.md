@@ -70,12 +70,13 @@ the mutable databases or WALs out of `TMPDIR`.
 For required fs-verity qualification, run the gate inside the filesystem owner:
 
 ```bash
-mkdir -p "$PWD/target/ci-scratch"
-chmod 0700 "$PWD/target/ci-scratch"
-RUNNER_TEMP="$PWD/target/ci-scratch" bash ci/setup-fsverity-tmp.sh -- <gate-command> [arguments...]
+mkdir -p "$PWD/.ci-scratch"
+chmod 0700 "$PWD/.ci-scratch"
+RUNNER_TEMP="$PWD/.ci-scratch" bash ci/setup-fsverity-tmp.sh -- <gate-command> [arguments...]
 ```
 
-Each checkout keeps this one stable scratch root, `$PWD/target/ci-scratch`.
+Each checkout keeps this one stable scratch root, `$PWD/.ci-scratch`, outside
+Cargo's `target/` so build-output cleanup preserves its recovery records.
 Reuse the directory across runs without deleting or replacing it: recovery
 records match its directory identity, so a later sweep must use the same parent.
 The wrapped command retains the caller's soft and hard file-descriptor limits
@@ -102,6 +103,11 @@ and only then removes its checked entries. Failed identity checks preserve the
 objects and restore their ownership.
 The helper keeps a small, root-owned recovery metadata directory for this
 checkout and caller in that protected ancestor (for example `/home` or `/tmp`).
+If its usual name is occupied by an untrusted object, it preserves that object
+and uses an authenticated directory with a random suffix. Later sweeps resume
+transactions in every authenticated fallback directory. Empty metadata
+directories are removed when the last transaction or sweep finishes; helpers
+waiting on a removed directory retry with a newly checked anchor.
 Each staging transaction records its caller, checkout, parent and object
 identities and helper process identity before taking ownership. Startup resumes
 dead transactions, including frozen runtimes still in the scratch parent and
@@ -109,6 +115,8 @@ partly created or removed runtimes in staging. Live, locked, open or attached
 resources are preserved for a later sweep; no manual root cleanup is needed.
 The five-second loop-autoclear bound remains separate from inventory and the
 bounded privileged create/remove round trips.
+The privileged helper sets umask 0077 on entry so every new staging directory
+starts private and searchable, independently of the caller's umask.
 Mounts use a separate namespace with slave propagation: owner mounts cannot
 reach other jobs. Host unmounts propagate into the owner when the upstream host
 mount is shared, as on the hosted runners and standard systemd hosts; a private

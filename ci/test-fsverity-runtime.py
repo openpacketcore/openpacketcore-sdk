@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import resource
 import select
 import shlex
@@ -87,6 +88,299 @@ class SafetyTests(unittest.TestCase):
         guardian.inventory = lambda **_kwargs: ([], [])
         return guardian
 
+    def test_documented_scratch_root_survives_build_output_cleanup(self):
+        documentation = (ROOT / "CONTRIBUTING.md").read_text()
+        match = re.search(r'RUNNER_TEMP="\$PWD/([^"]+)"', documentation)
+        self.assertIsNotNone(match, "document one checkout-relative stable scratch root")
+        relative = Path(match.group(1))
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        target = checkout / "target"
+        target.mkdir()
+        scratch = checkout / relative
+        scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            # Exercise removal/recreation of build output without touching a
+            # real development cache or invoking cargo clean on this checkout.
+            shutil.rmtree(target)
+            target.mkdir()
+            self.assertTrue(scratch.is_dir(), "build-output cleanup deleted the recovery parent")
+            self.assertEqual((scratch.stat().st_dev, scratch.stat().st_ino), RUNTIME.identity(descriptor))
+        finally:
+            os.close(descriptor)
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--no-index", "--stdin"], cwd=ROOT,
+            input=str(relative / "recovery-record") + "\n", text=True,
+            capture_output=True, timeout=5,
+        )
+        self.assertEqual(ignored.returncode, 0, "the stable scratch root must be gitignored")
+
+    def test_privileged_helper_normalizes_umask_before_opening_resources(self):
+        program = '''
+import importlib.util,json,os,stat,sys,time
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('runtime',sys.argv[1])
+runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
+os.umask(int(sys.argv[3],8))
+class ReachedBoundary(Exception): pass
+def socket_boundary(*args,**kwargs):
+    path=Path(sys.argv[2])/'entry-runtime'
+    path.mkdir(mode=0o700)
+    mode=stat.S_IMODE(path.stat().st_mode)
+    path.rmdir()
+    mask=os.umask(0o077);os.umask(mask)
+    print(json.dumps([mask,mode]))
+    raise ReachedBoundary
+runtime.socket.socket=socket_boundary
+try: runtime.privileged_helper('unused',os.getpid(),time.monotonic()+5)
+except ReachedBoundary: pass
+'''
+        for mask in (0o177, 0o777):
+            with self.subTest(umask=oct(mask)):
+                result = subprocess.run(
+                    ["python3", "-I", "-c", program, str(HARNESS.with_name("fsverity-runtime.py")),
+                     str(self.root), oct(mask)],
+                    check=True, capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(json.loads(result.stdout), [0o077, 0o700],
+                                 "privileged entry must create private searchable directories on first use")
+
+    def anchor_probe(self, program):
+        # A synthetic checkout below a fixture-owned protected ancestor keeps
+        # these root metadata tests away from every real checkout's anchors.
+        wrapper = '''
+import importlib.util,json,os,stat,sys,threading,time
+spec=importlib.util.spec_from_file_location('runtime',sys.argv[1])
+runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
+outer=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY)
+os.mkdir('anchor-fixture',mode=0o700,dir_fd=outer)
+ancestor=os.open('anchor-fixture',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=outer)
+created=[(os.dup(outer),'anchor-fixture',ancestor)];links=[]
+original_mkdir,original_open=runtime.os.mkdir,runtime.os.open
+def tracked_mkdir(name,*args,**kwargs):
+    result=original_mkdir(name,*args,**kwargs)
+    parent=kwargs['dir_fd']
+    fd=original_open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+    # A cleanup handle must not retain the transaction's open-description flock.
+    above=original_open('.',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+    created.append((above,name,fd))
+    return result
+runtime.os.mkdir=tracked_mkdir
+parent=None
+try:
+    os.fchmod(ancestor,0o1777)
+    runtime.os.mkdir('runner',mode=0o700,dir_fd=ancestor)
+    parent=os.open('runner',os.O_RDONLY|os.O_DIRECTORY,dir_fd=ancestor)
+    uid=int(os.environ['SUDO_UID']);gid=int(os.environ['SUDO_GID'])
+    os.fchown(parent,uid,gid)
+    workspace=os.readlink('/proc/self/fd/'+str(ancestor))
+    runtime.OWNER_ID=(workspace+'/synthetic-checkout').encode()
+    prefix='.opc-sdk-fsverity-staging.'+str(uid)+'.'+runtime.hashlib.sha256(runtime.OWNER_ID).hexdigest()[:24]
+    marker=json.dumps({'owner':runtime.OWNER_ID.decode(),'uid':uid},sort_keys=True).encode()
+    deadline=time.monotonic()+5
+    exec(compile(sys.argv[3],'<anchor-probe>','exec'))
+finally:
+    runtime.os.mkdir=original_mkdir
+    os.fchmod(ancestor,0o700)  # Freeze the fixture namespace before cleanup.
+    if parent is not None: os.close(parent)
+    for name,expected in links:
+        info=os.stat(name,dir_fd=ancestor,follow_symlinks=False)
+        assert (info.st_dev,info.st_ino)==expected and stat.S_ISLNK(info.st_mode)
+        os.unlink(name,dir_fd=ancestor)
+    for above,name,fd in reversed(created):
+        try:
+            if not os.fstat(fd).st_nlink: continue
+            assert runtime.Guardian.entry_identity(above,name)==runtime.identity(fd)
+            assert not os.listdir(fd),'fixture cleanup refuses unexpected entries'
+            os.rmdir(name,dir_fd=above)
+        finally:
+            os.close(fd);os.close(above)
+    os.close(outer)
+'''
+        try:
+            privileged("python3", "-I", "-c", wrapper,
+                       HARNESS.with_name("fsverity-runtime.py"), self.root, program)
+        except subprocess.CalledProcessError as error:
+            self.fail(error.stderr)
+
+    def test_staging_anchor_squatting_preserves_collisions_and_uses_a_private_fallback(self):
+        for collision in ("foreign", "symlink", "foreign-marker", "unsafe-mode"):
+            with self.subTest(collision=collision):
+                self.anchor_probe('kind=' + repr(collision) + '''
+if kind=='symlink':
+    os.symlink('unrelated-storage',prefix,dir_fd=ancestor)
+    info=os.stat(prefix,dir_fd=ancestor,follow_symlinks=False)
+    links.append((prefix,(info.st_dev,info.st_ino)))
+else:
+    os.mkdir(prefix,mode=0o700,dir_fd=ancestor)
+    fd=os.open(prefix,os.O_RDONLY|os.O_DIRECTORY,dir_fd=ancestor)
+    try:
+        if kind=='foreign': os.fchown(fd,65534 if uid!=65534 else 65533,-1)
+        if kind=='foreign-marker': os.setxattr(fd,runtime.STAGING_ATTRIBUTE,b'another owner')
+        if kind=='unsafe-mode': os.fchmod(fd,0o777)
+    finally: os.close(fd)
+before=os.stat(prefix,dir_fd=ancestor,follow_symlinks=False)
+with runtime.staging_root(parent,uid,deadline) as root:
+    selected=os.readlink('/proc/self/fd/'+str(root))
+    assert os.path.basename(selected)!=prefix,'selected the squatted name'
+    assert os.getxattr(root,runtime.STAGING_ATTRIBUTE)==marker
+    info=os.fstat(root)
+    assert info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o700
+after=os.stat(prefix,dir_fd=ancestor,follow_symlinks=False)
+assert (after.st_dev,after.st_ino,after.st_uid,after.st_mode)==(before.st_dev,before.st_ino,before.st_uid,before.st_mode)
+if kind=='foreign-marker':
+    fd=os.open(prefix,os.O_RDONLY|os.O_DIRECTORY,dir_fd=ancestor)
+    try: assert os.getxattr(fd,runtime.STAGING_ATTRIBUTE)==b'another owner'
+    finally: os.close(fd)
+assert not os.path.exists(selected),'the empty fallback anchor persists'
+''')
+
+    def test_empty_staging_anchor_is_removed_after_use(self):
+        self.anchor_probe('''
+with runtime.staging_root(parent,uid,deadline) as root:
+    path=os.readlink('/proc/self/fd/'+str(root))
+    assert os.path.isdir(path)
+assert not os.path.exists(path),'empty staging anchor was not removed'
+''')
+
+    def test_last_transaction_removes_its_empty_staging_anchor(self):
+        self.anchor_probe('''
+with runtime.protected_directory(parent,deadline,uid=uid,
+        transaction={'action':'create','name':runtime.PREFIX+'fixture'}) as transaction:
+    path=os.path.dirname(os.readlink('/proc/self/fd/'+str(transaction)))
+    assert os.path.isdir(path),'anchor removed while its transaction was active'
+assert not os.path.exists(path),'last transaction left an empty staging anchor'
+''')
+
+    def test_nonempty_staging_anchor_retains_its_recovery_record_until_reclaimed(self):
+        for squatted in (False, True):
+            with self.subTest(squatted=squatted):
+                self.anchor_probe('squatted=' + repr(squatted) + '''
+if squatted:
+    os.mkdir(prefix,mode=0o700,dir_fd=ancestor)
+    collision=os.open(prefix,os.O_RDONLY|os.O_DIRECTORY,dir_fd=ancestor)
+    try: os.fchown(collision,65534 if uid!=65534 else 65533,-1)
+    finally: os.close(collision)
+with runtime.protected_directory(parent,deadline,uid=uid,
+        transaction={'action':'create','name':runtime.PREFIX+'interrupted'}) as transaction:
+    path=os.path.dirname(os.readlink('/proc/self/fd/'+str(transaction)))
+    os.mkdir('runtime',mode=0o700,dir_fd=transaction)
+    record=json.loads(os.getxattr(transaction,runtime.STAGING_ATTRIBUTE))
+    record['boot']='stopped-fixture'
+    os.setxattr(transaction,runtime.STAGING_ATTRIBUTE,json.dumps(record).encode())
+assert os.path.isdir(path),'removed a nonempty recovery anchor'
+runtime.Guardian.inventory=lambda *args,**kwargs:([],[])
+runtime.recover_staging(parent,uid,deadline)
+assert not os.path.exists(path),'recovery left an anchor: '+repr(os.listdir(path))
+if squatted:
+    assert os.stat(prefix,dir_fd=ancestor).st_uid!=0,'changed the squatter'
+''')
+
+    def test_staging_waiter_retries_an_anchor_removed_after_selection(self):
+        self.anchor_probe('''
+ready,finish,done=threading.Event(),threading.Event(),threading.Event()
+active={};errors=[];intercepted=[]
+def first():
+    try:
+        with runtime.staging_root(parent,uid,deadline) as root:
+            active['identity']=runtime.identity(root)
+            active['path']=os.readlink('/proc/self/fd/'+str(root))
+            ready.set();assert finish.wait(3),'first helper did not finish'
+    except BaseException as error: errors.append(error)
+    finally: ready.set();done.set()
+worker=threading.Thread(target=first)
+original_exclusive=runtime.exclusive
+@runtime.contextmanager
+def exclusive(fd,limit):
+    if threading.current_thread() is threading.main_thread() and not intercepted and runtime.identity(fd)==active['identity']:
+        intercepted.append(True);finish.set()
+        assert done.wait(3),'first helper did not retire its anchor'
+        if errors: raise errors[0]
+        assert not os.path.exists(active['path']),'first helper left an empty anchor'
+    with original_exclusive(fd,limit): yield
+worker.start()
+try:
+    assert ready.wait(3),'first helper did not start'
+    if errors: raise errors[0]
+    runtime.exclusive=exclusive
+    with runtime.staging_root(parent,uid,deadline) as root:
+        path=os.readlink('/proc/self/fd/'+str(root))
+        assert runtime.identity(root)!=active['identity'],'yielded an unlinked anchor'
+        assert os.fstat(root).st_nlink and os.path.isdir(path)
+        assert os.getxattr(root,runtime.STAGING_ATTRIBUTE)==marker
+    assert intercepted and not os.path.exists(path)
+finally:
+    runtime.exclusive=original_exclusive
+    finish.set();worker.join(3)
+assert not worker.is_alive()
+if errors: raise errors[0]
+''')
+
+    def test_staging_coordination_preserves_a_root_callers_startup_lock(self):
+        self.anchor_probe('''
+os.fchown(parent,0,0)
+other=os.open('.',os.O_RDONLY|os.O_DIRECTORY,dir_fd=parent)
+try:
+    with runtime.exclusive(parent,deadline):
+        with runtime.staging_root(parent,0,deadline): pass
+        try: runtime.fcntl.flock(other,runtime.fcntl.LOCK_EX|runtime.fcntl.LOCK_NB)
+        except BlockingIOError: pass
+        else: raise AssertionError("staging coordination released the caller's startup lock")
+finally:
+    os.close(other)
+''')
+
+    def test_every_authenticated_fallback_anchor_is_recovered(self):
+        self.anchor_probe('''
+paths=[]
+for suffix in ('first','second'):
+    name=prefix+'.'+suffix
+    os.mkdir(name,mode=0o700,dir_fd=ancestor)
+    root=os.open(name,os.O_RDONLY|os.O_DIRECTORY,dir_fd=ancestor)
+    try:
+        os.setxattr(root,runtime.STAGING_ATTRIBUTE,marker)
+        paths.append(os.readlink('/proc/self/fd/'+str(root)))
+        name=runtime.STAGING_PREFIX+suffix
+        os.mkdir(name,mode=0o700,dir_fd=root)
+        transaction=os.open(name,os.O_RDONLY|os.O_DIRECTORY,dir_fd=root)
+        try:
+            record={'owner':runtime.OWNER_ID.decode(),'uid':uid,'parent':runtime.identity(parent),
+                'pid':os.getpid(),'start':runtime.process_stat(os.getpid())[1],'boot':'stopped-fixture',
+                'action':'create','name':runtime.PREFIX+suffix}
+            os.setxattr(transaction,runtime.STAGING_ATTRIBUTE,json.dumps(record).encode())
+            os.mkdir('runtime',mode=0o700,dir_fd=transaction)
+        finally: os.close(transaction)
+    finally: os.close(root)
+runtime.Guardian.inventory=lambda *args,**kwargs:([],[])
+runtime.recover_staging(parent,uid,deadline)
+assert all(not os.path.exists(path) for path in paths),'missed a concurrent fallback journal'
+''')
+
+    def test_staging_retries_creation_retired_before_its_first_open(self):
+        self.anchor_probe('''
+intercepted=[]
+def opened(name,*args,**kwargs):
+    above=kwargs.get('dir_fd')
+    if name==prefix and above is not None and runtime.identity(above)==runtime.identity(ancestor) and not intercepted:
+        try: os.stat(name,dir_fd=ancestor)
+        except FileNotFoundError: pass
+        else:
+            intercepted.append(True)
+            with runtime.staging_root(parent,uid,deadline): pass
+            assert not os.path.exists(workspace+'/'+prefix)
+    return original_open(name,*args,**kwargs)
+runtime.os.open=opened
+try:
+    with runtime.staging_root(parent,uid,deadline) as root:
+        path=os.readlink('/proc/self/fd/'+str(root))
+        assert os.fstat(root).st_nlink and os.path.isdir(path)
+        assert os.getxattr(root,runtime.STAGING_ATTRIBUTE)==marker
+    assert intercepted and not os.path.exists(path)
+finally:
+    runtime.os.open=original_open
+''')
+
     def interrupted_root_helper(self, phase, corruption=None):
         directory = self.runner / (RUNTIME.PREFIX + "root-helper-stop-" + phase)
         if not phase.startswith("create"):
@@ -144,6 +438,9 @@ def unlink(name,*args,**kwargs):
     if name=='ext4.img' and phase=='partial': stop()
     return result
 def mkdir(name,*args,**kwargs):
+    if name=='runtime' and phase=='create-mkdir':
+        # Inject a predecessor's mode-000 partial creation after entry setup.
+        os.umask(0o777)
     result=original_mkdir(name,*args,**kwargs)
     if name=='runtime' and phase=='create-mkdir':
         fd=kwargs['dir_fd'];state['directory']=os.readlink('/proc/self/fd/'+str(fd))+'/runtime'
@@ -168,7 +465,6 @@ runtime.protected_directory=protected;runtime.os.fchown=chown
 runtime.rename_new=rename;runtime.os.unlink=unlink
 runtime.os.mkdir=mkdir;runtime.os.rmdir=rmdir
 runtime.os.setxattr=xattr
-if phase=='create-mkdir': os.umask(0o777)
 if phase=='observe':
     state=json.load(open(report))
     if corruption=='mounted':
