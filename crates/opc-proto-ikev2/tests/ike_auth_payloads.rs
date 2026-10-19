@@ -1501,3 +1501,36 @@ fn outgoing_offer_rejects_invalid_proposal_numbers_before_normalization() {
         ))
     );
 }
+
+#[test]
+fn single_group_child_offer_preserves_other_transform_positions() {
+    for (group, width) in [(1, 96), (14, 256)] {
+        let mut security_association = child_sa_pfs_payload_build(group);
+        security_association.proposals[0]
+            .transforms
+            .push(Ikev2SaTransformBuild {
+                transform_type: 5,
+                transform_id: 0,
+                attributes: vec![],
+            });
+        let original_body = build_ike_auth_sa_payload(&security_association).expect("original SA");
+        let input = Ikev2CreateChildSaRekeyRequestBuild {
+            rekeyed_protocol_id: 3,
+            rekeyed_spi: vec![1, 2, 3, 4],
+            security_association,
+            nonce: Ikev2NoncePayloadBuild { nonce: vec![3; 32] },
+            key_exchange: Some(Ikev2KeyExchangePayloadBuild {
+                dh_group: group,
+                key_exchange_data: vec![2; width],
+            }),
+            traffic_selectors_initiator: ts_payload(),
+            traffic_selectors_responder: ts_payload(),
+        };
+        let built =
+            build_create_child_sa_rekey_request_payloads(&input).expect("single-group offer");
+        assert_eq!(
+            built.security_association.body, original_body,
+            "group {group}"
+        );
+    }
+}
