@@ -277,7 +277,7 @@ async fn log_admission_public_batch_deadline_resolves_committed_checkpoint() {
             // The real Raft runtime commits the command while its reply stays
             // held. The public operation must still observe its own deadline.
             let mut metrics = store.inner.raft.metrics();
-            metrics.wait_for(|current| current.last_applied.is_some_and(|log| log.index >= before + 1))
+            metrics.wait_for(|current| current.last_applied.is_some_and(|log| log.index > before))
                 .await.unwrap();
             tokio::time::advance(OPERATION_BOUND - Duration::from_millis(1)).await;
             assert!(write.as_mut().now_or_never().is_none(), "the 800ms deadline has not fired at 799ms");
