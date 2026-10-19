@@ -18,6 +18,9 @@ use super::{
     ProtectedRosterTerminalApplyTimings, ProtectedRosterV2TerminalStatusValidationStagesForTest,
 };
 
+#[cfg(all(test, feature = "test-control", target_os = "linux"))]
+mod tests;
+
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static OBSERVERS: Mutex<Vec<Weak<Observation>>> = Mutex::new(Vec::new());
 
