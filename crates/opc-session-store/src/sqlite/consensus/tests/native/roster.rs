@@ -106,6 +106,41 @@ async fn private_native_attachment_records_real_terminal_observations() {
                 }
             ))
         ));
+        let expected = TerminalRecord::from_canonical_bytes(
+            signed.terminal_command.record_bytes(),
+            &signed.admission,
+        )
+        .unwrap();
+        let evidence = signed.terminal_command.terminal_evidence().unwrap();
+        let read = applying
+            .native_public_read(&|| Ok(()), |state, check| {
+                state.with_roster_read(
+                    signed.identity,
+                    signed.authority.acquired_at().add_seconds(1).unwrap(),
+                    check,
+                    |store, logical_time| {
+                        roster_reads::read_protected_roster_v2_terminal_status_sync(
+                            store,
+                            signed.identity,
+                            signed.terminal_command.binding(),
+                            ProtectedRosterV2TerminalStatusRequest {
+                                registration_parts: signed.terminal_command.registration_parts(),
+                                current_authority: &signed.authority,
+                                terminal_body_commitment: expected.body_commitment(),
+                                terminal_evidence: &evidence,
+                                logical_time,
+                            },
+                        )
+                    },
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            read,
+            ProtectedRosterV2ReadResult::Terminalized(ref read)
+                if read.committed.record() == &expected
+        ));
     })
     .await
     .unwrap();
@@ -122,7 +157,7 @@ async fn private_native_attachment_records_real_terminal_observations() {
         [1; 6],
         "a private native attachment attributes each real terminal phase"
     );
-    assert!(observation.validation_stages().record_decoded > 0);
+    assert_eq!(observation.validation_stages().record_decoded, 1);
     tokio::task::spawn_blocking(move || wal.shutdown())
         .await
         .unwrap()
