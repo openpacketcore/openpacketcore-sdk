@@ -3385,6 +3385,59 @@ fn swm_root_imsi_recovery_requires_emergency_and_unchanged_requests() {
 
 #[test]
 #[cfg(feature = "app-swm")]
+fn swm_identity_recovery_rejects_answer_without_authenticated_peer_binding() {
+    let imei = emergency_imei();
+    let mut initial = sample_swm_request();
+    prepare_recovery_request(&mut initial);
+    let mut retry = initial.clone();
+    retry.terminal_information = Some(SwmTerminalInformation {
+        imei: Imei::from(&imei),
+        software_version: None,
+    });
+    let connection = apps::swm::SwmDiameterConnectionToken::new(std::num::NonZeroU64::MIN);
+    for origin_host in ["aaa.home.example", "other.home.example"] {
+        let initial_exchange =
+            correlate_exchange(&initial, &sample_identity_recovery_answer(), 1, 2)
+                .expect("initial Diameter correlation");
+        let mut answer = sample_final_emergency_answer(&imei);
+        answer.origin_host = origin_host.into();
+        let retry_exchange = request_envelope(&retry, 3, 4)
+            .with_expected_answer_peer(apps::swm::SwmExpectedAnswerPeer::direct(
+                connection,
+                "aaa.home.example",
+                "home.example",
+            ))
+            .correlate_answer(answer_envelope(&answer, 3, 4))
+            .expect("wire facts alone correlate without authenticating the sender");
+        let error = SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery(
+            initial_exchange,
+            retry_exchange,
+            &imei,
+        )
+        .expect_err("recovery must bind the completing answer to its authenticated peer");
+        assert_eq!(error.as_str(), "swm_emergency_answer_peer_binding_missing");
+    }
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
+fn swm_direct_emergency_rejects_answer_without_authenticated_peer_binding() {
+    let imei = emergency_imei();
+    let mut request = sample_swm_request();
+    request.emergency_services = Some(SwmEmergencyServices::emergency_indication());
+    let identity = apps::swm::emergency_nai(&imei);
+    request.user_name = Some(identity.clone().into());
+    request.eap_payload = eap_response_identity(0x17, &identity).into();
+    let exchange = request_envelope(&request, 1, 2)
+        .correlate_answer(answer_envelope(&sample_final_emergency_answer(&imei), 1, 2))
+        .expect("wire facts alone correlate without authenticating the sender");
+    let error = SwmEmergencyAuthorizationEvidence::verify_direct(exchange, &imei)
+        .expect_err("direct emergency evidence must also bind the authenticated answer peer");
+    assert_eq!(error.as_str(), "swm_emergency_answer_peer_binding_missing");
+}
+
+#[test]
+#[cfg(feature = "app-swm")]
 fn swm_identity_recovery_rejects_retry_user_name_case_change() {
     let imei = emergency_imei();
     let identity = "0234150999999999@nai.epc.mnc015.mcc234.3gppnetwork.org";
