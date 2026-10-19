@@ -6,6 +6,10 @@ use opc_session_store::SessionConsensusRpcFamily;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::AtomicUsize;
 
+#[cfg(feature = "test-control")]
+#[path = "disk_loss.rs"]
+mod disk_loss;
+
 #[derive(Debug)]
 struct ObservedPeer {
     transport: ScopedLoopbackPeer,
