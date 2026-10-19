@@ -340,7 +340,12 @@ async fn automatic_re_election_after_forced_split_vote() {
     .clone();
     let leader = retry.source as usize;
     assert_ne!(leader, 0);
-    assert_eq!(retry.request.vote.leader_id.term, split_term + 1);
+    assert_eq!(
+        retry.request.vote.leader_id.term,
+        split_term + 1,
+        "vote exchanges after the forced split: {:?}",
+        state.votes.borrow()
+    );
     assert_eq!(retry.response.vote, retry.request.vote);
     assert_eq!(state.votes.borrow().len(), 3, "one automatic retry wins");
     nodes[leader]
