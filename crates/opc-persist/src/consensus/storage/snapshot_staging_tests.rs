@@ -927,7 +927,7 @@ fn staged_legacy_cleanup_retains_its_own_directory_owner() {
 }
 
 #[cfg(unix)]
-fn queued_snapshot_verification_retains_owner(runtime_drop: bool, read: bool) {
+fn queued_snapshot_verification_retains_owner(runtime_drop: bool, read: bool, borrowed: bool) {
     use std::future::Future as _;
     use std::task::Poll;
 
@@ -962,71 +962,84 @@ fn queued_snapshot_verification_retains_owner(runtime_drop: bool, read: bool) {
         .max_blocking_threads(1)
         .build()
         .unwrap();
-    let (task, worker, resume, completed, mut receiver) = old_runtime.block_on(async {
-        let dir = Arc::new(std::fs::File::open(directory.path()).unwrap());
-        let lock =
-            crate::local_sqlite::AdmissionFileLock::acquire(dir.try_clone().unwrap()).unwrap();
-        let (sender, receiver) = tokio::sync::watch::channel(());
-        let owner = Arc::new(SnapshotDirectoryOwner::new(dir, Arc::new(lock), sender));
-        let mut work = Box::pin(async move {
-            let _owner = owner;
-            verify_snapshot_envelope(&path).await
-        });
-        let (mut worker, mut resume, started) = blocker();
-        tokio::time::timeout(WATCHDOG, started)
-            .await
-            .unwrap()
-            .unwrap();
-        // The verifier seeks to EOF, then to its footer, then reads the magic.
-        // Move the sole blocking worker's hold past each completed seek without
-        // polling the verifier, so its first read is also causally queued.
-        for _ in 0..if read { 2 } else { 0 } {
+    let (task, worker, resume, completed, mut receiver, retained_reader) =
+        old_runtime.block_on(async {
+            let dir = Arc::new(std::fs::File::open(directory.path()).unwrap());
+            let lock =
+                crate::local_sqlite::AdmissionFileLock::acquire(dir.try_clone().unwrap()).unwrap();
+            let (sender, receiver) = tokio::sync::watch::channel(());
+            let owner = Arc::new(SnapshotDirectoryOwner::new(dir, Arc::new(lock), sender));
+            let retained_reader = if borrowed {
+                Some(Arc::new(tokio::sync::Mutex::new(
+                    ConfigSnapshotFile::open(path.clone()).await.unwrap(),
+                )))
+            } else {
+                None
+            };
+            let reader = retained_reader.clone();
+            let mut work = Box::pin(async move {
+                if let Some(reader) = reader {
+                    let mut file = reader.lock().await;
+                    verify_open_snapshot_envelope(&mut file, owner).await
+                } else {
+                    verify_snapshot_envelope(&path, owner).await
+                }
+            });
+            let (mut worker, mut resume, started) = blocker();
+            tokio::time::timeout(WATCHDOG, started)
+                .await
+                .unwrap()
+                .unwrap();
+            // The verifier seeks to EOF, then to its footer, then reads the magic.
+            // Move the sole blocking worker's hold past each completed seek without
+            // polling the verifier, so its first read is also causally queued.
+            for _ in 0..if read { 2 } else { 0 } {
+                std::future::poll_fn(|cx| {
+                    assert!(work.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let (next_worker, next_resume, next_started) = blocker();
+                resume.send(()).unwrap();
+                tokio::time::timeout(WATCHDOG, worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tokio::time::timeout(WATCHDOG, next_started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                worker = next_worker;
+                resume = next_resume;
+            }
             std::future::poll_fn(|cx| {
-                assert!(work.as_mut().poll(cx).is_pending());
+                assert!(
+                    work.as_mut().poll(cx).is_pending(),
+                    "verification I/O must be queued"
+                );
                 Poll::Ready(())
             })
             .await;
-            let (next_worker, next_resume, next_started) = blocker();
-            resume.send(()).unwrap();
-            tokio::time::timeout(WATCHDOG, worker)
+            // This marker is behind the actual seek/read on the sole worker. It
+            // lets even a failing ownership assertion leave no detached file work.
+            let completed = tokio::task::spawn_blocking(|| ());
+            let (held, holding) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _work = work;
+                held.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            tokio::time::timeout(WATCHDOG, holding)
                 .await
                 .unwrap()
                 .unwrap();
-            tokio::time::timeout(WATCHDOG, next_started)
-                .await
-                .unwrap()
-                .unwrap();
-            worker = next_worker;
-            resume = next_resume;
-        }
-        std::future::poll_fn(|cx| {
-            assert!(
-                work.as_mut().poll(cx).is_pending(),
-                "verification I/O must be queued"
-            );
-            Poll::Ready(())
-        })
-        .await;
-        // This marker is behind the actual seek/read on the sole worker. It
-        // lets even a failing ownership assertion leave no detached file work.
-        let completed = tokio::task::spawn_blocking(|| ());
-        let (held, holding) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _work = work;
-            held.send(()).unwrap();
-            std::future::pending::<()>().await;
+            assert!(receiver.has_changed().is_ok());
+            assert!(crate::local_sqlite::AdmissionFileLock::acquire(
+                std::fs::File::open(directory.path()).unwrap()
+            )
+            .is_err());
+            (task, worker, resume, completed, receiver, retained_reader)
         });
-        tokio::time::timeout(WATCHDOG, holding)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(receiver.has_changed().is_ok());
-        assert!(crate::local_sqlite::AdmissionFileLock::acquire(
-            std::fs::File::open(directory.path()).unwrap()
-        )
-        .is_err());
-        (task, worker, resume, completed, receiver)
-    });
     let next_runtime = if runtime_drop {
         old_runtime.shutdown_background();
         runtime()
@@ -1074,28 +1087,58 @@ fn queued_snapshot_verification_retains_owner(runtime_drop: bool, read: bool) {
         !admitted_while_queued,
         "queued verification must retain directory admission"
     );
+    // A borrowed published reader survives cancellation, but its verification
+    // scope must retire admission once the physical worker has finished.
+    if let Some(reader) = retained_reader {
+        assert!(reader.try_lock().unwrap().path().is_file());
+        assert!(receiver.has_changed().is_err());
+    }
 }
 
 #[test]
 #[cfg(unix)]
 fn queued_snapshot_verification_seek_retains_owner_after_task_abort() {
-    queued_snapshot_verification_retains_owner(false, false);
+    queued_snapshot_verification_retains_owner(false, false, false);
 }
 
 #[test]
 #[cfg(unix)]
 fn queued_snapshot_verification_seek_retains_owner_after_runtime_drop() {
-    queued_snapshot_verification_retains_owner(true, false);
+    queued_snapshot_verification_retains_owner(true, false, false);
 }
 
 #[test]
 #[cfg(unix)]
 fn queued_snapshot_verification_read_retains_owner_after_task_abort() {
-    queued_snapshot_verification_retains_owner(false, true);
+    queued_snapshot_verification_retains_owner(false, true, false);
 }
 
 #[test]
 #[cfg(unix)]
 fn queued_snapshot_verification_read_retains_owner_after_runtime_drop() {
-    queued_snapshot_verification_retains_owner(true, true);
+    queued_snapshot_verification_retains_owner(true, true, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_borrowed_snapshot_verification_seek_retains_owner_after_task_abort() {
+    queued_snapshot_verification_retains_owner(false, false, true);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_borrowed_snapshot_verification_seek_retains_owner_after_runtime_drop() {
+    queued_snapshot_verification_retains_owner(true, false, true);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_borrowed_snapshot_verification_read_retains_owner_after_task_abort() {
+    queued_snapshot_verification_retains_owner(false, true, true);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_borrowed_snapshot_verification_read_retains_owner_after_runtime_drop() {
+    queued_snapshot_verification_retains_owner(true, true, true);
 }

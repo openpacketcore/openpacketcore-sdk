@@ -742,11 +742,13 @@ async fn validate_and_clean_snapshot_directory(
         if !file_type.is_file() {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
-        let (_, checksum, length) =
-            tokio::time::timeout(SNAPSHOT_OPERATION_TIMEOUT, verify_snapshot_envelope(&path))
-                .await
-                .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
-                .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
+        let (_, checksum, length) = tokio::time::timeout(
+            SNAPSHOT_OPERATION_TIMEOUT,
+            verify_snapshot_envelope(&path, owner.clone()),
+        )
+        .await
+        .map_err(|_| ConfigConsensusStorageError::BackendUnavailable)?
+        .map_err(|_| ConfigConsensusStorageError::CorruptState)?;
         if checksum != *expected_checksum || length != *expected_length {
             return Err(ConfigConsensusStorageError::CorruptState);
         }
@@ -1298,23 +1300,25 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
             drop(snapshot);
             let incoming_cleanup =
                 StagingArtifact::file(incoming.clone()).with_owner(owner.clone());
-            let (payload_length, checksum, total_length) =
-                tokio::time::timeout_at(deadline, verify_snapshot_envelope(&incoming))
-                    .await
-                    .map_err(|_| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            sqlite::invalid_data("config consensus snapshot install timed out"),
-                        )
-                    })?
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
+            let (payload_length, checksum, total_length) = tokio::time::timeout_at(
+                deadline,
+                verify_snapshot_envelope(&incoming, owner.clone()),
+            )
+            .await
+            .map_err(|_| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    sqlite::invalid_data("config consensus snapshot install timed out"),
+                )
+            })?
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
             let raw = self
                 .core
                 .snapshot_dir
@@ -1539,7 +1543,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                 })
                 .await?;
             }
-            verify_open_snapshot_envelope(&mut file).await
+            verify_open_snapshot_envelope(&mut file, self.core.snapshot_directory_owner()?).await
         }
         .await
         .map_err(|error| {
@@ -1844,17 +1848,22 @@ async fn envelope_snapshot_database(
     Ok((checksum, total, cleanup))
 }
 
-pub(crate) async fn verify_snapshot_envelope(path: &Path) -> io::Result<(u64, [u8; 32], u64)> {
-    let mut file = ConfigSnapshotFile::open(path.to_path_buf()).await?;
-    verify_open_snapshot_envelope(&mut file).await
+pub(crate) async fn verify_snapshot_envelope(
+    path: &Path,
+    owner: Arc<SnapshotDirectoryOwner>,
+) -> io::Result<(u64, [u8; 32], u64)> {
+    let mut file = ConfigSnapshotFile::open_owned(path.to_path_buf(), owner).await?;
+    verify_snapshot_reader(&mut file).await
 }
 
 /// Verify the selected descriptor even if publication has unlinked its path.
 /// A successful verification rewinds it for the snapshot transport reader.
 pub(crate) async fn verify_open_snapshot_envelope(
     file: &mut ConfigSnapshotFile,
+    owner: Arc<SnapshotDirectoryOwner>,
 ) -> io::Result<(u64, [u8; 32], u64)> {
-    verify_snapshot_reader(file).await
+    let mut reader = file.verification_reader(owner);
+    verify_snapshot_reader(&mut *reader).await
 }
 
 // Limit stalls, not the size-dependent duration of a healthy verification.
@@ -1950,7 +1959,7 @@ pub(crate) async fn inspect_voter_snapshot(
         ));
     }
     snapshot.sync_all().await?;
-    let (length, _, _) = verify_snapshot_envelope(snapshot.path()).await?;
+    let (length, _, _) = verify_snapshot_envelope(snapshot.path(), owner.clone()).await?;
     let raw = core
         .snapshot_dir
         .join(format!("inspect-{}.sqlite", uuid::Uuid::new_v4()));
@@ -4159,7 +4168,16 @@ mod tests {
             .expect("write future revision");
         file.sync_all().expect("sync future revision");
 
-        let error = verify_snapshot_envelope(&path)
+        let directory = Arc::new(std::fs::File::open(&snapshot_dir).unwrap());
+        let lock = crate::local_sqlite::AdmissionFileLock::acquire(directory.try_clone().unwrap())
+            .unwrap();
+        let (sender, _receiver) = tokio::sync::watch::channel(());
+        let owner = Arc::new(SnapshotDirectoryOwner::new(
+            directory,
+            Arc::new(lock),
+            sender,
+        ));
+        let error = verify_snapshot_envelope(&path, owner)
             .await
             .expect_err("future snapshot revision must fail closed");
         assert_eq!(io::ErrorKind::InvalidData, error.kind());

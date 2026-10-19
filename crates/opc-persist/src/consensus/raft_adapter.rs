@@ -353,7 +353,10 @@ impl ConfigRaftRpcHandler {
             .with_raft_state(|state| *state.vote_ref())
             .await
             .map_err(|error| Box::new(RaftError::Fatal(error)))?;
-        if vote < current_vote {
+        if !matches!(
+            vote.partial_cmp(&current_vote),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ) {
             return Ok(InstallSnapshotResponse { vote: current_vote });
         }
         let finished = {

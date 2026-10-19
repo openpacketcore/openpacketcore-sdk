@@ -56,6 +56,20 @@ impl ConfigSnapshotFile {
     }
 
     pub(crate) async fn open(path: PathBuf) -> io::Result<Self> {
+        Self::open_with_owner(path, None)
+    }
+
+    pub(crate) async fn open_owned(
+        path: PathBuf,
+        owner: std::sync::Arc<super::storage::SnapshotDirectoryOwner>,
+    ) -> io::Result<Self> {
+        Self::open_with_owner(path, Some(owner))
+    }
+
+    fn open_with_owner(
+        path: PathBuf,
+        owner: Option<std::sync::Arc<super::storage::SnapshotDirectoryOwner>>,
+    ) -> io::Result<Self> {
         #[cfg(unix)]
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -64,10 +78,21 @@ impl ConfigSnapshotFile {
         #[cfg(not(unix))]
         let file = std::fs::OpenOptions::new().read(true).open(&path)?;
         Ok(Self {
-            file: super::snapshot_io::SnapshotIo::new(file, None),
+            file: super::snapshot_io::SnapshotIo::new(file, owner),
             path,
             cleanup_on_drop: false,
         })
+    }
+
+    pub(crate) fn verification_reader(
+        &mut self,
+        owner: std::sync::Arc<super::storage::SnapshotDirectoryOwner>,
+    ) -> VerificationReader<'_> {
+        let previous = self.file.replace_verification_owner(Some(owner));
+        VerificationReader {
+            file: self,
+            previous,
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -81,6 +106,35 @@ impl ConfigSnapshotFile {
 
     pub(crate) async fn sync_all(&mut self) -> io::Result<()> {
         self.file.sync_all().await
+    }
+}
+
+/// Keep admission only for active verification, including cancellation. Each
+/// physical worker keeps its own clone after this scope releases the reader.
+pub(crate) struct VerificationReader<'a> {
+    file: &'a mut ConfigSnapshotFile,
+    previous: Option<std::sync::Arc<super::storage::SnapshotDirectoryOwner>>,
+}
+
+impl std::ops::Deref for VerificationReader<'_> {
+    type Target = ConfigSnapshotFile;
+
+    fn deref(&self) -> &Self::Target {
+        self.file
+    }
+}
+
+impl std::ops::DerefMut for VerificationReader<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.file
+    }
+}
+
+impl Drop for VerificationReader<'_> {
+    fn drop(&mut self) {
+        self.file
+            .file
+            .replace_verification_owner(self.previous.take());
     }
 }
 

@@ -1101,10 +1101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   excluding live owners. Cancelled or timed-out startup filesystem work keeps
   its directory descriptor and admission until completion, preventing late
   cleanup from deleting another store's published snapshot through descriptor
-  reuse. Queued snapshot writes, syncs and staging file operations retain
-  admission until completion. Planned shutdown fences and removes partial
-  transfers in both standard and voter profiles before the storage drain,
-  permitting restart with old closed handles still alive. (#1340)
+  reuse. Queued snapshot writes, syncs, staging file operations and internal
+  verification reads/seeks retain admission until completion. Published readers
+  release verification admission before returning to transport. Both snapshot
+  receivers reject votes incomparable with the engine's current vote before
+  creating staging. Planned shutdown fences and removes partial transfers in
+  both standard and voter profiles before the storage drain, permitting restart
+  with old closed handles still alive. (#1340)
 
 - `opc-persist`: snapshot reads pin the last durable publication independently
   of building or installing its successor, including a delayed SQLite commit.

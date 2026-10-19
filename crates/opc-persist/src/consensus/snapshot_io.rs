@@ -27,6 +27,7 @@ enum CompletedIo {
 
 pub(super) struct SnapshotIo {
     handle: Arc<OwnedHandle>,
+    verification_owner: Option<Arc<SnapshotDirectoryOwner>>,
     pending: Option<JoinHandle<io::Result<CompletedIo>>>,
     position: u64,
     seek: Option<SeekFrom>,
@@ -46,6 +47,7 @@ impl SnapshotIo {
                 file: Mutex::new(file),
                 _owner: owner,
             }),
+            verification_owner: None,
             pending: None,
             position: 0,
             seek: None,
@@ -55,12 +57,24 @@ impl SnapshotIo {
         }
     }
 
+    pub(super) fn replace_verification_owner(
+        &mut self,
+        owner: Option<Arc<SnapshotDirectoryOwner>>,
+    ) -> Option<Arc<SnapshotDirectoryOwner>> {
+        std::mem::replace(&mut self.verification_owner, owner)
+    }
+
     fn spawn<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut File) -> io::Result<T> + Send + 'static,
     ) -> JoinHandle<io::Result<T>> {
         let handle = self.handle.clone();
+        let owner = self.verification_owner.clone();
         tokio::task::spawn_blocking(move || {
+            // Verification can borrow an exported descriptor-only reader. Its
+            // scope may end before this physical operation, so retain its own
+            // admission independently of that scope and the reader's lifetime.
+            let _owner = owner;
             let mut file = handle
                 .file
                 .lock()

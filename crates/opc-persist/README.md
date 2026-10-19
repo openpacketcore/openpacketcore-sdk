@@ -339,10 +339,16 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   sweeping a live receiver or worker. Blocking filesystem work retains that
   admission and the directory descriptor through completion, even after startup
   cleanup is cancelled or times out; a reused descriptor cannot redirect a late
-  operation into another store. Shutdown fences snapshot reception in both standard and voter profiles,
-  joins the engine, and discards unfinished transfers before draining storage.
-  Queued file I/O retains admission until it finishes, so old closed store
-  handles cannot hold the lock after shutdown completes. No manual staging cleanup is required.
+  operation into another store. Internal envelope verification retains admission
+  through every queued seek and read, including verification of a borrowed
+  published reader. That temporary ownership ends when verification and its
+  physical work finish. Exported read-only published readers otherwise retain
+  only their file descriptor, so dormant readers do not pin directory admission.
+  Shutdown fences snapshot reception in both standard and voter profiles, joins
+  the engine, and discards unfinished transfers before draining storage. Queued
+  staging I/O retains admission until it finishes; old closed store handles
+  cannot hold the lock after shutdown completes. No manual staging cleanup is
+  required.
 - `probe_durable_readiness` uses Openraft's linearizable path; listener bind or
   a local SQLite read is not readiness evidence.
 - Planned `ConsensusConfigStore::shutdown()` closes application admission and
