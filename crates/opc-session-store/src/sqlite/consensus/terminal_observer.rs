@@ -7,7 +7,9 @@ use std::fs::File;
 #[cfg(any(target_os = "linux", feature = "test-control"))]
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+#[cfg(feature = "test-control")]
+use std::sync::Arc;
+use std::sync::{Mutex, Weak};
 use std::time::Instant;
 
 use rusqlite::Connection;
@@ -128,8 +130,9 @@ impl ProtectedRosterTerminalObservationForTest {
             for backend in backends {
                 let conn = backend.conn.lock().await;
                 files.push(
-                    opc_sqlite_file_control_sys::main_file_descriptor(&conn)
-                        .map_err(io::Error::other)?,
+                    opc_sqlite_file_control_sys::main_file_descriptor(&conn).map_err(|_| {
+                        io::Error::other("terminal observation database descriptor unavailable")
+                    })?,
                 );
             }
             Self::from_files(files)
@@ -174,7 +177,9 @@ impl ProtectedRosterTerminalObservationForTest {
         Self::from_files(vec![opc_sqlite_file_control_sys::main_file_descriptor(
             conn,
         )
-        .map_err(io::Error::other)?])
+        .map_err(|_| {
+            io::Error::other("terminal observation database descriptor unavailable")
+        })?])
     }
 
     /// Snapshot all six terminal-apply phase counts and durations.
