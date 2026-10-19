@@ -122,6 +122,7 @@ pub(crate) enum Event {
 }
 
 /// Observe the original call without adding a read, retry, or deadline.
+#[cfg(target_os = "linux")]
 pub(crate) async fn observe<F: Future>(operation: F) -> (F::Output, Vec<Event>) {
     EVENTS
         .scope(RefCell::new(Vec::new()), async {
