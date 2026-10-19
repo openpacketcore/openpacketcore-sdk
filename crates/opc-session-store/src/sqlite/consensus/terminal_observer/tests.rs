@@ -86,7 +86,10 @@ async fn observer_lookup_preserves_sqlite_locks_for_selected_and_unrelated_datab
         };
         begin_transaction(backend).await;
         assert_lock_state(path, TEST, true);
-        assert!(database_key(&backend.conn.lock().await).is_some());
+        {
+            let conn = backend.conn.lock().await;
+            assert!(database_key(&conn).is_some());
+        }
         assert_lock_state(path, TEST, true);
         backend
             .conn

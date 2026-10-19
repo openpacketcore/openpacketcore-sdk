@@ -10,6 +10,158 @@ use std::fs;
 
 pub(super) mod export;
 
+#[cfg(feature = "test-control")]
+async fn terminal_observation_native_fixture(
+    directory: &Path,
+    signed: &RosterV2PersistenceFixture,
+) -> (SqliteSessionBackend, SqliteConsensusCore, Arc<Wal>) {
+    let backend = SqliteSessionBackend::open(directory.join("backend.sqlite")).unwrap();
+    let mut core = SqliteConsensusCore::initialize_with_roster_attestation_root(
+        &backend,
+        directory.join("snapshots"),
+        signed.identity,
+        fixed_members(),
+        test_member_bindings(&fixed_members()),
+        ConsensusAuthorityProfile::FixedImmutable,
+        FIXED_TEST_PLACEMENT_POLICY,
+        Some(signed.root.clone()),
+    )
+    .await
+    .unwrap();
+    let fixture = crate::sqlite::consensus::wal::integration::PrivateWalTest::new_native(
+        directory.join("wal"),
+        [0xC4; 32],
+    );
+    fixture.attach(&mut core).await.unwrap();
+    let wal = Arc::clone(core.private_wal.as_ref().unwrap());
+    (backend, core, wal)
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_native_attachment_records_real_terminal_observations() {
+    let directory = tempfile::tempdir().unwrap();
+    let signed = roster_v2_fresh_wal_persistence_fixture(Phase::Established);
+    let (backend, _core, wal) =
+        terminal_observation_native_fixture(directory.path(), &signed).await;
+    let preparing = Arc::clone(&wal);
+    let signed = tokio::task::spawn_blocking(move || {
+        let mut lease = ordinary(
+            &signed,
+            1,
+            SessionMutationIntent::AcquireLease {
+                key: signed.authority.key().clone(),
+                owner: signed.authority.owner().clone(),
+                ttl: Duration::from_secs(60),
+            },
+        );
+        let EntryPayload::Normal(command) = &mut lease.payload else {
+            unreachable!()
+        };
+        command.logical_time = signed.authority.acquired_at();
+        let profile = Profile::v2();
+        let activation = ordinary(
+            &signed,
+            2,
+            SessionMutationIntent::ActivateProtectedRosterProfileV2 {
+                schema_version: profile.schema(),
+                consumer_revision: profile.consumer_revision(),
+                scope_identity: signed.identity,
+                voter_set_digest: protected_roster_profile_v2_voter_set_digest(
+                    signed.identity,
+                    &fixed_members(),
+                ),
+                profile_digest: profile.digest(),
+            },
+        );
+        let setup = [formation(), lease, activation, admission(&signed)];
+        commit(&preparing, &setup);
+        let applied = preparing.native_apply_committed(&setup).unwrap();
+        assert!(matches!(
+            &applied.responses[3].result,
+            Ok(SessionMutationOutcome::RosterAdmissionV2(
+                ConsensusRosterAdmissionOutcome::Admitted { .. }
+            ))
+        ));
+        signed
+    })
+    .await
+    .unwrap();
+    // Attach before observation: native attribution must not depend on a
+    // process-wide observer already existing when the fixture opens its WAL.
+    let observation = ProtectedRosterTerminalObservationForTest::new(&[backend])
+        .await
+        .unwrap();
+    let applying = Arc::clone(&wal);
+    tokio::task::spawn_blocking(move || {
+        let terminal = [terminal(&signed, 4)];
+        commit(&applying, &terminal);
+        let applied = applying.native_apply_committed(&terminal).unwrap();
+        assert!(matches!(
+            &applied.responses[0].result,
+            Ok(SessionMutationOutcome::RosterTerminalV2(
+                ConsensusRosterTerminalOutcome::Committed {
+                    replayed: false,
+                    ..
+                }
+            ))
+        ));
+    })
+    .await
+    .unwrap();
+    let counts = observation.timings();
+    assert_eq!(
+        [
+            counts.decode_and_proof_count,
+            counts.terminalization_preparation_count,
+            counts.production_apply_count,
+            counts.committed_outcome_count,
+            counts.replication_notification_count,
+            counts.transaction_remainder_commit_count,
+        ],
+        [1; 6],
+        "a private native attachment attributes each real terminal phase"
+    );
+    assert!(observation.validation_stages().record_decoded > 0);
+    tokio::task::spawn_blocking(move || wal.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_observation_identity_pins_its_connection_through_detached_captures() {
+    let directory = tempfile::tempdir().unwrap();
+    let signed = roster_v2_fresh_wal_persistence_fixture(Phase::Established);
+    let (backend, core, wal) = terminal_observation_native_fixture(directory.path(), &signed).await;
+    let connection = Arc::downgrade(&backend.conn);
+    let state = wal.with_native_read(|state| Ok(state.clone())).unwrap();
+    let capture = state.capture_application().unwrap();
+    let stopping = Arc::clone(&wal);
+    tokio::task::spawn_blocking(move || stopping.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(core);
+    drop(wal);
+    drop(backend);
+    assert!(
+        connection.upgrade().is_some(),
+        "cached native identity retains the backend's connection after owner shutdown"
+    );
+    drop(state);
+    assert!(
+        connection.upgrade().is_some(),
+        "a detached application capture retains the same inode pin independently"
+    );
+    drop(capture);
+    assert!(
+        connection.upgrade().is_none(),
+        "retiring the final capture releases the backend connection without a cycle"
+    );
+}
+
 fn entry(
     signed: &RosterV2PersistenceFixture,
     index: u64,
