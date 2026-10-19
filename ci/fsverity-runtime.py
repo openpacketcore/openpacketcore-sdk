@@ -669,6 +669,7 @@ def recover_staging_transactions(parent, root, uid, deadline, boot):
 
 def privileged_helper(address, parent, deadline):
     """Pinned caller-owned resources; destructive operations exclude writers."""
+    os.umask(0o077)
     descriptors = []
     result_fds = []
     response = {"ok": True}

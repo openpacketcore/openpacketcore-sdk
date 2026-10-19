@@ -48,6 +48,7 @@ Thumbs.db
 *~
 
 # Local scratch
+/.ci-scratch/
 scratch/
 _scratch/
 

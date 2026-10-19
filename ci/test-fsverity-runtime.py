@@ -438,6 +438,9 @@ def unlink(name,*args,**kwargs):
     if name=='ext4.img' and phase=='partial': stop()
     return result
 def mkdir(name,*args,**kwargs):
+    if name=='runtime' and phase=='create-mkdir':
+        # Inject a predecessor's mode-000 partial creation after entry setup.
+        os.umask(0o777)
     result=original_mkdir(name,*args,**kwargs)
     if name=='runtime' and phase=='create-mkdir':
         fd=kwargs['dir_fd'];state['directory']=os.readlink('/proc/self/fd/'+str(fd))+'/runtime'
@@ -462,7 +465,6 @@ runtime.protected_directory=protected;runtime.os.fchown=chown
 runtime.rename_new=rename;runtime.os.unlink=unlink
 runtime.os.mkdir=mkdir;runtime.os.rmdir=rmdir
 runtime.os.setxattr=xattr
-if phase=='create-mkdir': os.umask(0o777)
 if phase=='observe':
     state=json.load(open(report))
     if corruption=='mounted':
