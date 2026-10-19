@@ -325,7 +325,11 @@ impl RosterCommandStore for Store<'_, '_> {
     fn terminal_observation_database(
         &self,
     ) -> Option<crate::sqlite::consensus::terminal_observer::DatabaseKey> {
-        self.base.base.terminal_observation_database
+        self.base
+            .base
+            .terminal_observation_database
+            .as_ref()
+            .map(|database| database.key())
     }
 
     fn trust_root(

@@ -14,6 +14,8 @@ categories = ["database", "external-ffi-bindings"]
 publish = false
 
 [features]
+# Non-owning identity inspection; callers opt in without duplicating SQLite FDs.
+borrowed-file-identity = []
 # Test-only VFS hooks for session-store snapshot and SQLite durability
 # qualification. Production crates never enable this feature.
 test-vfs = []

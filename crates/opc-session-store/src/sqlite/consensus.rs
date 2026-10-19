@@ -67676,10 +67676,8 @@ BEGIN IMMEDIATE;
     fn terminal_observer_fixture(
         backend: &SqliteSessionBackend,
     ) -> ProtectedRosterTerminalObservationForTest {
-        terminal_observer::ProtectedRosterTerminalObservationForTest::from_connection(
-            &backend.conn.blocking_lock(),
-        )
-        .expect("observe the fixture's actual database descriptor")
+        terminal_observer::ProtectedRosterTerminalObservationForTest::from_backend(backend)
+            .expect("observe the fixture's actual database descriptor")
     }
 
     #[cfg(all(feature = "test-control", target_os = "linux"))]

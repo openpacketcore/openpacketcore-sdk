@@ -3,11 +3,10 @@
 #[cfg(target_os = "linux")]
 use std::cell::Cell;
 use std::collections::BTreeSet;
-use std::fs::File;
 #[cfg(any(target_os = "linux", feature = "test-control"))]
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "test-control")]
+#[cfg(any(target_os = "linux", feature = "test-control"))]
 use std::sync::Arc;
 use std::sync::{Mutex, Weak};
 use std::time::Instant;
@@ -66,16 +65,37 @@ pub(crate) struct DatabaseKey(u64, u64);
 
 impl DatabaseKey {
     #[cfg(target_os = "linux")]
-    pub(crate) fn for_file(file: &File) -> io::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
+    pub(crate) fn for_connection(conn: &Connection) -> io::Result<Self> {
+        opc_sqlite_file_control_sys::main_file_identity(conn)
+            .map(|(device, inode)| Self(device, inode))
+            .map_err(|_| io::Error::other("terminal observation database identity unavailable"))
+    }
+}
 
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(io::Error::other(
-                "terminal observation requires a database file",
-            ));
+/// Keep inode identity tied to SQLite's own connection lifetime. Every native
+/// state clone and detached capture carries this pin even without observers.
+/// No extra descriptor is created or independently closed by instrumentation.
+#[derive(Clone)]
+#[cfg(target_os = "linux")]
+pub(crate) struct PinnedDatabase {
+    key: DatabaseKey,
+    _connection: Arc<tokio::sync::Mutex<Connection>>,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedDatabase {
+    pub(crate) fn from_identity(
+        identity: (u64, u64),
+        connection: Arc<tokio::sync::Mutex<Connection>>,
+    ) -> Self {
+        Self {
+            key: DatabaseKey(identity.0, identity.1),
+            _connection: connection,
         }
-        Ok(Self(metadata.dev(), metadata.ino()))
+    }
+
+    pub(crate) fn key(&self) -> DatabaseKey {
+        self.key
     }
 }
 
@@ -86,8 +106,7 @@ pub(super) fn database_key(conn: &Connection) -> Option<DatabaseKey> {
     }
     #[cfg(target_os = "linux")]
     {
-        let file = opc_sqlite_file_control_sys::main_file_descriptor(conn).ok()?;
-        DatabaseKey::for_file(&file).ok()
+        DatabaseKey::for_connection(conn).ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -104,8 +123,9 @@ struct Counts {
 
 struct Observation {
     databases: BTreeSet<DatabaseKey>,
-    // Retain the actual descriptors so an observed inode cannot be recycled.
-    _files: Vec<File>,
+    // SQLite, rather than an independently owned descriptor, owns final close.
+    #[cfg(target_os = "linux")]
+    _pins: Vec<PinnedDatabase>,
     counts: Mutex<Counts>,
 }
 
@@ -129,16 +149,15 @@ impl ProtectedRosterTerminalObservationForTest {
     pub async fn new(backends: &[crate::sqlite::SqliteSessionBackend]) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            let mut files = Vec::with_capacity(backends.len());
+            let mut pins = Vec::with_capacity(backends.len());
             for backend in backends {
                 let conn = backend.conn.lock().await;
-                files.push(
-                    opc_sqlite_file_control_sys::main_file_descriptor(&conn).map_err(|_| {
-                        io::Error::other("terminal observation database descriptor unavailable")
-                    })?,
-                );
+                pins.push(PinnedDatabase {
+                    key: DatabaseKey::for_connection(&conn)?,
+                    _connection: Arc::clone(&backend.conn),
+                });
             }
-            Self::from_files(files)
+            Self::from_pins(pins)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -151,20 +170,17 @@ impl ProtectedRosterTerminalObservationForTest {
     }
 
     #[cfg(target_os = "linux")]
-    fn from_files(files: Vec<File>) -> io::Result<Self> {
-        if files.is_empty() {
+    fn from_pins(pins: Vec<PinnedDatabase>) -> io::Result<Self> {
+        if pins.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "terminal observation requires at least one database",
             ));
         }
-        let databases = files
-            .iter()
-            .map(DatabaseKey::for_file)
-            .collect::<io::Result<_>>()?;
+        let databases = pins.iter().map(PinnedDatabase::key).collect();
         let observation = Arc::new(Observation {
             databases,
-            _files: files,
+            _pins: pins,
             counts: Mutex::default(),
         });
         OBSERVERS
@@ -176,13 +192,12 @@ impl ProtectedRosterTerminalObservationForTest {
     }
 
     #[cfg(all(test, target_os = "linux"))]
-    pub(super) fn from_connection(conn: &Connection) -> io::Result<Self> {
-        Self::from_files(vec![opc_sqlite_file_control_sys::main_file_descriptor(
-            conn,
-        )
-        .map_err(|_| {
-            io::Error::other("terminal observation database descriptor unavailable")
-        })?])
+    pub(super) fn from_backend(backend: &crate::sqlite::SqliteSessionBackend) -> io::Result<Self> {
+        let conn = backend.conn.blocking_lock();
+        Self::from_pins(vec![PinnedDatabase {
+            key: DatabaseKey::for_connection(&conn)?,
+            _connection: Arc::clone(&backend.conn),
+        }])
     }
 
     /// Snapshot all six terminal-apply phase counts and durations.

@@ -2195,7 +2195,7 @@ impl Wal {
     #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn bind_terminal_observation_database_for_test(
         &self,
-        database: crate::sqlite::consensus::terminal_observer::DatabaseKey,
+        database: crate::sqlite::consensus::terminal_observer::PinnedDatabase,
     ) -> io::Result<()> {
         let mut state = lock_state(&self.shared)?;
         let native = state

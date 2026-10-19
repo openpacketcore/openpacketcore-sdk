@@ -1,6 +1,7 @@
 use super::*;
 use crate::sqlite::SqliteSessionBackend;
 use crate::test_process::CommandExt as _;
+use std::fs::File;
 use std::path::Path;
 
 const PROBE_PATH: &str = "OPC_TERMINAL_OBSERVER_LOCK_PROBE_PATH";
@@ -38,6 +39,7 @@ fn lock_probe_child() -> bool {
     true
 }
 
+#[track_caller]
 fn assert_lock_state(path: &Path, test: &str, blocked: bool) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--test-threads=4", "--nocapture"])

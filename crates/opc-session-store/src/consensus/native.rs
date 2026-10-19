@@ -419,7 +419,7 @@ pub(crate) struct NativeState {
     #[cfg(any(test, feature = "test-control"))]
     #[serde(skip)]
     pub(crate) terminal_observation_database:
-        Option<crate::sqlite::consensus::terminal_observer::DatabaseKey>,
+        Option<crate::sqlite::consensus::terminal_observer::PinnedDatabase>,
     identity: SessionConsensusIdentity,
     members: BTreeSet<SessionConsensusNodeId>,
     frontiers: NativeFrontiers,
@@ -494,7 +494,7 @@ impl Clone for NativeState {
             snapshot_origin: self.snapshot_origin.clone(),
             local_restore: self.local_restore.clone(),
             #[cfg(any(test, feature = "test-control"))]
-            terminal_observation_database: self.terminal_observation_database,
+            terminal_observation_database: self.terminal_observation_database.clone(),
             proof: self.proof.clone(),
             changes: None,
         }

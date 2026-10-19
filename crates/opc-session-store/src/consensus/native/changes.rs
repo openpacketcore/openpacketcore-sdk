@@ -1364,7 +1364,10 @@ impl Publication {
         #[cfg(any(test, feature = "test-control"))]
         if let Some(started) = self.terminal_remainder_started {
             crate::sqlite::consensus::record_native_roster_publication_timing(
-                state.terminal_observation_database,
+                state
+                    .terminal_observation_database
+                    .as_ref()
+                    .map(|database| database.key()),
                 started,
             );
         }

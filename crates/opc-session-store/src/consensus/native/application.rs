@@ -44,7 +44,10 @@ impl ApplicationCapture {
         #[cfg(any(test, feature = "test-control"))]
         let _terminal_hydration =
             crate::sqlite::consensus::terminal_observer::HydrationScope::enter(
-                self.state.terminal_observation_database,
+                self.state
+                    .terminal_observation_database
+                    .as_ref()
+                    .map(|database| database.key()),
             );
         check()?;
         #[cfg(feature = "test-control")]

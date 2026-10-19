@@ -421,7 +421,7 @@ fn advance_inner(
             native.business.terminal_observation_database = state
                 .native
                 .as_ref()
-                .and_then(|previous| previous.business.terminal_observation_database);
+                .and_then(|previous| previous.business.terminal_observation_database.clone());
         }
         let retired = state.native.replace(native);
         state.base_sequence = anchor.native_sequence();

@@ -269,7 +269,9 @@ impl NativeState {
         #[cfg(any(test, feature = "test-control"))]
         let _terminal_hydration =
             crate::sqlite::consensus::terminal_observer::HydrationScope::enter(
-                self.terminal_observation_database,
+                self.terminal_observation_database
+                    .as_ref()
+                    .map(|database| database.key()),
             );
         check().map_err(|_| unavailable())?;
         if identity != self.identity {

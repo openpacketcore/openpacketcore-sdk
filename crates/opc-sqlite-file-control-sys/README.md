@@ -27,3 +27,10 @@ registrations, and bounded typed results. It does not expose SQLite's borrowed
 handles or a general-purpose FFI surface, and unsupported platforms fail closed.
 
 The crate is source-build only and is not published independently.
+
+The optional `borrowed-file-identity` feature adds `main_file_identity` for
+non-owning device/inode inspection. It uses `fstat` on SQLite's borrowed Unix
+descriptor, or the verified snapshot source's retained descriptor, without
+duplicating or closing a file. The caller must retain the owning connection
+for as long as it retains the identity. This avoids cancelling SQLite's POSIX
+record locks through an independently owned descriptor's close.
