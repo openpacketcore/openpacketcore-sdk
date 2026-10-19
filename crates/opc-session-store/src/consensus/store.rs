@@ -22678,6 +22678,16 @@ mod membership_tests {
             session_consumer_roster_ingress_operation(admission_request.operation())
                 .expect("admission ingress operation");
 
+        // A separate fixture can issue ordinary quorum reads while this
+        // request's exact operation counts are observed.
+        let (
+            _other_directory,
+            other_store,
+            other_scope,
+            other_authorization,
+            other_key,
+            other_lease,
+        ) = consumer_boundary_store().await;
         reset_roster_ingress_test_counters();
         reset_consumer_consensus_proposal_count();
         let diagnostics_before_admission = store.protected_roster_diagnostic_snapshot();
@@ -23221,6 +23231,47 @@ mod membership_tests {
             Some(first_log + 5),
             "fresh admission, independent and exact replays, body conflict, and terminalization each append once"
         );
+        let other_counters = Arc::new(ConsumerCasTestCounters::default());
+        tokio::spawn(
+            CONSUMER_CAS_TEST_COUNTERS.scope(Arc::clone(&other_counters), async move {
+                let response = other_store
+                    .consumer_service()
+                    .execute(
+                        &other_authorization,
+                        SessionConsumerRequest::new(
+                            other_scope,
+                            SessionConsumerRequestId::from_bytes([0x96; 16]),
+                            SessionConsumerOperation::CompareAndSet {
+                                op: Box::new(CompareAndSet {
+                                    key: other_key.clone(),
+                                    lease: other_lease.clone(),
+                                    expected_generation: None,
+                                    new_record: consumer_record_with_payload_len(
+                                        &other_key,
+                                        &other_lease,
+                                        1024,
+                                    ),
+                                }),
+                            },
+                        ),
+                    )
+                    .await;
+                assert!(matches!(
+                    response,
+                    SessionConsumerResponse::CompareAndSet(Ok(_))
+                ));
+                other_store
+                    .linearizable_barrier_before(
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                    )
+                    .await
+                    .expect("independent fixture completes a real quorum read");
+            }),
+        )
+        .await
+        .expect("join independent consumer fixture");
+        assert_eq!(other_counters.proposals.load(Ordering::Relaxed), 2);
+        assert_eq!(other_counters.command_encodings.load(Ordering::Relaxed), 1);
         assert_eq!(
             CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
             1,
@@ -25560,6 +25611,14 @@ mod membership_tests {
             FencedTransitionMutation::delete(Generation::new(1)),
         )
         .expect("transition");
+        let (
+            _other_directory,
+            other_store,
+            other_scope,
+            other_authorization,
+            other_key,
+            other_lease,
+        ) = consumer_boundary_store().await;
         reset_fenced_transition_linearizable_admission_count();
         reset_consumer_consensus_proposal_count();
         let before = store
@@ -25591,6 +25650,45 @@ mod membership_tests {
             Some(before + 1),
             "the consumer transition must not append a BindConsumerRequest marker"
         );
+        let other_counters = Arc::new(ConsumerCasTestCounters::default());
+        tokio::spawn(
+            CONSUMER_CAS_TEST_COUNTERS.scope(Arc::clone(&other_counters), async move {
+                let response = other_store
+                    .consumer_service()
+                    .execute(
+                        &other_authorization,
+                        SessionConsumerRequest::new(
+                            other_scope,
+                            SessionConsumerRequestId::from_bytes([0x96; 16]),
+                            SessionConsumerOperation::CompareAndSet {
+                                op: Box::new(CompareAndSet {
+                                    key: other_key.clone(),
+                                    lease: other_lease.clone(),
+                                    expected_generation: None,
+                                    new_record: consumer_record_with_payload_len(
+                                        &other_key,
+                                        &other_lease,
+                                        1024,
+                                    ),
+                                }),
+                            },
+                        ),
+                    )
+                    .await;
+                assert!(matches!(
+                    response,
+                    SessionConsumerResponse::CompareAndSet(Ok(_))
+                ));
+                other_store
+                    .activate_fenced_transition_capability()
+                    .await
+                    .expect("independent fixture completes a real activation admission");
+            }),
+        )
+        .await
+        .expect("join independent consumer fixture");
+        assert_eq!(other_counters.proposals.load(Ordering::Relaxed), 2);
+        assert_eq!(other_counters.command_encodings.load(Ordering::Relaxed), 1);
         assert_eq!(
             FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.load(Ordering::Relaxed),
             1,

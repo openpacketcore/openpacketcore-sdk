@@ -20776,6 +20776,28 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn live_terminal_reconciliation_observer_ignores_unrelated_tasks() {
+        let observer = LiveTerminalRecoveryFullReconciliationObserver::install();
+        observe_live_terminal_recovery_full_reconciliation();
+        assert_eq!(
+            observer.full_reconciliations(),
+            1,
+            "the observed task records its own work"
+        );
+        tokio::spawn(async {
+            observe_live_terminal_recovery_full_reconciliation();
+        })
+        .await
+        .expect("join independent reconciliation observer task");
+        assert_eq!(
+            observer.full_reconciliations(),
+            1,
+            "another task's reconciliation must not enter this observation"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn live_terminal_reconciliation_skips_snapshot_selection_until_terminal_evidence() {
         let directory = tempfile::tempdir().expect("live terminal probe directory");
         let database = directory.path().join("sessions.sqlite");
