@@ -882,13 +882,13 @@ class QuiescentShardPlanTests(unittest.TestCase):
 class LibraryGroupPlanTests(unittest.TestCase):
     LIVE_LOG_FULL_WINDOW = {
         "consensus::store::async_persistence::tests::log_admission::"
-        "log_admission_full_window_blocked_build_durable": "native-log-3",
+        "log_admission_full_window_blocked_build_durable": "native-log-14",
         "consensus::store::async_persistence::tests::log_admission::"
-        "log_admission_full_window_blocked_build_async": "native-log-4",
+        "log_admission_full_window_blocked_build_async": "native-log-15",
         "consensus::store::async_persistence::tests::log_admission::"
-        "log_admission_full_window_blocked_transfer_durable": "native-log-5",
+        "log_admission_full_window_blocked_transfer_durable": "native-log-16",
         "consensus::store::async_persistence::tests::log_admission::"
-        "log_admission_full_window_blocked_transfer_async": "native-log-6",
+        "log_admission_full_window_blocked_transfer_async": "native-log-17",
     }
     NATIVE_FULL_BOUND = (
         "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
@@ -1030,7 +1030,7 @@ class LibraryGroupPlanTests(unittest.TestCase):
                 if mutation == "missing":
                     group["tests"].remove(name.rsplit("::", 1)[1])
                 elif mutation == "other-native":
-                    group["shard"] = "native-log-4" if owner == "native-log-3" else "native-log-3"
+                    group["shard"] = "native-log-15" if owner == "native-log-14" else "native-log-14"
                 elif mutation == "heavy":
                     group["shard"] = "heavy-0"
                 elif mutation == "ordinary":
