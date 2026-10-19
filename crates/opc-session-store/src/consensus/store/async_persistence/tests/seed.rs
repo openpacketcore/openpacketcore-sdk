@@ -1,16 +1,32 @@
 //! Seeding follows an actual committed leader change before recovery begins.
 
 use super::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use tokio::sync::oneshot;
 
 type BatchPause = (oneshot::Sender<u64>, oneshot::Receiver<()>);
 
 tokio::task_local! {
     static AFTER_BATCH: RefCell<Option<BatchPause>>;
+    static FORCE_FIRST_BATCH_HANDOFF: Cell<bool>;
 }
 
-pub(super) async fn after_batch(last: u64) {
+pub(super) async fn after_batch(fleet: &Fleet, last: u64) {
+    if FORCE_FIRST_BATCH_HANDOFF
+        .try_with(|force| force.replace(false))
+        .unwrap_or(false)
+    {
+        let leader = fleet.leader();
+        transfer_before(
+            fleet,
+            fleet.store(leader),
+            fleet.store((leader + 1) % 3),
+            tokio::time::Instant::now() + WAIT,
+            true,
+        )
+        .await;
+        eprintln!("seed setup handoff committed after index {last}");
+    }
     if let Some((entered, released)) = AFTER_BATCH
         .try_with(|pause| pause.borrow_mut().take())
         .ok()
@@ -21,10 +37,83 @@ pub(super) async fn after_batch(last: u64) {
     }
 }
 
+async fn transfer_before(
+    fleet: &Fleet,
+    source: &ConsensusSessionStore,
+    successor: &ConsensusSessionStore,
+    deadline: tokio::time::Instant,
+    observe_all: bool,
+) {
+    tokio::time::timeout_at(deadline, async {
+        let last = source.inner.raft.metrics().borrow().last_log_index.unwrap();
+        // A successful batch is quorum-applied. The chosen successor must
+        // apply that prefix too before it can accept the forced handoff.
+        successor
+            .inner
+            .raft
+            .metrics()
+            .wait_for(|current| current.last_applied.is_some_and(|log| log.index >= last))
+            .await
+            .unwrap();
+        let request = source
+            .inner
+            .raft
+            .begin_leadership_transfer(successor.inner.local_node_id)
+            .await
+            .unwrap();
+        for target in fleet
+            .stores
+            .iter()
+            .flatten()
+            .filter(|store| {
+                store.inner.local_node_id != source.inner.local_node_id
+                    && store.inner.local_node_id != successor.inner.local_node_id
+            })
+            .chain(std::iter::once(successor))
+        {
+            let response: Result<
+                (),
+                RaftError<SessionConsensusNodeId, opc_consensus::engine::raft::TransferLeaderError>,
+            > = source
+                .call_peer(
+                    target.inner.local_node_id,
+                    SessionConsensusRpcFamily::LeadershipTransfer,
+                    &request,
+                    deadline,
+                )
+                .await
+                .unwrap();
+            response.unwrap();
+        }
+        for store in fleet.stores.iter().flatten() {
+            // Some pressure fixtures isolate the third voter's data link.
+            // The old and new leader still observe the committed handoff;
+            // deterministic injection additionally waits for every voter.
+            if !observe_all
+                && store.inner.local_node_id != source.inner.local_node_id
+                && store.inner.local_node_id != successor.inner.local_node_id
+            {
+                continue;
+            }
+            let mut metrics = store.inner.raft.metrics();
+            metrics
+                .wait_for(|current| {
+                    current.vote.is_committed()
+                        && current.current_leader == Some(successor.inner.local_node_id)
+                        && current.vote.leader_id.term > request.from().leader_id.term
+                })
+                .await
+                .unwrap();
+        }
+    })
+    .await
+    .expect("setup handoff retains its original deadline");
+}
+
 pub(super) async fn leader_before(
     fleet: &Fleet,
     hint: Option<SessionConsensusNodeId>,
-    rejected: (SessionConsensusNodeId, u64),
+    rejected: Option<(SessionConsensusNodeId, u64)>,
     deadline: tokio::time::Instant,
 ) -> &ConsensusSessionStore {
     tokio::time::timeout_at(deadline, async {
@@ -43,9 +132,10 @@ pub(super) async fn leader_before(
                         && current.state == opc_consensus::engine::ServerState::Leader
                         && current.vote.is_committed()
                         && current.current_leader == Some(store.inner.local_node_id)
-                        && (store.inner.local_node_id != rejected.0
-                            || current.current_term > rejected.1))
-                        .then_some((*store, current.current_term))
+                        && rejected.is_none_or(|(node, term)| {
+                            store.inner.local_node_id != node || current.current_term > term
+                        }))
+                    .then_some((*store, current.current_term))
                 })
                 .max_by_key(|(store, term)| (*term, hint == Some(store.inner.local_node_id)));
             if let Some((leader, _)) = leader {
@@ -65,6 +155,17 @@ pub(super) async fn leader_before(
     .expect("leader discovery retains the original seed batch deadline")
 }
 
+pub(super) async fn restore_owner_before(
+    fleet: &Fleet,
+    owner: &ConsensusSessionStore,
+    deadline: tokio::time::Instant,
+) {
+    let leader = leader_before(fleet, Some(owner.inner.local_node_id), None, deadline).await;
+    if leader.inner.local_node_id != owner.inner.local_node_id {
+        transfer_before(fleet, leader, owner, deadline, false).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_admission_seed_follows_leader_change() {
     let mut fleet = fleet(SessionPersistenceMode::Durable).await;
@@ -72,7 +173,6 @@ async fn log_admission_seed_follows_leader_change() {
         let leader = fleet.leader();
         let source = fleet.store(leader);
         let successor = fleet.store((leader + 1) % 3);
-        let other = fleet.store((leader + 2) % 3);
         let command = repeated_command(source);
         let before = source.inner.raft.metrics().borrow().last_log_index.unwrap();
         let target = before + DURABLE_OPENRAFT_PROFILE.max_payload_entries + 4;
@@ -91,50 +191,7 @@ async fn log_admission_seed_follows_leader_change() {
             };
             assert_eq!(last, before + DURABLE_OPENRAFT_PROFILE.max_payload_entries);
             assert!(last < target);
-            // A successful batch is quorum-applied. The chosen successor must
-            // apply that prefix too before it can accept the forced handoff.
-            successor
-                .inner
-                .raft
-                .metrics()
-                .wait_for(|current| current.last_applied.is_some_and(|log| log.index >= last))
-                .await
-                .unwrap();
-            let request = source
-                .inner
-                .raft
-                .begin_leadership_transfer(successor.inner.local_node_id)
-                .await
-                .unwrap();
-            for target in [other, successor] {
-                let response: Result<
-                    (),
-                    RaftError<
-                        SessionConsensusNodeId,
-                        opc_consensus::engine::raft::TransferLeaderError,
-                    >,
-                > = source
-                    .call_peer(
-                        target.inner.local_node_id,
-                        SessionConsensusRpcFamily::LeadershipTransfer,
-                        &request,
-                        deadline,
-                    )
-                    .await
-                    .unwrap();
-                response.unwrap();
-            }
-            for store in [source, successor, other] {
-                let mut metrics = store.inner.raft.metrics();
-                metrics
-                    .wait_for(|current| {
-                        current.vote.is_committed()
-                            && current.current_leader == Some(successor.inner.local_node_id)
-                            && current.vote.leader_id.term > request.from().leader_id.term
-                    })
-                    .await
-                    .unwrap();
-            }
+            transfer_before(&fleet, source, successor, deadline, true).await;
             release.send(()).unwrap();
             seeding.await;
             for store in [source, successor] {
@@ -159,4 +216,18 @@ async fn log_admission_seed_follows_leader_change() {
     .await;
     fleet.close_all().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_blocked_build_seed_handoff_preserves_owner() {
+    let window = DURABLE_OPENRAFT_PROFILE.retained_logs
+        + 2 * DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
+        + 64;
+    FORCE_FIRST_BATCH_HANDOFF
+        .scope(Cell::new(true), async {
+            blocked_build(SessionPersistenceMode::Durable, window, 1, false).await;
+            assert!(!FORCE_FIRST_BATCH_HANDOFF.with(Cell::get));
+        })
+        .await;
 }

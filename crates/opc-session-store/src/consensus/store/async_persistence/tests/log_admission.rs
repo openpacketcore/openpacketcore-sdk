@@ -463,12 +463,46 @@ async fn seed_to(
     command: &SessionConsensusCommand,
     target: u64,
 ) {
+    seed_with_owner(fleet, store, command, target, false).await;
+}
+
+async fn seed_owned_to(
+    fleet: &Fleet,
+    store: &ConsensusSessionStore,
+    command: &SessionConsensusCommand,
+    target: u64,
+) {
+    seed_with_owner(fleet, store, command, target, true).await;
+}
+
+async fn seed_with_owner(
+    fleet: &Fleet,
+    store: &ConsensusSessionStore,
+    command: &SessionConsensusCommand,
+    target: u64,
+    restore_owner: bool,
+) {
     let mut writer = store;
     let mut last = store.inner.raft.metrics().borrow().last_log_index.unwrap();
     while last < target {
         let batch_target = last + (target - last).min(DURABLE_OPENRAFT_PROFILE.max_payload_entries);
         let deadline = tokio::time::Instant::now() + WAIT;
-        while last < batch_target {
+        loop {
+            if restore_owner && batch_target == target {
+                // The fixture's held snapshot and admission window belong to
+                // this voter. Restore its leadership before the final fill,
+                // sharing the last batch's deadline and counting the new term.
+                seed::restore_owner_before(fleet, store, deadline).await;
+                writer = store;
+                last = last.max(writer.inner.raft.metrics().borrow().last_log_index.unwrap());
+                assert!(
+                    last <= target,
+                    "setup handoff must fit before the final SDK fill"
+                );
+            }
+            if last >= batch_target {
+                break;
+            }
             let term = writer.inner.raft.metrics().borrow().current_term;
             let replies = tokio::time::timeout_at(
                 deadline,
@@ -501,15 +535,19 @@ async fn seed_to(
             if redirect && last < batch_target {
                 // Retry only routing refusals. Waiting and every subsequent
                 // dispatch share this batch's original deadline.
-                writer =
-                    seed::leader_before(fleet, hint, (writer.inner.local_node_id, term), deadline)
-                        .await;
+                writer = seed::leader_before(
+                    fleet,
+                    hint,
+                    Some((writer.inner.local_node_id, term)),
+                    deadline,
+                )
+                .await;
                 // The new term adds its own entry. Fill only the remaining
                 // prefix, then require application on the original store too.
                 last = last.max(writer.inner.raft.metrics().borrow().last_log_index.unwrap());
             }
         }
-        seed::after_batch(last).await;
+        seed::after_batch(fleet, last).await;
     }
     store
         .inner
@@ -615,7 +653,7 @@ async fn log_admission_review_blocked_snapshot_owner_cannot_hold_leadership() {
         let owner = store.inner.storage_shutdown.snapshot_owner_for_test();
         assert!(owner.is_retained());
         let command = repeated_command(store);
-        seed_to(
+        seed_owned_to(
             &fleet,
             store,
             &command,
@@ -978,7 +1016,7 @@ async fn blocked_build(
                 Some(purged) => purged.index + window - 8,
                 None => window - 9,
             };
-            seed_to(&fleet, store, &command, target).await;
+            seed_owned_to(&fleet, store, &command, target).await;
             // The last eight entries go through both SDK admission boundaries.
             for _ in 0..8 {
                 let reply = propose(store, &command, tokio::time::Instant::now() + WAIT).await;
@@ -1222,13 +1260,13 @@ async fn blocked_transfer(
                 follower_store.inner.local_node_id, gate.clone(),
             );
             gate.arm();
-            seed_to(&fleet, store, &command, last + DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
+            seed_owned_to(&fleet, store, &command, last + DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
                 + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;
             tokio::time::timeout(WAIT, gate.wait_started()).await.unwrap();
             fleet.set_link(leader, follower, true);
             let held_cut = hold.cut();
             // Select a newer cut whose purge target crosses the actual transfer.
-            seed_to(&fleet, store, &command, held_cut + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;
+            seed_owned_to(&fleet, store, &command, held_cut + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;
             select_snapshot(store).await;
             let before = store.inner.raft.metrics().borrow().clone();
             assert!(before.snapshot.unwrap().index > held_cut + DURABLE_OPENRAFT_PROFILE.retained_logs);
@@ -1237,7 +1275,7 @@ async fn blocked_transfer(
                 Some(purged) => purged.index + window - 8,
                 None => window - 9,
             };
-            seed_to(&fleet, store, &command, target).await;
+            seed_owned_to(&fleet, store, &command, target).await;
             for _ in 0..8 {
                 let reply = propose(store, &command, tokio::time::Instant::now() + WAIT).await;
                 assert!(matches!(&reply, ForwardMutationReply::Applied(response) if response.result.is_ok()),

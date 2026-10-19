@@ -131,7 +131,7 @@ async fn retained_batch(
             + DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
             + DURABLE_OPENRAFT_PROFILE.retained_logs
             + 64;
-        seed_to(&fleet, store, &command, through).await;
+        seed_owned_to(&fleet, store, &command, through).await;
         let window = store.log_pressure_snapshot().retained_rows;
         store
             .inner
@@ -400,7 +400,7 @@ async fn log_admission_review_public_v2_write_retains_exact_request() {
             + DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
             + DURABLE_OPENRAFT_PROFILE.retained_logs
             + 64;
-        seed_to(&fleet, store, &repeated_command(store), through).await;
+        seed_owned_to(&fleet, store, &repeated_command(store), through).await;
         let window = store.log_pressure_snapshot().retained_rows;
         store
             .inner
