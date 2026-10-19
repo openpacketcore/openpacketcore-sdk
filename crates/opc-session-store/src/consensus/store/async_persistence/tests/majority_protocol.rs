@@ -633,6 +633,10 @@ async fn exercise_five_voters_repeat_boundary_and_sequential_rejoin(protected: b
                 .async_authority()
                 .unwrap()
                 .unwrap();
+            eprintln!(
+                "recovery_fixture_authority turn={turn} previous_era={prior_era} recovered_era={}",
+                bound.era()
+            );
             assert!(bound.era() > prior_era);
             prior_era = bound.era();
             let request = create_request(store, 125 + turn, &provider()).await;
