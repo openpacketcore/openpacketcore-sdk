@@ -2013,6 +2013,17 @@ pub fn build_create_child_sa_rekey_request_payloads(
         notify_message_type: IKEV2_NOTIFY_REKEY_SA,
         notification_data: Vec::new(),
     })?;
+    // Reordering renumbers proposals; retain the encoder's zero-number rejection.
+    if input
+        .security_association
+        .proposals
+        .iter()
+        .any(|p| p.proposal_number == 0)
+    {
+        return Err(Ikev2IkeAuthBuildError::SecurityAssociation(
+            Ikev2SaInitBuildError::InvalidProposalNumber,
+        ));
+    }
     let mut offer = input.security_association.clone();
     crate::sa_init_negotiation::prefer_stronger_dh_groups(&mut offer);
     let sa_body = build_ike_auth_sa_payload(&offer)?;

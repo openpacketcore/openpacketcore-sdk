@@ -1,6 +1,3 @@
-#[path = "../../tests/support/nonce.rs"]
-mod peer_nonce_fixture;
-
 use super::*;
 use crate::*;
 use opc_crypto_provider::{IkeDhGroup, IkeDiffieHellmanOperations};
@@ -11,6 +8,30 @@ fn ok<T, E: std::fmt::Debug>(value: Result<T, E>) -> T {
         Ok(value) => value,
         Err(error) => panic!("synthetic fixture failed: {error:?}"),
     }
+}
+
+fn peer_nonce_wire(first: u8, bytes: &[u8], nonce: &[u8]) -> Vec<u8> {
+    let mut found = false;
+    let entries: Vec<_> = PayloadChain::new(PayloadType::from_u8(first), bytes)
+        .iter()
+        .map(|raw| {
+            let raw = ok(raw);
+            let body = if raw.payload_type == PayloadType::Nonce {
+                found = true;
+                nonce.to_vec()
+            } else {
+                raw.body.to_vec()
+            };
+            Ikev2IkeAuthPayloadBuild {
+                payload_type: raw.payload_type,
+                body,
+            }
+        })
+        .collect();
+    assert!(found, "fixture nonce payload");
+    ok(build_ike_auth_cleartext_payload_chain(&entries))
+        .1
+        .to_vec()
 }
 
 fn profile(prf: Ikev2PrfAlgorithm, group: Ikev2DhGroup) -> Ikev2SaInitCryptoProfile {
@@ -370,14 +391,13 @@ fn initiator_offers_stronger_groups_first_and_keeps_group_one_fallback() {
             },
         ));
         let mut response = response;
-        response.raw_payloads = peer_nonce_fixture::replace_nonce(
+        response.raw_payloads = peer_nonce_wire(
             response.header.next_payload,
             &response.raw_payloads,
             &[0x33; 16],
         )
         .into();
-        response.header.length =
-            28 + u32::try_from(response.raw_payloads.len()).expect("fixture length");
+        response.header.length = 28 + ok(u32::try_from(response.raw_payloads.len()));
         let accepted = ok(admit_ike_sa_init_response(
             &request,
             &response.as_borrowed(),
@@ -534,7 +554,7 @@ fn rekey_initiator_accepts_legacy_peer_nonce_and_generates_a_long_local_nonce() 
                 HeaderFlags::from_bits(!original_initiator, true, false),
                 7,
             );
-            let peer_wire = peer_nonce_fixture::replace_nonce(
+            let peer_wire = peer_nonce_wire(
                 response.first_payload().as_u8(),
                 response.bytes(),
                 &[0x33; 16],

@@ -2168,3 +2168,26 @@ fn outgoing_dedicated_offer_puts_group_one_last_without_reordering_other_groups(
         assert_eq!(groups, [19, 14, 1]);
     }
 }
+
+#[test]
+fn outgoing_offer_rejects_invalid_proposal_numbers_before_normalization() {
+    for numbers in [vec![0], vec![2], vec![1, 1]] {
+        let mut input = create_request_build();
+        let proposal = input.security_association.proposals[0].clone();
+        input.security_association.proposals = numbers
+            .iter()
+            .map(|number| {
+                let mut proposal = proposal.clone();
+                proposal.proposal_number = *number;
+                proposal
+            })
+            .collect();
+        assert!(
+            matches!(
+                build_ikev2_dedicated_bearer_create_child_sa_request(&input),
+                Err(Ikev2DedicatedBearerExchangeError::InvalidProposalNumber { .. })
+            ),
+            "invalid proposal numbers {numbers:?}"
+        );
+    }
+}

@@ -1481,3 +1481,23 @@ fn outgoing_child_offer_preserves_nonlegacy_and_no_pfs_proposal_order() {
         assert_eq!(ordered_groups, groups);
     }
 }
+
+#[test]
+fn outgoing_offer_rejects_invalid_proposal_numbers_before_normalization() {
+    let mut input = Ikev2CreateChildSaRekeyRequestBuild {
+        rekeyed_protocol_id: 3,
+        rekeyed_spi: vec![1, 2, 3, 4],
+        security_association: child_sa_payload_build(),
+        nonce: Ikev2NoncePayloadBuild { nonce: vec![3; 32] },
+        key_exchange: None,
+        traffic_selectors_initiator: ts_payload(),
+        traffic_selectors_responder: ts_payload(),
+    };
+    input.security_association.proposals[0].proposal_number = 0;
+    assert_eq!(
+        build_create_child_sa_rekey_request_payloads(&input),
+        Err(Ikev2IkeAuthBuildError::SecurityAssociation(
+            opc_proto_ikev2::Ikev2SaInitBuildError::InvalidProposalNumber
+        ))
+    );
+}

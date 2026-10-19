@@ -11,7 +11,10 @@ pub fn replace_nonce(first_payload: u8, bytes: &[u8], nonce: &[u8]) -> Vec<u8> {
             "fixture payload bounds"
         );
         if kind == 40 {
-            let new_len = u16::try_from(4 + nonce.len()).expect("fixture nonce length");
+            let new_len = match u16::try_from(4 + nonce.len()) {
+                Ok(len) => len,
+                Err(error) => panic!("fixture nonce length: {error}"),
+            };
             let mut out = bytes[..offset + 2].to_vec();
             out.extend_from_slice(&new_len.to_be_bytes());
             out.extend_from_slice(nonce);
