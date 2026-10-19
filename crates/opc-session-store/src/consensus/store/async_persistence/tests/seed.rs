@@ -91,6 +91,15 @@ async fn log_admission_seed_follows_leader_change() {
             };
             assert_eq!(last, before + DURABLE_OPENRAFT_PROFILE.max_payload_entries);
             assert!(last < target);
+            // A successful batch is quorum-applied. The chosen successor must
+            // apply that prefix too before it can accept the forced handoff.
+            successor
+                .inner
+                .raft
+                .metrics()
+                .wait_for(|current| current.last_applied.is_some_and(|log| log.index >= last))
+                .await
+                .unwrap();
             let request = source
                 .inner
                 .raft
