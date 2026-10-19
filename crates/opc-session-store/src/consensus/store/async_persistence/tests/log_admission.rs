@@ -458,31 +458,56 @@ async fn log_admission_review_demoted_requests_reroute_with_original_deadline() 
 }
 
 async fn seed_to(
-    _fleet: &Fleet,
+    fleet: &Fleet,
     store: &ConsensusSessionStore,
     command: &SessionConsensusCommand,
     target: u64,
 ) {
+    let mut writer = store;
     let mut last = store.inner.raft.metrics().borrow().last_log_index.unwrap();
     while last < target {
-        let count = (target - last).min(DURABLE_OPENRAFT_PROFILE.max_payload_entries);
-        let replies = tokio::time::timeout(
-            WAIT,
-            join_all((0..count).map(|_| store.inner.raft.client_write(command.clone()))),
-        )
-        .await
-        .unwrap();
-        for reply in replies {
-            let reply = reply.unwrap_or_else(|error| {
-                panic!(
-                    "seed failed: {error:?}; last={last} target={target}; pressure={:?}; metrics={:?}",
-                    store.log_pressure_snapshot(),
-                    store.inner.raft.metrics().borrow(),
-                )
-            });
-            assert!(reply.data.result.is_ok());
-            assert!(reply.log_id.index > last);
-            last = reply.log_id.index;
+        let batch_target = last + (target - last).min(DURABLE_OPENRAFT_PROFILE.max_payload_entries);
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while last < batch_target {
+            let term = writer.inner.raft.metrics().borrow().current_term;
+            let replies = tokio::time::timeout_at(
+                deadline,
+                join_all(
+                    (last..batch_target).map(|_| writer.inner.raft.client_write(command.clone())),
+                ),
+            )
+            .await
+            .expect("seed writes retain their original batch deadline");
+            let mut redirect = false;
+            let mut hint = None;
+            for reply in replies {
+                match reply {
+                    Ok(reply) => {
+                        assert!(reply.data.result.is_ok());
+                        assert!(reply.log_id.index > last);
+                        last = reply.log_id.index;
+                    }
+                    Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
+                        redirect = true;
+                        hint = forward.leader_id.or(hint);
+                    }
+                    Err(error) => panic!(
+                        "seed failed: {error:?}; last={last} target={target}; pressure={:?}; metrics={:?}",
+                        writer.log_pressure_snapshot(),
+                        writer.inner.raft.metrics().borrow(),
+                    ),
+                }
+            }
+            if redirect && last < batch_target {
+                // Retry only routing refusals. Waiting and every subsequent
+                // dispatch share this batch's original deadline.
+                writer =
+                    seed::leader_before(fleet, hint, (writer.inner.local_node_id, term), deadline)
+                        .await;
+                // The new term adds its own entry. Fill only the remaining
+                // prefix, then require application on the original store too.
+                last = last.max(writer.inner.raft.metrics().borrow().last_log_index.unwrap());
+            }
         }
         seed::after_batch(last).await;
     }

@@ -21,6 +21,50 @@ pub(super) async fn after_batch(last: u64) {
     }
 }
 
+pub(super) async fn leader_before(
+    fleet: &Fleet,
+    hint: Option<SessionConsensusNodeId>,
+    rejected: (SessionConsensusNodeId, u64),
+    deadline: tokio::time::Instant,
+) -> &ConsensusSessionStore {
+    tokio::time::timeout_at(deadline, async {
+        let mut metrics = fleet
+            .stores
+            .iter()
+            .flatten()
+            .map(|store| (store, store.inner.raft.metrics()))
+            .collect::<Vec<_>>();
+        loop {
+            let leader = metrics
+                .iter_mut()
+                .filter_map(|(store, metrics)| {
+                    let current = metrics.borrow_and_update();
+                    (current.running_state.is_ok()
+                        && current.state == opc_consensus::engine::ServerState::Leader
+                        && current.vote.is_committed()
+                        && current.current_leader == Some(store.inner.local_node_id)
+                        && (store.inner.local_node_id != rejected.0
+                            || current.current_term > rejected.1))
+                        .then_some((*store, current.current_term))
+                })
+                .max_by_key(|(store, term)| (*term, hint == Some(store.inner.local_node_id)));
+            if let Some((leader, _)) = leader {
+                return leader;
+            }
+            futures_util::future::select_all(
+                metrics
+                    .iter_mut()
+                    .map(|(_, metrics)| Box::pin(metrics.changed())),
+            )
+            .await
+            .0
+            .expect("seeding voters remain live while a leader commits");
+        }
+    })
+    .await
+    .expect("leader discovery retains the original seed batch deadline")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_admission_seed_follows_leader_change() {
     let mut fleet = fleet(SessionPersistenceMode::Durable).await;
