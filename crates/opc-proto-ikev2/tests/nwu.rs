@@ -1166,3 +1166,91 @@ fn nwu_ke_response_correlation_enforces_group_width() {
         }
     }
 }
+
+#[test]
+fn outgoing_nwu_request_rejects_a_short_local_nonce() {
+    for len in [16, 24, 31, 32] {
+        let mut input = create_input();
+        input.nonce.nonce.resize(len, 3);
+        let result = input.payloads();
+        if len < 32 {
+            assert_eq!(result, Err(Error::InvalidValue));
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}
+#[test]
+fn nwu_pfs_requires_stronger_ke_instead_of_group_one_fallback() {
+    for separate in [false, true] {
+        let mut input = nwu_ke_input(1, 96);
+        input.nonce.nonce.resize(32, 3);
+        let stronger = Ikev2SaTransformBuild {
+            transform_type: 4,
+            transform_id: 14,
+            attributes: vec![],
+        };
+        if separate {
+            let mut p = input.security_association.proposals[0].clone();
+            p.proposal_number = 2;
+            *p.transforms
+                .iter_mut()
+                .find(|t| t.transform_type == 4)
+                .expect("DH") = stronger;
+            input.security_association.proposals.push(p);
+        } else {
+            input.security_association.proposals[0]
+                .transforms
+                .push(stronger);
+        }
+        let (first, wire) = must(encode_payloads(&must(input.payloads())));
+        for peer in [Peer::Network, Peer::Ue] {
+            let request = must(CreateRequest::decode(
+                &create_header(peer, false),
+                first,
+                &wire,
+                AddressFamilies::Ipv4,
+                Limits::default(),
+            ));
+            let policy = must(AeadPolicy::new(vec![
+                must(AeadSuite::new(
+                    Ikev2EncryptionAlgorithm::AesGcm16_128,
+                    Some(opc_proto_ikev2::Ikev2DhGroup::Modp768),
+                    false,
+                )),
+                must(AeadSuite::new(
+                    Ikev2EncryptionAlgorithm::AesGcm16_128,
+                    Some(opc_proto_ikev2::Ikev2DhGroup::Modp2048),
+                    false,
+                )),
+            ]));
+            assert!(
+                policy.select(&request).is_err(),
+                "a stronger common PFS group must request a KE retry"
+            );
+        }
+    }
+}
+#[test]
+fn outgoing_nwu_offer_puts_group_one_last() {
+    let mut input = nwu_ke_input(1, 96);
+    input.nonce.nonce.resize(32, 3);
+    input.security_association.proposals[0]
+        .transforms
+        .push(Ikev2SaTransformBuild {
+            transform_type: 4,
+            transform_id: 14,
+            attributes: vec![],
+        });
+    let entries = must(input.payloads());
+    let sa = must(opc_proto_ikev2::Ikev2SaPayload::decode_body(
+        &entries[0].body,
+    ));
+    let groups: Vec<_> = sa.proposals[0]
+        .transforms
+        .iter()
+        .filter(|t| t.transform_type == 4)
+        .map(|t| t.transform_id)
+        .collect();
+    assert_eq!(groups, [14, 1]);
+}

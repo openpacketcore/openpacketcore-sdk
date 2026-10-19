@@ -532,3 +532,161 @@ fn rekey_initiator_accepts_legacy_peer_nonce_and_generates_a_long_local_nonce() 
         }
     }
 }
+
+#[test]
+fn outgoing_initial_response_rejects_a_short_local_nonce() {
+    let request = Header::new(
+        11,
+        0,
+        PayloadType::SecurityAssociation,
+        EXCHANGE_TYPE_IKE_SA_INIT,
+        HeaderFlags::from_bits(true, false, false),
+        0,
+    );
+    for len in [16, 24, 31, 32] {
+        let result = build_ike_sa_init_response(
+            &request,
+            22,
+            &Ikev2SaInitResponsePayloads {
+                security_association: offer(&[1], Ikev2PrfAlgorithm::HmacSha2_512),
+                key_exchange: Ikev2KeyExchangePayloadBuild {
+                    dh_group: 1,
+                    key_exchange_data: vec![2; 96],
+                },
+                nonce: Ikev2NoncePayloadBuild {
+                    nonce: vec![3; len],
+                },
+                notifies: vec![],
+            },
+        );
+        if len < 32 {
+            assert_eq!(result, Err(Ikev2SaInitBuildError::NonceTooShort));
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}
+
+fn outgoing_rekey_fixture() -> Ikev2IkeSaRekeyRequestBuild {
+    Ikev2IkeSaRekeyRequestBuild {
+        profile: profile(Ikev2PrfAlgorithm::HmacSha2_512, Ikev2DhGroup::Modp768),
+        new_initiator_spi: [0x55; 8],
+        nonce: Ikev2NoncePayloadBuild { nonce: vec![3; 32] },
+        key_exchange: Ikev2KeyExchangePayloadBuild {
+            dh_group: 1,
+            key_exchange_data: vec![2; 96],
+        },
+    }
+}
+
+#[test]
+fn outgoing_ike_rekey_request_rejects_a_short_local_nonce() {
+    for len in [16, 24, 31, 32] {
+        let mut input = outgoing_rekey_fixture();
+        input.nonce.nonce.resize(len, 3);
+        let result = build_ike_sa_rekey_request(&input);
+        if len < 32 {
+            assert_eq!(
+                result,
+                Err(Ikev2IkeSaRekeyRequestBuildError::Nonce(
+                    Ikev2SaInitBuildError::NonceTooShort
+                ))
+            );
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}
+
+#[test]
+fn outgoing_ike_rekey_response_rejects_a_short_local_nonce() {
+    for original_initiator in [false, true] {
+        let input = outgoing_rekey_fixture();
+        let wire = ok(build_ike_sa_rekey_request(&input));
+        let header = Header::new(
+            11,
+            22,
+            PayloadType::Encrypted,
+            EXCHANGE_TYPE_CREATE_CHILD_SA,
+            HeaderFlags::from_bits(original_initiator, false, false),
+            7,
+        );
+        let request = ok(decode_ike_sa_rekey_request(
+            &header,
+            wire.first_payload(),
+            wire.bytes(),
+        ));
+        let policy = ok(Ikev2SaInitNegotiationPolicy::new(vec![input.profile]));
+        for len in [16, 24, 31, 32] {
+            let result = build_ike_sa_rekey_response(&Ikev2IkeSaRekeyResponseBuild {
+                negotiation: ok(negotiate_ike_sa_rekey(&request, &policy)),
+                new_responder_spi: [0x66; 8],
+                nonce: Ikev2NoncePayloadBuild {
+                    nonce: vec![4; len],
+                },
+                key_exchange: input.key_exchange.clone(),
+            });
+            if len < 32 {
+                assert_eq!(
+                    result,
+                    Err(Ikev2IkeSaRekeyBuildError::Nonce(
+                        Ikev2SaInitBuildError::NonceTooShort
+                    ))
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+}
+
+#[test]
+fn key_derivation_rejects_short_local_nonces_in_each_exchange_role() {
+    crate::test_support::ensure_ike_crypto();
+    for prf in [
+        Ikev2PrfAlgorithm::HmacSha1,
+        Ikev2PrfAlgorithm::HmacSha2_256,
+        Ikev2PrfAlgorithm::HmacSha2_384,
+        Ikev2PrfAlgorithm::HmacSha2_512,
+    ] {
+        let parent = profile(prf, Ikev2DhGroup::Modp768);
+        let child =
+            Ikev2ChildSaCryptoProfile::new_aead(prf, Ikev2EncryptionAlgorithm::AesGcm16_128);
+        let sk_d = vec![4; prf.output_len()];
+        for local_initiator in [false, true] {
+            for len in [16, 24, 31] {
+                let local = vec![3; len];
+                let peer = vec![5; 32];
+                let (ni, nr, role) = if local_initiator {
+                    (local.as_slice(), peer.as_slice(), "initiator")
+                } else {
+                    (peer.as_slice(), local.as_slice(), "responder")
+                };
+                let results = [
+                    derive_ike_sa_init_key_material(parent, [1; 8], [2; 8], ni, nr, &[2; 96], None)
+                        .map(|_| ()),
+                    derive_ike_sa_rekey_key_material(
+                        prf, &sk_d, parent, [1; 8], [2; 8], ni, nr, &[2; 96],
+                    )
+                    .map(|_| ()),
+                    derive_child_sa_key_material(child, &sk_d, ni, nr, None).map(|_| ()),
+                    derive_initial_child_sa_key_material(
+                        child,
+                        &sk_d,
+                        ni,
+                        nr,
+                        Ikev2InitialExchangeNoncePolicy::Strict,
+                    )
+                    .map(|_| ()),
+                ];
+                for result in results {
+                    assert_eq!(
+                        result,
+                        Err(Ikev2SaInitCryptoError::InvalidNonceLength { role, len }),
+                        "{prf:?} local {role}"
+                    );
+                }
+            }
+        }
+    }
+}

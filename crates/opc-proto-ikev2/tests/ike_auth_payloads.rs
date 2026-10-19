@@ -1230,3 +1230,129 @@ fn generic_ke_response_build_enforces_group_width() {
         }
     }
 }
+
+fn outgoing_child_request() -> Ikev2CreateChildSaRekeyRequestBuild {
+    Ikev2CreateChildSaRekeyRequestBuild {
+        rekeyed_protocol_id: 3,
+        rekeyed_spi: vec![1, 2, 3, 4],
+        security_association: child_sa_payload_build(),
+        nonce: Ikev2NoncePayloadBuild { nonce: vec![3; 32] },
+        key_exchange: None,
+        traffic_selectors_initiator: ts_payload(),
+        traffic_selectors_responder: ts_payload(),
+    }
+}
+#[test]
+fn outgoing_child_request_rejects_a_short_local_nonce() {
+    for len in [16, 24, 31, 32] {
+        let mut input = outgoing_child_request();
+        input.nonce.nonce.resize(len, 3);
+        let result = build_create_child_sa_rekey_request_payloads(&input);
+        if len < 32 {
+            assert_eq!(
+                result,
+                Err(Ikev2IkeAuthBuildError::Nonce(
+                    opc_proto_ikev2::Ikev2SaInitBuildError::NonceTooShort
+                ))
+            );
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}
+#[test]
+fn outgoing_child_response_rejects_a_short_local_nonce() {
+    for len in [16, 24, 31, 32] {
+        let input = Ikev2CreateChildSaRekeyResponseBuild {
+            security_association: child_sa_payload_build(),
+            nonce: Ikev2NoncePayloadBuild {
+                nonce: vec![3; len],
+            },
+            key_exchange: None,
+            traffic_selectors_initiator: ts_payload(),
+            traffic_selectors_responder: ts_payload(),
+        };
+        let result = build_create_child_sa_rekey_response_payloads(&input);
+        if len < 32 {
+            assert_eq!(
+                result,
+                Err(Ikev2IkeAuthBuildError::Nonce(
+                    opc_proto_ikev2::Ikev2SaInitBuildError::NonceTooShort
+                ))
+            );
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}
+fn child_group_offer(separate: bool) -> Ikev2SaPayloadBuild {
+    let mut sa = child_sa_pfs_payload_build(1);
+    if separate {
+        let mut p = child_sa_pfs_payload_build(14).proposals.remove(0);
+        p.proposal_number = 2;
+        sa.proposals.push(p);
+    } else {
+        sa.proposals[0].transforms.push(Ikev2SaTransformBuild {
+            transform_type: 4,
+            transform_id: 14,
+            attributes: vec![],
+        });
+    }
+    sa
+}
+#[test]
+fn child_pfs_prefers_stronger_common_groups_over_group_one() {
+    for separate in [false, true] {
+        let wire = build_ike_auth_sa_payload(&child_group_offer(separate)).expect("SA");
+        let sa = Ikev2SaPayload::decode_body(&wire).expect("SA view");
+        let ts = build_ike_auth_traffic_selector_payload(&ts_payload()).expect("TS");
+        let ts = opc_proto_ikev2::Ikev2TrafficSelectorPayload::decode_body(&ts).expect("TS view");
+        let policy = Ikev2ChildSaNegotiationPolicy {
+            accepted_protocol_ids: vec![3],
+            required_transforms: vec![
+                Ikev2ChildSaTransformRequirement {
+                    transform_type: 1,
+                    accepted_transform_ids: vec![20],
+                },
+                Ikev2ChildSaTransformRequirement {
+                    transform_type: 4,
+                    accepted_transform_ids: vec![1, 14],
+                },
+            ],
+            accepted_initiator_traffic_selectors: vec![],
+            accepted_responder_traffic_selectors: vec![],
+        };
+        let selected =
+            negotiate_child_sa(&sa, &ts, &ts, &policy).expect("common stronger PFS suite");
+        assert_eq!(
+            selected
+                .transforms
+                .iter()
+                .find(|t| t.transform_type == 4)
+                .expect("DH")
+                .transform_id,
+            14
+        );
+    }
+}
+#[test]
+fn outgoing_child_offer_puts_group_one_last() {
+    for separate in [false, true] {
+        let mut input = outgoing_child_request();
+        input.security_association = child_group_offer(separate);
+        input.key_exchange = Some(Ikev2KeyExchangePayloadBuild {
+            dh_group: 1,
+            key_exchange_data: vec![2; 96],
+        });
+        let built = build_create_child_sa_rekey_request_payloads(&input).expect("offer");
+        let sa = Ikev2SaPayload::decode_body(&built.security_association.body).expect("SA view");
+        let groups: Vec<_> = sa
+            .proposals
+            .iter()
+            .flat_map(|p| &p.transforms)
+            .filter(|t| t.transform_type == 4)
+            .map(|t| t.transform_id)
+            .collect();
+        assert_eq!(groups, [14, 1]);
+    }
+}
