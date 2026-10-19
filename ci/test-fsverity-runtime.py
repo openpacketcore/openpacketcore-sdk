@@ -143,6 +143,12 @@ def unlink(name,*args,**kwargs):
     return result
 def mkdir(name,*args,**kwargs):
     result=original_mkdir(name,*args,**kwargs)
+    if name=='runtime' and phase=='create-mkdir':
+        fd=kwargs['dir_fd'];state['directory']=os.readlink('/proc/self/fd/'+str(fd))+'/runtime'
+        info=os.stat('runtime',dir_fd=fd,follow_symlinks=False)
+        state['directory_identity']=[info.st_dev,info.st_ino]
+        assert runtime.stat.S_IMODE(info.st_mode)==0 and info.st_uid==0
+        stop()
     if name=='tmp' and phase=='create-partial':
         fd=kwargs['dir_fd'];state['directory']=os.readlink('/proc/self/fd/'+str(fd))
         state['directory_identity']=runtime.identity(fd);stop()
@@ -160,6 +166,7 @@ runtime.protected_directory=protected;runtime.os.fchown=chown
 runtime.rename_new=rename;runtime.os.unlink=unlink
 runtime.os.mkdir=mkdir;runtime.os.rmdir=rmdir
 runtime.os.setxattr=xattr
+if phase=='create-mkdir': os.umask(0o777)
 if phase=='observe':
     state=json.load(open(report))
     if corruption=='mounted':
@@ -272,6 +279,9 @@ finally:
     def test_next_sweep_reclaims_an_interrupted_partial_creation(self):
         self.interrupted_root_helper("create-partial")
 
+    def test_next_sweep_reclaims_creation_stopped_after_mkdir_under_restrictive_umask(self):
+        self.interrupted_root_helper("create-mkdir")
+
     def test_next_sweep_reclaims_creation_interrupted_after_publication(self):
         self.interrupted_root_helper("create-published")
 
@@ -287,6 +297,75 @@ finally:
         for corruption in ("owner", "uid", "parent", "directory", "image", "live"):
             with self.subTest(corruption=corruption):
                 self.interrupted_root_helper("freeze", corruption=corruption)
+
+    def test_concurrent_recovery_skips_a_completed_transaction_from_another_parent(self):
+        other = self.root / "other-parent"
+        other.mkdir(mode=0o700)
+        privileged("python3", "-I", "-c", '''
+import importlib.util,os,sys,threading,time
+spec=importlib.util.spec_from_file_location('runtime',sys.argv[1])
+runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
+parents=[os.open(path,os.O_RDONLY|os.O_DIRECTORY) for path in sys.argv[2:]]
+uid=int(os.environ['SUDO_UID']);deadline=time.monotonic()+5
+ready,finish=threading.Event(),threading.Event()
+active={};errors=[];visited=[]
+def first_transaction():
+    try:
+        with runtime.protected_directory(parents[0],deadline,uid=uid,
+                transaction={'action':'create','name':runtime.PREFIX+'first'}) as fd:
+            active['path']=os.readlink('/proc/self/fd/'+str(fd))
+            active['name']=os.path.basename(active['path'])
+            ready.set()
+            assert finish.wait(3),'first transaction did not complete'
+    except BaseException as error:
+        errors.append(error)
+    finally:
+        ready.set()
+worker=threading.Thread(target=first_transaction)
+original_open,original_listdir=runtime.os.open,runtime.os.listdir
+worker.start()
+try:
+    assert ready.wait(3),'first transaction did not start'
+    if errors: raise errors[0]
+    with runtime.protected_directory(parents[1],deadline,uid=uid,
+            transaction={'action':'create','name':runtime.PREFIX+'second'}) as second:
+        second_path=os.readlink('/proc/self/fd/'+str(second))
+        second_name=os.path.basename(second_path)
+        assert os.path.dirname(second_path)==os.path.dirname(active['path'])
+        anchor=os.open('..',os.O_RDONLY|os.O_DIRECTORY,dir_fd=second)
+        try:
+            anchor_identity=runtime.identity(anchor)
+            def listed(fd):
+                names=original_listdir(fd)
+                if isinstance(fd,int) and runtime.identity(fd)==anchor_identity:
+                    assert active['name'] in names and second_name in names
+                    return [active['name'],second_name]
+                return names
+            def opened(name,*args,**kwargs):
+                parent=kwargs.get('dir_fd')
+                if parent is not None and runtime.identity(parent)==anchor_identity:
+                    visited.append(name)
+                    if name==active['name']:
+                        finish.set();worker.join(3)
+                        assert not worker.is_alive(),'first transaction did not finish'
+                        if errors: raise errors[0]
+                        assert not os.path.exists(active['path'])
+                return original_open(name,*args,**kwargs)
+            runtime.os.open=opened;runtime.os.listdir=listed
+            runtime.recover_staging(parents[1],uid,deadline)
+            assert visited==[active['name'],second_name],visited
+            assert os.path.isdir(second_path),'recovery removed a live transaction'
+        finally:
+            runtime.os.open, runtime.os.listdir=original_open,original_listdir
+            os.close(anchor)
+    assert not os.path.exists(second_path)
+finally:
+    runtime.os.open, runtime.os.listdir=original_open,original_listdir
+    finish.set();worker.join(3)
+    for fd in parents: os.close(fd)
+assert not worker.is_alive()
+if errors: raise errors[0]
+''', HARNESS.with_name("fsverity-runtime.py"), self.runner, other)
 
     def test_remove_rejects_an_unowned_parent_and_a_different_parent_inode(self):
         directory = self.candidate("wrong-parent")
@@ -328,6 +407,26 @@ finally:
         finally:
             os.close(descriptor)
             os.close(parent)
+
+    def test_creation_round_trip_allows_the_cleanup_class_budget(self):
+        guardian = self.guardian()
+        guardian.sweep = lambda _root: None
+        guardian.stopping = lambda: False
+        calls = []
+        now = time.monotonic()
+
+        def request(operation, _descriptors, **kwargs):
+            calls.append((operation, kwargs.get('deadline', now + 5) - now))
+            raise RuntimeError("creation boundary reached")
+
+        with patch.dict(os.environ, RUNNER_TEMP=str(self.runner)), \
+                patch.object(RUNTIME.ctypes, "CDLL") as libc, \
+                patch.object(RUNTIME, "privileged_request", side_effect=request):
+            libc.return_value.prctl.return_value = 0
+            with self.assertRaisesRegex(RuntimeError, "creation boundary reached"):
+                guardian.execute(["true"])
+        self.assertEqual(calls[0][0], "create")
+        self.assertGreaterEqual(calls[0][1], 29, "creation must also allow the sudo round trip and fsyncs")
 
     def test_autoclear_keeps_its_bound_and_does_not_spend_the_removal_inventory_budget(self):
         directory = self.candidate("autoclear-budget")
