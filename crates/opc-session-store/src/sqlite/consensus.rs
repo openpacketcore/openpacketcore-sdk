@@ -67828,6 +67828,107 @@ BEGIN IMMEDIATE;
     }
 
     #[cfg(feature = "test-control")]
+    fn terminal_observer_fixture_snapshots(
+        _backend: &SqliteSessionBackend,
+    ) -> (
+        ProtectedRosterTerminalApplyTimings,
+        ProtectedRosterV2TerminalStatusValidationStagesForTest,
+    ) {
+        // RED adapter: the current public readers ignore the selected backend.
+        (
+            protected_roster_terminal_apply_timings_for_test(),
+            protected_roster_v2_terminal_status_validation_stages_for_test(),
+        )
+    }
+
+    #[cfg(feature = "test-control")]
+    fn apply_and_read_terminal_observer_fixture(path: &Path) {
+        initialize_protected_roster_v2_recovery_fixture(
+            path,
+            ProtectedRosterV2RecoveryFixtureState::Established,
+        )
+        .expect("real V2 membership, admission and terminal apply");
+        let backend = SqliteSessionBackend::open(path).expect("reopen real V2 writer");
+        let conn = backend.conn.blocking_lock();
+        let fixture = crate::consensus::types::roster_v2_persistence_fixture();
+        let terminal = TerminalRecord::from_canonical_bytes(
+            fixture.terminal_command.record_bytes(),
+            &fixture.admission,
+        )
+        .expect("exact terminal body");
+        let evidence = fixture
+            .terminal_command
+            .terminal_evidence()
+            .expect("V2 evidence");
+        assert!(matches!(
+            read_protected_roster_v2_terminal_status_sync(
+                &conn,
+                fixture.identity,
+                fixture.terminal_command.binding(),
+                ProtectedRosterV2TerminalStatusRequest {
+                    registration_parts: fixture.terminal_command.registration_parts(),
+                    current_authority: &fixture.authority,
+                    terminal_body_commitment: terminal.body_commitment(),
+                    terminal_evidence: &evidence,
+                    logical_time: v2_persistence_logical_time(),
+                },
+            ).expect("real terminal status"),
+            ProtectedRosterV2ReadResult::Terminalized(ref read)
+                if read.committed.record() == &terminal
+        ));
+    }
+
+    #[cfg(feature = "test-control")]
+    #[test]
+    fn terminal_apply_timings_ignore_an_unrelated_database() {
+        let directory = tempfile::tempdir().expect("independent terminal databases");
+        let passive = SqliteSessionBackend::open(directory.path().join("passive.sqlite"))
+            .expect("observed passive database");
+        let active_path = directory.path().join("active.sqlite");
+        let active = SqliteSessionBackend::open(&active_path).expect("unrelated active database");
+        reset_protected_roster_terminal_apply_timings_for_test();
+        let before = terminal_observer_fixture_snapshots(&passive).0;
+        std::thread::spawn(move || apply_and_read_terminal_observer_fixture(&active_path))
+            .join()
+            .expect("independent storage worker");
+        let active_counts = terminal_observer_fixture_snapshots(&active).0;
+        assert!(
+            active_counts.production_apply_count > 0,
+            "positive control observes real Q2"
+        );
+        assert_eq!(
+            terminal_observer_fixture_snapshots(&passive).0,
+            before,
+            "another database's real terminal apply must not contaminate the selected fixture"
+        );
+    }
+
+    #[cfg(feature = "test-control")]
+    #[test]
+    fn terminal_validation_stages_ignore_an_unrelated_database() {
+        let directory = tempfile::tempdir().expect("independent validation databases");
+        let passive = SqliteSessionBackend::open(directory.path().join("passive.sqlite"))
+            .expect("observed passive database");
+        let active_path = directory.path().join("active.sqlite");
+        let active = SqliteSessionBackend::open(&active_path).expect("unrelated active database");
+        reset_protected_roster_v2_terminal_status_validation_stages_for_test();
+        let before = terminal_observer_fixture_snapshots(&passive).1;
+        std::thread::spawn(move || apply_and_read_terminal_observer_fixture(&active_path))
+            .join()
+            .expect("independent storage worker");
+        let active_counts = terminal_observer_fixture_snapshots(&active).1;
+        assert!(
+            active_counts.record_decoded > 0,
+            "positive control observes real terminal status"
+        );
+        assert_eq!(
+            terminal_observer_fixture_snapshots(&passive).1,
+            before,
+            "another database's real validation must not contaminate the selected fixture"
+        );
+    }
+
+    #[cfg(feature = "test-control")]
     #[test]
     fn protected_roster_v2_terminal_status_validation_stages_are_fixed_and_redacted() {
         let snapshot = protected_roster_v2_terminal_status_validation_stages_for_test();
