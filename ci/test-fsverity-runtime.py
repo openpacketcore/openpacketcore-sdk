@@ -85,16 +85,20 @@ class SafetyTests(unittest.TestCase):
         guardian.inventory = lambda **_kwargs: ([], [])
         return guardian
 
-    def interrupted_root_helper(self, phase):
-        directory = self.candidate("root-helper-stop-" + phase)
+    def interrupted_root_helper(self, phase, corruption=None):
+        directory = self.runner / (RUNTIME.PREFIX + "root-helper-stop-" + phase)
+        if not phase.startswith("create"):
+            self.candidate("root-helper-stop-" + phase)
         report = self.root / "stopped-helper.json"
         report.write_text("{}")
         program = '''
 import importlib.util,json,os,sys
-path,report,phase,*arguments=sys.argv[1:]
+path,report,phase,corruption,*arguments=sys.argv[1:]
 spec=importlib.util.spec_from_file_location('runtime',path)
 runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
 original_chown,original_rename,original_unlink=runtime.os.fchown,runtime.rename_new,runtime.os.unlink
+original_mkdir,original_rmdir=runtime.os.mkdir,runtime.os.rmdir
+original_xattr=runtime.os.setxattr
 original_protected=runtime.protected_directory
 state={}
 @runtime.contextmanager
@@ -103,6 +107,16 @@ def protected(*args,**kwargs):
         state['stage']=os.readlink('/proc/self/fd/'+str(fd));state['stage_identity']=runtime.identity(fd)
         yield fd
 def stop():
+    if corruption:
+        fd=os.open(state['stage'],os.O_RDONLY|os.O_DIRECTORY)
+        record=json.loads(os.getxattr(fd,runtime.STAGING_ATTRIBUTE))
+        if corruption=='owner': record['owner']='another checkout'
+        elif corruption=='uid': record['uid']+=1
+        elif corruption in ('directory','image','parent'): record[corruption][1]+=1
+        elif corruption=='live':
+            record['pid']=int(arguments[-2])
+            record['start']=runtime.process_stat(record['pid'])[1]
+        os.setxattr(fd,runtime.STAGING_ATTRIBUTE,json.dumps(record).encode());os.close(fd)
     with open(report,'w') as stream: json.dump(state,stream)
     os._exit(77)
 def chown(fd,uid,gid):
@@ -118,21 +132,58 @@ def rename(source,name,destination,new_name):
         state['directory']=os.readlink('/proc/self/fd/'+str(destination))+'/runtime'
         state['directory_identity']=runtime.Guardian.entry_identity(destination,'runtime')
         if phase=='moved': stop()
+    if name=='runtime' and phase=='create-published':
+        state['directory']=os.readlink('/proc/self/fd/'+str(destination))+'/'+new_name
+        state['directory_identity']=runtime.Guardian.entry_identity(destination,new_name)
+        stop()
     return result
 def unlink(name,*args,**kwargs):
     result=original_unlink(name,*args,**kwargs)
     if name=='ext4.img' and phase=='partial': stop()
     return result
+def mkdir(name,*args,**kwargs):
+    result=original_mkdir(name,*args,**kwargs)
+    if name=='tmp' and phase=='create-partial':
+        fd=kwargs['dir_fd'];state['directory']=os.readlink('/proc/self/fd/'+str(fd))
+        state['directory_identity']=runtime.identity(fd);stop()
+    return result
+def rmdir(name,*args,**kwargs):
+    result=original_rmdir(name,*args,**kwargs)
+    if name=='tmp' and phase=='empty': stop()
+    return result
+def xattr(fd,name,value):
+    if phase=='unmarked' and name==getattr(runtime,'STAGING_ATTRIBUTE','') and 'action' in json.loads(value):
+        state['stage']=os.readlink('/proc/self/fd/'+str(fd));state['stage_identity']=runtime.identity(fd)
+        state['directory']=state['stage']+'/runtime';stop()
+    return original_xattr(fd,name,value)
 runtime.protected_directory=protected;runtime.os.fchown=chown
 runtime.rename_new=rename;runtime.os.unlink=unlink
+runtime.os.mkdir=mkdir;runtime.os.rmdir=rmdir
+runtime.os.setxattr=xattr
+if phase=='observe':
+    state=json.load(open(report))
+    if corruption=='mounted':
+        runtime.Guardian.inventory=lambda *a,**k:([],[{'target':state['directory']+'/tmp'}])
+    else:
+        image=os.stat(state['directory']+'/ext4.img')
+        runtime.Guardian.inventory=lambda *a,**k:([{'name':'/dev/loop-test',
+            'back-maj:min':str(os.major(image.st_dev))+':'+str(os.minor(image.st_dev)),
+            'back-ino':image.st_ino}],[])
 sys.argv=[path,*arguments];runtime.main()
 '''
         original_popen = subprocess.Popen
+        observing = False
+        held = []
+        if corruption == "locked":
+            held.append(os.open(directory, os.O_RDONLY | os.O_DIRECTORY))
+        elif corruption == "leased":
+            held.append(os.open(directory / "ext4.img", os.O_PATH))
 
         def interrupted(command, *args, **kwargs):
             if "--privileged" in command:
                 command = ["sudo", "-n", "python3", "-I", "-c", program,
-                           str(HARNESS.with_name("fsverity-runtime.py")), str(report), phase,
+                           str(HARNESS.with_name("fsverity-runtime.py")), str(report),
+                           "observe" if observing else phase, corruption or "",
                            *command[command.index("--privileged"):]]
             return original_popen(command, *args, **kwargs)
 
@@ -141,17 +192,45 @@ sys.argv=[path,*arguments];runtime.main()
         try:
             with patch.object(RUNTIME.subprocess, "Popen", side_effect=interrupted):
                 with self.assertRaises((RuntimeError, ValueError)):
-                    self.guardian().sweep(self.runner)
+                    if phase.startswith("create"):
+                        parent = os.open(self.runner, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            RUNTIME.privileged_request("create", [parent], name=directory.name)
+                        finally:
+                            os.close(parent)
+                    else:
+                        self.guardian().sweep(self.runner)
             state = json.loads(report.read_text())
             self.assertIn("stage", state, "did not reach the helper interruption")
-            self.guardian().sweep(self.runner)
+            if corruption == "locked":
+                fcntl.flock(held[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif corruption == "leased":
+                held.append(os.open(f"/proc/self/fd/{held[0]}", os.O_RDONLY))
+            if corruption in ("attached", "mounted"):
+                observing = True
+                with patch.object(RUNTIME.subprocess, "Popen", side_effect=interrupted):
+                    self.guardian().sweep(self.runner)
+            else:
+                self.guardian().sweep(self.runner)
             remaining = privileged("python3", "-c", """
 import json,os,sys
 state=json.load(open(sys.argv[1]))
 print(json.dumps([p for p in (state['stage'],state['directory']) if os.path.exists(p)]))
 """, report)
-            self.assertEqual(json.loads(remaining), [], "next sweep did not reclaim a stopped root helper")
+            if corruption:
+                self.assertTrue(json.loads(remaining), "recovery accepted an invalid or live transaction")
+                if corruption in ("locked", "leased", "attached", "mounted"):
+                    for descriptor in held:
+                        os.close(descriptor)
+                    held.clear()
+                    self.guardian().sweep(self.runner)
+                    self.assertFalse(directory.exists(), "recovery lost its record while the resource was busy")
+            else:
+                self.assertEqual(json.loads(remaining), [], "next sweep did not reclaim a stopped root helper")
+                self.assertFalse(directory.exists())
         finally:
+            for descriptor in held:
+                os.close(descriptor)
             # The RED must not strand its deliberately stopped root fixture.
             # Only the exact descriptors/identities recorded by this fixture
             # are eligible; no glob or recursive root cleanup is permitted.
@@ -186,6 +265,28 @@ finally:
 
     def test_next_sweep_finishes_a_partially_removed_root_runtime(self):
         self.interrupted_root_helper("partial")
+
+    def test_next_sweep_finishes_an_empty_frozen_runtime(self):
+        self.interrupted_root_helper("empty")
+
+    def test_next_sweep_reclaims_an_interrupted_partial_creation(self):
+        self.interrupted_root_helper("create-partial")
+
+    def test_next_sweep_reclaims_creation_interrupted_after_publication(self):
+        self.interrupted_root_helper("create-published")
+
+    def test_next_sweep_reclaims_empty_transaction_interrupted_before_marking(self):
+        self.interrupted_root_helper("unmarked")
+
+    def test_recovery_preserves_busy_resources_and_retries_them_later(self):
+        for corruption in ("locked", "leased", "attached", "mounted"):
+            with self.subTest(busy=corruption):
+                self.interrupted_root_helper("freeze", corruption=corruption)
+
+    def test_recovery_requires_checkout_uid_parent_and_object_identities(self):
+        for corruption in ("owner", "uid", "parent", "directory", "image", "live"):
+            with self.subTest(corruption=corruption):
+                self.interrupted_root_helper("freeze", corruption=corruption)
 
     def test_remove_rejects_an_unowned_parent_and_a_different_parent_inode(self):
         directory = self.candidate("wrong-parent")
@@ -227,6 +328,30 @@ finally:
         finally:
             os.close(descriptor)
             os.close(parent)
+
+    def test_autoclear_keeps_its_bound_and_does_not_spend_the_removal_inventory_budget(self):
+        directory = self.candidate("autoclear-budget")
+        guardian = self.guardian()
+        guardian.reap_descendants = unittest.mock.Mock()
+        clock = [time.monotonic()]
+        started = clock[0]
+        inventories = []
+
+        def attachments(*_args, **kwargs):
+            if 'deadline' in kwargs:
+                inventories.append(kwargs['deadline'] - started)
+                clock[0] += 4.8  # Slow final autoclear inventory, within its five seconds.
+            return [], []
+
+        def remove(*_args, deadline):
+            self.assertGreaterEqual(deadline - clock[0], 4.99)
+            return True
+
+        guardian.attachments = attachments
+        guardian.remove_runtime = remove
+        with patch.object(RUNTIME.time, "monotonic", side_effect=lambda: clock[0]):
+            guardian.release(directory)
+        self.assertEqual(inventories, [5])
 
     def deletion_boundary_race(self, kind):
         directory = self.candidate("boundary")

@@ -17,6 +17,7 @@ import ctypes
 from contextlib import contextmanager
 import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -34,8 +35,11 @@ import time
 PREFIX = "opc-sdk-fsverity-runtime."
 OWNER_ATTRIBUTE = "user.opc_sdk_fsverity_owner"
 GUARDIAN_ATTRIBUTE = "user.opc_sdk_fsverity_guardian"
+STAGING_ATTRIBUTE = "user.opc_sdk_fsverity_staging"
+STAGING_PREFIX = ".opc-sdk-fsverity-remove."
 OWNER_ID = str(Path(__file__).resolve().parent.parent).encode()
 SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+CLEANUP_HELPER_SECONDS = 30
 
 
 def within(path, directory):
@@ -161,18 +165,46 @@ def rename_new(source, name, destination, new_name):
         raise OSError(error, os.strerror(error))
 
 
-@contextmanager
-def protected_directory(parent, deadline):
-    """A same-filesystem namespace the caller cannot rename entries inside.
+def validate_parent(parent, uid, directory=None):
+    info = os.fstat(parent)
+    if info.st_uid != uid or not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o300 != 0o300:
+        raise RuntimeError("runtime parent must be writable and owned by the caller")
+    if directory is not None:
+        above = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        try:
+            if identity(above) != identity(parent):
+                raise RuntimeError("runtime parent does not contain the pinned directory")
+        finally:
+            os.close(above)
 
-    Directory descriptors alone cannot make unlinkat/rmdir conditional on an
-    inode. Their parent must also exclude untrusted writers. Find a root-owned
-    ancestor (or a root-owned sticky directory), then create our root-only
-    staging directory there. Never delete a nonempty staging directory on error.
+
+@contextmanager
+def exclusive(descriptor, deadline):
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            time.sleep(min(.05, remaining(deadline)))
+    try:
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextmanager
+def staging_root(parent, uid, deadline):
+    """Persistent, checkout-specific metadata; only root can write inside.
+
+    An empty anchor interrupted before its marker is written is safe to finish
+    initializing. Transaction creation/marking is serialized here, so an empty
+    unmarked transaction interrupted during mkdir is also recoverable. No live
+    runtime can ever be put in an unmarked transaction.
     """
     ancestor = os.dup(parent)
     descriptor = None
-    name = ".opc-sdk-fsverity-remove." + secrets.token_hex(16)
+    name = ".opc-sdk-fsverity-staging." + str(uid) + "." + hashlib.sha256(OWNER_ID).hexdigest()[:24]
+    marker = json.dumps({"owner": OWNER_ID.decode(), "uid": uid}, sort_keys=True).encode()
     try:
         device = os.fstat(parent).st_dev
         while True:
@@ -186,30 +218,75 @@ def protected_directory(parent, deadline):
                 raise RuntimeError("no protected ancestor on runtime filesystem; retaining runtime")
             os.close(ancestor)
             ancestor = above
-        os.mkdir(name, mode=0o700, dir_fd=ancestor)
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=ancestor)
+        except FileExistsError:
+            pass
         descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=ancestor)
-        os.fchmod(descriptor, 0o700)
+        info = os.fstat(descriptor)
+        if info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0 and not os.listdir(descriptor):
+            os.fchmod(descriptor, 0o700)  # Interrupted mkdir, or restrictive caller umask.
+            info = os.fstat(descriptor)
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+            raise RuntimeError("untrusted fs-verity staging root")
+        with exclusive(descriptor, deadline):
+            try:
+                observed = os.getxattr(descriptor, STAGING_ATTRIBUTE)
+            except OSError as error:
+                if error.errno != errno.ENODATA or os.listdir(descriptor):
+                    raise
+                os.setxattr(descriptor, STAGING_ATTRIBUTE, marker)
+                os.fsync(descriptor)
+                os.fsync(ancestor)
+                observed = marker
+            if observed != marker:
+                raise RuntimeError("fs-verity staging root belongs to another owner")
+            yield descriptor
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(ancestor)
+
+
+@contextmanager
+def protected_directory(parent, deadline, *, uid, transaction):
+    """Root-only transaction namespace with a durable recovery identity."""
+    descriptor = anchor = None
+    name = STAGING_PREFIX + secrets.token_hex(16)
+    try:
+        with staging_root(parent, uid, deadline) as root:
+            anchor = os.dup(root)
+            os.mkdir(name, mode=0o700, dir_fd=root)
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            os.fchmod(descriptor, 0o700)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            record = {"owner": OWNER_ID.decode(), "uid": uid, "parent": identity(parent),
+                      "pid": os.getpid(), "start": process_stat(os.getpid())[1],
+                      "boot": Path('/proc/sys/kernel/random/boot_id').read_text().strip(), **transaction}
+            os.setxattr(descriptor, STAGING_ATTRIBUTE, json.dumps(record).encode())
+            os.fsync(descriptor)
+            os.fsync(root)  # Persist authority before changing runtime ownership.
         yield descriptor
     finally:
         if descriptor is not None:
             try:
                 if not os.listdir(descriptor):
-                    os.rmdir(name, dir_fd=ancestor)
+                    os.rmdir(name, dir_fd=anchor)
                 else:
-                    print(f"fs-verity: retaining protected staging directory {name}", file=sys.stderr)
+                    print(f"fs-verity: retaining recoverable staging directory {name}", file=sys.stderr)
             finally:
                 os.close(descriptor)
-        os.close(ancestor)
+        if anchor is not None:
+            os.close(anchor)
 
 
 def create_runtime(parent, name, uid, gid, deadline):
-    info = os.fstat(parent)
-    if info.st_uid != uid or not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o300 != 0o300:
-        raise RuntimeError("runtime parent must be writable and owned by the caller")
+    validate_parent(parent, uid)
     directory = image = temporary = None
     published = False
     try:
-        with protected_directory(parent, deadline) as staging:
+        with protected_directory(parent, deadline, uid=uid,
+                                 transaction={"action": "create", "name": name}) as staging:
             os.mkdir("runtime", mode=0o700, dir_fd=staging)
             try:
                 directory = os.open("runtime", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=staging)
@@ -249,6 +326,7 @@ def create_runtime(parent, name, uid, gid, deadline):
 
 
 def remove_verified_runtime(parent, directory, image, temporary, name, uid, deadline):
+    validate_parent(parent, uid, directory)
     if not is_owned(directory, uid=uid):
         return False
     image_info, tmp_info = os.fstat(image), os.fstat(temporary)
@@ -258,7 +336,9 @@ def remove_verified_runtime(parent, directory, image, temporary, name, uid, dead
             or fcntl.fcntl(image, fcntl.F_GETLEASE) != fcntl.F_WRLCK):
         return False
     moved = False
-    with protected_directory(parent, deadline) as staging:
+    transaction = {"action": "remove", "name": name, "directory": identity(directory),
+                   "image": identity(image), "temporary": identity(temporary)}
+    with protected_directory(parent, deadline, uid=uid, transaction=transaction) as staging:
         try:
             # Freeze precisely the pinned directories. Even an actor that
             # opened these directories before staging cannot replace entries
@@ -295,6 +375,168 @@ def remove_verified_runtime(parent, directory, image, temporary, name, uid, dead
                 os.fchown(directory, uid, -1)
 
 
+def recover_transaction(parent, staging, record, uid, deadline):
+    """Resume only the pinned identities recorded before privileged takeover."""
+    name = record["name"]
+    if not name.startswith(PREFIX) or "/" in name or record["action"] not in ("create", "remove"):
+        raise RuntimeError("invalid fs-verity recovery record")
+    entries = set(os.listdir(staging))
+    if not entries <= {"runtime"}:
+        raise RuntimeError("unexpected entries in fs-verity recovery transaction")
+    location, runtime_name = (staging, "runtime") if entries else (parent, name)
+    if not entries and record["action"] == "create":
+        return True  # Published creation is caller-owned, reclaimed by ordinary sweep.
+    if not entries:
+        # A failed restore may have renamed the frozen original within this
+        # parent. Its journaled inode, not a fresh pathname match, is authority.
+        runtime_name = None
+        for candidate in os.listdir(parent):
+            remaining(deadline)
+            try:
+                if list(Guardian.entry_identity(parent, candidate)) == record["directory"]:
+                    runtime_name = candidate
+                    break
+            except FileNotFoundError:
+                continue
+        if runtime_name is None:
+            return True
+    try:
+        directory = os.open(runtime_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=location)
+    except FileNotFoundError:
+        return False
+    temporary = image = None
+    leased = False
+    previous = signal.signal(signal.SIGIO, lambda *_args: None)
+    try:
+        info = os.fstat(directory)
+        if record["action"] == "remove" and list(identity(directory)) != record["directory"]:
+            if location == staging:
+                # The interrupted helper moved a substituted object. Preserve
+                # it by moving it back; never delete or chown that foreign inode.
+                try:
+                    rename_new(staging, "runtime", parent, name)
+                except FileExistsError:
+                    rename_new(staging, "runtime", parent, PREFIX + "restored." + secrets.token_hex(16))
+            return False
+        if info.st_uid not in (0, uid) or stat.S_IMODE(info.st_mode) != 0o700:
+            return
+        if record["action"] == "remove" and not is_owned(directory, uid=info.st_uid):
+            return
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        # Creation may have stopped before its first child/marker was made;
+        # only an authenticated, root-only create transaction permits that.
+        contents = set(os.listdir(directory))
+        if not contents <= {"ext4.img", "tmp"}:
+            return
+        if "tmp" in contents:
+            temporary = os.open("tmp", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            tmp_info = os.fstat(temporary)
+            if (tmp_info.st_uid not in (0, uid) or stat.S_IMODE(tmp_info.st_mode) not in (0, 0o700)
+                    or os.listdir(temporary) or tmp_info.st_dev != info.st_dev
+                    or record["action"] == "remove" and list(identity(temporary)) != record["temporary"]):
+                return
+        if "ext4.img" in contents:
+            node = os.open("ext4.img", os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            try:
+                image_info = os.fstat(node)
+                if (not stat.S_ISREG(image_info.st_mode) or image_info.st_uid not in (0, uid)
+                        or image_info.st_nlink != 1
+                        or record["action"] == "remove" and list(identity(node)) != record["image"]):
+                    return
+                image = os.open(f"/proc/self/fd/{node}", os.O_RDWR | os.O_CLOEXEC)
+            finally:
+                os.close(node)
+            try:
+                fcntl.fcntl(image, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+                leased = True
+            except OSError as error:
+                if error.errno in (errno.EAGAIN, errno.EINVAL, errno.ENOTSUP):
+                    return
+                raise
+        loops, mounts = Guardian(-1).inventory(deadline=deadline)
+        path = os.readlink(f"/proc/self/fd/{directory}")
+        backing = identity(image) if image is not None else record.get("image")
+        if (any(within(mount["target"], path) for mount in mounts)
+                or backing is not None and any(
+                    (loop["back-maj:min"], loop["back-ino"]) ==
+                    (f"{os.major(backing[0])}:{os.minor(backing[0])}", backing[1]) for loop in loops)):
+            return
+        os.fchown(directory, 0, -1)
+        os.fchmod(directory, 0o700)
+        if temporary is not None:
+            os.fchown(temporary, 0, -1)
+            os.fchmod(temporary, 0o700)
+        if (set(os.listdir(directory)) != contents
+                or image is not None and Guardian.entry_identity(directory, "ext4.img") != identity(image)
+                or temporary is not None and (os.listdir(temporary)
+                    or Guardian.entry_identity(directory, "tmp") != identity(temporary))):
+            raise RuntimeError("runtime entries changed during recovery")
+        if location != staging:
+            remaining(deadline)
+            rename_new(parent, runtime_name, staging, "runtime")
+        # Only the root helper can replace bindings inside staging now.
+        if Guardian.entry_identity(staging, "runtime") != identity(directory):
+            raise RuntimeError("runtime binding changed during recovery")
+        if image is not None:
+            if fcntl.fcntl(image, fcntl.F_GETLEASE) != fcntl.F_WRLCK:
+                return
+            os.unlink("ext4.img", dir_fd=directory)
+        if temporary is not None:
+            os.rmdir("tmp", dir_fd=directory)
+        os.rmdir("runtime", dir_fd=staging)
+        return True
+    finally:
+        if leased:
+            fcntl.fcntl(image, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+        signal.signal(signal.SIGIO, previous)
+        for descriptor in (image, temporary, directory):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def recover_staging(parent, uid, deadline):
+    validate_parent(parent, uid)
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    with staging_root(parent, uid, deadline) as root:
+        for name in os.listdir(root):
+            remaining(deadline)
+            if not name.startswith(STAGING_PREFIX):
+                continue
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            try:
+                info = os.fstat(descriptor)
+                if info.st_uid != 0 or stat.S_IMODE(info.st_mode) not in (0, 0o700):
+                    continue
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                try:
+                    record = json.loads(os.getxattr(descriptor, STAGING_ATTRIBUTE))
+                except OSError as error:
+                    if error.errno == errno.ENODATA and not os.listdir(descriptor):
+                        os.rmdir(name, dir_fd=root)  # Stopped before recording any resources.
+                        continue
+                    raise
+                if (record.get("owner") != OWNER_ID.decode() or record.get("uid") != uid
+                        or record.get("parent") != list(identity(parent))):
+                    continue
+                if record.get("boot") == boot:
+                    try:
+                        if process_stat(record["pid"])[1] == record["start"]:
+                            continue
+                    except (ProcessLookupError, FileNotFoundError):
+                        pass
+                completed = recover_transaction(parent, descriptor, record, uid, deadline)
+                if completed and not os.listdir(descriptor):
+                    os.rmdir(name, dir_fd=root)
+            finally:
+                os.close(descriptor)
+
+
 def privileged_helper(address, parent, deadline):
     """Pinned caller-owned resources; destructive operations exclude writers."""
     descriptors = []
@@ -309,7 +551,9 @@ def privileged_helper(address, parent, deadline):
         request, descriptors = receive_message(connection)
         try:
             operation = request["operation"]
-            if operation in ("create", "remove"):
+            if operation == "recover":
+                recover_staging(descriptors[0], uid, deadline)
+            elif operation in ("create", "remove"):
                 name = request["name"]
                 if not name.startswith(PREFIX) or "/" in name:
                     raise RuntimeError("invalid owned runtime name")
@@ -629,7 +873,8 @@ class Guardian:
             remaining(deadline)
             result = {}
             privileged_request("remove", [parent, descriptor, image, temporary],
-                               name=directory.name, deadline=deadline, result=result)
+                               name=directory.name, deadline=time.monotonic() + CLEANUP_HELPER_SECONDS,
+                               result=result)
             return result["removed"]
         finally:
             if leased:
@@ -647,6 +892,7 @@ class Guardian:
         parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         try:
             with self.startup_lock(parent):
+                privileged_request("recover", [parent], deadline=time.monotonic() + CLEANUP_HELPER_SECONDS)
                 for name in os.listdir(parent):
                     if not name.startswith(PREFIX):
                         continue
@@ -715,7 +961,7 @@ class Guardian:
                     time.sleep(min(.05, remaining(deadline)))
                 if errors:
                     raise RuntimeError(f"descendant cleanup failed: {errors}")
-                if not self.remove_runtime(directory, descriptor, parent, deadline=deadline):
+                if not self.remove_runtime(directory, descriptor, parent, deadline=time.monotonic() + 5):
                     raise RuntimeError("runtime ownership/layout changed; retaining it")
         finally:
             if borrowed:

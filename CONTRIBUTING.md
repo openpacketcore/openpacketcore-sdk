@@ -91,6 +91,15 @@ exists the gate fails closed. Removal freezes the pinned directory inodes,
 moves the runtime into that protected namespace, verifies its identity there,
 and only then removes its checked entries. Failed identity checks preserve the
 objects and restore their ownership.
+The helper keeps a small, root-owned recovery metadata directory for this
+checkout and caller in that protected ancestor (for example `/home` or `/tmp`).
+Each staging transaction records its caller, checkout, parent and object
+identities and helper process identity before taking ownership. Startup resumes
+dead transactions, including frozen runtimes still in the scratch parent and
+partly created or removed runtimes in staging. Live, locked, open or attached
+resources are preserved for a later sweep; no manual root cleanup is needed.
+The five-second loop-autoclear bound remains separate from inventory and the
+bounded privileged-removal round trip.
 Mounts use a separate namespace with slave propagation: owner mounts cannot
 reach other jobs. Host unmounts propagate into the owner when the upstream host
 mount is shared, as on the hosted runners and standard systemd hosts; a private
