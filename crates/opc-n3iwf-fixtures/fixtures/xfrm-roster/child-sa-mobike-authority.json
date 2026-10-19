@@ -4,7 +4,7 @@
   "context": {
     "source_vector": {
       "path": "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json",
-      "sha256": "b092689801a0f85e2d32580ee5ab66b9a103291aa5db36baaf55d815504b3f55",
+      "sha256": "76fee6c1a58eb38aa89ff39bf8fd4e0a29f8048e40a294abbef8639e9c9bbd97",
       "case": "mobike-authority"
     },
     "cases": 11,
@@ -56,7 +56,7 @@
   ],
   "wire": {
     "path": "wire/child-sa-mobike-authority.hex",
-    "digest_sha256": "0197535d2a56ec150365fc6907e2e8e49116fdddb9fdb71eb0669263db470776"
+    "digest_sha256": "e4e65437de0c0ae393c37d9b414d51647b22d6d2d4d698bbdf681fa69724e09a"
   },
   "semantic_assertions": [
     "family=mobike-authority",

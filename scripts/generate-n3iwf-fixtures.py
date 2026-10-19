@@ -3265,7 +3265,7 @@ def xfrm_roster_lifecycle(subset_dir: Path) -> list[dict]:
 
 def xfrm_child_sa_profiles(subset_dir: Path) -> list[dict]:
     source = "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json"
-    digest = "b092689801a0f85e2d32580ee5ab66b9a103291aa5db36baaf55d815504b3f55"
+    digest = "76fee6c1a58eb38aa89ff39bf8fd4e0a29f8048e40a294abbef8639e9c9bbd97"
     path = ROOT / source
     if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         raise ValueError("n3iwf_child_sa_profile_digest")
