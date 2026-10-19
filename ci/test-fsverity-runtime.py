@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import resource
 import select
 import shlex
@@ -86,6 +87,64 @@ class SafetyTests(unittest.TestCase):
         guardian = RUNTIME.Guardian(-1)
         guardian.inventory = lambda **_kwargs: ([], [])
         return guardian
+
+    def test_documented_scratch_root_survives_build_output_cleanup(self):
+        documentation = (ROOT / "CONTRIBUTING.md").read_text()
+        match = re.search(r'RUNNER_TEMP="\$PWD/([^"]+)"', documentation)
+        self.assertIsNotNone(match, "document one checkout-relative stable scratch root")
+        relative = Path(match.group(1))
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        target = checkout / "target"
+        target.mkdir()
+        scratch = checkout / relative
+        scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            # Exercise removal/recreation of build output without touching a
+            # real development cache or invoking cargo clean on this checkout.
+            shutil.rmtree(target)
+            target.mkdir()
+            self.assertTrue(scratch.is_dir(), "build-output cleanup deleted the recovery parent")
+            self.assertEqual((scratch.stat().st_dev, scratch.stat().st_ino), RUNTIME.identity(descriptor))
+        finally:
+            os.close(descriptor)
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--no-index", "--stdin"], cwd=ROOT,
+            input=str(relative / "recovery-record") + "\n", text=True,
+            capture_output=True, timeout=5,
+        )
+        self.assertEqual(ignored.returncode, 0, "the stable scratch root must be gitignored")
+
+    def test_privileged_helper_normalizes_umask_before_opening_resources(self):
+        program = '''
+import importlib.util,json,os,stat,sys,time
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('runtime',sys.argv[1])
+runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
+os.umask(int(sys.argv[3],8))
+class ReachedBoundary(Exception): pass
+def socket_boundary(*args,**kwargs):
+    path=Path(sys.argv[2])/'entry-runtime'
+    path.mkdir(mode=0o700)
+    mode=stat.S_IMODE(path.stat().st_mode)
+    path.rmdir()
+    mask=os.umask(0o077);os.umask(mask)
+    print(json.dumps([mask,mode]))
+    raise ReachedBoundary
+runtime.socket.socket=socket_boundary
+try: runtime.privileged_helper('unused',os.getpid(),time.monotonic()+5)
+except ReachedBoundary: pass
+'''
+        for mask in (0o177, 0o777):
+            with self.subTest(umask=oct(mask)):
+                result = subprocess.run(
+                    ["python3", "-I", "-c", program, str(HARNESS.with_name("fsverity-runtime.py")),
+                     str(self.root), oct(mask)],
+                    check=True, capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(json.loads(result.stdout), [0o077, 0o700],
+                                 "privileged entry must create private searchable directories on first use")
 
     def anchor_probe(self, program):
         # A synthetic checkout below a fixture-owned protected ancestor keeps
