@@ -23,7 +23,7 @@ def workflow_commands(directory: Path, slice_name: str) -> list[list[str]]:
     """Capture shell-expanded argv from the required workflow step."""
     matches = re.findall(
         r"^      - name: Run opc-session-net tests on i686\n"
-        r"(?:(?:        #[^\n]*|)\n)*        run: \|\n"
+        r"(?:(?:        (?:#[^\n]*|shell: [^\n]*)|)\n)*        run: \|\n"
         r"((?:(?:          [^\n]*|)\n)+)",
         WORKFLOW.read_text(),
         re.MULTILINE,
