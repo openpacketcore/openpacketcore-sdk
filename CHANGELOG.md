@@ -770,6 +770,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: wait for the initial record on every replica before
+  injecting owner or fence drift in the renewal fixture. Exercise a lagging
+  follower deterministically so quorum acknowledgement cannot race the direct
+  database edits.
+
 - `opc-proto-diameter`: require request-bound authenticated peer evidence for
   SWm emergency authorization, including both answers in identity recovery.
   `correlate_answer_from_connection` retains the existing wire checks and

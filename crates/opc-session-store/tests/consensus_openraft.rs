@@ -4059,6 +4059,15 @@ async fn fenced_transition_renew_rejects_record_owner_or_fence_mismatch() {
     drop(lagging_connection);
     replication_gate.holding.store(false, Ordering::SeqCst);
 
+    // Quorum acknowledgement does not wait for every follower. Each public
+    // read waits for its local applied barrier before we inject record drift.
+    for (index, replica) in cluster.stores.iter().enumerate() {
+        assert!(
+            matches!(replica.get(&key).await, Ok(Some(record)) if record == original),
+            "replica {index} applies the original record before fault injection"
+        );
+    }
+
     // Mutate only the persisted record in every temporary replica. The lease
     // rows remain intact, so each renewal request below is otherwise currently
     // valid and may reach the record-ownership admission check.
