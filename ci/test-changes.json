@@ -227,6 +227,27 @@
       "kind": "assertions-decreased",
       "reason": "Explicit SDK-generated volume enrollment moves deterministic-key and manifest construction into fixture setup; retained enrolled values replace later reconstruction. Replacement requests still verify real key possession, but use the SDK signer through Fleet/Network accessors that the static helper graph does not fully resolve. Existing operation-result and state assertions, durability checks and timing bounds remain; no test is disabled or given a longer bound.",
       "issue": 1330
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::sa_init_crypto::tests::skeyseed_matches_existing_epdg_vector",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::sa_init_crypto::tests::skeyseed_matches_synthetic_peer16_local32_vector",
+      "reason": "Rename the synthetic SKEYSEED check to identify its peer-16/local-32 nonce inputs. The positive vector and assertions are retained.",
+      "issue": 476
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::sa_init_crypto::tests::initial_exchange_legacy_sha512_nonce_policy_is_coherent_and_rekeys_stay_strict",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::sa_init_crypto::tests::legacy_sha512_nonce_policies_preserve_peer16_and_enforce_local32",
+      "reason": "Rename the legacy SHA2-512 nonce-policy check to describe peer-16 acceptance and the local-32 floor in initial and rekey derivation. The existing positive vectors and rejection assertions are retained.",
+      "issue": 476
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::ikev2::tests::initial_exchange_legacy_sha512_nonce_policy_maps_only_initial_child_keys",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-ipsec-xfrm::lib=lib::ikev2::tests::initial_child_xfrm_mapping_preserves_legacy_sha512_peer_nonce",
+      "reason": "Rename the initial XFRM mapping check to identify legacy SHA2-512 peer-nonce acceptance. Known-answer crypt/auth keys and below-floor rejection assertions are retained with an explicit local responder role.",
+      "issue": 476
     }
   ]
 }
