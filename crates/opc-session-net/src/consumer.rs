@@ -18318,7 +18318,9 @@ impl PersistentPreparedCompareAndSetToken {
         let client = self.router.receipt_client(&self.state.status_cursor);
         match client.ensure_warm_request_capacity_before(deadline).await {
             Ok(()) => {}
-            Err(SessionConsumerClientError::Scope) => {
+            Err(
+                SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked,
+            ) => {
                 return self.terminal_receipt(Err(
                     PreparedCompareAndSetStatusError::TopologyAuthorityRevoked,
                 ));
@@ -18332,14 +18334,32 @@ impl PersistentPreparedCompareAndSetToken {
         if deadline <= now {
             return Err(PreparedCompareAndSetStatusError::Deadline);
         }
-        let attempt_deadline = deadline.min(
-            now.checked_add(self.budget.physical_attempt_timeout())
-                .ok_or(PreparedCompareAndSetStatusError::Deadline)?,
-        );
+        let budget =
+            PreparedCheckpointBudget::new(deadline, self.budget.physical_attempt_timeout())
+                .map_err(|_| PreparedCompareAndSetStatusError::Deadline)?;
+        let SessionConsumerOperation::CompareAndSetStatus { request } =
+            self.receipt_request().operation()
+        else {
+            return Err(PreparedCompareAndSetStatusError::Unavailable);
+        };
         let result = match client
-            .execute_classified_before(self.receipt_request(), attempt_deadline, 1)
+            .execute_v1_read_with_budget(
+                DeadlineV1Read::CompareAndSetStatus(request.clone()),
+                budget,
+            )
             .await
         {
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::ScopeMismatch
+                | SessionConsumerRejection::TopologyMismatch
+                | SessionConsumerRejection::Unauthorized,
+            )) => Err(PreparedCompareAndSetStatusError::TopologyAuthorityRevoked),
+            Err(error) if deadline_read::read_authority_revoked(&error) => {
+                Err(PreparedCompareAndSetStatusError::TopologyAuthorityRevoked)
+            }
+            Ok(_) if tokio::time::Instant::now() >= deadline => {
+                Err(PreparedCompareAndSetStatusError::Deadline)
+            }
             Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
                 SessionConsumerCompareAndSetStatus::Recorded(
                     SessionConsumerCompareAndSetReceiptOutcome::Applied,
@@ -18367,13 +18387,6 @@ impl PersistentPreparedCompareAndSetToken {
             Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
                 SessionConsumerCompareAndSetStatus::NotFound,
             ))) => Ok(PreparedCasStatus::NotFound),
-            Ok(SessionConsumerResponse::Rejected(
-                SessionConsumerRejection::ScopeMismatch
-                | SessionConsumerRejection::TopologyMismatch,
-            ))
-            | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope)) => {
-                Err(PreparedCompareAndSetStatusError::TopologyAuthorityRevoked)
-            }
             Ok(_) | Err(_) => Err(PreparedCompareAndSetStatusError::Unavailable),
         };
         match result {
@@ -18680,7 +18693,9 @@ impl PersistentPreparedLeaseAcquireToken {
         let client = self.router.receipt_client(&self.state.status_cursor);
         match client.ensure_warm_request_capacity_before(deadline).await {
             Ok(()) => {}
-            Err(SessionConsumerClientError::Scope) => {
+            Err(
+                SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked,
+            ) => {
                 return self.terminal_receipt(Err(
                     PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked,
                 ));
@@ -18694,19 +18709,33 @@ impl PersistentPreparedLeaseAcquireToken {
         if deadline <= now {
             return Err(PreparedLeaseAcquireStatusError::Deadline);
         }
-        let deadline = deadline.min(
-            now.checked_add(self.budget.physical_attempt_timeout())
-                .ok_or(PreparedLeaseAcquireStatusError::Deadline)?,
-        );
+        let budget =
+            PreparedCheckpointBudget::new(deadline, self.budget.physical_attempt_timeout())
+                .map_err(|_| PreparedLeaseAcquireStatusError::Deadline)?;
+        let SessionConsumerOperation::LeaseMutationStatus { request } =
+            self.receipt_request().operation()
+        else {
+            return Err(PreparedLeaseAcquireStatusError::Unavailable);
+        };
         let result = match client
-            .execute_classified_before(self.receipt_request(), deadline, 1)
+            .execute_v1_read_with_budget(
+                DeadlineV1Read::LeaseMutationStatus(request.clone()),
+                budget,
+            )
             .await
         {
-            Ok(SessionConsumerResponse::LeaseMutationStatus(Ok(status))) => Ok(status),
-            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch))
-            | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope)) => {
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::ScopeMismatch
+                | SessionConsumerRejection::TopologyMismatch
+                | SessionConsumerRejection::Unauthorized,
+            )) => Err(PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked),
+            Err(error) if deadline_read::read_authority_revoked(&error) => {
                 Err(PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked)
             }
+            Ok(_) if tokio::time::Instant::now() >= deadline => {
+                Err(PreparedLeaseAcquireStatusError::Deadline)
+            }
+            Ok(SessionConsumerResponse::LeaseMutationStatus(Ok(status))) => Ok(status),
             Ok(_) | Err(_) => Err(PreparedLeaseAcquireStatusError::Unavailable),
         };
         match result {

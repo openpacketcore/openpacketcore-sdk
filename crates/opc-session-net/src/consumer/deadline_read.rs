@@ -9,6 +9,8 @@ use opc_session_store::{FencedTransitionV2HistoryState, FencedTransitionV2Reques
 pub(super) enum DeadlineV1Read {
     Get(opc_session_store::SessionKey),
     PreflightRecordExpiry(Vec<RecordExpiryPreflight>),
+    CompareAndSetStatus(Box<SessionConsumerCompareAndSetRequest>),
+    LeaseMutationStatus(Box<SessionConsumerLeaseMutationRequest>),
 }
 
 pub(super) enum DeadlineV2Read {
@@ -145,16 +147,28 @@ impl PersistentSessionConsumerClient {
         read: DeadlineV1Read,
         budget: PreparedCheckpointBudget,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
-        let operation = match read {
-            DeadlineV1Read::Get(key) => SessionConsumerOperation::Get { key },
-            DeadlineV1Read::PreflightRecordExpiry(preflights) => {
-                SessionConsumerOperation::PreflightRecordExpiry { preflights }
-            }
+        let (request_id, operation) = match read {
+            DeadlineV1Read::Get(key) => (
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::Get { key },
+            ),
+            DeadlineV1Read::PreflightRecordExpiry(preflights) => (
+                SessionConsumerRequestId::new(),
+                SessionConsumerOperation::PreflightRecordExpiry { preflights },
+            ),
+            DeadlineV1Read::CompareAndSetStatus(request) => (
+                request.request_id(),
+                SessionConsumerOperation::CompareAndSetStatus { request },
+            ),
+            DeadlineV1Read::LeaseMutationStatus(request) => (
+                request.request_id(),
+                SessionConsumerOperation::LeaseMutationStatus { request },
+            ),
         };
         let boundary = call_boundary(&self.pool.client, tokio::time::Instant::now(), budget);
         let result = self
             .execute_classified_with_deadlines(
-                &self.request(SessionConsumerRequestId::new(), operation),
+                &self.request(request_id, operation),
                 budget.original_deadline(),
                 1,
                 Some(boundary),
@@ -233,7 +247,7 @@ pub(super) async fn settle_v1_read_result(
     result
 }
 
-fn read_authority_revoked(error: &SessionConsumerCallError) -> bool {
+pub(super) fn read_authority_revoked(error: &SessionConsumerCallError) -> bool {
     matches!(
         error,
         SessionConsumerCallError::BeforeCallWrite(

@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a fresh installation with no migration; consumer manifest publication and
   automatic replacement remain required before advertising the capability.
 
+- `opc-session-store`: add the local-only
+  `StoreError::FencedTransitionRecoveryJournalUnavailable` variant; exhaustive
+  matches must handle it. Existing serialized discriminants remain unchanged,
+  and consumer wire errors continue to expose ordinary unavailability. The
+  typed condition alone grants no preparation retry or proof of non-execution.
+
 - `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
   `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
   must handle both variants. (#1334)
@@ -813,6 +819,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-session-net`: preserve valid slow quorum replies until the caller's
+  original deadline for protected history, expiry and receipt reads, including
+  prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight
+  and V2 history methods also bypass the ordinary response timeout. Setup and
+  Call write keep their existing caps, mutations keep their physical budgets,
+  and an unanswered written read cannot trigger speculative voter failover.
 
 - `opc-session-store`: wait for the initial record on every replica before
   injecting owner or fence drift in the renewal fixture. Exercise a lagging

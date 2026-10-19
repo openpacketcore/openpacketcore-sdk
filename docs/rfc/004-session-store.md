@@ -2278,13 +2278,41 @@ authority revocation and MUST be returned as rejected
 Receipt status is read-only. A single status call uses the next deterministic
 canonical successor voter. A status-until-terminal call repeats bounded
 canonical-roster passes under the single immutable caller absolute deadline,
-with every physical attempt additionally capped by the prepared
-physical-attempt budget. It can end with a deadline; `NotFound`, unavailable,
-or a per-attempt deadline remains nonterminal while outer budget remains. None
-is proof that a delayed mutation cannot commit. A terminal receipt is cached
-locally. Restart recovery returns only the status-only
+with one physical read in flight. Pool admission, setup and Call write retain
+the physical-attempt cap and any earlier configured limit. Once written, the
+read MAY wait for its response until the caller's remaining original deadline;
+the ordinary persistent operation timeout MUST NOT discard an otherwise valid
+response sooner. A reply or a proven pre-write failure permits the next voter.
+An unanswered written read, including a closed transport without a response,
+MUST consume the remaining deadline without speculative failover. Observed
+authority revocation remains terminal immediately, and completions at or after
+the deadline MUST NOT establish a result. `NotFound`, unavailable replies and
+pre-write failures remain nonterminal while outer budget remains. None proves
+that a delayed mutation cannot commit or removes an ambiguity marker. A
+terminal receipt is cached locally. Restart recovery returns only the status-only
 `SessionConsumerRecoveredFencedTransitionStatus` handle; it deliberately has
 no execute authority, even if the recovered token is otherwise valid.
+
+The same response-deadline contract covers protected V1/V2 expiry preflights,
+V2 history reads and prepared CAS/lease receipt lookups. Prepared checkpoint
+receipts retain their existing separate warmup admission before the physical
+Call budget. Mutation attempt limits and end-to-end deadlines MUST NOT increase.
+For ordinary persistent reads, callers explicitly supply their existing
+`PreparedCheckpointBudget` to `get_with_budget`,
+`preflight_record_expiry_with_budget`, or
+`fenced_transition_v2_history_state_with_budget`; legacy methods without a
+caller deadline retain their configured operation timeout. The net-private
+request types can express only the corresponding reads, never a transition,
+batch or void. Callers owning a stricter lease deadline MUST pass the earlier
+deadline rather than create a fresh response budget.
+
+`StoreError::FencedTransitionRecoveryJournalUnavailable` identifies failure to
+access or authenticate the local protected V2 recovery journal. It is distinct
+from a live-owner conflict and from remote unavailability. Frozen consumer wire
+errors map it to ordinary unavailability, so a remote error or matching message
+cannot grant local journal authority. The typed condition alone MUST NOT permit
+preparation again: an ordered lookup must still establish absence of the exact
+retained identity within the original caller budget.
 
 `SessionConsumerPreparedFencedTransitionV2Backend` (#982) is the protected
 consumer facade for #702's epoch-fenced V2 protocol. It has the V1 facade's

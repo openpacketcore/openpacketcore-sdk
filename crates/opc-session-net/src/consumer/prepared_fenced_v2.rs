@@ -493,8 +493,8 @@ impl ActivatedFencedTransitionV2Backend {
         self.router.clients.len()
     }
 
-    /// The per-attempt deadline installed by the handle, or a fresh
-    /// read-attempt cap bounded by this adapter's immutable deadline.
+    /// The mutation deadline installed by the handle, or a fresh mutation
+    /// attempt cap bounded by this adapter's immutable deadline.
     fn attempt_deadline(&self) -> Option<tokio::time::Instant> {
         let deadline = self.route.attempt_deadline().unwrap_or_else(|| {
             tokio::time::Instant::now()
@@ -1535,10 +1535,9 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                     break;
                 }
             };
-            // Status is read-only, so one unavailable voter moves the row's
-            // read to the next canonical voter. Each physical call advances
-            // the sweep's status cursor, and one row makes at most one
-            // attempt per voter before the sweep stops as interrupted.
+            // A reply or pre-write failure permits the next canonical voter.
+            // A written read without a reply consumes the remaining sweep
+            // deadline. Each row submits at most one read per voter.
             let mut status = None;
             for _ in 0..voter_count {
                 if tokio::time::Instant::now() >= deadline {
