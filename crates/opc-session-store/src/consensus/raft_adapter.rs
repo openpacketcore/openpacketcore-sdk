@@ -1350,6 +1350,60 @@ impl SessionRaftRpcHandler {
         self
     }
 
+    /// Answer only after the caller has checked durable authority, voting
+    /// admission, persistence policy, and the authenticated candidate identity.
+    pub(crate) async fn pre_vote_after_admission(
+        &self,
+        rpc: PreVoteRequest<SessionConsensusNodeId>,
+    ) -> Result<PreVoteResponse<SessionConsensusNodeId>, Box<RaftError<SessionConsensusNodeId>>>
+    {
+        let fixed_members = self
+            .fixed_quorum_admission
+            .as_ref()
+            .is_some_and(|authority| {
+                authority.members.contains(&self.local_node_id)
+                    && rpc
+                        .vote
+                        .leader_id()
+                        .voted_for()
+                        .is_some_and(|candidate| authority.members.contains(&candidate))
+            });
+        if fixed_members {
+            let proposed = rpc.vote;
+            let response = self
+                .raft
+                .with_raft_state(move |state| {
+                    // The canonical initializer may have missed its first
+                    // campaign before these peers started. Their durable fixed
+                    // topology supplies voting eligibility until replication
+                    // supplies engine membership. Inspect one serialized state;
+                    // never seed a log, persist a vote, or renew an election timer.
+                    if state.log_ids != Default::default()
+                        || state.membership_state != Default::default()
+                        || state.committed.is_some()
+                        || state.snapshot_meta != Default::default()
+                        || state.vote_ref().is_committed()
+                    {
+                        return None;
+                    }
+                    // An empty log is necessarily no fresher than the candidate's.
+                    // A prior unsuccessful real vote is allowed, but a committed
+                    // leader vote always delegates to the engine's lease checks.
+                    Some(PreVoteResponse::new(
+                        state.vote_ref(),
+                        None,
+                        !proposed.is_committed() && &proposed > state.vote_ref(),
+                    ))
+                })
+                .await
+                .map_err(RaftError::Fatal)?;
+            if let Some(response) = response {
+                return Ok(response);
+            }
+        }
+        self.raft.pre_vote(rpc).await.map_err(Box::new)
+    }
+
     /// Handle a raw engine RPC using the complete inbound operation deadline.
     ///
     /// The durable fixed-quorum authority record is checked at this final
@@ -1559,7 +1613,7 @@ impl SessionRaftRpcHandler {
                 if !persistence.permits_pre_vote(&rpc) {
                     return rejected_response(SessionConsensusPeerError::Rejected);
                 }
-                encode_engine_result(&self.raft.pre_vote(rpc).await)
+                encode_engine_result(&self.pre_vote_after_admission(rpc).await)
             }
             SessionConsensusRpcFamily::InstallSnapshot => {
                 let rpc = match decode_and_bind_sender::<
@@ -2670,6 +2724,8 @@ mod tests {
         backend: SqliteSessionBackend,
         raft: SessionRaft,
         #[cfg(target_os = "linux")]
+        wal: Option<Arc<crate::sqlite::consensus::wal::Wal>>,
+        #[cfg(target_os = "linux")]
         state_machine: storage::SqliteConsensusStateMachine,
         handler: SessionRaftRpcHandler,
         scope: SessionConsensusIdentity,
@@ -2774,6 +2830,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             authority_backoff,
         );
+        #[cfg(target_os = "linux")]
+        let wal = log_store.private_wal();
         let raft = SessionRaft::new(
             local,
             Arc::new(
@@ -2796,6 +2854,8 @@ mod tests {
             _temp: temp,
             backend,
             raft,
+            #[cfg(target_os = "linux")]
+            wal,
             #[cfg(target_os = "linux")]
             state_machine: snapshot_state_machine,
             handler,
@@ -2963,6 +3023,195 @@ mod tests {
             .await
             .expect("voter engine still handles protocol traffic after receiver replacement");
         fixture.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fixed_bootstrap_pre_vote_is_read_only_and_preserves_election_guards() {
+        async fn saved_vote(
+            fixture: &FixedFollowerFixture,
+        ) -> Option<Vote<SessionConsensusNodeId>> {
+            use rusqlite::OptionalExtension;
+
+            #[cfg(target_os = "linux")]
+            if let Some(wal) = &fixture.wal {
+                return crate::sqlite::consensus::wal::adapter::WalLogStore::new(Arc::clone(wal))
+                    .read_vote()
+                    .await
+                    .unwrap();
+            }
+            rusqlite::Connection::open(fixture._temp.path().join("sessions.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT vote_json FROM consensus_vote WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .unwrap()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        }
+
+        for selected in [
+            FixedAuthorityBackend::Sqlite,
+            #[cfg(target_os = "linux")]
+            FixedAuthorityBackend::Native,
+        ] {
+            let fixture = fixed_follower_fixture(Duration::from_secs(1), false, selected).await;
+            fixture.raft.runtime_config().elect(false);
+            let last_log_id = Some(LogId::new(CommittedLeaderId::new(1, fixture.leader), 0));
+            let wire = |scope, sender, vote| {
+                SessionConsensusWireRequest::try_new(
+                    scope,
+                    sender,
+                    SessionConsensusRpcFamily::PreVote,
+                    encode_bounded(&PreVoteRequest::new(vote, last_log_id)).unwrap(),
+                )
+                .unwrap()
+            };
+            let decode = |response: SessionConsensusWireResponse| {
+                let result: Result<
+                    PreVoteResponse<SessionConsensusNodeId>,
+                    RaftError<SessionConsensusNodeId>,
+                > = decode_bounded(&response.result.unwrap()).unwrap();
+                result.unwrap()
+            };
+
+            for actual_vote in [None, Some(Vote::new(7, fixture.leader))] {
+                if let Some(vote) = actual_vote {
+                    let request = SessionConsensusWireRequest::try_new(
+                        fixture.scope,
+                        fixture.leader,
+                        SessionConsensusRpcFamily::Vote,
+                        encode_bounded(&VoteRequest::new(vote, last_log_id)).unwrap(),
+                    )
+                    .unwrap();
+                    let response = fixture.handler.handle(fixture.leader, request).await;
+                    let result: Result<
+                        VoteResponse<SessionConsensusNodeId>,
+                        RaftError<SessionConsensusNodeId>,
+                    > = decode_bounded(&response.result.unwrap()).unwrap();
+                    assert!(result.unwrap().vote_granted);
+                }
+                let before = fixture
+                    .raft
+                    .with_raft_state(|state| state.clone())
+                    .await
+                    .unwrap();
+                let before_saved = saved_vote(&fixture).await;
+                assert_eq!(before_saved, actual_vote);
+                for (proposed, expected) in [
+                    (Vote::new(42, fixture.leader), true),
+                    (Vote::new_committed(42, fixture.leader), false),
+                    (Vote::new(6, fixture.leader), actual_vote.is_none()),
+                    (Vote::new(7, fixture.leader), actual_vote.is_none()),
+                    (Vote::new(8, fixture.leader), true),
+                ] {
+                    let response = decode(
+                        fixture
+                            .handler
+                            .handle(
+                                fixture.leader,
+                                wire(fixture.scope, fixture.leader, proposed),
+                            )
+                            .await,
+                    );
+                    assert_eq!(
+                        response.vote_granted, expected,
+                        "{selected:?}: {proposed:?}"
+                    );
+                    assert_eq!(&response.vote, before.vote_ref());
+                    assert_eq!(response.last_log_id, None);
+                    assert_eq!(
+                        fixture
+                            .raft
+                            .with_raft_state(|state| state.clone())
+                            .await
+                            .unwrap(),
+                        before
+                    );
+                    assert_eq!(saved_vote(&fixture).await, before_saved);
+                }
+
+                let mut dynamic = fixture.handler.clone();
+                dynamic.fixed_quorum_admission = None;
+                assert!(
+                    !decode(
+                        dynamic
+                            .handle(
+                                fixture.leader,
+                                wire(fixture.scope, fixture.leader, Vote::new(42, fixture.leader))
+                            )
+                            .await
+                    )
+                    .vote_granted
+                );
+                for (scope, sender, candidate) in [
+                    (identity(0x82), fixture.leader, fixture.leader),
+                    (fixture.scope, node_id(9), node_id(9)),
+                    (fixture.scope, fixture.leader, node_id(3)),
+                ] {
+                    assert_eq!(
+                        fixture
+                            .handler
+                            .handle(sender, wire(scope, sender, Vote::new(42, candidate)))
+                            .await
+                            .result,
+                        Err(SessionConsensusPeerError::ScopeMismatch),
+                    );
+                }
+                assert_eq!(
+                    fixture
+                        .raft
+                        .with_raft_state(|state| state.clone())
+                        .await
+                        .unwrap(),
+                    before
+                );
+                assert_eq!(saved_vote(&fixture).await, before_saved);
+            }
+
+            // Even an empty heartbeat proves a leader existed. The fixed
+            // bootstrap reply must not bypass the engine's leader-lease guard.
+            let response = fixture
+                .raft
+                .append_entries(AppendEntriesRequest {
+                    vote: Vote::new_committed(7, fixture.leader),
+                    prev_log_id: None,
+                    entries: vec![],
+                    leader_commit: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(response, AppendEntriesResponse::Success);
+            let before = fixture
+                .raft
+                .with_raft_state(|state| state.clone())
+                .await
+                .unwrap();
+            let before_saved = saved_vote(&fixture).await;
+            assert!(
+                !decode(
+                    fixture
+                        .handler
+                        .handle(
+                            fixture.leader,
+                            wire(fixture.scope, fixture.leader, Vote::new(42, fixture.leader))
+                        )
+                        .await
+                )
+                .vote_granted
+            );
+            assert_eq!(
+                fixture
+                    .raft
+                    .with_raft_state(|state| state.clone())
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert_eq!(saved_vote(&fixture).await, before_saved);
+            fixture.raft.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

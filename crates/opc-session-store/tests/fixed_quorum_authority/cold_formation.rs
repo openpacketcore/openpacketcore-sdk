@@ -242,3 +242,50 @@ async fn delayed_pristine_peers_recover_a_missed_bootstrap_campaign() {
 async fn delayed_pristine_peers_recover_after_the_bootstrap_voter_restarts() {
     missed_bootstrap_campaign(true).await;
 }
+
+#[tokio::test]
+async fn isolated_fixed_voters_never_gain_authority_or_repeat_real_campaigns() {
+    let fleet = ColdFleet::new();
+    for peer in &fleet.peers {
+        peer.transport.set_enabled(false);
+    }
+    let stores = join_all((0..3).map(|index| fleet.open(index))).await;
+    let outcome = AssertUnwindSafe(async {
+        let mut initial_terms = Vec::new();
+        for attempt in 0..2 {
+            let results =
+                join_all(stores.iter().map(ConsensusSessionStore::initialize_cluster)).await;
+            for (index, (store, result)) in stores.iter().zip(results).enumerate() {
+                assert_eq!(
+                    result,
+                    Err(ConsensusSessionStoreOpenError::ClusterFormationRejected)
+                );
+                let status = store.status();
+                assert_eq!(status.last_log_index, (index == 0).then_some(0));
+                assert_eq!(status.applied_index, None);
+                assert_eq!(status.leader_id, None);
+                assert!(!status.admitted);
+                assert_eq!(status.term, u64::from(index == 0));
+                if attempt == 0 {
+                    initial_terms.push(status.term);
+                } else {
+                    assert_eq!(
+                        status.term, initial_terms[index],
+                        "retrying initialization cannot bypass Pre-Vote or consume a term"
+                    );
+                }
+            }
+        }
+    })
+    .catch_unwind()
+    .await;
+    for peer in &fleet.peers {
+        peer.transport.clear().await;
+    }
+    for result in join_all(stores.iter().map(ConsensusSessionStore::shutdown)).await {
+        result.expect("drain isolated voter");
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

@@ -170,6 +170,10 @@ evidence.
   wait for replicated membership. A member reopening durable Openraft state
   skips bootstrap and re-admits normally. Clean first formation fails closed
   when the canonical node is absent.
+  Fixed-quorum peers awaiting their first replicated membership can answer
+  authenticated Pre-Vote inquiries using the admitted topology. This lets
+  formation recover when the canonical member's first campaign missed absent
+  peers, without persisting speculative votes or granting application authority.
 - `ConsensusSessionStore::probe_durable_readiness` uses the same bounded
   Openraft linearizable-read barrier as real authoritative operations. Its
   recovery-latch check and barrier share the configured complete-operation
@@ -1134,6 +1138,15 @@ membership from DNS order or start a local writer while peers are still
 unidentified. Clean first formation requires the canonical node and fails
 closed if it is absent; this restriction does not apply to a fleet reopening
 persisted Openraft membership.
+
+If the canonical member's first campaign runs before its peers start, automatic
+Pre-Vote retries recover once an admitted majority is reachable, including after
+the canonical member restarts. A fixed peer with no log, membership, snapshot or
+committed leader vote uses its admitted fixed topology to answer the inquiry.
+The reply changes no term, log, durable vote or election timer. Once engine
+membership or leader state exists, normal Pre-Vote eligibility, log-freshness and
+leader-lease checks apply. Application authority still requires the exact
+membership to be committed and applied and a live quorum to be available.
 
 The topology member vector contains only `QuorumReplicaDescriptor` values.
 The node's one local SQLite backend is supplied separately to
