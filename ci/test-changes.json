@@ -255,6 +255,20 @@
       "renamed_to": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::fixture_v2_facade_reclaim_sweep_keeps_rows_when_a_written_read_is_silent",
       "reason": "Read responses now retain the immutable caller deadline while setup and Call write keep their physical cap. A voter silent after a written read must not trigger speculative failover. The replacement requires the read to remain pending beyond its setup/write cap, stop at the original deadline, retain all four journal rows, submit exactly one status read, and dispatch no additional mutation. This follows the slow linearized history-read defect class without extending any caller deadline.",
       "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::tests::public_protected_fenced_transition_rotates_b_attempt_timeout_to_c",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-net::lib=lib::consumer::tests::public_protected_fenced_transition_waits_for_written_b_receipt_until_original_deadline",
+      "reason": "Replace post-write failover at the physical cap with the caller-deadline read contract. The unchanged three-second deadline and 100 ms physical cap now require a pending written B read beyond the physical cap, a typed deadline result, exactly one B read, no C receipt or post-deadline read, the same single mutation on A, and a retained journal row. No caller bound or mutation authority is increased.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::tests::public_protected_fenced_transition_exhausts_all_receipt_voters_without_replay",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-net::lib=lib::consumer::tests::public_protected_fenced_transition_exhausts_replying_voters_then_waits_for_silent_a",
+      "reason": "Keep traversal after completed unavailable replies, then require the unanswered written A read to consume the remaining original three-second deadline without another voter round. The replacement checks exact B/C/A order and call counts, the unchanged single mutation on A, the typed deadline result and a retained journal row. Completed NotFound retry rounds remain covered separately; no caller bound is increased.",
+      "issue": 1328
     }
   ]
 }

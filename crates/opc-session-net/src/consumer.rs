@@ -25293,9 +25293,9 @@ mod tests {
                         }
                         PublicProtectedFencedStatusBehavior::Timeout => {
                             // Cross the real authenticated service boundary,
-                            // then deliberately outlive the client's physical
-                            // attempt cap. This keeps the original caller
-                            // deadline available for the next voter.
+                            // then withhold the response through the caller's
+                            // deadline. A written read must not be overlapped
+                            // by a speculative request to the next voter.
                             tokio::time::sleep(Duration::from_millis(250)).await;
                             std::future::pending::<SessionConsumerResponse>().await
                         }
@@ -27585,7 +27585,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_protected_fenced_transition_rotates_b_attempt_timeout_to_c() {
+    async fn public_protected_fenced_transition_waits_for_written_b_receipt_until_original_deadline(
+    ) {
         let fixture = public_protected_fenced_acceptance_fixture(
             [
                 PublicProtectedFencedStatusBehavior::Unavailable,
@@ -27612,26 +27613,49 @@ mod tests {
             prepared.execute_once().await,
             Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })
         );
-        let status = prepared.status_until_terminal(deadline).await;
-        let recorded = fixture
+        let status = {
+            let status = prepared.status_until_terminal(deadline);
+            tokio::pin!(status);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut status)
+                    .await
+                    .is_err(),
+                "a written receipt read remains pending beyond the physical cap"
+            );
+            status.await
+        };
+        assert_eq!(
+            status,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+            "a silent written B read consumes the immutable caller deadline"
+        );
+        assert!(tokio::time::Instant::now() >= deadline);
+        assert_eq!(
+            prepared.status_until_terminal(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+            "an expired caller deadline cannot dispatch another receipt read"
+        );
+        assert!(fixture
             .recorded_outcome
             .lock()
             .expect("recorded outcome lock")
-            .clone()
-            .expect("C records the exact successful receipt");
-        assert_eq!(
-            status,
-            Ok(FencedTransitionStatus::Recorded(Box::new(Ok(recorded)))),
-            "a capped B attempt is retryable while the original deadline remains available"
-        );
+            .is_none());
         assert_eq!(
             fixture
                 .status_order
                 .lock()
                 .expect("status order lock")
                 .as_slice(),
-            ["B", "C"],
-            "cold/timed-out B consumes only its one physical-attempt cap before C"
+            ["B"],
+            "no speculative C read overlaps the unanswered B read"
+        );
+        assert_eq!(
+            fixture
+                .status_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 1, 0],
+            "the logical read submits exactly one physical receipt request"
         );
         assert_eq!(
             fixture
@@ -27641,6 +27665,7 @@ mod tests {
             [1, 0, 0],
             "the status timeout cannot restore mutation authority"
         );
+        assert_public_protected_fenced_journal_row_retained(&fixture);
         fixture.shutdown().await;
     }
 
@@ -27706,7 +27731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_protected_fenced_transition_exhausts_all_receipt_voters_without_replay() {
+    async fn public_protected_fenced_transition_exhausts_replying_voters_then_waits_for_silent_a() {
         let fixture = public_protected_fenced_acceptance_fixture(
             [
                 PublicProtectedFencedStatusBehavior::Timeout,
@@ -27743,13 +27768,19 @@ mod tests {
             .lock()
             .expect("status order lock")
             .clone();
-        assert!(
-            status_order.len() > 3
-                && status_order
-                    .iter()
-                    .enumerate()
-                    .all(|(index, voter)| *voter == ["B", "C", "A"][index % 3]),
-            "one absolute budget continues deterministic full read-only voter rounds"
+        assert_eq!(
+            status_order,
+            ["B", "C", "A"],
+            "unavailable replies permit traversal, then written silence spends the remaining deadline"
+        );
+        assert!(tokio::time::Instant::now() >= deadline);
+        assert_eq!(
+            fixture
+                .status_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [1, 1, 1],
+            "a silent written read cannot start another voter round"
         );
         assert_eq!(
             fixture
@@ -27759,7 +27790,26 @@ mod tests {
             [1, 0, 0],
             "all unavailable/deadline receipts remain read-only"
         );
+        assert_public_protected_fenced_journal_row_retained(&fixture);
         fixture.shutdown().await;
+    }
+
+    fn assert_public_protected_fenced_journal_row_retained(
+        fixture: &PublicProtectedFencedAcceptanceFixture,
+    ) {
+        let connection = rusqlite::Connection::open_with_flags(
+            &fixture.journal_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("read the prepared journal after an unresolved receipt");
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM prepared_fenced_transition_journal",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained prepared journal rows");
+        assert_eq!(rows, 1, "written silence cannot erase the ambiguity marker");
     }
 
     async fn v2_effectful_request(nonce: u8) -> SessionConsumerV2Request {
