@@ -218,16 +218,14 @@ impl LiveTerminalRecoveryFullReconciliationObserver {
     }
 
     async fn observe<F: std::future::Future>(&self, future: F) -> F::Output {
+        assert!(
+            LIVE_TERMINAL_RECOVERY_FULL_RECONCILIATIONS
+                .try_with(|_| ())
+                .is_err(),
+            "live terminal recovery full reconciliation observer already active"
+        );
         LIVE_TERMINAL_RECOVERY_FULL_RECONCILIATIONS
-            .scope(Arc::clone(&self.full_reconciliations), async {
-                let result = future.await;
-                assert!(
-                    LIVE_TERMINAL_RECOVERY_FULL_RECONCILIATIONS
-                        .with(|current| Arc::ptr_eq(current, &self.full_reconciliations)),
-                    "live terminal recovery full reconciliation observer changed"
-                );
-                result
-            })
+            .scope(Arc::clone(&self.full_reconciliations), future)
             .await
     }
 
@@ -530,22 +528,101 @@ fn snapshot_database_leases() -> &'static std::sync::Mutex<
 // Force the otherwise tiny same-OFD admission interval in a regression test.
 // The production registry never relies on timing; this only makes the former
 // check/unlock/insert race deterministic.
-#[cfg(test)]
-fn snapshot_database_lease_admission_barrier(
-) -> &'static std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>> {
-    static BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>> =
-        std::sync::OnceLock::new();
-    BARRIER.get_or_init(|| std::sync::Mutex::new(None))
+#[cfg(all(test, target_os = "linux"))]
+struct SnapshotDatabaseLeaseAdmissionHook {
+    barrier: Arc<tokio::sync::Barrier>,
+    arrivals: AtomicUsize,
 }
 
-#[cfg(test)]
-async fn wait_snapshot_database_lease_admission_barrier() {
-    let barrier = snapshot_database_lease_admission_barrier()
+#[cfg(all(test, target_os = "linux"))]
+fn snapshot_database_lease_admission_barriers() -> &'static std::sync::Mutex<
+    BTreeMap<SnapshotDatabaseIdentity, Arc<SnapshotDatabaseLeaseAdmissionHook>>,
+> {
+    static BARRIERS: std::sync::OnceLock<
+        std::sync::Mutex<
+            BTreeMap<SnapshotDatabaseIdentity, Arc<SnapshotDatabaseLeaseAdmissionHook>>,
+        >,
+    > = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct SnapshotDatabaseLeaseAdmissionBarrierGuard {
+    database_identity: SnapshotDatabaseIdentity,
+    hook: Arc<SnapshotDatabaseLeaseAdmissionHook>,
+    // Pin the identity for the entire installation, even if the backend is
+    // dropped before the guard. An unrelated file cannot reuse this inode.
+    _database_file: std::fs::File,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl SnapshotDatabaseLeaseAdmissionBarrierGuard {
+    async fn install(backend: &SqliteSessionBackend, barrier: Arc<tokio::sync::Barrier>) -> Self {
+        use std::os::linux::fs::MetadataExt as _;
+
+        let database_file = backend
+            .duplicate_main_file_descriptor_for_snapshot_lease()
+            .await
+            .expect("duplicate admission barrier database")
+            .expect("admission barrier requires a durable database");
+        let metadata = database_file
+            .metadata()
+            .expect("stat admission barrier database");
+        let database_identity = SnapshotDatabaseIdentity {
+            device: metadata.st_dev(),
+            inode: metadata.st_ino(),
+        };
+        let hook = Arc::new(SnapshotDatabaseLeaseAdmissionHook {
+            barrier,
+            arrivals: AtomicUsize::new(0),
+        });
+        let installed = {
+            let mut barriers = snapshot_database_lease_admission_barriers()
+                .lock()
+                .expect("install database admission barrier");
+            Arc::ptr_eq(
+                barriers
+                    .entry(database_identity)
+                    .or_insert_with(|| Arc::clone(&hook)),
+                &hook,
+            )
+        };
+        assert!(installed, "database admission barrier already installed");
+        Self {
+            database_identity,
+            hook,
+            _database_file: database_file,
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for SnapshotDatabaseLeaseAdmissionBarrierGuard {
+    fn drop(&mut self) {
+        let mut barriers = snapshot_database_lease_admission_barriers()
+            .lock()
+            .expect("clear database admission barrier");
+        if barriers
+            .get(&self.database_identity)
+            .is_some_and(|hook| Arc::ptr_eq(hook, &self.hook))
+        {
+            barriers.remove(&self.database_identity);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+async fn wait_snapshot_database_lease_admission_barrier(
+    database_identity: SnapshotDatabaseIdentity,
+) {
+    let hook = snapshot_database_lease_admission_barriers()
         .lock()
         .expect("snapshot database admission barrier")
-        .clone();
-    if let Some(barrier) = barrier {
-        barrier.wait().await;
+        .get(&database_identity)
+        .cloned();
+    if let Some(hook) = hook {
+        hook.arrivals.fetch_add(1, Ordering::AcqRel);
+        hook.barrier.wait().await;
     }
 }
 
@@ -816,8 +893,8 @@ async fn acquire_snapshot_directory(
     // is essential: dropping a rejected duplicate Flock would LOCK_UN the
     // still-live first lease. The registry check, Flock acquisition, and
     // weak insertion remain one synchronous critical section.
-    #[cfg(test)]
-    wait_snapshot_database_lease_admission_barrier().await;
+    #[cfg(all(test, target_os = "linux"))]
+    wait_snapshot_database_lease_admission_barrier(database_identity).await;
 
     #[cfg(target_os = "linux")]
     let mut lease = Arc::new(SnapshotDirectoryLease {
@@ -2067,28 +2144,71 @@ async fn wait_before_fixed_install_source_copy(final_path: &Path) {
 }
 
 #[cfg(test)]
-fn seal_in_place_gate() -> &'static std::sync::Mutex<Option<std::sync::Arc<SnapshotArtifactGate>>> {
-    static GATE: std::sync::OnceLock<
-        std::sync::Mutex<Option<std::sync::Arc<SnapshotArtifactGate>>>,
+fn seal_in_place_gates() -> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>>
+{
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<PathBuf, Arc<SnapshotArtifactGate>>>,
     > = std::sync::OnceLock::new();
-    GATE.get_or_init(|| std::sync::Mutex::new(None))
+    GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(test)]
-async fn wait_after_in_place_seal_cleanup_is_armed() {
-    let gate = seal_in_place_gate()
-        .lock()
-        .map(|gate| gate.clone())
-        .unwrap_or(None);
-    if let Some(gate) = gate {
-        gate.block_if_armed().await;
+struct SealInPlaceGateGuard {
+    final_path: PathBuf,
+    gate: Arc<SnapshotArtifactGate>,
+}
+
+#[cfg(test)]
+impl SealInPlaceGateGuard {
+    fn install(final_path: PathBuf, gate: Arc<SnapshotArtifactGate>) -> Self {
+        let installed = {
+            let mut gates = seal_in_place_gates()
+                .lock()
+                .expect("install in-place seal gate");
+            match gates.entry(final_path.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Arc::clone(&gate));
+                    true
+                }
+                std::collections::btree_map::Entry::Occupied(_) => false,
+            }
+        };
+        assert!(
+            installed,
+            "in-place seal gate already installed for this path"
+        );
+        Self { final_path, gate }
     }
 }
 
 #[cfg(test)]
-fn in_place_seal_test_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+impl Drop for SealInPlaceGateGuard {
+    fn drop(&mut self) {
+        // Removing the entry alone cannot wake a caller that already cloned
+        // this gate. Release that caller before retiring our registration.
+        self.gate.release();
+        let mut gates = seal_in_place_gates()
+            .lock()
+            .expect("clear in-place seal gate");
+        if gates
+            .get(&self.final_path)
+            .is_some_and(|gate| Arc::ptr_eq(gate, &self.gate))
+        {
+            gates.remove(&self.final_path);
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_after_in_place_seal_cleanup_is_armed(final_path: &Path) {
+    let gate = seal_in_place_gates()
+        .lock()
+        .expect("in-place seal gate")
+        .get(final_path)
+        .cloned();
+    if let Some(gate) = gate {
+        gate.block_if_armed().await;
+    }
 }
 
 #[cfg(test)]
@@ -7676,7 +7796,7 @@ async fn seal_snapshot_database_in_place(
     })?;
     let mut output = tokio::fs::File::from_std(raw_file);
     #[cfg(test)]
-    wait_after_in_place_seal_cleanup_is_armed().await;
+    wait_after_in_place_seal_cleanup_is_armed(final_path).await;
     if output.metadata().await?.len() != payload_length {
         return Err(consensus::invalid_data(
             "session consensus snapshot changed before sealing",
@@ -11067,7 +11187,6 @@ mod tests {
 
     #[tokio::test]
     async fn in_place_seal_appends_footer_to_the_compacted_pinned_inode() {
-        let _serial = in_place_seal_test_lock().lock().await;
         let directory = tempfile::tempdir().expect("in-place seal directory");
         let compacted_path = directory.path().join("vacuum.sqlite");
         let final_path = directory.path().join("snapshot.opc");
@@ -11128,8 +11247,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_place_seal_gate_ignores_unrelated_snapshot_paths() {
+        let directory = tempfile::tempdir().expect("independent seal gate directory");
+        let compacted_path = directory.path().join("unrelated.sqlite");
+        let final_path = directory.path().join("unrelated.opc");
+        let mut compacted = PinnedSqliteFile::from_new_file(
+            secure_snapshot_create_file(&compacted_path).expect("create unrelated compacted inode"),
+            compacted_path.clone(),
+        )
+        .expect("pin unrelated compacted inode");
+        {
+            let mut file = compacted
+                .file()
+                .try_clone()
+                .expect("clone unrelated compacted inode");
+            std::io::Write::write_all(&mut file, b"unrelated compacted snapshot")
+                .expect("write unrelated compacted payload");
+            file.sync_all().expect("sync unrelated compacted payload");
+        }
+        compacted = compacted
+            .refresh_identity()
+            .expect("refresh unrelated compacted identity");
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let guard =
+            SealInPlaceGateGuard::install(directory.path().join("intended.opc"), Arc::clone(&gate));
+        let mut seal = Box::pin(seal_snapshot_database_in_place(
+            compacted,
+            &final_path,
+            false,
+            SnapshotIntegrityPolicy::FsVerity,
+            None,
+        ));
+        let captured = tokio::select! {
+            result = &mut seal => {
+                drop(result.expect("unrelated seal completes"));
+                false
+            }
+            () = gate.wait_started() => true,
+        };
+        drop(guard);
+        if captured {
+            drop(seal.await.expect("release wrongly captured seal"));
+        }
+        assert!(
+            !captured,
+            "an unrelated snapshot must not enter another fixture's seal gate"
+        );
+        assert!(
+            !compacted_path.exists(),
+            "the unpublished unrelated inode is cleaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_place_seal_gate_guards_release_only_their_own_waiters() {
+        let directory = tempfile::tempdir().expect("independent seal gate owners");
+        let first_path = directory.path().join("first.opc");
+        let second_path = directory.path().join("second.opc");
+        let first_gate = Arc::new(SnapshotArtifactGate::new());
+        let second_gate = Arc::new(SnapshotArtifactGate::new());
+        first_gate.arm();
+        second_gate.arm();
+        let first = SealInPlaceGateGuard::install(first_path.clone(), first_gate);
+        let second = SealInPlaceGateGuard::install(second_path.clone(), second_gate);
+        let mut first_wait = Box::pin(wait_after_in_place_seal_cleanup_is_armed(&first_path));
+        let mut second_wait = Box::pin(wait_after_in_place_seal_cleanup_is_armed(&second_path));
+        assert!(futures_util::poll!(&mut first_wait).is_pending());
+        assert!(futures_util::poll!(&mut second_wait).is_pending());
+
+        drop(first);
+        assert!(futures_util::poll!(&mut first_wait).is_ready());
+        assert!(futures_util::poll!(&mut second_wait).is_pending());
+        // Retiring one fixture also must not remove the other registration:
+        // a new matching caller still joins its held gate.
+        let mut later_second = Box::pin(wait_after_in_place_seal_cleanup_is_armed(&second_path));
+        assert!(futures_util::poll!(&mut later_second).is_pending());
+        drop(second);
+        assert!(futures_util::poll!(&mut second_wait).is_ready());
+        assert!(futures_util::poll!(&mut later_second).is_ready());
+    }
+
+    #[tokio::test]
     async fn cancelled_in_place_seal_removes_the_compacted_inode() {
-        let _serial = in_place_seal_test_lock().lock().await;
         let directory = tempfile::tempdir().expect("in-place seal cancellation directory");
         let compacted_path = directory.path().join("vacuum.sqlite");
         let final_path = directory.path().join("snapshot.opc");
@@ -11150,7 +11350,7 @@ mod tests {
 
         let gate = Arc::new(SnapshotArtifactGate::new());
         gate.arm();
-        *seal_in_place_gate().lock().expect("set in-place seal gate") = Some(Arc::clone(&gate));
+        let guard = SealInPlaceGateGuard::install(final_path.clone(), Arc::clone(&gate));
         let seal = tokio::spawn(async move {
             seal_snapshot_database_in_place(
                 compacted,
@@ -11164,9 +11364,7 @@ mod tests {
         gate.wait_started().await;
         seal.abort();
         assert!(matches!(seal.await, Err(error) if error.is_cancelled()));
-        *seal_in_place_gate()
-            .lock()
-            .expect("clear in-place seal gate") = None;
+        drop(guard);
         assert!(
             !compacted_path.exists(),
             "cancellation after cleanup arming must unlink the compacted inode"
@@ -20804,6 +21002,41 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn live_terminal_reconciliation_observer_rejects_precreated_overlap() {
+        use futures_util::FutureExt as _;
+
+        let outer = LiveTerminalRecoveryFullReconciliationObserver::install();
+        let inner = LiveTerminalRecoveryFullReconciliationObserver::install();
+        outer
+            .observe(async {
+                let overlap = std::panic::AssertUnwindSafe(inner.observe(async {
+                    observe_live_terminal_recovery_full_reconciliation();
+                }))
+                .catch_unwind()
+                .await;
+                assert!(
+                    overlap.is_err(),
+                    "pre-created observers must reject overlapping observation before replacing the owner"
+                );
+                observe_live_terminal_recovery_full_reconciliation();
+            })
+            .await;
+        assert_eq!(outer.full_reconciliations(), 1);
+        assert_eq!(inner.full_reconciliations(), 0);
+
+        // Rejection must restore the outer owner, and completion must allow
+        // a later independent scope on the same task.
+        inner
+            .observe(async {
+                observe_live_terminal_recovery_full_reconciliation();
+            })
+            .await;
+        assert_eq!(inner.full_reconciliations(), 1);
+        assert_eq!(outer.full_reconciliations(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn live_terminal_reconciliation_skips_snapshot_selection_until_terminal_evidence() {
         let directory = tempfile::tempdir().expect("live terminal probe directory");
         let database = directory.path().join("sessions.sqlite");
@@ -21598,14 +21831,92 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_database_lease_barrier_ignores_unrelated_databases() {
+        let directory = tempfile::tempdir().expect("database barrier isolation directory");
+        let intended_backend = SqliteSessionBackend::open(directory.path().join("intended.sqlite"))
+            .expect("intended database backend");
+        let unrelated_backend =
+            SqliteSessionBackend::open(directory.path().join("unrelated.sqlite"))
+                .expect("unrelated database backend");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let guard = SnapshotDatabaseLeaseAdmissionBarrierGuard::install(
+            &intended_backend,
+            Arc::clone(&barrier),
+        )
+        .await;
+
+        // Reserve one party for the intended fixture before opening an
+        // unrelated database. That open must not provide its missing peer.
+        let mut intended_wait = Box::pin(barrier.wait());
+        assert!(futures_util::poll!(&mut intended_wait).is_pending());
+        let unrelated = acquire_snapshot_directory_lease(
+            &unrelated_backend,
+            &directory.path().join("unrelated-snapshots"),
+        )
+        .await
+        .expect("unrelated database obtains its own lease");
+        let paired_with_unrelated = futures_util::poll!(&mut intended_wait).is_ready();
+        drop(guard);
+        if !paired_with_unrelated {
+            let (first, second) = tokio::join!(intended_wait, barrier.wait());
+            assert_ne!(first.is_leader(), second.is_leader());
+        }
+        drop(unrelated);
+        assert!(
+            !paired_with_unrelated,
+            "an unrelated database must not satisfy the intended fixture's barrier"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_database_lease_barrier_guards_retire_independently() {
+        let directory = tempfile::tempdir().expect("independent database barrier owners");
+        let first_backend = SqliteSessionBackend::open(directory.path().join("first.sqlite"))
+            .expect("first barrier backend");
+        let second_backend = SqliteSessionBackend::open(directory.path().join("second.sqlite"))
+            .expect("second barrier backend");
+        let first = SnapshotDatabaseLeaseAdmissionBarrierGuard::install(
+            &first_backend,
+            Arc::new(tokio::sync::Barrier::new(2)),
+        )
+        .await;
+        let second_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let second = SnapshotDatabaseLeaseAdmissionBarrierGuard::install(
+            &second_backend,
+            Arc::clone(&second_barrier),
+        )
+        .await;
+        drop(first);
+
+        let mut second_wait = Box::pin(second_barrier.wait());
+        assert!(futures_util::poll!(&mut second_wait).is_pending());
+        let first_lease = acquire_snapshot_directory_lease(
+            &first_backend,
+            &directory.path().join("first-snapshots"),
+        )
+        .await
+        .expect("retired first barrier does not block its database");
+        assert!(futures_util::poll!(&mut second_wait).is_pending());
+        let second_lease = acquire_snapshot_directory_lease(
+            &second_backend,
+            &directory.path().join("second-snapshots"),
+        )
+        .await
+        .expect("second database joins only its own barrier");
+        assert!(futures_util::poll!(&mut second_wait).is_ready());
+        assert_eq!(second.hook.arrivals.load(Ordering::Acquire), 1);
+        drop((first_lease, second_lease));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_same_backend_different_directories_admit_exactly_one_lease() {
         let directory = tempfile::tempdir().expect("database namespace race directory");
         let backend = SqliteSessionBackend::open(directory.path().join("sessions.sqlite"))
             .expect("database namespace race backend");
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        *snapshot_database_lease_admission_barrier()
-            .lock()
-            .expect("install database namespace race barrier") = Some(Arc::clone(&barrier));
+        let guard = SnapshotDatabaseLeaseAdmissionBarrierGuard::install(&backend, barrier).await;
 
         let first_path = directory.path().join("first-snapshots");
         let second_path = directory.path().join("second-snapshots");
@@ -21613,9 +21924,12 @@ mod tests {
             acquire_snapshot_directory_lease(&backend, &first_path),
             acquire_snapshot_directory_lease(&backend, &second_path),
         );
-        *snapshot_database_lease_admission_barrier()
-            .lock()
-            .expect("clear database namespace race barrier") = None;
+        assert_eq!(
+            guard.hook.arrivals.load(Ordering::Acquire),
+            2,
+            "both competing acquisitions must pass through their database's barrier"
+        );
+        drop(guard);
 
         assert_eq!(
             usize::from(first.is_ok()) + usize::from(second.is_ok()),
