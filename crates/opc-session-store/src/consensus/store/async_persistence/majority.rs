@@ -531,12 +531,6 @@ impl ConsensusSessionStore {
                     .await
                     .map_err(unavailable)?
                     .map_err(unavailable)?;
-                #[cfg(test)]
-                eprintln!(
-                    "recovery_fixture_prepare node={:?} era={} stage=promised",
-                    self.inner.local_node_id,
-                    bound.era()
-                );
                 let vote = Vote::new(bound.retired_through() + 1, self.inner.local_node_id);
                 loop {
                     if tokio::time::Instant::now() >= deadline {
@@ -557,12 +551,6 @@ impl ConsensusSessionStore {
                         .await
                         .map_err(unavailable)?;
                     if reply.vote_granted && reply.vote == vote && reply.last_log_id == last {
-                        #[cfg(test)]
-                        eprintln!(
-                            "recovery_fixture_prepare node={:?} era={} stage=self_vote_granted",
-                            self.inner.local_node_id,
-                            bound.era()
-                        );
                         break;
                     }
                     tokio::time::timeout_at(
@@ -600,12 +588,6 @@ impl ConsensusSessionStore {
                 }
             })
             .await?;
-        #[cfg(test)]
-        eprintln!(
-            "recovery_fixture_prepare node={:?} era={} stage=drained",
-            self.inner.local_node_id,
-            bound.era()
-        );
         let prepared = Prepared {
             participant: original.clone(),
             promise: bound.plan(),
@@ -1162,21 +1144,13 @@ impl ConsensusSessionStore {
             let boundary = match reply {
                 Ok(Reply::Committed(boundary)) => boundary,
                 other => {
-                    // A triggered election makes one real vote attempt. It
-                    // cannot safely reuse its term after a lost response, and
-                    // an accepted proposal may still finish. The next drive
-                    // must either verify that the exact committed election
+                    // The engine may finish its election or accepted proposal
+                    // after the caller's deadline. The next drive must either
+                    // verify that the exact committed election
                     // still owns resumable work, or prepare a strictly newer
                     // range. That preparation drains and supersedes old effects.
                     current.restart = true;
                     let error = other.err().unwrap_or(SessionConsensusPeerError::Protocol);
-                    #[cfg(test)]
-                    eprintln!(
-                        "recovery_fixture_commit_error era={} leader={:?} error={error:?} coordinator_vote={:?}",
-                        selection.round.era,
-                        selection.leader,
-                        self.inner.raft.metrics().borrow().vote
-                    );
                     current.resume_owned_commit = matches!(
                         error,
                         SessionConsensusPeerError::Timeout | SessionConsensusPeerError::Unavailable

@@ -789,6 +789,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expires. The decision preserves the full lease and reads one serialized
   engine state without changing votes, logs, or election timers.
 
+- `opc-session-store`: Async recovery resumes an intact committed election
+  after a caller deadline, avoiding repeated reservation and lease waits under
+  load while retaining every boundary, persistence and activation check.
+
 - `opc-proto-diameter`: require request-bound authenticated peer evidence for
   SWm emergency authorization, including both answers in identity recovery.
   `correlate_answer_from_connection` retains the existing wire checks and
