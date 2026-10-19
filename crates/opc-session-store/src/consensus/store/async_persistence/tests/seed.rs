@@ -138,7 +138,14 @@ async fn log_admission_seed_follows_leader_change() {
             release.send(()).unwrap();
             seeding.await;
             for store in [source, successor] {
-                let current = store.inner.raft.metrics().borrow().clone();
+                // Write completion can precede metrics publication. Observe
+                // application under the enclosing deadline before checking it.
+                let mut metrics = store.inner.raft.metrics();
+                let current = metrics
+                    .wait_for(|current| current.last_applied.is_some_and(|log| log.index >= target))
+                    .await
+                    .unwrap()
+                    .clone();
                 assert_eq!(current.last_log_index, Some(target));
                 assert!(current.last_applied.is_some_and(|log| log.index >= target));
                 assert_eq!(current.current_leader, Some(successor.inner.local_node_id));
