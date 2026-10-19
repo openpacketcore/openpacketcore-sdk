@@ -172,7 +172,7 @@ async fn protected_history_discards_late_handoff_without_caching_authority() {
                 }
                 // A second caller needs fresh authority. A late first reply must
                 // not have populated the facade's cached history.
-                let fresh = facade
+                let mut fresh = facade
                     .prepare_fenced_transition(
                         create(request_id(1201), 1201, PAYLOAD),
                         read_budget(),

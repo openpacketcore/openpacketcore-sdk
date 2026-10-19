@@ -50,7 +50,7 @@ fn fixture_origin(
     digest.update(identity.cluster_id().as_bytes());
     digest.update(identity.configuration_id().as_bytes());
     digest.update(identity.configuration_epoch().get().to_be_bytes());
-    digest.update(fixture.voters[0].authority.roster_commitment());
+    digest.update(fixture.voters[0].authority.roster_commitment().as_bytes());
     for voter in &fixture.voters {
         digest.update(voter.authority.node_id().get().to_be_bytes());
     }
