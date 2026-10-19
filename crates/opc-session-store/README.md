@@ -1148,6 +1148,8 @@ leader's lease expires. The reply changes no term, log, durable vote or election
 timer. Once engine history exists, normal Pre-Vote eligibility, log-freshness
 and leader-lease checks apply. Application authority still requires the exact
 membership to be committed and applied and a live quorum to be available.
+The application's startup loop may retry `initialize_cluster()` on the same
+open store as peers become reachable; this needs no operator action.
 
 The topology member vector contains only `QuorumReplicaDescriptor` values.
 The node's one local SQLite backend is supplied separately to

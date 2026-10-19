@@ -512,7 +512,7 @@ impl Fleet {
     async fn open_size(size: u16) -> Self {
         Self::open_size_with_io_hook(size, None).await
     }
-    async fn open_size_with_io_hook(
+    async fn open_pristine_with_io_hook(
         size: u16,
         hook: Option<(u16, crate::sqlite::consensus::wal::owner::IoHookForTest)>,
     ) -> Self {
@@ -551,19 +551,25 @@ impl Fleet {
             nodes.push(store);
             directories.push(directory);
         }
+        Self {
+            nodes,
+            network,
+            directories,
+        }
+    }
+    async fn open_size_with_io_hook(
+        size: u16,
+        hook: Option<(u16, crate::sqlite::consensus::wal::owner::IoHookForTest)>,
+    ) -> Self {
+        let fleet = Self::open_pristine_with_io_hook(size, hook).await;
         let mut formation = tokio::task::JoinSet::new();
-        for node in &nodes {
+        for node in &fleet.nodes {
             let node = node.clone();
             formation.spawn(async move { node.initialize_cluster().await });
         }
         while let Some(result) = formation.join_next().await {
             result.unwrap().unwrap();
         }
-        let fleet = Self {
-            nodes,
-            network,
-            directories,
-        };
         fleet.nodes[0].inner.raft.trigger().elect().await.unwrap();
         fleet.nodes[0]
             .inner
@@ -586,6 +592,95 @@ impl Fleet {
             self.network.disconnect_and_shutdown(&node).await;
         }
         drop(self.directories);
+    }
+}
+
+#[tokio::test]
+async fn pristine_voter_slot_pre_vote_is_authenticated_and_read_only() {
+    use futures_util::FutureExt;
+    use opc_consensus::engine::raft::{PreVoteRequest, PreVoteResponse};
+    use opc_consensus::engine::storage::RaftLogStorage;
+    use std::panic::AssertUnwindSafe;
+
+    let fleet = Fleet::open_pristine_with_io_hook(3, None).await;
+    let outcome = AssertUnwindSafe(async {
+        let sender = &fleet.nodes[0];
+        let receiver = &fleet.nodes[1];
+        let candidate = member(1, 1).identity.node_id();
+        let responder = member(2, 1).identity.node_id();
+        let before = receiver
+            .inner
+            .raft
+            .with_raft_state(|state| state.clone())
+            .await
+            .unwrap();
+        assert_eq!(before.log_ids, Default::default());
+        assert_eq!(before.membership_state, Default::default());
+        assert_eq!(before.committed, None);
+        assert_eq!(before.snapshot_meta, Default::default());
+        assert!(!receiver.status().admitted);
+        let wal = receiver
+            .inner
+            .voter_profile
+            .as_ref()
+            .unwrap()
+            .core
+            .private_wal
+            .as_ref()
+            .unwrap()
+            .clone();
+        let mut log = crate::sqlite::consensus::wal::adapter::WalLogStore::new(wal);
+        assert_eq!(log.read_vote().await.unwrap(), None);
+
+        for (vote, expected) in [
+            (Vote::new(7, candidate), true),
+            (Vote::new_committed(7, candidate), false),
+        ] {
+            let request = SessionConsensusWireRequest::try_new(
+                sender.inner.storage_identity,
+                candidate,
+                SessionConsensusRpcFamily::PreVote,
+                encode_bounded(&PreVoteRequest::new(vote, Some(Default::default()))).unwrap(),
+            )
+            .unwrap();
+            // This transport supplies the actual incarnation proof and enters
+            // the slot admission route; its raw call method panics.
+            let response = sender
+                .inner
+                .voter_profile
+                .as_ref()
+                .unwrap()
+                .transport
+                .peer(responder)
+                .call(request)
+                .await
+                .unwrap();
+            let result: Result<
+                PreVoteResponse<SessionConsensusNodeId>,
+                RaftError<SessionConsensusNodeId>,
+            > = decode_bounded(&response.result.unwrap()).unwrap();
+            let response = result.unwrap();
+            assert_eq!(response.vote_granted, expected);
+            assert_eq!(&response.vote, before.vote_ref());
+            assert_eq!(response.last_log_id, None);
+            assert_eq!(
+                receiver
+                    .inner
+                    .raft
+                    .with_raft_state(|state| state.clone())
+                    .await
+                    .unwrap(),
+                before
+            );
+            assert_eq!(log.read_vote().await.unwrap(), None);
+            assert!(!receiver.status().admitted);
+        }
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
     }
 }
 
