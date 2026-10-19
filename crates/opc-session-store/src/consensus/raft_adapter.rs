@@ -3334,6 +3334,17 @@ mod tests {
         let fixture = fixed_follower_fixture(Duration::from_secs(1), false, selected).await;
         fixture.raft.runtime_config().elect(false);
         fixture.raft.runtime_config().tick(false);
+        // A running blocking task inhibits Tokio's automatic clock advance.
+        // Keep real storage I/O from moving the lease boundary while requests
+        // run; every clock change below is explicit and independent of load.
+        let (release_clock, hold_clock) = std::sync::mpsc::channel::<()>();
+        let (clock_started, clock_ready) = tokio::sync::oneshot::channel();
+        let clock_guard = tokio::task::spawn_blocking(move || {
+            clock_started.send(()).unwrap();
+            let _ = hold_clock.recv();
+        });
+        clock_ready.await.unwrap();
+        tokio::time::pause();
         let outcome = AssertUnwindSafe(async {
             let minimum = Duration::from_millis(fixture.raft.config().election_timeout_min);
             let lease = Duration::from_millis(fixture.raft.config().election_timeout_max);
@@ -3349,7 +3360,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!inquire(&fixture, proposed).await);
-            tokio::time::sleep_until(first + minimum).await;
+            tokio::time::advance(minimum).await;
             assert!(SessionRaftTypeConfig::now() < first + lease);
             assert!(
                 !inquire(&fixture, proposed).await,
@@ -3363,14 +3374,20 @@ mod tests {
                 .await
                 .unwrap();
             assert!(renewed > first);
-            tokio::time::sleep_until(first + lease + Duration::from_millis(1)).await;
+            tokio::time::advance(lease - minimum + Duration::from_millis(1)).await;
             assert!(SessionRaftTypeConfig::now() < renewed + lease);
             assert!(
                 !inquire(&fixture, proposed).await,
                 "another heartbeat renews the leader lease even without membership"
             );
 
-            tokio::time::sleep_until(renewed + lease + Duration::from_millis(1)).await;
+            tokio::time::advance(renewed + lease - SessionRaftTypeConfig::now()).await;
+            assert_eq!(SessionRaftTypeConfig::now(), renewed + lease);
+            assert!(
+                !inquire(&fixture, proposed).await,
+                "the exact lease deadline is still protected"
+            );
+            tokio::time::advance(Duration::from_millis(1)).await;
             assert!(
                 inquire(&fixture, proposed).await,
                 "an expired committed vote without membership must not strand formation"
@@ -3386,6 +3403,9 @@ mod tests {
         })
         .catch_unwind()
         .await;
+        tokio::time::resume();
+        drop(release_clock);
+        clock_guard.await.unwrap();
         fixture.raft.shutdown().await.unwrap();
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);

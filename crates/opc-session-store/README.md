@@ -1142,10 +1142,11 @@ persisted Openraft membership.
 If the canonical member's first campaign runs before its peers start, automatic
 Pre-Vote retries recover once an admitted majority is reachable, including after
 the canonical member restarts. A fixed peer with no log, membership, snapshot or
-committed leader vote uses its admitted fixed topology to answer the inquiry.
-The reply changes no term, log, durable vote or election timer. Once engine
-membership or leader state exists, normal Pre-Vote eligibility, log-freshness and
-leader-lease checks apply. Application authority still requires the exact
+commit uses its admitted fixed topology to answer the inquiry. If it received a
+leader's committed vote before membership arrived, it refuses until that
+leader's lease expires. The reply changes no term, log, durable vote or election
+timer. Once engine history exists, normal Pre-Vote eligibility, log-freshness
+and leader-lease checks apply. Application authority still requires the exact
 membership to be committed and applied and a live quorum to be available.
 
 The topology member vector contains only `QuorumReplicaDescriptor` values.

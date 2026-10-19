@@ -117,11 +117,28 @@ async fn missed_bootstrap_campaign(restart_canonical: bool) {
     let mut stores = vec![fleet.open(0).await];
     let outcome = AssertUnwindSafe(async {
         // Both peer stores and listeners are absent, not merely delayed RPCs.
+        // Observe the real campaigns while initialization is pending, within
+        // its existing operation budget rather than starting another timeout.
+        let campaign_deadline = tokio::time::Instant::now()
+            + opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
+        let (initialization, campaigns) = tokio::join!(
+            stores[0].initialize_cluster(),
+            tokio::time::timeout_at(campaign_deadline, async {
+                while !fleet.peers[1..].iter().all(|peer| {
+                    peer.missed_votes.load(Ordering::SeqCst) > 0
+                        && peer.pre_votes.load(Ordering::SeqCst) > 0
+                }) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }),
+        );
         assert_eq!(
-            stores[0].initialize_cluster().await,
+            initialization,
             Err(ConsensusSessionStoreOpenError::ClusterFormationRejected),
             "a lone voter cannot admit itself"
         );
+        campaigns
+            .expect("observe missed real votes and automatic Pre-Votes within the operation bound");
         for peer in &fleet.peers[1..] {
             assert!(
                 peer.missed_votes.load(Ordering::SeqCst) > 0,
@@ -166,11 +183,20 @@ async fn missed_bootstrap_campaign(restart_canonical: bool) {
             assert!(!reopened.status().admitted);
             stores.push(reopened);
         }
+        // Opening installs the handler. Keep both routes unavailable until
+        // their pristine-state assertions finish so replication cannot race
+        // the second store's open or those assertions.
+        for peer in &fleet.peers[1..] {
+            peer.transport.set_enabled(false);
+        }
         stores.push(fleet.open(1).await);
         stores.push(fleet.open(2).await);
         for store in &stores[1..] {
             assert_eq!(store.status().last_log_index, None);
             assert!(!store.status().admitted);
+        }
+        for peer in &fleet.peers[1..] {
+            peer.transport.set_enabled(true);
         }
 
         // Retain the existing fixed-quorum 30-second readiness bound and every
