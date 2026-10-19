@@ -221,6 +221,11 @@ async fn recover_with_control(fleet: &Fleet, control: &RecoveryInitializationCon
         }
     })
     .await;
+    eprintln!(
+        "recovery_fixture_result elapsed={:?} attempts={attempts} completed={}",
+        started.elapsed(),
+        result.is_ok()
+    );
     if result.is_err() {
         eprintln!(
             "recovery_fixture_elapsed={:?} attempts={attempts} last_initializations={last_initializations:?} survivor_initializations={}",
