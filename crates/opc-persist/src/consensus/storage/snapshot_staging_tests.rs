@@ -925,3 +925,177 @@ fn staged_legacy_cleanup_retains_its_own_directory_owner() {
     )
     .is_ok());
 }
+
+#[cfg(unix)]
+fn queued_snapshot_verification_retains_owner(runtime_drop: bool, read: bool) {
+    use std::future::Future as _;
+    use std::task::Poll;
+
+    fn blocker() -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::mpsc::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            paused
+                .recv_timeout(WATCHDOG)
+                .expect("release blocking worker");
+        });
+        (worker, resume, started)
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshot-queued-verification.opc");
+    let payload = b"queued envelope verification";
+    let mut envelope = payload.to_vec();
+    envelope.extend_from_slice(SNAPSHOT_FOOTER_MAGIC);
+    envelope
+        .extend_from_slice(&super::super::types::CONFIG_CONSENSUS_SNAPSHOT_VERSION.to_be_bytes());
+    envelope.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    envelope.extend_from_slice(&Sha256::digest(payload));
+    std::fs::write(&path, &envelope).unwrap();
+    let old_runtime = Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let (task, worker, resume, completed, mut receiver) = old_runtime.block_on(async {
+        let dir = Arc::new(std::fs::File::open(directory.path()).unwrap());
+        let lock =
+            crate::local_sqlite::AdmissionFileLock::acquire(dir.try_clone().unwrap()).unwrap();
+        let (sender, receiver) = tokio::sync::watch::channel(());
+        let owner = Arc::new(SnapshotDirectoryOwner::new(dir, Arc::new(lock), sender));
+        let mut work = Box::pin(async move {
+            let _owner = owner;
+            verify_snapshot_envelope(&path).await
+        });
+        let (mut worker, mut resume, started) = blocker();
+        tokio::time::timeout(WATCHDOG, started)
+            .await
+            .unwrap()
+            .unwrap();
+        // The verifier seeks to EOF, then to its footer, then reads the magic.
+        // Move the sole blocking worker's hold past each completed seek without
+        // polling the verifier, so its first read is also causally queued.
+        for _ in 0..if read { 2 } else { 0 } {
+            std::future::poll_fn(|cx| {
+                assert!(work.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            let (next_worker, next_resume, next_started) = blocker();
+            resume.send(()).unwrap();
+            tokio::time::timeout(WATCHDOG, worker)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(WATCHDOG, next_started)
+                .await
+                .unwrap()
+                .unwrap();
+            worker = next_worker;
+            resume = next_resume;
+        }
+        std::future::poll_fn(|cx| {
+            assert!(
+                work.as_mut().poll(cx).is_pending(),
+                "verification I/O must be queued"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        // This marker is behind the actual seek/read on the sole worker. It
+        // lets even a failing ownership assertion leave no detached file work.
+        let completed = tokio::task::spawn_blocking(|| ());
+        let (held, holding) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _work = work;
+            held.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(WATCHDOG, holding)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(receiver.has_changed().is_ok());
+        assert!(crate::local_sqlite::AdmissionFileLock::acquire(
+            std::fs::File::open(directory.path()).unwrap()
+        )
+        .is_err());
+        (task, worker, resume, completed, receiver)
+    });
+    let next_runtime = if runtime_drop {
+        old_runtime.shutdown_background();
+        runtime()
+    } else {
+        task.abort();
+        old_runtime
+    };
+    next_runtime.block_on(async {
+        assert!(tokio::time::timeout(WATCHDOG, task)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
+    });
+    let closed_while_queued = receiver.has_changed().is_err();
+    let admitted_while_queued = crate::local_sqlite::AdmissionFileLock::acquire(
+        std::fs::File::open(directory.path()).unwrap(),
+    )
+    .is_ok();
+    resume.send(()).unwrap();
+    next_runtime.block_on(async {
+        tokio::time::timeout(WATCHDOG, worker)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(WATCHDOG, completed)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(WATCHDOG, async {
+            while receiver.changed().await.is_ok() {}
+        })
+        .await
+        .unwrap();
+    });
+    assert!(crate::local_sqlite::AdmissionFileLock::acquire(
+        std::fs::File::open(directory.path()).unwrap()
+    )
+    .is_ok());
+    assert!(
+        !closed_while_queued,
+        "queued verification must remain in the shutdown drain"
+    );
+    assert!(
+        !admitted_while_queued,
+        "queued verification must retain directory admission"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_snapshot_verification_seek_retains_owner_after_task_abort() {
+    queued_snapshot_verification_retains_owner(false, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_snapshot_verification_seek_retains_owner_after_runtime_drop() {
+    queued_snapshot_verification_retains_owner(true, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_snapshot_verification_read_retains_owner_after_task_abort() {
+    queued_snapshot_verification_retains_owner(false, true);
+}
+
+#[test]
+#[cfg(unix)]
+fn queued_snapshot_verification_read_retains_owner_after_runtime_drop() {
+    queued_snapshot_verification_retains_owner(true, true);
+}

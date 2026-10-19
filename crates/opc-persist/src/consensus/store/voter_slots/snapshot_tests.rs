@@ -1,6 +1,90 @@
 use super::*;
 
 #[tokio::test]
+async fn voter_snapshot_rejects_incomparable_vote_before_staging() {
+    let directory = tempfile::tempdir().unwrap();
+    let local = member(1, 1).identity.node_id();
+    let source = member(2, 1).identity.node_id();
+    let snapshots = directory.path().join("snapshots");
+    let store = ConsensusConfigStore::open_with_voter_slots(
+        genesis(),
+        local,
+        SqliteBackend::in_memory_for_test().await.unwrap(),
+        &snapshots,
+        Arc::new(Resolver(Arc::new(Network::default()))),
+    )
+    .await
+    .unwrap();
+    store.inner.raft.runtime_config().elect(false);
+    let current_vote = Vote::new(5, local);
+    store
+        .inner
+        .raft
+        .vote(VoteRequest {
+            vote: current_vote,
+            last_log_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .inner
+            .raft
+            .with_raft_state(|state| *state.vote_ref())
+            .await
+            .unwrap(),
+        current_vote
+    );
+    let rpc = InstallSnapshotRequest::<ConfigRaftTypeConfig> {
+        vote: Vote::new(5, source),
+        meta: SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "incomparable-voter-transfer".into(),
+        },
+        offset: 0,
+        data: b"must not stage".to_vec(),
+        done: false,
+    };
+    assert_eq!(rpc.vote.partial_cmp(&current_vote), None);
+    let engine_response = store
+        .inner
+        .raft
+        .install_snapshot(rpc.clone())
+        .await
+        .unwrap();
+    assert_eq!(engine_response.vote, current_vote);
+    assert_eq!(std::fs::read_dir(&snapshots).unwrap().count(), 0);
+    let profile = store.inner.voter_profile.as_ref().unwrap();
+    let response = profile
+        .receive_snapshot(
+            &store,
+            source,
+            rpc,
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let result: Result<
+        InstallSnapshotResponse<ConsensusNodeId>,
+        RaftError<ConsensusNodeId, InstallSnapshotError>,
+    > = decode_config_wire(&response.result.unwrap()).unwrap();
+    assert_eq!(result.unwrap().vote, engine_response.vote);
+    let staged = std::fs::read_dir(&snapshots).unwrap().count();
+    let retained = profile.incoming.lock().await.is_some();
+    store.shutdown().await.unwrap();
+    assert_eq!(
+        staged, 0,
+        "an engine-rejected incomparable vote must not create staging"
+    );
+    assert!(
+        !retained,
+        "an engine-rejected vote must not retain a receiver"
+    );
+}
+
+#[tokio::test]
 async fn shutdown_discards_partial_snapshot_and_reopens_with_old_handles_alive() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());

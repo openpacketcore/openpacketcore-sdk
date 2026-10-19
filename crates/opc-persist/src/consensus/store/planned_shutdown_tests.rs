@@ -470,3 +470,89 @@ async fn standard_shutdown_discards_partial_snapshot_with_old_handles_alive() {
         .expect("restart must not require dropping old public store handles");
     reopened.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn standard_snapshot_rejects_incomparable_vote_before_staging() {
+    use opc_consensus::engine::raft::{
+        InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest,
+    };
+    use opc_consensus::engine::{SnapshotMeta, Vote};
+    let directory = tempfile::tempdir().unwrap();
+    let local = ConsensusNodeId::new(1).unwrap();
+    let source = ConsensusNodeId::new(2).unwrap();
+    let identity = opc_consensus::ConsensusIdentity::new(
+        opc_consensus::ConsensusClusterId::new("standard-incomparable-snapshot").unwrap(),
+        opc_consensus::ConsensusConfigurationId::from_bytes([0x47; 32]),
+        opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap(),
+    );
+    let topology =
+        ConfigConsensusTopology::try_new(identity, local, BTreeSet::from([local])).unwrap();
+    let snapshots = directory.path().join("snapshots");
+    let store = ConsensusConfigStore::open(
+        topology,
+        SqliteBackend::in_memory_for_test().await.unwrap(),
+        &snapshots,
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    store.inner.raft.runtime_config().elect(false);
+    let current_vote = Vote::new(5, local);
+    store
+        .inner
+        .raft
+        .vote(VoteRequest {
+            vote: current_vote,
+            last_log_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .inner
+            .raft
+            .with_raft_state(|state| *state.vote_ref())
+            .await
+            .unwrap(),
+        current_vote
+    );
+    let rpc = InstallSnapshotRequest::<ConfigRaftTypeConfig> {
+        vote: Vote::new(5, source),
+        meta: SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "incomparable-standard-transfer".into(),
+        },
+        offset: 0,
+        data: b"must not stage".to_vec(),
+        done: false,
+    };
+    assert_eq!(rpc.vote.partial_cmp(&current_vote), None);
+    let engine_response = store
+        .inner
+        .raft
+        .install_snapshot(rpc.clone())
+        .await
+        .unwrap();
+    assert_eq!(engine_response.vote, current_vote);
+    assert_eq!(std::fs::read_dir(&snapshots).unwrap().count(), 0);
+    let request = ConsensusWireRequest::try_new(
+        identity,
+        source,
+        ConsensusRpcFamily::InstallSnapshot,
+        encode_config_wire(&rpc).unwrap(),
+    )
+    .unwrap();
+    let response = store.inner.raft_handler.handle(source, request).await;
+    let result: Result<
+        InstallSnapshotResponse<ConsensusNodeId>,
+        RaftError<ConsensusNodeId, opc_consensus::engine::error::InstallSnapshotError>,
+    > = decode_config_wire(&response.result.unwrap()).unwrap();
+    assert_eq!(result.unwrap().vote, engine_response.vote);
+    let staged = std::fs::read_dir(&snapshots).unwrap().count();
+    store.shutdown().await.unwrap();
+    assert_eq!(
+        staged, 0,
+        "an engine-rejected incomparable vote must not create staging"
+    );
+}
