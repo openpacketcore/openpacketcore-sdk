@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2ChildSaNegotiationError` adds `KeyExchangeRequired`,
   `InvalidKeyExchange` and `KeyExchangeDhGroupMismatch`, and `nwu::Error` adds `KeyExchangeDhGroupMismatch`;
   exhaustive matches must handle them. Retry errors expose `invalid_ke_notify()`.
-  Group 1 follows stronger common Child-SA PFS groups in policies and offers.
+  Group 1 follows stronger common Child-SA PFS groups in policies and offers;
+  other transform positions are preserved.
   `ResponderNonceTooShortForPrf` is deprecated as an unconstructed compatibility
   diagnostic; peer nonce errors use the absolute 16-octet floor.
 

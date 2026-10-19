@@ -314,9 +314,22 @@ pub fn negotiate_ike_sa_init(
 
 pub(crate) fn prefer_stronger_dh_groups(offer: &mut Ikev2SaPayloadBuild) {
     for proposal in &mut offer.proposals {
-        proposal.transforms.sort_by_key(|transform| {
-            transform.transform_type == TRANSFORM_TYPE_DH && transform.transform_id == 1
-        });
+        let mut dh_transforms: Vec<_> = proposal
+            .transforms
+            .iter()
+            .filter(|transform| transform.transform_type == TRANSFORM_TYPE_DH)
+            .cloned()
+            .collect();
+        dh_transforms.sort_by_key(|transform| transform.transform_id == 1);
+        // Preserve all non-DH positions, including a following ESP ESN transform.
+        for (slot, transform) in proposal
+            .transforms
+            .iter_mut()
+            .filter(|transform| transform.transform_type == TRANSFORM_TYPE_DH)
+            .zip(dh_transforms)
+        {
+            *slot = transform;
+        }
     }
     offer.proposals.sort_by_key(|proposal| {
         let groups = || {
