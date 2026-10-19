@@ -51,14 +51,30 @@ pub(super) async fn after_batch(
     }
     if let Some(follower) = TRACK_LAGGING_FOLLOWER.try_with(Cell::get).ok().flatten() {
         let leader = leader_before(fleet, None, None, deadline).await;
-        let reachable = !fleet.peers[follower]
-            .blocked_senders
-            .lock()
-            .unwrap()
-            .contains(&leader.inner.local_node_id);
+        let seed_limit = *fleet.peers[follower].seed_prefix_limit.lock().unwrap();
+        if let Some(limit) = seed_limit {
+            assert!(
+                fleet
+                    .store(follower)
+                    .inner
+                    .raft
+                    .metrics()
+                    .borrow()
+                    .last_log_index
+                    .is_some_and(|last| last <= limit),
+                "initial seed preserves the isolated follower prefix across handoff"
+            );
+        }
+        let reachable = seed_limit.is_none()
+            && !fleet.peers[follower]
+                .blocked_senders
+                .lock()
+                .unwrap()
+                .contains(&leader.inner.local_node_id);
         if reachable {
             // Exercise the allowed successor-to-follower route before setup
-            // restores its original leader. Correct isolation leaves no route.
+            // restores its original leader. Correct isolation leaves no route
+            // that can advance the prefix.
             tokio::time::timeout_at(
                 deadline,
                 fleet

@@ -61,6 +61,7 @@ struct Peer {
     blocked_senders: Mutex<BTreeSet<SessionConsensusNodeId>>,
     blocked_votes: AtomicBool,
     blocked_append_above: Mutex<Option<(SessionConsensusNodeId, u64)>>,
+    seed_prefix_limit: Mutex<Option<u64>>,
     held_reply: Mutex<Option<Arc<races::ReplyHold>>>,
     held_requests: Mutex<Option<Arc<history_read::RequestHold>>>,
     cut_mutation: Mutex<Option<admission::CutMutation>>,
@@ -100,6 +101,24 @@ impl SessionConsensusPeer for Peer {
             .contains(&request.sender)
         {
             return Err(SessionConsensusPeerError::Unavailable);
+        }
+        let seed_limit = *self.seed_prefix_limit.lock().unwrap();
+        if let Some(limit) = seed_limit {
+            // Keep initial seeding from advancing this follower, while letting
+            // a new leader discover its missing prefix through real conflicts.
+            if request.family == SessionConsensusRpcFamily::InstallSnapshot {
+                return Err(SessionConsensusPeerError::Unavailable);
+            }
+            if let Some(append) = races::append_request(&request) {
+                let can_extend_prefix = append.prev_log_id.is_none_or(|prev| prev.index <= limit)
+                    && append
+                        .entries
+                        .last()
+                        .is_some_and(|entry| entry.log_id.index > limit);
+                if can_extend_prefix {
+                    return Err(SessionConsensusPeerError::Unavailable);
+                }
+            }
         }
         let held_requests = self.held_requests.lock().unwrap().clone();
         if let Some(hold) = held_requests {
@@ -254,6 +273,7 @@ impl Fleet {
                     blocked_senders: Mutex::new(BTreeSet::new()),
                     blocked_votes: AtomicBool::new(false),
                     blocked_append_above: Mutex::new(None),
+                    seed_prefix_limit: Mutex::new(None),
                     held_reply: Mutex::new(None),
                     held_requests: Mutex::new(None),
                     cut_mutation: Mutex::new(None),

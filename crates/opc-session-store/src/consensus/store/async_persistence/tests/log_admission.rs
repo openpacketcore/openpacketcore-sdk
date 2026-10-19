@@ -1254,12 +1254,10 @@ async fn blocked_transfer(
             let last = store.inner.raft.metrics().borrow().last_log_index.unwrap();
             follower_store.inner.raft.wait(Some(WAIT))
                 .applied_index_at_least(Some(last), "follower caught up before isolation").await.unwrap();
-            // A seed handoff must not let another leader catch this voter up.
-            for sender in 0..3 {
-                if sender != follower {
-                    fleet.set_link(sender, follower, false);
-                }
-            }
+            // Preserve a lagging prefix across seed handoff, but let a newly
+            // elected leader obtain genuine conflict replies from this voter.
+            *fleet.peers[follower].seed_prefix_limit.lock().unwrap() =
+                follower_store.inner.raft.metrics().borrow().last_log_index;
             let gate = Arc::new(SnapshotArtifactGate::new());
             let hold = store.inner.peer_directory.pause_snapshot_transfer_for_test(
                 follower_store.inner.local_node_id, gate.clone(),
@@ -1268,11 +1266,7 @@ async fn blocked_transfer(
             seed_owned_to(&fleet, store, &command, last + DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
                 + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;
             tokio::time::timeout(WAIT, gate.wait_started()).await.unwrap();
-            for sender in 0..3 {
-                if sender != follower {
-                    fleet.set_link(sender, follower, true);
-                }
-            }
+            *fleet.peers[follower].seed_prefix_limit.lock().unwrap() = None;
             let held_cut = hold.cut();
             // Select a newer cut whose purge target crosses the actual transfer.
             seed_owned_to(&fleet, store, &command, held_cut + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;
