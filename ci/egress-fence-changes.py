@@ -62,6 +62,8 @@ EXPLICIT_PATHS = (
     "scripts/build-egress-fence-ebpf.sh",
     "scripts/publish-order.py",
     "ci/setup-fsverity-tmp.sh",
+    "ci/fsverity-runtime.py",
+    "ci/test-fsverity-runtime.py",
     "ci/egress-fence-changes.py",
     "ci/test-egress-fence-changes.py",
     "ci/egress-fence-tests.py",

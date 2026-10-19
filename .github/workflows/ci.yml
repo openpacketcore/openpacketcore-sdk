@@ -298,9 +298,6 @@ jobs:
         with:
           components: clippy,rustfmt
 
-      - name: Prepare fs-verity snapshot storage
-        run: ci/setup-fsverity-tmp.sh
-
       # Each shard builds only its own test targets, so the tree stays far
       # below the former single-job peak that forced `cargo clean` between
       # steps. Debug symbols remain off via CARGO_PROFILE_*_DEBUG above; do
@@ -328,6 +325,7 @@ jobs:
         run: python3 ci/test-shards.py precheck --shard '${{ matrix.shard }}' --split-libraries
 
       - name: Run test shard
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' --split-libraries > shard-commands.txt
@@ -375,9 +373,6 @@ jobs:
         with:
           components: clippy,rustfmt
 
-      - name: Prepare fs-verity snapshot storage
-        run: ci/setup-fsverity-tmp.sh
-
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -388,6 +383,7 @@ jobs:
         run: python3 ci/test-shards.py precheck --shard '${{ matrix.shard }}'
 
       - name: Run test shard
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           python3 ci/test-shards.py plan --shard '${{ matrix.shard }}' > shard-commands.txt
@@ -427,9 +423,6 @@ jobs:
         with:
           components: clippy,rustfmt
 
-      - name: Prepare fs-verity snapshot storage
-        run: ci/setup-fsverity-tmp.sh
-
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -437,6 +430,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run exact library partition
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           python3 ci/test-shards.py run-libraries --shard '${{ matrix.shard }}' \
             --output "${RUNNER_TEMP}/library-test-map.json"
@@ -758,6 +752,9 @@ jobs:
           python3 ci/test-local-kernel-lifecycle-supervision.py \
             --evidence-dir "${RUNNER_TEMP}/local-kernel-lifecycle-supervision-regressions"
 
+      - name: Regress fs-verity runtime interruption and stale cleanup
+        run: python3 ci/test-fsverity-runtime.py -v
+
       - name: Check local kernel lifecycle support
         run: |
           set -euo pipefail
@@ -984,9 +981,6 @@ jobs:
       # artifacts on the dedicated fs-verity filesystem. Build output,
       # TMPDIR, databases, WALs, sockets, and general process scratch remain
       # on ordinary storage.
-      - name: Prepare fs-verity snapshot storage
-        run: ci/setup-fsverity-tmp.sh
-
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
         with:
@@ -997,6 +991,7 @@ jobs:
         run: python3 ci/test-i686-target-selection.py
 
       - name: Run opc-session-net tests on i686
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         # The stateless three-voter consumer proofs retain literal authority
         # and snapshot budgets. Run every functional test exactly once,
         # but give each wall-time contract a fresh 32-bit process so completed

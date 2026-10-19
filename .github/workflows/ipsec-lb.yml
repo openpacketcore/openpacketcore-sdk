@@ -9,6 +9,8 @@ on:
       - "crates/opc-session-net/**"
       - ".github/workflows/ipsec-lb.yml"
       - "ci/setup-fsverity-tmp.sh"
+      - "ci/fsverity-runtime.py"
+      - "ci/test-fsverity-runtime.py"
       - "scripts/build-ipsec-lb-ebpf.sh"
       - "scripts/check-ebpf-license.sh"
       - "Cargo.toml"
@@ -23,6 +25,8 @@ on:
       - "crates/opc-session-net/**"
       - ".github/workflows/ipsec-lb.yml"
       - "ci/setup-fsverity-tmp.sh"
+      - "ci/fsverity-runtime.py"
+      - "ci/test-fsverity-runtime.py"
       - "scripts/build-ipsec-lb-ebpf.sh"
       - "scripts/check-ebpf-license.sh"
       - "Cargo.toml"
@@ -54,9 +58,6 @@ jobs:
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
 
-      - name: Prepare fs-verity snapshot storage
-        run: ci/setup-fsverity-tmp.sh
-
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -67,6 +68,7 @@ jobs:
         run: cargo clippy --locked -p opc-ipsec-lb -p opc-ipsec-lb-ebpf-common -p opc-session-net --all-targets --all-features -- -D warnings
 
       - name: Run conformance tests
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           ordinary_timing_contracts=(

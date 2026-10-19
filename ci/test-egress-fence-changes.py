@@ -100,6 +100,8 @@ class DecisionTests(unittest.TestCase):
             "crates/opc-egress-fence-ebpf/oracle/src/main.rs",
             ".github/workflows/egress-fence.yml",
             "ci/setup-fsverity-tmp.sh",
+            "ci/fsverity-runtime.py",
+            "ci/test-fsverity-runtime.py",
             "scripts/build-egress-fence-ebpf.sh",
             "scripts/publish-order.py",
             "crates/opc-session-testkit/qualification/v6/session-ha-profile.json",

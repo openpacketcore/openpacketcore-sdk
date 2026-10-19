@@ -67,6 +67,65 @@ on those filesystems do not exercise disk-sync latency. Setting
 `OPC_FS_VERITY_SNAPSHOT_ROOT` places immutable snapshots only; it does not move
 the mutable databases or WALs out of `TMPDIR`.
 
+For required fs-verity qualification, run the gate inside the filesystem owner:
+
+```bash
+mkdir -p "$PWD/target/ci-scratch"
+chmod 0700 "$PWD/target/ci-scratch"
+RUNNER_TEMP="$PWD/target/ci-scratch" bash ci/setup-fsverity-tmp.sh -- <gate-command> [arguments...]
+```
+
+Each checkout keeps this one stable scratch root, `$PWD/target/ci-scratch`.
+Reuse the directory across runs without deleting or replacing it: recovery
+records match its directory identity, so a later sweep must use the same parent.
+The wrapped command retains the caller's soft and hard file-descriptor limits
+and umask. Privileged namespace setup must not replace the storage workload's
+descriptor budget or its ordinary file-creation permissions.
+
+The owner sets `OPC_FS_VERITY_SNAPSHOT_ROOT` and
+`OPC_FS_VERITY_QUALIFICATION=required` for that command, then unmounts and removes
+its private image. It also cleans up on interruption, including a killed
+launcher. Startup reclaims only this checkout's marked, unlocked, current-user,
+mode-0700 `opc-sdk-fsverity-runtime.*` directories containing exactly `ext4.img`
+and an empty `tmp/`, with no loop or mount attachment. The root/runtime locks
+serialize attachment with deletion; an exclusive backing-file lease also
+excludes concurrent opens during inventory and removal. Legacy `opc-fsverity.*`
+and other tools' `fs-verity-runtime.*` directories are always preserved.
+Inventory or cleanup errors fail the gate.
+The scratch parent must be owned and writable by the caller, and its filesystem
+must support `user.*` xattrs and file leases. This can exclude older tmpfs
+implementations. Creation and removal use a root-only staging directory under
+a root-owned, non-writable or sticky ancestor on that same filesystem; if none
+exists the gate fails closed. Removal freezes the pinned directory inodes,
+moves the runtime into that protected namespace, verifies its identity there,
+and only then removes its checked entries. Failed identity checks preserve the
+objects and restore their ownership.
+The helper keeps a small, root-owned recovery metadata directory for this
+checkout and caller in that protected ancestor (for example `/home` or `/tmp`).
+Each staging transaction records its caller, checkout, parent and object
+identities and helper process identity before taking ownership. Startup resumes
+dead transactions, including frozen runtimes still in the scratch parent and
+partly created or removed runtimes in staging. Live, locked, open or attached
+resources are preserved for a later sweep; no manual root cleanup is needed.
+The five-second loop-autoclear bound remains separate from inventory and the
+bounded privileged create/remove round trips.
+Mounts use a separate namespace with slave propagation: owner mounts cannot
+reach other jobs. Host unmounts propagate into the owner when the upstream host
+mount is shared, as on the hosted runners and standard systemd hosts; a private
+upstream mount cannot provide that propagation. Setup requires
+passwordless `unshare` and `setpriv`; commands retain the caller's identity,
+environment, stdin and inherited ownership locks.
+GitHub steps use `shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}`
+so the runner resolves `bash` on PATH. Running setup in an earlier step no longer
+exports a filesystem for subsequent steps. Replace split setup/export/EXIT-trap
+recipes with the `-- <gate-command> [arguments...]` form before using this helper.
+The real mount and
+interruption regressions are `python3 ci/test-fsverity-runtime.py -v` on Linux
+with the same passwordless namespace, mount, chown, umount and losetup privileges.
+The narrow privileged Python helper also requires passwordless sudo: it passes
+pinned loop descriptors, creates/removes verified caller-owned runtimes in a
+protected namespace, and disposes only of verified caller-owned descendants.
+
 ```bash
 cargo fmt --all --check
 git diff --check

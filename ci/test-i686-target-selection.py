@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,7 +23,7 @@ def workflow_commands(directory: Path, slice_name: str) -> list[list[str]]:
     """Capture shell-expanded argv from the required workflow step."""
     matches = re.findall(
         r"^      - name: Run opc-session-net tests on i686\n"
-        r"(?:(?:        #[^\n]*|)\n)*        run: \|\n"
+        r"(?:(?:        (?:#[^\n]*|shell: [^\n]*)|)\n)*        run: \|\n"
         r"((?:(?:          [^\n]*|)\n)+)",
         WORKFLOW.read_text(),
         re.MULTILINE,
@@ -56,6 +57,24 @@ def workflow_commands(directory: Path, slice_name: str) -> list[list[str]]:
 
 
 class I686TargetSelectionTests(unittest.TestCase):
+    def test_wrapped_shell_keeps_the_same_cargo_selections(self) -> None:
+        wrapped = WORKFLOW.read_text()
+        ordinary = re.sub(r"^        shell: .*setup-fsverity-tmp\.sh.*\n", "", wrapped,
+                          flags=re.MULTILINE)
+        self.assertNotEqual(wrapped, ordinary, "exercise the workflow's actual wrapped shell")
+        with tempfile.TemporaryDirectory(prefix="i686-wrapped-selection-") as temporary:
+            root = Path(temporary)
+            workflow = root / "ci.yml"
+            selections = []
+            for index, source in enumerate((ordinary, wrapped)):
+                workflow.write_text(source)
+                directory = root / str(index)
+                directory.mkdir()
+                with patch(__name__ + ".WORKFLOW", workflow):
+                    selections.append({name: workflow_commands(directory, name)
+                                       for name in ("ordinary", "ordinary-integration", "contracts")})
+            self.assertEqual(selections[0], selections[1])
+
     def test_future_binary_and_integration_tests_run_exactly_once(self) -> None:
         # This dependency-free fixture reproduces the reviewer's missing
         # auto-discovered executable unit test using real i686 Cargo selection.

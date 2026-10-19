@@ -48,9 +48,6 @@ jobs:
           sudo apt-get install --yes --no-install-recommends gcc-multilib
           rustup target add i686-unknown-linux-gnu
 
-      - name: Prepare fs-verity snapshot storage
-        run: ci/setup-fsverity-tmp.sh
-
       - name: Prepare ordinary disk scratch
         run: |
           scratch="$(mktemp -d "${RUNNER_TEMP}/cnf-performance.XXXXXX")"
@@ -62,6 +59,7 @@ jobs:
           shared-key: opc-performance-${{ matrix.profile }}
 
       - name: Qualify original latency limit
+        shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           mkdir -p performance-results
