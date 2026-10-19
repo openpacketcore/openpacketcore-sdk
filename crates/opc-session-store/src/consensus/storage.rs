@@ -205,7 +205,13 @@ tokio::task_local! {
 
 #[cfg(all(test, target_os = "linux"))]
 impl LiveTerminalRecoveryFullReconciliationObserver {
-    fn new() -> Self {
+    fn install() -> Self {
+        assert!(
+            LIVE_TERMINAL_RECOVERY_FULL_RECONCILIATIONS
+                .try_with(|_| ())
+                .is_err(),
+            "live terminal recovery full reconciliation observer already installed"
+        );
         Self {
             full_reconciliations: Arc::new(AtomicUsize::new(0)),
         }
@@ -213,7 +219,15 @@ impl LiveTerminalRecoveryFullReconciliationObserver {
 
     async fn observe<F: std::future::Future>(&self, future: F) -> F::Output {
         LIVE_TERMINAL_RECOVERY_FULL_RECONCILIATIONS
-            .scope(Arc::clone(&self.full_reconciliations), future)
+            .scope(Arc::clone(&self.full_reconciliations), async {
+                let result = future.await;
+                assert!(
+                    LIVE_TERMINAL_RECOVERY_FULL_RECONCILIATIONS
+                        .with(|current| Arc::ptr_eq(current, &self.full_reconciliations)),
+                    "live terminal recovery full reconciliation observer changed"
+                );
+                result
+            })
             .await
     }
 
@@ -20751,9 +20765,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_terminal_reconciliation_observer_ignores_unrelated_tasks() {
-        let observer = LiveTerminalRecoveryFullReconciliationObserver::new();
+        let observer = LiveTerminalRecoveryFullReconciliationObserver::install();
         observer
             .observe(async {
+                assert!(
+                    std::panic::catch_unwind(
+                        LiveTerminalRecoveryFullReconciliationObserver::install
+                    )
+                    .is_err(),
+                    "one task cannot install overlapping reconciliation observers"
+                );
                 observe_live_terminal_recovery_full_reconciliation();
                 assert_eq!(
                     observer.full_reconciliations(),
@@ -20762,6 +20783,13 @@ mod tests {
                 );
                 tokio::spawn(async {
                     observe_live_terminal_recovery_full_reconciliation();
+                    let independent = LiveTerminalRecoveryFullReconciliationObserver::install();
+                    independent
+                        .observe(async {
+                            observe_live_terminal_recovery_full_reconciliation();
+                        })
+                        .await;
+                    assert_eq!(independent.full_reconciliations(), 1);
                 })
                 .await
                 .expect("join independent reconciliation observer task");
@@ -20809,7 +20837,7 @@ mod tests {
                 .expect("bind current terminal fixture snapshot")
         };
         let consumer = log_store.live_terminal_recovery_handoff_consumer();
-        let observer = LiveTerminalRecoveryFullReconciliationObserver::new();
+        let observer = LiveTerminalRecoveryFullReconciliationObserver::install();
 
         assert_eq!(
             LiveTerminalRecoveryHandoffState::Clear,
