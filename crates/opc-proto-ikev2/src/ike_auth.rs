@@ -1842,8 +1842,9 @@ impl fmt::Debug for Ikev2CreateChildSaRekeyResponsePayloads {
 /// Select a Child SA and selectors, preferring a stronger common PFS group
 /// over group 1. Other accepted alternatives retain wire order.
 ///
-/// Supply `key_exchange` for PFS; a different common group returns a typed
-/// retry whose `invalid_ke_notify()` produces the response Notify.
+/// Supply `key_exchange` for PFS; a different KE group returns a typed retry
+/// naming the selected group, including when the received group is unsupported.
+/// Its `invalid_ke_notify()` produces the response Notify.
 ///
 /// This helper deliberately stops at product-neutral negotiation intent. It does
 /// not choose subscriber policy, allocate responder SPIs, or install XFRM state.
@@ -1913,16 +1914,16 @@ pub fn negotiate_child_sa(
 
     if let Some(preferred) = selected_child_dh(&transforms).filter(|group| *group != 0) {
         let key_exchange = key_exchange.ok_or(Ikev2ChildSaNegotiationError::KeyExchangeRequired)?;
-        let group = Ikev2DhGroup::from_transform_id(key_exchange.dh_group)
-            .map_err(|_| Ikev2ChildSaNegotiationError::InvalidKeyExchange)?;
-        validate_peer_public_len(group, key_exchange.key_exchange_data)
-            .map_err(|_| Ikev2ChildSaNegotiationError::InvalidKeyExchange)?;
         if key_exchange.dh_group != preferred {
             return Err(Ikev2ChildSaNegotiationError::KeyExchangeDhGroupMismatch {
                 received: key_exchange.dh_group,
                 preferred,
             });
         }
+        let group = Ikev2DhGroup::from_transform_id(preferred)
+            .map_err(|_| Ikev2ChildSaNegotiationError::InvalidKeyExchange)?;
+        validate_peer_public_len(group, key_exchange.key_exchange_data)
+            .map_err(|_| Ikev2ChildSaNegotiationError::InvalidKeyExchange)?;
     }
 
     let initiator_traffic_selector =
@@ -2776,7 +2777,7 @@ pub enum Ikev2ChildSaNegotiationError {
     UnconstrainedTransformType,
     /// PFS negotiation requires the peer's KE payload.
     KeyExchangeRequired,
-    /// The peer KE group is unsupported or its public value has the wrong width.
+    /// The matching KE group is unsupported or its public value has the wrong width.
     InvalidKeyExchange,
     /// A common PFS suite needs a different KE. Return `INVALID_KE_PAYLOAD`.
     KeyExchangeDhGroupMismatch {

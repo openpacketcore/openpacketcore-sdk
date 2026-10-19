@@ -813,6 +813,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after a caller deadline, avoiding repeated reservation and lease waits under
   load while retaining every boundary, persistence and activation check.
 
+- `opc-proto-ikev2`: Child-SA negotiation returns `INVALID_KE_PAYLOAD` naming
+  the selected group before interpreting a different received KE group, including
+  groups the SDK does not implement. Matching-group KE widths remain validated.
+
 - `opc-proto-diameter`: require request-bound authenticated peer evidence for
   SWm emergency authorization, including both answers in identity recovery.
   `correlate_answer_from_connection` retains the existing wire checks and
