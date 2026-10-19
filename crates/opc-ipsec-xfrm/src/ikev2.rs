@@ -1996,6 +1996,69 @@ mod tests {
         }
     }
 
+    fn assert_sdk_initiated_xfrm_nonce_bounds(initial: bool) {
+        ensure_ike_crypto();
+        for (prf, key_len) in [
+            (Ikev2PrfAlgorithm::HmacSha1, 20),
+            (Ikev2PrfAlgorithm::HmacSha2_256, 32),
+            (Ikev2PrfAlgorithm::HmacSha2_384, 48),
+            (Ikev2PrfAlgorithm::HmacSha2_512, 64),
+        ] {
+            let profile =
+                Ikev2ChildSaCryptoProfile::new_aead(prf, Ikev2EncryptionAlgorithm::AesGcm16_128);
+            let sk_d = vec![0x0f; key_len];
+            let derive = |ni: &[u8], nr: &[u8]| {
+                if initial {
+                    derive_initial_child_sa_xfrm_keys(
+                        profile,
+                        &sk_d,
+                        ni,
+                        nr,
+                        Ikev2InitialExchangeNoncePolicy::strict(),
+                    )
+                } else {
+                    derive_child_sa_xfrm_keys(profile, &sk_d, ni, nr, None)
+                }
+            };
+            // The SDK user initiates the exchange: Ni is local; Nr is received.
+            // Legacy peers retain the RFC 7296 section 3.9 receive floor.
+            for peer_len in [16, 24, 31, 32, 256] {
+                let keys = match derive(&[0xa1; 32], &vec![0xb2; peer_len]) {
+                    Ok(keys) => keys,
+                    Err(error) => panic!(
+                        "initiator rejects peer Nr of {peer_len} octets with {prf:?}: {error:?}"
+                    ),
+                };
+                assert!(keys.inbound.aead.is_some());
+                assert!(keys.outbound.aead.is_some());
+            }
+            for local_len in [16, 24, 31] {
+                let error = match derive(&vec![0xa1; local_len], &[0xb2; 32]) {
+                    Ok(_) => panic!("initiator accepted short local Ni of {local_len} octets"),
+                    Err(error) => error,
+                };
+                assert_invalid_nonce_diagnostic(error, Ikev2ChildSaNonceRole::Initiator, local_len);
+            }
+            for peer_len in [15, 257] {
+                let error = match derive(&[0xa1; 32], &vec![0xb2; peer_len]) {
+                    Ok(_) => panic!("initiator accepted out-of-range peer Nr of {peer_len} octets"),
+                    Err(error) => error,
+                };
+                assert_invalid_nonce_diagnostic(error, Ikev2ChildSaNonceRole::Responder, peer_len);
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_initiated_child_sa_xfrm_keys_accept_short_peer_nonce() {
+        assert_sdk_initiated_xfrm_nonce_bounds(false);
+    }
+
+    #[test]
+    fn sdk_initiated_initial_child_sa_xfrm_keys_accept_short_peer_nonce() {
+        assert_sdk_initiated_xfrm_nonce_bounds(true);
+    }
+
     #[test]
     fn child_sa_xfrm_key_derivation_retains_initiator_nonce_diagnostics() {
         ensure_ike_crypto();

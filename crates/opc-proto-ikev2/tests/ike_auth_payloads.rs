@@ -1403,6 +1403,11 @@ fn child_pfs_retries_an_unsupported_ke_guess_with_the_selected_group() {
 }
 
 #[test]
+fn child_pfs_retries_a_legacy_unsupported_ke_guess_with_the_selected_group() {
+    assert_child_pfs_ke_guess_retry(5, 192);
+}
+
+#[test]
 fn child_pfs_retries_a_different_supported_ke_guess_before_width_validation() {
     for width in [64, 63, 65] {
         assert_child_pfs_ke_guess_retry(19, width);
