@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   volume enrollment before open. The SDK generates incarnation keys and returns
   a signer; missing, mismatched or retired enrollment returns
   `VoterIdentityReplacementRequired` before Raft starts. Consumed enrollment
-  cannot re-seed lost consensus tables. Crossing this storage boundary requires
+  cannot re-seed lost consensus tables. Formation and readiness require a fresh
+  authenticated quorum barrier before admission. Crossing this storage boundary requires
   a fresh installation with no migration; consumer manifest publication and
   automatic replacement remain required before advertising the capability.
 

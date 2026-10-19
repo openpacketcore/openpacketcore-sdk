@@ -102,6 +102,7 @@ enum ControlRequest {
         request_digest: [u8; 32],
         marker: VoterSlotLogId,
     },
+    QuorumBarrier,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -112,6 +113,7 @@ pub(super) enum ControlReply {
     },
     SnapshotInstalled(VoterSnapshotEvidence),
     AppliedMarker(VoterSlotLogId),
+    QuorumBarrier(ReadBarrierReply),
 }
 
 impl SessionVoterProfile {
@@ -119,8 +121,12 @@ impl SessionVoterProfile {
         &self,
         store: &ConsensusSessionStore,
         request: ControlRequest,
+        deadline: tokio::time::Instant,
     ) -> Result<ControlReply, VoterReplacementError> {
         match request {
+            ControlRequest::QuorumBarrier => Ok(ControlReply::QuorumBarrier(
+                store.local_voter_slot_barrier_before(deadline).await,
+            )),
             ControlRequest::LossProbe { target, nonce, .. } => {
                 let result = if target == store.inner.local_node_id {
                     Err(VoterReplacementError::TargetStillLive)
@@ -492,6 +498,143 @@ impl SessionVoterProfile {
 }
 
 impl ConsensusSessionStore {
+    // Formation must prove a live quorum before opening the application latch.
+    // Its authenticated control route therefore checks committed membership
+    // directly, without depending on either member's application admission or
+    // enabling the still-unadvertised application RPC families.
+    async fn require_voter_slot_barrier_authority_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), LinearizableBarrierFailure> {
+        if self.inner.retirement.is_started()
+            || !self.inner.persistence_protocol.is_active()
+            || !self.engine_is_running_in_local_scope()
+            || self
+                .inner
+                .voter_profile
+                .as_ref()
+                .is_none_or(|profile| !profile.application_admitted(&self.inner.raft))
+        {
+            return Err(LinearizableBarrierFailure::Unavailable);
+        }
+        match self.operator_recovery_gate_before(deadline).await {
+            OperatorRecoveryGate::Clear => {}
+            OperatorRecoveryGate::Active | OperatorRecoveryGate::Corrupt => {
+                return Err(LinearizableBarrierFailure::RecoveryRequired);
+            }
+            OperatorRecoveryGate::Unavailable => {
+                return Err(LinearizableBarrierFailure::Unavailable);
+            }
+        }
+        if !matches!(
+            tokio::time::timeout_at(deadline, self.durable_fixed_quorum_scope_is_exact()).await,
+            Ok(Ok(true))
+        ) {
+            return Err(LinearizableBarrierFailure::Unavailable);
+        }
+        Ok(())
+    }
+
+    async fn local_voter_slot_barrier_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ReadBarrierReply {
+        let check = || self.require_voter_slot_barrier_authority_before(deadline);
+        let failure = |error| match error {
+            LinearizableBarrierFailure::RecoveryRequired => ReadBarrierReply::RecoveryRequired,
+            LinearizableBarrierFailure::Unavailable => ReadBarrierReply::Unavailable,
+        };
+        if let Err(error) = check().await {
+            return failure(error);
+        }
+        let Ok(scope) = self.current_scope() else {
+            return ReadBarrierReply::Unavailable;
+        };
+        match self.inner.read_barrier.admit(deadline).await {
+            Ok(admit) => {
+                if let Err(error) = check().await {
+                    return failure(error);
+                }
+                if self.current_scope().is_ok_and(|current| current == scope) {
+                    ReadBarrierReply::Ready(admit.read_log_id())
+                } else {
+                    ReadBarrierReply::Unavailable
+                }
+            }
+            Err(LinearizableReadBarrierError::NotLeader { leader }) => {
+                ReadBarrierReply::NotLeader { leader }
+            }
+            Err(_) => ReadBarrierReply::Unavailable,
+        }
+    }
+
+    pub(super) async fn voter_slot_barrier_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<LogId<SessionConsensusNodeId>>, LinearizableBarrierFailure> {
+        self.require_voter_slot_barrier_authority_before(deadline)
+            .await?;
+        let scope = self
+            .current_scope()
+            .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
+        let mut preferred = None;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(LinearizableBarrierFailure::Unavailable);
+            }
+            let leader = match preferred.take() {
+                Some(leader) => leader,
+                None => self
+                    .wait_for_known_leader(deadline)
+                    .await
+                    .map_err(|_| LinearizableBarrierFailure::Unavailable)?,
+            };
+            if !scope.1.contains(&leader) {
+                return Err(LinearizableBarrierFailure::Unavailable);
+            }
+            let reply = if leader == self.inner.local_node_id {
+                self.local_voter_slot_barrier_before(deadline).await
+            } else {
+                match self
+                    .slot_control_call(leader, &ControlRequest::QuorumBarrier, deadline)
+                    .await
+                {
+                    Ok(ControlReply::QuorumBarrier(reply)) => reply,
+                    _ => ReadBarrierReply::Unavailable,
+                }
+            };
+            match reply {
+                ReadBarrierReply::Ready(log_id) => {
+                    if let Some(cut) = log_id {
+                        self.inner
+                            .read_barrier
+                            .wait_for_applied_index(cut.index, deadline)
+                            .await
+                            .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
+                    }
+                    self.require_voter_slot_barrier_authority_before(deadline)
+                        .await?;
+                    if self.current_scope().is_ok_and(|current| current == scope) {
+                        return Ok(log_id);
+                    }
+                    return Err(LinearizableBarrierFailure::Unavailable);
+                }
+                ReadBarrierReply::RecoveryRequired => {
+                    return Err(LinearizableBarrierFailure::RecoveryRequired);
+                }
+                ReadBarrierReply::NotLeader { leader: next } => {
+                    preferred = next.filter(|next| *next != leader && scope.1.contains(next));
+                }
+                ReadBarrierReply::Unavailable => {}
+            }
+            if preferred.is_none() {
+                self.wait_for_route_refresh(leader, deadline)
+                    .await
+                    .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
+            }
+        }
+    }
+
     /// Reopen the explicit Durable fixed-slot incarnation profile after enrollment.
     ///
     /// The resolver must prove both current workload credentials and the selected
@@ -1545,7 +1688,10 @@ pub(super) async fn handle(
                 SessionConsensusRpcFamily::TopologyAdmissionBarrier => {
                     let control = decode_bounded(&request.payload)
                         .map_err(|_| VoterReplacementError::InvalidTransition)?;
-                    let response = profile.control(&store, control).await;
+                    if matches!(control, ControlRequest::QuorumBarrier) && !sender_voting {
+                        return Err(VoterReplacementError::UnauthorizedReplacement);
+                    }
+                    let response = profile.control(&store, control, deadline).await;
                     Ok(encode_bounded(&response).map_or_else(
                         |_| rejected(SessionConsensusPeerError::Protocol),
                         |payload| SessionConsensusWireResponse {

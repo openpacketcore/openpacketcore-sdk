@@ -6570,6 +6570,11 @@ impl ConsensusSessionStore {
         {
             return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
         }
+        if self.inner.voter_profile.is_some() {
+            self.voter_slot_barrier_before(deadline)
+                .await
+                .map_err(|_| ConsensusSessionStoreOpenError::ClusterFormationRejected)?;
+        }
         self.inner.admitted.store(true, Ordering::Release);
         if !self.exact_membership_is_admitted() {
             return Err(ConsensusSessionStoreOpenError::ClusterFormationRejected);
@@ -6662,6 +6667,11 @@ impl ConsensusSessionStore {
             && self.inner.persistence_protocol.is_active()
             && engine_running
             && current_members.contains(&self.inner.local_node_id)
+            && self
+                .inner
+                .voter_profile
+                .as_ref()
+                .is_none_or(|profile| profile.application_admitted(&self.inner.raft))
             && (self.inner.topology.mode() != QuorumTopologyMode::FixedDurableQuorum
                 || self
                     .inner
@@ -10152,6 +10162,12 @@ impl ConsensusSessionStore {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, LinearizableBarrierFailure> {
+        if self.inner.voter_profile.is_some() {
+            self.require_durable_fixed_quorum_admission_before(deadline)
+                .await
+                .map_err(|_| LinearizableBarrierFailure::Unavailable)?;
+            return self.voter_slot_barrier_before(deadline).await;
+        }
         self.linearizable_barrier_with_scope_admission_before(deadline, false)
             .await
     }

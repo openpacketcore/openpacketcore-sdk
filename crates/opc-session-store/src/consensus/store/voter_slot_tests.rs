@@ -656,6 +656,10 @@ impl Fleet {
     }
 
     async fn form(&self) {
+        // Any enrolled genesis member may initialize. Start the leader required
+        // by these scenarios before the other initializers can race it; all
+        // peers are already open and use the real authenticated protocol.
+        self.nodes[0].initialize_cluster().await.unwrap();
         let mut formation = tokio::task::JoinSet::new();
         for node in &self.nodes {
             let node = node.clone();

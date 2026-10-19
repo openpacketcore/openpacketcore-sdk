@@ -172,18 +172,17 @@ impl VoterIdentitySigner {
             return Err(refused);
         }
         let cluster =
-            ConsensusClusterId::from_bytes(bytes[16..48].try_into().map_err(|_| refused.clone())?);
+            ConsensusClusterId::from_bytes(bytes[16..48].try_into().map_err(|_| refused)?);
         let slot = SlotId::new(u16::from_be_bytes(
-            bytes[48..50].try_into().map_err(|_| refused.clone())?,
+            bytes[48..50].try_into().map_err(|_| refused)?,
         ))
-        .map_err(|_| refused.clone())?;
+        .map_err(|_| refused)?;
         let incarnation = VoterIncarnation::new(u64::from_be_bytes(
-            bytes[50..58].try_into().map_err(|_| refused.clone())?,
+            bytes[50..58].try_into().map_err(|_| refused)?,
         ))
-        .map_err(|_| refused.clone())?;
-        let secret =
-            Zeroizing::new(<[u8; 32]>::try_from(&bytes[58..90]).map_err(|_| refused.clone())?);
-        let key = SigningKey::from_bytes((&*secret).into()).map_err(|_| refused.clone())?;
+        .map_err(|_| refused)?;
+        let secret = Zeroizing::new(<[u8; 32]>::try_from(&bytes[58..90]).map_err(|_| refused)?);
+        let key = SigningKey::from_bytes((&*secret).into()).map_err(|_| refused)?;
         let signer = Self {
             cluster,
             identity: VoterSlotIdentity::new(slot, incarnation),

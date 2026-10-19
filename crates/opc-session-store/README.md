@@ -319,6 +319,9 @@ identity. Peers require proof of the selected key before any bootstrap
 Pre-Vote grant or term change. Any enrolled genesis member may initialize the
 same full manifest, so an absent preferred initiator does not block a fresh
 majority. After formation, the committed `VoterSlotTable` is the authority.
+Initialization opens admission only after a fresh authenticated Openraft quorum
+barrier and local apply. The readiness probes use that same control route and
+never reuse a pre-restart admission observation or a cached reachability proof.
 
 The local enrollment binding is excluded from portable snapshots; installing
 a snapshot preserves the recipient's own binding and key. First initialization

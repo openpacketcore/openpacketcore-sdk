@@ -202,7 +202,7 @@ impl OpenVoter {
     pub(super) async fn initialize_cluster(&self) -> Result<(), ConsensusSessionStoreOpenError> {
         match self {
             Self::Running(store) => store.initialize_cluster().await,
-            Self::Refused(error) => Err(error.clone()),
+            Self::Refused(error) => Err(*error),
         }
     }
 
