@@ -1256,8 +1256,10 @@ async fn blocked_transfer(
                 .applied_index_at_least(Some(last), "follower caught up before isolation").await.unwrap();
             // Preserve a lagging prefix across seed handoff, but let a newly
             // elected leader obtain genuine conflict replies from this voter.
-            *fleet.peers[follower].seed_prefix_limit.lock().unwrap() =
-                follower_store.inner.raft.metrics().borrow().last_log_index;
+            *fleet.peers[follower].seed_prefix_limit.lock().unwrap() = Some((
+                mode,
+                follower_store.inner.raft.metrics().borrow().last_log_index.unwrap(),
+            ));
             let gate = Arc::new(SnapshotArtifactGate::new());
             let hold = store.inner.peer_directory.pause_snapshot_transfer_for_test(
                 follower_store.inner.local_node_id, gate.clone(),

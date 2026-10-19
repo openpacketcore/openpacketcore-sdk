@@ -61,7 +61,7 @@ struct Peer {
     blocked_senders: Mutex<BTreeSet<SessionConsensusNodeId>>,
     blocked_votes: AtomicBool,
     blocked_append_above: Mutex<Option<(SessionConsensusNodeId, u64)>>,
-    seed_prefix_limit: Mutex<Option<u64>>,
+    seed_prefix_limit: Mutex<Option<(SessionPersistenceMode, u64)>>,
     held_reply: Mutex<Option<Arc<races::ReplyHold>>>,
     held_requests: Mutex<Option<Arc<history_read::RequestHold>>>,
     cut_mutation: Mutex<Option<admission::CutMutation>>,
@@ -103,13 +103,13 @@ impl SessionConsensusPeer for Peer {
             return Err(SessionConsensusPeerError::Unavailable);
         }
         let seed_limit = *self.seed_prefix_limit.lock().unwrap();
-        if let Some(limit) = seed_limit {
+        if let Some((mode, limit)) = seed_limit {
             // Keep initial seeding from advancing this follower, while letting
             // a new leader discover its missing prefix through real conflicts.
             if request.family == SessionConsensusRpcFamily::InstallSnapshot {
                 return Err(SessionConsensusPeerError::Unavailable);
             }
-            if let Some(append) = races::append_request(&request) {
+            if let Some(append) = races::append_request_in_mode(&request, mode) {
                 let can_extend_prefix = append.prev_log_id.is_none_or(|prev| prev.index <= limit)
                     && append
                         .entries

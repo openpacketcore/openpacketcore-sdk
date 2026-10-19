@@ -52,7 +52,7 @@ pub(super) async fn after_batch(
     if let Some(follower) = TRACK_LAGGING_FOLLOWER.try_with(Cell::get).ok().flatten() {
         let leader = leader_before(fleet, None, None, deadline).await;
         let seed_limit = *fleet.peers[follower].seed_prefix_limit.lock().unwrap();
-        if let Some(limit) = seed_limit {
+        if let Some((_, limit)) = seed_limit {
             assert!(
                 fleet
                     .store(follower)
