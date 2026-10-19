@@ -17,6 +17,7 @@ use opc_consensus::engine::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     PreVoteRequest, PreVoteResponse, TransferLeaderRequest, VoteRequest, VoteResponse,
 };
+use opc_consensus::engine::type_config::TypeConfigExt;
 use opc_consensus::engine::{EmptyNode, EntryPayload, Membership, StoredMembership, Vote};
 use opc_consensus::{
     decode_bounded, decode_roster_bounded, encode_bounded, encode_roster_bounded,
@@ -1370,6 +1371,10 @@ impl SessionRaftRpcHandler {
             });
         if fixed_members {
             let proposed = rpc.vote;
+            // Match the pinned engine's leader lease, including its inclusive
+            // deadline. Configuration is immutable; time is read on the core.
+            let leader_lease =
+                std::time::Duration::from_millis(self.raft.config().election_timeout_max);
             let response = self
                 .raft
                 .with_raft_state(move |state| {
@@ -1382,17 +1387,23 @@ impl SessionRaftRpcHandler {
                         || state.membership_state != Default::default()
                         || state.committed.is_some()
                         || state.snapshot_meta != Default::default()
-                        || state.vote_ref().is_committed()
                     {
                         return None;
                     }
                     // An empty log is necessarily no fresher than the candidate's.
-                    // A prior unsuccessful real vote is allowed, but a committed
-                    // leader vote always delegates to the engine's lease checks.
+                    // A heartbeat may have persisted a committed vote before
+                    // membership arrived. Preserve its lease, then allow the
+                    // next campaign after that leader disappears. Without any
+                    // membership this node cannot be a leader or accept a lease
+                    // release, so the engine's other lease cases cannot apply.
+                    let lease_active = state.vote_ref().is_committed()
+                        && state
+                            .vote_last_modified()
+                            .is_some_and(|at| SessionRaftTypeConfig::now() <= at + leader_lease);
                     Some(PreVoteResponse::new(
                         state.vote_ref(),
                         None,
-                        !proposed.is_committed() && &proposed > state.vote_ref(),
+                        !proposed.is_committed() && &proposed > state.vote_ref() && !lease_active,
                     ))
                 })
                 .await
