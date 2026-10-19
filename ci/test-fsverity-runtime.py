@@ -301,7 +301,7 @@ finally:
     def test_concurrent_recovery_skips_a_completed_transaction_from_another_parent(self):
         other = self.root / "other-parent"
         other.mkdir(mode=0o700)
-        privileged("python3", "-I", "-c", '''
+        program = '''
 import importlib.util,os,sys,threading,time
 spec=importlib.util.spec_from_file_location('runtime',sys.argv[1])
 runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
@@ -365,7 +365,12 @@ finally:
     for fd in parents: os.close(fd)
 assert not worker.is_alive()
 if errors: raise errors[0]
-''', HARNESS.with_name("fsverity-runtime.py"), self.runner, other)
+'''
+        try:
+            privileged("python3", "-I", "-c", program,
+                       HARNESS.with_name("fsverity-runtime.py"), self.runner, other)
+        except subprocess.CalledProcessError as error:
+            self.fail(error.stderr)
 
     def test_remove_rejects_an_unowned_parent_and_a_different_parent_inode(self):
         directory = self.candidate("wrong-parent")

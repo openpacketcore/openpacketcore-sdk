@@ -418,7 +418,11 @@ def recover_transaction(parent, staging, record, uid, deadline):
                 except FileExistsError:
                     rename_new(staging, "runtime", parent, PREFIX + "restored." + secrets.token_hex(16))
             return False
-        if info.st_uid not in (0, uid) or stat.S_IMODE(info.st_mode) != 0o700:
+        # A restrictive umask can leave mkdir's root-owned inode at mode 000
+        # before create reaches fchmod, still inside authenticated staging.
+        modes = (0, 0o700) if (record["action"] == "create" and location == staging
+                              and info.st_uid == 0) else (0o700,)
+        if info.st_uid not in (0, uid) or stat.S_IMODE(info.st_mode) not in modes:
             return
         if record["action"] == "remove" and not is_owned(directory, uid=info.st_uid):
             return
@@ -505,7 +509,10 @@ def recover_staging(parent, uid, deadline):
             remaining(deadline)
             if not name.startswith(STAGING_PREFIX):
                 continue
-            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            try:
+                descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+            except FileNotFoundError:
+                continue  # A live transaction completed after the listing.
             try:
                 info = os.fstat(descriptor)
                 if info.st_uid != 0 or stat.S_IMODE(info.st_mode) not in (0, 0o700):
@@ -983,7 +990,9 @@ class Guardian:
                 name = PREFIX + secrets.token_hex(16)
                 # Initialize under a protected parent too: creation rollback
                 # must not have the same name-substitution bug as final removal.
-                self.directory_fd, self.image_fd = privileged_request("create", [self.parent_fd], name=name)
+                self.directory_fd, self.image_fd = privileged_request(
+                    "create", [self.parent_fd], name=name,
+                    deadline=time.monotonic() + CLEANUP_HELPER_SECONDS)
                 self.image_identity = identity(self.image_fd)
                 directory = root / name
                 try:

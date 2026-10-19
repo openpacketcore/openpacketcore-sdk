@@ -70,8 +70,14 @@ the mutable databases or WALs out of `TMPDIR`.
 For required fs-verity qualification, run the gate inside the filesystem owner:
 
 ```bash
-RUNNER_TEMP=/existing/private/scratch bash ci/setup-fsverity-tmp.sh -- <gate-command> [arguments...]
+mkdir -p "$PWD/target/ci-scratch"
+chmod 0700 "$PWD/target/ci-scratch"
+RUNNER_TEMP="$PWD/target/ci-scratch" bash ci/setup-fsverity-tmp.sh -- <gate-command> [arguments...]
 ```
+
+Each checkout keeps this one stable scratch root, `$PWD/target/ci-scratch`.
+Reuse the directory across runs without deleting or replacing it: recovery
+records match its directory identity, so a later sweep must use the same parent.
 
 The owner sets `OPC_FS_VERITY_SNAPSHOT_ROOT` and
 `OPC_FS_VERITY_QUALIFICATION=required` for that command, then unmounts and removes
@@ -99,7 +105,7 @@ dead transactions, including frozen runtimes still in the scratch parent and
 partly created or removed runtimes in staging. Live, locked, open or attached
 resources are preserved for a later sweep; no manual root cleanup is needed.
 The five-second loop-autoclear bound remains separate from inventory and the
-bounded privileged-removal round trip.
+bounded privileged create/remove round trips.
 Mounts use a separate namespace with slave propagation: owner mounts cannot
 reach other jobs. Host unmounts propagate into the owner when the upstream host
 mount is shared, as on the hosted runners and standard systemd hosts; a private
