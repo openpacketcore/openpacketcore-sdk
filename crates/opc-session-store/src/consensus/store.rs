@@ -634,6 +634,9 @@ impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
             SessionConsensusStorageError::IdentityMismatch
             | SessionConsensusStorageError::SchemaVersionMismatch
             | SessionConsensusStorageError::InvalidIdentity => Self::DurableIdentityMismatch,
+            SessionConsensusStorageError::VoterIdentityReplacementRequired => {
+                Self::VoterIdentityReplacementRequired
+            }
             SessionConsensusStorageError::BackendUnavailable => Self::StorageUnavailable,
         }
     }

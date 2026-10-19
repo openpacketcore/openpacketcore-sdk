@@ -1593,16 +1593,16 @@ impl SqliteSessionBackend {
             let path = self
                 .database_path
                 .as_ref()
-                .ok_or(crate::consensus::storage::SessionConsensusStorageError::IdentityMismatch)?;
+                .ok_or(crate::consensus::storage::SessionConsensusStorageError::VoterIdentityReplacementRequired)?;
             let retained = voter_identity::read_anchor(&conn, path).map_err(|_| {
-                crate::consensus::storage::SessionConsensusStorageError::IdentityMismatch
+                crate::consensus::storage::SessionConsensusStorageError::VoterIdentityReplacementRequired
             })?;
             if retained.cluster_instance() != expected.cluster_instance()
                 || retained.identity() != expected.identity()
                 || retained.key_digest() != expected.key_digest()
             {
                 return Err(
-                    crate::consensus::storage::SessionConsensusStorageError::IdentityMismatch,
+                    crate::consensus::storage::SessionConsensusStorageError::VoterIdentityReplacementRequired,
                 );
             }
         }

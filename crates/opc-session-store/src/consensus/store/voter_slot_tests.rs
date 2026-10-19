@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "voter_identity_tests.rs"]
+mod identity_tests;
 #[path = "voter_slot_lifecycle_tests.rs"]
 mod lifecycle_tests;
 #[path = "voter_slot_progress_tests.rs"]
@@ -1222,6 +1224,18 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
     drop(candidate);
     let directory = fleet.directories.last().unwrap().path();
     let backend = SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap();
+    let retained_signer = backend
+        .voter_identity_signer(
+            fleet.genesis().cluster_instance,
+            &prepared.table().slots[2].member,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retained_signer.key_digest(),
+        prepared.table().slots[2].member.key_digest,
+        "snapshot installation and restart preserve the successor volume's own key"
+    );
     let reopened = ConsensusSessionStore::open_with_voter_slots_and_integrity(
         fleet.topology(3),
         prepared.table().clone(),

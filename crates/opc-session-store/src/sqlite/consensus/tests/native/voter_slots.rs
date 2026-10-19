@@ -121,11 +121,64 @@ fn voter_slot_initialize_refuses_reseeding_after_both_consensus_bindings_are_los
 }
 
 #[test]
+fn voter_enrollment_consumption_rolls_back_with_identity_creation() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let conn = backend.conn.blocking_lock();
+    let initial = fixture::genesis(3);
+    crate::sqlite::voter_identity::enroll_projection_for_test(&conn, &initial);
+    let seed = crate::sqlite::consensus::voter_slots::Seed::genesis(initial.clone()).unwrap();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    crate::sqlite::consensus::voter_slots::initialize(
+        &tx,
+        false,
+        Some(&seed),
+        seed.identity().unwrap(),
+        &seed.members(),
+        ConsensusAuthorityProfile::FixedImmutable,
+    )
+    .unwrap();
+    assert_eq!(
+        tx.query_row(
+            "SELECT initialized FROM consensus_voter_anchor",
+            [],
+            |row| row.get::<_, u64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    tx.rollback().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT initialized FROM consensus_voter_anchor",
+            [],
+            |row| row.get::<_, u64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(!table_exists(&conn, "consensus_voter_slots").unwrap());
+    assert!(!table_exists(&conn, "consensus_identity").unwrap());
+    initialize(&conn, &initial, true).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT initialized FROM consensus_voter_anchor",
+            [],
+            |row| row.get::<_, u64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn slot_seed_profile_cannot_be_adopted_by_legacy_or_created_over_legacy() {
     for old_first in [false, true] {
         let backend = SqliteSessionBackend::in_memory().unwrap();
         let conn = backend.conn.blocking_lock();
         let initial = fixture::genesis(3);
+        if !old_first {
+            crate::sqlite::voter_identity::enroll_projection_for_test(&conn, &initial);
+        }
         initialize(&conn, &initial, !old_first).unwrap();
         let before: i64 = conn
             .query_row("PRAGMA schema_version", [], |row| row.get(0))
@@ -155,6 +208,7 @@ fn native_wal_slot_reader_never_releases_an_unflushed_truncation() {
         let backend = SqliteSessionBackend::open(directory.path().join("seed.sqlite")).unwrap();
         let initial = fixture::genesis(size);
         let conn = backend.conn.blocking_lock();
+        crate::sqlite::voter_identity::enroll_projection_for_test(&conn, &initial);
         let identity = initialize(&conn, &initial, true).unwrap();
         let held = Arc::new(AtomicBool::new(false));
         let latch = Arc::new((Mutex::new((false, false)), Condvar::new()));
@@ -279,6 +333,7 @@ fn native_slot_export_carries_the_current_table_and_exact_pending_intent() {
     let backend = SqliteSessionBackend::open(directory.path().join("seed.sqlite")).unwrap();
     let initial = fixture::genesis(3);
     let conn = backend.conn.blocking_lock();
+    crate::sqlite::voter_identity::enroll_projection_for_test(&conn, &initial);
     let identity = initialize(&conn, &initial, true).unwrap();
     let wal = Wal::create_native(
         &directory.path().join("wal"),
@@ -345,6 +400,23 @@ fn native_slot_export_carries_the_current_table_and_exact_pending_intent() {
             .unwrap(),
         expected
     );
+    assert!(crate::sqlite::voter_identity::anchor_present(&snapshot).unwrap());
+    snapshot.pragma_update(None, "query_only", false).unwrap();
+    prepare_portable_snapshot_metadata_sync(&snapshot).unwrap();
+    assert!(
+        !crate::sqlite::voter_identity::anchor_present(&snapshot).unwrap(),
+        "portable snapshots cannot replace the recipient volume's enrollment"
+    );
+    assert_eq!(
+        crate::sqlite::consensus::voter_slots::read_state(&snapshot)
+            .unwrap()
+            .unwrap(),
+        expected
+    );
+    assert!(
+        crate::sqlite::voter_identity::anchor_present(&backend.conn.blocking_lock()).unwrap(),
+        "export strips only the disposable image, never the local anchor"
+    );
     drop(snapshot);
     wal.shutdown().unwrap();
     let reopened = Wal::open(
@@ -368,6 +440,7 @@ fn native_installed_snapshot_cut_preserves_or_resolves_intent_after_selected_reo
             let directory = tempfile::tempdir().unwrap();
             let backend = SqliteSessionBackend::open(directory.path().join("seed.sqlite")).unwrap();
             let conn = backend.conn.blocking_lock();
+            crate::sqlite::voter_identity::enroll_projection_for_test(&conn, &initial);
             let identity = initialize(&conn, &initial, true).unwrap();
             let wal = Wal::create_native(
                 &directory.path().join("wal"),

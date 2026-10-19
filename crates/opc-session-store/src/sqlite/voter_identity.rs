@@ -3,7 +3,7 @@
 use super::*;
 use std::io::{Read, Write};
 
-use opc_consensus::voter_slots::{VoterSlotIdentity, VoterSlotMember};
+use opc_consensus::voter_slots::{SlotId, VoterIncarnation, VoterSlotIdentity, VoterSlotMember};
 use opc_consensus::ConsensusClusterId;
 use zeroize::Zeroizing;
 
@@ -16,7 +16,8 @@ const SCHEMA: &str = "CREATE TABLE consensus_voter_anchor (
     installation BLOB NOT NULL CHECK (typeof(installation) = 'blob' AND length(installation) = 32),
     slot INTEGER NOT NULL CHECK (slot BETWEEN 1 AND 65535),
     incarnation INTEGER NOT NULL CHECK (incarnation BETWEEN 1 AND 140737488355328),
-    key_digest BLOB NOT NULL CHECK (typeof(key_digest) = 'blob' AND length(key_digest) = 32)
+    key_digest BLOB NOT NULL CHECK (typeof(key_digest) = 'blob' AND length(key_digest) = 32),
+    initialized INTEGER NOT NULL CHECK (initialized IN (0, 1))
 )";
 
 fn refused() -> ConsensusSessionStoreOpenError {
@@ -37,10 +38,14 @@ pub(super) fn anchor_present(conn: &Connection) -> rusqlite::Result<bool> {
     )
 }
 
-pub(super) fn read_anchor(
-    conn: &Connection,
-    database: &Path,
-) -> Result<VoterIdentitySigner, ConsensusSessionStoreOpenError> {
+struct PublicAnchor {
+    installation: ConsensusClusterId,
+    identity: VoterSlotIdentity,
+    key_digest: [u8; 32],
+    initialized: bool,
+}
+
+fn read_public_anchor(conn: &Connection) -> Result<PublicAnchor, ConsensusSessionStoreOpenError> {
     if !anchor_present(conn).map_err(|_| refused())? {
         return Err(refused());
     }
@@ -49,21 +54,111 @@ pub(super) fn read_anchor(
             row.get(0)
         })
         .map_err(|_| refused())?;
-    let (version, installation, slot, incarnation, digest): (u64, Vec<u8>, u16, u64, Vec<u8>) = conn
+    let (version, installation, slot, incarnation, digest, initialized):
+        (u64, Vec<u8>, u16, u64, Vec<u8>, u64) = conn
         .query_row(
-            "SELECT format, installation, slot, incarnation, key_digest FROM consensus_voter_anchor WHERE singleton = 1 AND length(installation) = 32 AND length(key_digest) = 32",
+            "SELECT format, installation, slot, incarnation, key_digest, initialized FROM consensus_voter_anchor WHERE singleton = 1 AND length(installation) = 32 AND length(key_digest) = 32",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
         .map_err(|_| refused())?;
-    if count != 1 || version != 1 {
+    if count != 1 || version != 1 || initialized > 1 {
         return Err(refused());
     }
+    Ok(PublicAnchor {
+        installation: ConsensusClusterId::from_bytes(
+            installation.try_into().map_err(|_| refused())?,
+        ),
+        identity: VoterSlotIdentity::new(
+            SlotId::new(slot).map_err(|_| refused())?,
+            VoterIncarnation::new(incarnation).map_err(|_| refused())?,
+        ),
+        key_digest: digest.try_into().map_err(|_| refused())?,
+        initialized: initialized == 1,
+    })
+}
+
+/// The public local binding is checked again inside the identity transaction.
+/// A retained key alone cannot re-seed a lost database or consumed enrollment.
+pub(super) fn require_seed_enrollment(
+    conn: &Connection,
+    seed: &consensus::voter_slots::Seed,
+    initialized: bool,
+) -> Result<(), crate::consensus::storage::SessionConsensusStorageError> {
+    use crate::consensus::storage::SessionConsensusStorageError::VoterIdentityReplacementRequired;
+    let anchor = read_public_anchor(conn).map_err(|_| VoterIdentityReplacementRequired)?;
+    if anchor.initialized != initialized
+        || anchor.installation != seed.genesis.cluster_instance
+        || !seed.initial.slots.iter().any(|slot| {
+            slot.member.identity == anchor.identity
+                && slot.member.key_digest == anchor.key_digest
+                && slot.retired_through < anchor.identity.incarnation().get()
+        })
+    {
+        return Err(VoterIdentityReplacementRequired);
+    }
+    Ok(())
+}
+
+/// Called in the same transaction that creates the first consensus identity.
+pub(super) fn consume_enrollment(
+    conn: &Connection,
+) -> Result<(), crate::consensus::storage::SessionConsensusStorageError> {
+    use crate::consensus::storage::SessionConsensusStorageError as Error;
+    let changed = conn.execute(
+        "UPDATE consensus_voter_anchor SET initialized = 1 WHERE singleton = 1 AND initialized = 0", [],
+    ).map_err(|_| Error::BackendUnavailable)?;
+    if changed != 1 {
+        return Err(Error::VoterIdentityReplacementRequired);
+    }
+    Ok(())
+}
+
+fn create_public_anchor(
+    conn: &Connection,
+    installation: ConsensusClusterId,
+    identity: VoterSlotIdentity,
+    key_digest: [u8; 32],
+) -> rusqlite::Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    conn.execute(
+        "INSERT INTO consensus_voter_anchor VALUES (1, 1, ?1, ?2, ?3, ?4, 0)",
+        params![
+            installation.as_bytes(),
+            identity.slot().get(),
+            identity.incarnation().get(),
+            key_digest.as_slice()
+        ],
+    )?;
+    Ok(())
+}
+
+// Pure storage fixtures seed only the public projection. Public store tests
+// exercise real file-backed enrollment and proof of the SDK-generated key.
+#[cfg(test)]
+pub(crate) fn enroll_projection_for_test(
+    conn: &Connection,
+    table: &opc_consensus::voter_slots::VoterSlotTable,
+) {
+    let member = &table.slots[0].member;
+    create_public_anchor(
+        conn,
+        table.cluster_instance,
+        member.identity,
+        member.key_digest,
+    )
+    .unwrap();
+}
+
+pub(super) fn read_anchor(
+    conn: &Connection,
+    database: &Path,
+) -> Result<VoterIdentitySigner, ConsensusSessionStoreOpenError> {
+    let anchor = read_public_anchor(conn)?;
     let signer = read_private_anchor(database)?;
-    if signer.cluster_instance().as_bytes() != installation.as_slice()
-        || signer.identity().slot().get() != slot
-        || signer.identity().incarnation().get() != incarnation
-        || signer.key_digest() != digest.as_slice()
+    if signer.cluster_instance() != anchor.installation
+        || signer.identity() != anchor.identity
+        || signer.key_digest() != anchor.key_digest
     {
         return Err(refused());
     }
@@ -125,17 +220,8 @@ impl SqliteSessionBackend {
                 return Err(ConsensusSessionStoreOpenError::VoterIdentityAlreadyEnrolled);
             }
             let signer = VoterIdentitySigner::generate(installation, identity)?;
-            tx.execute_batch(SCHEMA).map_err(unavailable)?;
-            tx.execute(
-                "INSERT INTO consensus_voter_anchor VALUES (1, 1, ?1, ?2, ?3, ?4)",
-                params![
-                    installation.as_bytes(),
-                    identity.slot().get(),
-                    identity.incarnation().get(),
-                    signer.key_digest().as_slice()
-                ],
-            )
-            .map_err(unavailable)?;
+            create_public_anchor(&tx, installation, identity, signer.key_digest())
+                .map_err(unavailable)?;
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]

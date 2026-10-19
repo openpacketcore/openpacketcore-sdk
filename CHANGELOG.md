@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-session-store`: the unadvertised voter-slot profile requires explicit
+  volume enrollment before open. The SDK generates incarnation keys and returns
+  a signer; missing, mismatched or retired enrollment returns
+  `VoterIdentityReplacementRequired` before Raft starts. Consumed enrollment
+  cannot re-seed lost consensus tables. Crossing this storage boundary requires
+  a fresh installation with no migration; consumer manifest publication and
+  automatic replacement remain required before advertising the capability.
+
 - `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
   `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
   must handle both variants. (#1334)
