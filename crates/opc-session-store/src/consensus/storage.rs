@@ -199,28 +199,22 @@ struct LiveTerminalRecoveryFullReconciliationObserver {
 }
 
 #[cfg(test)]
-fn live_terminal_recovery_full_reconciliation_observer(
-) -> &'static std::sync::Mutex<Option<Arc<AtomicUsize>>> {
-    static OBSERVER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<AtomicUsize>>>> =
-        std::sync::OnceLock::new();
-    OBSERVER.get_or_init(|| std::sync::Mutex::new(None))
+tokio::task_local! {
+    static LIVE_TERMINAL_RECOVERY_FULL_RECONCILIATIONS: Arc<AtomicUsize>;
 }
 
 #[cfg(all(test, target_os = "linux"))]
 impl LiveTerminalRecoveryFullReconciliationObserver {
-    fn install() -> Self {
-        let full_reconciliations = Arc::new(AtomicUsize::new(0));
-        let mut installed = live_terminal_recovery_full_reconciliation_observer()
-            .lock()
-            .expect("live terminal recovery full reconciliation observer");
-        assert!(
-            installed.is_none(),
-            "live terminal recovery full reconciliation observer already installed"
-        );
-        *installed = Some(Arc::clone(&full_reconciliations));
+    fn new() -> Self {
         Self {
-            full_reconciliations,
+            full_reconciliations: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    async fn observe<F: std::future::Future>(&self, future: F) -> F::Output {
+        LIVE_TERMINAL_RECOVERY_FULL_RECONCILIATIONS
+            .scope(Arc::clone(&self.full_reconciliations), future)
+            .await
     }
 
     fn full_reconciliations(&self) -> usize {
@@ -228,31 +222,11 @@ impl LiveTerminalRecoveryFullReconciliationObserver {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-impl Drop for LiveTerminalRecoveryFullReconciliationObserver {
-    fn drop(&mut self) {
-        let mut installed = live_terminal_recovery_full_reconciliation_observer()
-            .lock()
-            .expect("live terminal recovery full reconciliation observer");
-        assert!(
-            installed
-                .as_ref()
-                .is_some_and(|observer| Arc::ptr_eq(observer, &self.full_reconciliations)),
-            "live terminal recovery full reconciliation observer changed"
-        );
-        *installed = None;
-    }
-}
-
 #[cfg(test)]
 fn observe_live_terminal_recovery_full_reconciliation() {
-    if let Some(observer) = live_terminal_recovery_full_reconciliation_observer()
-        .lock()
-        .expect("live terminal recovery full reconciliation observer")
-        .as_ref()
-    {
+    let _ = LIVE_TERMINAL_RECOVERY_FULL_RECONCILIATIONS.try_with(|observer| {
         observer.fetch_add(1, Ordering::AcqRel);
-    }
+    });
 }
 
 #[cfg(test)]
@@ -20777,23 +20751,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_terminal_reconciliation_observer_ignores_unrelated_tasks() {
-        let observer = LiveTerminalRecoveryFullReconciliationObserver::install();
-        observe_live_terminal_recovery_full_reconciliation();
-        assert_eq!(
-            observer.full_reconciliations(),
-            1,
-            "the observed task records its own work"
-        );
-        tokio::spawn(async {
-            observe_live_terminal_recovery_full_reconciliation();
-        })
-        .await
-        .expect("join independent reconciliation observer task");
-        assert_eq!(
-            observer.full_reconciliations(),
-            1,
-            "another task's reconciliation must not enter this observation"
-        );
+        let observer = LiveTerminalRecoveryFullReconciliationObserver::new();
+        observer
+            .observe(async {
+                observe_live_terminal_recovery_full_reconciliation();
+                assert_eq!(
+                    observer.full_reconciliations(),
+                    1,
+                    "the observed task records its own work"
+                );
+                tokio::spawn(async {
+                    observe_live_terminal_recovery_full_reconciliation();
+                })
+                .await
+                .expect("join independent reconciliation observer task");
+                assert_eq!(
+                    observer.full_reconciliations(),
+                    1,
+                    "another task's reconciliation must not enter this observation"
+                );
+            })
+            .await;
     }
 
     #[cfg(target_os = "linux")]
@@ -20831,12 +20809,12 @@ mod tests {
                 .expect("bind current terminal fixture snapshot")
         };
         let consumer = log_store.live_terminal_recovery_handoff_consumer();
-        let observer = LiveTerminalRecoveryFullReconciliationObserver::install();
+        let observer = LiveTerminalRecoveryFullReconciliationObserver::new();
 
         assert_eq!(
             LiveTerminalRecoveryHandoffState::Clear,
-            consumer
-                .reconcile()
+            observer
+                .observe(consumer.reconcile())
                 .await
                 .expect("clear probe revalidates application authority"),
             "clear steady state does not enter snapshot reconciliation"
@@ -20862,8 +20840,8 @@ mod tests {
             .expect("publish active terminal fixture latch");
         assert_eq!(
             LiveTerminalRecoveryHandoffState::Active,
-            consumer
-                .reconcile()
+            observer
+                .observe(consumer.reconcile())
                 .await
                 .expect("active probe remains closed without snapshot work")
         );
@@ -20902,8 +20880,8 @@ mod tests {
 
         assert_eq!(
             LiveTerminalRecoveryHandoffState::Consumed,
-            consumer
-                .reconcile()
+            observer
+                .observe(consumer.reconcile())
                 .await
                 .expect("terminal evidence enters full snapshot reconciliation")
         );

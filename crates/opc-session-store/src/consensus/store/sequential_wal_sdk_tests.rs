@@ -1127,6 +1127,18 @@ async fn quorum_authority_native_durable_cut_and_independent_sql_cold_reconstruc
             if let Some(expected) = &independent_outcomes {
                 assert!(&outcomes == expected, "native outcomes differ from independent SQL execution");
             } else { independent_outcomes = Some(outcomes); }
+            if native {
+                // Exercise the normal leadership handoff before the final
+                // drain, while every authenticated voter is still available.
+                fleet.stores[leader].prepare_shutdown().await
+                    .expect("live leader completes its planned handoff");
+            }
+            // Shutdown preparation can legitimately persist another vote.
+            // Finish it while every WAL owner is live, then capture the exact
+            // authority/cut witness that the joined cold reader must preserve.
+            // close() reuses these clone-wide preparations before its drain.
+            let prepared = join_all(fleet.stores.iter().map(ConsensusSessionStore::prepare_shutdown_for_stop)).await;
+            eprintln!("quorum_authority_shutdown_preparations={prepared:?}");
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             let live = loop {
                 let facts = fleet.stores.iter().enumerate().map(|(slot, store)| {
@@ -1182,12 +1194,6 @@ async fn quorum_authority_native_durable_cut_and_independent_sql_cold_reconstruc
                         .native_activation_facts_for_test().expect("post-snapshot raw witness");
                     assert_eq!(after, live[slot], "snapshot publication preserves every captured authority/cut/business fact");
                 }
-            }
-            if native {
-                // Exercise the normal leadership handoff before the final
-                // drain, while every authenticated voter is still available.
-                fleet.stores[leader].prepare_shutdown().await
-                    .expect("live leader completes its planned handoff");
             }
             (retained, live, sql)
         }).catch_unwind().await;
