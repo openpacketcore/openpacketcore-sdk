@@ -193,19 +193,108 @@ def exclusive(descriptor, deadline):
         fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
+def staging_metadata(uid):
+    name = ".opc-sdk-fsverity-staging." + str(uid) + "." + hashlib.sha256(OWNER_ID).hexdigest()[:24]
+    marker = json.dumps({"owner": OWNER_ID.decode(), "uid": uid}, sort_keys=True).encode()
+    return name, marker
+
+
+def select_staging_root(ancestor, uid, deadline, *, skip=(), create=True):
+    """Reuse authenticated metadata; collisions get an unpredictable fallback."""
+    prefix, marker = staging_metadata(uid)
+    names = [prefix] + sorted(name for name in os.listdir(ancestor) if name.startswith(prefix + "."))
+    for name in names:
+        remaining(deadline)
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=ancestor)
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                continue
+            raise
+        accepted = False
+        try:
+            info = os.fstat(descriptor)
+            if (identity(descriptor) in skip or info.st_uid != 0
+                    or stat.S_IMODE(info.st_mode) not in (0, 0o700)
+                    or stat.S_IMODE(info.st_mode) == 0 and os.listdir(descriptor)):
+                continue
+            try:
+                observed = os.getxattr(descriptor, STAGING_ATTRIBUTE)
+            except OSError as error:
+                if error.errno != errno.ENODATA:
+                    raise
+                if os.listdir(descriptor):
+                    continue
+                observed = marker  # Empty initialization interrupted before marking.
+            if observed != marker:
+                continue
+            accepted = True
+            return name, descriptor
+        finally:
+            if not accepted:
+                os.close(descriptor)
+    if not create:
+        return None
+    name = prefix
+    while True:
+        remaining(deadline)
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=ancestor)
+            return name, os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=ancestor)
+        except FileExistsError:
+            name = prefix + "." + secrets.token_hex(16)
+        except FileNotFoundError:
+            continue  # Another helper initialized and retired it before open.
+
+
+def retire_staging_root(descriptor, uid, deadline):
+    """Retire only a pinned, authenticated, empty anchor; never wait for a user."""
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return  # The active holder checks for an empty anchor on its own exit.
+    ancestor = None
+    try:
+        info = os.fstat(descriptor)
+        if not info.st_nlink:
+            return
+        prefix, marker = staging_metadata(uid)
+        name = Path(os.readlink(f"/proc/self/fd/{descriptor}")).name
+        if (info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700
+                or name != prefix and not name.startswith(prefix + ".")
+                or os.getxattr(descriptor, STAGING_ATTRIBUTE) != marker):
+            raise RuntimeError("untrusted fs-verity staging root during retirement")
+        if info.st_nlink > 2:
+            return  # Still contains transaction directories; cannot be empty.
+        ancestor = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+        above = os.fstat(ancestor)
+        if (above.st_uid != 0 or above.st_dev != info.st_dev
+                or above.st_mode & 0o022 and not above.st_mode & stat.S_ISVTX):
+            raise RuntimeError("unprotected fs-verity staging ancestor")
+        if Guardian.entry_identity(ancestor, name) != identity(descriptor):
+            raise RuntimeError("staging root binding changed before retirement")
+        if not os.listdir(descriptor):
+            remaining(deadline)
+            os.rmdir(name, dir_fd=ancestor)
+            os.fsync(ancestor)
+    finally:
+        if ancestor is not None:
+            os.close(ancestor)
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
 @contextmanager
-def staging_root(parent, uid, deadline):
-    """Persistent, checkout-specific metadata; only root can write inside.
+def staging_root(parent, uid, deadline, *, skip=(), create=True):
+    """Recoverable, checkout-specific metadata; only root can write inside.
 
     An empty anchor interrupted before its marker is written is safe to finish
     initializing. Transaction creation/marking is serialized here, so an empty
     unmarked transaction interrupted during mkdir is also recoverable. No live
-    runtime can ever be put in an unmarked transaction.
+    runtime can ever be put in an unmarked transaction. The anchor lock excludes
+    retirement during use; waiters recheck their pinned anchor after locking.
     """
     ancestor = os.dup(parent)
-    descriptor = None
-    name = ".opc-sdk-fsverity-staging." + str(uid) + "." + hashlib.sha256(OWNER_ID).hexdigest()[:24]
-    marker = json.dumps({"owner": OWNER_ID.decode(), "uid": uid}, sort_keys=True).encode()
+    _prefix, marker = staging_metadata(uid)
     try:
         device = os.fstat(parent).st_dev
         while True:
@@ -219,33 +308,48 @@ def staging_root(parent, uid, deadline):
                 raise RuntimeError("no protected ancestor on runtime filesystem; retaining runtime")
             os.close(ancestor)
             ancestor = above
-        try:
-            os.mkdir(name, mode=0o700, dir_fd=ancestor)
-        except FileExistsError:
-            pass
-        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=ancestor)
-        info = os.fstat(descriptor)
-        if info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0 and not os.listdir(descriptor):
-            os.fchmod(descriptor, 0o700)  # Interrupted mkdir, or restrictive caller umask.
-            info = os.fstat(descriptor)
-        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
-            raise RuntimeError("untrusted fs-verity staging root")
-        with exclusive(descriptor, deadline):
+        while True:
+            selected = select_staging_root(ancestor, uid, deadline, skip=skip, create=create)
+            if selected is None:
+                yield None
+                return
+            name, descriptor = selected
+            authenticated = False
             try:
-                observed = os.getxattr(descriptor, STAGING_ATTRIBUTE)
-            except OSError as error:
-                if error.errno != errno.ENODATA or os.listdir(descriptor):
-                    raise
-                os.setxattr(descriptor, STAGING_ATTRIBUTE, marker)
-                os.fsync(descriptor)
-                os.fsync(ancestor)
-                observed = marker
-            if observed != marker:
-                raise RuntimeError("fs-verity staging root belongs to another owner")
-            yield descriptor
+                with exclusive(descriptor, deadline):
+                    try:
+                        bound = Guardian.entry_identity(ancestor, name)
+                    except FileNotFoundError:
+                        continue
+                    if bound != identity(descriptor):
+                        continue  # Selected before the prior holder retired it.
+                    info = os.fstat(descriptor)
+                    if info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0 and not os.listdir(descriptor):
+                        os.fchmod(descriptor, 0o700)
+                        info = os.fstat(descriptor)
+                    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                        raise RuntimeError("untrusted fs-verity staging root")
+                    try:
+                        observed = os.getxattr(descriptor, STAGING_ATTRIBUTE)
+                    except OSError as error:
+                        if error.errno != errno.ENODATA or os.listdir(descriptor):
+                            raise
+                        os.setxattr(descriptor, STAGING_ATTRIBUTE, marker)
+                        os.fsync(descriptor)
+                        os.fsync(ancestor)
+                        observed = marker
+                    if observed != marker:
+                        raise RuntimeError("fs-verity staging root belongs to another owner")
+                    authenticated = True
+                    yield descriptor
+                    return
+            finally:
+                try:
+                    if authenticated:
+                        retire_staging_root(descriptor, uid, deadline)
+                finally:
+                    os.close(descriptor)
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
         os.close(ancestor)
 
 
@@ -278,7 +382,10 @@ def protected_directory(parent, deadline, *, uid, transaction):
             finally:
                 os.close(descriptor)
         if anchor is not None:
-            os.close(anchor)
+            try:
+                retire_staging_root(anchor, uid, deadline)
+            finally:
+                os.close(anchor)
 
 
 def create_runtime(parent, name, uid, gid, deadline):
@@ -505,44 +612,59 @@ def recover_transaction(parent, staging, record, uid, deadline):
 def recover_staging(parent, uid, deadline):
     validate_parent(parent, uid)
     boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-    with staging_root(parent, uid, deadline) as root:
-        for name in os.listdir(root):
-            remaining(deadline)
-            if not name.startswith(STAGING_PREFIX):
+    visited = []
+    try:
+        while True:
+            with staging_root(parent, uid, deadline, create=False,
+                              skip={identity(fd) for fd in visited}) as root:
+                if root is None:
+                    return
+                # Keep visited inodes pinned so an inode number cannot be reused.
+                visited.append(os.dup(root))
+                recover_staging_transactions(parent, root, uid, deadline, boot)
+    finally:
+        for descriptor in visited:
+            os.close(descriptor)
+
+
+def recover_staging_transactions(parent, root, uid, deadline, boot):
+    for name in os.listdir(root):
+        remaining(deadline)
+        if not name.startswith(STAGING_PREFIX):
+            continue
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+        except FileNotFoundError:
+            continue  # A live transaction completed after the listing.
+        try:
+            info = os.fstat(descriptor)
+            if info.st_uid != 0 or stat.S_IMODE(info.st_mode) not in (0, 0o700):
                 continue
             try:
-                descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
-            except FileNotFoundError:
-                continue  # A live transaction completed after the listing.
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
             try:
-                info = os.fstat(descriptor)
-                if info.st_uid != 0 or stat.S_IMODE(info.st_mode) not in (0, 0o700):
+                record = json.loads(os.getxattr(descriptor, STAGING_ATTRIBUTE))
+            except OSError as error:
+                if error.errno == errno.ENODATA and not os.listdir(descriptor):
+                    os.rmdir(name, dir_fd=root)  # Stopped before recording any resources.
                     continue
+                raise
+            if (record.get("owner") != OWNER_ID.decode() or record.get("uid") != uid
+                    or record.get("parent") != list(identity(parent))):
+                continue
+            if record.get("boot") == boot:
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    continue
-                try:
-                    record = json.loads(os.getxattr(descriptor, STAGING_ATTRIBUTE))
-                except OSError as error:
-                    if error.errno == errno.ENODATA and not os.listdir(descriptor):
-                        os.rmdir(name, dir_fd=root)  # Stopped before recording any resources.
+                    if process_stat(record["pid"])[1] == record["start"]:
                         continue
-                    raise
-                if (record.get("owner") != OWNER_ID.decode() or record.get("uid") != uid
-                        or record.get("parent") != list(identity(parent))):
-                    continue
-                if record.get("boot") == boot:
-                    try:
-                        if process_stat(record["pid"])[1] == record["start"]:
-                            continue
-                    except (ProcessLookupError, FileNotFoundError):
-                        pass
-                completed = recover_transaction(parent, descriptor, record, uid, deadline)
-                if completed and not os.listdir(descriptor):
-                    os.rmdir(name, dir_fd=root)
-            finally:
-                os.close(descriptor)
+                except (ProcessLookupError, FileNotFoundError):
+                    pass
+            completed = recover_transaction(parent, descriptor, record, uid, deadline)
+            if completed and not os.listdir(descriptor):
+                os.rmdir(name, dir_fd=root)
+        finally:
+            os.close(descriptor)
 
 
 def privileged_helper(address, parent, deadline):

@@ -103,7 +103,9 @@ def tracked_mkdir(name,*args,**kwargs):
     result=original_mkdir(name,*args,**kwargs)
     parent=kwargs['dir_fd']
     fd=original_open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
-    created.append((os.dup(parent),name,fd))
+    # A cleanup handle must not retain the transaction's open-description flock.
+    above=original_open('.',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+    created.append((above,name,fd))
     return result
 runtime.os.mkdir=tracked_mkdir
 parent=None
@@ -211,7 +213,7 @@ with runtime.protected_directory(parent,deadline,uid=uid,
 assert os.path.isdir(path),'removed a nonempty recovery anchor'
 runtime.Guardian.inventory=lambda *args,**kwargs:([],[])
 runtime.recover_staging(parent,uid,deadline)
-assert not os.path.exists(path),'recovery left an empty anchor'
+assert not os.path.exists(path),'recovery left an anchor: '+repr(os.listdir(path))
 if squatted:
     assert os.stat(prefix,dir_fd=ancestor).st_uid!=0,'changed the squatter'
 ''')
@@ -254,6 +256,70 @@ finally:
     finish.set();worker.join(3)
 assert not worker.is_alive()
 if errors: raise errors[0]
+''')
+
+    def test_staging_coordination_preserves_a_root_callers_startup_lock(self):
+        self.anchor_probe('''
+os.fchown(parent,0,0)
+other=os.open('.',os.O_RDONLY|os.O_DIRECTORY,dir_fd=parent)
+try:
+    with runtime.exclusive(parent,deadline):
+        with runtime.staging_root(parent,0,deadline): pass
+        try: runtime.fcntl.flock(other,runtime.fcntl.LOCK_EX|runtime.fcntl.LOCK_NB)
+        except BlockingIOError: pass
+        else: raise AssertionError("staging coordination released the caller's startup lock")
+finally:
+    os.close(other)
+''')
+
+    def test_every_authenticated_fallback_anchor_is_recovered(self):
+        self.anchor_probe('''
+paths=[]
+for suffix in ('first','second'):
+    name=prefix+'.'+suffix
+    os.mkdir(name,mode=0o700,dir_fd=ancestor)
+    root=os.open(name,os.O_RDONLY|os.O_DIRECTORY,dir_fd=ancestor)
+    try:
+        os.setxattr(root,runtime.STAGING_ATTRIBUTE,marker)
+        paths.append(os.readlink('/proc/self/fd/'+str(root)))
+        name=runtime.STAGING_PREFIX+suffix
+        os.mkdir(name,mode=0o700,dir_fd=root)
+        transaction=os.open(name,os.O_RDONLY|os.O_DIRECTORY,dir_fd=root)
+        try:
+            record={'owner':runtime.OWNER_ID.decode(),'uid':uid,'parent':runtime.identity(parent),
+                'pid':os.getpid(),'start':runtime.process_stat(os.getpid())[1],'boot':'stopped-fixture',
+                'action':'create','name':runtime.PREFIX+suffix}
+            os.setxattr(transaction,runtime.STAGING_ATTRIBUTE,json.dumps(record).encode())
+            os.mkdir('runtime',mode=0o700,dir_fd=transaction)
+        finally: os.close(transaction)
+    finally: os.close(root)
+runtime.Guardian.inventory=lambda *args,**kwargs:([],[])
+runtime.recover_staging(parent,uid,deadline)
+assert all(not os.path.exists(path) for path in paths),'missed a concurrent fallback journal'
+''')
+
+    def test_staging_retries_creation_retired_before_its_first_open(self):
+        self.anchor_probe('''
+intercepted=[]
+def opened(name,*args,**kwargs):
+    above=kwargs.get('dir_fd')
+    if name==prefix and above is not None and runtime.identity(above)==runtime.identity(ancestor) and not intercepted:
+        try: os.stat(name,dir_fd=ancestor)
+        except FileNotFoundError: pass
+        else:
+            intercepted.append(True)
+            with runtime.staging_root(parent,uid,deadline): pass
+            assert not os.path.exists(workspace+'/'+prefix)
+    return original_open(name,*args,**kwargs)
+runtime.os.open=opened
+try:
+    with runtime.staging_root(parent,uid,deadline) as root:
+        path=os.readlink('/proc/self/fd/'+str(root))
+        assert os.fstat(root).st_nlink and os.path.isdir(path)
+        assert os.getxattr(root,runtime.STAGING_ATTRIBUTE)==marker
+    assert intercepted and not os.path.exists(path)
+finally:
+    runtime.os.open=original_open
 ''')
 
     def interrupted_root_helper(self, phase, corruption=None):

@@ -102,6 +102,11 @@ and only then removes its checked entries. Failed identity checks preserve the
 objects and restore their ownership.
 The helper keeps a small, root-owned recovery metadata directory for this
 checkout and caller in that protected ancestor (for example `/home` or `/tmp`).
+If its usual name is occupied by an untrusted object, it preserves that object
+and uses an authenticated directory with a random suffix. Later sweeps resume
+transactions in every authenticated fallback directory. Empty metadata
+directories are removed when the last transaction or sweep finishes; helpers
+waiting on a removed directory retry with a newly checked anchor.
 Each staging transaction records its caller, checkout, parent and object
 identities and helper process identity before taking ownership. Startup resumes
 dead transactions, including frozen runtimes still in the scratch parent and
