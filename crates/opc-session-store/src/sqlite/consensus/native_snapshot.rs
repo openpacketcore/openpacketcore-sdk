@@ -335,6 +335,9 @@ pub(crate) fn roster(
             )
         }
     };
+    #[cfg(any(test, feature = "test-control"))]
+    let _terminal_hydration =
+        terminal_observer::HydrationScope::enter(terminal_observer::database_key(conn));
     let hydrated =
         roster_rows::hydrate_original(profile, original, binding, canonical.to_vec(), root, scope)
             .map_err(corrupt)?;

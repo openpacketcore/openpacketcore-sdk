@@ -241,6 +241,7 @@ impl NativeDelta<'_> {
             self.notifications.push(notification);
             #[cfg(any(test, feature = "test-control"))]
             crate::sqlite::consensus::record_native_roster_notification_timing(
+                self.base.terminal_observation_database,
                 notification_started,
             );
         }

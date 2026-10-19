@@ -537,6 +537,10 @@ impl NativeOwner {
         if let Some(diagnostics) = &core.diagnostics {
             wal.publish_native_roster_occupancy(diagnostics);
         }
+        #[cfg(any(test, feature = "test-control"))]
+        wal.bind_terminal_observation_database_for_test(
+            consensus::terminal_observer::DatabaseKey::for_file(&self.database)?,
+        )?;
         let wal = Arc::new(wal);
         *self
             .current

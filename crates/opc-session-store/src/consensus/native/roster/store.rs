@@ -321,6 +321,13 @@ impl<'s, 'a> Store<'s, 'a> {
 }
 
 impl RosterCommandStore for Store<'_, '_> {
+    #[cfg(any(test, feature = "test-control"))]
+    fn terminal_observation_database(
+        &self,
+    ) -> Option<crate::sqlite::consensus::terminal_observer::DatabaseKey> {
+        self.base.base.terminal_observation_database
+    }
+
     fn trust_root(
         &self,
     ) -> Result<

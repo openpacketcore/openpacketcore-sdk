@@ -416,6 +416,13 @@ fn advance_inner(
         let mut state = lock_state(shared)?;
         require_live(&state, disk, old, &installation, &version)?;
         let old_selected = basis.replace_for_install(old, selected)?;
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            native.business.terminal_observation_database = state
+                .native
+                .as_ref()
+                .and_then(|previous| previous.business.terminal_observation_database);
+        }
         let retired = state.native.replace(native);
         state.base_sequence = anchor.native_sequence();
         state.history_bytes = 0;

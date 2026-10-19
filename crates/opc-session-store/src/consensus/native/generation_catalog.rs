@@ -245,6 +245,8 @@ impl Catalog {
                 roster_root: roster_root.clone(),
                 snapshot_origin,
                 local_restore: None,
+                #[cfg(any(test, feature = "test-control"))]
+                terminal_observation_database: None,
                 proof: None,
                 changes: None,
             },

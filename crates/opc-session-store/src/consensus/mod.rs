@@ -34,9 +34,7 @@ pub use snapshot_integrity::SnapshotIntegrityPolicy;
 #[cfg(feature = "test-control")]
 #[doc(hidden)]
 pub use crate::sqlite::test_support::{
-    protected_roster_terminal_apply_timing_test_guard,
-    protected_roster_v2_terminal_status_validation_stages_for_test,
-    reset_protected_roster_v2_terminal_status_validation_stages_for_test,
+    ProtectedRosterTerminalObservationForTest,
     ProtectedRosterV2TerminalStatusValidationStagesForTest,
 };
 pub use network::{
