@@ -20862,6 +20862,41 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn live_terminal_reconciliation_observer_rejects_precreated_overlap() {
+        use futures_util::FutureExt as _;
+
+        let outer = LiveTerminalRecoveryFullReconciliationObserver::install();
+        let inner = LiveTerminalRecoveryFullReconciliationObserver::install();
+        outer
+            .observe(async {
+                let overlap = std::panic::AssertUnwindSafe(inner.observe(async {
+                    observe_live_terminal_recovery_full_reconciliation();
+                }))
+                .catch_unwind()
+                .await;
+                assert!(
+                    overlap.is_err(),
+                    "pre-created observers must reject overlapping observation before replacing the owner"
+                );
+                observe_live_terminal_recovery_full_reconciliation();
+            })
+            .await;
+        assert_eq!(outer.full_reconciliations(), 1);
+        assert_eq!(inner.full_reconciliations(), 0);
+
+        // Rejection must restore the outer owner, and completion must allow
+        // a later independent scope on the same task.
+        inner
+            .observe(async {
+                observe_live_terminal_recovery_full_reconciliation();
+            })
+            .await;
+        assert_eq!(inner.full_reconciliations(), 1);
+        assert_eq!(outer.full_reconciliations(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn live_terminal_reconciliation_skips_snapshot_selection_until_terminal_evidence() {
         let directory = tempfile::tempdir().expect("live terminal probe directory");
         let database = directory.path().join("sessions.sqlite");
