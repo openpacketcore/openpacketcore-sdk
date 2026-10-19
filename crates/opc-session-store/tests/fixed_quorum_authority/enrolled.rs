@@ -2,6 +2,10 @@
 
 use super::*;
 use opc_consensus::voter_slots::*;
+use opc_session_store::test_support::{
+    append_consensus_padding_entry_for_test, consensus_padding_receipt_status_for_test,
+    ConsensusPaddingReceiptStatusForTest,
+};
 use opc_session_store::VoterIdentitySigner;
 use sha2::{Digest, Sha256};
 
@@ -543,14 +547,45 @@ async fn missed_enrolled_bootstrap_campaign(restart_canonical: bool) {
                 .collect::<Vec<_>>()
         );
         let leader = stores[0].status().leader_id.expect("elected leader");
+        let request_id = [0x83; 16];
+        let leader_store = stores
+            .iter()
+            .find(|store| store.status().node_id == leader)
+            .expect("the elected leader belongs to the enrolled fleet");
+        let committed = append_consensus_padding_entry_for_test(leader_store, request_id)
+            .await
+            .expect("the formed quorum durably commits a new command");
         for store in &stores {
             assert!(store.status().admitted);
             assert_eq!(store.status().leader_id, Some(leader));
             assert!(store.status().applied_index.is_some());
-            store
-                .max_replication_sequence()
-                .await
-                .expect("live quorum operation");
+            tokio::time::timeout(
+                opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                async {
+                    loop {
+                        match consensus_padding_receipt_status_for_test(store, request_id)
+                            .await
+                            .expect("read the exact durable command receipt")
+                        {
+                            ConsensusPaddingReceiptStatusForTest::NotFound => {}
+                            receipt => {
+                                assert_eq!(
+                                    receipt,
+                                    ConsensusPaddingReceiptStatusForTest::Recorded {
+                                        raft_log_index: committed,
+                                    }
+                                );
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                },
+            )
+            .await
+            .expect(
+                "every enrolled voter applies the committed command within the operation bound",
+            );
         }
     })
     .catch_unwind()
