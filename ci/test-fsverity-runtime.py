@@ -1286,8 +1286,9 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
         self.assertEqual(list(self.runner.iterdir()), [])
 
     def test_command_preserves_callers_file_limit_and_umask(self):
-        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
-        soft = 65536 if hard == resource.RLIM_INFINITY else min(65536, hard)
+        inherited_hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        hard = 131072 if inherited_hard == resource.RLIM_INFINITY else min(131072, inherited_hard)
+        soft = min(65536, hard)
         arm = parent_death_guard()
         for mask in (0o002, 0o027, 0o777):
             with self.subTest(umask=oct(mask)):
@@ -1309,7 +1310,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
 
     def test_low_bootstrap_file_limit_does_not_cap_the_command(self):
         program = '''
-import importlib.util,resource,sys
+import importlib.util,sys
 spec=importlib.util.spec_from_file_location('runtime',sys.argv[1])
 runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
 original=runtime.subprocess.Popen
@@ -1318,9 +1319,7 @@ def bootstrap(command,*args,**kwargs):
     global hits
     if command[:3]==['/usr/bin/sudo','-n','/usr/bin/unshare']:
         hits+=1
-        hard=resource.getrlimit(resource.RLIMIT_NOFILE)[1]
-        hard='unlimited' if hard==resource.RLIM_INFINITY else str(hard)
-        command=command[:2]+['/usr/bin/prlimit','--nofile=1024:'+hard,'--']+command[2:]
+        command=command[:2]+['/usr/bin/prlimit','--nofile=1024:1024','--']+command[2:]
     return original(command,*args,**kwargs)
 runtime.subprocess.Popen=bootstrap
 result=runtime.launch([sys.executable,'-c',

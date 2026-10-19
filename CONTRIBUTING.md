@@ -78,6 +78,9 @@ RUNNER_TEMP="$PWD/target/ci-scratch" bash ci/setup-fsverity-tmp.sh -- <gate-comm
 Each checkout keeps this one stable scratch root, `$PWD/target/ci-scratch`.
 Reuse the directory across runs without deleting or replacing it: recovery
 records match its directory identity, so a later sweep must use the same parent.
+The wrapped command retains the caller's soft and hard file-descriptor limits
+and umask. Privileged namespace setup must not replace the storage workload's
+descriptor budget or its ordinary file-creation permissions.
 
 The owner sets `OPC_FS_VERITY_SNAPSHOT_ROOT` and
 `OPC_FS_VERITY_QUALIFICATION=required` for that command, then unmounts and removes

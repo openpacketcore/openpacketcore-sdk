@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
 import select
 import secrets
 import signal
@@ -1083,6 +1084,7 @@ def receive_guardian(address, parent):
         os.close(source)
     os.environ.clear()
     os.environ.update(message["environment"])
+    os.umask(message["umask"])
     if os.readlink("/proc/self/ns/mnt") == message["namespace"]:
         raise RuntimeError("fs-verity guardian did not enter a separate mount namespace")
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -1093,6 +1095,10 @@ def receive_guardian(address, parent):
 
 
 def launch(command):
+    caller_umask = int(next(line.split()[1] for line in Path("/proc/self/status").read_text().splitlines()
+                           if line.startswith("Umask:")), 8)
+    nofile = ":".join("unlimited" if value == resource.RLIM_INFINITY else str(value)
+                      for value in resource.getrlimit(resource.RLIMIT_NOFILE))
     reader, writer = os.pipe()
     interrupted = None
 
@@ -1131,6 +1137,10 @@ def launch(command):
             # Drop privilege before executing Python or restoring user env.
             process = subprocess.Popen([
                 "/usr/bin/sudo", "-n", "/usr/bin/unshare", "--mount", "--propagation", "slave", "--",
+                # sudo policy can replace the caller's soft/hard limits. Restore
+                # both before dropping privilege; storage needs the same fd
+                # budget it had in the original workflow shell.
+                "/usr/bin/prlimit", f"--nofile={nofile}", "--",
                 "/usr/bin/setpriv", "--reuid", str(os.getuid()), "--regid", str(os.getgid()),
                 *group_args, "--", sys.executable, str(Path(__file__).resolve()),
                 "--guardian", address, str(os.getpid()),
@@ -1153,6 +1163,7 @@ def launch(command):
             with connection:
                 connection.settimeout(30)
                 message = json.dumps({"targets": targets, "environment": dict(os.environ),
+                                      "umask": caller_umask,
                                       "namespace": os.readlink("/proc/self/ns/mnt"), "command": command})
                 connection.sendmsg([message.encode()], [(
                     socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [reader, *targets]))])
