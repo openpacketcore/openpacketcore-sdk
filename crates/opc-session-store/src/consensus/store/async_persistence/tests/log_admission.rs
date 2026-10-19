@@ -4,6 +4,9 @@ use super::*;
 use crate::consensus::snapshot::SnapshotArtifactGate;
 use opc_consensus::DURABLE_OPENRAFT_PROFILE;
 
+#[path = "seed.rs"]
+mod seed;
+
 #[cfg(feature = "test-control")]
 #[path = "write_retention.rs"]
 mod write_retention;
@@ -454,7 +457,12 @@ async fn log_admission_review_demoted_requests_reroute_with_original_deadline() 
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-async fn seed_to(store: &ConsensusSessionStore, command: &SessionConsensusCommand, target: u64) {
+async fn seed_to(
+    _fleet: &Fleet,
+    store: &ConsensusSessionStore,
+    command: &SessionConsensusCommand,
+    target: u64,
+) {
     let mut last = store.inner.raft.metrics().borrow().last_log_index.unwrap();
     while last < target {
         let count = (target - last).min(DURABLE_OPENRAFT_PROFILE.max_payload_entries);
@@ -476,6 +484,7 @@ async fn seed_to(store: &ConsensusSessionStore, command: &SessionConsensusComman
             assert!(reply.log_id.index > last);
             last = reply.log_id.index;
         }
+        seed::after_batch(last).await;
     }
     store
         .inner
@@ -582,6 +591,7 @@ async fn log_admission_review_blocked_snapshot_owner_cannot_hold_leadership() {
         assert!(owner.is_retained());
         let command = repeated_command(store);
         seed_to(
+            &fleet,
             store,
             &command,
             DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
@@ -943,7 +953,7 @@ async fn blocked_build(
                 Some(purged) => purged.index + window - 8,
                 None => window - 9,
             };
-            seed_to(store, &command, target).await;
+            seed_to(&fleet, store, &command, target).await;
             // The last eight entries go through both SDK admission boundaries.
             for _ in 0..8 {
                 let reply = propose(store, &command, tokio::time::Instant::now() + WAIT).await;
@@ -1047,7 +1057,7 @@ async fn log_admission_cold_recovery_keeps_quarantine_and_commits_at_full_window
         let initial = store.inner.raft.metrics().borrow().last_applied.unwrap();
         let command = repeated_command(store);
         let end = initial.index + DURABLE_OPENRAFT_PROFILE.logs_per_snapshot + 64;
-        seed_to(store, &command, end).await;
+        seed_to(&fleet, store, &command, end).await;
         drop(guard);
         store
             .inner
@@ -1187,13 +1197,13 @@ async fn blocked_transfer(
                 follower_store.inner.local_node_id, gate.clone(),
             );
             gate.arm();
-            seed_to(store, &command, last + DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
+            seed_to(&fleet, store, &command, last + DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
                 + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;
             tokio::time::timeout(WAIT, gate.wait_started()).await.unwrap();
             fleet.set_link(leader, follower, true);
             let held_cut = hold.cut();
             // Select a newer cut whose purge target crosses the actual transfer.
-            seed_to(store, &command, held_cut + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;
+            seed_to(&fleet, store, &command, held_cut + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;
             select_snapshot(store).await;
             let before = store.inner.raft.metrics().borrow().clone();
             assert!(before.snapshot.unwrap().index > held_cut + DURABLE_OPENRAFT_PROFILE.retained_logs);
@@ -1202,7 +1212,7 @@ async fn blocked_transfer(
                 Some(purged) => purged.index + window - 8,
                 None => window - 9,
             };
-            seed_to(store, &command, target).await;
+            seed_to(&fleet, store, &command, target).await;
             for _ in 0..8 {
                 let reply = propose(store, &command, tokio::time::Instant::now() + WAIT).await;
                 assert!(matches!(&reply, ForwardMutationReply::Applied(response) if response.result.is_ok()),
