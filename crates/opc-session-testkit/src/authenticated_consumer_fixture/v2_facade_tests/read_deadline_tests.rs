@@ -2,7 +2,12 @@
 //! Every hold follows a successful response from the real three-voter service.
 
 use super::*;
-use opc_session_store::RecordExpiryPreflight;
+use opc_session_net::SessionConsumerPreparedCheckpointBackend;
+use opc_session_store::{
+    PreparedCompareAndSetExecuteError, PreparedCompareAndSetOutcome, PreparedCompareAndSetStatus,
+    PreparedLeaseAcquireExecuteError, RecordExpiryPreflight, SessionConsumerLeaseMutationResult,
+    SessionConsumerLeaseMutationStatus,
+};
 use opc_types::Timestamp;
 
 const HOLDS: [u64; 3] = [200, 500, 700];
@@ -12,6 +17,10 @@ const HISTORY: usize = 2;
 const STATUS: usize = 3;
 const MUTATION: usize = 4;
 const V1_STATUS: usize = 5;
+const CAS_STATUS: usize = 6;
+const LEASE_STATUS: usize = 7;
+const CAS_MUTATION: usize = 8;
+const LEASE_MUTATION: usize = 9;
 
 fn read_budget() -> PreparedCheckpointBudget {
     PreparedCheckpointBudget::new(
@@ -702,5 +711,145 @@ async fn concurrent_slow_receipts_use_one_call_each_without_overload() {
     assert!(
         evidence.9 <= 2,
         "two logical callers never fan out into more waiters"
+    );
+}
+
+#[tokio::test]
+async fn prepared_checkpoint_cas_keeps_successful_200_500_700ms_receipts() {
+    let mut evidence = Vec::new();
+    for millis in HOLDS {
+        let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
+            .await
+            .unwrap();
+        let clients = clients(&fixture);
+        for client in &clients {
+            client.prewarm().await.unwrap();
+        }
+        let protected = Arc::new(EncryptingSessionBackend::new(
+            Arc::new(FixtureGeneralConsumerBackend::new(
+                clients.clone(),
+                Arc::clone(&fixture.ordinary_cas_fault),
+            )),
+            CountingProvider::new(),
+            "read-deadline-checkpoint",
+        ));
+        let key = session_key(930);
+        let lease = protected
+            .acquire(&key, owner(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        let mut record = finite_record(930);
+        record.fence = lease.fence();
+        let composite =
+            SessionConsumerPreparedCheckpointBackend::persistent(protected, clients.clone())
+                .unwrap();
+        let budget = read_budget();
+        let mut prepared = composite
+            .prepare_compare_and_set(
+                SessionConsumerRequestId::new(),
+                CompareAndSet {
+                    key,
+                    lease,
+                    expected_generation: None,
+                    new_record: record,
+                },
+                budget,
+            )
+            .await
+            .unwrap();
+        hold(&fixture, CAS_MUTATION, 700);
+        hold(&fixture, CAS_STATUS, millis);
+        let mutation = prepared.execute_once().await;
+        let receipt = prepared.status_once(budget.original_deadline()).await;
+        evidence.push((
+            millis,
+            mutation == Err(PreparedCompareAndSetExecuteError::OutcomeUnknown),
+            matches!(
+                receipt,
+                Ok(PreparedCompareAndSetStatus::Recorded(
+                    PreparedCompareAndSetOutcome::Applied
+                ))
+            ),
+            held(&fixture, CAS_MUTATION),
+            held(&fixture, CAS_STATUS),
+        ));
+        drop(prepared);
+        drop(composite);
+        close(fixture, clients).await;
+    }
+    eprintln!("prepared CAS slow receipts: {evidence:?}");
+    assert!(
+        evidence
+            .iter()
+            .all(|(_, unknown, exact, mutations, reads)| *unknown
+                && *exact
+                && *mutations == 1
+                && *reads == 1),
+        "{evidence:?}"
+    );
+}
+
+#[tokio::test]
+async fn prepared_checkpoint_lease_keeps_successful_200_500_700ms_receipts() {
+    let mut evidence = Vec::new();
+    for millis in HOLDS {
+        let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
+            .await
+            .unwrap();
+        let clients = clients(&fixture);
+        for client in &clients {
+            client.prewarm().await.unwrap();
+        }
+        let protected = Arc::new(EncryptingSessionBackend::new(
+            Arc::new(FixtureGeneralConsumerBackend::new(
+                clients.clone(),
+                Arc::clone(&fixture.ordinary_cas_fault),
+            )),
+            CountingProvider::new(),
+            "read-deadline-checkpoint",
+        ));
+        let composite =
+            SessionConsumerPreparedCheckpointBackend::persistent(protected, clients.clone())
+                .unwrap();
+        let key = session_key(931);
+        let budget = read_budget();
+        let mut prepared = composite
+            .prepare_acquire_with_id(
+                SessionConsumerRequestId::new(),
+                key.clone(),
+                owner(),
+                Duration::from_secs(30),
+                budget,
+            )
+            .unwrap();
+        hold(&fixture, LEASE_MUTATION, 700);
+        hold(&fixture, LEASE_STATUS, millis);
+        let mutation = prepared.execute_once().await;
+        let receipt = prepared.status_once(budget.original_deadline()).await;
+        evidence.push((
+            millis,
+            mutation == Err(PreparedLeaseAcquireExecuteError::OutcomeUnknown),
+            matches!(
+                receipt,
+                Ok(SessionConsumerLeaseMutationStatus::Recorded(result))
+                    if matches!(*result, Ok(SessionConsumerLeaseMutationResult::Acquire(ref lease))
+                        if lease.key() == &key)
+            ),
+            held(&fixture, LEASE_MUTATION),
+            held(&fixture, LEASE_STATUS),
+        ));
+        drop(prepared);
+        drop(composite);
+        close(fixture, clients).await;
+    }
+    eprintln!("prepared lease slow receipts: {evidence:?}");
+    assert!(
+        evidence
+            .iter()
+            .all(|(_, unknown, exact, mutations, reads)| *unknown
+                && *exact
+                && *mutations == 1
+                && *reads == 1),
+        "{evidence:?}"
     );
 }

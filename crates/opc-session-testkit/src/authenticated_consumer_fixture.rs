@@ -1934,11 +1934,11 @@ async fn start_fixture_listener(
 struct FixtureConsumer {
     inner: Arc<dyn SessionQuorumConsumer>,
     #[cfg(test)]
-    reply_holds: [std::sync::atomic::AtomicU64; 6],
+    reply_holds: [std::sync::atomic::AtomicU64; 10],
     #[cfg(test)]
-    held_replies: [AtomicUsize; 6],
+    held_replies: [AtomicUsize; 10],
     #[cfg(test)]
-    held_reply_started: [tokio::sync::Notify; 6],
+    held_reply_started: [tokio::sync::Notify; 10],
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
@@ -2081,6 +2081,12 @@ impl SessionQuorumConsumer for FixtureConsumer {
             SessionConsumerResponse::Get(Ok(_)) => self.hold_reply(0).await,
             SessionConsumerResponse::PreflightRecordExpiry(Ok(())) => self.hold_reply(1).await,
             SessionConsumerResponse::FencedTransitionStatus(Ok(_)) => self.hold_reply(5).await,
+            SessionConsumerResponse::CompareAndSetStatus(Ok(_)) => self.hold_reply(6).await,
+            SessionConsumerResponse::LeaseMutationStatus(Ok(_)) => self.hold_reply(7).await,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success)) => {
+                self.hold_reply(8).await;
+            }
+            SessionConsumerResponse::AcquireLease(Ok(_)) => self.hold_reply(9).await,
             _ => {}
         }
         if let Some(gate) = ordinary_fault {

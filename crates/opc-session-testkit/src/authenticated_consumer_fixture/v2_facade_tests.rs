@@ -789,7 +789,8 @@ async fn fixture_v2_facade_reclaim_sweep_keeps_rows_when_a_written_read_is_silen
             committed_v2(&mut handle, &request, deadline).await;
             prepared.push(handle);
         }
-        let stalled = fixture.stall_fenced_transition_v2_status_on_canonical_voter(0);
+        // A receipt cursor starts at the successor of the mutation origin.
+        let stalled = fixture.stall_fenced_transition_v2_status_on_canonical_voter(1);
         let started = tokio::time::Instant::now();
         let sweep_budget = budget(soon());
         let before = fixture.diagnostics();
