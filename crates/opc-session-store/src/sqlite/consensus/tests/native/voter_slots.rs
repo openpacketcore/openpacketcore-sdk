@@ -29,6 +29,94 @@ fn initialize(
 }
 
 #[test]
+fn voter_slot_initialize_requires_explicit_volume_enrollment() {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    let conn = backend.conn.blocking_lock();
+    let initial = fixture::genesis(3);
+    let schema: u64 = conn
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    let result =
+        initialize(&conn, &initial, true).map_err(crate::ConsensusSessionStoreOpenError::from);
+    assert!(
+        matches!(
+            result,
+            Err(crate::ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired)
+        ),
+        "opening without explicit enrollment must refuse before creating an identity: {result:?}"
+    );
+    assert!(!table_exists(&conn, "consensus_identity").unwrap());
+    assert!(!table_exists(&conn, "consensus_voter_slots").unwrap());
+    assert!(!table_exists(&conn, "consensus_voter_anchor").unwrap());
+    assert_eq!(
+        conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, u64>(0))
+            .unwrap(),
+        schema
+    );
+}
+
+fn retained_enrollment_cannot_reseed_missing_consensus_tables(erase_seed: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = SqliteSessionBackend::open(directory.path().join("enrolled.sqlite")).unwrap();
+    let mut initial = fixture::genesis(3);
+    let signer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(
+            backend
+                .enroll_voter_identity(initial.cluster_instance, initial.slots[0].member.identity),
+        )
+        .unwrap();
+    initial.slots[0].member.key_digest = signer.key_digest();
+    let conn = backend.conn.blocking_lock();
+    initialize(&conn, &initial, true).unwrap();
+    conn.execute_batch("DROP TABLE consensus_identity").unwrap();
+    if erase_seed {
+        conn.execute_batch("DROP TABLE consensus_voter_slots")
+            .unwrap();
+    }
+    let schema: u64 = conn
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    let result =
+        initialize(&conn, &initial, true).map_err(crate::ConsensusSessionStoreOpenError::from);
+    assert!(
+        matches!(
+            result,
+            Err(crate::ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired)
+        ),
+        "a used enrollment cannot recreate missing consensus identity: {result:?}"
+    );
+    assert!(!table_exists(&conn, "consensus_identity").unwrap());
+    assert_eq!(
+        table_exists(&conn, "consensus_voter_slots").unwrap(),
+        !erase_seed
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA schema_version", [], |row| row.get::<_, u64>(0))
+            .unwrap(),
+        schema
+    );
+    drop(conn);
+    drop(backend);
+    assert!(directory
+        .path()
+        .join("enrolled.sqlite.voter-identity")
+        .is_file());
+}
+
+#[test]
+fn voter_slot_initialize_refuses_an_enrolled_root_missing_its_consensus_identity() {
+    retained_enrollment_cannot_reseed_missing_consensus_tables(false);
+}
+
+#[test]
+fn voter_slot_initialize_refuses_reseeding_after_both_consensus_bindings_are_lost() {
+    retained_enrollment_cannot_reseed_missing_consensus_tables(true);
+}
+
+#[test]
 fn slot_seed_profile_cannot_be_adopted_by_legacy_or_created_over_legacy() {
     for old_first in [false, true] {
         let backend = SqliteSessionBackend::in_memory().unwrap();

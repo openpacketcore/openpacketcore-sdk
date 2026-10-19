@@ -108,8 +108,8 @@ impl SessionConsensusPeer for EnrolledPeer {
 
     async fn call_with_incarnation(
         &self,
-        binding: VoterRpcBinding,
         request: SessionConsensusWireRequest,
+        binding: VoterRpcBinding,
         timeout: Duration,
     ) -> Result<VoterAuthenticatedResponse, SessionConsensusPeerError> {
         let family = request.family;
