@@ -216,29 +216,35 @@ async fn automatic_re_election_after_forced_split_vote() {
     let config =
         Arc::new(durable_openraft_config(DurableOpenraftDomain::ConfigurationState).unwrap());
     assert!(config.enable_elect && config.enable_tick);
+    // The real engine maps these legal RNG inputs to 5s and 7.25s within
+    // the unchanged production timeout range. Its 100ms ticker can round
+    // independent random draws onto the same tick; a one-second construction
+    // offset leaves those tick phases aligned and can produce a second split.
+    // Control the samples so this fixture proves exactly one automatic retry.
+    // Draws cover construction plus the initial campaign on each node, and
+    // one additional timer-driven campaign on the winning survivor.
+    let scripts = [
+        test_runtime::ElectionRngScript::new([0; 2]),
+        test_runtime::ElectionRngScript::new([0; 3]),
+        test_runtime::ElectionRngScript::new([3_u64 << 62; 2]),
+    ];
     let mut nodes = Vec::new();
     let mut machines = Vec::new();
-    for id in 0..3 {
-        if id == 2 {
-            // Keep the production timers and random sampling. Offset the last
-            // ticker by one virtual second so automatic retries cannot arrive
-            // in the same tick. Paused time drains runnable RPC/storage tasks
-            // before advancing to the next timer, regardless of host load.
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+    for (id, script) in (0_u64..3).zip(&scripts) {
         let machine = MemoryStateMachine::default();
-        let node = Raft::new(
-            id,
-            config.clone(),
-            Network {
-                source: id,
-                state: state.clone(),
-            },
-            MemoryLog::default(),
-            machine.clone(),
-        )
-        .await
-        .unwrap();
+        let node = script
+            .scope(Raft::new(
+                id,
+                config.clone(),
+                Network {
+                    source: id,
+                    state: state.clone(),
+                },
+                MemoryLog::default(),
+                machine.clone(),
+            ))
+            .await
+            .unwrap();
         node.runtime_config().elect(false);
         state.nodes.lock().unwrap().insert(id, node.clone());
         nodes.push(node);
@@ -340,7 +346,13 @@ async fn automatic_re_election_after_forced_split_vote() {
     .clone();
     let leader = retry.source as usize;
     assert_ne!(leader, 0);
-    assert_eq!(retry.request.vote.leader_id.term, split_term + 1);
+    assert_eq!(leader, 1, "the earlier scripted timeout wins");
+    assert_eq!(
+        retry.request.vote.leader_id.term,
+        split_term + 1,
+        "vote exchanges after the forced split: {:?}",
+        state.votes.borrow()
+    );
     assert_eq!(retry.response.vote, retry.request.vote);
     assert_eq!(state.votes.borrow().len(), 3, "one automatic retry wins");
     nodes[leader]
@@ -369,4 +381,7 @@ async fn automatic_re_election_after_forced_split_vote() {
         node.shutdown().await.unwrap();
     }
     state.nodes.lock().unwrap().clear();
+    for script in scripts {
+        script.finish();
+    }
 }
