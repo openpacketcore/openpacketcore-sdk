@@ -542,12 +542,13 @@ pub fn main_file_identity(connection: &Connection) -> Result<(u64, u64), FileCon
         |descriptor| {
             use std::os::unix::fs::MetadataExt as _;
 
-            // SAFETY: the checked Unix descriptor stays owned by the borrowed
-            // connection throughout this synchronous callback. ManuallyDrop
-            // prevents File from closing it, including on errors or unwinding.
-            // Only metadata is read; no ownership operation escapes this scope.
-            let file =
-                std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(descriptor) });
+            let file = std::mem::ManuallyDrop::new({
+                // SAFETY: the checked Unix descriptor stays owned by the
+                // borrowed connection throughout this synchronous callback.
+                // ManuallyDrop prevents close even on errors or unwinding.
+                // Only metadata is read; no ownership operation escapes.
+                unsafe { std::fs::File::from_raw_fd(descriptor) }
+            });
             // std uses the full-width Linux metadata ABI, including on i686.
             let metadata = file.metadata().map_err(|_| FileControlError)?;
             if !metadata.is_file() {
