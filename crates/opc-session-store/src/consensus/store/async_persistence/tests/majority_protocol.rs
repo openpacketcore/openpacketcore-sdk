@@ -788,7 +788,36 @@ async fn async_recovery_late_committed_election_resumes_without_retiring_its_rou
                         assert!(attempt.await.is_err());
                         break;
                     }
-                    result = &mut attempt => assert!(result.is_err()),
+                    result = &mut attempt => {
+                        assert!(result.is_err());
+                        let current = store
+                            .inner
+                            .persistence_protocol
+                            .recovery_coordinator
+                            .lock()
+                            .await;
+                        if let Some(selection) = current
+                            .as_ref()
+                            .and_then(|current| current.selection.as_ref())
+                        {
+                            let prepared = selection.prepared[&selection.leader]
+                                .retained
+                                .vote
+                                .unwrap();
+                            let expected = Vote::new(
+                                prepared.leader_id.term + 1,
+                                selection.leader,
+                            );
+                            if store.inner.raft.metrics().borrow().vote == expected {
+                                // The real campaign outlives this caller. Capture
+                                // its remaining grants before any retry can
+                                // retire its round and consume different grants.
+                                drop(current);
+                                (&mut entered).await;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         })
