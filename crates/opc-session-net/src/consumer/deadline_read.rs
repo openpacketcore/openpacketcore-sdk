@@ -41,6 +41,9 @@ impl PersistentSessionConsumerClient {
     /// setup and Call write retain the physical-attempt cap (and any earlier
     /// configured pre-request limit). This submits at most one physical read.
     /// No mutation can be submitted through this entry point.
+    /// An authenticated authority rejection is terminal
+    /// [`StoreError::TopologyAuthorityRevoked`], including `Unauthorized`.
+    /// The legacy [`Self::get`] method keeps its existing error mapping.
     ///
     /// ```compile_fail
     /// # use opc_session_net::PersistentSessionConsumerClient;
@@ -86,6 +89,8 @@ impl PersistentSessionConsumerClient {
     ///
     /// This follows [`Self::get_with_budget`]'s split deadline contract and
     /// submits only the payload-free expiry descriptors, never a mutation.
+    /// Authority rejection has the same terminal classification as
+    /// [`Self::get_with_budget`].
     pub async fn preflight_record_expiry_with_budget(
         &self,
         preflights: Vec<RecordExpiryPreflight>,

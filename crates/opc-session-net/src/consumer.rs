@@ -17480,10 +17480,10 @@ pub enum SessionConsumerPreparedFencedTransitionStatusError {
     NotExecuted,
     #[error("prepared fenced transition deadline elapsed")]
     Deadline,
-    /// One physical receipt attempt reached its configured cap while the
-    /// immutable outer deadline remains live. This is retryable only by the
-    /// SDK-owned status-only runner; callers must not infer any mutation
-    /// authority from it.
+    /// A V1 receipt attempt exhausted its pre-write admission or setup cap
+    /// while the immutable outer deadline remains live. V2 status attempts
+    /// do not return this variant. Only the SDK-owned status runner may retry;
+    /// this error grants no mutation authority.
     #[error("prepared fenced transition receipt attempt deadline elapsed")]
     AttemptDeadline,
     #[error("prepared fenced transition authority was revoked")]

@@ -595,8 +595,13 @@ Ordinary callers opt in with `get_with_budget`,
 `preflight_record_expiry_with_budget`, or
 `fenced_transition_v2_history_state_with_budget`, passing their existing
 `PreparedCheckpointBudget` and any earlier lease deadline. These narrow methods
-cannot submit a transition, batch or void. Legacy read methods without a caller
-deadline retain their configured operation timeout.
+cannot submit a transition, batch or void. Their response wait follows the
+caller budget, including when that deadline exceeds the legacy 10-second
+operation ceiling; transport lifecycle retirement still applies. Legacy read
+methods without a caller deadline retain their configured operation timeout.
+Budget-bearing GET/expiry reads and prepared CAS/lease receipts classify
+observed authority rejection as terminal `TopologyAuthorityRevoked`. Legacy
+GET retains its existing `Unauthorized` to `BackendUnavailable` mapping.
 
 The local protected V2 journal reports
 `StoreError::FencedTransitionRecoveryJournalUnavailable`. It remains distinct
@@ -682,8 +687,10 @@ backoff deadline plus bounded jitter;
 waiting callers do not create per-caller resolver/TCP/TLS/Hello storms. With
 two attempts the first backoff floor is 50 ms by default plus at most 25 ms
 jitter, clipped to its logical deadline. The existing 5-second idle,
-10-second operation, 16 MiB frame, 256-server-connection, and TLS lifecycle
-bounds remain in force; shutdown drain is at most 5 seconds.
+16 MiB frame, 256-server-connection, and TLS lifecycle bounds remain in force;
+shutdown drain is at most 5 seconds. Ordinary calls retain the 10-second
+operation ceiling. Budget-bearing read responses instead use their caller's
+original deadline, as described above.
 One constant pool-wide maintenance task (not one task per lane or subscriber)
 physically retires cached lanes at the earliest idle/lifecycle deadline.
 An accepted material-epoch change schedules each already-admitted lane on a

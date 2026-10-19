@@ -826,6 +826,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and V2 history methods also bypass the ordinary response timeout. Setup and
   Call write keep their existing caps, mutations keep their physical budgets,
   and an unanswered written read cannot trigger speculative voter failover.
+  Prepared CAS/lease receipts and budget-bearing GET/expiry reads classify
+  authenticated authority rejection as terminal `TopologyAuthorityRevoked`;
+  legacy GET error mapping is unchanged.
 
 - `opc-session-store`: wait for the initial record on every replica before
   injecting owner or fence drift in the renewal fixture. Exercise a lagging
