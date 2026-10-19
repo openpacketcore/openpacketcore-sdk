@@ -1957,6 +1957,10 @@ struct FixtureConsumer {
     #[cfg(test)]
     stall_fenced_transition_v2_status: AtomicBool,
     #[cfg(test)]
+    stall_fenced_transition_v2_history_state: AtomicBool,
+    #[cfg(test)]
+    fenced_transition_v2_history_state_stalled: tokio::sync::Notify,
+    #[cfg(test)]
     fenced_transition_v2_status_fault: std::sync::atomic::AtomicU8,
     #[cfg(test)]
     fenced_transition_v2_status_stalled: Arc<tokio::sync::Notify>,
@@ -2012,6 +2016,10 @@ impl FixtureConsumer {
             last_fenced_transition_v2_request: Mutex::new(None),
             #[cfg(test)]
             stall_fenced_transition_v2_status: AtomicBool::new(false),
+            #[cfg(test)]
+            stall_fenced_transition_v2_history_state: AtomicBool::new(false),
+            #[cfg(test)]
+            fenced_transition_v2_history_state_stalled: tokio::sync::Notify::new(),
             #[cfg(test)]
             fenced_transition_v2_status_fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
@@ -2243,6 +2251,14 @@ impl SessionQuorumConsumer for FixtureConsumer {
         ) {
             self.fenced_transition_v2_history_state_calls
                 .fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            if self
+                .stall_fenced_transition_v2_history_state
+                .load(Ordering::Acquire)
+            {
+                self.fenced_transition_v2_history_state_stalled.notify_one();
+                std::future::pending::<()>().await;
+            }
             #[cfg(test)]
             if self
                 .fail_next_fenced_transition_v2_history_state
