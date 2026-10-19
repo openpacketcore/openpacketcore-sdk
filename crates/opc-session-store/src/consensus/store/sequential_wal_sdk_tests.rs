@@ -1183,6 +1183,12 @@ async fn quorum_authority_native_durable_cut_and_independent_sql_cold_reconstruc
                     assert_eq!(after, live[slot], "snapshot publication preserves every captured authority/cut/business fact");
                 }
             }
+            if native {
+                // Exercise the normal leadership handoff before the final
+                // drain, while every authenticated voter is still available.
+                fleet.stores[leader].prepare_shutdown().await
+                    .expect("live leader completes its planned handoff");
+            }
             (retained, live, sql)
         }).catch_unwind().await;
         let closed = fleet.close().await;
