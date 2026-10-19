@@ -11660,8 +11660,9 @@ pub fn emergency_nai(imei: &Imei15) -> String {
 /// SWm emergency DER must also place those exact bytes in `User-Name` (normally
 /// by passing [`emergency_nai`] for the direct IMEI path). For identity recovery,
 /// use the exact IMSI identity received from the UE: an IMSI emergency NAI, or a
-/// root IMSI NAI under the receive-side interoperability extension. Preserve the
-/// original identity and complete EAP payload in the retry without rewriting
+/// root IMSI NAI under the receive-side interoperability extension documented by
+/// [`SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery`]. Preserve
+/// the original identity and complete EAP payload in the retry without rewriting
 /// the realm. The helper accepts an empty identity, as RFC 3748 permits, but the
 /// SWm emergency verifier rejects it because it cannot match a required identity.
 ///

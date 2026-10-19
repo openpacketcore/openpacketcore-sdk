@@ -1969,12 +1969,13 @@ is not valid on a DEA.
 `Experimental-Result`. The optional 3GPP result (vendor 10415, code 5001)
 requests TS 33.402 device-identity recovery; it is not authorization. After
 the UE returns a TS 24.302 `DEVICE_IDENTITY`, the retry DER carries the
-recovered exact 15-digit IMEI in `Terminal-Information`. The recovery branch
-accepts the TS 23.003 IMSI emergency NAI forms for AKA/AKA-prime and, for
-emergency-indicated requests, ordinary root IMSI NAIs as a receive-side
-interoperability extension. Conforming UEs must still use the IMSI emergency
-NAI. Both forms require an exact EAP-Response/Identity whose bytes equal
-User-Name; the retry preserves the original identity and complete EAP payload.
+recovered exact 15-digit IMEI in `Terminal-Information`. For emergency-indicated
+requests, the recovery branch accepts AKA/AKA-prime IMSI identities in the
+TS 23.003 IMSI emergency NAI form and, as a receive-side interoperability
+extension, in the ordinary root NAI form. Conforming UEs must still use the
+IMSI emergency NAI. Both forms require an exact EAP-Response/Identity whose
+bytes equal User-Name; the retry preserves the original identity and complete
+EAP payload.
 See [RFC 005 §10.1](../../docs/rfc/005-protocol-framework.md#101-swm-emergency-identity-receive-interoperability).
 
 For an ordinary base result, use
