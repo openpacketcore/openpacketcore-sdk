@@ -137,6 +137,12 @@ struct Observation {
 /// when two observers select the same database. Dropping one retires only that
 /// observation. No commands, identities or error material appear in snapshots.
 ///
+/// The observation keeps each selected backend's SQLite connection open until
+/// it is dropped. In tests and `test-control` builds, native state, its clones
+/// and detached captures also keep their backend's connection open while they
+/// live, even without an observation. Dropping the backend alone therefore
+/// need not close its SQLite connection.
+///
 /// This test-control facility requires file-backed Linux SQLite databases.
 #[cfg(feature = "test-control")]
 pub struct ProtectedRosterTerminalObservationForTest(Arc<Observation>);

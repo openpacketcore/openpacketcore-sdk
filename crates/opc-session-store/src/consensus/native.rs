@@ -413,6 +413,9 @@ impl Serialize for NativeFrontierValues {
     }
 }
 
+/// Resident native state. In tests and `test-control` builds, attached states
+/// and their clones retain the backend's SQLite connection until they are
+/// dropped, preserving the observation identity even without an observer.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeState {

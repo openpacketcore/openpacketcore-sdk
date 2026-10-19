@@ -521,11 +521,12 @@ pub fn main_file_descriptor(connection: &Connection) -> Result<std::fs::File, Fi
 
 /// Read the main database's `(device, inode)` without owning another descriptor.
 ///
-/// The connection keeps its descriptor borrowed throughout `fstat`. No open,
-/// duplication or close occurs, so inspection cannot release SQLite's POSIX
-/// record locks. Callers that retain this identity must also retain the owning
-/// connection to prevent inode reuse. Moved files and unsupported VFSes fail
-/// closed. Available with the `borrowed-file-identity` feature.
+/// The connection keeps its descriptor borrowed during full-width metadata
+/// inspection, including on 32-bit Linux. No open, duplication or close occurs,
+/// so inspection cannot release SQLite's POSIX record locks. Callers that retain
+/// this identity must also retain the owning connection to prevent inode reuse.
+/// Moved files and unsupported VFSes fail closed. Available with the
+/// `borrowed-file-identity` feature.
 #[cfg(all(target_os = "linux", feature = "borrowed-file-identity"))]
 pub fn main_file_identity(connection: &Connection) -> Result<(u64, u64), FileControlError> {
     if sqlite_file_has_moved(connection, c"main")? {
@@ -534,66 +535,31 @@ pub fn main_file_identity(connection: &Connection) -> Result<(u64, u64), FileCon
     if let Some(identity) = verified_snapshot::file_identity(connection, c"main")? {
         return Ok(identity);
     }
-    let mut vfs_name: *mut libc::c_char = std::ptr::null_mut();
-    // SAFETY: SQLite writes its allocated VFSNAME string into this pointer.
-    // The connection and database name remain borrowed for the whole call.
-    let result = unsafe {
-        ffi::sqlite3_file_control(
-            connection.handle(),
-            c"main".as_ptr(),
-            ffi::SQLITE_FCNTL_VFSNAME,
-            (&mut vfs_name as *mut *mut libc::c_char).cast::<c_void>(),
-        )
-    };
-    let accepted = if result == ffi::SQLITE_OK && !vfs_name.is_null() {
-        // SAFETY: a successful VFSNAME result is a NUL-terminated allocation.
-        unsafe {
-            matches!(
-                CStr::from_ptr(vfs_name).to_bytes(),
-                b"unix" | b"unix-excl" | b"unix-dotfile" | b"unix-none"
-            )
-        }
-    } else {
-        false
-    };
-    // SAFETY: SQLite owns this allocation; sqlite3_free also accepts null.
-    unsafe { ffi::sqlite3_free(vfs_name.cast::<c_void>()) };
-    if !accepted {
+    let identity = with_borrowed_sqlite_descriptor(
+        connection,
+        c"main",
+        ffi::SQLITE_FCNTL_FILE_POINTER,
+        |descriptor| {
+            use std::os::unix::fs::MetadataExt as _;
+
+            // SAFETY: the checked Unix descriptor stays owned by the borrowed
+            // connection throughout this synchronous callback. ManuallyDrop
+            // prevents File from closing it, including on errors or unwinding.
+            // Only metadata is read; no ownership operation escapes this scope.
+            let file =
+                std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(descriptor) });
+            // std uses the full-width Linux metadata ABI, including on i686.
+            let metadata = file.metadata().map_err(|_| FileControlError)?;
+            if !metadata.is_file() {
+                return Err(FileControlError);
+            }
+            Ok((metadata.dev(), metadata.ino()))
+        },
+    )?;
+    if sqlite_file_has_moved(connection, c"main")? {
         return Err(FileControlError);
     }
-    let mut file: *mut c_void = std::ptr::null_mut();
-    // SAFETY: SQLite returns its borrowed sqlite3_file pointer. No ownership
-    // is transferred, and the connection cannot close during this call chain.
-    let result = unsafe {
-        ffi::sqlite3_file_control(
-            connection.handle(),
-            c"main".as_ptr(),
-            ffi::SQLITE_FCNTL_FILE_POINTER,
-            (&mut file as *mut *mut c_void).cast::<c_void>(),
-        )
-    };
-    if result != ffi::SQLITE_OK || file.is_null() {
-        return Err(FileControlError);
-    }
-    // SAFETY: only the pinned bundled Unix VFS layouts admitted above reach
-    // this access. The descriptor remains owned exclusively by SQLite.
-    let descriptor = unsafe { (*file.cast::<BundledUnixFilePrefix>()).descriptor };
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: fstat borrows the descriptor and initializes the complete stat
-    // structure on success. It never changes the descriptor's ownership.
-    if descriptor < 0 || unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } != 0 {
-        return Err(FileControlError);
-    }
-    // SAFETY: the successful fstat above initialized every field.
-    let metadata = unsafe { metadata.assume_init() };
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
-        || sqlite_file_has_moved(connection, c"main")?
-    {
-        return Err(FileControlError);
-    }
-    // Linux libc's inode type is narrower on some supported 32-bit targets.
-    #[allow(clippy::unnecessary_cast)]
-    Ok((metadata.st_dev as u64, metadata.st_ino as u64))
+    Ok(identity)
 }
 
 /// Borrowed database identity inspection is unavailable on this platform.
@@ -642,6 +608,32 @@ fn duplicate_sqlite_file_descriptor(
             return Ok(file);
         }
     }
+    with_borrowed_sqlite_descriptor(connection, database, opcode, |descriptor| {
+        // SAFETY: `descriptor` belongs to SQLite; F_DUPFD_CLOEXEC returns a new
+        // owned descriptor or -1, without changing SQLite's ownership.
+        let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 || sqlite_file_has_moved(connection, database)? {
+            if duplicate >= 0 {
+                // SAFETY: this branch owns only the just-created duplicate.
+                unsafe { libc::close(duplicate) };
+            }
+            return Err(FileControlError);
+        }
+        // SAFETY: the successful fcntl result is a unique owned descriptor.
+        Ok(unsafe { std::fs::File::from_raw_fd(duplicate) })
+    })
+}
+
+// Keep the pinned Unix VFS admission and layout read in one audited boundary.
+// Callers consume the descriptor synchronously and retain their moved-file
+// checks after inspection. SQLite retains ownership throughout the callback.
+#[cfg(target_os = "linux")]
+fn with_borrowed_sqlite_descriptor<T>(
+    connection: &Connection,
+    database: &CStr,
+    opcode: libc::c_int,
+    inspect: impl FnOnce(libc::c_int) -> Result<T, FileControlError>,
+) -> Result<T, FileControlError> {
     let mut vfs_name: *mut libc::c_char = std::ptr::null_mut();
     // SAFETY: SQLite allocates `vfs_name` for this documented file-control
     // opcode. The pointer is freed with SQLite's allocator before return.
@@ -653,17 +645,18 @@ fn duplicate_sqlite_file_descriptor(
             (&mut vfs_name as *mut *mut libc::c_char).cast::<c_void>(),
         )
     };
-    if vfs_result != ffi::SQLITE_OK || vfs_name.is_null() {
-        return Err(FileControlError);
-    }
-    // SAFETY: SQLite returned a NUL-terminated allocation for VFSNAME.
-    let accepted_vfs = unsafe {
-        matches!(
-            CStr::from_ptr(vfs_name).to_bytes(),
-            b"unix" | b"unix-excl" | b"unix-dotfile" | b"unix-none"
-        )
+    let accepted_vfs = if vfs_result == ffi::SQLITE_OK && !vfs_name.is_null() {
+        // SAFETY: SQLite returned a NUL-terminated allocation for VFSNAME.
+        unsafe {
+            matches!(
+                CStr::from_ptr(vfs_name).to_bytes(),
+                b"unix" | b"unix-excl" | b"unix-dotfile" | b"unix-none"
+            )
+        }
+    } else {
+        false
     };
-    // SAFETY: `vfs_name` is owned by SQLite per SQLITE_FCNTL_VFSNAME.
+    // SAFETY: SQLite owns the VFSNAME allocation; sqlite3_free accepts null.
     unsafe { ffi::sqlite3_free(vfs_name.cast::<c_void>()) };
     if !accepted_vfs {
         return Err(FileControlError);
@@ -694,18 +687,7 @@ fn duplicate_sqlite_file_descriptor(
     if descriptor < 0 {
         return Err(FileControlError);
     }
-    // SAFETY: `descriptor` belongs to SQLite; F_DUPFD_CLOEXEC returns a new
-    // owned descriptor or -1, without changing SQLite's ownership.
-    let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 || sqlite_file_has_moved(connection, database)? {
-        if duplicate >= 0 {
-            // SAFETY: this branch owns only the just-created duplicate.
-            unsafe { libc::close(duplicate) };
-        }
-        return Err(FileControlError);
-    }
-    // SAFETY: the successful fcntl result is a unique owned descriptor.
-    Ok(unsafe { std::fs::File::from_raw_fd(duplicate) })
+    inspect(descriptor)
 }
 
 #[cfg(not(target_os = "linux"))]

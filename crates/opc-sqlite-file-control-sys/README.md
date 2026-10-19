@@ -28,9 +28,14 @@ handles or a general-purpose FFI surface, and unsupported platforms fail closed.
 
 The crate is source-build only and is not published independently.
 
-The optional `borrowed-file-identity` feature adds `main_file_identity` for
-non-owning device/inode inspection. It uses `fstat` on SQLite's borrowed Unix
-descriptor, or the verified snapshot source's retained descriptor, without
-duplicating or closing a file. The caller must retain the owning connection
-for as long as it retains the identity. This avoids cancelling SQLite's POSIX
-record locks through an independently owned descriptor's close.
+The optional `borrowed-file-identity` feature adds `main_file_identity` and the
+defaulted `VerifiedSnapshotSource::file_identity` method for non-owning
+device/inode inspection. It reads full-width metadata, including on i686, from
+SQLite's borrowed Unix descriptor or the verified snapshot source's retained
+descriptor, without opening, duplicating or closing a file. Unix identity
+inspection and descriptor duplication share the VFS admission and descriptor
+lookup. The caller must retain the owning connection for as long as it retains
+the identity. This avoids cancelling SQLite's POSIX record locks through an
+independently owned descriptor's close. The store enables this feature through
+`test-control` and its test dependencies; observations and test native states
+and captures keep their backend connections open until they are dropped.

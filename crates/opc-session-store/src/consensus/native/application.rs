@@ -6,6 +6,8 @@ use super::*;
 use crate::consensus::verified_snapshot::VerificationMemory;
 use std::mem::size_of;
 
+/// Detached application state. In tests and `test-control` builds, its native
+/// state also keeps the backend's SQLite connection open until capture drop.
 pub(crate) struct ApplicationCapture {
     state: NativeState,
     // Covers the bounded frontiers/membership copy and persistent map roots.
