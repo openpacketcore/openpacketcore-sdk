@@ -238,6 +238,7 @@
         "majority_protocol::protected_async_recovery_five_voters_repeat_boundary_and_sequential_rejoin",
         "majority_protocol::async_recovery_activation_retry_survives_a_new_real_leader",
         "majority_protocol::protected_async_recovery_activation_retry_survives_a_new_real_leader",
+        "majority_protocol::async_recovery_late_committed_election_resumes_without_retiring_its_round",
         "majority_protocol::async_recovery_retries_an_election_interrupted_after_preparation",
         "majority_protocol::protected_async_recovery_retries_an_election_interrupted_after_preparation",
         "majority_protocol::async_recovery_old_ready_and_delayed_activation_cannot_admit_a_replacement",
