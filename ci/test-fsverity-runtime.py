@@ -85,6 +85,149 @@ class SafetyTests(unittest.TestCase):
         guardian.inventory = lambda **_kwargs: ([], [])
         return guardian
 
+    def interrupted_root_helper(self, phase):
+        directory = self.candidate("root-helper-stop-" + phase)
+        report = self.root / "stopped-helper.json"
+        report.write_text("{}")
+        program = '''
+import importlib.util,json,os,sys
+path,report,phase,*arguments=sys.argv[1:]
+spec=importlib.util.spec_from_file_location('runtime',path)
+runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
+original_chown,original_rename,original_unlink=runtime.os.fchown,runtime.rename_new,runtime.os.unlink
+original_protected=runtime.protected_directory
+state={}
+@runtime.contextmanager
+def protected(*args,**kwargs):
+    with original_protected(*args,**kwargs) as fd:
+        state['stage']=os.readlink('/proc/self/fd/'+str(fd));state['stage_identity']=runtime.identity(fd)
+        yield fd
+def stop():
+    with open(report,'w') as stream: json.dump(state,stream)
+    os._exit(77)
+def chown(fd,uid,gid):
+    result=original_chown(fd,uid,gid)
+    if uid==0 and runtime.stat.S_ISDIR(os.fstat(fd).st_mode):
+        state['directory']=os.readlink('/proc/self/fd/'+str(fd))
+        state['directory_identity']=runtime.identity(fd)
+        if phase=='freeze': stop()
+    return result
+def rename(source,name,destination,new_name):
+    result=original_rename(source,name,destination,new_name)
+    if new_name=='runtime':
+        state['directory']=os.readlink('/proc/self/fd/'+str(destination))+'/runtime'
+        state['directory_identity']=runtime.Guardian.entry_identity(destination,'runtime')
+        if phase=='moved': stop()
+    return result
+def unlink(name,*args,**kwargs):
+    result=original_unlink(name,*args,**kwargs)
+    if name=='ext4.img' and phase=='partial': stop()
+    return result
+runtime.protected_directory=protected;runtime.os.fchown=chown
+runtime.rename_new=rename;runtime.os.unlink=unlink
+sys.argv=[path,*arguments];runtime.main()
+'''
+        original_popen = subprocess.Popen
+
+        def interrupted(command, *args, **kwargs):
+            if "--privileged" in command:
+                command = ["sudo", "-n", "python3", "-I", "-c", program,
+                           str(HARNESS.with_name("fsverity-runtime.py")), str(report), phase,
+                           *command[command.index("--privileged"):]]
+            return original_popen(command, *args, **kwargs)
+
+        # An isolated ordinary-file runtime: there are no mounts or loop
+        # devices to mutate. The helper really exits between its syscalls.
+        try:
+            with patch.object(RUNTIME.subprocess, "Popen", side_effect=interrupted):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    self.guardian().sweep(self.runner)
+            state = json.loads(report.read_text())
+            self.assertIn("stage", state, "did not reach the helper interruption")
+            self.guardian().sweep(self.runner)
+            remaining = privileged("python3", "-c", """
+import json,os,sys
+state=json.load(open(sys.argv[1]))
+print(json.dumps([p for p in (state['stage'],state['directory']) if os.path.exists(p)]))
+""", report)
+            self.assertEqual(json.loads(remaining), [], "next sweep did not reclaim a stopped root helper")
+        finally:
+            # The RED must not strand its deliberately stopped root fixture.
+            # Only the exact descriptors/identities recorded by this fixture
+            # are eligible; no glob or recursive root cleanup is permitted.
+            privileged("python3", "-c", '''
+import json,os,stat,sys
+state=json.load(open(sys.argv[1]))
+if 'stage' not in state: sys.exit(0)
+handles=[]
+try:
+    for key in ('directory','stage'):
+        try: fd=os.open(state[key],os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        except FileNotFoundError: continue
+        handles.append(fd)
+        info=os.fstat(fd)
+        assert [info.st_dev,info.st_ino]==state[key+'_identity']
+        entries=set(os.listdir(fd))
+        if key=='directory':
+            assert entries<={'ext4.img','tmp'}
+            if 'ext4.img' in entries: os.unlink('ext4.img',dir_fd=fd)
+            if 'tmp' in entries: os.rmdir('tmp',dir_fd=fd)
+        else: assert not entries
+        os.rmdir(state[key])
+finally:
+    for fd in handles: os.close(fd)
+''', report)
+
+    def test_next_sweep_reclaims_helper_stopped_before_the_staging_move(self):
+        self.interrupted_root_helper("freeze")
+
+    def test_next_sweep_reclaims_helper_stopped_after_the_staging_move(self):
+        self.interrupted_root_helper("moved")
+
+    def test_next_sweep_finishes_a_partially_removed_root_runtime(self):
+        self.interrupted_root_helper("partial")
+
+    def test_remove_rejects_an_unowned_parent_and_a_different_parent_inode(self):
+        directory = self.candidate("wrong-parent")
+        descriptors = [os.open(directory, os.O_RDONLY | os.O_DIRECTORY),
+                       os.open(directory / "ext4.img", os.O_RDWR),
+                       os.open(directory / "tmp", os.O_RDONLY | os.O_DIRECTORY)]
+        try:
+            fcntl.fcntl(descriptors[1], fcntl.F_SETLEASE, fcntl.F_WRLCK)
+            for path in (Path("/tmp"), self.root):
+                with self.subTest(parent=str(path)):
+                    parent = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, "runtime parent"):
+                            RUNTIME.privileged_request("remove", [parent, *descriptors], name=directory.name)
+                        self.assertEqual(directory.stat().st_uid, os.getuid())
+                    finally:
+                        os.close(parent)
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+    def test_removal_round_trip_has_a_budget_separate_from_its_inventories(self):
+        directory = self.candidate("round-trip")
+        parent = os.open(self.runner, os.O_RDONLY | os.O_DIRECTORY)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        calls = []
+        now = time.monotonic()
+
+        def request(operation, _descriptors, *, deadline, result, **_kwargs):
+            calls.append((operation, deadline - now))
+            result['removed'] = True
+            return []
+
+        try:
+            with patch.object(RUNTIME, "privileged_request", side_effect=request):
+                self.assertTrue(self.guardian().remove_runtime(directory, descriptor, parent, deadline=now + .2))
+            self.assertEqual(calls[0][0], "remove")
+            self.assertGreaterEqual(calls[0][1], 29, "sudo received only the almost-spent inventory budget")
+        finally:
+            os.close(descriptor)
+            os.close(parent)
+
     def deletion_boundary_race(self, kind):
         directory = self.candidate("boundary")
         foreign = self.candidate("foreign", self.root)
