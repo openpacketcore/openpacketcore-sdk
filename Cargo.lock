@@ -3901,6 +3901,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

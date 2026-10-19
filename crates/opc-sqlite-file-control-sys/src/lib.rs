@@ -30,6 +30,9 @@ mod verified_snapshot;
 #[cfg(target_os = "linux")]
 pub use verified_snapshot::{RegisteredSnapshot, VerifiedSnapshotSource};
 
+#[cfg(all(test, target_os = "linux", feature = "borrowed-file-identity"))]
+mod identity_tests;
+
 /// Failure from a SQLite descriptor control or verified snapshot registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileControlError;
