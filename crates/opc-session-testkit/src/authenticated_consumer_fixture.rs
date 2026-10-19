@@ -1933,6 +1933,10 @@ async fn start_fixture_listener(
 /// Response-loss decorator around the real store-owned quorum service.
 struct FixtureConsumer {
     inner: Arc<dyn SessionQuorumConsumer>,
+    #[cfg(test)]
+    reply_holds: [std::sync::atomic::AtomicU64; 5],
+    #[cfg(test)]
+    held_replies: [AtomicUsize; 5],
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
@@ -1981,6 +1985,10 @@ impl FixtureConsumer {
     ) -> Self {
         Self {
             inner,
+            #[cfg(test)]
+            reply_holds: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            held_replies: std::array::from_fn(|_| AtomicUsize::new(0)),
             lose_next_fenced_transition_response,
             lose_next_fenced_transition_v2_response,
             fenced_transition_status_misses_remaining,
@@ -2018,6 +2026,16 @@ impl FixtureConsumer {
             voter,
         }
     }
+
+    /// Hold only a successful response produced by the real quorum service.
+    #[cfg(test)]
+    async fn hold_reply(&self, kind: usize) {
+        let millis = self.reply_holds[kind].load(Ordering::Acquire);
+        if millis != 0 {
+            self.held_replies[kind].fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -2053,6 +2071,12 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .fetch_add(1, Ordering::SeqCst);
         }
         let response = self.inner.execute(authorization, request).await;
+        #[cfg(test)]
+        match &response {
+            SessionConsumerResponse::Get(Ok(_)) => self.hold_reply(0).await,
+            SessionConsumerResponse::PreflightRecordExpiry(Ok(())) => self.hold_reply(1).await,
+            _ => {}
+        }
         if let Some(gate) = ordinary_fault {
             match ordinary_call {
                 FixtureOrdinaryCasCall::Mutation if gate.observe_committed_success(&response) => {
@@ -2209,6 +2233,17 @@ impl SessionQuorumConsumer for FixtureConsumer {
             }
         }
         let response = self.inner.execute_v2(authorization, request).await;
+        #[cfg(test)]
+        match &response {
+            SessionConsumerV2Response::FencedTransitionV2HistoryState(Ok(_)) => {
+                self.hold_reply(2).await;
+            }
+            SessionConsumerV2Response::FencedTransitionV2Status(Ok(_)) => {
+                self.hold_reply(3).await;
+            }
+            SessionConsumerV2Response::FencedTransitionV2(Ok(_)) => self.hold_reply(4).await,
+            _ => {}
+        }
         #[cfg(test)]
         if matches!(
             &response,

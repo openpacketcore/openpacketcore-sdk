@@ -15832,6 +15832,35 @@ impl PersistentSessionConsumerClient {
         }
     }
 
+    /// Read authoritative state within the caller's immutable checkpoint budget.
+    pub async fn get_with_budget(
+        &self,
+        key: opc_session_store::SessionKey,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<Option<opc_session_store::StoredSessionRecord>, StoreError> {
+        tokio::time::timeout_at(budget.original_deadline(), self.get(key))
+            .await
+            .map_err(|_| {
+                StoreError::BackendUnavailable("consumer authoritative read unavailable".into())
+            })?
+    }
+
+    /// Validate expiry authority within the caller's immutable checkpoint budget.
+    pub async fn preflight_record_expiry_with_budget(
+        &self,
+        preflights: Vec<RecordExpiryPreflight>,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<(), StoreError> {
+        tokio::time::timeout_at(
+            budget.original_deadline(),
+            self.preflight_record_expiry(preflights),
+        )
+        .await
+        .map_err(|_| {
+            StoreError::BackendUnavailable("consumer expiry authority unavailable".into())
+        })?
+    }
+
     pub async fn get(
         &self,
         key: opc_session_store::SessionKey,
