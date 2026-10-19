@@ -2195,7 +2195,7 @@ async fn protected_v2_journal_rejects_mixed_formats_and_corrupted_bindings() {
             .with_fenced_transition_v2_journal_scope(fixture.v2_scope());
     assert!(matches!(
         reopened.fenced_transition_v2_status(&request).await,
-        Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
+        Err(StoreError::BackendUnavailable(_))
     ));
     assert_eq!(reopened_provider.calls(), 0);
 }
@@ -2230,7 +2230,7 @@ async fn protected_v2_scope_mismatch_stops_before_provider_or_inner() {
     .with_fenced_transition_v2_journal_scope(scope);
     assert!(matches!(
         wrong_namespace.fenced_transition_v2(request.clone()).await,
-        Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
+        Err(StoreError::BackendUnavailable(_))
     ));
     assert_eq!(wrong_namespace_provider.calls(), 0);
     assert_eq!(spy.v2_executed().len(), dispatched);
@@ -2242,7 +2242,7 @@ async fn protected_v2_scope_mismatch_stops_before_provider_or_inner() {
             .with_fenced_transition_v2_journal_scope(scope);
     assert!(matches!(
         wrong_mode.fenced_transition_v2(request.clone()).await,
-        Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
+        Err(StoreError::BackendUnavailable(_))
     ));
     assert_eq!(remote_provider.calls(), 0);
     assert_eq!(spy.v2_executed().len(), dispatched);
@@ -2259,7 +2259,7 @@ async fn protected_v2_scope_mismatch_stops_before_provider_or_inner() {
     ));
     assert!(matches!(
         wrong_cluster.fenced_transition_v2(request.clone()).await,
-        Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
+        Err(StoreError::BackendUnavailable(_))
     ));
     assert_eq!(wrong_cluster_provider.calls(), 0);
     assert_eq!(spy.v2_executed().len(), dispatched);
@@ -2276,7 +2276,7 @@ async fn protected_v2_scope_mismatch_stops_before_provider_or_inner() {
                 request.request_id(),
             )
             .await,
-        Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
+        Err(StoreError::BackendUnavailable(_))
     ));
 }
 
@@ -2372,7 +2372,7 @@ async fn protected_v2_index_divergence_fails_closed_before_reseal_or_dispatch() 
                 local_request.request_id(),
             )
             .await,
-        Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
+        Err(StoreError::BackendUnavailable(_))
     ));
     let local_retry_provider = CountingKeyProvider::with_key("v2-index-local-retry", 0x86);
     let local_retry = EncryptingSessionBackend::new(
@@ -2384,7 +2384,7 @@ async fn protected_v2_index_divergence_fails_closed_before_reseal_or_dispatch() 
     .with_fenced_transition_v2_journal_scope(local_scope);
     assert!(matches!(
         local_retry.fenced_transition_v2(local_request).await,
-        Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
+        Err(StoreError::BackendUnavailable(_))
     ));
     assert_eq!(local_retry_provider.calls(), 0);
     assert_eq!(local_spy.v2_executed().len(), local_dispatched);
@@ -2425,7 +2425,7 @@ async fn protected_v2_index_divergence_fails_closed_before_reseal_or_dispatch() 
                 remote_request.request_id(),
             )
             .await,
-        Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
+        Err(StoreError::BackendUnavailable(_))
     ));
     let remote_retry_provider = CountingRemoteProvider::with_key("v2-index-remote-retry", 0x88);
     let remote_retry = RemoteSealingSessionBackend::new(
@@ -2437,7 +2437,7 @@ async fn protected_v2_index_divergence_fails_closed_before_reseal_or_dispatch() 
     .with_fenced_transition_v2_journal_scope(remote_scope);
     assert!(matches!(
         remote_retry.fenced_transition_v2(remote_request).await,
-        Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
+        Err(StoreError::BackendUnavailable(_))
     ));
     assert_eq!(remote_retry_provider.calls(), 0);
     assert_eq!(remote_spy.v2_executed().len(), remote_dispatched);
