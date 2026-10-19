@@ -3215,6 +3215,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixed_bootstrap_pre_vote_recovers_after_committed_vote_lease_expires_sqlite() {
+        committed_vote_without_membership_recovers(FixedAuthorityBackend::Sqlite).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fixed_bootstrap_pre_vote_recovers_after_committed_vote_lease_expires_native() {
+        committed_vote_without_membership_recovers(FixedAuthorityBackend::Native).await;
+    }
+
+    async fn committed_vote_without_membership_recovers(selected: FixedAuthorityBackend) {
+        use futures_util::FutureExt;
+        use opc_consensus::engine::type_config::TypeConfigExt;
+        use rusqlite::OptionalExtension;
+        use std::panic::AssertUnwindSafe;
+
+        async fn saved_vote(
+            fixture: &FixedFollowerFixture,
+        ) -> Option<Vote<SessionConsensusNodeId>> {
+            #[cfg(target_os = "linux")]
+            if let Some(wal) = &fixture.wal {
+                return crate::sqlite::consensus::wal::adapter::WalLogStore::new(Arc::clone(wal))
+                    .read_vote()
+                    .await
+                    .unwrap();
+            }
+            rusqlite::Connection::open(fixture._temp.path().join("sessions.sqlite"))
+                .unwrap()
+                .query_row(
+                    "SELECT vote_json FROM consensus_vote WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .unwrap()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        }
+
+        async fn heartbeat(fixture: &FixedFollowerFixture) {
+            let request = SessionConsensusWireRequest::try_new(
+                fixture.scope,
+                fixture.leader,
+                SessionConsensusRpcFamily::AppendEntries,
+                encode_bounded(&AppendEntriesRequest::<SessionRaftTypeConfig> {
+                    vote: Vote::new_committed(7, fixture.leader),
+                    prev_log_id: None,
+                    entries: vec![],
+                    leader_commit: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let response = fixture.handler.handle(fixture.leader, request).await;
+            let result: Result<
+                AppendEntriesResponse<SessionConsensusNodeId>,
+                RaftError<SessionConsensusNodeId>,
+            > = decode_bounded(&response.result.unwrap()).unwrap();
+            assert_eq!(result.unwrap(), AppendEntriesResponse::Success);
+        }
+
+        async fn inquire(
+            fixture: &FixedFollowerFixture,
+            proposed: Vote<SessionConsensusNodeId>,
+        ) -> bool {
+            let before = fixture
+                .raft
+                .with_raft_state(|state| state.clone())
+                .await
+                .unwrap();
+            assert_eq!(before.log_ids, Default::default());
+            assert_eq!(before.membership_state, Default::default());
+            assert_eq!(before.committed, None);
+            assert_eq!(before.snapshot_meta, Default::default());
+            assert_eq!(before.vote_ref(), &Vote::new_committed(7, fixture.leader));
+            let persisted = saved_vote(fixture).await;
+            assert_eq!(persisted, Some(*before.vote_ref()));
+            let candidate = node_id(3);
+            let request = SessionConsensusWireRequest::try_new(
+                fixture.scope,
+                candidate,
+                SessionConsensusRpcFamily::PreVote,
+                encode_bounded(&PreVoteRequest::new(proposed, Some(LogId::default()))).unwrap(),
+            )
+            .unwrap();
+            let response = fixture.handler.handle(candidate, request).await;
+            let result: Result<
+                PreVoteResponse<SessionConsensusNodeId>,
+                RaftError<SessionConsensusNodeId>,
+            > = decode_bounded(&response.result.unwrap()).unwrap();
+            let response = result.unwrap();
+            assert_eq!(&response.vote, before.vote_ref());
+            assert_eq!(response.last_log_id, None);
+            assert_eq!(
+                fixture
+                    .raft
+                    .with_raft_state(|state| state.clone())
+                    .await
+                    .unwrap(),
+                before,
+                "Pre-Vote must preserve the complete state, including the lease timestamp"
+            );
+            assert_eq!(saved_vote(fixture).await, persisted);
+            response.vote_granted
+        }
+
+        let fixture = fixed_follower_fixture(Duration::from_secs(1), false, selected).await;
+        fixture.raft.runtime_config().elect(false);
+        fixture.raft.runtime_config().tick(false);
+        let outcome = AssertUnwindSafe(async {
+            let minimum = Duration::from_millis(fixture.raft.config().election_timeout_min);
+            let lease = Duration::from_millis(fixture.raft.config().election_timeout_max);
+            assert!(minimum < lease);
+            let proposed = Vote::new(8, node_id(3));
+
+            // A successful empty heartbeat persists the leader's committed
+            // vote but supplies no log or engine membership.
+            heartbeat(&fixture).await;
+            let first = fixture
+                .raft
+                .with_raft_state(|state| state.vote_last_modified().unwrap())
+                .await
+                .unwrap();
+            assert!(!inquire(&fixture, proposed).await);
+            tokio::time::sleep_until(first + minimum).await;
+            assert!(SessionRaftTypeConfig::now() < first + lease);
+            assert!(
+                !inquire(&fixture, proposed).await,
+                "the leader lease lasts through the maximum, not minimum, election timeout"
+            );
+
+            heartbeat(&fixture).await;
+            let renewed = fixture
+                .raft
+                .with_raft_state(|state| state.vote_last_modified().unwrap())
+                .await
+                .unwrap();
+            assert!(renewed > first);
+            tokio::time::sleep_until(first + lease + Duration::from_millis(1)).await;
+            assert!(SessionRaftTypeConfig::now() < renewed + lease);
+            assert!(
+                !inquire(&fixture, proposed).await,
+                "another heartbeat renews the leader lease even without membership"
+            );
+
+            tokio::time::sleep_until(renewed + lease + Duration::from_millis(1)).await;
+            assert!(
+                inquire(&fixture, proposed).await,
+                "an expired committed vote without membership must not strand formation"
+            );
+            for rejected in [
+                Vote::new(6, node_id(3)),
+                Vote::new(7, node_id(3)),
+                Vote::new_committed(8, node_id(3)),
+            ] {
+                assert!(!inquire(&fixture, rejected).await);
+            }
+            assert!(inquire(&fixture, proposed).await);
+        })
+        .catch_unwind()
+        .await;
+        fixture.raft.shutdown().await.unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
     async fn authenticated_pre_vote_leaves_engine_and_durable_vote_unchanged() {
         use rusqlite::OptionalExtension;
 
