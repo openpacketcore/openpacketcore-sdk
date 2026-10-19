@@ -2754,6 +2754,9 @@ impl SwmDiameterEapRequestEnvelope {
     /// Parsed successful emergency answers tolerate ignored subscription APN
     /// data; locally built answers retain the sender prohibition. Every DER
     /// of an emergency exchange must carry its own emergency indication.
+    /// This compatibility path does not authenticate the answer peer and
+    /// cannot produce emergency authorization evidence. Use
+    /// [`Self::correlate_answer_from_connection`] instead.
     pub fn correlate_answer(
         self,
         answer: SwmDiameterEapAnswerEnvelope,
@@ -2767,7 +2770,50 @@ impl SwmDiameterEapRequestEnvelope {
             answer,
             effective_mobility_mode,
             mobility_mode_source,
+            answer_peer_authenticated: false,
         })
+    }
+
+    /// Bind an application answer to the authenticated connection of its request.
+    ///
+    /// `received_on` must come from the transport that authenticated the sender,
+    /// not from an answer AVP. The retained request must carry the trusted
+    /// [`SwmExpectedAnswerPeer`] installed before dispatch. As with
+    /// [`Self::correlate_response`], connection generation and the configured
+    /// logical-origin policy must match; routed answers may have a different
+    /// final AAA Origin from their authenticated transport peer.
+    ///
+    /// This retains every check in [`Self::correlate_answer`] and produces an
+    /// exchange usable by either emergency authorization constructor. The caller
+    /// must still atomically consume its matching live pending-request entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing wire-correlation errors, or a peer-binding error if
+    /// the request has no trusted peer, the connection differs, or the answer
+    /// Origin violates the configured direct or routed policy.
+    pub fn correlate_answer_from_connection(
+        self,
+        answer: SwmDiameterEapAnswerEnvelope,
+        received_on: SwmDiameterConnectionToken,
+    ) -> Result<SwmCorrelatedDiameterEapExchange, SwmEmergencyAuthorizationError> {
+        let mut exchange = self.correlate_answer(answer)?;
+        let expected_peer = exchange
+            .request
+            .expected_answer_peer
+            .as_ref()
+            .ok_or(SwmEmergencyAuthorizationError::AnswerPeerBindingMissing)?;
+        if expected_peer.connection() != received_on {
+            return Err(SwmEmergencyAuthorizationError::AnswerPeerConnectionMismatch);
+        }
+        if !expected_peer.matches_origin(
+            exchange.answer().origin_host.as_ref(),
+            exchange.answer().origin_realm.as_ref(),
+        ) {
+            return Err(SwmEmergencyAuthorizationError::AnswerPeerIdentityMismatch);
+        }
+        exchange.answer_peer_authenticated = true;
+        Ok(exchange)
     }
 
     /// Correlate a response received on an authenticated Diameter connection.
@@ -2825,12 +2871,16 @@ enum SwmDiameterEapAnswerEnvelopeProvenance {
     Outbound,
 }
 
-/// Opaque request/answer pair with all SWm and Diameter correlation checked.
+/// Opaque request/answer pair with SWm and Diameter wire correlation checked.
+///
+/// Emergency authorization additionally requires authenticated peer correlation
+/// through [`SwmDiameterEapRequestEnvelope::correlate_answer_from_connection`].
 pub struct SwmCorrelatedDiameterEapExchange {
     request: SwmDiameterEapRequestEnvelope,
     answer: SwmDiameterEapAnswerEnvelope,
     effective_mobility_mode: Option<SwmLocallyConfiguredMobilityMode>,
     mobility_mode_source: Option<SwmConditionalValueSource>,
+    answer_peer_authenticated: bool,
 }
 
 impl SwmCorrelatedDiameterEapExchange {
@@ -3418,9 +3468,12 @@ pub enum SwmEmergencyAuthorizationPath {
 /// Redaction-safe proof that a correlated emergency exchange returned the
 /// exact IMEI-derived MSK required by TS 33.402.
 ///
-/// The request and answer envelopes bind both Diameter identifiers. The caller
-/// must additionally have consumed the matching live pending-request entry;
-/// parsing a stored answer again is not proof that it is still pending.
+/// Each exchange must come from
+/// [`SwmDiameterEapRequestEnvelope::correlate_answer_from_connection`]. This binds
+/// the answer to its request's authenticated connection and trusted Origin
+/// policy as well as both Diameter identifiers. The caller must additionally
+/// have consumed the matching live pending-request entry; parsing a stored
+/// answer again is not proof that it is still pending.
 pub struct SwmEmergencyAuthorizationEvidence {
     path: SwmEmergencyAuthorizationPath,
     msk: SwmUnauthenticatedEmergencyMsk,
@@ -3432,6 +3485,9 @@ impl SwmEmergencyAuthorizationEvidence {
         exchange: SwmCorrelatedDiameterEapExchange,
         imei: &Imei15,
     ) -> Result<Self, SwmEmergencyAuthorizationError> {
+        if !exchange.answer_peer_authenticated {
+            return Err(SwmEmergencyAuthorizationError::AnswerPeerBindingMissing);
+        }
         let request = exchange.request();
         ensure_emergency_request(request)?;
         if request.terminal_information.is_some() {
@@ -3457,6 +3513,11 @@ impl SwmEmergencyAuthorizationEvidence {
 
     /// Verify the IMSI-to-IMEI recovery sequence defined by TS 33.402 §13.3.
     ///
+    /// An emergency-indicated request may use an IMSI emergency NAI or, as a
+    /// receive-side interoperability extension, an ordinary root IMSI NAI.
+    /// The retry must preserve the original identity and EAP payload exactly.
+    /// TS 23.003 §19.3.9 still requires conforming UEs to use the `sos` realm.
+    ///
     /// Class-free retained top-level and grouped extensions are compared
     /// byte-exactly. If either DER recursively contains IETF Class, verification
     /// returns [`SwmEmergencyAuthorizationError::RetryRequestMismatch`] before
@@ -3466,6 +3527,10 @@ impl SwmEmergencyAuthorizationEvidence {
         retry_exchange: SwmCorrelatedDiameterEapExchange,
         imei: &Imei15,
     ) -> Result<Self, SwmEmergencyAuthorizationError> {
+        if !initial_exchange.answer_peer_authenticated || !retry_exchange.answer_peer_authenticated
+        {
+            return Err(SwmEmergencyAuthorizationError::AnswerPeerBindingMissing);
+        }
         let initial_request = initial_exchange.request();
         let identity_response = initial_exchange.answer();
         let retry_request = retry_exchange.request();
@@ -3479,7 +3544,7 @@ impl SwmEmergencyAuthorizationEvidence {
             .map(Redacted::as_ref)
             .map(String::as_str)
             .ok_or(SwmEmergencyAuthorizationError::IdentityRecoveryInitialIdentityInvalid)?;
-        if !is_imsi_emergency_nai(initial_identity) {
+        if !is_imsi_identity_recovery_nai(initial_identity) {
             return Err(SwmEmergencyAuthorizationError::IdentityRecoveryInitialIdentityInvalid);
         }
         ensure_eap_response_identity(initial_request, initial_identity.as_bytes())?;
@@ -3560,6 +3625,12 @@ impl fmt::Debug for SwmEmergencyAuthorizationEvidence {
 /// Fail-closed errors while correlating an unauthenticated emergency exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwmEmergencyAuthorizationError {
+    /// An answer lacks request-bound authenticated peer correlation.
+    AnswerPeerBindingMissing,
+    /// An answer arrived on a different authenticated connection generation.
+    AnswerPeerConnectionMismatch,
+    /// An answer violates the request's trusted logical-origin policy.
+    AnswerPeerIdentityMismatch,
     /// The initiating DER did not have the required SWm request shape.
     InitialRequestInvalid,
     /// The initiating DER did not request emergency services.
@@ -3572,7 +3643,7 @@ pub enum SwmEmergencyAuthorizationError {
     InitialEapIdentityMismatch,
     /// The first DER already contained Terminal-Information.
     InitialTerminalInformationUnexpected,
-    /// Recovery did not begin with an exact IMSI-based emergency NAI.
+    /// Recovery did not begin with a valid IMSI emergency or root NAI.
     IdentityRecoveryInitialIdentityInvalid,
     /// Request and answer Session-Id values differ.
     SessionMismatch,
@@ -3616,6 +3687,9 @@ impl SwmEmergencyAuthorizationError {
     /// Stable redaction-safe label.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AnswerPeerBindingMissing => "swm_emergency_answer_peer_binding_missing",
+            Self::AnswerPeerConnectionMismatch => "swm_emergency_answer_peer_connection_mismatch",
+            Self::AnswerPeerIdentityMismatch => "swm_emergency_answer_peer_identity_mismatch",
             Self::InitialRequestInvalid => "swm_emergency_initial_request_invalid",
             Self::InitialRequestNotEmergency => "swm_emergency_request_not_indicated",
             Self::InitialIdentityMismatch => "swm_emergency_initial_identity_mismatch",
@@ -11584,10 +11658,13 @@ pub fn emergency_nai(imei: &Imei15) -> String {
 ///
 /// `identity` is copied verbatim into the Type-Data field. Callers building a
 /// SWm emergency DER must also place those exact bytes in `User-Name` (normally
-/// by passing [`emergency_nai`] for the direct IMEI path or the canonical IMSI
-/// Emergency NAI for identity recovery). The helper accepts an empty identity,
-/// as RFC 3748 permits, but the SWm emergency verifier rejects it because it
-/// cannot match a required emergency identity.
+/// by passing [`emergency_nai`] for the direct IMEI path). For identity recovery,
+/// use the exact IMSI identity received from the UE: an IMSI emergency NAI, or a
+/// root IMSI NAI under the receive-side interoperability extension documented by
+/// [`SwmEmergencyAuthorizationEvidence::verify_after_identity_recovery`]. Preserve
+/// the original identity and complete EAP payload in the retry without rewriting
+/// the realm. The helper accepts an empty identity, as RFC 3748 permits, but the
+/// SWm emergency verifier rejects it because it cannot match a required identity.
 ///
 /// # Errors
 ///
@@ -11636,7 +11713,7 @@ impl fmt::Display for SwmEapResponseIdentityBuildError {
 
 impl Error for SwmEapResponseIdentityBuildError {}
 
-fn is_imsi_emergency_nai(identity: &str) -> bool {
+fn is_imsi_identity_recovery_nai(identity: &str) -> bool {
     let Some((username, realm)) = identity.split_once('@') else {
         return false;
     };
@@ -11651,29 +11728,26 @@ fn is_imsi_emergency_nai(identity: &str) -> bool {
         return false;
     }
 
-    let mut labels = realm.split('.');
-    let (
-        Some(sos),
-        Some(nai),
-        Some(epc),
-        Some(mnc_label),
-        Some(mcc_label),
-        Some(network),
-        Some(org),
-    ) = (
+    // The caller requires an emergency-indicated DER. Accept a root NAI on
+    // receive without rewriting the identity retained for the recovery retry.
+    let mut labels = realm.split('.').peekable();
+    if labels
+        .peek()
+        .is_some_and(|label| label.eq_ignore_ascii_case("sos"))
+    {
+        labels.next();
+    }
+    let (Some(nai), Some(epc), Some(mnc_label), Some(mcc_label), Some(network), Some(org)) = (
         labels.next(),
         labels.next(),
         labels.next(),
         labels.next(),
         labels.next(),
         labels.next(),
-        labels.next(),
-    )
-    else {
+    ) else {
         return false;
     };
     if labels.next().is_some()
-        || !sos.eq_ignore_ascii_case("sos")
         || !nai.eq_ignore_ascii_case("nai")
         || !epc.eq_ignore_ascii_case("epc")
         || !network.eq_ignore_ascii_case("3gppnetwork")

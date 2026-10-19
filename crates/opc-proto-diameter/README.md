@@ -1969,9 +1969,14 @@ is not valid on a DEA.
 `Experimental-Result`. The optional 3GPP result (vendor 10415, code 5001)
 requests TS 33.402 device-identity recovery; it is not authorization. After
 the UE returns a TS 24.302 `DEVICE_IDENTITY`, the retry DER carries the
-recovered exact 15-digit IMEI in `Terminal-Information`. The recovery branch
-accepts only the TS 23.003 IMSI emergency NAI forms for AKA/AKA-prime and an
-exact EAP-Response/Identity whose bytes equal User-Name.
+recovered exact 15-digit IMEI in `Terminal-Information`. For emergency-indicated
+requests, the recovery branch accepts AKA/AKA-prime IMSI identities in the
+TS 23.003 IMSI emergency NAI form and, as a receive-side interoperability
+extension, in the ordinary root NAI form. Conforming UEs must still use the
+IMSI emergency NAI. Both forms require an exact EAP-Response/Identity whose
+bytes equal User-Name; the retry preserves the original identity and complete
+EAP payload.
+See [RFC 005 §10.1](../../docs/rfc/005-protocol-framework.md#101-swm-emergency-identity-receive-interoperability).
 
 For an ordinary base result, use
 `SwmDiameterResult::is_diameter_authorization_rejected()` to identify exact
@@ -1983,23 +1988,31 @@ policy; this crate does not translate between protocols.
 
 Emergency DER builders should use `emergency_nai(&imei)` for the direct IMEI
 path and pass the exact resulting bytes to `build_eap_response_identity`;
-recovery DER builders use the same EAP helper with their canonical IMSI
-Emergency NAI. The returned IMEI NAI is sensitive equipment identity and must
-not be logged.
+recovery DER builders use the same EAP helper with the exact IMSI identity
+received from the UE (an IMSI emergency NAI, or a root IMSI NAI under the
+receive-side extension). Never rewrite that identity or the EAP payload in
+the retry. The returned IMEI NAI is sensitive equipment identity and must not
+be logged.
 Identity octets are copied verbatim, including an RFC-permitted empty body, and
 only inputs that cannot fit EAP's two-octet packet length are rejected before
 allocation. The emergency verifier still rejects empty or mismatched identity
 material.
 
-Emergency authorization consumes request/answer envelopes that retain both
-Diameter transaction identifiers; the final DEA must have exact base
+Emergency authorization requires `correlate_answer_from_connection` with the
+transport's authenticated connection token and the trusted `SwmExpectedAnswerPeer`
+bound to the request before dispatch. This applies to both answers in recovery
+and to the direct IMEI path. Codec-only `correlate_answer` exchanges are refused.
+Connection generation and the configured direct or routed Origin policy must
+match; a routed AAA Origin need not equal the authenticated agent's identity.
+All existing request/answer checks, including both Diameter transaction
+identifiers, remain mandatory; the final DEA must have exact base
 `DIAMETER_SUCCESS` (2001), an exact EAP Success with the matching Response
 identifier, a nonempty TS 33.402 Annex A.4 MSK derived from the exact received
 IMEI digits, and the same permanent identity in `Mobile-Node-Identifier`. A
 live transport must also consume its matching pending request before invoking
-the evidence API; `correlate_answer` consumes both envelopes and produces the
-only opaque exchange accepted by the evidence constructor, but codec equality
-does not make a replay live. The resulting
+the evidence API; `correlate_answer_from_connection` consumes both envelopes
+and produces the opaque exchange accepted by the evidence constructor, but
+codec equality does not make a replay live. The resulting
 MSK feeds ordinary IKEv2 method-2 AUTH. No no-MSK or IKEv2 NULL-auth shortcut
 is modeled or authorized.
 

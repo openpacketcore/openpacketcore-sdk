@@ -24530,13 +24530,17 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    #[allow(
-        clippy::await_holding_lock,
-        reason = "the test-only proposal counter is process-global evidence"
-    )]
     async fn consumer_authorization_rejects_mixed_cas_and_batch_before_any_effect() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let (_directory, store, scope, authorization, key, lease) = consumer_boundary_store().await;
+        let (
+            _other_directory,
+            other_store,
+            other_scope,
+            other_authorization,
+            other_key,
+            other_lease,
+        ) = consumer_boundary_store().await;
         let service = store.consumer_service();
         let foreign_key = SessionKey {
             tenant: TenantId::from_static("consumer-ungranted-third-tenant"),
@@ -24546,28 +24550,61 @@ mod membership_tests {
             .max_replication_sequence()
             .await
             .expect("sequence before rejected consumer requests");
-        reset_consumer_consensus_proposal_count();
+        let rejected_counters = Arc::new(ConsumerCasTestCounters::default());
 
-        let mixed_cas = service
-            .execute(
-                &authorization,
-                SessionConsumerRequest::new(
-                    scope,
-                    SessionConsumerRequestId::from_bytes([0x94; 16]),
-                    SessionConsumerOperation::CompareAndSet {
-                        op: Box::new(CompareAndSet {
-                            key: key.clone(),
-                            lease: lease.clone(),
-                            expected_generation: None,
-                            new_record: consumer_record_with_payload_len(
-                                &foreign_key,
-                                &lease,
-                                crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
-                            ),
-                        }),
-                    },
-                ),
-            )
+        // A different fixture may submit a valid request while these requests
+        // are rejected. Join its real proposal before checking our evidence,
+        // so counter isolation does not depend on test-runner scheduling.
+        let other_counters = Arc::new(ConsumerCasTestCounters::default());
+        let other_request = tokio::spawn(CONSUMER_CAS_TEST_COUNTERS.scope(
+            Arc::clone(&other_counters),
+            async move {
+                other_store
+                    .consumer_service()
+                    .execute(
+                        &other_authorization,
+                        SessionConsumerRequest::new(
+                            other_scope,
+                            SessionConsumerRequestId::from_bytes([0x96; 16]),
+                            SessionConsumerOperation::CompareAndSet {
+                                op: Box::new(CompareAndSet {
+                                    key: other_key.clone(),
+                                    lease: other_lease.clone(),
+                                    expected_generation: None,
+                                    new_record: consumer_record_with_payload_len(
+                                        &other_key,
+                                        &other_lease,
+                                        crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+                                    ),
+                                }),
+                            },
+                        ),
+                    )
+                    .await
+            },
+        ));
+
+        let mixed_cas = service.execute(
+            &authorization,
+            SessionConsumerRequest::new(
+                scope,
+                SessionConsumerRequestId::from_bytes([0x94; 16]),
+                SessionConsumerOperation::CompareAndSet {
+                    op: Box::new(CompareAndSet {
+                        key: key.clone(),
+                        lease: lease.clone(),
+                        expected_generation: None,
+                        new_record: consumer_record_with_payload_len(
+                            &foreign_key,
+                            &lease,
+                            crate::sqlite::SQLITE_CONSENSUS_MAX_VALUE_BYTES,
+                        ),
+                    }),
+                },
+            ),
+        );
+        let mixed_cas = CONSUMER_CAS_TEST_COUNTERS
+            .scope(Arc::clone(&rejected_counters), mixed_cas)
             .await;
         assert_eq!(
             mixed_cas,
@@ -24575,23 +24612,24 @@ mod membership_tests {
             "CAS checks its direct key, lease key, and replacement-record key"
         );
 
-        let mixed_batch = service
-            .execute(
-                &authorization,
-                SessionConsumerRequest::new(
-                    scope,
-                    SessionConsumerRequestId::from_bytes([0x95; 16]),
-                    SessionConsumerOperation::Batch {
-                        ops: vec![
-                            SessionOp::RefreshTtl {
-                                lease: lease.clone(),
-                                ttl: Duration::from_secs(30),
-                            },
-                            SessionOp::Get { key: foreign_key },
-                        ],
-                    },
-                ),
-            )
+        let mixed_batch = service.execute(
+            &authorization,
+            SessionConsumerRequest::new(
+                scope,
+                SessionConsumerRequestId::from_bytes([0x95; 16]),
+                SessionConsumerOperation::Batch {
+                    ops: vec![
+                        SessionOp::RefreshTtl {
+                            lease: lease.clone(),
+                            ttl: Duration::from_secs(30),
+                        },
+                        SessionOp::Get { key: foreign_key },
+                    ],
+                },
+            ),
+        );
+        let mixed_batch = CONSUMER_CAS_TEST_COUNTERS
+            .scope(Arc::clone(&rejected_counters), mixed_batch)
             .await;
         assert_eq!(
             mixed_batch,
@@ -24599,9 +24637,21 @@ mod membership_tests {
             "an unauthorized later slot prevents the potentially mutating slot zero effect"
         );
         assert_eq!(
-            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
-            0,
-            "authorization rejects mixed fields before a consensus proposal"
+            other_request
+                .await
+                .expect("other fixture request completes"),
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success)),
+            "the independent authorized fixture performs its mutation"
+        );
+        assert_eq!(
+            other_counters.proposals.load(Ordering::Relaxed),
+            2,
+            "the positive control observes the other fixture's binding and CAS proposals"
+        );
+        assert_eq!(
+            other_counters.command_encodings.load(Ordering::Relaxed),
+            1,
+            "the positive control encodes its CAS once"
         );
         assert_eq!(
             store
@@ -24610,6 +24660,11 @@ mod membership_tests {
                 .expect("sequence after rejected consumer requests"),
             before,
             "mixed authorization rejects before slot zero can mutate"
+        );
+        assert_eq!(
+            rejected_counters.proposals.load(Ordering::Relaxed),
+            0,
+            "authorization rejects mixed fields before a consensus proposal"
         );
     }
 
