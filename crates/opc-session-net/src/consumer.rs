@@ -11032,6 +11032,10 @@ struct PersistentV2CallAttempt<'a> {
     pre_request_deadline: tokio::time::Instant,
     pre_request_budget_active: bool,
     deadline: tokio::time::Instant,
+    /// Only exact history/status reads may extend their response wait past
+    /// the ordinary attempt deadline. The transport checks the operation
+    /// before acquiring any admission or setup capacity.
+    read_response_deadline: Option<tokio::time::Instant>,
     status_write_accepted: Option<&'a AtomicBool>,
 }
 
@@ -11846,8 +11850,21 @@ impl PersistentSessionConsumerV2Pool {
             pre_request_deadline,
             pre_request_budget_active,
             deadline,
+            read_response_deadline,
             status_write_accepted,
         } = attempt;
+        if read_response_deadline.is_some()
+            && !matches!(
+                request.operation(),
+                SessionConsumerV2Operation::FencedTransitionV2HistoryState
+                    | SessionConsumerV2Operation::FencedTransitionV2Status { .. }
+            )
+        {
+            return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            });
+        }
+        let deadline = read_response_deadline.unwrap_or(deadline);
         if tokio::time::Instant::now() >= deadline {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Deadline,
@@ -12092,6 +12109,7 @@ impl PersistentSessionConsumerV2Pool {
                         pre_request_deadline,
                         pre_request_budget_active,
                         deadline,
+                        read_response_deadline: None,
                         status_write_accepted: status_retry.then_some(&status_write_accepted),
                     },
                 )
@@ -15532,6 +15550,21 @@ impl PersistentSessionConsumerClient {
         connect_attempts: usize,
         call_boundary_deadline: Option<tokio::time::Instant>,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        if call_boundary_deadline.is_some()
+            && !matches!(
+                request.operation(),
+                SessionConsumerOperation::Get { .. }
+                    | SessionConsumerOperation::PreflightRecordExpiry { .. }
+                    | SessionConsumerOperation::CompareAndSetStatus { .. }
+                    | SessionConsumerOperation::LeaseMutationStatus { .. }
+            )
+        {
+            self.pool
+                .record_error(SessionConsumerClientError::Protocol, false, false);
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ));
+        }
         // A retained status lookup has one immutable operation deadline, but
         // each bounded transport attempt must enter the pool at its own
         // instant.  Reusing the original start here would make a response

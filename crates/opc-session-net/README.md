@@ -599,9 +599,11 @@ cannot submit a transition, batch or void. Their response wait follows the
 caller budget, including when that deadline exceeds the legacy 10-second
 operation ceiling; transport lifecycle retirement still applies. Legacy read
 methods without a caller deadline retain their configured operation timeout.
-Budget-bearing GET/expiry reads and prepared CAS/lease receipts classify
-observed authority rejection as terminal `TopologyAuthorityRevoked`. Legacy
-GET retains its existing `Unauthorized` to `BackendUnavailable` mapping.
+Prepared CAS/lease receipts classify observed authority rejection as terminal
+`TopologyAuthorityRevoked` and cache that result. Budget-bearing GET/expiry
+reads preserve their legacy wire-rejection mapping, including `Unauthorized`
+to `BackendUnavailable`. Both split-deadline transports reject operations
+outside their closed set of reads before admission or setup.
 
 The local protected V2 journal reports
 `StoreError::FencedTransitionRecoveryJournalUnavailable`. It remains distinct

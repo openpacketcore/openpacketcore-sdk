@@ -41,9 +41,9 @@ impl PersistentSessionConsumerClient {
     /// setup and Call write retain the physical-attempt cap (and any earlier
     /// configured pre-request limit). This submits at most one physical read.
     /// No mutation can be submitted through this entry point.
-    /// An authenticated authority rejection is terminal
-    /// [`StoreError::TopologyAuthorityRevoked`], including `Unauthorized`.
-    /// The legacy [`Self::get`] method keeps its existing error mapping.
+    /// Wire rejections use the same mapping as [`Self::get`], including
+    /// `Unauthorized` to [`StoreError::BackendUnavailable`]. A transport-level
+    /// loss of authority remains [`StoreError::TopologyAuthorityRevoked`].
     ///
     /// ```compile_fail
     /// # use opc_session_net::PersistentSessionConsumerClient;
@@ -72,9 +72,6 @@ impl PersistentSessionConsumerClient {
             Ok(SessionConsumerResponse::Get(value)) => {
                 value.map_err(SessionConsumerStoreError::into_store_error)
             }
-            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized)) => {
-                Err(StoreError::TopologyAuthorityRevoked)
-            }
             Ok(SessionConsumerResponse::Rejected(value)) => Err(rejection_into_store_error(value)),
             Err(error) if read_authority_revoked(&error) => {
                 Err(StoreError::TopologyAuthorityRevoked)
@@ -89,8 +86,7 @@ impl PersistentSessionConsumerClient {
     ///
     /// This follows [`Self::get_with_budget`]'s split deadline contract and
     /// submits only the payload-free expiry descriptors, never a mutation.
-    /// Authority rejection has the same terminal classification as
-    /// [`Self::get_with_budget`].
+    /// Wire rejections keep [`Self::preflight_record_expiry`]'s classification.
     pub async fn preflight_record_expiry_with_budget(
         &self,
         preflights: Vec<RecordExpiryPreflight>,
@@ -102,9 +98,6 @@ impl PersistentSessionConsumerClient {
         {
             Ok(SessionConsumerResponse::PreflightRecordExpiry(value)) => {
                 value.map_err(SessionConsumerStoreError::into_store_error)
-            }
-            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized)) => {
-                Err(StoreError::TopologyAuthorityRevoked)
             }
             Ok(SessionConsumerResponse::Rejected(value)) => Err(rejection_into_store_error(value)),
             Err(error) if read_authority_revoked(&error) => {
@@ -219,7 +212,8 @@ impl PersistentSessionConsumerClient {
                     admission_deadline: boundary,
                     pre_request_deadline: boundary,
                     pre_request_budget_active: true,
-                    deadline: budget.original_deadline(),
+                    deadline: boundary,
+                    read_response_deadline: Some(budget.original_deadline()),
                     status_write_accepted: None,
                 },
             )

@@ -60,6 +60,21 @@ async fn budgeted_get_preserves_legacy_unauthorized_classification() {
     assert!(matches!(legacy, Err(StoreError::BackendUnavailable(_))));
     assert!(matches!(budgeted, Err(StoreError::BackendUnavailable(_))));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let legacy_expiry = voters.router.clients[0]
+        .preflight_record_expiry(Vec::new())
+        .await;
+    let budgeted_expiry = voters.router.clients[0]
+        .preflight_record_expiry_with_budget(Vec::new(), prepared_failover_budget())
+        .await;
+    assert!(matches!(
+        legacy_expiry,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert!(matches!(
+        budgeted_expiry,
+        Err(StoreError::BackendUnavailable(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!(mutations.load(Ordering::SeqCst), 0);
     voters.shutdown().await;
 }
@@ -181,5 +196,67 @@ async fn split_deadline_v1_transport_rejects_mutation_before_admission() {
         0,
         "no effectful call reaches the wire"
     );
+    voters.shutdown().await;
+}
+
+#[tokio::test]
+async fn split_deadline_v2_transport_rejects_non_receipt_operations_before_admission() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let voters = prepared_failover_voters(
+        "split-v2-read-guard",
+        [
+            Some(Arc::new(CountingV2RejectingTestConsumer {
+                calls: Arc::clone(&calls),
+            })),
+            None,
+            None,
+        ],
+    )
+    .await;
+    let body =
+        v2_authority_boundary_request("prepared-router-cas", NetworkFunctionKind::smf(), 0x83);
+    for operation in [
+        SessionConsumerV2Operation::FencedTransitionV2 {
+            request: Box::new(body.clone()),
+        },
+        SessionConsumerV2Operation::FencedTransitionV2Batch {
+            requests: vec![body.clone()],
+        },
+        SessionConsumerV2Operation::FencedTransitionV2Void {
+            request: Box::new(body.clone()),
+        },
+        SessionConsumerV2Operation::FencedTransitionV2VoidCapability,
+    ] {
+        let request = SessionConsumerV2Request::new(voters.scope, operation);
+        request.validate().unwrap();
+        let now = tokio::time::Instant::now();
+        let boundary = now + Duration::from_millis(250);
+        let result = voters.router.clients[0]
+            .v2_pool
+            .execute_classified_once(
+                &request,
+                super::super::PersistentV2CallAttempt {
+                    operation_started: now,
+                    admission_started: now,
+                    admission_deadline: boundary,
+                    pre_request_deadline: boundary,
+                    pre_request_budget_active: true,
+                    deadline: boundary,
+                    read_response_deadline: Some(now + Duration::from_secs(3)),
+                    status_write_accepted: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let diagnostics = voters.router.clients[0].v2_diagnostics().await;
+        assert_eq!(diagnostics.setup_attempts, 0);
+        assert_eq!(diagnostics.pool_wait_max, 0);
+    }
     voters.shutdown().await;
 }
