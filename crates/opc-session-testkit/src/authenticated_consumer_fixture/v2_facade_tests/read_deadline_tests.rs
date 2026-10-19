@@ -10,6 +10,8 @@ use opc_session_store::{
 };
 use opc_types::Timestamp;
 
+mod handoff_tests;
+
 const HOLDS: [u64; 3] = [200, 500, 700];
 const GET: usize = 0;
 const EXPIRY: usize = 1;

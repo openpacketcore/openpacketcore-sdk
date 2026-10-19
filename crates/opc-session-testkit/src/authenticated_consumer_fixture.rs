@@ -1939,6 +1939,8 @@ struct FixtureConsumer {
     held_replies: [AtomicUsize; 10],
     #[cfg(test)]
     held_reply_started: [tokio::sync::Notify; 10],
+    #[cfg(test)]
+    reply_gates: [Mutex<Option<Arc<tokio::sync::Semaphore>>>; 10],
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
@@ -1993,6 +1995,8 @@ impl FixtureConsumer {
             held_replies: std::array::from_fn(|_| AtomicUsize::new(0)),
             #[cfg(test)]
             held_reply_started: std::array::from_fn(|_| tokio::sync::Notify::new()),
+            #[cfg(test)]
+            reply_gates: std::array::from_fn(|_| Mutex::new(None)),
             lose_next_fenced_transition_response,
             lose_next_fenced_transition_v2_response,
             fenced_transition_status_misses_remaining,
@@ -2035,10 +2039,15 @@ impl FixtureConsumer {
     #[cfg(test)]
     async fn hold_reply(&self, kind: usize) {
         let millis = self.reply_holds[kind].load(Ordering::Acquire);
-        if millis != 0 {
+        let gate = self.reply_gates[kind].lock().unwrap().clone();
+        if millis != 0 || gate.is_some() {
             self.held_replies[kind].fetch_add(1, Ordering::SeqCst);
             self.held_reply_started[kind].notify_one();
-            tokio::time::sleep(Duration::from_millis(millis)).await;
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            } else {
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+            }
         }
     }
 }
