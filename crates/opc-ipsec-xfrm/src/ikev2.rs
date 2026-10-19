@@ -11,8 +11,9 @@ use std::{error::Error, fmt};
 use opc_proto_ikev2::{
     derive_child_sa_key_material, derive_initial_child_sa_key_material, Ikev2ChildSaCryptoProfile,
     Ikev2ChildSaNegotiation, Ikev2EncryptionAlgorithm, Ikev2InitialExchangeNoncePolicy,
-    Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError, Ikev2SaInitCryptoErrorCode,
-    Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE, IKEV2_TS_IPV6_ADDR_RANGE,
+    Ikev2IntegrityAlgorithm, Ikev2NonceLocalRole, Ikev2SaInitCryptoError,
+    Ikev2SaInitCryptoErrorCode, Ikev2TrafficSelectorBuild, IKEV2_TS_IPV4_ADDR_RANGE,
+    IKEV2_TS_IPV6_ADDR_RANGE,
 };
 
 use crate::{
@@ -493,13 +494,19 @@ impl Error for Ikev2ChildSaXfrmError {}
 /// [`crate::XFRM_ENCR_NULL`] crypt slot. The IKEv2 KEYMAT remains
 /// authenticated-only: no cipher key or salt bytes are fabricated.
 ///
+/// `local_role` identifies the nonce-producing role in this exchange, independently
+/// of the original IKE-SA role. The returned `inbound` slot always contains
+/// initiator-to-responder material and `outbound` contains responder-to-initiator
+/// material. An exchange initiator swaps these slots for local installation.
+///
 /// # Errors
 ///
-/// Derivation is local-responder shaped: local Nr requires 32..=256 octets,
-/// while peer Ni accepts 16..=256. Returns [`Ikev2ChildSaKeyMaterialError`] when
+/// The local nonce requires 32..=256 octets; the peer nonce accepts 16..=256.
+/// Returns [`Ikev2ChildSaKeyMaterialError`] when
 /// role-aware KEYMAT derivation fails or the selected profile has no SDK XFRM
 /// algorithm-name mapping.
 pub fn derive_child_sa_xfrm_keys(
+    local_role: Ikev2NonceLocalRole,
     profile: Ikev2ChildSaCryptoProfile,
     sk_d: &[u8],
     initiator_nonce: &[u8],
@@ -507,7 +514,7 @@ pub fn derive_child_sa_xfrm_keys(
     new_dh_shared_secret: Option<&[u8]>,
 ) -> Result<Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError> {
     let key_material = derive_child_sa_key_material(
-        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
+        local_role,
         profile,
         sk_d,
         initiator_nonce,
@@ -531,16 +538,20 @@ pub fn derive_child_sa_xfrm_keys(
 
 /// Derive the mandatory initial Child SA KEYMAT and map it into XFRM keys.
 ///
-/// This directional mapper is local-responder shaped: Nr must have 32..=256
-/// octets and peer Ni may have 16..=256, independently of PRF. Both initial
-/// policy names enforce these bounds. This helper derives without new DH;
-/// PFS and replacement Child SAs use the generic helper.
+/// `local_role` identifies the nonce-producing role in this exchange. The local
+/// nonce must have 32..=256 octets and the peer nonce may have 16..=256,
+/// independently of PRF. Both initial policy names enforce these bounds.
+/// The returned `inbound`/`outbound` slots retain initiator-to-responder and
+/// responder-to-initiator material respectively; an initiator swaps them for
+/// local installation. This helper derives without new DH; PFS and replacement
+/// Child SAs use the generic helper.
 ///
 /// # Errors
 ///
 /// Returns [`Ikev2ChildSaKeyMaterialError`] when initial-exchange KEYMAT
 /// derivation fails or the selected profile has no SDK XFRM mapping.
 pub fn derive_initial_child_sa_xfrm_keys(
+    local_role: Ikev2NonceLocalRole,
     profile: Ikev2ChildSaCryptoProfile,
     sk_d: &[u8],
     initiator_nonce: &[u8],
@@ -548,7 +559,7 @@ pub fn derive_initial_child_sa_xfrm_keys(
     nonce_policy: Ikev2InitialExchangeNoncePolicy,
 ) -> Result<Ikev2ChildSaDirectionalXfrmKeys, Ikev2ChildSaKeyMaterialError> {
     let key_material = derive_initial_child_sa_key_material(
-        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
+        local_role,
         profile,
         sk_d,
         initiator_nonce,
@@ -1706,11 +1717,17 @@ mod tests {
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesGcm16_256,
         );
-        let keys =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 32], None) {
-                Ok(keys) => keys,
-                Err(error) => panic!("child SA XFRM key derivation failed: {error:?}"),
-            };
+        let keys = match derive_child_sa_xfrm_keys(
+            Ikev2NonceLocalRole::Responder,
+            profile,
+            &[0x0f; 32],
+            &[0xa1; 16],
+            &[0xb2; 32],
+            None,
+        ) {
+            Ok(keys) => keys,
+            Err(error) => panic!("child SA XFRM key derivation failed: {error:?}"),
+        };
 
         assert!(keys.inbound.auth.is_none());
         assert!(keys.inbound.crypt.is_none());
@@ -1783,11 +1800,17 @@ mod tests {
             Ikev2EncryptionAlgorithm::AesCbc256,
             Ikev2IntegrityAlgorithm::HmacSha2_256_128,
         );
-        let keys =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 32], None) {
-                Ok(keys) => keys,
-                Err(error) => panic!("child SA XFRM key derivation failed: {error:?}"),
-            };
+        let keys = match derive_child_sa_xfrm_keys(
+            Ikev2NonceLocalRole::Responder,
+            profile,
+            &[0x0f; 32],
+            &[0xa1; 16],
+            &[0xb2; 32],
+            None,
+        ) {
+            Ok(keys) => keys,
+            Err(error) => panic!("child SA XFRM key derivation failed: {error:?}"),
+        };
 
         assert!(keys.inbound.aead.is_none());
         let inbound_crypt = match &keys.inbound.crypt {
@@ -1818,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_exchange_legacy_sha512_nonce_policy_maps_only_initial_child_keys() {
+    fn initial_child_xfrm_mapping_preserves_legacy_sha512_peer_nonce() {
         ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_encrypt_then_mac(
             Ikev2PrfAlgorithm::HmacSha2_512,
@@ -1828,7 +1851,8 @@ mod tests {
         let initiator_nonce: Vec<u8> = (0x00..0x10).collect();
         let responder_nonce: Vec<u8> = (0xa0..0xc0).collect();
         // Both derivation helpers reject a peer below the absolute nonce floor.
-        let strict_error = match derive_child_sa_xfrm_keys(
+        let short_peer_error = match derive_child_sa_xfrm_keys(
+            Ikev2NonceLocalRole::Responder,
             profile,
             &[0x1e; 64],
             &initiator_nonce[..15],
@@ -1840,9 +1864,10 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert_invalid_nonce_diagnostic(strict_error, Ikev2ChildSaNonceRole::Initiator, 15);
+        assert_invalid_nonce_diagnostic(short_peer_error, Ikev2ChildSaNonceRole::Initiator, 15);
 
         let keys = match derive_initial_child_sa_xfrm_keys(
+            Ikev2NonceLocalRole::Responder,
             profile,
             &hex_to_bytes(concat!(
                 "1ef8043115a66058857ef6e5d2f006c1ef36e5dc6bcb72410b0a9159c13fd120",
@@ -1909,6 +1934,7 @@ mod tests {
             Ikev2IntegrityAlgorithm::HmacSha1_96,
         );
         let keys = match derive_child_sa_xfrm_keys(
+            Ikev2NonceLocalRole::Responder,
             profile,
             &[0x0f; 20],
             &[0xa1; 16],
@@ -1945,11 +1971,17 @@ mod tests {
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2IntegrityAlgorithm::HmacSha2_256_128,
         );
-        let keys =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 32], None) {
-                Ok(keys) => keys,
-                Err(error) => panic!("ENCR_NULL Child SA XFRM key derivation failed: {error:?}"),
-            };
+        let keys = match derive_child_sa_xfrm_keys(
+            Ikev2NonceLocalRole::Responder,
+            profile,
+            &[0x0f; 32],
+            &[0xa1; 16],
+            &[0xb2; 32],
+            None,
+        ) {
+            Ok(keys) => keys,
+            Err(error) => panic!("ENCR_NULL Child SA XFRM key derivation failed: {error:?}"),
+        };
 
         for (direction, expected) in [
             (
@@ -2010,6 +2042,7 @@ mod tests {
             let derive = |ni: &[u8], nr: &[u8]| {
                 if initial {
                     derive_initial_child_sa_xfrm_keys(
+                        Ikev2NonceLocalRole::Initiator,
                         profile,
                         &sk_d,
                         ni,
@@ -2017,7 +2050,14 @@ mod tests {
                         Ikev2InitialExchangeNoncePolicy::strict(),
                     )
                 } else {
-                    derive_child_sa_xfrm_keys(profile, &sk_d, ni, nr, None)
+                    derive_child_sa_xfrm_keys(
+                        Ikev2NonceLocalRole::Initiator,
+                        profile,
+                        &sk_d,
+                        ni,
+                        nr,
+                        None,
+                    )
                 }
             };
             // The SDK user initiates the exchange: Ni is local; Nr is received.
@@ -2060,17 +2100,60 @@ mod tests {
     }
 
     #[test]
+    fn local_nonce_role_preserves_exchange_direction_key_slots() {
+        ensure_ike_crypto();
+        let profile = Ikev2ChildSaCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::HmacSha2_256,
+            Ikev2EncryptionAlgorithm::AesGcm16_128,
+        );
+        let mut by_role = Vec::new();
+        for role in [
+            Ikev2NonceLocalRole::Initiator,
+            Ikev2NonceLocalRole::Responder,
+        ] {
+            let generic = derive_child_sa_xfrm_keys(
+                role,
+                profile,
+                &[0x0f; 32],
+                &[0xa1; 32],
+                &[0xb2; 32],
+                None,
+            )
+            .expect("generic KEYMAT");
+            let initial = derive_initial_child_sa_xfrm_keys(
+                role,
+                profile,
+                &[0x0f; 32],
+                &[0xa1; 32],
+                &[0xb2; 32],
+                Ikev2InitialExchangeNoncePolicy::strict(),
+            )
+            .expect("initial KEYMAT");
+            assert_eq!(initial, generic);
+            by_role.push(generic);
+        }
+        assert_eq!(by_role[0], by_role[1]);
+        assert_ne!(by_role[0].inbound, by_role[0].outbound);
+    }
+
+    #[test]
     fn child_sa_xfrm_key_derivation_retains_initiator_nonce_diagnostics() {
         ensure_ike_crypto();
         let profile = Ikev2ChildSaCryptoProfile::new_aead(
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesGcm16_128,
         );
-        let error =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 15], &[0xb2; 32], None) {
-                Ok(value) => panic!("short initiator nonce unexpectedly derived keys: {value:?}"),
-                Err(error) => error,
-            };
+        let error = match derive_child_sa_xfrm_keys(
+            Ikev2NonceLocalRole::Responder,
+            profile,
+            &[0x0f; 32],
+            &[0xa1; 15],
+            &[0xb2; 32],
+            None,
+        ) {
+            Ok(value) => panic!("short initiator nonce unexpectedly derived keys: {value:?}"),
+            Err(error) => error,
+        };
 
         assert_invalid_nonce_diagnostic(error, Ikev2ChildSaNonceRole::Initiator, 15);
         assert_eq!(error.as_str(), "ikev2_child_sa_keymat_derivation_failed");
@@ -2087,11 +2170,17 @@ mod tests {
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesGcm16_128,
         );
-        let error =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 32], &[0xa1; 16], &[0xb2; 15], None) {
-                Ok(value) => panic!("short responder nonce unexpectedly derived keys: {value:?}"),
-                Err(error) => error,
-            };
+        let error = match derive_child_sa_xfrm_keys(
+            Ikev2NonceLocalRole::Responder,
+            profile,
+            &[0x0f; 32],
+            &[0xa1; 16],
+            &[0xb2; 15],
+            None,
+        ) {
+            Ok(value) => panic!("short responder nonce unexpectedly derived keys: {value:?}"),
+            Err(error) => error,
+        };
 
         assert_invalid_nonce_diagnostic(error, Ikev2ChildSaNonceRole::Responder, 15);
         assert_eq!(error.as_str(), "ikev2_child_sa_keymat_derivation_failed");
@@ -2108,11 +2197,17 @@ mod tests {
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2EncryptionAlgorithm::AesGcm16_128,
         );
-        let error =
-            match derive_child_sa_xfrm_keys(profile, &[0x0f; 31], &[0xa1; 16], &[0xb2; 32], None) {
-                Ok(value) => panic!("invalid SK_d unexpectedly derived keys: {value:?}"),
-                Err(error) => error,
-            };
+        let error = match derive_child_sa_xfrm_keys(
+            Ikev2NonceLocalRole::Responder,
+            profile,
+            &[0x0f; 31],
+            &[0xa1; 16],
+            &[0xb2; 32],
+            None,
+        ) {
+            Ok(value) => panic!("invalid SK_d unexpectedly derived keys: {value:?}"),
+            Err(error) => error,
+        };
         let Ikev2ChildSaKeyMaterialError::KeyDerivation(diagnostic) = error else {
             panic!("expected Child-SA KEYMAT derivation diagnostic");
         };

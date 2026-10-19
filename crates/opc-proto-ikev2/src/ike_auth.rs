@@ -1844,7 +1844,10 @@ impl fmt::Debug for Ikev2CreateChildSaRekeyResponsePayloads {
 ///
 /// Supply `key_exchange` for PFS; a different KE group returns a typed retry
 /// naming the selected group, including when the received group is unsupported.
-/// Its `invalid_ke_notify()` produces the response Notify.
+/// Its `invalid_ke_notify()` produces the response Notify. A selected non-NONE
+/// DH group with `None` returns `KeyExchangeRequired`, including DH-bearing
+/// IKE_AUTH offers and DH-agnostic policy probes. Other non-group-1 alternatives
+/// retain wire order without a matching-KE fallback.
 ///
 /// This helper deliberately stops at product-neutral negotiation intent. It does
 /// not choose subscriber policy, allocate responder SPIs, or install XFRM state.

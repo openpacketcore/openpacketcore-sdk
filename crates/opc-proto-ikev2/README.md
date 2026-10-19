@@ -1378,8 +1378,9 @@ other profiles. Initial initiator offers likewise place group-1 alternatives
 and group-1-only proposals last. Responder selection, including IKE-SA rekey in
 either original IKE role, requests a stronger KE with `INVALID_KE_PAYLOAD` when
 necessary instead of accepting a group-1 KE while a stronger common suite exists.
-Caller order and existing matching-KE fallback among non-group-1 groups remain
-unchanged; there is no global group-strength ranking. Group 1 remains usable
+Caller order among non-group-1 groups remains unchanged; IKE-SA and NWu selection
+retain their matching-KE fallback. Generic Child-SA selection retains wire order
+without that fallback. There is no global group-strength ranking. Group 1 remains usable
 when it is the only common group. Generic Child-SA PFS negotiation and NWu AEAD
 policy apply the same group-1-last rule and expose a typed retry Notify. Generic,
 dedicated-bearer and NWu Child-SA request offers put group 1 last while preserving
@@ -1426,9 +1427,11 @@ encoders remain available for caller-supplied wire fixtures.
 All public IKE/Child-SA KDFs require `Ikev2NonceLocalRole`. It identifies the
 initiator or responder of the exchange that produced Ni and Nr, independently
 of the original IKE-SA role during rekey. The local nonce must be 32..=256
-octets; the peer nonce may be 16..=256 for every PRF. XFRM derivation helpers use
-the local-responder mapping: Ni is received and Nr is local. Below-floor inputs
-return typed errors before cryptographic derivation.
+octets; the peer nonce may be 16..=256 for every PRF. Both XFRM derivation helpers
+also require this role: Ni is local for an initiator, and Nr is local for a
+responder. Their key slots retain initiator-to-responder `inbound` and
+responder-to-initiator `outbound` material; an exchange initiator swaps the slots
+for local installation. Below-floor inputs return typed errors before derivation.
 
 Accepting a 16-octet SHA2-512 peer nonce deliberately relaxes RFC 7296 section
 2.10's half-PRF-key requirement for legacy compatibility. Both initial
@@ -1447,12 +1450,22 @@ value through the admitted crypto module.
 
 Generic Child-SA negotiation and NWu AEAD policy put group 1 after stronger
 common PFS groups. SDK-built Child-SA offers apply the same stable ordering.
-`negotiate_child_sa` takes the peer KE alongside the SA and selectors. A stronger
+`negotiate_child_sa` takes the peer KE alongside the SA and selectors. A selected
 common suite with a different KE produces a typed `KeyExchangeDhGroupMismatch`;
 `invalid_ke_notify()` constructs the `INVALID_KE_PAYLOAD` response Notify.
-A group-1-only common offer remains usable. Non-group-1 choices retain caller
-or wire order and existing matching-KE fallback, with no global strength ranking.
-Selected response proposal numbers retain their request correlation.
+A group-1-only common offer remains usable. The generic helper keeps wire order
+among other groups and has no matching-KE fallback: it requests the selected
+group even if a later accepted non-group-1 choice matches the received KE.
+IKE-SA and NWu policy retain their existing matching-KE fallback.
+
+Migration: passing `None` with a selected non-NONE DH group now returns
+`KeyExchangeRequired`. This includes an IKE_AUTH SAi2 carrying DH and DH-agnostic
+policy probes. RFC 7296 section 1.2 initial Child-SA offers in IKE_AUTH omit DH;
+CREATE_CHILD_SA probes must supply the received KE and handle the typed group
+mismatch instead of using KE-less selection to choose a retry response.
+SDK-built initial and Child-SA request offers reorder and renumber proposals.
+Correlate responses against the encoded or retained offer, including its proposal
+numbers. Selected response proposal numbers retain that request correlation.
 
 ## Authenticated-only ESP Child SAs
 
@@ -1695,8 +1708,8 @@ contain exactly `SA, Nr, [KEr], TSi, TSr`. The selected ESP proposal must be
 executable and drawn from the exact offer. `DH=NONE` may be represented by
 omission where RFC 7296 permits it, but ESP always requires one explicit
 SN/ESN transform (ID 0 means no extended sequence numbers). PFS requires the
-offered KE group and a valid group public value. Ni and Nr must each be at
-least half the established PRF's preferred key length, and both returned
+offered KE group and a valid group public value. Local Ni requires 32..=256
+octets; received Nr accepts 16..=256 independently of PRF. Both returned
 selector sets must cover the current Child SA while remaining within the
 request offer. Selector containment compares the exact union of complete
 protocol × port × IPv4/IPv6-address boxes, so adjacent or overlapping entries

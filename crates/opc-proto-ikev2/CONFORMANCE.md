@@ -7,16 +7,21 @@
   restore. Existing explicit allowlists remain authoritative. Other admitted
   common groups are preferred; group 1 is selected only when it is the only
   common group. IKE and Child-SA PFS offers and policies move it last;
-  a stronger common suite with a different KE produces an `INVALID_KE_PAYLOAD`
-  retry Notify through the typed error helper. Caller/wire order and existing
-  matching-KE fallback among other groups remain unchanged; this is not a global
-  group-strength ranking.
+  a different received KE produces a typed retry whose `INVALID_KE_PAYLOAD`
+  Notify names the selected common group. Other groups retain caller/wire order;
+  IKE-SA and NWu selection retain matching-KE fallback, while generic Child-SA
+  selection uses wire order without that fallback. This is not a global group
+  strength ranking. SDK-built request offers reorder and renumber proposals;
+  response correlation uses the encoded or retained offer. A selected non-NONE
+  DH group with no KE returns `KeyExchangeRequired`, including DH-bearing
+  IKE_AUTH offers and DH-agnostic negotiation probes.
 - **RFC 7296 §§2.10/2.13:** local generation uses admitted entropy and at least
   32 octets and half the PRF's preferred key length (32 for all supported PRFs).
   Every typed outgoing nonce builder enforces 32..=256 octets. Every public
   IKE/Child-SA KDF requires `Ikev2NonceLocalRole`, the role in the nonce-producing
   exchange, and enforces 32..=256 locally and 16..=256 for the peer. XFRM mapping
-  helpers derive as local responder. Accepting received nonces below half the
+  helpers also require this role and retain their exchange-relative key slots.
+  Accepting received nonces below half the
   PRF key size is deliberate legacy compatibility. Below-floor inputs return
   typed errors. Raw nonce encoders retain the 16-octet wire floor for fixtures.
 

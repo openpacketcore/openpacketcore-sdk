@@ -3825,7 +3825,7 @@ mod tests {
     }
 
     #[test]
-    fn skeyseed_matches_existing_epdg_vector() {
+    fn skeyseed_matches_synthetic_peer16_local32_vector() {
         let profile = base_profile(Ikev2EncryptionAlgorithm::AesGcm16_128);
         let ni = hex_to_bytes("5b0f9f3a20b5a4e7190d1778d88f8f1f");
         let nr = hex_to_bytes(concat!(
@@ -4403,7 +4403,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_exchange_legacy_sha512_nonce_policy_is_coherent_and_rekeys_stay_strict() {
+    fn legacy_sha512_nonce_policies_preserve_peer16_and_enforce_local32() {
         crate::test_support::ensure_ike_crypto();
         // Byte-synthetic interoperability vector: the parent IKE SA retains
         // legacy MODP-768 and the mandatory initial Child SA derives without

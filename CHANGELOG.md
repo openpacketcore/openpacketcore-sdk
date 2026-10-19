@@ -24,7 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-proto-ikev2`: every typed IKE and Child-SA outgoing nonce builder now
   requires at least 32 octets. Public IKE/Child-SA key-derivation functions require
   an explicit `Ikev2NonceLocalRole`, enforce 32..=256 locally, and accept
-  16..=256 from peers for every PRF. XFRM derivation maps the local responder role.
+  16..=256 from peers for every PRF.
+- `opc-ipsec-xfrm`: `derive_child_sa_xfrm_keys` and
+  `derive_initial_child_sa_xfrm_keys` require `Ikev2NonceLocalRole` as their first
+  argument. Pass the role in the exchange that produced Ni and Nr: the local
+  nonce requires 32..=256 octets, and the peer nonce accepts 16..=256 for every
+  PRF. Key slots retain their exchange-relative directions; initiator callers
+  continue swapping the slots for local installation.
 - `opc-proto-ikev2`: `Ikev2IkeAuthBuildError` adds `KeyExchangeValueInvalid`;
   exhaustive matches must handle it. Generic CREATE_CHILD_SA builders now reject
   unsupported DH groups and KE public values whose width does not match the group.
@@ -32,8 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ikev2ChildSaNegotiationError` adds `KeyExchangeRequired`,
   `InvalidKeyExchange` and `KeyExchangeDhGroupMismatch`, and `nwu::Error` adds `KeyExchangeDhGroupMismatch`;
   exhaustive matches must handle them. Retry errors expose `invalid_ke_notify()`.
+  Passing `None` with a selected non-NONE DH group returns `KeyExchangeRequired`,
+  including DH-bearing IKE_AUTH SAi2 offers and DH-agnostic negotiation probes.
+  Supply the received KE for CREATE_CHILD_SA probes and handle the typed retry;
+  conforming initial Child-SA offers in IKE_AUTH omit DH. Generic Child-SA
+  selection keeps non-group-1 wire order without a matching-KE fallback.
   Group 1 follows stronger common Child-SA PFS groups in policies and offers;
-  other transform positions are preserved.
+  other transform positions are preserved. SDK-built initial and Child-SA
+  request offers also renumber proposals; correlate responses against the
+  encoded or retained offer rather than pre-build proposal numbers.
   `ResponderNonceTooShortForPrf` is deprecated as an unconstructed compatibility
   diagnostic; peer nonce errors use the absolute 16-octet floor.
 
