@@ -78,9 +78,10 @@ async fn observer_lookup_preserves_sqlite_locks_for_selected_and_unrelated_datab
         let observed = SqliteSessionBackend::open(&selected_path).unwrap();
         let other_path = directory.path().join("unrelated.sqlite");
         let other = SqliteSessionBackend::open(&other_path).unwrap();
-        let observation = ProtectedRosterTerminalObservationForTest::new(&[observed.clone()])
-            .await
-            .unwrap();
+        let observation =
+            ProtectedRosterTerminalObservationForTest::new(std::slice::from_ref(&observed))
+                .await
+                .unwrap();
         let (backend, path) = if selected {
             (&observed, &selected_path)
         } else {
@@ -123,10 +124,10 @@ async fn observer_retirement_preserves_sqlite_locks_while_another_observer_is_ac
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("observed.sqlite");
     let backend = SqliteSessionBackend::open(&path).unwrap();
-    let retired = ProtectedRosterTerminalObservationForTest::new(&[backend.clone()])
+    let retired = ProtectedRosterTerminalObservationForTest::new(std::slice::from_ref(&backend))
         .await
         .unwrap();
-    let remaining = ProtectedRosterTerminalObservationForTest::new(&[backend.clone()])
+    let remaining = ProtectedRosterTerminalObservationForTest::new(std::slice::from_ref(&backend))
         .await
         .unwrap();
     begin_transaction(&backend).await;
