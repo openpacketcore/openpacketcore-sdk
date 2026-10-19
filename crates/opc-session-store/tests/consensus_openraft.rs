@@ -614,6 +614,39 @@ impl SessionConsensusRpcHandler for RejectFencedTransitionCapabilityProbeHandler
     }
 }
 
+struct HoldAppendEntriesForRequest {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+    request_id: [u8; 16],
+    holding: AtomicBool,
+    held: tokio::sync::Notify,
+}
+
+impl fmt::Debug for HoldAppendEntriesForRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HoldAppendEntriesForRequest(<redacted>)")
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for HoldAppendEntriesForRequest {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if self.holding.load(Ordering::SeqCst)
+            && request.family == SessionConsensusRpcFamily::AppendEntries
+            && contains_bytes(&request.payload, &self.request_id)
+        {
+            self.held.notify_one();
+            return SessionConsensusWireResponse {
+                result: Err(SessionConsensusPeerError::Unavailable),
+            };
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
 struct Baseline36720ActivationProbeHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
 }
@@ -3953,6 +3986,21 @@ async fn fenced_transition_renew_rejects_record_owner_or_fence_mismatch() {
     let cluster =
         TestCluster::start_with_operation_timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT)
             .await;
+    let (leader_index, _, _) = cluster.observed_leader();
+    let lagging_index = (0..MEMBER_COUNT)
+        .find(|index| *index != 0 && *index != leader_index)
+        .expect("a follower other than the caller");
+    let replication_gate = Arc::new(HoldAppendEntriesForRequest {
+        inner: cluster.stores[lagging_index].rpc_handler(),
+        request_id: [0x24; 16],
+        holding: AtomicBool::new(true),
+        held: tokio::sync::Notify::new(),
+    });
+    for ((_, target), path) in &cluster.paths {
+        if *target == lagging_index {
+            path.install(replication_gate.clone());
+        }
+    }
     let store = &cluster.stores[0];
     let key = session_key(b"fenced-transition-renew-owner-fence-mismatch");
     let observation = store
@@ -3972,6 +4020,53 @@ async fn fenced_transition_renew_rejects_record_owner_or_fence_mismatch() {
         .fenced_transition(create)
         .await
         .expect("commit initial transition");
+
+    // A quorum can commit the create while one follower has not applied it.
+    // Hold only this request's replication, preserving capability probes and
+    // ordinary Raft traffic, and prove that the replica is actually behind.
+    tokio::time::timeout(
+        DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+        replication_gate.held.notified(),
+    )
+    .await
+    .expect("initial create reaches the held follower");
+    let lagging_connection = rusqlite::Connection::open(
+        cluster
+            ._directory
+            .path()
+            .join(format!("node-{lagging_index}.sqlite")),
+    )
+    .expect("open lagging temporary replica");
+    let lagging_records: usize = lagging_connection
+        .query_row(
+            r#"
+            SELECT COUNT(*) FROM session_records
+            WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
+            "#,
+            rusqlite::params![
+                key.tenant.as_str(),
+                key.nf_kind.as_str(),
+                key.key_type.to_string(),
+                key.stable_id.as_ref(),
+            ],
+            |row| row.get(0),
+        )
+        .expect("read lagging replica's initial record count");
+    assert_eq!(
+        lagging_records, 0,
+        "the held follower has not applied the create"
+    );
+    drop(lagging_connection);
+    replication_gate.holding.store(false, Ordering::SeqCst);
+
+    // Quorum acknowledgement does not wait for every follower. Each public
+    // read waits for its local applied barrier before we inject record drift.
+    for (index, replica) in cluster.stores.iter().enumerate() {
+        assert!(
+            matches!(replica.get(&key).await, Ok(Some(record)) if record == original),
+            "replica {index} applies the original record before fault injection"
+        );
+    }
 
     // Mutate only the persisted record in every temporary replica. The lease
     // rows remain intact, so each renewal request below is otherwise currently
