@@ -41012,6 +41012,8 @@ pub(crate) mod historical_snapshot_fixture;
 #[cfg(test)]
 mod tests {
     mod activation_ack;
+    #[cfg(target_os = "linux")]
+    mod descriptor_locks;
     mod lease_deferral;
     #[path = "scope_authority.rs"]
     mod scope_authority_tests;

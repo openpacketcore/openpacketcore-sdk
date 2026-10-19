@@ -26,6 +26,9 @@ pub(crate) static SNAPSHOT_PROCESS_FD_GATE: RwLock<()> = RwLock::new(());
 mod snapshot_descriptor_probe;
 
 #[cfg(target_os = "linux")]
+pub(crate) mod sqlite_lock_probe;
+
+#[cfg(target_os = "linux")]
 pub(crate) use snapshot_descriptor_probe::record_snapshot_seal_failure;
 
 struct PendingChild(Option<Child>);

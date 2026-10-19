@@ -6734,6 +6734,19 @@ fn create_vacuum_raw_snapshot_intermediate(
     ))
 }
 
+// Keep the snapshot builder's live-source descriptor fence independently
+// exercisable without involving the offline copier or destination files.
+fn snapshot_build_live_file(
+    connection: &rusqlite::Connection,
+    source: &PinnedSqliteFile,
+) -> io::Result<PinnedSqliteFile> {
+    opc_sqlite_file_control_sys::main_file_descriptor(connection)
+        .map_err(|_| {
+            consensus::invalid_data("session consensus live source descriptor is unavailable")
+        })
+        .and_then(|file| PinnedSqliteFile::from_file(file, source.path().to_path_buf()))
+}
+
 /// Build a file-backed snapshot from one independently owned WAL reader. The
 /// live consensus connection is held only long enough to admit and compare the
 /// exact applied/membership cut; backup and offline finalization never retain
@@ -6841,15 +6854,7 @@ async fn build_file_backed_snapshot_database(
         core.with_application_cache_read(&conn, || {
             match consensus::begin_snapshot_read_sync(&worker.reader, core.storage_identity) {
                 Ok(source_cut) => {
-                    let live_file = opc_sqlite_file_control_sys::main_file_descriptor(&conn)
-                        .map_err(|_| {
-                            consensus::invalid_data(
-                                "session consensus live source descriptor is unavailable",
-                            )
-                        })
-                        .and_then(|file| {
-                            PinnedSqliteFile::from_file(file, database_file.path().to_path_buf())
-                        });
+                    let live_file = snapshot_build_live_file(&conn, database_file);
                     match live_file {
                         Ok(live_file) if live_file.identity() != database_file.identity() => {
                             Err(consensus::invalid_data(
@@ -8713,6 +8718,8 @@ fn reject_indeterminate_snapshot_publication(core: &SqliteConsensusCore) -> io::
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod descriptor_locks;
     #[cfg(target_os = "linux")]
     mod native_log_retained_bound;
     #[cfg(target_os = "linux")]
