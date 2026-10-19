@@ -248,6 +248,13 @@
       "renamed_to": "rust:crates/opc-ipsec-xfrm::lib=lib::ikev2::tests::initial_child_xfrm_mapping_preserves_legacy_sha512_peer_nonce",
       "reason": "Rename the initial XFRM mapping check to identify legacy SHA2-512 peer-nonce acceptance. Known-answer crypt/auth keys and below-floor rejection assertions are retained with an explicit local responder role.",
       "issue": 476
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::fixture_v2_facade_reclaim_sweep_reads_past_a_stalled_voter",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::fixture_v2_facade_reclaim_sweep_keeps_rows_when_a_written_read_is_silent",
+      "reason": "Read responses now retain the immutable caller deadline while setup and Call write keep their physical cap. A voter silent after a written read must not trigger speculative failover. The replacement requires the read to remain pending beyond its setup/write cap, stop at the original deadline, retain all four journal rows, submit exactly one status read, and dispatch no additional mutation. This follows the slow linearized history-read defect class without extending any caller deadline.",
+      "issue": 1328
     }
   ]
 }

@@ -1,0 +1,245 @@
+//! Read-only calls with separate pre-write and caller-owned response deadlines.
+//!
+//! The closed request types below cannot represent a mutation. Both wire
+//! revisions retain their existing authenticated call/response machinery.
+
+use super::*;
+use opc_session_store::{FencedTransitionV2HistoryState, FencedTransitionV2Request};
+
+pub(super) enum DeadlineV1Read {
+    Get(opc_session_store::SessionKey),
+    PreflightRecordExpiry(Vec<RecordExpiryPreflight>),
+}
+
+pub(super) enum DeadlineV2Read {
+    HistoryState,
+    Status(Box<FencedTransitionV2Request>),
+}
+
+fn call_boundary(
+    client: &StatelessSessionConsumerClient,
+    started: tokio::time::Instant,
+    budget: PreparedCheckpointBudget,
+) -> tokio::time::Instant {
+    let deadline = budget.original_deadline();
+    let attempt =
+        started
+            .checked_add(budget.physical_attempt_timeout().min(
+                effective_consumer_operation_timeout(client.operation_timeout),
+            ))
+            .map_or(deadline, |end| end.min(deadline));
+    let (configured, _) = client.pre_request_deadline(started, deadline);
+    attempt.min(configured)
+}
+
+impl PersistentSessionConsumerClient {
+    /// Read authoritative state within the caller's immutable checkpoint budget.
+    ///
+    /// The response may use the remaining original deadline. Pool admission,
+    /// setup and Call write retain the physical-attempt cap (and any earlier
+    /// configured pre-request limit). This submits at most one physical read.
+    /// No mutation can be submitted through this entry point.
+    ///
+    /// ```compile_fail
+    /// # use opc_session_net::PersistentSessionConsumerClient;
+    /// # use opc_session_store::{FencedTransitionRequest, PreparedCheckpointBudget};
+    /// async fn transition(client: &PersistentSessionConsumerClient, request: FencedTransitionRequest, budget: PreparedCheckpointBudget) {
+    ///     client.get_with_budget(request, budget).await;
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # use opc_session_net::PersistentSessionConsumerClient;
+    /// # use opc_session_store::{SessionOp, PreparedCheckpointBudget};
+    /// async fn batch(client: &PersistentSessionConsumerClient, operations: Vec<SessionOp>, budget: PreparedCheckpointBudget) {
+    ///     client.get_with_budget(operations, budget).await;
+    /// }
+    /// ```
+    pub async fn get_with_budget(
+        &self,
+        key: opc_session_store::SessionKey,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<Option<opc_session_store::StoredSessionRecord>, StoreError> {
+        match self
+            .execute_v1_read_with_budget(DeadlineV1Read::Get(key), budget)
+            .await
+        {
+            Ok(SessionConsumerResponse::Get(value)) => {
+                value.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized)) => {
+                Err(StoreError::TopologyAuthorityRevoked)
+            }
+            Ok(SessionConsumerResponse::Rejected(value)) => Err(rejection_into_store_error(value)),
+            Err(error) if read_authority_revoked(&error) => {
+                Err(StoreError::TopologyAuthorityRevoked)
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer authoritative read unavailable".into(),
+            )),
+        }
+    }
+
+    /// Validate expiry authority within the caller's immutable checkpoint budget.
+    ///
+    /// This follows [`Self::get_with_budget`]'s split deadline contract and
+    /// submits only the payload-free expiry descriptors, never a mutation.
+    pub async fn preflight_record_expiry_with_budget(
+        &self,
+        preflights: Vec<RecordExpiryPreflight>,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<(), StoreError> {
+        match self
+            .execute_v1_read_with_budget(DeadlineV1Read::PreflightRecordExpiry(preflights), budget)
+            .await
+        {
+            Ok(SessionConsumerResponse::PreflightRecordExpiry(value)) => {
+                value.map_err(SessionConsumerStoreError::into_store_error)
+            }
+            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::Unauthorized)) => {
+                Err(StoreError::TopologyAuthorityRevoked)
+            }
+            Ok(SessionConsumerResponse::Rejected(value)) => Err(rejection_into_store_error(value)),
+            Err(error) if read_authority_revoked(&error) => {
+                Err(StoreError::TopologyAuthorityRevoked)
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer expiry authority unavailable".into(),
+            )),
+        }
+    }
+
+    /// Read one voter's linearized V2 history using the caller's original budget.
+    ///
+    /// This narrow authority read has the same pre-write and response deadlines
+    /// as [`Self::get_with_budget`]. It neither dispatches a transition nor
+    /// creates a new retry budget. Callers retain ownership of quorum policy.
+    ///
+    /// ```compile_fail
+    /// # use opc_session_net::PersistentSessionConsumerClient;
+    /// # use opc_session_store::{SessionConsumerV2Request, PreparedCheckpointBudget};
+    /// async fn void(client: &PersistentSessionConsumerClient, void_request: SessionConsumerV2Request, budget: PreparedCheckpointBudget) {
+    ///     client.fenced_transition_v2_history_state_with_budget(void_request, budget).await;
+    /// }
+    /// ```
+    pub async fn fenced_transition_v2_history_state_with_budget(
+        &self,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<FencedTransitionV2HistoryState, StoreError> {
+        let response = self
+            .execute_v2_read_with_budget(DeadlineV2Read::HistoryState, budget)
+            .await;
+        if prepared_fenced_v2::v2_authority_revoked(&response) {
+            return Err(StoreError::TopologyAuthorityRevoked);
+        }
+        match response {
+            Ok(SessionConsumerV2Response::FencedTransitionV2HistoryState(Ok(state))) => Ok(state),
+            _ => Err(StoreError::BackendUnavailable(
+                "consumer history authority unavailable".into(),
+            )),
+        }
+    }
+
+    pub(super) async fn execute_v1_read_with_budget(
+        &self,
+        read: DeadlineV1Read,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        let operation = match read {
+            DeadlineV1Read::Get(key) => SessionConsumerOperation::Get { key },
+            DeadlineV1Read::PreflightRecordExpiry(preflights) => {
+                SessionConsumerOperation::PreflightRecordExpiry { preflights }
+            }
+        };
+        let boundary = call_boundary(&self.pool.client, tokio::time::Instant::now(), budget);
+        let result = self
+            .execute_classified_with_deadlines(
+                &self.request(SessionConsumerRequestId::new(), operation),
+                budget.original_deadline(),
+                1,
+                Some(boundary),
+            )
+            .await;
+        settle_v1_read_result(result, budget.original_deadline()).await
+    }
+
+    pub(super) async fn execute_v2_read_with_budget(
+        &self,
+        read: DeadlineV2Read,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+        if self.fenced_mutation_roster_transport_enabled() {
+            return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            });
+        }
+        let operation = match read {
+            DeadlineV2Read::HistoryState => {
+                SessionConsumerV2Operation::FencedTransitionV2HistoryState
+            }
+            DeadlineV2Read::Status(request) => {
+                SessionConsumerV2Operation::FencedTransitionV2Status { request }
+            }
+        };
+        let request = SessionConsumerV2Request::new(self.scope(), operation);
+        if request.validate().is_err() {
+            return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            });
+        }
+        self.v2_pool.ensure_idle_reaper();
+        let started = tokio::time::Instant::now();
+        let boundary = call_boundary(&self.v2_pool.client, started, budget);
+        let result = self
+            .v2_pool
+            .execute_classified_once(
+                &request,
+                PersistentV2CallAttempt {
+                    operation_started: started,
+                    admission_started: started,
+                    admission_deadline: boundary,
+                    pre_request_deadline: boundary,
+                    pre_request_budget_active: true,
+                    deadline: budget.original_deadline(),
+                    status_write_accepted: None,
+                },
+            )
+            .await;
+        if matches!(
+            result,
+            Err(PersistentSessionConsumerV2ExecuteError::ReadUnavailable { cause })
+                if !matches!(cause, SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked)
+        ) {
+            // After a Call write, a closed transport is not a completed
+            // server read. Keep the caller's deadline spent so an outer
+            // voter loop cannot overlap that possibly-running operation.
+            tokio::time::sleep_until(budget.original_deadline()).await;
+        }
+        result
+    }
+}
+
+pub(super) async fn settle_v1_read_result(
+    result: Result<SessionConsumerResponse, SessionConsumerCallError>,
+    deadline: tokio::time::Instant,
+) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+    if matches!(
+        result,
+        Err(SessionConsumerCallError::MayHaveSent(cause))
+            if !matches!(cause, SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked)
+    ) {
+        tokio::time::sleep_until(deadline).await;
+    }
+    result
+}
+
+fn read_authority_revoked(error: &SessionConsumerCallError) -> bool {
+    matches!(
+        error,
+        SessionConsumerCallError::BeforeCallWrite(
+            SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked
+        ) | SessionConsumerCallError::MayHaveSent(
+            SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked
+        )
+    )
+}

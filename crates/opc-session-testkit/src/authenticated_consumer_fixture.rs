@@ -1934,9 +1934,11 @@ async fn start_fixture_listener(
 struct FixtureConsumer {
     inner: Arc<dyn SessionQuorumConsumer>,
     #[cfg(test)]
-    reply_holds: [std::sync::atomic::AtomicU64; 5],
+    reply_holds: [std::sync::atomic::AtomicU64; 6],
     #[cfg(test)]
-    held_replies: [AtomicUsize; 5],
+    held_replies: [AtomicUsize; 6],
+    #[cfg(test)]
+    held_reply_started: [tokio::sync::Notify; 6],
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
@@ -1989,6 +1991,8 @@ impl FixtureConsumer {
             reply_holds: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             held_replies: std::array::from_fn(|_| AtomicUsize::new(0)),
+            #[cfg(test)]
+            held_reply_started: std::array::from_fn(|_| tokio::sync::Notify::new()),
             lose_next_fenced_transition_response,
             lose_next_fenced_transition_v2_response,
             fenced_transition_status_misses_remaining,
@@ -2033,6 +2037,7 @@ impl FixtureConsumer {
         let millis = self.reply_holds[kind].load(Ordering::Acquire);
         if millis != 0 {
             self.held_replies[kind].fetch_add(1, Ordering::SeqCst);
+            self.held_reply_started[kind].notify_one();
             tokio::time::sleep(Duration::from_millis(millis)).await;
         }
     }
@@ -2075,6 +2080,7 @@ impl SessionQuorumConsumer for FixtureConsumer {
         match &response {
             SessionConsumerResponse::Get(Ok(_)) => self.hold_reply(0).await,
             SessionConsumerResponse::PreflightRecordExpiry(Ok(())) => self.hold_reply(1).await,
+            SessionConsumerResponse::FencedTransitionStatus(Ok(_)) => self.hold_reply(5).await,
             _ => {}
         }
         if let Some(gate) = ordinary_fault {

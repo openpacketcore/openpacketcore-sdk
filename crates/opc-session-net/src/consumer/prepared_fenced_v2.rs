@@ -505,35 +505,45 @@ impl ActivatedFencedTransitionV2Backend {
         (deadline > tokio::time::Instant::now()).then_some(deadline)
     }
 
-    fn read_attempt_deadline(&self) -> Option<tokio::time::Instant> {
-        let now = tokio::time::Instant::now();
-        let deadline = now
-            .checked_add(self.attempt_timeout)
-            .map_or(self.deadline, |capped| capped.min(self.deadline));
-        (deadline > now).then_some(deadline)
+    fn read_budget(&self) -> Option<PreparedCheckpointBudget> {
+        (self.deadline > tokio::time::Instant::now())
+            .then(|| PreparedCheckpointBudget::new(self.deadline, self.attempt_timeout).ok())
+            .flatten()
+    }
+
+    fn status_read_budget(&self) -> Option<PreparedCheckpointBudget> {
+        // The status caller installs its chosen read deadline, which may be
+        // earlier than the immutable original deadline. Mutation attempts
+        // still install their own physical cap through the same affine route.
+        let deadline = self
+            .route
+            .attempt_deadline()
+            .unwrap_or(self.deadline)
+            .min(self.deadline);
+        (deadline > tokio::time::Instant::now())
+            .then(|| PreparedCheckpointBudget::new(deadline, self.attempt_timeout).ok())
+            .flatten()
     }
 }
 
 /// Read linearized V2 history state, traversing the canonical roster from
-/// `origin`. Every attempt is read-only, so an interrupted read may move to
-/// the next voter under the caller's deadline.
+/// `origin`. Advance after a reply or a pre-write failure. A transmitted read
+/// without a reply spends the remaining caller deadline without hedging.
 async fn linearized_v2_history_state(
     router: &PreparedConsumerRouter,
     origin: usize,
-    attempt_deadline: impl Fn() -> Option<tokio::time::Instant>,
+    budget: PreparedCheckpointBudget,
 ) -> Result<FencedTransitionV2HistoryState, StoreError> {
     let voter_count = router.clients.len();
     for offset in 0..voter_count {
-        let Some(deadline) = attempt_deadline() else {
+        if tokio::time::Instant::now() >= budget.original_deadline() {
             break;
-        };
+        }
         let client =
             &router.clients[prepared_voter_index(origin.wrapping_add(offset), voter_count)];
-        let request = SessionConsumerV2Request::new(
-            router.scope,
-            SessionConsumerV2Operation::FencedTransitionV2HistoryState,
-        );
-        let response = client.execute_v2_before(&request, deadline).await;
+        let response = client
+            .execute_v2_read_with_budget(DeadlineV2Read::HistoryState, budget)
+            .await;
         if v2_authority_revoked(&response) {
             return Err(StoreError::TopologyAuthorityRevoked);
         }
@@ -546,7 +556,7 @@ async fn linearized_v2_history_state(
     ))
 }
 
-fn v2_authority_revoked(
+pub(super) fn v2_authority_revoked(
     response: &Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError>,
 ) -> bool {
     matches!(
@@ -617,27 +627,23 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
         }
         // Expiry authority is a read-only general-lane RPC. Traverse the same
         // deterministic order from this handle's origin under one immutable
-        // deadline; retrying an interrupted read spends no dispatch authority.
+        // deadline. No response wait overlaps another physical read.
         let voter_count = self.voter_count();
         let mut last_unavailable = None;
         for offset in 0..voter_count {
-            let Some(deadline) = self.read_attempt_deadline() else {
+            let Some(budget) = self.read_budget() else {
                 break;
             };
             let client = &self.router.clients[prepared_voter_index(
                 self.route.mutation_voter(voter_count).wrapping_add(offset),
                 voter_count,
             )];
-            let request = SessionConsumerRequest::new(
-                self.router.scope,
-                SessionConsumerRequestId::new(),
-                SessionConsumerOperation::PreflightRecordExpiry {
-                    preflights: preflights.to_vec(),
-                },
-            );
             let response = tokio::time::timeout_at(
-                deadline,
-                client.execute_classified_before(&request, deadline, 1),
+                budget.original_deadline(),
+                client.execute_v1_read_with_budget(
+                    DeadlineV1Read::PreflightRecordExpiry(preflights.to_vec()),
+                    budget,
+                ),
             )
             .await;
             match response {
@@ -717,7 +723,7 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
         let state = linearized_v2_history_state(
             &self.router,
             self.route.mutation_voter(self.voter_count()),
-            || self.read_attempt_deadline(),
+            self.read_budget().ok_or_else(prepared_fenced_v2_deadline)?,
         )
         .await?;
         self.history.observe(state);
@@ -878,18 +884,12 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
         &self,
         request: &FencedTransitionV2Request,
     ) -> Result<FencedTransitionV2Status, StoreError> {
-        let Some(deadline) = self.attempt_deadline() else {
-            return Err(prepared_fenced_v2_deadline());
-        };
+        let budget = self
+            .status_read_budget()
+            .ok_or_else(prepared_fenced_v2_deadline)?;
         let voter = self.route.next_status_voter(self.voter_count());
-        let wire = SessionConsumerV2Request::new(
-            self.router.scope,
-            SessionConsumerV2Operation::FencedTransitionV2Status {
-                request: Box::new(request.clone()),
-            },
-        );
         let response = self.router.clients[voter]
-            .execute_v2_before(&wire, deadline)
+            .execute_v2_read_with_budget(DeadlineV2Read::Status(Box::new(request.clone())), budget)
             .await;
         if v2_authority_revoked(&response) {
             return Err(StoreError::TopologyAuthorityRevoked);
@@ -1067,11 +1067,12 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         let read_deadline = tokio::time::Instant::now()
             .checked_add(DEFAULT_CONSUMER_OPERATION_TIMEOUT)
             .unwrap_or_else(tokio::time::Instant::now);
-        let history = match linearized_v2_history_state(&router, 0, || {
-            (tokio::time::Instant::now() < read_deadline).then_some(read_deadline)
-        })
-        .await
-        {
+        let read_budget = PreparedCheckpointBudget::new(
+            read_deadline,
+            opc_session_store::PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
+        )
+        .map_err(|_| prepared_fenced_v2_readiness_unavailable())?;
+        let history = match linearized_v2_history_state(&router, 0, read_budget).await {
             Ok(state) => Some(state),
             Err(StoreError::TopologyAuthorityRevoked) => {
                 return Err(StoreError::TopologyAuthorityRevoked);
@@ -1385,12 +1386,12 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 }
             }
             for _ in 0..self.router.clients.len() {
-                let Some(attempt_deadline) = reclaim_attempt_deadline(&budget, deadline) else {
+                if tokio::time::Instant::now() >= deadline {
                     return Err(prepared_fenced_v2_deadline());
-                };
-                route.install_attempt_deadline(attempt_deadline);
+                }
+                route.install_attempt_deadline(deadline);
                 match tokio::time::timeout_at(
-                    attempt_deadline,
+                    deadline,
                     backend.protected_fenced_transition_v2_status(&prepared),
                 )
                 .await
@@ -1540,12 +1541,12 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             // attempt per voter before the sweep stops as interrupted.
             let mut status = None;
             for _ in 0..voter_count {
-                let Some(attempt_deadline) = reclaim_attempt_deadline(&budget, deadline) else {
+                if tokio::time::Instant::now() >= deadline {
                     break;
-                };
-                route.install_attempt_deadline(attempt_deadline);
+                }
+                route.install_attempt_deadline(deadline);
                 match tokio::time::timeout_at(
-                    attempt_deadline,
+                    deadline,
                     backend.protected_fenced_transition_v2_status(&prepared),
                 )
                 .await
@@ -2329,11 +2330,6 @@ impl PersistentPreparedFencedTransitionV2Token {
         if now >= deadline {
             return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
         }
-        let attempt_deadline = deadline.min(
-            now.checked_add(self.budget.physical_attempt_timeout())
-                .ok_or(SessionConsumerPreparedFencedTransitionStatusError::Deadline)?,
-        );
-        let physical_cap_active = attempt_deadline < deadline;
         let _attempt = self
             .state
             .begin_status()
@@ -2341,22 +2337,22 @@ impl PersistentPreparedFencedTransitionV2Token {
         if let Some(result) = self.cached_terminal_receipt() {
             return result;
         }
-        self.route.install_attempt_deadline(attempt_deadline);
+        self.route.install_attempt_deadline(deadline);
         let result = match tokio::time::timeout_at(
-            attempt_deadline,
+            deadline,
             self.backend
                 .protected_fenced_transition_v2_status(&self.prepared),
         )
         .await
         {
+            Ok(Ok(_)) if tokio::time::Instant::now() >= deadline => {
+                Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
+            }
             Ok(Ok(status)) => Ok(status),
             Ok(Err(StoreError::TopologyAuthorityRevoked)) => {
                 Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked)
             }
             Ok(Err(_)) => Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
-            Err(_) if physical_cap_active => {
-                Err(SessionConsumerPreparedFencedTransitionStatusError::AttemptDeadline)
-            }
             Err(_) => Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
         };
         match result {

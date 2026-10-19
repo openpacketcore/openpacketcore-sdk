@@ -75,7 +75,6 @@ const RECOVERY_TABLE: &str = "protected_fenced_transition_v2_recovery_journal";
 const RECOVERY_PRIMARY_INDEX: &str =
     "sqlite_autoindex_protected_fenced_transition_v2_recovery_journal_1";
 const RECOVERY_MEMBERSHIP_INDEX: &str = "protected_fenced_transition_v2_recovery_membership_idx";
-const RECOVERY_UNAVAILABLE: &str = "protected fenced-transition V2 recovery journal unavailable";
 const RECOVERY_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 const RECOVERY_CATALOG_SCAN_LIMIT: usize = RECOVERY_SCHEMA_OBJECT_COUNT as usize + 1;
 const RECOVERY_METADATA_SCAN_LIMIT: usize = 2;
@@ -977,7 +976,7 @@ fn recovery_path_error(error: StoreError) -> StoreError {
 }
 
 fn recovery_unavailable() -> StoreError {
-    StoreError::BackendUnavailable(RECOVERY_UNAVAILABLE.into())
+    StoreError::FencedTransitionRecoveryJournalUnavailable
 }
 
 fn recovery_journal_full(count: i64, capacity: usize) -> Result<bool, StoreError> {
@@ -1893,7 +1892,7 @@ mod tests {
     fn assert_unavailable<T>(result: Result<T, StoreError>) {
         assert!(matches!(
             result,
-            Err(StoreError::BackendUnavailable(message)) if message == RECOVERY_UNAVAILABLE
+            Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
         ));
     }
 

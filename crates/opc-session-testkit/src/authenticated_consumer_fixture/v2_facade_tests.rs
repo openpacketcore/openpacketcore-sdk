@@ -765,15 +765,14 @@ async fn fixture_v2_facade_reclaim_sweep_retains_recorded_and_unresolved_rows() 
     fixture.shutdown().await.expect("shut down fixture");
 }
 
-/// A voter that never answers receipt lookups is a fault the quorum
-/// tolerates, so it must not stall reclamation: each row's read-only status
-/// moves on to the next canonical voter.
+/// After a receipt Call is written, silence consumes the original sweep
+/// deadline. No second voter read or later mutation may hide that ambiguity.
 #[tokio::test]
-async fn fixture_v2_facade_reclaim_sweep_reads_past_a_stalled_voter() {
+async fn fixture_v2_facade_reclaim_sweep_keeps_rows_when_a_written_read_is_silent() {
     let fixture = AuthenticatedPreparedFencedTransitionFixture::start([scope()])
         .await
         .expect("start authenticated three-voter fixture");
-    let fixture = with_fixture_protocol_clock("reclaim past a stalled voter", async move {
+    let fixture = with_fixture_protocol_clock("reclaim waits for the original read deadline", async move {
         let provider = CountingProvider::new();
         let facade = fixture
             .open_local_aead_v2(Arc::clone(&provider), "fixture-v2-sweep-stalled")
@@ -790,43 +789,37 @@ async fn fixture_v2_facade_reclaim_sweep_reads_past_a_stalled_voter() {
             committed_v2(&mut handle, &request, deadline).await;
             prepared.push(handle);
         }
-        let stalled = fixture.stall_fenced_transition_v2_status_on_canonical_voter(1);
+        let stalled = fixture.stall_fenced_transition_v2_status_on_canonical_voter(0);
         let started = tokio::time::Instant::now();
         let sweep_budget = budget(soon());
+        let before = fixture.diagnostics();
         let sweep = facade.reclaim_resolved_fenced_transitions(16, sweep_budget);
         tokio::pin!(sweep);
-        let mut stalled_attempts = 0;
-        let report = loop {
-            tokio::select! {
-                result = &mut sweep => break result.expect("bounded sweep"),
-                () = stalled.notified() => {
-                    stalled_attempts += 1;
-                    // Prove the stalled RPC's original cap, then drive past
-                    // timer-wheel rounding without spending host scheduling time.
-                    tokio::time::advance(sweep_budget.physical_attempt_timeout() - FIXTURE_TIMER_TICK).await;
-                    assert!(
-                        futures_util::poll!(&mut sweep).is_pending(),
-                        "the stalled voter remains pending before its physical deadline"
-                    );
-                    tokio::time::advance(FIXTURE_TIMER_TICK * 2).await;
-                }
-            }
-        };
-        assert!(
-            !report.interrupted(),
-            "a stalled voter is skipped, not a sweep-wide unavailability: {report:?}"
-        );
-        assert_eq!(report.examined(), 4);
-        assert_eq!(report.retained(), 4, "Recorded rows are retained");
+        tokio::select! {
+            result = &mut sweep => panic!("sweep returned before the controlled hold: {result:?}"),
+            () = stalled.notified() => {}
+        }
+        tokio::time::advance(sweep_budget.physical_attempt_timeout() + FIXTURE_TIMER_TICK).await;
+        assert!(futures_util::poll!(&mut sweep).is_pending(),
+            "a written read remains pending beyond its setup/write cap");
+        tokio::time::advance(sweep_budget.original_deadline() - tokio::time::Instant::now() + FIXTURE_TIMER_TICK).await;
+        let report = sweep.await.expect("bounded sweep reports interruption");
+        assert!(report.interrupted(), "silence fails closed at the original deadline");
+        assert_eq!(report.examined(), 0);
+        assert_eq!(report.retained(), 0, "no row gained a confirmed receipt");
         assert_eq!(report.reclaimed(), 0);
+        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 4);
+        let after = fixture.diagnostics();
         assert_eq!(
-            stalled_attempts, 2,
-            "both visits reach the actual stalled voter"
+            after.fenced_transition_v2_status_calls() - before.fenced_transition_v2_status_calls(),
+            1,
+            "one physical receipt read consumes the deadline without hedging"
         );
+        assert_eq!(after.fenced_transition_v2_calls(), before.fenced_transition_v2_calls());
         assert_eq!(
             tokio::time::Instant::now() - started,
-            (sweep_budget.physical_attempt_timeout() + FIXTURE_TIMER_TICK) * stalled_attempts,
-            "only the stalled voter consumes the original sweep deadline"
+            sweep_budget.original_deadline() - started + FIXTURE_TIMER_TICK,
+            "the response wait cannot mint a later end-to-end bound"
         );
         drop(prepared);
         fixture
