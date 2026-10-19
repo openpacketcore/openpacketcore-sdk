@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import resource
 import select
 import shlex
 import shutil
@@ -18,6 +19,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1281,6 +1283,27 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
 
     def test_failing_command_keeps_exit_status_and_removes_runtime(self):
         self.run_command("sh", "-c", "exit 37", expected=37)
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_command_preserves_callers_file_limit_and_umask(self):
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        soft = 65536 if hard == resource.RLIM_INFINITY else min(65536, hard)
+        arm = parent_death_guard()
+
+        def configure_caller():
+            arm()
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+            os.umask(0o027)
+
+        result = subprocess.run(
+            [str(HARNESS), "--", sys.executable, "-c",
+             "import json,os,resource; print(json.dumps({"
+             "'nofile': resource.getrlimit(resource.RLIMIT_NOFILE), 'umask': os.umask(0)}))"],
+            env=self.environment, preexec_fn=configure_caller,
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"nofile": [soft, hard], "umask": 0o027})
         self.assertEqual(list(self.runner.iterdir()), [])
 
     def test_runtime_mount_is_not_visible_to_other_jobs(self):
