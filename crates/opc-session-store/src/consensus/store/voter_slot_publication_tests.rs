@@ -74,7 +74,7 @@ async fn voter_status_waits_for_the_leaders_strict_wal_publication() {
         .expect("the quorum read is independent of local publication")
         .unwrap();
         let authority = VoterReplacementAuthorization::new(
-            genesis().cluster_instance,
+            fleet.genesis().cluster_instance,
             BTreeSet::from([SlotId::new(3).unwrap()]),
             "spiffe://example.test/recovery-controller".into(),
             public(&member(21, 1)),
@@ -133,7 +133,7 @@ async fn voter_status_waits_for_a_survivors_strict_wal_publication() {
         fleet.nodes.pop().unwrap().shutdown().await.unwrap();
         tokio::time::sleep(VOTER_RECENT_TRAFFIC_WINDOW + Duration::from_millis(100)).await;
         let prepared = leader
-            .replace_voter(verified_request(&genesis(), 3))
+            .replace_voter(fleet.verified_request(&fleet.genesis(), 3))
             .await
             .unwrap();
         let retained = prepared.table().replacement.as_ref().unwrap();
@@ -169,7 +169,7 @@ async fn voter_status_waits_for_a_survivors_strict_wal_publication() {
             std::io::ErrorKind::WouldBlock
         );
         let authority = VoterReplacementAuthorization::new(
-            genesis().cluster_instance,
+            fleet.genesis().cluster_instance,
             BTreeSet::from([SlotId::new(3).unwrap()]),
             "spiffe://example.test/recovery-controller".into(),
             public(&member(21, 1)),

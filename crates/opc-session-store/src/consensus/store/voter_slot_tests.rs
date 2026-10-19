@@ -80,7 +80,10 @@ fn topology(local: u16) -> ValidatedQuorumTopology {
     topology_for(3, local)
 }
 fn topology_for(size: u16, local: u16) -> ValidatedQuorumTopology {
-    let table = genesis_for(size);
+    topology_from_table(genesis_for(size), local)
+}
+fn topology_from_table(table: VoterSlotTable, local: u16) -> ValidatedQuorumTopology {
+    let size = table.slots.len() as u16;
     let identity = table
         .current_configuration()
         .identity(table.cluster_instance, table.manifest_digest)
@@ -135,8 +138,16 @@ fn published_voter_state(store: &ConsensusSessionStore) -> Option<VoterSlotDurab
     }
 }
 
+#[derive(Debug)]
+struct Enrollment {
+    genesis: VoterSlotTable,
+    signers: BTreeMap<SessionConsensusNodeId, crate::VoterIdentitySigner>,
+    candidates: std::sync::Mutex<BTreeMap<SessionConsensusNodeId, tempfile::TempDir>>,
+}
+
 #[derive(Debug, Default)]
 struct Network {
+    enrollment: std::sync::OnceLock<Enrollment>,
     handlers:
         std::sync::RwLock<BTreeMap<SessionConsensusNodeId, Arc<dyn SessionConsensusRpcHandler>>>,
     freeze_after_marker: AtomicU64,
@@ -166,6 +177,28 @@ struct HeldResponse {
     release: tokio::sync::oneshot::Receiver<()>,
 }
 impl Network {
+    fn genesis(&self) -> VoterSlotTable {
+        self.enrollment.get().unwrap().genesis.clone()
+    }
+
+    fn signer(
+        &self,
+        member: &VoterSlotMember,
+    ) -> Result<crate::VoterIdentitySigner, SessionConsensusPeerError> {
+        self.enrollment
+            .get()
+            .unwrap()
+            .signers
+            .get(&member.identity.node_id())
+            .filter(|signer| signer.key_digest() == member.key_digest)
+            .cloned()
+            .ok_or(SessionConsensusPeerError::Rejected)
+    }
+
+    fn verified_request(&self, table: &VoterSlotTable, slot: u16) -> VerifiedVoterReplacement {
+        verified_request(self, table, slot)
+    }
+
     fn handler(
         &self,
         node: SessionConsensusNodeId,
@@ -368,11 +401,11 @@ impl SessionConsensusPeer for Peer {
                 &challenge,
                 &binding.source_spiffe_id,
                 channel,
-                public(&binding.source),
-                sign(
-                    &binding.source,
-                    &voter_rpc_possession_signing_input(&challenge).unwrap(),
-                ),
+                self.network.signer(&binding.source)?.public_key(),
+                self.network
+                    .signer(&binding.source)?
+                    .sign_rpc(&challenge)
+                    .unwrap(),
             )
             .map_err(|_| SessionConsensusPeerError::Rejected)?;
         if self.network.observe_empty_append_to.load(Ordering::SeqCst) == self.node_id().get()
@@ -489,11 +522,11 @@ impl SessionConsensusPeer for Peer {
                 &challenge,
                 &response_binding.source_spiffe_id,
                 channel,
-                public(&self.member),
-                sign(
-                    &self.member,
-                    &voter_rpc_possession_signing_input(&challenge).unwrap(),
-                ),
+                self.network.signer(&self.member)?.public_key(),
+                self.network
+                    .signer(&self.member)?
+                    .sign_rpc(&challenge)
+                    .unwrap(),
             )
             .map_err(|_| SessionConsensusPeerError::Rejected)?;
         Ok(VoterAuthenticatedResponse { response, proof })
@@ -519,25 +552,58 @@ impl Fleet {
         let network = Arc::new(Network::default());
         let mut nodes = Vec::new();
         let mut directories = Vec::new();
+        let mut backends = Vec::new();
+        let mut table = genesis_for(size);
+        let mut signers = BTreeMap::new();
+        let mut candidates = BTreeMap::new();
+        // Enroll every volume before publishing the complete genesis manifest.
+        // Candidate keys are independently staged; they have no voting authority.
         for slot in 1..=size {
-            let directory = tempfile::tempdir().unwrap();
-            let backend =
-                SqliteSessionBackend::open(directory.path().join("session.sqlite")).unwrap();
-            if let Some((selected, hook)) = &hook {
-                if slot == *selected {
-                    backend
-                        .native_owner
-                        .as_ref()
-                        .unwrap()
-                        .set_io_hook_for_test(hook.clone());
+            for incarnation in 1..=2 {
+                let directory = tempfile::tempdir().unwrap();
+                let backend =
+                    SqliteSessionBackend::open(directory.path().join("session.sqlite")).unwrap();
+                let identity = member(slot, incarnation).identity;
+                let signer = backend
+                    .enroll_voter_identity(table.cluster_instance, identity)
+                    .await
+                    .unwrap();
+                if incarnation == 1 {
+                    table.slots[usize::from(slot - 1)].member.key_digest = signer.key_digest();
+                    if let Some((selected, hook)) = &hook {
+                        if slot == *selected {
+                            backend
+                                .native_owner
+                                .as_ref()
+                                .unwrap()
+                                .set_io_hook_for_test(hook.clone());
+                        }
+                    }
+                    backends.push(backend);
+                    directories.push(directory);
+                } else {
+                    candidates.insert(identity.node_id(), directory);
                 }
+                signers.insert(identity.node_id(), signer);
             }
+        }
+        table.manifest_digest = Sha256::digest(encode_voter_slot_table(&table).unwrap()).into();
+        network
+            .enrollment
+            .set(Enrollment {
+                genesis: table.clone(),
+                signers,
+                candidates: std::sync::Mutex::new(candidates),
+            })
+            .unwrap();
+        for (index, backend) in backends.into_iter().enumerate() {
+            let slot = index as u16 + 1;
             let store = ConsensusSessionStore::open_with_voter_slots_and_integrity(
-                topology_for(size, slot),
-                genesis_for(size),
+                topology_from_table(table.clone(), slot),
+                table.clone(),
                 member(slot, 1).identity.node_id(),
                 backend,
-                directory.path().join("snapshots"),
+                directories[index].path().join("snapshots"),
                 Arc::new(Resolver(network.clone())),
                 super::super::SnapshotIntegrityPolicy::PortableVerified,
             )
@@ -549,7 +615,6 @@ impl Fleet {
                 .unwrap()
                 .insert(member(slot, 1).identity.node_id(), store.rpc_handler());
             nodes.push(store);
-            directories.push(directory);
         }
         Self {
             nodes,
@@ -557,35 +622,71 @@ impl Fleet {
             directories,
         }
     }
+
+    fn genesis(&self) -> VoterSlotTable {
+        self.network.genesis()
+    }
+    fn topology(&self, local: u16) -> ValidatedQuorumTopology {
+        topology_from_table(self.genesis(), local)
+    }
+    fn verified_request(&self, table: &VoterSlotTable, slot: u16) -> VerifiedVoterReplacement {
+        self.network.verified_request(table, slot)
+    }
+    fn candidate_directory(&self, slot: u16, incarnation: u64) -> tempfile::TempDir {
+        self.network
+            .enrollment
+            .get()
+            .unwrap()
+            .candidates
+            .lock()
+            .unwrap()
+            .remove(&member(slot, incarnation).identity.node_id())
+            .unwrap()
+    }
+
     async fn open_size_with_io_hook(
         size: u16,
         hook: Option<(u16, crate::sqlite::consensus::wal::owner::IoHookForTest)>,
     ) -> Self {
         let fleet = Self::open_pristine_with_io_hook(size, hook).await;
+        fleet.form().await;
+        fleet
+    }
+
+    async fn form(&self) {
         let mut formation = tokio::task::JoinSet::new();
-        for node in &fleet.nodes {
+        for node in &self.nodes {
             let node = node.clone();
             formation.spawn(async move { node.initialize_cluster().await });
         }
         while let Some(result) = formation.join_next().await {
             result.unwrap().unwrap();
         }
-        fleet.nodes[0].inner.raft.trigger().elect().await.unwrap();
-        fleet.nodes[0]
+        self.nodes[0].inner.raft.trigger().elect().await.unwrap();
+        self.nodes[0]
             .inner
             .raft
             .wait(Some(Duration::from_secs(5)))
             .current_leader(member(1, 1).identity.node_id(), "fixture leader")
             .await
             .unwrap();
-        fleet.nodes[0]
+        self.nodes[0]
             .inner
             .raft
             .ensure_linearizable()
             .await
             .unwrap();
+    }
+
+    async fn open_with_delayed_last() -> Self {
+        let mut fleet = Self::open_pristine_with_io_hook(3, None).await;
+        let delayed = fleet.nodes.pop().unwrap();
+        fleet.network.disconnect_and_shutdown(&delayed).await;
+        drop(delayed);
+        fleet.form().await;
         fleet
     }
+
     async fn close(self) {
         self.network.handlers.write().unwrap().clear();
         for node in self.nodes {
@@ -684,9 +785,21 @@ async fn pristine_voter_slot_pre_vote_is_authenticated_and_read_only() {
     }
 }
 
-fn verified_request(table: &VoterSlotTable, slot: u16) -> VerifiedVoterReplacement {
+fn verified_request(
+    network: &Network,
+    table: &VoterSlotTable,
+    slot: u16,
+) -> VerifiedVoterReplacement {
     let old = &table.slots[usize::from(slot - 1)].member;
-    let candidate = member(slot, old.identity.incarnation().get() + 1);
+    let mut candidate = member(slot, old.identity.incarnation().get() + 1);
+    let signer = network
+        .enrollment
+        .get()
+        .unwrap()
+        .signers
+        .get(&candidate.identity.node_id())
+        .unwrap();
+    candidate.key_digest = signer.key_digest();
     let controller = member(20, 1);
     let controller_spiffe = "spiffe://example.test/controller";
     let authority = VoterReplacementAuthorization::new(
@@ -758,11 +871,8 @@ fn verified_request(table: &VoterSlotTable, slot: u16) -> VerifiedVoterReplaceme
             &challenge,
             &request.attestation.candidate_spiffe_id,
             [7; 32],
-            public(&candidate),
-            sign(
-                &candidate,
-                &voter_candidate_possession_signing_input(&challenge).unwrap(),
-            ),
+            signer.public_key(),
+            signer.sign_candidate(&challenge).unwrap(),
         )
         .unwrap();
     VoterReplacementVerifier::new()
@@ -783,7 +893,7 @@ async fn authenticated_loss_claim_for_a_live_voter_has_no_effect() {
     let before = leader.voter_slot_state().await.unwrap();
     assert_eq!(
         leader
-            .replace_voter(verified_request(before.table(), 3))
+            .replace_voter(fleet.verified_request(before.table(), 3))
             .await,
         Err(VoterReplacementError::TargetStillLive)
     );
@@ -799,7 +909,7 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
     fleet.network.disconnect_and_shutdown(&fleet.nodes[2]).await;
     tokio::time::sleep(VOTER_RECENT_TRAFFIC_WINDOW + Duration::from_millis(100)).await;
     let prepared = leader
-        .replace_voter(verified_request(&genesis(), 3))
+        .replace_voter(fleet.verified_request(&fleet.genesis(), 3))
         .await
         .unwrap();
     assert!(prepared.table().is_retired(member(3, 1).identity.node_id()));
@@ -807,7 +917,7 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
     // the accepted credential or policy has rotated. They grant no new slot.
     let retained = &prepared.table().replacement.as_ref().unwrap().attestation;
     let current = VoterReplacementAuthorization::new(
-        genesis().cluster_instance,
+        fleet.genesis().cluster_instance,
         BTreeSet::from([SlotId::new(3).unwrap()]),
         "spiffe://example.test/recovery-controller".into(),
         public(&member(21, 1)),
@@ -875,8 +985,8 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
     let directory = fleet.directories[1].path();
     let backend = SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap();
     let survivor = ConsensusSessionStore::open_with_voter_slots_and_integrity(
-        topology(2),
-        genesis(),
+        fleet.topology(2),
+        fleet.genesis(),
         member(2, 1).identity.node_id(),
         backend,
         directory.join("snapshots"),
@@ -958,10 +1068,10 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
             .await
             .unwrap()
     );
-    let directory = tempfile::tempdir().unwrap();
+    let directory = fleet.candidate_directory(3, 2);
     let backend = SqliteSessionBackend::open(directory.path().join("session.sqlite")).unwrap();
     let candidate = ConsensusSessionStore::open_with_voter_slots_and_integrity(
-        topology(3),
+        fleet.topology(3),
         prepared.table().clone(),
         member(3, 2).identity.node_id(),
         backend,
@@ -977,7 +1087,7 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
     drop(candidate);
     let backend = SqliteSessionBackend::open(directory.path().join("session.sqlite")).unwrap();
     let candidate = ConsensusSessionStore::open_with_voter_slots_and_integrity(
-        topology(3),
+        fleet.topology(3),
         prepared.table().clone(),
         member(3, 2).identity.node_id(),
         backend,
@@ -1113,7 +1223,7 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
     let directory = fleet.directories.last().unwrap().path();
     let backend = SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap();
     let reopened = ConsensusSessionStore::open_with_voter_slots_and_integrity(
-        topology(3),
+        fleet.topology(3),
         prepared.table().clone(),
         member(3, 2).identity.node_id(),
         backend,
@@ -1208,7 +1318,7 @@ async fn fixed_slot_five_and_nine_voter_quorums_refuse_raw_high_term_traffic() {
         );
         assert_eq!(
             receiver.voter_slot_state().await.unwrap().table(),
-            &genesis_for(size)
+            &fleet.genesis()
         );
         fleet.nodes[0]
             .inner
@@ -1225,17 +1335,23 @@ async fn voter_snapshot_barrier_closes_local_application_admission_before_dispat
     let fleet = Fleet::open().await;
     let target = fleet.nodes[2].clone();
     assert!(target.exact_membership_is_admitted());
-    let mut incoming = genesis();
+    let mut incoming = fleet.genesis();
     incoming
         .apply_control(
-            &VoterSlotControl::Begin(Box::new(verified_request(&genesis(), 3).request().clone())),
+            &VoterSlotControl::Begin(Box::new(
+                fleet
+                    .verified_request(&fleet.genesis(), 3)
+                    .request()
+                    .clone(),
+            )),
             VoterSlotLogId {
                 term: 10,
                 index: 100,
             },
         )
         .unwrap();
-    let members = genesis()
+    let members = fleet
+        .genesis()
         .current_configuration()
         .members
         .iter()
@@ -1298,7 +1414,7 @@ async fn voter_snapshot_deadline_retains_inspected_artifact_until_engine_complet
     use opc_consensus::engine::raft::InstallSnapshotRequest;
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let fleet = Fleet::open().await;
+    let fleet = Fleet::open_with_delayed_last().await;
     let leader = &fleet.nodes[0];
     leader.inner.raft.trigger().snapshot().await.unwrap();
     let mut progress = leader.inner.raft.metrics();
@@ -1325,11 +1441,11 @@ async fn voter_snapshot_deadline_retains_inspected_artifact_until_engine_complet
         .with_raft_state(|state| *state.vote_ref())
         .await
         .unwrap();
-    let directory = tempfile::tempdir().unwrap();
+    let directory = &fleet.directories[2];
     let backend = SqliteSessionBackend::open(directory.path().join("session.sqlite")).unwrap();
     let target = ConsensusSessionStore::open_with_voter_slots_and_integrity(
-        topology(3),
-        genesis(),
+        fleet.topology(3),
+        fleet.genesis(),
         member(3, 1).identity.node_id(),
         backend,
         directory.path().join("snapshots"),
@@ -1418,12 +1534,14 @@ async fn voter_provisional_prepare_reinstalls_the_engine_fence_before_reopened_r
         .store(member(2, 1).identity.node_id().get(), Ordering::SeqCst);
     let leader = fleet.nodes.remove(0);
     assert_eq!(
-        leader.replace_voter(verified_request(&genesis(), 3)).await,
+        leader
+            .replace_voter(fleet.verified_request(&fleet.genesis(), 3))
+            .await,
         Err(VoterReplacementError::OutcomeUnknown)
     );
     let provisional = leader.voter_slot_state().await.unwrap();
     assert!(provisional.intent().is_some());
-    assert_eq!(provisional.table(), &genesis());
+    assert_eq!(provisional.table(), &fleet.genesis());
     fleet
         .network
         .handlers
@@ -1434,8 +1552,8 @@ async fn voter_provisional_prepare_reinstalls_the_engine_fence_before_reopened_r
     drop(leader);
     let directory = fleet.directories[0].path();
     let reopened = ConsensusSessionStore::open_with_voter_slots_and_integrity(
-        topology(1),
-        genesis(),
+        fleet.topology(1),
+        fleet.genesis(),
         member(1, 1).identity.node_id(),
         SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap(),
         directory.join("snapshots"),
@@ -1592,7 +1710,7 @@ async fn vetoed_prepare_recovers_with_elected_leader(winner: u16) {
         .network
         .paused_nonempty_append_to
         .store(b, Ordering::SeqCst);
-    let request = verified_request(&genesis(), 3);
+    let request = fleet.verified_request(&fleet.genesis(), 3);
     let proposer = leader.clone();
     let proposal = tokio::spawn(async move { proposer.replace_voter(request).await });
     // Wait until A has passed its probe, fenced C and durably appended Prepare.
@@ -1780,11 +1898,8 @@ async fn voter_higher_term_target_leader_truncates_reopened_prepare() {
         .paused_nonempty_append_to
         .store(b, Ordering::SeqCst);
     let proposer = leader.clone();
-    let proposal = tokio::spawn(async move {
-        proposer
-            .replace_voter(verified_request(&genesis(), 3))
-            .await
-    });
+    let request = fleet.verified_request(&fleet.genesis(), 3);
+    let proposal = tokio::spawn(async move { proposer.replace_voter(request).await });
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if published_voter_state(&leader).is_some_and(|state| state.intent().is_some()) {
@@ -1839,8 +1954,8 @@ async fn voter_higher_term_target_leader_truncates_reopened_prepare() {
     let reopened = loop {
         attempt += 1;
         let result = ConsensusSessionStore::open_with_voter_slots_and_integrity(
-            topology(1),
-            genesis(),
+            fleet.topology(1),
+            fleet.genesis(),
             member(1, 1).identity.node_id(),
             SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap(),
             directory.join("snapshots"),

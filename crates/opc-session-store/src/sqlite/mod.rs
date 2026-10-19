@@ -46,6 +46,7 @@ pub mod audit;
 pub(crate) mod consensus;
 #[cfg(target_os = "linux")]
 mod native;
+mod voter_identity;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use native::startup_pressure;
 #[cfg(target_os = "linux")]
@@ -636,6 +637,7 @@ pub struct SqliteSessionBackend {
     scope_scan_limits: Arc<StdMutex<crate::scope_scan::ScopeScanLimits>>,
     pub(crate) fenced_transition_profile: crate::FencedTransitionV2Profile,
     pub(crate) voter_seed: Option<Arc<consensus::voter_slots::Seed>>,
+    pub(crate) voter_signer: Option<crate::VoterIdentitySigner>,
     #[cfg(target_os = "linux")]
     pub(crate) native_owner: Option<Arc<consensus::wal::owner::NativeOwner>>,
     #[cfg(target_os = "linux")]
@@ -1474,6 +1476,7 @@ impl SqliteSessionBackend {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             fenced_transition_profile,
             voter_seed: None,
+            voter_signer: None,
             #[cfg(target_os = "linux")]
             native_owner,
             #[cfg(target_os = "linux")]
@@ -1586,6 +1589,23 @@ impl SqliteSessionBackend {
         &self,
     ) -> Result<bool, crate::consensus::storage::SessionConsensusStorageError> {
         let conn = self.conn.lock().await;
+        if let Some(expected) = &self.voter_signer {
+            let path = self
+                .database_path
+                .as_ref()
+                .ok_or(crate::consensus::storage::SessionConsensusStorageError::IdentityMismatch)?;
+            let retained = voter_identity::read_anchor(&conn, path).map_err(|_| {
+                crate::consensus::storage::SessionConsensusStorageError::IdentityMismatch
+            })?;
+            if retained.cluster_instance() != expected.cluster_instance()
+                || retained.identity() != expected.identity()
+                || retained.key_digest() != expected.key_digest()
+            {
+                return Err(
+                    crate::consensus::storage::SessionConsensusStorageError::IdentityMismatch,
+                );
+            }
+        }
         consensus::voter_slots::preflight(&conn, self.voter_seed.as_deref())
     }
 

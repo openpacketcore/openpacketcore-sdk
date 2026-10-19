@@ -24,6 +24,7 @@ pub(super) struct SessionVoterSetup {
     pub(super) initial: VoterSlotTable,
     pub(super) local: SessionConsensusNodeId,
     pub(super) resolver: Arc<dyn VoterPeerResolver>,
+    pub(super) signer: crate::VoterIdentitySigner,
 }
 
 pub(super) struct SessionVoterProfile {
@@ -204,7 +205,25 @@ impl SessionVoterProfile {
         local: SessionConsensusNodeId,
         core: crate::sqlite::consensus::SqliteConsensusCore,
         resolver: Arc<dyn VoterPeerResolver>,
+        signer: crate::VoterIdentitySigner,
     ) -> Result<Arc<Self>, ConsensusSessionStoreOpenError> {
+        // The recovered committed table replaces the manifest as authority.
+        // Refuse a retired/rebound local key before attaching an engine or
+        // enabling any election, heartbeat, or authenticated RPC service.
+        let retained = Reader(core.clone())
+            .read_voter_slot_state()
+            .await
+            .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
+        if retained.table().cluster_instance != signer.cluster_instance()
+            || !retained.table().slots.iter().any(|slot| {
+                slot.member.identity.node_id() == local
+                    && slot.member.identity == signer.identity()
+                    && slot.member.key_digest == signer.key_digest()
+                    && slot.retired_through < signer.identity().incarnation().get()
+            })
+        {
+            return Err(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired);
+        }
         let admission = SessionVoterAdmission::new(local, Arc::new(Reader(core.clone())))
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
@@ -473,11 +492,13 @@ impl SessionVoterProfile {
 }
 
 impl ConsensusSessionStore {
-    /// Open the explicit Durable fixed-slot incarnation profile from a fresh installation.
+    /// Reopen the explicit Durable fixed-slot incarnation profile after enrollment.
     ///
     /// The resolver must prove both current workload credentials and the selected
     /// incarnation key on every channel. Legacy transports cannot enable this
     /// profile. The capability remains unadvertised until end-to-end qualification.
+    /// A missing/mismatched volume key or anchor requires a new incarnation;
+    /// this method never enrolls, regenerates a key, or repairs an empty volume.
     pub async fn open_with_voter_slots_and_integrity(
         topology: ValidatedQuorumTopology,
         initial: VoterSlotTable,
@@ -498,13 +519,19 @@ impl ConsensusSessionStore {
             .slots
             .iter()
             .find(|slot| slot.member.identity.node_id() == local)
-            .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
+            .ok_or(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired)?;
         let local_genesis = topology
             .local_consensus_node_id()
             .and_then(|node| VoterSlotIdentity::from_node_id(node).ok())
             .ok_or(ConsensusSessionStoreOpenError::InvalidTopology)?;
         if selected.member.identity.slot() != local_genesis.slot() {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);
+        }
+        let signer = backend
+            .voter_identity_signer(initial.cluster_instance, &selected.member)
+            .await?;
+        if selected.retired_through >= selected.member.identity.incarnation().get() {
+            return Err(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired);
         }
         if initial != genesis
             && (selected.phase != VoterSlotPhase::Pending
@@ -542,6 +569,7 @@ impl ConsensusSessionStore {
                 initial,
                 local,
                 resolver,
+                signer,
             }),
         )
         .await

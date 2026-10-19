@@ -62,7 +62,7 @@ async fn voter_remote_survivor_live_target_veto_has_no_effect() {
     let before = leader.voter_slot_state().await.unwrap();
     let log_before = leader.inner.raft.metrics().borrow().last_log_index;
     let result = leader
-        .replace_voter(verified_request(before.table(), 3))
+        .replace_voter(fleet.verified_request(before.table(), 3))
         .await;
     let after = leader.voter_slot_state().await.unwrap();
     let log_after = leader.inner.raft.metrics().borrow().last_log_index;

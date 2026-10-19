@@ -111,7 +111,12 @@ pub(super) fn initialize(
 ) -> Result<(), SessionConsensusStorageError> {
     let stored = read_seed(conn).map_err(|_| SessionConsensusStorageError::CorruptState)?;
     match (selected, stored) {
-        (None, None) => Ok(()),
+        (None, None)
+            if !super::super::voter_identity::anchor_present(conn)
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)? =>
+        {
+            Ok(())
+        }
         (Some(selected), Some(stored))
             if selected.genesis == stored.genesis
                 && selected.identity().ok() == Some(identity)
@@ -208,7 +213,12 @@ pub(crate) fn preflight(
 ) -> Result<bool, SessionConsensusStorageError> {
     let retained = read_seed(conn).map_err(|_| SessionConsensusStorageError::CorruptState)?;
     match (selected, retained.as_ref()) {
-        (None, None) => Ok(false),
+        (None, None)
+            if !super::super::voter_identity::anchor_present(conn)
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)? =>
+        {
+            Ok(false)
+        }
         (Some(selected), Some(retained)) if selected.genesis == retained.genesis => Ok(true),
         (Some(_), None)
             if !table_exists(conn, "consensus_identity")

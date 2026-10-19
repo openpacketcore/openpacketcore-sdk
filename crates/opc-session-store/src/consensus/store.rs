@@ -503,6 +503,14 @@ fn attestation_deadline_from_verification_start(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ConsensusSessionStoreOpenError {
+    /// The volume has no matching enrolled key/anchor, or this incarnation is
+    /// retired. Select a new incarnation through the surviving quorum; never
+    /// recreate the missing identity or initialize this volume as genesis.
+    #[error("voter identity replacement required")]
+    VoterIdentityReplacementRequired,
+    /// Explicit enrollment never replaces an existing or interrupted anchor.
+    #[error("voter identity is already enrolled")]
+    VoterIdentityAlreadyEnrolled,
     /// An existing storage root selected another persistence mode. Changing
     /// acknowledgement semantics never converts or resets retained state.
     #[error("session consensus persistence mode does not match this storage root")]
@@ -3664,7 +3672,11 @@ impl ConsensusSessionStore {
         if topology.voter_slot_genesis().is_some() != voter_setup.is_some() {
             return Err(ConsensusSessionStoreOpenError::InvalidTopology);
         }
+        if voter_setup.is_none() && backend.has_voter_identity_anchor().await? {
+            return Err(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired);
+        }
         if let Some(setup) = &voter_setup {
+            backend.voter_signer = Some(setup.signer.clone());
             if persistence != SessionPersistenceMode::Durable {
                 return Err(ConsensusSessionStoreOpenError::PersistenceModeMismatch);
             }
@@ -3811,6 +3823,7 @@ impl ConsensusSessionStore {
                     local_node_id,
                     log_store.voter_slot_core(),
                     setup.resolver,
+                    setup.signer,
                 )
                 .await?,
             )
@@ -4011,6 +4024,9 @@ impl ConsensusSessionStore {
         operation_timeout: Duration,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
         Self::require_dynamic_consensus_platform()?;
+        if backend.has_voter_identity_anchor().await? {
+            return Err(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired);
+        }
         Self::open_with_clock(
             topology,
             backend,
@@ -6506,7 +6522,21 @@ impl ConsensusSessionStore {
             })?
             .map_err(|_| ConsensusSessionStoreOpenError::EngineUnavailable)?;
         let canonical_bootstrap = self.inner.bootstrap_members.first().copied();
-        if !initialized && canonical_bootstrap == Some(self.inner.local_node_id) {
+        let may_initialize = self.inner.voter_profile.as_ref().map_or_else(
+            || canonical_bootstrap == Some(self.inner.local_node_id),
+            |profile| {
+                profile.admission.local_voting_admitted()
+                    && self
+                        .inner
+                        .bootstrap_members
+                        .contains(&self.inner.local_node_id)
+            },
+        );
+        // Every enrolled genesis member proposes the same complete manifest.
+        // A missing preferred initiator must not deadlock a retained majority.
+        // Replacement incarnations are absent from that manifest and cannot
+        // enter this path, including while their first snapshot is pending.
+        if !initialized && may_initialize {
             let initialize = tokio::time::timeout_at(
                 deadline,
                 self.inner

@@ -12,7 +12,7 @@ pub(super) async fn prepared_fleet() -> (Fleet, ConsensusSessionStore, VoterSlot
     fleet.nodes.pop().unwrap().shutdown().await.unwrap();
     tokio::time::sleep(VOTER_RECENT_TRAFFIC_WINDOW + Duration::from_millis(100)).await;
     let prepared = leader
-        .replace_voter(verified_request(&genesis(), 3))
+        .replace_voter(fleet.verified_request(&fleet.genesis(), 3))
         .await
         .unwrap();
     (fleet, leader, prepared)
@@ -22,9 +22,9 @@ pub(super) async fn add_candidate(
     fleet: &mut Fleet,
     prepared: &VoterSlotDurableState,
 ) -> ConsensusSessionStore {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = fleet.candidate_directory(3, 2);
     let candidate = ConsensusSessionStore::open_with_voter_slots_and_integrity(
-        topology(3),
+        fleet.topology(3),
         prepared.table().clone(),
         member(3, 2).identity.node_id(),
         SqliteSessionBackend::open(directory.path().join("session.sqlite")).unwrap(),

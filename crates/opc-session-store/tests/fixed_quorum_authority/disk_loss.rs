@@ -1,5 +1,6 @@
 //! An erased voter must not make a shorter history authoritative.
 
+use super::enrolled::{EnrolledFleet as ColdFleet, OpenVoter};
 use super::*;
 use opc_session_store::test_support::{
     append_consensus_padding_entry_for_test, consensus_padding_receipt_status_for_test,
@@ -14,42 +15,19 @@ fn volume(fleet: &ColdFleet, index: usize) -> PathBuf {
     fleet.directory.path().join(format!("volume-{index}"))
 }
 
-async fn open(fleet: &ColdFleet, index: usize) -> ConsensusSessionStore {
-    let directory = volume(fleet, index);
-    std::fs::create_dir_all(&directory).expect("private voter volume");
-    let peers = fleet
-        .peers
-        .iter()
-        .enumerate()
-        .filter(|(other, _)| *other != index)
-        .map(|(_, peer)| {
-            let transport: Arc<dyn SessionConsensusPeer> = peer.clone();
-            (peer.node_id(), transport)
-        })
-        .collect();
-    let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
-        fleet.topologies[index].clone(),
-        SqliteSessionBackend::open(directory.join("voter.sqlite"))
-            .expect("file-backed voter volume"),
-        directory.join("snapshots"),
-        peers,
-        SnapshotIntegrityPolicy::PortableVerified,
-    )
-    .await
-    .expect("open voter under its configured identity");
-    fleet.peers[index]
-        .transport
-        .install(store.rpc_handler())
-        .await;
-    store
+async fn open(fleet: &ColdFleet, index: usize) -> OpenVoter {
+    fleet.open(index).await
 }
 
-async fn initialize(stores: &[Option<ConsensusSessionStore>]) {
+async fn initialize(stores: &[Option<OpenVoter>]) {
     join_all(stores.iter().flatten().map(|store| async {
         loop {
             match store.initialize_cluster().await {
                 Ok(()) => return,
                 Err(ConsensusSessionStoreOpenError::ClusterFormationRejected) => {}
+                Err(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired) => {
+                    assert!(store.refused(), "replacement refusal has no running engine");
+                }
                 other => panic!("unexpected voter admission result: {other:?}"),
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -86,20 +64,21 @@ async fn wait_for_receipt(store: &ConsensusSessionStore, request: [u8; 16], inde
     .expect("voter applies the exact committed receipt");
 }
 
-async fn drain(fleet: &ColdFleet, stores: &mut [Option<ConsensusSessionStore>]) {
+async fn drain(fleet: &ColdFleet, stores: &mut [Option<OpenVoter>]) {
     for peer in &fleet.peers {
         peer.transport.clear().await;
     }
-    for result in join_all(stores.iter().flatten().map(ConsensusSessionStore::shutdown)).await {
+    for result in join_all(stores.iter().flatten().map(OpenVoter::shutdown)).await {
         result.expect("drain voter before removing its volume");
     }
+    fleet.forget_signers();
     for store in stores {
         *store = None;
     }
 }
 
 async fn lost_voter_cannot_erase_committed_history(wipe_canonical: bool) {
-    let fleet = ColdFleet::new();
+    let fleet = ColdFleet::new().await;
     let mut stores = Vec::new();
     for index in 0..3 {
         stores.push(Some(open(&fleet, index).await));
@@ -171,6 +150,10 @@ async fn lost_voter_cannot_erase_committed_history(wipe_canonical: bool) {
         }
         stores[lagging] = Some(open(&fleet, lagging).await);
         stores[wiped] = Some(open(&fleet, wiped).await);
+        assert!(
+            stores[wiped].as_ref().unwrap().refused(),
+            "the erased volume must refuse its enrolled identity before starting Raft"
+        );
         let pre_votes_before: usize = fleet
             .peers
             .iter()
@@ -248,4 +231,165 @@ async fn lost_noncanonical_voter_cannot_erase_a_committed_entry() {
 #[tokio::test]
 async fn lost_canonical_voter_cannot_erase_a_committed_entry() {
     lost_voter_cannot_erase_committed_history(true).await;
+}
+
+#[tokio::test]
+async fn genesis_survivor_and_erased_voter_stall_until_the_committed_holder_returns() {
+    let fleet = ColdFleet::new().await;
+    let mut stores: Vec<Option<OpenVoter>> = (0..3).map(|_| None).collect();
+    let outcome = AssertUnwindSafe(async {
+        let wiped = 0;
+        let genesis = 1;
+        let holder = 2;
+
+        // The nonpreferred member is genuinely enrolled and has exactly the
+        // genesis entry. It never receives the subsequently committed history.
+        stores[genesis] = Some(open(&fleet, genesis).await);
+        assert_eq!(
+            stores[genesis].as_ref().unwrap().initialize_cluster().await,
+            Err(ConsensusSessionStoreOpenError::ClusterFormationRejected)
+        );
+        assert_eq!(
+            stores[genesis].as_ref().unwrap().status().last_log_index,
+            Some(0)
+        );
+        assert!(stores[genesis].as_ref().unwrap().status().term > 0);
+        assert!(!stores[genesis].as_ref().unwrap().status().admitted);
+        drain(&fleet, &mut stores).await;
+
+        fleet.peers[genesis].transport.set_enabled(false);
+        stores[wiped] = Some(open(&fleet, wiped).await);
+        stores[holder] = Some(open(&fleet, holder).await);
+        tokio::time::timeout(Duration::from_secs(30), initialize(&stores))
+            .await
+            .expect("the enrolled majority forms while the genesis-only voter is offline");
+        let leader = stores[wiped].as_ref().unwrap().status().leader_id.unwrap();
+        let leader_index = fleet
+            .peers
+            .iter()
+            .position(|peer| peer.node_id() == leader)
+            .unwrap();
+        let committed = append_consensus_padding_entry_for_test(
+            stores[leader_index].as_ref().unwrap(),
+            COMMITTED,
+        )
+        .await
+        .expect("acknowledge history on both available volumes");
+        assert!(committed > 0);
+        for index in [wiped, holder] {
+            wait_for_receipt(stores[index].as_ref().unwrap(), COMMITTED, committed).await;
+        }
+        drain(&fleet, &mut stores).await;
+        std::fs::remove_dir_all(volume(&fleet, wiped)).unwrap();
+        fleet.peers[holder].transport.set_enabled(false);
+        fleet.peers[genesis].transport.set_enabled(true);
+        stores[genesis] = Some(open(&fleet, genesis).await);
+        stores[wiped] = Some(open(&fleet, wiped).await);
+        assert!(stores[wiped].as_ref().unwrap().refused());
+        assert_eq!(consensus_padding_receipt_status_for_test(
+            stores[genesis].as_ref().unwrap(), COMMITTED,
+        ).await.unwrap(), ConsensusPaddingReceiptStatusForTest::NotFound);
+        let inquiries: usize = fleet
+            .peers
+            .iter()
+            .map(|peer| peer.pre_votes.load(Ordering::SeqCst))
+            .sum();
+        let admitted = tokio::time::timeout(Duration::from_secs(30), async {
+            initialize(&stores).await;
+            append_consensus_padding_entry_for_test(stores[genesis].as_ref().unwrap(), AFTER_LOSS)
+                .await
+                .expect("an admitted majority could write");
+        })
+        .await;
+        assert!(
+            admitted.is_err(),
+            "genesis plus an erased volume must stall"
+        );
+        assert!(
+            fleet
+                .peers
+                .iter()
+                .map(|peer| peer.pre_votes.load(Ordering::SeqCst))
+                .sum::<usize>()
+                > inquiries,
+            "real automatic campaigns must exercise the safety boundary"
+        );
+        for store in stores.iter().flatten() {
+            assert!(!store.status().admitted);
+        }
+        assert_eq!(
+            stores[genesis].as_ref().unwrap().status().last_log_index,
+            Some(0)
+        );
+
+        fleet.peers[wiped].transport.clear().await;
+        fleet.peers[wiped].transport.set_enabled(false);
+        stores[wiped].take().unwrap().shutdown().await.unwrap();
+        fleet.peers[holder].transport.set_enabled(true);
+        stores[holder] = Some(open(&fleet, holder).await);
+        tokio::time::timeout(Duration::from_secs(30), initialize(&stores))
+            .await
+            .expect("the retained majority heals within the existing readiness bound");
+        for store in stores.iter().flatten() {
+            wait_for_receipt(store, COMMITTED, committed).await;
+        }
+        assert_eq!(
+            stores[genesis].as_ref().unwrap().status().leader_id,
+            Some(fleet.peers[holder].node_id()),
+            "the retained longer log wins"
+        );
+        let after =
+            append_consensus_padding_entry_for_test(stores[holder].as_ref().unwrap(), AFTER_LOSS)
+                .await
+                .expect("the healed majority accepts new durable work");
+        assert!(after > committed);
+        wait_for_receipt(stores[genesis].as_ref().unwrap(), AFTER_LOSS, after).await;
+    })
+    .catch_unwind()
+    .await;
+    drain(&fleet, &mut stores).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn enrolled_majority_forms_without_the_preferred_genesis_initiator() {
+    let fleet = ColdFleet::new().await;
+    let mut stores: Vec<Option<OpenVoter>> = (0..3).map(|_| None).collect();
+    let outcome = AssertUnwindSafe(async {
+        fleet.peers[0].transport.set_enabled(false);
+        stores[1] = Some(open(&fleet, 1).await);
+        stores[2] = Some(open(&fleet, 2).await);
+        tokio::time::timeout(Duration::from_secs(30), initialize(&stores))
+            .await
+            .expect("any enrolled genesis majority can initialize the exact manifest");
+        let leader = stores[1].as_ref().unwrap().status().leader_id.unwrap();
+        let leader_index = fleet
+            .peers
+            .iter()
+            .position(|peer| peer.node_id() == leader)
+            .unwrap();
+        assert_ne!(leader_index, 0);
+        let committed = append_consensus_padding_entry_for_test(
+            stores[leader_index].as_ref().unwrap(),
+            COMMITTED,
+        )
+        .await
+        .expect("the majority commits without the preferred initiator");
+        for store in stores.iter().flatten() {
+            assert!(store.status().admitted);
+            wait_for_receipt(store, COMMITTED, committed).await;
+            assert_eq!(
+                store.voter_slot_state().await.unwrap().table(),
+                &fleet.genesis
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    drain(&fleet, &mut stores).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }

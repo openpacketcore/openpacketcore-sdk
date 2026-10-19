@@ -10,6 +10,10 @@ use std::sync::atomic::AtomicUsize;
 #[path = "disk_loss.rs"]
 mod disk_loss;
 
+#[cfg(feature = "test-control")]
+#[path = "enrolled.rs"]
+mod enrolled;
+
 #[derive(Debug)]
 struct ObservedPeer {
     transport: ScopedLoopbackPeer,
