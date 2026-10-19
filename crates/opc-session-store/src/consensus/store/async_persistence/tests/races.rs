@@ -60,7 +60,7 @@ impl ReplyRelease {
         Self::install(peer, sender, ReplyFilter::AppendAtOrAfter(minimum_index))
     }
 
-    fn vote(peer: &Peer, sender: SessionConsensusNodeId) -> Self {
+    pub(super) fn vote(peer: &Peer, sender: SessionConsensusNodeId) -> Self {
         Self::install(peer, sender, ReplyFilter::GrantedVote)
     }
 

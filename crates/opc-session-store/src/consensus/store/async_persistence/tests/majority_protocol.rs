@@ -816,6 +816,110 @@ async fn exercise_activation_retry_survives_a_new_real_leader(protected: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_recovery_late_committed_election_resumes_without_retiring_its_round() {
+    let _timing = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new(5);
+    let result = AssertUnwindSafe(async {
+        fleet.start().await;
+        cold(&mut fleet).await;
+        let candidate = index(&fleet, coordinator(&fleet));
+        let store = fleet.store(candidate);
+        let holds = fleet
+            .peers
+            .iter()
+            .filter(|peer| peer.node != store.inner.local_node_id)
+            .map(|peer| super::races::ReplyRelease::vote(peer, store.inner.local_node_id))
+            .collect::<Vec<_>>();
+        let entered = join_all(holds.iter().map(super::races::ReplyRelease::wait_started));
+        tokio::pin!(entered);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let attempt = store.initialize_cluster();
+                tokio::pin!(attempt);
+                tokio::select! {
+                    _ = &mut entered => {
+                        // The real campaign continues after this unchanged
+                        // 800ms caller deadline; no vote reply has reached it.
+                        assert!(attempt.await.is_err());
+                        break;
+                    }
+                    result = &mut attempt => assert!(result.is_err()),
+                }
+            }
+        })
+        .await
+        .expect("the real recovery campaign reaches the held vote replies");
+        let selection = {
+            let current = store
+                .inner
+                .persistence_protocol
+                .recovery_coordinator
+                .lock()
+                .await;
+            let current = current.as_ref().unwrap();
+            assert!(current.restart && current.resume_owned_commit);
+            assert!(current.boundary.is_none());
+            current.selection.clone().unwrap()
+        };
+        assert_eq!(selection.leader, store.inner.local_node_id);
+        let prepared_vote = selection.prepared[&selection.leader].retained.vote.unwrap();
+        // Comparison only: the actual election must produce this vote.
+        let mut elected = Vote::new(prepared_vote.leader_id.term + 1, selection.leader);
+        assert_eq!(store.inner.raft.metrics().borrow().vote, elected);
+        assert!(matches!(
+            control(&fleet, candidate, Action::CommitStatus(selection.clone())).await,
+            Ok(Reply::CommitStatus(false))
+        ));
+        for hold in &holds {
+            hold.release();
+        }
+        elected.commit();
+        super::races::until(
+            [store.inner.raft.metrics()],
+            || store.inner.raft.metrics().borrow().vote == elected,
+            "the delayed genuine grants complete the same real election",
+        )
+        .await;
+        assert!(!store.inner.persistence_protocol.is_active());
+        assert!(matches!(
+            control(&fleet, candidate, Action::CommitStatus(selection.clone())).await,
+            Ok(Reply::CommitStatus(true))
+        ));
+        recover(&fleet).await;
+        for recovered in fleet.stores.iter().flatten() {
+            assert_eq!(
+                recovered
+                    .inner
+                    .private_wal
+                    .as_ref()
+                    .unwrap()
+                    .async_authority()
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .era(),
+                selection.round.era,
+                "a caller timeout must not retire an intact committed election"
+            );
+        }
+        let request = create_request(store, 123, &provider()).await;
+        let lease = store
+            .acquire(
+                request.lease().key(),
+                OwnerId::new("late-election-successor").unwrap(),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        store.release(lease).await.unwrap();
+    })
+    .catch_unwind()
+    .await;
+    fleet.close_all().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_retries_an_election_interrupted_after_preparation() {
     exercise_retries_an_election_interrupted_after_preparation(false).await;
 }
