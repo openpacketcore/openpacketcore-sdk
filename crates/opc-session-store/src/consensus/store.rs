@@ -271,26 +271,38 @@ macro_rules! scoped_read_observe {
     };
 }
 
+// These observations follow only the explicitly scoped request future.
+// Independent tasks and other fixtures must not enter its exact counts.
 #[cfg(test)]
-static CONSUMER_CONSENSUS_PROPOSAL_COUNT: AtomicU64 = AtomicU64::new(0);
+#[derive(Default)]
+struct StoreOperationTestCounters {
+    fenced_transition_linearizable_admissions: AtomicU64,
+    roster_linearizable_barriers: AtomicU64,
+    roster_logical_time_reads: AtomicU64,
+    roster_admission_submissions: AtomicU64,
+    roster_terminal_submissions: AtomicU64,
+    roster_terminal_status_reads: AtomicU64,
+}
 
 #[cfg(test)]
-static FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT: AtomicU64 = AtomicU64::new(0);
+tokio::task_local! {
+    static STORE_OPERATION_TEST_COUNTERS: Arc<StoreOperationTestCounters>;
+}
 
 #[cfg(test)]
-static ROSTER_INGRESS_LINEARIZABLE_BARRIER_COUNT: AtomicU64 = AtomicU64::new(0);
+fn store_operation_test_counters() -> Arc<StoreOperationTestCounters> {
+    STORE_OPERATION_TEST_COUNTERS.with(Arc::clone)
+}
 
 #[cfg(test)]
-static ROSTER_INGRESS_LOGICAL_TIME_READ_COUNT: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-static ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-static ROSTER_INGRESS_TERMINAL_SUBMISSION_COUNT: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-static ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+async fn with_store_operation_test_counters(future: impl std::future::Future<Output = ()>) {
+    STORE_OPERATION_TEST_COUNTERS
+        .scope(
+            Arc::new(StoreOperationTestCounters::default()),
+            CONSUMER_CAS_TEST_COUNTERS.scope(Arc::new(ConsumerCasTestCounters::default()), future),
+        )
+        .await;
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -326,22 +338,39 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
+fn consumer_consensus_proposal_count() -> u64 {
+    CONSUMER_CAS_TEST_COUNTERS.with(|counters| counters.proposals.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
 fn reset_consumer_consensus_proposal_count() {
-    CONSUMER_CONSENSUS_PROPOSAL_COUNT.store(0, Ordering::Relaxed);
+    CONSUMER_CAS_TEST_COUNTERS.with(|counters| counters.proposals.store(0, Ordering::Relaxed));
 }
 
 #[cfg(test)]
 fn reset_fenced_transition_linearizable_admission_count() {
-    FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.store(0, Ordering::Relaxed);
+    store_operation_test_counters()
+        .fenced_transition_linearizable_admissions
+        .store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
 fn reset_roster_ingress_test_counters() {
-    ROSTER_INGRESS_LINEARIZABLE_BARRIER_COUNT.store(0, Ordering::Relaxed);
-    ROSTER_INGRESS_LOGICAL_TIME_READ_COUNT.store(0, Ordering::Relaxed);
-    ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.store(0, Ordering::Relaxed);
-    ROSTER_INGRESS_TERMINAL_SUBMISSION_COUNT.store(0, Ordering::Relaxed);
-    ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT.store(0, Ordering::Relaxed);
+    store_operation_test_counters()
+        .roster_linearizable_barriers
+        .store(0, Ordering::Relaxed);
+    store_operation_test_counters()
+        .roster_logical_time_reads
+        .store(0, Ordering::Relaxed);
+    store_operation_test_counters()
+        .roster_admission_submissions
+        .store(0, Ordering::Relaxed);
+    store_operation_test_counters()
+        .roster_terminal_submissions
+        .store(0, Ordering::Relaxed);
+    store_operation_test_counters()
+        .roster_terminal_status_reads
+        .store(0, Ordering::Relaxed);
 }
 
 const SESSION_CONSENSUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
@@ -8717,7 +8746,11 @@ impl ConsensusSessionStore {
                 | SessionMutationIntent::PreflightScopeProfile
         ) {
             #[cfg(test)]
-            FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
+            let _ = STORE_OPERATION_TEST_COUNTERS.try_with(|counters| {
+                counters
+                    .fenced_transition_linearizable_admissions
+                    .fetch_add(1, Ordering::Relaxed);
+            });
             match self.inner.read_barrier.admit(deadline).await {
                 Ok(admit) => Some(admit),
                 Err(LinearizableReadBarrierError::NotLeader { leader }) => {
@@ -9465,7 +9498,6 @@ impl ConsensusSessionStore {
                 Ok(Ok(response)) => {
                     #[cfg(test)]
                     if consumer_scoped {
-                        CONSUMER_CONSENSUS_PROPOSAL_COUNT.fetch_add(1, Ordering::Relaxed);
                         let _ = CONSUMER_CAS_TEST_COUNTERS.try_with(|counters| {
                             counters.record_proposal();
                         });
@@ -10093,7 +10125,11 @@ impl ConsensusSessionStore {
         scope_traffic: bool,
     ) -> Result<Option<LogId<SessionConsensusNodeId>>, LinearizableBarrierFailure> {
         #[cfg(test)]
-        ROSTER_INGRESS_LINEARIZABLE_BARRIER_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = STORE_OPERATION_TEST_COUNTERS.try_with(|counters| {
+            counters
+                .roster_linearizable_barriers
+                .fetch_add(1, Ordering::Relaxed);
+        });
         #[cfg(test)]
         if let Ok(Some(failure)) = PUBLICATION_BARRIER_FAILURE_FOR_TEST.try_with(|fault| {
             let (remaining, failure) = fault.get()?;
@@ -13673,7 +13709,11 @@ impl ConsensusSessionConsumerService {
 
     async fn roster_read_time(&self) -> Result<Timestamp, SessionConsumerRosterRejection> {
         #[cfg(test)]
-        ROSTER_INGRESS_LOGICAL_TIME_READ_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = STORE_OPERATION_TEST_COUNTERS.try_with(|counters| {
+            counters
+                .roster_logical_time_reads
+                .fetch_add(1, Ordering::Relaxed);
+        });
         let persisted = self
             .store
             .inner
@@ -13939,7 +13979,11 @@ impl ConsensusSessionConsumerService {
         // before entering it so this one terminal proposal cannot self-block.
         drop(scope_guard);
         #[cfg(test)]
-        ROSTER_INGRESS_TERMINAL_SUBMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = STORE_OPERATION_TEST_COUNTERS.try_with(|counters| {
+            counters
+                .roster_terminal_submissions
+                .fetch_add(1, Ordering::Relaxed);
+        });
         match self
             .store
             .submit_request_before(
@@ -14111,7 +14155,11 @@ impl ConsensusSessionConsumerService {
         };
         drop(scope_guard);
         #[cfg(test)]
-        ROSTER_INGRESS_TERMINAL_SUBMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = STORE_OPERATION_TEST_COUNTERS.try_with(|counters| {
+            counters
+                .roster_terminal_submissions
+                .fetch_add(1, Ordering::Relaxed);
+        });
         match self
             .store
             .submit_request_before(
@@ -15138,7 +15186,11 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     Err(_) => return admission_response(SessionConsumerRosterRejection::Malformed),
                 };
                 #[cfg(test)]
-                ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
+                let _ = STORE_OPERATION_TEST_COUNTERS.try_with(|counters| {
+                    counters
+                        .roster_admission_submissions
+                        .fetch_add(1, Ordering::Relaxed);
+                });
                 match self
                     .store
                     .submit_request_before(
@@ -15461,7 +15513,11 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     Err(_) => return rejection_response(SessionConsumerRosterRejection::Malformed),
                 };
                 #[cfg(test)]
-                ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT.fetch_add(1, Ordering::Relaxed);
+                let _ = STORE_OPERATION_TEST_COUNTERS.try_with(|counters| {
+                    counters
+                        .roster_terminal_status_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                });
                 let read = match self
                     .store
                     .inner
@@ -15834,7 +15890,11 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     Err(_) => return reject(SessionConsumerRosterRejection::Malformed),
                 };
                 #[cfg(test)]
-                ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
+                let _ = STORE_OPERATION_TEST_COUNTERS.try_with(|counters| {
+                    counters
+                        .roster_admission_submissions
+                        .fetch_add(1, Ordering::Relaxed);
+                });
                 match self
                     .store
                     .submit_request_before(
@@ -16097,7 +16157,11 @@ impl SessionQuorumRosterIngress for ConsensusSessionConsumerService {
                     .protected_roster_v2_terminal_status_backend_entered
                     .fetch_add(1, Ordering::Relaxed);
                 #[cfg(test)]
-                ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT.fetch_add(1, Ordering::Relaxed);
+                let _ = STORE_OPERATION_TEST_COUNTERS.try_with(|counters| {
+                    counters
+                        .roster_terminal_status_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                });
                 let (read, authority_time) = match self
                     .store
                     .inner
@@ -22511,11 +22575,14 @@ mod membership_tests {
     }
 
     #[tokio::test]
-    #[allow(
-        clippy::await_holding_lock,
-        reason = "the roster-ingress call counters are process-global test evidence"
-    )]
     async fn protected_roster_ingress_has_two_mutations_and_read_only_status_paths() {
+        with_store_operation_test_counters(
+            protected_roster_ingress_has_two_mutations_and_read_only_status_paths_case(),
+        )
+        .await;
+    }
+
+    async fn protected_roster_ingress_has_two_mutations_and_read_only_status_paths_case() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let directory = tempfile::tempdir().expect("roster ingress directory");
         let start = Timestamp::from_str("2025-01-01T00:00:00Z").expect("test start");
@@ -22678,6 +22745,16 @@ mod membership_tests {
             session_consumer_roster_ingress_operation(admission_request.operation())
                 .expect("admission ingress operation");
 
+        // A separate fixture can issue ordinary quorum reads while this
+        // request's exact operation counts are observed.
+        let (
+            _other_directory,
+            other_store,
+            other_scope,
+            other_authorization,
+            other_key,
+            other_lease,
+        ) = consumer_boundary_store().await;
         reset_roster_ingress_test_counters();
         reset_consumer_consensus_proposal_count();
         let diagnostics_before_admission = store.protected_roster_diagnostic_snapshot();
@@ -22879,12 +22956,14 @@ mod membership_tests {
             "same-body replay applies at a new Raft position without another registration"
         );
         assert_eq!(
-            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
+            consumer_consensus_proposal_count(),
             2,
             "fresh admission and the no-effect replay are the only submitted admission commands"
         );
         assert_eq!(
-            ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_admission_submissions
+                .load(Ordering::Relaxed),
             2
         );
 
@@ -22932,12 +23011,14 @@ mod membership_tests {
             "an exact replay reaches the roster classifier instead of the generic ledger"
         );
         assert_eq!(
-            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
+            consumer_consensus_proposal_count(),
             3,
             "the exact replay is a no-effect roster command, not a cached capability response"
         );
         assert_eq!(
-            ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_admission_submissions
+                .load(Ordering::Relaxed),
             3
         );
 
@@ -23221,31 +23302,82 @@ mod membership_tests {
             Some(first_log + 5),
             "fresh admission, independent and exact replays, body conflict, and terminalization each append once"
         );
+        let other_counters = Arc::new(ConsumerCasTestCounters::default());
+        tokio::spawn(
+            CONSUMER_CAS_TEST_COUNTERS.scope(Arc::clone(&other_counters), async move {
+                let response = other_store
+                    .consumer_service()
+                    .execute(
+                        &other_authorization,
+                        SessionConsumerRequest::new(
+                            other_scope,
+                            SessionConsumerRequestId::from_bytes([0x96; 16]),
+                            SessionConsumerOperation::CompareAndSet {
+                                op: Box::new(CompareAndSet {
+                                    key: other_key.clone(),
+                                    lease: other_lease.clone(),
+                                    expected_generation: None,
+                                    new_record: consumer_record_with_payload_len(
+                                        &other_key,
+                                        &other_lease,
+                                        1024,
+                                    ),
+                                }),
+                            },
+                        ),
+                    )
+                    .await;
+                assert!(matches!(
+                    response,
+                    SessionConsumerResponse::CompareAndSet(Ok(_))
+                ));
+                other_store
+                    .linearizable_barrier_before(
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                    )
+                    .await
+                    .expect("independent fixture completes a real quorum read");
+            }),
+        )
+        .await
+        .expect("join independent consumer fixture");
+        assert_eq!(other_counters.proposals.load(Ordering::Relaxed), 2);
+        assert_eq!(other_counters.command_encodings.load(Ordering::Relaxed), 1);
         assert_eq!(
-            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
+            consumer_consensus_proposal_count(),
             1,
             "after replay accounting resets, terminalization is the only fresh-effect command"
         );
         assert_eq!(
-            ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_admission_submissions
+                .load(Ordering::Relaxed),
             0
         );
         assert_eq!(
-            ROSTER_INGRESS_TERMINAL_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_terminal_submissions
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(
-            ROSTER_INGRESS_LINEARIZABLE_BARRIER_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_linearizable_barriers
+                .load(Ordering::Relaxed),
             0,
             "terminalize must not issue a pre-write ReadIndex barrier"
         );
         assert_eq!(
-            ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_terminal_status_reads
+                .load(Ordering::Relaxed),
             0,
             "terminalize must not consult the terminal-status projection"
         );
         assert_eq!(
-            ROSTER_INGRESS_LOGICAL_TIME_READ_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_logical_time_reads
+                .load(Ordering::Relaxed),
             1,
             "terminalize performs its one local temporal admission read"
         );
@@ -23294,27 +23426,37 @@ mod membership_tests {
             store.inner.raft.metrics().borrow().last_log_index,
             status_log
         );
-        assert_eq!(CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(consumer_consensus_proposal_count(), 0);
         assert_eq!(
-            ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_admission_submissions
+                .load(Ordering::Relaxed),
             0
         );
         assert_eq!(
-            ROSTER_INGRESS_TERMINAL_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_terminal_submissions
+                .load(Ordering::Relaxed),
             0
         );
         assert_eq!(
-            ROSTER_INGRESS_LINEARIZABLE_BARRIER_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_linearizable_barriers
+                .load(Ordering::Relaxed),
             2,
             "each protected-roster read path has one quorum barrier"
         );
         assert_eq!(
-            ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_terminal_status_reads
+                .load(Ordering::Relaxed),
             1,
             "only terminal status reaches its terminal projection"
         );
         assert_eq!(
-            ROSTER_INGRESS_LOGICAL_TIME_READ_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_logical_time_reads
+                .load(Ordering::Relaxed),
             0,
             "status uses its post-barrier projection read rather than terminalize's pre-write read"
         );
@@ -23379,22 +23521,30 @@ mod membership_tests {
             store.inner.raft.metrics().borrow().last_log_index,
             expired_status_log
         );
-        assert_eq!(CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(consumer_consensus_proposal_count(), 0);
         assert_eq!(
-            ROSTER_INGRESS_ADMISSION_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_admission_submissions
+                .load(Ordering::Relaxed),
             0
         );
         assert_eq!(
-            ROSTER_INGRESS_TERMINAL_SUBMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_terminal_submissions
+                .load(Ordering::Relaxed),
             0
         );
         assert_eq!(
-            ROSTER_INGRESS_LINEARIZABLE_BARRIER_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_linearizable_barriers
+                .load(Ordering::Relaxed),
             1,
             "expired terminal status reaches the post-barrier expiry check"
         );
         assert_eq!(
-            ROSTER_INGRESS_TERMINAL_STATUS_READ_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .roster_terminal_status_reads
+                .load(Ordering::Relaxed),
             1,
             "expiry is rechecked from the post-barrier terminal projection time"
         );
@@ -24531,6 +24681,13 @@ mod membership_tests {
 
     #[tokio::test]
     async fn consumer_authorization_rejects_mixed_cas_and_batch_before_any_effect() {
+        with_store_operation_test_counters(
+            consumer_authorization_rejects_mixed_cas_and_batch_before_any_effect_case(),
+        )
+        .await;
+    }
+
+    async fn consumer_authorization_rejects_mixed_cas_and_batch_before_any_effect_case() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let (_directory, store, scope, authorization, key, lease) = consumer_boundary_store().await;
         let (
@@ -25501,6 +25658,13 @@ mod membership_tests {
 
     #[tokio::test]
     async fn consumer_fenced_transition_bypasses_the_legacy_binding_proposal() {
+        with_store_operation_test_counters(
+            consumer_fenced_transition_bypasses_the_legacy_binding_proposal_case(),
+        )
+        .await;
+    }
+
+    async fn consumer_fenced_transition_bypasses_the_legacy_binding_proposal_case() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let directory = tempfile::tempdir().expect("consumer transition directory");
         let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
@@ -25560,6 +25724,14 @@ mod membership_tests {
             FencedTransitionMutation::delete(Generation::new(1)),
         )
         .expect("transition");
+        let (
+            _other_directory,
+            other_store,
+            other_scope,
+            other_authorization,
+            other_key,
+            other_lease,
+        ) = consumer_boundary_store().await;
         reset_fenced_transition_linearizable_admission_count();
         reset_consumer_consensus_proposal_count();
         let before = store
@@ -25591,13 +25763,54 @@ mod membership_tests {
             Some(before + 1),
             "the consumer transition must not append a BindConsumerRequest marker"
         );
+        let other_counters = Arc::new(ConsumerCasTestCounters::default());
+        tokio::spawn(
+            CONSUMER_CAS_TEST_COUNTERS.scope(Arc::clone(&other_counters), async move {
+                let response = other_store
+                    .consumer_service()
+                    .execute(
+                        &other_authorization,
+                        SessionConsumerRequest::new(
+                            other_scope,
+                            SessionConsumerRequestId::from_bytes([0x96; 16]),
+                            SessionConsumerOperation::CompareAndSet {
+                                op: Box::new(CompareAndSet {
+                                    key: other_key.clone(),
+                                    lease: other_lease.clone(),
+                                    expected_generation: None,
+                                    new_record: consumer_record_with_payload_len(
+                                        &other_key,
+                                        &other_lease,
+                                        1024,
+                                    ),
+                                }),
+                            },
+                        ),
+                    )
+                    .await;
+                assert!(matches!(
+                    response,
+                    SessionConsumerResponse::CompareAndSet(Ok(_))
+                ));
+                other_store
+                    .activate_fenced_transition_capability()
+                    .await
+                    .expect("independent fixture completes a real activation admission");
+            }),
+        )
+        .await
+        .expect("join independent consumer fixture");
+        assert_eq!(other_counters.proposals.load(Ordering::Relaxed), 2);
+        assert_eq!(other_counters.command_encodings.load(Ordering::Relaxed), 1);
         assert_eq!(
-            FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .fenced_transition_linearizable_admissions
+                .load(Ordering::Relaxed),
             1,
             "a warmed local fenced transition admits exactly one linearizable quorum proof"
         );
         assert_eq!(
-            CONSUMER_CONSENSUS_PROPOSAL_COUNT.load(Ordering::Relaxed),
+            consumer_consensus_proposal_count(),
             1,
             "the carried proof reaches exactly one fenced-transition proposal"
         );
@@ -25605,6 +25818,13 @@ mod membership_tests {
 
     #[tokio::test]
     async fn state_voter_activation_is_one_proof_one_proposal_and_idempotent() {
+        with_store_operation_test_counters(
+            state_voter_activation_is_one_proof_one_proposal_and_idempotent_case(),
+        )
+        .await;
+    }
+
+    async fn state_voter_activation_is_one_proof_one_proposal_and_idempotent_case() {
         let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
         let (_directory, store, scope, authorization, key, _lease) =
             consumer_boundary_store().await;
@@ -25627,7 +25847,9 @@ mod membership_tests {
             "cold activation appends exactly its cluster-scope certificate"
         );
         assert_eq!(
-            FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .fenced_transition_linearizable_admissions
+                .load(Ordering::Relaxed),
             1,
             "cold activation carries exactly one typed quorum admission"
         );
@@ -25642,7 +25864,9 @@ mod membership_tests {
             "an already applied exact certificate never appends a second proposal"
         );
         assert_eq!(
-            FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters()
+                .fenced_transition_linearizable_admissions
+                .load(Ordering::Relaxed),
             2,
             "repeat activation still proves the current leader but reuses the durable certificate"
         );
@@ -25699,7 +25923,7 @@ mod membership_tests {
             "an activated V1 transition retains one proposal and no binding marker"
         );
         assert_eq!(
-            FENCED_TRANSITION_LINEARIZABLE_ADMISSION_COUNT.load(Ordering::Relaxed),
+            store_operation_test_counters().fenced_transition_linearizable_admissions.load(Ordering::Relaxed),
             0,
             "the durable activation lets the following V1 write quorum linearize without a redundant read admission"
         );
