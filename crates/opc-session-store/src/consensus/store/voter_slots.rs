@@ -1499,14 +1499,14 @@ pub(super) async fn handle(
                     let rpc: PreVoteRequest<SessionConsensusNodeId> =
                         decode_and_bind_sender(&request.payload, sender)
                             .map_err(|_| VoterReplacementError::UnauthorizedReplacement)?;
-                    Ok(
-                        encode_engine_result(&store.inner.raft.pre_vote(rpc).await).map_or_else(
-                            rejected,
-                            |payload| SessionConsensusWireResponse {
-                                result: Ok(payload),
-                            },
-                        ),
+                    Ok(encode_engine_result(
+                        &store.inner.raft_handler.pre_vote_after_admission(rpc).await,
                     )
+                    .map_or_else(rejected, |payload| {
+                        SessionConsensusWireResponse {
+                            result: Ok(payload),
+                        }
+                    }))
                 }
                 SessionConsensusRpcFamily::InstallSnapshot => {
                     let rpc = snapshot.ok_or(VoterReplacementError::UnauthorizedReplacement)?;

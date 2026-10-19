@@ -6465,6 +6465,9 @@ impl ConsensusSessionStore {
     /// member invokes Openraft initialization. Other pristine members wait for
     /// replicated membership, avoiding fixed-timeout split-vote lockstep.
     /// Clean first formation fails closed if the canonical member is absent.
+    /// Fixed peers with no engine membership or leader state answer Pre-Vote
+    /// using the admitted topology, so a missed first campaign can recover
+    /// through automatic elections without changing this initialization rule.
     ///
     /// A cold Async voter requires a fresh live-quorum cut and actual catch-up,
     /// or supported unanimous retained-owner recovery when no compatible live

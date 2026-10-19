@@ -776,6 +776,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies the dispatched connection and trusted answer-Origin policy.
   Codec-only `correlate_answer` exchanges no longer authorize emergency access.
 
+- `opc-session-store`: recover fixed-quorum formation after the canonical
+  initializer's first campaign misses absent peers, including after restart.
+  Peers awaiting their first membership answer authenticated Pre-Vote inquiries
+  from the admitted fixed topology without changing votes, logs or timers.
+  Canonical initialization and quorum-gated application admission are preserved.
+
 - `opc-session-store` and `opc-persist`: add `shutdown_unplanned()` for an
   embedder with a failed replication listener. It fences admission, suppresses
   leadership handoff, and retains clone-wide, cancellation-safe engine and

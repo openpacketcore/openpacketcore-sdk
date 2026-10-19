@@ -106,7 +106,11 @@ For each node:
    to replicate. Nodes reopening persisted Openraft state skip bootstrap and
    re-admit normally, including a noncanonical persistent majority. Clean
    first formation fails closed if the canonical node is absent; do not
-   designate a substitute initializer under the same topology epoch. If no
+   designate a substitute initializer under the same topology epoch. If its
+   first campaign missed absent peers, automatic Pre-Vote retries recover once
+   a configured majority is reachable. Fixed peers awaiting their first
+   membership answer from their admitted topology without changing votes,
+   logs or timers. Retrying initialization needs no operator action. If no
    compatible majority is available and no peer has proved incompatible,
    returning admission reports `CompatibleQuorumUnavailable`. A known mismatch
    without a verified majority retains `ClusterFormationRejected`, including
