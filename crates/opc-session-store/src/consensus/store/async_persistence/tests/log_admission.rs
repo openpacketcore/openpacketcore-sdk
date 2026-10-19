@@ -547,7 +547,7 @@ async fn seed_with_owner(
                 last = last.max(writer.inner.raft.metrics().borrow().last_log_index.unwrap());
             }
         }
-        seed::after_batch(fleet, last).await;
+        seed::after_batch(fleet, last, deadline).await;
     }
     store
         .inner
@@ -1254,7 +1254,12 @@ async fn blocked_transfer(
             let last = store.inner.raft.metrics().borrow().last_log_index.unwrap();
             follower_store.inner.raft.wait(Some(WAIT))
                 .applied_index_at_least(Some(last), "follower caught up before isolation").await.unwrap();
-            fleet.set_link(leader, follower, false);
+            // A seed handoff must not let another leader catch this voter up.
+            for sender in 0..3 {
+                if sender != follower {
+                    fleet.set_link(sender, follower, false);
+                }
+            }
             let gate = Arc::new(SnapshotArtifactGate::new());
             let hold = store.inner.peer_directory.pause_snapshot_transfer_for_test(
                 follower_store.inner.local_node_id, gate.clone(),
@@ -1263,7 +1268,11 @@ async fn blocked_transfer(
             seed_owned_to(&fleet, store, &command, last + DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
                 + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;
             tokio::time::timeout(WAIT, gate.wait_started()).await.unwrap();
-            fleet.set_link(leader, follower, true);
+            for sender in 0..3 {
+                if sender != follower {
+                    fleet.set_link(sender, follower, true);
+                }
+            }
             let held_cut = hold.cut();
             // Select a newer cut whose purge target crosses the actual transfer.
             seed_owned_to(&fleet, store, &command, held_cut + DURABLE_OPENRAFT_PROFILE.retained_logs + 64).await;

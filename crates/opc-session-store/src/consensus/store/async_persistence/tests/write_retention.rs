@@ -242,6 +242,11 @@ async fn retained_batch(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_review_public_write_retains_with_seed_handoff() {
+    seed::force_seed_handoff(retained_batch(false, false, false, false, false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_admission_review_public_write_retains_local_request() {
     retained_batch(false, false, false, false, false).await;
 }

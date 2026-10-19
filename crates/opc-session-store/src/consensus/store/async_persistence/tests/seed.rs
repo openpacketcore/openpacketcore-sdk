@@ -9,23 +9,32 @@ type BatchPause = (oneshot::Sender<u64>, oneshot::Receiver<()>);
 tokio::task_local! {
     static AFTER_BATCH: RefCell<Option<BatchPause>>;
     static FORCE_FIRST_BATCH_HANDOFF: Cell<bool>;
+    static FORCE_CONNECTED_HANDOFF: Cell<bool>;
+    static TRACK_LAGGING_FOLLOWER: Cell<Option<usize>>;
 }
 
-pub(super) async fn after_batch(fleet: &Fleet, last: u64) {
-    if FORCE_FIRST_BATCH_HANDOFF
+pub(super) async fn after_batch(fleet: &Fleet, last: u64, deadline: tokio::time::Instant) {
+    let connected = FORCE_CONNECTED_HANDOFF
         .try_with(|force| force.replace(false))
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let ordinary = FORCE_FIRST_BATCH_HANDOFF
+        .try_with(|force| force.replace(false))
+        .unwrap_or(false);
+    if connected || ordinary {
         let leader = fleet.leader();
+        let offset = if connected { 2 } else { 1 };
         transfer_before(
             fleet,
             fleet.store(leader),
-            fleet.store((leader + 1) % 3),
-            tokio::time::Instant::now() + WAIT,
-            true,
+            fleet.store((leader + offset) % 3),
+            deadline,
+            !connected,
         )
         .await;
-        eprintln!("seed setup handoff committed after index {last}");
+        if connected {
+            TRACK_LAGGING_FOLLOWER.with(|tracked| tracked.set(Some((leader + 1) % 3)));
+        }
+        eprintln!("seed setup handoff committed after index {last}; connected={connected}");
     }
     if let Some((entered, released)) = AFTER_BATCH
         .try_with(|pause| pause.borrow_mut().take())
@@ -35,6 +44,40 @@ pub(super) async fn after_batch(fleet: &Fleet, last: u64) {
         entered.send(last).unwrap();
         released.await.unwrap();
     }
+    if let Some(follower) = TRACK_LAGGING_FOLLOWER.try_with(Cell::get).ok().flatten() {
+        let leader = leader_before(fleet, None, None, deadline).await;
+        let reachable = !fleet.peers[follower]
+            .blocked_senders
+            .lock()
+            .unwrap()
+            .contains(&leader.inner.local_node_id);
+        if reachable {
+            // Exercise the allowed successor-to-follower route before setup
+            // restores its original leader. Correct isolation leaves no route.
+            tokio::time::timeout_at(
+                deadline,
+                fleet
+                    .store(follower)
+                    .inner
+                    .raft
+                    .metrics()
+                    .wait_for(|current| current.last_applied.is_some_and(|log| log.index >= last)),
+            )
+            .await
+            .expect("follower observation retains the seed batch deadline")
+            .unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "test-control")]
+pub(super) async fn force_seed_handoff(operation: impl std::future::Future<Output = ()>) {
+    FORCE_FIRST_BATCH_HANDOFF
+        .scope(Cell::new(true), async {
+            operation.await;
+            assert!(!FORCE_FIRST_BATCH_HANDOFF.with(Cell::get));
+        })
+        .await;
 }
 
 async fn transfer_before(
@@ -66,7 +109,8 @@ async fn transfer_before(
             .iter()
             .flatten()
             .filter(|store| {
-                store.inner.local_node_id != source.inner.local_node_id
+                observe_all
+                    && store.inner.local_node_id != source.inner.local_node_id
                     && store.inner.local_node_id != successor.inner.local_node_id
             })
             .chain(std::iter::once(successor))
@@ -229,5 +273,22 @@ async fn log_admission_blocked_build_seed_handoff_preserves_owner() {
             blocked_build(SessionPersistenceMode::Durable, window, 1, false).await;
             assert!(!FORCE_FIRST_BATCH_HANDOFF.with(Cell::get));
         })
+        .await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_admission_blocked_transfer_seed_handoff_preserves_owner() {
+    let window = DURABLE_OPENRAFT_PROFILE.retained_logs
+        + 2 * DURABLE_OPENRAFT_PROFILE.logs_per_snapshot
+        + 64;
+    FORCE_CONNECTED_HANDOFF
+        .scope(
+            Cell::new(true),
+            TRACK_LAGGING_FOLLOWER.scope(Cell::new(None), async {
+                blocked_transfer(SessionPersistenceMode::Durable, window, 1, false).await;
+                assert!(!FORCE_CONNECTED_HANDOFF.with(Cell::get));
+            }),
+        )
         .await;
 }
