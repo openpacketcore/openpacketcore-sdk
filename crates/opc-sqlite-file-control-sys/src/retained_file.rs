@@ -3,14 +3,20 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek};
 use std::mem::ManuallyDrop;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
-use crate::{with_borrowed_sqlite_descriptor, with_main_file};
+use crate::with_main_file;
+
+mod unix_retirement;
+use unix_retirement::Retirement;
+
+#[cfg(test)]
+mod retirement_tests;
 
 #[cfg(test)]
 thread_local! {
@@ -18,33 +24,47 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-/// A regular file whose descriptor is owned and closed by SQLite.
+/// A regular file whose final close is coordinated with SQLite.
 ///
-/// Clones share ownership; they never duplicate the OS descriptor. The private
-/// connection is never queried, so it neither acquires database locks nor
-/// checkpoints a WAL. Its Unix VFS defers the final descriptor close while
-/// another SQLite connection holds POSIX locks on this inode. This also covers
-/// independently opened connections and cancelled workers.
+/// Clones share ownership; they never duplicate the OS descriptor. Admission
+/// reads the exact regular inode through its pinned descriptor. Final release
+/// joins the bundled Unix VFS's deferred-close queue while another SQLite
+/// connection holds POSIX locks on that inode. This includes independently
+/// opened connections and cancelled workers. No SQL or checkpoint is executed.
 #[derive(Clone)]
 pub struct RetainedSqliteFile {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    // This is only a borrowed view. SQLite alone closes the actual descriptor.
+    // Always retire through the native close coordinator, including failed
+    // admission and unwinding. Both fields are consumed exactly once in Drop.
     file: ManuallyDrop<File>,
-    // A mutex gives the unqueried, private connection a Sync owner. No caller
-    // can execute SQL, replace the main descriptor or close it independently.
-    _connection: Mutex<Connection>,
+    retirement: ManuallyDrop<Retirement>,
+    identity: (u64, u64),
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // SAFETY: these fields were initialized together and are never taken
+        // elsewhere. Arc invokes this destructor once after the last borrower.
+        let (file, retirement) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.file),
+                ManuallyDrop::take(&mut self.retirement),
+            )
+        };
+        retirement.close(file, self.identity);
+    }
 }
 
 impl RetainedSqliteFile {
     /// Open an existing regular file without admitting a final symlink.
     ///
-    /// An O_PATH pin establishes regular-file identity before SQLite opens the
-    /// reader. Both the SQLite descriptor and the public name must match that
-    /// held inode before the pin is returned. No raw readable descriptor is
-    /// created, including on failed admission.
+    /// An O_PATH pin establishes regular-file identity before any readable
+    /// open. The reader opens only that exact descriptor through procfs, never
+    /// its resolved pathname. A final public-name fence rejects substitution;
+    /// even failed admission retires the reader through SQLite's close queue.
     pub fn open_nofollow(path: &Path) -> io::Result<Self> {
         let pin = OpenOptions::new()
             .read(true)
@@ -69,50 +89,35 @@ impl RetainedSqliteFile {
         if !expected_metadata.is_file() {
             return Err(unavailable());
         }
-        // Resolve only the held descriptor. SQLite's NOFOLLOW flag rejects a
-        // substituted symlink, and the descriptor fence below rejects every
-        // different inode. No SQL is executed on the newly opened connection.
-        let path = std::fs::read_link(format!("/proc/self/fd/{}", expected.as_raw_fd()))?;
+        // Allocate close coordination before any readable descriptor exists.
+        // Following this procfs descriptor link reopens the held regular inode
+        // even if its old public pathname is concurrently replaced or removed.
+        let retirement = Retirement::prepare()?;
+        let path = format!("/proc/self/fd/{}", expected.as_raw_fd());
         #[cfg(test)]
         BEFORE_READABLE_OPEN.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
                 hook();
             }
         });
-        let connection = Connection::open_with_flags_and_vfs(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            "unix",
-        )
-        .map_err(|_| unavailable())?;
-        with_main_file(&connection, |observed| {
-            let metadata = observed.metadata()?;
-            if !metadata.is_file() || identity(&metadata) != identity(&expected_metadata) {
-                return Err(unavailable());
-            }
-            Ok(())
-        })
-        .map_err(|_| unavailable())??;
-        let file = with_borrowed_sqlite_descriptor(
-            &connection,
-            c"main",
-            rusqlite::ffi::SQLITE_FCNTL_FILE_POINTER,
-            |descriptor| {
-                // SAFETY: the private connection moves into Inner below and
-                // cannot be accessed by callers. It owns this descriptor for
-                // the entire Arc lifetime. ManuallyDrop cannot close it.
-                Ok(ManuallyDrop::new(unsafe { File::from_raw_fd(descriptor) }))
-            },
-        )
-        .map_err(|_| unavailable())?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?;
+        let mut inner = Inner {
+            file: ManuallyDrop::new(file),
+            retirement: ManuallyDrop::new(retirement),
+            identity: identity(&expected_metadata),
+        };
+        // The live descriptor supplied above fixes identity even if this fstat
+        // fails. Wrap before checking so every subsequent error uses the queue.
+        let metadata = inner.file.metadata()?;
+        inner.identity = identity(&metadata);
+        if !metadata.is_file() || inner.identity != identity(&expected_metadata) {
+            return Err(unavailable());
+        }
         Ok(Self {
-            inner: Arc::new(Inner {
-                file,
-                _connection: Mutex::new(connection),
-            }),
+            inner: Arc::new(inner),
         })
     }
 

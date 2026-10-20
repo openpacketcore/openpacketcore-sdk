@@ -39,9 +39,19 @@ fences. Callers retain the owning connection for as long as they retain a
 same-process inode identity; persistent recovery still needs UUID and handle
 identity.
 
-`RetainedSqliteFile` owns an unqueried, private SQLite connection for pins that
-must outlive their originating connection. Clones share this owner. Its final
-close participates in SQLite's Unix inode bookkeeping, which defers close while
-any SQLite connection to the inode holds POSIX locks. No SQL, checkpoint,
-process-wide VFS registration or descriptor duplication is used. The store
-enables the feature in its production Unix dependency as well as test controls.
+`RetainedSqliteFile` first pins a regular inode with `O_PATH`, then opens only
+that exact descriptor through `/proc/self/fd`. It never resolves the descriptor
+back to a caller-controlled pathname. Clones share one reader, and a final name
+fence rejects substitution. Failed admission uses the same coordinated close.
+
+Final close follows the bundled SQLite 3.53.2 Unix VFS's global-then-inode mutex
+order and joins its deferred-close queue whenever a native connection retains
+POSIX locks. A shared, private, unqueried connection to the kernel-owned
+`/proc/self/stat` entry anchors the native inode list only while pins exist.
+Queue storage is reserved before the readable open and uses SQLite's allocator;
+SQLite frees queued descriptors after its final lock ends. Queued readers cannot
+be reused as native database handles. The boundary checks the exact bundled ABI
+and requires runtime mutexes; unsupported versions/configurations fail closed.
+No SQL, checkpoint, writable directory, temporary link, process-wide VFS change
+or descriptor duplication is used. The store enables the feature in its
+production Unix dependency as well as test controls.

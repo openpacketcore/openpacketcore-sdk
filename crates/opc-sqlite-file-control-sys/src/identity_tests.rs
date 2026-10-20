@@ -1,4 +1,4 @@
-use super::main_file_identity;
+use super::{main_file_identity, RetainedSqliteFile};
 use rusqlite::Connection;
 use std::os::unix::fs::MetadataExt as _;
 
@@ -40,6 +40,11 @@ fn main_file_identity_accepts_sparse_files_larger_than_i32_max() {
 
     let expected = (metadata.dev(), metadata.ino());
     assert_eq!(main_file_identity(&connection), Ok(expected));
+    let pin = RetainedSqliteFile::from_connection(&connection).expect("retain full-width inode");
+    let retained = pin.file().metadata().expect("retained file metadata");
+    assert_eq!((retained.dev(), retained.ino()), expected);
+    assert_eq!(retained.len(), size);
+    drop(pin);
     assert_eq!(
         connection
             .query_row("SELECT value FROM sentinel", [], |row| row.get::<_, i64>(0))
