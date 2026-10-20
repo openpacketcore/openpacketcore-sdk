@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 
@@ -14,20 +15,23 @@ PRELUDE = "use std::{fs::File, io, os::fd::{AsFd, BorrowedFd}};\n"
 
 
 class BorrowedDescriptorGuardTests(unittest.TestCase):
-    def compile(self, source, *, configured=True):
+    def compile(self, source, *, configured=True, dependencies=""):
         with tempfile.TemporaryDirectory(prefix="clippy-fd-guard-") as directory:
             fixture = Path(directory)
             (fixture / "src").mkdir()
             (fixture / "Cargo.toml").write_text(
                 '[package]\nname = "borrowed-fd-guard-fixture"\n'
                 'version = "0.0.0"\nedition = "2021"\n[workspace]\n'
+                '[dependencies]\n' + dependencies
             )
             (fixture / "src/lib.rs").write_text(source)
             (fixture / "clippy.toml").write_text(
                 (ROOT / "clippy.toml").read_text() if configured else ""
             )
             result = subprocess.run(
-                ["cargo", "clippy", "--offline", "--message-format=json", "--", "-D", "warnings"],
+                # Dependency fixtures may fetch their locked version on a cold CI host.
+                ["cargo", "clippy", *([] if dependencies else ["--offline"]),
+                 "--message-format=json", "--", "-D", "warnings"],
                 cwd=fixture, text=True, capture_output=True,
                 env=dict(os.environ, CLIPPY_CONF_DIR=str(fixture),
                          CARGO_TARGET_DIR=str(ROOT / "target/clippy-fd-guard")),
@@ -75,6 +79,24 @@ pub fn retain_directory(directory: &File) -> io::Result<File> {
         result, errors = self.compile(source)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(errors, [])
+
+    def test_rustix_duplication_is_rejected(self):
+        packages = tomllib.loads((ROOT / "Cargo.lock").read_text())["package"]
+        version = next(package["version"] for package in packages if package["name"] == "rustix")
+        dependencies = f'rustix = "={version}"\n'
+        source = """
+use std::{io, os::fd::{AsFd, OwnedFd}};
+pub fn duplicate(pin: &impl AsFd) -> io::Result<OwnedFd> {
+    Ok(rustix::io::fcntl_dupfd_cloexec(pin, 0)?)
+}
+"""
+        result, errors = self.compile(source, configured=False, dependencies=dependencies)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(errors, [])
+        result, errors = self.compile(source, dependencies=dependencies)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([error["code"]["code"] for error in errors],
+                         ["clippy::disallowed_methods"], result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

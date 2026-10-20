@@ -822,8 +822,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-store`, `opc-sqlite-file-control-sys`: clarify that retained pins
   hide `File` references but still expose borrowed descriptors, which callers
-  must not duplicate or close. Repository Clippy checks reject borrowed-FD
-  duplication, with local exceptions for directory, socket and BPF handles.
+  must not duplicate or close. Repository Clippy checks reject
+  `BorrowedFd::try_clone_to_owned`, `rustix::io::dup`,
+  `rustix::io::fcntl_dupfd_cloexec` and `nix::unistd::dup`, with local exceptions
+  for directory, socket, BPF and interpreter handles.
 
 - `opc-session-store`: hash terminal snapshot envelopes through the retained
   reader without duplicating and closing its descriptor, preserving SQLite

@@ -176,6 +176,10 @@ async fn pinned_namespace_child() {
     let namespace = std::env::var(CHILD_NAMESPACE).unwrap_or_else(|_| role.clone());
     let configured = root.join(namespace).join("snapshots");
     let descriptor = File::open(&configured).expect("open actor snapshot descriptor");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture duplicates a snapshot directory, not a SQLite database descriptor"
+    )]
     let descriptor = File::from(
         rustix::io::fcntl_dupfd_cloexec(&descriptor, number)
             .expect("reserve equal synthetic procfd number"),
