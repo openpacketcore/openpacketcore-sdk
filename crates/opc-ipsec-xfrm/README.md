@@ -1267,6 +1267,12 @@ IPsec security path. It supplies no tunnel, encryption or source authentication.
 The caller must constrain the selector, ensure that only authorized packet
 producers set the complete mark, and activate routing and protection together
 before opening traffic. It does not permit local output or inbound delivery.
+Lower numeric priorities win: a transit policy that outranks an overlapping
+Forward policy takes precedence for matching marked packets, including over an
+unmarked policy requiring a tunnel. Linux drops matching tunnel-decapsulated
+traffic that carries the transit mark.
+Mark specificity does not override priority; equal-priority matches depend on
+kernel ordering, so coordinate distinct priorities for overlaps.
 
 Use `QueryPolicyRequest` with the exact selector, `Forward`, and the full mark.
 Readback returns the explicit transit action only for that complete kernel

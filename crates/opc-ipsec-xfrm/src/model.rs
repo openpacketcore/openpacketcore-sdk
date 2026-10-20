@@ -858,6 +858,12 @@ impl PolicyParameters {
     /// Exact readback recognizes the same unscoped Forward/Allow/empty-template
     /// shape as [`XfrmAction::AllowForwardTransit`]. Existing ordinary `Allow`
     /// installations still require a transform template.
+    /// Lower numeric priorities win: a transit policy that outranks an
+    /// overlapping Forward policy takes precedence for matching marked packets,
+    /// including over an unmarked policy requiring a tunnel. Linux drops
+    /// matching tunnel-decapsulated traffic that carries the transit mark.
+    /// Mark specificity does not override priority; equal-priority matches
+    /// depend on kernel ordering, so coordinate distinct priorities for overlaps.
     ///
     /// # Errors
     /// Returns [`XfrmError::InvalidConfig`] for a zero or non-full-mask mark.

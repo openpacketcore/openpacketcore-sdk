@@ -496,15 +496,45 @@ async fn identical_sas_remain_isolated_between_namespace_bound_actors(
                 .ok_or_else(|| io::Error::other("transit mark missing"))?,
         ),
     );
+    let sibling = PolicyParameters::forward_transit(
+        transit.selector.clone(),
+        20,
+        XfrmLookupMark::full(0x4000_0002),
+    )?;
+    let sibling_query = QueryPolicyRequest::new(sibling.selector.clone(), XfrmDirection::Forward)
+        .with_mark(XfrmLookupMark::full(0x4000_0002));
+    backend_a
+        .install_policy(InstallPolicyRequest {
+            parameters: sibling.clone(),
+        })
+        .await?;
+    assert_eq!(
+        backend_a.query_policy(sibling_query.clone()).await?,
+        sibling
+    );
     backend_a.remove_policy_exact(policy_remove.clone()).await?;
     assert!(matches!(
         backend_a.query_policy(policy_query.clone()).await,
         Err(opc_ipsec_xfrm::XfrmError::NotFound)
     ));
+    assert_eq!(
+        backend_a.query_policy(sibling_query.clone()).await?,
+        sibling
+    );
     assert_eq!(backend_b.query_policy(policy_query.clone()).await?, transit);
     backend_b.remove_policy_exact(policy_remove).await?;
     assert!(matches!(
         backend_b.query_policy(policy_query).await,
+        Err(opc_ipsec_xfrm::XfrmError::NotFound)
+    ));
+    backend_a
+        .remove_policy_exact(ExactRemovePolicyRequest::new(
+            RemovePolicyRequest::new(sibling.selector, XfrmDirection::Forward)
+                .with_mark(XfrmLookupMark::full(0x4000_0002)),
+        ))
+        .await?;
+    assert!(matches!(
+        backend_a.query_policy(sibling_query).await,
         Err(opc_ipsec_xfrm::XfrmError::NotFound)
     ));
 

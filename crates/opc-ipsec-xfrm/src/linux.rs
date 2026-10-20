@@ -8116,6 +8116,60 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn marked_forward_transit_parser_preserves_other_template_free_allows() {
+        let transit = marked_forward_transit_parameters();
+        let encoded = encode_policy_info(&transit).unwrap();
+        for shape in ["unmarked", "zero", "partial", "interface", "in", "out"] {
+            // These are foreign kernel replies: the public ALLOW encoder
+            // deliberately cannot construct a template-free ordinary allow.
+            let mut body = encoded.clone();
+            let mut expected = transit.clone();
+            expected.action = XfrmAction::Allow;
+            match shape {
+                "unmarked" => {
+                    remove_route_attr(&mut body, XFRM_USER_POLICY_INFO_LEN, XFRMA_MARK);
+                    expected.mark = None;
+                }
+                "zero" | "partial" => {
+                    let offset = route_attr_payload_offset_from(
+                        &body,
+                        XFRM_USER_POLICY_INFO_LEN,
+                        XFRMA_MARK,
+                    )
+                    .unwrap();
+                    if shape == "zero" {
+                        body[offset..offset + 4].copy_from_slice(&0_u32.to_ne_bytes());
+                        expected.mark = Some(XfrmLookupMark::full(0));
+                    } else {
+                        body[offset + 4..offset + 8]
+                            .copy_from_slice(&0x7fff_ffff_u32.to_ne_bytes());
+                        expected.mark =
+                            Some(XfrmLookupMark::new(0x4000_0001, 0x7fff_ffff).unwrap());
+                    }
+                }
+                "interface" => {
+                    append_attr(&mut body, XFRMA_IF_ID, &9_u32.to_ne_bytes()).unwrap();
+                    expected.if_id = Some(9);
+                }
+                "in" => {
+                    body[160] = XFRM_POLICY_IN;
+                    expected.direction = XfrmDirection::In;
+                }
+                "out" => {
+                    body[160] = XFRM_POLICY_OUT;
+                    expected.direction = XfrmDirection::Out;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                parse_policy_state(&body).unwrap().parameters,
+                expected,
+                "{shape}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn marked_forward_transit_refuses_every_broader_shape_before_dispatch() {
         let valid = marked_forward_transit_parameters();
