@@ -1048,6 +1048,32 @@ async fn shutdown_fixed_cluster_for_reopen(
     }
 }
 
+async fn observe_fixed_admission_before(
+    stores: &[ConsensusSessionStore],
+    deadline: tokio::time::Instant,
+) -> Vec<opc_session_store::SessionConsensusStatus> {
+    let mut last_statuses = Vec::new();
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            last_statuses = stores.iter().map(ConsensusSessionStore::status).collect();
+            if last_statuses.iter().all(|status| status.admitted) {
+                return last_statuses.clone();
+            }
+            // Reuse the caller's operation deadline, including time already
+            // spent reopening or issuing the manifest. Do not start a new
+            // timeout or add a sleep for this nonblocking observation.
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "fixed admission was not observed within the existing operation bound: \
+             {last_statuses:?}: {error}"
+        )
+    })
+}
+
 fn successor_request(identity: ConsensusIdentity) -> SessionTopologyTransitionRequest {
     SessionTopologyTransitionRequest::try_new(
         SessionTopologyTransitionId::from_bytes([0x71; 16]),
@@ -1428,14 +1454,17 @@ async fn initialized_fixed_three_voter_cluster_reopens_with_durable_authority_an
     drop(stores);
     drop(paths);
 
+    let admission_deadline = tokio::time::Instant::now()
+        + opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
     let (_database_paths, reopened, reopened_paths) = open_fixed_cluster_in_with_paths(
         directory.path(),
         3,
         PlacementResiliencePolicy::AllowReducedResilience,
     )
     .await;
+    let statuses = observe_fixed_admission_before(&reopened, admission_deadline).await;
     assert!(
-        reopened.iter().all(|store| store.status().admitted),
+        statuses.iter().all(|status| status.admitted),
         "reopened fixed voters must retain exact durable admission"
     );
     assert!(
@@ -1495,14 +1524,17 @@ async fn fixed_quorum_reopen_migrates_each_released_cursor_only_recovery_schema(
         replace_operator_recovery_with_released_cursor_only_schema(database, schema);
     }
 
+    let admission_deadline = tokio::time::Instant::now()
+        + opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
     let (_database_paths, reopened, reopened_paths) = open_fixed_cluster_in_with_paths(
         directory.path(),
         3,
         PlacementResiliencePolicy::AllowReducedResilience,
     )
     .await;
+    let statuses = observe_fixed_admission_before(&reopened, admission_deadline).await;
     assert!(
-        reopened.iter().all(|store| store.status().admitted),
+        statuses.iter().all(|status| status.admitted),
         "reopened fixed voters must retain exact durable admission"
     );
     assert!(
@@ -1686,6 +1718,8 @@ async fn fixed_quorum_public_reopen_reseeds_each_released_cursor_only_unsealed_s
         replace_operator_recovery_with_released_cursor_only_schema(database, schema);
     }
 
+    let admission_deadline = tokio::time::Instant::now()
+        + opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
     let (_database_paths, reopened, reopened_paths) =
         open_fixed_cluster_in_separate_paths_with_integrity_and_backend(
             database_directory.path(),
@@ -1696,8 +1730,9 @@ async fn fixed_quorum_public_reopen_reseeds_each_released_cursor_only_unsealed_s
             true,
         )
         .await;
+    let statuses = observe_fixed_admission_before(&reopened, admission_deadline).await;
     assert!(
-        reopened.iter().all(|store| store.status().admitted),
+        statuses.iter().all(|status| status.admitted),
         "reseeded fixed voters must retain exact durable admission"
     );
     assert!(
@@ -1741,6 +1776,8 @@ async fn fixed_quorum_public_reopen_reseeds_each_released_cursor_only_unsealed_s
 
     // A second public reopen proves that neither the journal nor the old
     // namespace artifact remains necessary after the atomic metadata switch.
+    let admission_deadline = tokio::time::Instant::now()
+        + opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
     let (_database_paths, reopened, reopened_paths) =
         open_fixed_cluster_in_separate_paths_with_integrity_and_backend(
             database_directory.path(),
@@ -1751,7 +1788,8 @@ async fn fixed_quorum_public_reopen_reseeds_each_released_cursor_only_unsealed_s
             true,
         )
         .await;
-    assert!(reopened.iter().all(|store| store.status().admitted));
+    let statuses = observe_fixed_admission_before(&reopened, admission_deadline).await;
+    assert!(statuses.iter().all(|status| status.admitted));
     shutdown_fixed_cluster_for_reopen(&reopened, &reopened_paths).await;
 }
 
@@ -2567,16 +2605,15 @@ async fn running_fixed_placement_policy_drift_revokes_live_authority_on_backend(
     ] {
         let (_directory, database_paths, stores, paths) =
             open_fixed_authority_fault_cluster(configured_policy, legacy_sqlite).await;
+        let admission_deadline = tokio::time::Instant::now()
+            + opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
         stores[0]
             .consumer_authorization_manifest([fixed_consumer_grant()])
             .await
             .expect("exact fixed policy grants consumer authority");
-        assert!(
-            stores[0].status().admitted,
-            "exact fixed policy is admitted"
-        );
-        let start_sequence = stores[0]
-            .status()
+        let status = observe_fixed_admission_before(&stores[..1], admission_deadline).await[0];
+        assert!(status.admitted, "exact fixed policy is admitted");
+        let start_sequence = status
             .last_log_index
             .map_or(0, |index| index.saturating_add(1));
         let mut watch = SessionBackend::watch(&stores[0], start_sequence)

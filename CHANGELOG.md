@@ -820,10 +820,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `opc-session-store`: the pristine fixed-quorum member test waits for both its
-  committed receipt and admission within the existing catch-up bound. A
-  deterministic owner-contention regression preserves the admission, leader,
-  readiness and exact-history assertions.
+- `opc-session-store`: fixed-quorum formation, receipt and reopen tests observe
+  admission within their existing catch-up or operation bounds and retain that
+  status for subsequent assertions. A deterministic owner-contention regression
+  runs the same scenario and assertions; catch-up timeouts identify the last
+  member, receipt and status. Document that nonblocking diagnostic admission can
+  read false while the native storage owner is busy, and that a panicking
+  test-control owner callback poisons and fences the store.
 
 - `opc-session-net`: preserve valid slow quorum replies until the caller's
   original deadline for protected history, expiry and receipt reads, including
