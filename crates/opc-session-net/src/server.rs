@@ -2256,6 +2256,11 @@ async fn handle_connection(
         let handshake = tls_config
             .begin_handshake()
             .map_err(|_| ProtocolError::Authentication)?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::update(|context| {
+            context.generation = Some(generation);
+            context.material_epoch = Some(handshake.epoch().get());
+        });
         let acceptor =
             tokio_rustls::TlsAcceptor::from(session_server_tls_config(handshake.rustls_config()));
         #[cfg(feature = "test-control")]

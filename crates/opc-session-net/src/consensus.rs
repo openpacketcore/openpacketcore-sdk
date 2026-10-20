@@ -1341,7 +1341,7 @@ impl ConsensusColdConnector {
                     let connector = self.clone();
                     async move {
                         #[cfg(feature = "test-control")]
-                        crate::qualification_diagnostics::stage("resolve");
+                        crate::qualification_diagnostics::begin_resolution(Some(attempt.epoch()));
                         let addr = connector.target.resolve().await.map_err(|error| {
                             #[cfg(feature = "test-control")]
                             crate::qualification_diagnostics::io_error(&error);
@@ -1471,7 +1471,7 @@ impl ConsensusColdConnector {
         }
 
         #[cfg(feature = "test-control")]
-        crate::qualification_diagnostics::stage("resolve");
+        crate::qualification_diagnostics::begin_resolution(None);
         let addr = self.target.resolve().await.map_err(|error| {
             #[cfg(feature = "test-control")]
             crate::qualification_diagnostics::io_error(&error);
@@ -3831,6 +3831,11 @@ async fn handle_consensus_connection(
         let handshake = tls_config
             .begin_handshake()
             .map_err(|_| ProtocolError::Authentication)?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::update(|context| {
+            context.generation = Some(generation);
+            context.material_epoch = Some(handshake.epoch().get());
+        });
         let acceptor = tokio_rustls::TlsAcceptor::from(consensus_server_tls_config(
             handshake.rustls_config(),
             handler.compatibility().is_some(),

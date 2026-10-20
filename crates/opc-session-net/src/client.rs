@@ -723,7 +723,7 @@ async fn open_connection_attempt(
                 let binding = binding.clone();
                 async move {
                     #[cfg(feature = "test-control")]
-                    crate::qualification_diagnostics::stage("resolve");
+                    crate::qualification_diagnostics::begin_resolution(Some(attempt.epoch()));
                     let addr = target.resolve().await.map_err(ProtocolError::Io)?;
                     #[cfg(feature = "test-control")]
                     crate::qualification_diagnostics::update(|context| {
@@ -827,7 +827,7 @@ async fn open_connection_attempt(
         })
     } else {
         #[cfg(feature = "test-control")]
-        crate::qualification_diagnostics::stage("resolve");
+        crate::qualification_diagnostics::begin_resolution(None);
         let addr = target.resolve().await.map_err(ProtocolError::Io)?;
         #[cfg(feature = "test-control")]
         crate::qualification_diagnostics::update(|context| {

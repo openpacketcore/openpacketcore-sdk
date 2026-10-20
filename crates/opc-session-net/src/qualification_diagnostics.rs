@@ -92,6 +92,17 @@ pub(crate) fn stage(stage: &str) {
     });
 }
 
+pub(crate) fn begin_resolution(material_epoch: Option<opc_tls::TlsMaterialEpoch>) {
+    stage("resolve");
+    update(|context| {
+        // A TLS material retry may allocate another socket inside one logical
+        // attempt. A failed new lookup must never name the previous socket.
+        context.local_addr = None;
+        context.peer_addr = None;
+        context.material_epoch = material_epoch.map(opc_tls::TlsMaterialEpoch::get);
+    });
+}
+
 pub(crate) fn socket(stream: &tokio::net::TcpStream) {
     update(|context| {
         context.local_addr = stream.local_addr().ok();
@@ -134,4 +145,32 @@ pub(crate) fn record_transport_failure(outcome: &str, io_kind: Option<io::ErrorK
     METRICS
         .session_net_connection_failure_transport
         .fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retry_resolution_cannot_attribute_a_failure_to_the_previous_socket() {
+        let mut previous = context("consensus-outbound", None, None, 3, None);
+        previous.local_addr = Some("127.0.0.1:4000".parse().expect("local endpoint"));
+        previous.peer_addr = Some("127.0.0.1:5000".parse().expect("peer endpoint"));
+        previous.material_epoch = Some(7);
+        previous.io_kind = Some("ConnectionReset".to_owned());
+        scope(previous, async {
+            begin_resolution(None);
+            io_error(&io::Error::from(io::ErrorKind::NotFound));
+            CONNECTION.with(|context| {
+                let current = context.borrow();
+                assert_eq!(current.stage, "resolve");
+                assert_eq!(current.io_kind.as_deref(), Some("NotFound"));
+                assert_eq!(current.local_addr, None);
+                assert_eq!(current.peer_addr, None);
+                assert_eq!(current.material_epoch, None);
+                assert_eq!(current.generation, Some(3));
+            });
+        })
+        .await;
+    }
 }
