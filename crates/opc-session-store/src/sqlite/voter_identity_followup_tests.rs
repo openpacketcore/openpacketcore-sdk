@@ -98,7 +98,8 @@ async fn voter_anchor_busy_remains_retryable_through_signer_preflight_and_seed()
         signer.key_digest()
     );
     assert!(backend.voter_profile_preflight().await.is_ok());
-    assert!(require_seed_enrollment(&backend.conn.lock().await, &seed, false).is_ok());
+    let conn = backend.conn.lock().await;
+    assert!(require_seed_enrollment(&conn, &seed, false).is_ok());
 }
 
 #[test]
