@@ -1720,7 +1720,9 @@ mod tests {
 
         let mut replacement = params.clone();
         replacement.priority = params.priority.wrapping_add(100);
-        replacement.templates.clear();
+        replacement.templates[0].mode = XfrmMode::Transport;
+        assert_ne!(replacement.templates, params.templates);
+        assert!(crate::model::validate_policy_parameters(&replacement).is_ok());
         let error = backend
             .install_policy(InstallPolicyRequest {
                 parameters: replacement,
