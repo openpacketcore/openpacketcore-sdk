@@ -11529,6 +11529,24 @@ mod tests {
         use std::io::Write as _;
 
         const PARENT_PID: &str = "OPC_SNAPSHOT_SEAL_RETIREMENT_PARENT_PID";
+        const TEST: &str = "consensus::storage::tests::fixed_snapshot_seal_waits_for_test_child_descriptor_retirement";
+        if std::env::var_os(PARENT_PID).is_none() {
+            // Keep the deliberate write hold, and any poisoning on panic,
+            // out of unrelated seals and store opens in the shared process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=4", "--nocapture"])
+                .env(PARENT_PID, std::process::id().to_string())
+                .test_output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "isolated seal descriptor retirement: {stdout}\n{stderr}"
+            );
+            return;
+        }
+
         let fixture_pid = std::process::id();
         let parent_pid = std::env::var(PARENT_PID)
             .map(|value| value.parse::<u32>().unwrap())
