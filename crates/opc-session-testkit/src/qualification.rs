@@ -6962,6 +6962,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-control")]
+    mod diagnostics;
+
     use super::*;
 
     fn batch_release_gate_pool(
