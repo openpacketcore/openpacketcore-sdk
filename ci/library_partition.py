@@ -15,7 +15,7 @@ import subprocess
 import cargo_test_selection
 
 
-SHARDS = (0, 1)
+SHARDS = (0, 1, 2)
 
 
 def owner(name: str) -> int:

@@ -110,6 +110,8 @@ pub enum XfrmObjectRosterRequestError {
     /// A member cannot produce an exact unconditional removal identity, so
     /// compensation could remove an object this roster never installed.
     NonExactRemovalIdentity,
+    /// A member's explicit Forward transit policy has an unsupported shape.
+    InvalidForwardTransit,
     /// Two members share one exact deletion identity, which would make reverse
     /// compensation ambiguous.
     DuplicateDeletionIdentity,
@@ -145,6 +147,7 @@ impl XfrmObjectRosterRequestError {
             Self::NonExactRemovalIdentity => {
                 "xfrm_object_roster_request_non_exact_removal_identity"
             }
+            Self::InvalidForwardTransit => "xfrm_object_roster_request_invalid_forward_transit",
             Self::DuplicateDeletionIdentity => {
                 "xfrm_object_roster_request_duplicate_deletion_identity"
             }
@@ -232,6 +235,10 @@ impl XfrmObjectRosterRequest {
             return Err(XfrmObjectRosterRequestError::TooManyMembers);
         }
         for member in &members {
+            member
+                .request
+                .validate_forward_transit()
+                .map_err(|_| XfrmObjectRosterRequestError::InvalidForwardTransit)?;
             if let Some((identity, _)) = member.identity {
                 if identity.iter().all(|byte| *byte == 0) {
                     return Err(XfrmObjectRosterRequestError::MalformedMemberIdentity);
@@ -3135,6 +3142,22 @@ mod tests {
             roster_of(&[Kind::Sa; XFRM_OBJECT_ROSTER_MAX_MEMBERS]).arity(),
             8
         );
+    }
+
+    #[test]
+    fn forward_transit_roster_refuses_an_invalid_later_member() {
+        for parameters in crate::model::malformed_forward_transit_parameters() {
+            let result = XfrmObjectRosterRequest::new(vec![
+                XfrmObjectRosterMemberRequest::new(sa_request(0)),
+                XfrmObjectRosterMemberRequest::new(XfrmObjectInstallRequest::Policy(
+                    crate::InstallPolicyRequest { parameters },
+                )),
+            ]);
+            assert!(
+                result.is_err(),
+                "the complete roster must validate before any preparation"
+            );
+        }
     }
 
     #[tokio::test]

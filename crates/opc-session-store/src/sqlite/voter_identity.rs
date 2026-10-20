@@ -24,10 +24,67 @@ fn refused() -> ConsensusSessionStoreOpenError {
     ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired
 }
 
+fn anchor_sql_error(error: rusqlite::Error) -> ConsensusSessionStoreOpenError {
+    use rusqlite::{Error, ErrorCode};
+    let malformed = match error {
+        Error::SqliteFailure(error, _) | Error::SqlInputError { error, .. } => {
+            // These queries have fixed SQL. SQLITE_ERROR therefore identifies
+            // an incompatible anchor schema, such as a missing column. Extended
+            // operational errors (including SQLITE_ERROR_RETRY) remain retryable.
+            error.extended_code == rusqlite::ffi::SQLITE_ERROR
+                || matches!(
+                    error.code,
+                    ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase | ErrorCode::TypeMismatch
+                )
+        }
+        Error::QueryReturnedNoRows
+        | Error::FromSqlConversionFailure(..)
+        | Error::IntegralValueOutOfRange(..)
+        | Error::InvalidColumnType(..)
+        | Error::Utf8Error(..) => true,
+        _ => false,
+    };
+    if malformed {
+        refused()
+    } else {
+        ConsensusSessionStoreOpenError::StorageUnavailable
+    }
+}
+
+fn anchor_io_error(error: std::io::Error) -> ConsensusSessionStoreOpenError {
+    match error.kind() {
+        // InvalidInput is the regular-file/nofollow gate's object rejection.
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::InvalidInput => refused(),
+        _ => ConsensusSessionStoreOpenError::StorageUnavailable,
+    }
+}
+
+pub(super) fn storage_error(
+    error: ConsensusSessionStoreOpenError,
+) -> crate::consensus::storage::SessionConsensusStorageError {
+    use crate::consensus::storage::SessionConsensusStorageError as Error;
+    match error {
+        ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired => {
+            Error::VoterIdentityReplacementRequired
+        }
+        _ => Error::BackendUnavailable,
+    }
+}
+
 fn key_path(database: &Path) -> PathBuf {
     let mut path = database.as_os_str().to_os_string();
     path.push(".voter-identity");
     PathBuf::from(path)
+}
+
+fn private_anchor_present(database: &Path) -> Result<bool, ConsensusSessionStoreOpenError> {
+    match std::fs::symlink_metadata(key_path(database)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(ConsensusSessionStoreOpenError::StorageUnavailable),
+    }
 }
 
 pub(super) fn anchor_present(conn: &Connection) -> rusqlite::Result<bool> {
@@ -46,14 +103,14 @@ struct PublicAnchor {
 }
 
 fn read_public_anchor(conn: &Connection) -> Result<PublicAnchor, ConsensusSessionStoreOpenError> {
-    if !anchor_present(conn).map_err(|_| refused())? {
+    if !anchor_present(conn).map_err(anchor_sql_error)? {
         return Err(refused());
     }
     let count: u64 = conn
         .query_row("SELECT COUNT(*) FROM consensus_voter_anchor", [], |row| {
             row.get(0)
         })
-        .map_err(|_| refused())?;
+        .map_err(anchor_sql_error)?;
     let (version, installation, slot, incarnation, digest, initialized):
         (u64, Vec<u8>, u16, u64, Vec<u8>, u64) = conn
         .query_row(
@@ -61,7 +118,7 @@ fn read_public_anchor(conn: &Connection) -> Result<PublicAnchor, ConsensusSessio
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
-        .map_err(|_| refused())?;
+        .map_err(anchor_sql_error)?;
     if count != 1 || version != 1 || initialized > 1 {
         return Err(refused());
     }
@@ -86,7 +143,7 @@ pub(super) fn require_seed_enrollment(
     initialized: bool,
 ) -> Result<(), crate::consensus::storage::SessionConsensusStorageError> {
     use crate::consensus::storage::SessionConsensusStorageError::VoterIdentityReplacementRequired;
-    let anchor = read_public_anchor(conn).map_err(|_| VoterIdentityReplacementRequired)?;
+    let anchor = read_public_anchor(conn).map_err(storage_error)?;
     if anchor.initialized != initialized
         || anchor.installation != seed.genesis.cluster_instance
         || !seed.initial.slots.iter().any(|slot| {
@@ -168,16 +225,47 @@ pub(super) fn read_anchor(
 fn read_private_anchor(
     database: &Path,
 ) -> Result<VoterIdentitySigner, ConsensusSessionStoreOpenError> {
-    let mut file = open_regular_read_nofollow(&key_path(database)).map_err(|_| refused())?;
-    if file.metadata().map_err(|_| refused())?.len() != crate::voter_identity::RECORD_BYTES as u64 {
+    let mut file = open_regular_read_nofollow(&key_path(database)).map_err(anchor_io_error)?;
+    if file.metadata().map_err(anchor_io_error)?.len() != crate::voter_identity::RECORD_BYTES as u64
+    {
         return Err(refused());
     }
+    read_private_record(&mut file)
+}
+
+fn read_private_record(
+    reader: &mut impl Read,
+) -> Result<VoterIdentitySigner, ConsensusSessionStoreOpenError> {
     let mut bytes = Zeroizing::new([0; crate::voter_identity::RECORD_BYTES]);
-    file.read_exact(bytes.as_mut()).map_err(|_| refused())?;
+    reader.read_exact(bytes.as_mut()).map_err(anchor_io_error)?;
     VoterIdentitySigner::from_record(&bytes)
 }
 
 impl SqliteSessionBackend {
+    /// Read the completed enrollment's public coordinates after a process restart.
+    ///
+    /// This reads only the public anchor and neither provisions an identity nor
+    /// returns private key material. It is metadata, not possession proof or
+    /// consensus admission; use [`Self::voter_identity_signer`] to prove the
+    /// retained key against the published or selected binding.
+    /// Missing or malformed metadata requires identity replacement; operational
+    /// read failures return retryable [`ConsensusSessionStoreOpenError::StorageUnavailable`].
+    pub async fn voter_identity_binding(
+        &self,
+    ) -> Result<crate::VoterIdentityBinding, ConsensusSessionStoreOpenError> {
+        let conn = self.conn.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let anchor = read_public_anchor(&conn)?;
+            Ok(crate::VoterIdentityBinding {
+                cluster: anchor.installation,
+                identity: anchor.identity,
+                key_digest: anchor.key_digest,
+            })
+        })
+        .await
+        .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?
+    }
+
     /// Explicitly enroll a new volume, before publishing its immutable manifest.
     ///
     /// The SDK generates the private incarnation key. Its installation, slot,
@@ -214,8 +302,8 @@ impl SqliteSessionBackend {
                 .map_err(unavailable)?;
             if anchor_present(&tx).map_err(unavailable)?
                 || consensus_identity_exists(&tx)
-                    .map_err(|_| ConsensusSessionStoreOpenError::VoterIdentityAlreadyEnrolled)?
-                || std::fs::symlink_metadata(key_path(&path)).is_ok()
+                    .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?
+                || private_anchor_present(&path)?
             {
                 return Err(ConsensusSessionStoreOpenError::VoterIdentityAlreadyEnrolled);
             }
@@ -258,6 +346,9 @@ impl SqliteSessionBackend {
     /// `member` comes from the published genesis manifest or the selected
     /// committed replacement table. The consensus opener repeats this check
     /// and checks the recovered committed retirement floor before starting Raft.
+    /// Missing, malformed or mismatched enrollment requires identity replacement;
+    /// operational read failures return retryable
+    /// [`ConsensusSessionStoreOpenError::StorageUnavailable`].
     pub async fn voter_identity_signer(
         &self,
         installation: ConsensusClusterId,
@@ -297,12 +388,15 @@ impl SqliteSessionBackend {
     pub(crate) async fn has_voter_identity_anchor(
         &self,
     ) -> Result<bool, ConsensusSessionStoreOpenError> {
-        Ok(self
-            .database_path
+        self.database_path
             .as_ref()
-            .is_some_and(|path| std::fs::symlink_metadata(key_path(path)).is_ok()))
+            .map_or(Ok(false), |path| private_anchor_present(path))
     }
 }
+
+#[cfg(test)]
+#[path = "voter_identity_followup_tests.rs"]
+mod followup_tests;
 
 #[cfg(test)]
 mod tests {

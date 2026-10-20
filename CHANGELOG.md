@@ -131,6 +131,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-store`: `SqliteSessionBackend::voter_identity_binding` returns
+  an enrolled volume's public installation, slot, incarnation and key digest
+  after restart, without exporting private key material or granting admission.
+
+- `opc-ipsec-xfrm`: `PolicyParameters::forward_transit` and the explicit
+  `XfrmAction::AllowForwardTransit` install an unscoped Forward allow with a
+  nonzero full-mask mark and no transform template. Exact readback, removal and
+  durable fingerprints retain the complete identity. Other transit shapes are
+  rejected before writer admission, durable preparation or composite effects;
+  ordinary Allow policies keep their template requirement. The durable-install
+  and roster-request errors add `InvalidForwardTransit` for this refusal.
+
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
   Live predecessor-lease contention retains one nonterminal binding with a
@@ -820,9 +832,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: isolate initial formation in functional consensus fixtures from
+  scheduling pauses using the existing controlled clock, preserving engine
+  runtimes, operation bounds and authority checks. Keep explicit initialization
+  deadline controls on real time. Add opt-in `test-control` diagnostics for
+  initialization rejection and planned-shutdown fallback stages, deadlines,
+  successor votes and read-proof results; production behavior is unchanged.
+
+- `opc-persist`: keep SQLite worker admission, initialization, progress and
+  commit checks on the caller's Tokio clock. Paused time no longer spends a
+  fresh operation's budget, and advancing time expires the worker's deadline
+  before a late commit. Synchronous retained-store admission keeps its real-time
+  deadline, and commit permission and timeout bounds are unchanged. A worker
+  that cancels its own expired commit now retains the timeout result instead
+  of allowing a late callback success to override it.
+
+- `opc-session-store`: fixed-quorum formation, receipt and reopen tests observe
+  admission within their existing catch-up or operation bounds and retain that
+  status for subsequent assertions. A deterministic owner-contention regression
+  runs the same scenario and assertions; catch-up timeouts identify the last
+  member, receipt and status. Document that nonblocking diagnostic admission can
+  read false while the native storage owner is busy, and that a panicking
+  test-control owner callback poisons and fences the store.
+
+- `opc-session-store`: isolate the snapshot seal descriptor-retirement fixture
+  in a child process so its deliberate write-gate hold cannot stall or poison
+  unrelated seals and store opens. Verify its parent marker against the actual
+  parent process. Preserve all assertions and timing bounds.
 - `opc-egress-fence`: keep empty and truncated L3 vectors in the independent
   object oracle executable on kernels that reject short IP test-run transport
   headers. Preserve the exact packet bytes and every gate assertion.
+- `opc-session-store`: hash terminal snapshot envelopes through the retained
+  reader without duplicating and closing its descriptor, preserving SQLite
+  record locks. Managed pins expose narrow read and identity operations.
+
+- `opc-session-store`: retain the whole recovery journal owner in queued
+  operations, keeping its admission lease until all predecessor descriptors
+  retire even when a cancelled worker fails before running its operation.
+
+- `opc-session-store`: transient enrollment read failures remain retryable
+  through signer reopen and consensus preflight. Missing selected native WAL
+  roots in the enrolled voter profile return `VoterIdentityReplacementRequired`
+  while retaining the existing startup refusal.
+- `opc-session-net`: classify complete, correlated V2 transition and batch
+  pre-dispatch refusals as `NotTransmitted` and send those refusals from the
+  server instead of closing the connection. Settle an original prepared V2
+  handle's exact recovery row after failed local preflight or proven all-voter
+  non-dispatch. Ambiguous sends and resumed deferred requests retain status
+  recovery; void replies retain their typed identity checks. Older peers
+  conservatively report unknown and retain recovery. (#1405)
+
 - `opc-session-net`: preserve valid slow quorum replies until the caller's
   original deadline for protected history, expiry and receipt reads, including
   prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight
@@ -848,6 +907,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-store`: synchronize unit-test snapshot namespace reopen with
   child descriptor retirement, preventing inherited sockets from causing
   spurious `EADDRINUSE` while preserving live-owner exclusion checks.
+
+- `opc-session-net`: V2 client error and service outcome-unknown diagnostics
+  are emitted only with `test-control` (including `--all-features` qualification
+  builds). Client diagnostics cover errors after a Call starts and pooled poison
+  checkouts, including failures later recovered by the pool. Pre-Call TCP/TLS/Hello
+  setup, pool admission, cold `connect_once`, and actor enqueue failures print
+  nothing. Service diagnostics cover both one-shot and pooled calls. Builds
+  without `test-control` perform no diagnostic stderr
+  writes in these paths. Isolated qualification logs mutation timing and client
+  counters, then voter state and a redacted receipt category after failure,
+  preserving the original result and 800 ms assertion.
+
+- `opc-session-store`: preserve SQLite's POSIX record locks while checking
+  snapshot, checkpoint and recovery file identities, reopening databases,
+  processing requests, and retiring owners, leases and readers. Identity
+  checks borrow SQLite's descriptor; retained database pins close through
+  SQLite's inode bookkeeping even across independent connections and cancelled
+  workers and through portable verification. Recovery journal handover keeps
+  admission excluded until every predecessor descriptor has closed. Persistent
+  recovery identity and cross-process flock fences remain enforced.
 
 - `opc-session-store`: wait for the initial record on every replica before
   injecting owner or fence drift in the renewal fixture. Exercise a lagging

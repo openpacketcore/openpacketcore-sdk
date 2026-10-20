@@ -322,6 +322,24 @@
       "kind": "clock-source-changed",
       "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
       "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::cold_formation::enrolled::delayed_pristine_enrolled_peers_recover_a_missed_bootstrap_campaign",
+      "kind": "assertions-decreased",
+      "reason": "Reuse one admitted ConsensusSessionStore status captured inside the existing exact-receipt wait instead of three independent status calls. The static helper resolver attributes the local OpenVoter::status refusal assertion to those calls, so its count falls by two. All three explicit admitted, leader and applied-index assertions remain, along with the exact receipt check, original operation bound and poll interval.",
+      "issue": 1407
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::cold_formation::enrolled::delayed_pristine_enrolled_peers_recover_after_the_bootstrap_voter_restarts",
+      "kind": "assertions-decreased",
+      "reason": "Reuse one admitted ConsensusSessionStore status captured inside the existing exact-receipt wait instead of three independent status calls. The static helper resolver attributes the local OpenVoter::status refusal assertion to those calls, so its count falls by two. All three explicit admitted, leader and applied-index assertions remain, along with the exact receipt check, original operation bound and poll interval.",
+      "issue": 1407
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::cold_formation::pristine_member_joins_a_formed_quorum_without_losing_committed_history",
+      "kind": "assertions-decreased",
+      "reason": "Remove the redundant admitted assertion after the bounded receipt loop already requires that same captured status to be admitted before it can exit. A missing admission still fails within the original 30-second bound, now naming the last store, receipt and status. Exact receipt-index, leader and readiness assertions remain; no timeout, poll interval or production behavior changes.",
+      "issue": 1407
     }
   ]
 }

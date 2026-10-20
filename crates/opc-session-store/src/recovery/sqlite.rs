@@ -24,7 +24,9 @@ use super::{
     RecoveryExecutionState, RecoveryFixedPlacementPolicy, RecoveryIntegrityKey, RecoveryLimits,
     RecoveryPlan, RecoveryReplica, RecoveryReplicaEvidence, RecoveryReplicaFormat,
 };
-use crate::consensus::snapshot::{SNAPSHOT_DATABASE_MAX_BYTES, SNAPSHOT_ENVELOPE_FOOTER_BYTES};
+use crate::consensus::snapshot::{
+    SqliteFileRead, SNAPSHOT_DATABASE_MAX_BYTES, SNAPSHOT_ENVELOPE_FOOTER_BYTES,
+};
 use crate::consensus::types::{FinalizeOperatorRecoveryV2Intent, SessionMutationOutcome};
 use crate::consensus::{
     SessionConsensusConfigurationEpoch, SessionConsensusConfigurationId,
@@ -45,6 +47,10 @@ use crate::{
 #[cfg(test)]
 #[path = "sqlite/scope_scan_schema_tests.rs"]
 mod scope_scan_schema_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "sqlite/descriptor_locks.rs"]
+mod descriptor_locks;
 
 const PATH_MAX_BYTES: usize = 4_096;
 #[cfg(any(target_os = "linux", test))]
@@ -725,7 +731,7 @@ struct RecoveryV2InvariantProtocolBudget {
 #[cfg(unix)]
 struct ReplicaExecutionLock {
     path: PathBuf,
-    _file: nix::fcntl::Flock<File>,
+    _file: crate::consensus::snapshot::SnapshotDatabaseFlock,
     device: u64,
     inode: u64,
     /// The original target database remains pinned for the entire execute
@@ -5124,8 +5130,9 @@ fn acquire_fleet_execution_locks(
             .file
             .try_clone()
             .map_err(|_| RecoveryError::FileOperationFailed)?;
-        let file = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-            .map_err(|_| RecoveryError::FileOperationFailed)?;
+        let file =
+            crate::consensus::snapshot::SnapshotDatabaseFlock::lock(std::sync::Arc::new(lock_file))
+                .map_err(|_| RecoveryError::FileOperationFailed)?;
         locks.push(ReplicaExecutionLock {
             path: paths.database,
             _file: file,
@@ -5158,11 +5165,8 @@ fn revalidate_execution_lock(
         .iter()
         .find(|lock| lock.path == canonical)
         .ok_or(RecoveryError::SourceChanged)?;
-    let observed = open_regular_read(&canonical).map_err(|_| RecoveryError::SourceChanged)?;
-    let metadata = observed
-        .metadata()
-        .map_err(|_| RecoveryError::SourceChanged)?;
-    if metadata.dev() != lock.device || metadata.ino() != lock.inode {
+    let metadata = fs::symlink_metadata(&canonical).map_err(|_| RecoveryError::SourceChanged)?;
+    if !metadata.is_file() || metadata.dev() != lock.device || metadata.ino() != lock.inode {
         return Err(RecoveryError::SourceChanged);
     }
     Ok(())
@@ -6522,7 +6526,7 @@ fn execution_lock_for_path<'a>(
 /// inode, so holding this second lock makes the exchange continuous for both
 /// names until the workflow has durably recorded the cleanup result.
 #[cfg(unix)]
-type PreparedDatabaseExecutionLock = nix::fcntl::Flock<File>;
+type PreparedDatabaseExecutionLock = crate::consensus::snapshot::SnapshotDatabaseFlock;
 
 #[cfg(not(unix))]
 struct PreparedDatabaseExecutionLock;
@@ -6535,7 +6539,7 @@ fn lock_prepared_database(
         .file
         .try_clone()
         .map_err(|_| RecoveryError::FileOperationFailed)?;
-    nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+    PreparedDatabaseExecutionLock::lock(std::sync::Arc::new(lock_file))
         .map_err(|_| RecoveryError::FileOperationFailed)
 }
 
@@ -8437,7 +8441,7 @@ fn prepare_staged_database(
         .metadata()
         .map_err(|_| RecoveryError::FileOperationFailed)?
         .len();
-    let temporary_file = copy_file_bounded_from(&mut staged.file, &temporary, max)?;
+    let temporary_file = copy_file_bounded_from(&staged.file, &temporary, max)?;
     let conn = open_read_write_pinned(&temporary_file)?;
     ops::rotate_restore_scan_incarnation_sync(&conn)
         .map_err(|_| RecoveryError::FileOperationFailed)?;
@@ -9419,7 +9423,7 @@ fn current_snapshot_identity_from_pinned(
 /// or moves it.  A pathname is only a lookup; this descriptor is the object
 /// whose fs-verity state, envelope and inode identity are trusted.
 struct PinnedSnapshotFile {
-    file: File,
+    file: crate::consensus::snapshot::SqliteFilePin,
     #[cfg(target_os = "linux")]
     portable: Option<std::sync::Arc<crate::consensus::verified_snapshot::PortableSnapshot>>,
     #[cfg(unix)]
@@ -9581,7 +9585,7 @@ fn workflow_allows_historical_consumed_latch(
     plan: &RecoveryPlan,
     workflow: &WorkflowRecord,
     database_path: &Path,
-    database_file: &File,
+    database_file: &impl SqliteFileRead,
 ) -> Result<bool, RecoveryError> {
     if workflow.state != RecoveryExecutionState::Rejoined || workflow.terminal_proof.is_none() {
         return Ok(false);
@@ -10902,6 +10906,8 @@ impl PinnedSnapshotFile {
                     if self.portable.is_none() {
                         self.portable = Some(
                             crate::consensus::verified_snapshot::PortableSnapshot::capture_checked(
+                                // Keep the close owner even if an independently
+                                // opened SQLite connection still uses this inode.
                                 self.file
                                     .try_clone()
                                     .map_err(|_| RecoveryError::FileOperationFailed)?,
@@ -10952,12 +10958,13 @@ impl PinnedSnapshotFile {
         }
         self.file
             .try_clone()
-            .map(crate::consensus::snapshot::PinnedSnapshotReader::File)
+            .map(crate::consensus::snapshot::PinnedSnapshotReader::Pinned)
             .map_err(|_| RecoveryError::FileOperationFailed)
     }
 
     fn open(path: &Path) -> Result<Self, RecoveryError> {
-        let file = open_regular_read(path).map_err(|_| RecoveryError::CorruptReplica)?;
+        let file = crate::consensus::snapshot::SqliteFilePin::open_database(path)
+            .map_err(|_| RecoveryError::CorruptReplica)?;
         let metadata = file.metadata().map_err(|_| RecoveryError::CorruptReplica)?;
         if !metadata.is_file() {
             return Err(RecoveryError::CorruptReplica);
@@ -11019,10 +11026,7 @@ impl PinnedSnapshotFile {
     /// Re-resolve a pathname only to prove it still names this open inode.
     /// The descriptor, not the pathname, remains the input to every scan.
     fn verify_path_identity(&self, path: &Path) -> Result<(), RecoveryError> {
-        let observed = open_regular_read(path).map_err(|_| RecoveryError::SourceChanged)?;
-        let metadata = observed
-            .metadata()
-            .map_err(|_| RecoveryError::SourceChanged)?;
+        let metadata = fs::symlink_metadata(path).map_err(|_| RecoveryError::SourceChanged)?;
         if !metadata.is_file() {
             return Err(RecoveryError::SourceChanged);
         }
@@ -11365,11 +11369,10 @@ fn recovery_path_binding(
 
 fn recovery_file_identity(
     key: &RecoveryIntegrityKey,
-    file: &File,
+    file: &impl SqliteFileRead,
 ) -> Result<RecoveryDigest, RecoveryError> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsFd as _;
         // This is intentionally a crash-stable, comparison-only identity.
         // Mount IDs describe one Linux mount instance and must remain only a
         // live descriptor fence; timestamps and dev/inode are likewise not
@@ -11377,7 +11380,7 @@ fn recovery_file_identity(
         // boundary obtains an externally assigned filesystem UUID plus an
         // `AT_HANDLE_FID` opaque inode handle and fails closed when either is
         // unavailable.
-        let persistent = opc_fs_verity_sys::persistent_file_identity(file.as_fd())
+        let persistent = opc_fs_verity_sys::persistent_file_identity(file.borrow_descriptor())
             .map_err(|_| RecoveryError::FileOperationFailed)?;
         Ok(RecoveryDigest::from_bytes(plan_mac(
             key,
@@ -11432,43 +11435,45 @@ fn open_read_only(path: &Path) -> Result<Connection, RecoveryError> {
 /// the descriptor that authorized this recovery operation.  A procfs path is
 /// not itself an identity proof: bundled SQLite canonicalizes it before
 /// `xOpen`, which permits an attacker to exchange the public name between
-/// canonicalization and the VFS open.  `main_file_descriptor` duplicates the
-/// descriptor SQLite actually owns, without transferring VFS ownership.
+/// canonicalization and the VFS open. Borrow the descriptor SQLite actually
+/// owns; a temporary duplicate would release its POSIX locks when closed.
 #[cfg(target_os = "linux")]
 fn verify_sqlite_main_file_binding(
-    expected: &File,
+    expected: &impl SqliteFileRead,
     connection: &Connection,
 ) -> Result<(), RecoveryError> {
     use std::os::fd::AsFd as _;
     use std::os::unix::fs::MetadataExt as _;
 
-    let observed = opc_sqlite_file_control_sys::main_file_descriptor(connection)
-        .map_err(|_| RecoveryError::SourceChanged)?;
-    let expected_metadata = expected
-        .metadata()
-        .map_err(|_| RecoveryError::SourceChanged)?;
-    let observed_metadata = observed
-        .metadata()
-        .map_err(|_| RecoveryError::SourceChanged)?;
-    if !expected_metadata.is_file()
-        || !observed_metadata.is_file()
-        || expected_metadata.dev() != observed_metadata.dev()
-        || expected_metadata.ino() != observed_metadata.ino()
-    {
-        return Err(RecoveryError::SourceChanged);
-    }
+    opc_sqlite_file_control_sys::with_main_file(connection, |observed| {
+        let expected_metadata = expected
+            .file_metadata()
+            .map_err(|_| RecoveryError::SourceChanged)?;
+        let observed_metadata = observed
+            .metadata()
+            .map_err(|_| RecoveryError::SourceChanged)?;
+        if !expected_metadata.is_file()
+            || !observed_metadata.is_file()
+            || expected_metadata.dev() != observed_metadata.dev()
+            || expected_metadata.ino() != observed_metadata.ino()
+        {
+            return Err(RecoveryError::SourceChanged);
+        }
 
-    // Device/inode is the live, same-mount fence.  Pair it with the stable
-    // filesystem UUID + opaque file handle so an inode recycle cannot be
-    // accepted as the same recovery object across the persistent boundary.
-    let expected_persistent = opc_fs_verity_sys::persistent_file_identity(expected.as_fd())
-        .map_err(|_| RecoveryError::SourceChanged)?;
-    let observed_persistent = opc_fs_verity_sys::persistent_file_identity(observed.as_fd())
-        .map_err(|_| RecoveryError::SourceChanged)?;
-    if expected_persistent != observed_persistent {
-        return Err(RecoveryError::SourceChanged);
-    }
-    Ok(())
+        // Device/inode is the live, same-mount fence.  Pair it with the stable
+        // filesystem UUID + opaque file handle so an inode recycle cannot be
+        // accepted as the same recovery object across the persistent boundary.
+        let expected_persistent =
+            opc_fs_verity_sys::persistent_file_identity(expected.borrow_descriptor())
+                .map_err(|_| RecoveryError::SourceChanged)?;
+        let observed_persistent = opc_fs_verity_sys::persistent_file_identity(observed.as_fd())
+            .map_err(|_| RecoveryError::SourceChanged)?;
+        if expected_persistent != observed_persistent {
+            return Err(RecoveryError::SourceChanged);
+        }
+        Ok(())
+    })
+    .map_err(|_| RecoveryError::SourceChanged)?
 }
 
 /// Open SQLite through an already authenticated regular-file descriptor.
@@ -11657,27 +11662,27 @@ fn open_read_write_created(_writer: &File) -> Result<Connection, RecoveryError> 
 }
 
 fn copy_file_bounded_from(
-    source_file: &mut File,
+    source_file: &impl SqliteFileRead,
     destination: &Path,
     max: u64,
 ) -> Result<PinnedSnapshotFile, RecoveryError> {
-    use std::io::{Seek, SeekFrom};
+    use std::io::SeekFrom;
 
     let source_metadata = source_file
-        .metadata()
+        .file_metadata()
         .map_err(|_| RecoveryError::FileOperationFailed)?;
     if !source_metadata.is_file() || source_metadata.len() == 0 || source_metadata.len() > max {
         return Err(RecoveryError::WorkLimitExceeded);
     }
     source_file
-        .seek(SeekFrom::Start(0))
+        .seek_bytes(SeekFrom::Start(0))
         .map_err(|_| RecoveryError::FileOperationFailed)?;
     let mut destination_file = private_create_new(destination)?;
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut copied = 0_u64;
     loop {
         let read = source_file
-            .read(&mut buffer)
+            .read_bytes(&mut buffer)
             .map_err(|_| RecoveryError::FileOperationFailed)?;
         if read == 0 {
             break;

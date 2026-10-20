@@ -1246,6 +1246,43 @@ required link is fail-closed. `Debug`/`Display` for observation types print
 only labels and non-sensitive metadata—never addresses, ports, SPIs, marks,
 or interface identities.
 
+## Exact-mark forward transit
+
+`PolicyParameters::forward_transit(selector, priority, mark)` explicitly builds
+an unscoped `Forward` policy with `XfrmAction::AllowForwardTransit`, a nonzero
+full-mask `XfrmLookupMark`, and no transform template. Pass it through the usual
+`InstallPolicyRequest` and `XfrmBackend::install_policy`. Linux and the mock
+reject any other shape carrying this action before dispatch. Ordinary `Allow`
+installations continue to require a template on Linux.
+
+The same pure transit-shape check runs before namespace writer admission,
+durable preparation, staged journal admission and the first composite effect.
+Rosters and bidirectional installs preflight every policy member before starting
+any member. Invalid transit preparation returns `InvalidForwardTransit` from
+`XfrmObjectInstallDurableError` or `XfrmObjectRosterRequestError`, without
+changing store bytes, writer epochs or existing prepared authorities.
+
+This policy permits matching forwarded plaintext without requiring an inbound
+IPsec security path. It supplies no tunnel, encryption or source authentication.
+The caller must constrain the selector, ensure that only authorized packet
+producers set the complete mark, and activate routing and protection together
+before opening traffic. It does not permit local output or inbound delivery.
+Lower numeric priorities win: a transit policy that outranks an overlapping
+Forward policy takes precedence for matching marked packets, including over an
+unmarked policy requiring a tunnel. Linux drops matching tunnel-decapsulated
+traffic that carries the transit mark.
+Mark specificity does not override priority; equal-priority matches depend on
+kernel ordering, so coordinate distinct priorities for overlaps.
+
+Use `QueryPolicyRequest` with the exact selector, `Forward`, and the full mark.
+Readback returns the explicit transit action only for that complete kernel
+shape. `ExactRemovePolicyRequest` uses the same selector/direction/mark identity;
+retain namespace-wide writer exclusion through readback, recovery and removal,
+as for other policies. Staged/durable installs bind the transit action and full
+request into their existing authenticated fingerprints. Existing records and
+ordinary policy bytes are unchanged. Crash recovery uses the same store and
+exact policy readback; no external cleanup is introduced.
+
 ## Lookup marks and what "exact" can mean
 
 An SA or policy lookup mark is [`XfrmLookupMark`], not a raw value/mask pair,

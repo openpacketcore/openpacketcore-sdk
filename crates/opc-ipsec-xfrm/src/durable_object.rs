@@ -483,6 +483,8 @@ pub enum XfrmObjectInstallDurableError {
     InvalidTransition,
     /// The request cannot produce an exact unconditional removal identity.
     NonExactRemovalIdentity,
+    /// An explicit Forward transit policy has a broader, unsupported shape.
+    InvalidForwardTransit,
     /// The exact operation record is absent.
     NotFound,
     /// The bounded store has no safe publication slot remaining.
@@ -506,6 +508,7 @@ impl XfrmObjectInstallDurableError {
             Self::Stale => "xfrm_object_recovery_stale",
             Self::InvalidTransition => "xfrm_object_recovery_invalid_transition",
             Self::NonExactRemovalIdentity => "xfrm_object_recovery_non_exact_removal_identity",
+            Self::InvalidForwardTransit => "xfrm_object_recovery_invalid_forward_transit",
             Self::NotFound => "xfrm_object_recovery_not_found",
             Self::CapacityExceeded => "xfrm_object_recovery_capacity_exceeded",
         }
@@ -1104,6 +1107,9 @@ impl XfrmObjectInstallRecoveryStore {
         &self,
         request: &XfrmObjectInstallRequest,
     ) -> Result<DurableObjectFingerprints, XfrmObjectInstallDurableError> {
+        request
+            .validate_forward_transit()
+            .map_err(|_| XfrmObjectInstallDurableError::InvalidForwardTransit)?;
         let removal = request.removal();
         validate_exact_lookup_mark(removal.lookup_mark(), "durable_object.install.mark")
             .map_err(|_| XfrmObjectInstallDurableError::NonExactRemovalIdentity)?;
@@ -2457,6 +2463,7 @@ pub(crate) fn mac_action(mac: &mut HmacSha256, action: XfrmAction) {
         match action {
             XfrmAction::Allow => 1,
             XfrmAction::Block => 2,
+            XfrmAction::AllowForwardTransit => 3,
         },
     );
 }
@@ -2946,6 +2953,62 @@ mod tests {
                 if_id: Some(600),
             },
         })
+    }
+
+    #[test]
+    fn forward_transit_install_fingerprint_binds_explicit_intent_and_exact_mark() {
+        let proof_key = key(9);
+        let parameters = crate::PolicyParameters::forward_transit(
+            XfrmSelector::new(
+                IpAddress::Ipv4([10, 0, 0, 1]),
+                IpAddress::Ipv4([10, 0, 0, 2]),
+                17,
+            ),
+            100,
+            XfrmLookupMark::full(0x4000_0001),
+        )
+        .unwrap();
+        let request = XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+            parameters: parameters.clone(),
+        });
+        let expected = authenticate_install_request(
+            proof_key.canonical_mac_key(),
+            INSTALL_REQUEST_AUTH_DOMAIN,
+            &request,
+        )
+        .unwrap();
+        // Independently encoded with action byte 3 and the fixed synthetic key.
+        assert_eq!(
+            expected,
+            [
+                0xc9, 0xb0, 0x80, 0xab, 0x0e, 0x12, 0x92, 0x08, 0xfa, 0xb7, 0x64, 0xde, 0xfa, 0xc5,
+                0x0a, 0x9f, 0x93, 0x0b, 0xa5, 0x8c, 0xab, 0x39, 0x41, 0x37, 0xf9, 0x40, 0xfa, 0x44,
+                0xbf, 0x01, 0x2f, 0xf9,
+            ],
+            "transit install-request encoding changed"
+        );
+        for change in ["action", "mark", "priority", "direction"] {
+            let mut changed = parameters.clone();
+            match change {
+                "action" => changed.action = XfrmAction::Allow,
+                "mark" => changed.mark = Some(XfrmLookupMark::full(0x4000_0002)),
+                "priority" => changed.priority += 1,
+                _ => changed.direction = XfrmDirection::Out,
+            }
+            let changed = XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+                parameters: changed,
+            });
+            assert_ne!(
+                expected,
+                authenticate_install_request(
+                    proof_key.canonical_mac_key(),
+                    INSTALL_REQUEST_AUTH_DOMAIN,
+                    &changed
+                )
+                .unwrap(),
+                "{change}"
+            );
+        }
     }
 
     /// Byte-pinned canonical encodings for the object family.

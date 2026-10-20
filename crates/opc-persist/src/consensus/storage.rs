@@ -2914,6 +2914,275 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frozen_setup_does_not_spend_new_backend_probe_budget() {
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        assert!(std::time::Instant::now() > (frozen + Duration::from_secs(3)).into_std());
+
+        let value = sqlite::run_backend_sqlite_with_timeout(
+            &backend,
+            Duration::from_secs(3),
+            |conn, cancellation| {
+                cancellation.check_io()?;
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                    .map_err(|_| sqlite::invalid_data("fresh backend query failed"))
+            },
+        )
+        .await;
+        tokio::time::resume();
+        assert_eq!(
+            value.expect("new operation has its own three-second budget"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_clock_paused_progress_keeps_the_callers_budget() {
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
+        let budget = Duration::from_millis(20);
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        assert!(std::time::Instant::now() > (frozen + budget).into_std());
+
+        let sum = sqlite::run_backend_sqlite_with_timeout(&backend, budget, |conn, _| {
+            // Enough SQLite instructions to invoke the worker's progress hook.
+            conn.query_row(
+                "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL \
+                 SELECT n + 1 FROM numbers WHERE n < 10000) SELECT SUM(n) FROM numbers",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| sqlite::invalid_data("progress probe failed"))
+        })
+        .await
+        .expect("real time cannot exhaust a frozen Tokio budget");
+        assert_eq!(sum, 50_005_000);
+        assert_eq!(tokio::time::Instant::now(), frozen);
+    }
+
+    #[tokio::test]
+    async fn sqlite_clock_advanced_deadline_rejects_commit_without_polling_caller() {
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        backend
+            .conn()
+            .lock()
+            .await
+            .execute("CREATE TABLE clock_probe (value INTEGER NOT NULL)", [])
+            .expect("probe table");
+        tokio::time::pause();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let budget = Duration::from_secs(30);
+        let mut operation = std::pin::pin!(sqlite::run_backend_sqlite_with_timeout(
+            &backend,
+            budget,
+            move |conn, _| {
+                let tx = conn.unchecked_transaction().expect("probe transaction");
+                tx.execute("INSERT INTO clock_probe VALUES (1)", [])
+                    .expect("probe insert");
+                ready_tx.send(()).expect("worker ready");
+                release_rx.recv().expect("worker release");
+                let committed = tx.commit().is_ok();
+                committed_tx.send(committed).expect("commit result");
+                Ok(())
+            },
+        ));
+        // Leave the timeout future unpolled while advancing time. The worker
+        // must reject the commit itself, before the caller can cancel it.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker starts");
+        tokio::time::advance(budget).await;
+        release_tx.send(()).expect("release after deadline");
+        let committed = committed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker finishes");
+        let result = operation.await;
+        let count: i64 = backend
+            .conn()
+            .lock()
+            .await
+            .query_row("SELECT COUNT(*) FROM clock_probe", [], |row| row.get(0))
+            .expect("connection reused");
+        assert!(!committed, "the worker must reject the expired commit");
+        assert_eq!(
+            result.expect_err("expired worker").kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(count, 0, "expired work leaves no durable row");
+    }
+
+    #[tokio::test]
+    async fn sqlite_clock_advanced_progress_stays_bounded_after_commit() {
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        backend
+            .conn()
+            .lock()
+            .await
+            .execute("CREATE TABLE clock_probe (value INTEGER NOT NULL)", [])
+            .expect("probe table");
+        tokio::time::pause();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let budget = Duration::from_secs(30);
+        let mut operation = std::pin::pin!(sqlite::run_backend_sqlite_with_timeout(
+            &backend,
+            budget,
+            move |conn, _| {
+                conn.execute("INSERT INTO clock_probe VALUES (1)", [])
+                    .expect("authorized commit");
+                ready_tx.send(()).expect("commit ready");
+                release_rx.recv().expect("worker release");
+                let query = conn.query_row(
+                    "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL \
+                     SELECT n + 1 FROM numbers WHERE n < 10000) SELECT SUM(n) FROM numbers",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                );
+                Ok(
+                    matches!(query, Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::OperationInterrupted),
+                )
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("commit finishes");
+        tokio::time::advance(budget).await;
+        release_tx.send(()).expect("release after deadline");
+        let interrupted = operation
+            .await
+            .expect("report the commit winner's actual result");
+        let count: i64 = backend
+            .conn()
+            .lock()
+            .await
+            .query_row("SELECT COUNT(*) FROM clock_probe", [], |row| row.get(0))
+            .expect("connection reused");
+        assert!(
+            interrupted,
+            "SQL progress remains bounded after commit authorization"
+        );
+        assert_eq!(count, 1, "the authorized commit remains durable");
+    }
+
+    #[tokio::test]
+    async fn sqlite_clock_paused_initialization_keeps_the_callers_budget() {
+        let temp = tempfile::tempdir().expect("snapshot directory");
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        let admitted = admit_snapshot_directory(&backend, temp.path().join("snapshots"))
+            .expect("admitted directory");
+        tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
+        let core = sqlite::ConfigConsensusCore::initialize_with_test_timeout(
+            &backend,
+            admitted,
+            identity(),
+            members(),
+            Arc::new(ConfigDurableProgress::default()),
+            None,
+            Duration::from_millis(20),
+            move |_| {
+                std::thread::sleep(Duration::from_millis(40));
+                assert_eq!(tokio::time::Instant::now(), frozen);
+            },
+        )
+        .await
+        .expect("real time cannot exhaust the frozen initialization budget");
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        let count: i64 = backend
+            .conn()
+            .lock()
+            .await
+            .query_row("SELECT COUNT(*) FROM config_raft_identity", [], |row| {
+                row.get(0)
+            })
+            .expect("initialized identity");
+        assert_eq!(count, 1);
+        drop(core);
+    }
+
+    #[tokio::test]
+    async fn sqlite_clock_rejected_commit_never_returns_late_success_in_real_time() {
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        backend
+            .conn()
+            .lock()
+            .await
+            .execute("CREATE TABLE clock_probe (value INTEGER NOT NULL)", [])
+            .expect("probe table");
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let mut operation = std::pin::pin!(sqlite::run_backend_sqlite_with_timeout(
+            &backend,
+            Duration::from_millis(20),
+            move |conn, _| {
+                let tx = conn.unchecked_transaction().expect("probe transaction");
+                tx.execute("INSERT INTO clock_probe VALUES (1)", [])
+                    .expect("probe insert");
+                std::thread::sleep(Duration::from_millis(40));
+                committed_tx
+                    .send(tx.commit().is_ok())
+                    .expect("commit result");
+                Ok(7)
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Hold the caller until the worker rejects its own expired commit.
+        // This exercises both the deadline and cancellation without a timer
+        // future getting the first chance to cancel the operation.
+        let committed = committed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker finishes");
+        let result = operation.await;
+        let count: i64 = backend
+            .conn()
+            .lock()
+            .await
+            .query_row("SELECT COUNT(*) FROM clock_probe", [], |row| row.get(0))
+            .expect("connection reused");
+        assert!(!committed, "the expired commit is rejected");
+        assert_eq!(count, 0, "rejected work leaves no durable row");
+        assert_eq!(
+            result
+                .expect_err("cancelled work cannot return success")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test]
     async fn pre_core_probe_timeout_never_queues_late_work_and_reuses_backend() {
         let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
             .await

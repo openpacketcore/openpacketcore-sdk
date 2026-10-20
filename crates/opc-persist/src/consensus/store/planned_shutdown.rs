@@ -61,6 +61,8 @@ impl ConfigShutdownCoordinator {
             return receiver.clone();
         }
         let deadline = Instant::now() + planned_shutdown_timeout(store.inner.operation_timeout);
+        #[cfg(any(test, feature = "test-control"))]
+        let mut diagnostic = diagnostics::ShutdownDiagnostic::new(deadline);
         let (sender, receiver) = watch::channel(None);
         *completion = Some(receiver.clone());
         // Config reads never reuse cached leases. Fence every public/forwarded
@@ -74,6 +76,8 @@ impl ConfigShutdownCoordinator {
             // bounded attempt before publishing shutdown completion.
             drop(store.inner.repair_progress.lock().await.take());
             let mut timeout_reason = PlannedShutdownFallback::DeadlineElapsed;
+            #[cfg(any(test, feature = "test-control"))]
+            let mut diagnostic_outer_timeout = false;
             let preparation = tokio::select! {
                 biased;
                 _ = unplanned.wait_for(|requested| *requested) => {
@@ -81,9 +85,24 @@ impl ConfigShutdownCoordinator {
                 }
                 result = tokio::time::timeout_at(
                     deadline,
-                    store.transfer_before_shutdown(deadline, &mut timeout_reason),
-                ) => result.unwrap_or(Err(timeout_reason)),
+                    store.transfer_before_shutdown(
+                        deadline,
+                        &mut timeout_reason,
+                        #[cfg(any(test, feature = "test-control"))]
+                        &mut diagnostic,
+                    ),
+                ) => {
+                    #[cfg(any(test, feature = "test-control"))]
+                    { diagnostic_outer_timeout = result.is_err(); }
+                    result.unwrap_or(Err(timeout_reason))
+                },
             };
+            // Keep the trace outside the timed future so cancellation retains
+            // the last attempted read proof and the observed successor vote.
+            #[cfg(any(test, feature = "test-control"))]
+            if preparation.is_err() {
+                diagnostic.emit(&store, &preparation, diagnostic_outer_timeout);
+            }
             let outcome = match preparation {
                 Ok(outcome) => outcome,
                 Err(PlannedShutdownFallback::Unplanned) => PlannedShutdownOutcome::Fallback {
@@ -172,9 +191,15 @@ impl ConsensusConfigStore {
         &self,
         deadline: Instant,
         timeout_reason: &mut PlannedShutdownFallback,
+        #[cfg(any(test, feature = "test-control"))]
+        diagnostic: &mut diagnostics::ShutdownDiagnostic,
     ) -> Result<PlannedShutdownOutcome, PlannedShutdownFallback> {
         use PlannedShutdownFallback as Reason;
 
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            diagnostic.timing.stage = "admission";
+        }
         if !self.exact_membership_is_admitted() {
             return Err(Reason::NotAdmitted);
         }
@@ -203,6 +228,10 @@ impl ConsensusConfigStore {
         // The core decides its role atomically, including candidates with
         // delayed vote responses. A fenced target may be skipped only before
         // preparation succeeds; a retained handoff is never retargeted.
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            diagnostic.timing.stage = "prepare-handoff";
+        }
         let handoff = loop {
             let candidate = candidates.pop();
             match self.inner.raft.prepare_shutdown(candidate).await {
@@ -221,12 +250,22 @@ impl ConsensusConfigStore {
         let Some(request) = handoff else {
             return Ok(PlannedShutdownOutcome::FollowerRetired);
         };
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            diagnostic.successor = Some(*request.to());
+            diagnostic.from_term = Some(request.from().leader_id.term);
+            diagnostic.required_log = request.last_log_id().copied();
+        }
         let quorum = scope.0.len() / 2 + 1;
         if scope.0.len().saturating_sub(1) < quorum {
             return Err(Reason::InsufficientSurvivingVoters);
         }
 
         *timeout_reason = Reason::SurvivingQuorumUnavailable;
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            diagnostic.timing.stage = "release-surviving-quorum";
+        }
         // Borrowed calls are cancelled synchronously with this preparation.
         // No detached release task may retain a store after shutdown completes.
         let mut releases = FuturesUnordered::new();
@@ -256,6 +295,10 @@ impl ConsensusConfigStore {
         drop(releases);
 
         *timeout_reason = Reason::NoUpToDateVoter;
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            diagnostic.timing.stage = "transfer-successor";
+        }
         loop {
             if !self.shutdown_scope_is_current(&scope) {
                 return Err(Reason::ScopeChanged);
@@ -276,6 +319,10 @@ impl ConsensusConfigStore {
         }
 
         *timeout_reason = Reason::SuccessorUnconfirmed;
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            diagnostic.timing.stage = "confirm-successor";
+        }
         let successor = *request.to();
         let mut metrics = self.inner.raft.metrics();
         loop {
@@ -284,6 +331,11 @@ impl ConsensusConfigStore {
             }
             let observed = {
                 let current = metrics.borrow_and_update();
+                #[cfg(any(test, feature = "test-control"))]
+                {
+                    diagnostic.successor_vote =
+                        (current.current_leader == Some(successor)).then_some(current.vote);
+                }
                 (current.current_leader == Some(successor)
                     && current.vote.is_committed()
                     && current.vote.leader_id.term > request.from().leader_id.term)
@@ -296,14 +348,34 @@ impl ConsensusConfigStore {
                     budget: ForwardedBudget::from_deadline(deadline)
                         .map_err(|_| Reason::SuccessorUnconfirmed)?,
                 };
-                if let Ok(ReadBarrierReply::Ready(read_log_id)) = self
-                    .call_peer(successor, ConsensusRpcFamily::ReadBarrier, &read, deadline)
-                    .await
+                #[cfg(any(test, feature = "test-control"))]
                 {
+                    diagnostic.timing.stage = "successor-read-proof";
+                    diagnostic.read_state = "in-flight";
+                    diagnostic.read_reply = None;
+                    diagnostic.read_error = None;
+                    diagnostic.current_matches = None;
+                }
+                let read_result: Result<ReadBarrierReply, _> = self
+                    .call_peer(successor, ConsensusRpcFamily::ReadBarrier, &read, deadline)
+                    .await;
+                #[cfg(any(test, feature = "test-control"))]
+                {
+                    diagnostic.read_state = "returned";
+                    match &read_result {
+                        Ok(reply) => diagnostic.read_reply = Some(reply.clone()),
+                        Err(error) => diagnostic.read_error = Some(error.kind().clone()),
+                    }
+                }
+                if let Ok(ReadBarrierReply::Ready(read_log_id)) = read_result {
                     let current_matches = {
                         let current = metrics.borrow();
                         current.current_leader == Some(successor) && current.vote == vote
                     };
+                    #[cfg(any(test, feature = "test-control"))]
+                    {
+                        diagnostic.current_matches = Some(current_matches);
+                    }
                     if current_matches
                         && self.shutdown_scope_is_current(&scope)
                         && request.last_log_id().is_none_or(|required| {
@@ -313,10 +385,18 @@ impl ConsensusConfigStore {
                         return Ok(PlannedShutdownOutcome::LeaderTransferred { successor });
                     }
                 }
+                #[cfg(any(test, feature = "test-control"))]
+                {
+                    diagnostic.timing.stage = "successor-route-refresh";
+                }
                 self.wait_for_route_refresh(successor, deadline)
                     .await
                     .map_err(|_| Reason::SuccessorUnconfirmed)?;
             } else {
+                #[cfg(any(test, feature = "test-control"))]
+                {
+                    diagnostic.timing.stage = "successor-vote";
+                }
                 tokio::time::timeout_at(deadline, metrics.changed())
                     .await
                     .map_err(|_| Reason::SuccessorUnconfirmed)?

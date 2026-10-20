@@ -578,7 +578,7 @@ fn authority_backoff_io_error(
         .unwrap_or_else(|| std::io::Error::from(kind))
 }
 
-/// Redaction-safe current Openraft observation for readiness and operations.
+/// Redaction-safe current Openraft observation for operational diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SessionConsensusStatus {
     /// Local canonical node ID.
@@ -592,6 +592,9 @@ pub struct SessionConsensusStatus {
     /// Highest locally applied log index.
     pub applied_index: Option<u64>,
     /// Whether exact configured membership has been admitted and remains live.
+    /// This nonblocking observation can read false while another thread holds
+    /// the fixed-quorum storage owner; use
+    /// [`ConsensusSessionStore::probe_fixed_durable_quorum_readiness`] for readiness.
     pub admitted: bool,
     /// Number of snapshots that completed offline finalization and durable
     /// OpenRaft publication on this voter.
@@ -6480,14 +6483,18 @@ impl ConsensusSessionStore {
 
     /// Initialize pristine members with the exact admitted voting set.
     ///
-    /// Concurrent calls are expected, but only the canonical lowest pristine
-    /// member invokes Openraft initialization. Other pristine members wait for
-    /// replicated membership, avoiding fixed-timeout split-vote lockstep.
-    /// Clean first formation fails closed if the canonical member is absent.
-    /// Fixed peers with no engine history answer Pre-Vote using the admitted
-    /// topology after any observed leader lease expires, so a missed first
-    /// campaign can recover through automatic elections without changing this
-    /// initialization rule.
+    /// Concurrent calls are expected. In the enrolled voter-slot profile, any
+    /// admitted pristine genesis member may initialize the same complete
+    /// immutable manifest. Formation therefore does not require a preferred
+    /// initiator, and admission follows a fresh authenticated quorum barrier
+    /// and local apply.
+    ///
+    /// In the legacy fixed profile, only the canonical lowest pristine member
+    /// invokes Openraft initialization. Other pristine members wait for replicated
+    /// membership, avoiding fixed-timeout split-vote lockstep; clean formation
+    /// requires the canonical member. Fixed peers with no engine history answer
+    /// Pre-Vote using the admitted topology after any observed leader lease
+    /// expires, so a missed first campaign can recover through automatic elections.
     ///
     /// A cold Async voter requires a fresh live-quorum cut and actual catch-up,
     /// or supported unanimous retained-owner recovery when no compatible live
@@ -6640,6 +6647,9 @@ impl ConsensusSessionStore {
     }
 
     /// Snapshot redaction-safe status directly from the one Openraft engine.
+    /// Admission is a nonblocking observation that can read false while another
+    /// thread holds the fixed-quorum storage owner; use
+    /// [`Self::probe_fixed_durable_quorum_readiness`] for readiness.
     pub fn status(&self) -> SessionConsensusStatus {
         let current_members = self
             .current_scope()

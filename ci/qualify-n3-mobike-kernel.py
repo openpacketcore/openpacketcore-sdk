@@ -43,12 +43,15 @@ def run(args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, **kwargs)
 
 
-def download(url, path, expected):
+def download(url, path, expected, *, image=False):
     if not path.exists() or digest(path) != expected:
         temporary = path.with_suffix(path.suffix + ".download")
         try:
-            with urllib.request.urlopen(url, timeout=90) as source, temporary.open("wb") as target:
-                shutil.copyfileobj(source, target)
+            if image:
+                run(["bash", Path(__file__).resolve().with_name("download-image.sh"), url, temporary])
+            else:
+                with urllib.request.urlopen(url, timeout=90) as source, temporary.open("wb") as target:
+                    shutil.copyfileobj(source, target)
             if digest(temporary) != expected:
                 raise RuntimeError("download digest mismatch")
             temporary.replace(path)
@@ -115,7 +118,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     kernel_image = kernel(cache, output, args.jobs)
     base = cache / "ubuntu-24.04.img"
-    download(IMAGE_URL, base, IMAGE_SHA)
+    download(IMAGE_URL, base, IMAGE_SHA, image=True)
     vm = Path(tempfile.mkdtemp(prefix="n3-mobike-vm-", dir=cache))
     pid = None
     try:

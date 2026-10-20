@@ -2770,15 +2770,29 @@ enum ConsumerV2WireResponse {
     Response(ConsumerV2CallResponse),
 }
 
+fn v2_rejection_proves_not_dispatched(
+    operation: &SessionConsumerV2Operation,
+    rejection: SessionConsumerRejection,
+) -> bool {
+    matches!(
+        operation,
+        SessionConsumerV2Operation::FencedTransitionV2 { .. }
+            | SessionConsumerV2Operation::FencedTransitionV2Batch { .. }
+    ) && consumer_rejection_proves_not_dispatched(rejection)
+}
+
 fn v2_response_matches_operation(
     operation: &SessionConsumerV2Operation,
     response: &SessionConsumerV2Response,
 ) -> bool {
     match (operation, response) {
-        // A generic rejection does not carry a V2 transition identity. It is
-        // safe only for the V2 read surface; an effectful Call that may have
-        // reached the service must retain its exact recovery identity.
-        (_, SessionConsumerV2Response::Rejected(_)) => !v2_operation_is_effectful(operation),
+        // A closed pre-dispatch refusal can complete a transition or batch
+        // without a receipt, after the wire boundary authenticates the full
+        // tuple. Void results retain their typed original-identity contract.
+        (_, SessionConsumerV2Response::Rejected(rejection)) => {
+            !v2_operation_is_effectful(operation)
+                || v2_rejection_proves_not_dispatched(operation, *rejection)
+        }
         (
             SessionConsumerV2Operation::FencedTransitionV2Capability,
             SessionConsumerV2Response::FencedTransitionV2Capability(_),
@@ -8611,13 +8625,15 @@ impl StatelessSessionConsumerClient {
             Err(cause) => return Err(v2_persistent_error(request, true, cause)),
         };
         if v2_response_is_outcome_unknown(&response) {
+            #[cfg(feature = "test-control")]
+            eprintln!("sdk_v2_diagnostic_origin=service_outcome_unknown");
             return Err(v2_outcome_unknown(request).unwrap_or(
                 PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                     cause: SessionConsumerClientError::Protocol,
                 },
             ));
         }
-        Ok(response)
+        classify_v2_completed_response(request, response)
     }
 
     async fn execute_classified(
@@ -10028,6 +10044,8 @@ impl fmt::Debug for PersistentSessionConsumerV2Diagnostics {
 #[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PersistentSessionConsumerV2ExecuteError {
+    /// No Call bytes were accepted, or a complete matching transition or
+    /// batch reply proves that the voter refused the request before dispatch.
     #[error("V2 request was not transmitted")]
     NotTransmitted { cause: SessionConsumerClientError },
     #[error("V2 read is unavailable")]
@@ -11828,6 +11846,7 @@ impl PersistentSessionConsumerV2Pool {
             ),
         )
         .await
+        .and_then(|response| classify_v2_completed_response(request, response))
     }
 
     /// Execute one V2 operation whose complete lifetime is also bounded by a
@@ -11876,6 +11895,7 @@ impl PersistentSessionConsumerV2Pool {
             ),
         )
         .await
+        .and_then(|response| classify_v2_completed_response(request, response))
     }
 
     /// Execute one fresh V2 attempt within a caller-owned absolute deadline.
@@ -12120,6 +12140,8 @@ impl PersistentSessionConsumerV2Pool {
                 .push_back(PersistentV2PoolEntry::Lane(connection));
         }
         if service_outcome_unknown {
+            #[cfg(feature = "test-control")]
+            eprintln!("sdk_v2_diagnostic_origin=service_outcome_unknown");
             return Err(v2_outcome_unknown(request).unwrap_or(
                 PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                     cause: SessionConsumerClientError::Protocol,
@@ -12494,11 +12516,32 @@ impl PersistentSessionConsumerV2Pool {
     }
 }
 
+/// Classify only a complete response whose wire tuple and request shape have
+/// already matched. For pooled calls this runs after the transport retry
+/// budget, so a received refusal cannot trigger a hidden same-voter replay.
+fn classify_v2_completed_response(
+    request: &SessionConsumerV2Request,
+    response: SessionConsumerV2Response,
+) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+    if matches!(
+        &response,
+        SessionConsumerV2Response::Rejected(rejection)
+            if v2_rejection_proves_not_dispatched(request.operation(), *rejection)
+    ) {
+        return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable,
+        });
+    }
+    Ok(response)
+}
+
 fn v2_persistent_error(
     request: &SessionConsumerV2Request,
     wrote: bool,
     cause: SessionConsumerClientError,
 ) -> PersistentSessionConsumerV2ExecuteError {
+    #[cfg(feature = "test-control")]
+    eprintln!("sdk_v2_diagnostic_origin=client wrote={wrote} cause={cause:?}");
     if wrote && v2_operation_is_effectful(request.operation()) {
         if let Some(error) = v2_outcome_unknown(request) {
             return error;
@@ -21982,6 +22025,8 @@ mod tests {
     #[path = "prewarm_batch.rs"]
     mod prewarm_batch;
     mod read_deadline_tests;
+    mod v2_diagnostics_tests;
+    mod v2_not_dispatched;
     #[path = "void_alpn_tests.rs"]
     mod void_alpn_tests;
     #[path = "void_wire_tests.rs"]

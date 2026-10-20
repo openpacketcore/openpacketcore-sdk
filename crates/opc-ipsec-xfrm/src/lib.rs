@@ -1,5 +1,10 @@
 //! Safe Linux XFRM IPsec backend model for OpenPacketCore.
 //!
+//! [`PolicyParameters::forward_transit`] explicitly opts into an unscoped,
+//! exact nonzero mark Forward allow without a tunnel template. It authorizes
+//! forwarded plaintext only; callers own trusted mark production and coordinated
+//! routing/protection activation. Ordinary allow policies retain their templates.
+//!
 //! This crate provides a backend trait for XFRM SA/policy lifecycle operations,
 //! a deterministic mock backend for tests, an unsupported-platform backend, and
 //! redaction-safe error types. SA parameters can carry an independent Linux

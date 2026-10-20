@@ -20,10 +20,9 @@ struct Resources {
 }
 
 #[cfg(target_os = "linux")]
-fn observe(file: &std::fs::File) -> io::Result<Resources> {
+fn observe(file: &impl std::os::fd::AsFd, metadata: std::fs::Metadata) -> io::Result<Resources> {
     use std::os::linux::fs::MetadataExt as _;
 
-    let metadata = file.metadata()?;
     let filesystem = nix::sys::statvfs::fstatvfs(file)?;
     let fragment = u128::from(filesystem.fragment_size());
     Ok(Resources {
@@ -50,7 +49,10 @@ pub(super) fn record_failure(
 ) {
     #[cfg(target_os = "linux")]
     for &(role, pinned) in artifacts {
-        let observation = observe(pinned.file());
+        let observation = pinned
+            .file()
+            .metadata()
+            .and_then(|metadata| observe(pinned.file(), metadata));
         let resources = observation.as_ref().ok();
         let observation_error_kind = observation.as_ref().err().map(io::Error::kind);
         let observation_os_error = observation.as_ref().err().and_then(io::Error::raw_os_error);
@@ -96,10 +98,10 @@ mod tests {
         std::fs::write(&path, [7; 8192]).unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let original = file.metadata().unwrap();
-        let before = observe(&file).unwrap();
+        let before = observe(&file, file.metadata().unwrap()).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, [9; 16384]).unwrap();
-        let after = observe(&file).unwrap();
+        let after = observe(&file, file.metadata().unwrap()).unwrap();
         assert_eq!(
             (after.device, after.inode),
             (original.st_dev(), original.st_ino())

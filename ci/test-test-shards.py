@@ -7,6 +7,7 @@ import copy
 import importlib.util
 import io
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -324,6 +325,7 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.plan = TEST_SHARDS.load_plan()
         self.targets = [self.plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))]
+        self.targets += sorted({group["target"] for group in self.plan.get("integration_groups", [])})
 
     def test_exact_serial_phase_precedes_parallel_tests_with_original_selection(self) -> None:
         commands = TEST_SHARDS.commands(self.plan, "misc", self.targets)
@@ -455,6 +457,184 @@ class ScopePayloadSerialPhaseTests(unittest.TestCase):
         with patch.object(TEST_SHARDS, "commands", side_effect=changed), \
                 self.assertRaisesRegex(SystemExit, "unsupported.*selection"):
             TEST_SHARDS.verify_commands(self.plan, self.targets)
+
+
+class IntegrationBalanceTests(unittest.TestCase):
+    def plan(self):
+        return {
+            "integration_shards": 3,
+            "default_weight": 1,
+            "weights": {"split": 10},
+            "fixed_weights": {"it-0": 10},
+            "heavy": {"target": "heavy", "shards": []},
+            "integration_groups": [{
+                "target": "split", "shard": "it-2", "weight": 10,
+                "tests": ["module::moved"],
+            }],
+        }
+
+    def test_fixed_work_and_named_groups_reserve_capacity_before_target_packing(self):
+        plan = self.plan()
+        targets = ["heavy", "split", "other", "future"]
+        buckets = TEST_SHARDS.assign(plan, targets)
+        self.assertEqual([shard for shard, names in buckets.items() if "split" in names],
+                         ["it-1"])
+        self.assertCountEqual(
+            [name for names in buckets.values() for name in names],
+            ["split", "other", "future"],
+        )
+        self.assertEqual(buckets, TEST_SHARDS.assign(plan, list(reversed(targets))))
+
+    def test_verifier_rejects_mutated_split_commands_from_the_generator(self):
+        plan = TEST_SHARDS.load_plan()
+        targets = TEST_SHARDS.integration_targets()
+        group = plan["integration_groups"][0]
+        original = TEST_SHARDS.integration_commands
+        with patch("sys.stdout", new_callable=io.StringIO):
+            TEST_SHARDS.verify_commands(plan, targets)
+        for remainder in (False, True):
+            for mutation in ("duplicate", "missing-name", "nonexact", "threads", "profile", "neighbor"):
+                def changed(plan, shard, targets):
+                    commands = copy.deepcopy(original(plan, shard, targets))
+                    for index, command in enumerate(commands):
+                        if group["target"] not in command or ("--skip" in command) != remainder:
+                            continue
+                        if mutation == "duplicate":
+                            commands.insert(index, command.copy())
+                        elif mutation == "missing-name":
+                            name_index = command.index(group["tests"][0])
+                            del command[name_index - int(remainder):name_index + 1]
+                        elif mutation == "nonexact":
+                            command.remove("--exact")
+                        elif mutation == "threads":
+                            command[command.index("--test-threads=4")] = "--test-threads=1"
+                        elif mutation == "profile":
+                            commands[index] = ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", *command]
+                        else:
+                            cut = command.index("--")
+                            command[cut:cut] = ["--test", next(name for name in targets
+                                                            if name != group["target"])]
+                        break
+                    return commands
+
+                with self.subTest(remainder=remainder, mutation=mutation), \
+                        patch.object(TEST_SHARDS, "integration_commands", side_effect=changed), \
+                        self.assertRaisesRegex(SystemExit, "split integration"):
+                    TEST_SHARDS.verify_commands(plan, targets)
+
+    def test_remainder_filters_cannot_skip_another_targets_same_named_test(self):
+        plan = self.plan()
+        moved = plan["integration_groups"][0]["tests"][0]
+        targets = ["heavy", "split", "other", "future"]
+        with patch.object(TEST_SHARDS, "quiescent_contracts", return_value=()):
+            commands = [
+                command for shard in ("it-0", "it-1", "it-2")
+                for command in TEST_SHARDS.integration_commands(plan, shard, targets)
+            ]
+        split = [command for command in commands if "split" in command]
+        self.assertEqual(len(split), 2)
+        remainder = next(command for command in split if "--skip" in command)
+        self.assertEqual(remainder, TEST_SHARDS.SELECTION + [
+            "--test", "split", "--", *TEST_SHARDS.HARNESS,
+            "--exact", "--skip", moved,
+        ])
+        self.assertEqual(next(command for command in split if "--skip" not in command),
+                         TEST_SHARDS.SELECTION + [
+                             "--test", "split", "--", *TEST_SHARDS.HARNESS,
+                             "--exact", moved,
+                         ])
+        for command in commands:
+            if "split" not in command:
+                self.assertNotIn("--skip", command)
+
+    def test_invalid_group_or_load_cannot_silently_remove_coverage(self):
+        for mutation in ("empty", "duplicate", "unknown-shard", "missing-target",
+                         "negative", "nonfinite"):
+            plan = self.plan()
+            group = plan["integration_groups"][0]
+            if mutation == "empty":
+                group["tests"] = []
+            elif mutation == "duplicate":
+                plan["integration_groups"].append(copy.deepcopy(group))
+            elif mutation == "unknown-shard":
+                group["shard"] = "it-99"
+            elif mutation == "missing-target":
+                group["target"] = "missing"
+            elif mutation == "negative":
+                plan["fixed_weights"]["it-0"] = -1
+            else:
+                group["weight"] = float("nan")
+            with self.subTest(mutation=mutation), self.assertRaises(SystemExit):
+                TEST_SHARDS.verify_integration_groups(plan, ["heavy", "split", "other"])
+
+    def test_live_partition_keeps_future_names_and_rejects_stale_or_ignored_names(self):
+        plan = self.plan()
+        inventories = [
+            ["module::moved", "module::moved_future", "new_test"],
+            ["module::moved_future", "new_test"],
+            ["module::moved"],
+            [],
+        ]
+        for mutation in ("none", "stale", "ignored", "overlap", "gap"):
+            listings = copy.deepcopy(inventories)
+            if mutation == "stale":
+                listings[2] = []
+            elif mutation == "ignored":
+                listings[3] = ["module::moved"]
+            elif mutation == "overlap":
+                listings[1].append("module::moved")
+            elif mutation == "gap":
+                listings[1].remove("new_test")
+            with self.subTest(mutation=mutation), patch.object(
+                TEST_SHARDS, "list_integration_tests", side_effect=listings
+            ):
+                if mutation == "none":
+                    TEST_SHARDS.verify_grouped_integration(plan, "split")
+                else:
+                    with self.assertRaises(SystemExit):
+                        TEST_SHARDS.verify_grouped_integration(plan, "split")
+
+    def test_real_cargo_runs_both_halves_and_same_named_neighbors_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "integration-fixture"\nversion = "0.1.0"\nedition = "2021"\n'
+            )
+            (root / "tests").mkdir()
+            for target in ("split", "other", "future"):
+                (root / "tests" / (target + ".rs")).write_text(
+                    'mod module {\n'
+                    f'#[test] fn moved() {{ println!("executed:{target}:moved"); }}\n'
+                    f'#[test] fn moved_future() {{ println!("executed:{target}:future"); }}\n'
+                    '#[test] #[ignore] fn child() { panic!("ignored child ran"); }\n'
+                    '}\n'
+                    f'#[test] fn unlisted() {{ println!("executed:{target}:unlisted"); }}\n'
+                )
+            subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root,
+                           check=True, capture_output=True)
+            base = ["cargo", "test", "--locked", "--offline", "--quiet"]
+            plan = self.plan()
+            targets = ["heavy", "split", "other", "future"]
+            observed = []
+            with (
+                patch.dict(os.environ, {"CARGO_TARGET_DIR": str(root / "target")}),
+                patch.object(TEST_SHARDS, "ROOT", root),
+                patch.object(TEST_SHARDS, "SELECTION", base),
+                patch.object(TEST_SHARDS, "HARNESS", ["--test-threads=4", "--nocapture"]),
+                patch.object(TEST_SHARDS, "quiescent_contracts", return_value=()),
+                patch.object(TEST_SHARDS, "integration_targets", return_value=targets),
+                patch.object(TEST_SHARDS, "verify"),
+            ):
+                for shard in ("it-0", "it-1", "it-2"):
+                    TEST_SHARDS.precheck(plan, shard)
+                    for command in TEST_SHARDS.integration_commands(plan, shard, targets):
+                        result = subprocess.run(command, cwd=root, check=True,
+                                                text=True, capture_output=True)
+                        observed.extend(re.findall(r"executed:[a-z]+:[a-z]+", result.stdout))
+            self.assertCountEqual(observed, [
+                f"executed:{target}:{name}" for target in ("split", "other", "future")
+                for name in ("moved", "future", "unlisted")
+            ])
 
 
 class QuiescentShardPlanTests(unittest.TestCase):
@@ -922,6 +1102,7 @@ class RealtimeQualificationPartitionTests(unittest.TestCase):
         self.targets = [
             self.plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))
         ]
+        self.targets += sorted({group["target"] for group in self.plan.get("integration_groups", [])})
 
     def test_only_the_listed_full_name_leaves_required_shards(self) -> None:
         invocations = {
@@ -1043,8 +1224,18 @@ class HostedLibraryTransferTests(unittest.TestCase):
         text = TEST_SHARDS.WORKFLOW.read_text()
         native_shards = TEST_SHARDS.native_log_bound.CORE_SHARDS
         native_matrix = "shard: [" + ", ".join(native_shards) + "]"
+        library_shards = [str(shard) for shard in TEST_SHARDS.library_partition.SHARDS]
+        library_matrix = "shard: [" + ", ".join(library_shards) + "]"
+        ordinary_shards = [shard for shard in TEST_SHARDS.shard_ids(self.plan)
+                           if shard not in native_shards]
+        ordinary_matrix = "shard: [" + ", ".join(ordinary_shards) + "]"
         replacements = (
-            ("shard: [0, 1]", "shard: [0]"),
+            *((library_matrix, "shard: [" + ", ".join(
+                shard for shard in library_shards if shard != missing
+            ) + "]") for missing in library_shards),
+            *((ordinary_matrix, "shard: [" + ", ".join(
+                shard for shard in ordinary_shards if shard != missing
+            ) + "]") for missing in ordinary_shards),
             *((native_matrix, "shard: [" + ", ".join(
                 shard for shard in native_shards if shard != missing
             ) + "]") for missing in native_shards),

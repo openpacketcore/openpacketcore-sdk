@@ -842,6 +842,13 @@ one of:
 - `OutcomeUnknown { request_id }` carrying the caller-stable ID for any
   may-have-sent result.
 
+A complete, correlated `Rejected(Unavailable)` reply to the transition proves
+that the answering voter refused before submitting its consensus intent. The
+V2 handle may advance to the next canonical voter with the identical ID and
+body, at most once per voter: that exact request is idempotent at the quorum and
+has no additional effect. The transport itself does not replay a received
+refusal. This V2 rule differs from the V1 handle's terminal refusal rule.
+
 `OutcomeUnknown` includes every response the `/2` client does not accept as
 an exact completion. For example, a recorded deterministic error such as a
 stale fence is not accepted on the execute response; exact status then
@@ -894,14 +901,16 @@ journal rejects a new ID with `FencedTransitionHistoryFull` before provider
 or transport work until a row is removed. A row is removed only by
 compare-and-delete of its exact authenticated bytes, and only in these cases:
 
-1. The original affine handle removes its own row when every candidate voter
+1. The original affine handle removes its own row when its local journal
+   preflight fails before any possible dispatch, when every candidate voter
    proved `NotTransmitted`, when its execution was refused with
    `TopologyAuthorityRevoked` (classified before any Call byte), or after a
    definitive unbound rejection (`EpochNotActive`, `Retired`, `HistoryFull`,
    or `RetentionExhausted`) of its single possible dispatch. In each case the
    transition never bound a receipt and cannot bind one later. If that
    removal fails or is cancelled, the handle stays resolved and
-   `release_resolved` retries it.
+   `release_resolved` retries it. A resumed deferred handle retains its earlier
+   binding and status recovery when a later local preflight fails.
 2. `release_resolved` on a live or recovered handle removes its row after
    that handle has observed a resolution: a matching outcome, one of the
    execution results in case 1, abandonment in case 4, any other definitive

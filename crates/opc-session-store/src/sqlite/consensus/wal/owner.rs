@@ -23,6 +23,24 @@ const ROOT_MAGIC: &[u8; 8] = b"OPCNR002";
 const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA004";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct MissingNativeRoot(io::Error);
+
+#[track_caller]
+fn missing_native_root(message: &'static str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        MissingNativeRoot(invalid_data(message)),
+    )
+}
+
+pub(crate) fn is_missing_native_root(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<MissingNativeRoot>())
+}
+
 #[cfg(any(test, feature = "test-control"))]
 type GenerationHookForTest = Arc<dyn Fn(&'static str) -> io::Result<()> + Send + Sync>;
 
@@ -48,7 +66,9 @@ pub(crate) enum RootPointForTest {
 #[cfg(test)]
 pub(crate) type RootHookForTest = Arc<dyn Fn(RootPointForTest) -> io::Result<()> + Send + Sync>;
 
-fn read_selection(database: &File) -> io::Result<Option<[u8; ROOT_BYTES as usize]>> {
+fn read_selection(
+    database: &impl std::os::fd::AsFd,
+) -> io::Result<Option<[u8; ROOT_BYTES as usize]>> {
     let mut bytes = [0; ROOT_BYTES as usize];
     match rustix::fs::fgetxattr(database, SELECTION_ATTRIBUTE, &mut bytes[..]) {
         Ok(len) if len == bytes.len() => Ok(Some(bytes)),
@@ -106,7 +126,7 @@ pub(super) fn directory_path(file: &File) -> PathBuf {
 /// incomplete or closed selected owner cannot dispatch to the SQLite basis.
 pub(crate) struct NativeOwner {
     parent: Arc<File>,
-    database: File,
+    database: Arc<crate::consensus::snapshot::SqliteFilePin>,
     database_name: OsString,
     database_identity: (u64, u64),
     native_name: OsString,
@@ -123,6 +143,10 @@ pub(crate) struct NativeOwner {
 }
 
 impl NativeOwner {
+    pub(crate) fn database_pin(&self) -> Arc<crate::consensus::snapshot::SqliteFilePin> {
+        Arc::clone(&self.database)
+    }
+
     pub(crate) fn discover(path: &Path, conn: &Connection) -> io::Result<Self> {
         let parent = open_directory(
             path.parent()
@@ -134,8 +158,7 @@ impl NativeOwner {
             .to_os_string();
         let mut native_name = database_name.clone();
         native_name.push(".native-wal");
-        let file = opc_sqlite_file_control_sys::main_file_descriptor(conn)
-            .map_err(|_| invalid_data("native database descriptor unavailable"))?;
+        let file = crate::consensus::snapshot::SqliteFilePin::from_connection(conn)?;
         let metadata = file.metadata()?;
         let named = fs::symlink_metadata(directory_path(&parent).join(&database_name))?;
         if !metadata.is_file() || !named.is_file() || identity(&metadata) != identity(&named) {
@@ -152,7 +175,7 @@ impl NativeOwner {
         let selected = read_selection(&file)?.is_some() || namespace_exists;
         Ok(Self {
             parent,
-            database: file,
+            database: Arc::new(file),
             database_name,
             database_identity: identity(&metadata),
             native_name,
@@ -313,7 +336,7 @@ impl NativeOwner {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if read_selection(&self.database)?.is_some() {
-                    return Err(invalid_data("selected native root is missing"));
+                    return Err(missing_native_root("selected native root is missing"));
                 }
                 Ok(None)
             }
@@ -496,7 +519,7 @@ impl NativeOwner {
             .map_err(io::Error::other)?
         } else {
             if !core.fresh_native_basis || read_selection(&self.database)?.is_some() {
-                return Err(invalid_data(
+                return Err(missing_native_root(
                     "existing fixed storage is missing its native root",
                 ));
             }

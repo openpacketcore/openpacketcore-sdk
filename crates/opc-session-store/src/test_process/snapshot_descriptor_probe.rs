@@ -67,14 +67,17 @@ thread_local! {
 }
 
 /// Observe a real busy-enable failure without changing the returned kernel error.
-pub(crate) fn record_snapshot_seal_failure(file: &File, error: &opc_fs_verity_sys::Error) {
+pub(crate) fn record_snapshot_seal_failure(
+    metadata: io::Result<std::fs::Metadata>,
+    error: &opc_fs_verity_sys::Error,
+) {
     let opc_fs_verity_sys::Error::Enable(error) = error else {
         return;
     };
     if error.raw_os_error() != Some(libc::ETXTBSY) {
         return;
     }
-    let report = collect_report(file);
+    let report = collect_report(metadata);
     // Diagnostics must not replace the original ioctl result if stderr fails.
     if let Ok(encoded) = serde_json::to_string(&report) {
         let _ = writeln!(
@@ -108,7 +111,7 @@ fn fd_flags(text: &str) -> Option<u32> {
     u32::from_str_radix(proc_field(text, "flags:")?, 8).ok()
 }
 
-fn collect_report(file: &File) -> DescriptorReport {
+fn collect_report(metadata: io::Result<std::fs::Metadata>) -> DescriptorReport {
     let mut report = DescriptorReport {
         test_pid: std::process::id(),
         identity: None,
@@ -119,7 +122,7 @@ fn collect_report(file: &File) -> DescriptorReport {
         incomplete: false,
         matches: Vec::new(),
     };
-    let Ok(metadata) = file.metadata() else {
+    let Ok(metadata) = metadata else {
         report.incomplete = true;
         return report;
     };
@@ -461,7 +464,7 @@ mod tests {
         drop(writer);
         let reader = File::open(&path).unwrap();
         let mut child = ChildGuard::retaining(reader.try_clone().unwrap());
-        let observed = collect_report(&reader);
+        let observed = collect_report(reader.metadata());
         take_report();
         pinned
             .seal_fixed()
@@ -496,7 +499,7 @@ mod tests {
             opc_fs_verity_sys::Error::Enable(io::Error::from_raw_os_error(libc::EIO)),
             opc_fs_verity_sys::Error::Measure(io::Error::from_raw_os_error(libc::ETXTBSY)),
         ] {
-            crate::test_process::record_snapshot_seal_failure(&file, &error);
+            crate::test_process::record_snapshot_seal_failure(file.metadata(), &error);
             assert!(take_report().is_none());
         }
         assert_eq!(

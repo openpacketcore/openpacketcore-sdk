@@ -131,7 +131,7 @@ pub mod topology_attestation;
 pub mod ttl;
 pub mod voter_identity;
 
-pub use voter_identity::VoterIdentitySigner;
+pub use voter_identity::{VoterIdentityBinding, VoterIdentitySigner};
 
 #[cfg(test)]
 mod protected_fenced_transition_tests;

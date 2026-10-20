@@ -2049,7 +2049,14 @@ voter, exactly as after a proven pre-write failure, and MUST end
 `NotTransmitted` when every voter rejects or is unreachable. Scope, topology,
 authorization and validation rejections remain terminal.
 
-For persistent V2 calls, `NotTransmitted` is a pre-write result. A
+For persistent V2 calls, `NotTransmitted` means either a proven pre-write
+failure or a complete `Rejected(Unavailable)` reply to a transition or batch
+with the exact correlation, attempt nonce, and request commitment. The server
+MUST return that refusal only before submitting the operation's own consensus
+intent; for a batch, no item may have been submitted. Uncertainty after a
+possible submission MUST retain the operation's typed unknown result. A received refusal MUST NOT
+restart the transport's connection retry loop. Void operations retain their
+typed, identity-bearing reply requirement. A
 `ReadUnavailable` result is a post-write read loss for a non-effectful V2
 capability, history, or status operation and may be retried as that read.
 `OutcomeUnknown { request_id }` is returned when an epoch-fenced V2 transition
@@ -2318,7 +2325,15 @@ retained identity within the original caller budget.
 consumer facade for #702's epoch-fenced V2 protocol. It has the V1 facade's
 exact-roster activation, canonical routing, affine execute handle,
 receipt-only restart recovery, and single-seal journal discipline, with these
-differences. The caller supplies the same `FencedTransitionRequest`, whose
+differences. A complete, correlated pre-dispatch refusal permits the V2 handle
+to advance to the next canonical voter with the identical ID and complete
+request body. The exact V2 request is idempotent at the quorum, so this advance
+cannot cause an additional effect. Each handle MAY attempt each voter at most
+once; any possible send without an accepted no-dispatch proof permanently
+makes it receipt-only. This differs from the V1 handle's terminal treatment of
+a received refusal described above.
+
+The caller supplies the same `FencedTransitionRequest`, whose
 16-byte ID is the caller-stable recovery identity. The facade MUST name an
 active epoch from a linearized V2 history state it observed; callers never
 choose an epoch or a nonce. It MAY reuse that observation across preparations
@@ -2333,8 +2348,9 @@ Execution and status MUST dispatch only that authenticated journaled request.
 
 The recovery journal holds at most 4,096 live rows. That count is an
 authenticated admission fence, not an absorbing lifetime: a row is removed by
-exact compare-and-delete only after a proven all-voter pre-dispatch failure, a
-definitive unbound rejection, an original handle's `abandon_unexecuted` before
+exact compare-and-delete only after an original handle's failed local journal
+preflight before any possible dispatch, a proven all-voter pre-dispatch failure,
+a definitive unbound rejection, an original handle's `abandon_unexecuted` before
 execution has ever started, a caller `release_resolved` on a handle that
 observed a resolution, or a bounded `reclaim_resolved_fenced_transitions`
 sweep. The sweep removes rows at or below the retired floor, or whose fresh

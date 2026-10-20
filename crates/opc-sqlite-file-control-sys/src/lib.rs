@@ -33,6 +33,11 @@ pub use verified_snapshot::{RegisteredSnapshot, VerifiedSnapshotSource};
 #[cfg(all(test, target_os = "linux", feature = "borrowed-file-identity"))]
 mod identity_tests;
 
+#[cfg(all(target_os = "linux", feature = "borrowed-file-identity"))]
+mod retained_file;
+#[cfg(all(target_os = "linux", feature = "borrowed-file-identity"))]
+pub use retained_file::RetainedSqliteFile;
+
 /// Failure from a SQLite descriptor control or verified snapshot registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileControlError;
@@ -529,43 +534,120 @@ pub fn main_file_descriptor(connection: &Connection) -> Result<std::fs::File, Fi
 /// `borrowed-file-identity` feature.
 #[cfg(all(target_os = "linux", feature = "borrowed-file-identity"))]
 pub fn main_file_identity(connection: &Connection) -> Result<(u64, u64), FileControlError> {
-    if sqlite_file_has_moved(connection, c"main")? {
+    database_file_identity(connection, "main")
+}
+
+/// Read a named database's full-width identity without opening or closing a
+/// descriptor. The name is interpreted only by SQLite, never as a pathname.
+#[cfg(all(target_os = "linux", feature = "borrowed-file-identity"))]
+pub fn database_file_identity(
+    connection: &Connection,
+    database: &str,
+) -> Result<(u64, u64), FileControlError> {
+    let database = CString::new(database).map_err(|_| FileControlError)?;
+    let database = database.as_c_str();
+    if sqlite_file_has_moved(connection, database)? {
         return Err(FileControlError);
     }
-    if let Some(identity) = verified_snapshot::file_identity(connection, c"main")? {
-        return Ok(identity);
-    }
-    let identity = with_borrowed_sqlite_descriptor(
-        connection,
-        c"main",
-        ffi::SQLITE_FCNTL_FILE_POINTER,
-        |descriptor| {
+    let identity = if let Some(identity) = verified_snapshot::file_identity(connection, database)? {
+        identity
+    } else {
+        with_sqlite_file(connection, database, |file| {
             use std::os::unix::fs::MetadataExt as _;
-
-            let file = std::mem::ManuallyDrop::new({
-                // SAFETY: the checked Unix descriptor stays owned by the
-                // borrowed connection throughout this synchronous callback.
-                // ManuallyDrop prevents close even on errors or unwinding.
-                // Only metadata is read; no ownership operation escapes.
-                unsafe { std::fs::File::from_raw_fd(descriptor) }
-            });
-            // std uses the full-width Linux metadata ABI, including on i686.
             let metadata = file.metadata().map_err(|_| FileControlError)?;
-            if !metadata.is_file() {
-                return Err(FileControlError);
-            }
             Ok((metadata.dev(), metadata.ino()))
-        },
-    )?;
-    if sqlite_file_has_moved(connection, c"main")? {
+        })??
+    };
+    if sqlite_file_has_moved(connection, database)? {
         return Err(FileControlError);
     }
     Ok(identity)
 }
 
+/// Inspect SQLite's main file while its descriptor remains owned by SQLite.
+///
+/// This synchronous callback permits descriptor-bound metadata, filesystem
+/// identity and attribute checks without a duplicate whose close would release
+/// POSIX locks. The callback must not close or duplicate the descriptor. The
+/// borrowed file cannot escape the callback. Moved files and unsupported VFSes
+/// fail closed before and after inspection.
+#[cfg(all(target_os = "linux", feature = "borrowed-file-identity"))]
+pub fn with_main_file<T>(
+    connection: &Connection,
+    inspect: impl FnOnce(&std::fs::File) -> T,
+) -> Result<T, FileControlError> {
+    with_sqlite_file(connection, c"main", inspect)
+}
+
+#[cfg(all(target_os = "linux", feature = "borrowed-file-identity"))]
+fn with_sqlite_file<T>(
+    connection: &Connection,
+    database: &CStr,
+    inspect: impl FnOnce(&std::fs::File) -> T,
+) -> Result<T, FileControlError> {
+    if sqlite_file_has_moved(connection, database)? {
+        return Err(FileControlError);
+    }
+    let result = if let Some(source) = verified_snapshot::retained_source(connection, database)? {
+        use std::os::fd::AsRawFd as _;
+
+        source.validate().map_err(|_| FileControlError)?;
+        let descriptor = source.borrowed_descriptor().map_err(|_| FileControlError)?;
+        let file = std::mem::ManuallyDrop::new(
+            // SAFETY: source retains this borrowed descriptor throughout the
+            // synchronous callback. ManuallyDrop prevents any close, including
+            // on unwind. The File reference cannot escape this inspection.
+            unsafe { std::fs::File::from_raw_fd(descriptor.as_raw_fd()) },
+        );
+        let result = inspect(&file);
+        source.validate().map_err(|_| FileControlError)?;
+        result
+    } else {
+        with_borrowed_sqlite_descriptor(
+            connection,
+            database,
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            |descriptor| {
+                let file = std::mem::ManuallyDrop::new(
+                    // SAFETY: the connection owns the checked descriptor
+                    // throughout this synchronous borrow. ManuallyDrop prevents
+                    // close on callback errors or unwinding. No borrow escapes.
+                    unsafe { std::fs::File::from_raw_fd(descriptor) },
+                );
+                if !file.metadata().map_err(|_| FileControlError)?.is_file() {
+                    return Err(FileControlError);
+                }
+                Ok(inspect(&file))
+            },
+        )?
+    };
+    if sqlite_file_has_moved(connection, database)? {
+        return Err(FileControlError);
+    }
+    Ok(result)
+}
+
 /// Borrowed database identity inspection is unavailable on this platform.
 #[cfg(all(not(target_os = "linux"), feature = "borrowed-file-identity"))]
 pub fn main_file_identity(_connection: &Connection) -> Result<(u64, u64), FileControlError> {
+    Err(FileControlError)
+}
+
+/// Borrowed named-database identity inspection is unavailable on this platform.
+#[cfg(all(not(target_os = "linux"), feature = "borrowed-file-identity"))]
+pub fn database_file_identity(
+    _connection: &Connection,
+    _database: &str,
+) -> Result<(u64, u64), FileControlError> {
+    Err(FileControlError)
+}
+
+/// Borrowed file inspection is unavailable on this platform.
+#[cfg(all(not(target_os = "linux"), feature = "borrowed-file-identity"))]
+pub fn with_main_file<T>(
+    _connection: &Connection,
+    _inspect: impl FnOnce(&std::fs::File) -> T,
+) -> Result<T, FileControlError> {
     Err(FileControlError)
 }
 
@@ -626,8 +708,10 @@ fn duplicate_sqlite_file_descriptor(
 }
 
 // Keep the pinned Unix VFS admission and layout read in one audited boundary.
-// Callers consume the descriptor synchronously and retain their moved-file
-// checks after inspection. SQLite retains ownership throughout the callback.
+// Inspection callers consume the descriptor synchronously and retain their
+// moved-file checks. RetainedSqliteFile instead keeps a non-closing File view
+// alongside its private connection for the entire pin lifetime. SQLite owns
+// the descriptor in both cases; the callback never transfers close authority.
 #[cfg(target_os = "linux")]
 fn with_borrowed_sqlite_descriptor<T>(
     connection: &Connection,

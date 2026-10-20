@@ -3,6 +3,8 @@
 mod audit;
 mod audit_continuity;
 mod compatibility;
+#[cfg(any(test, feature = "test-control"))]
+mod diagnostics;
 mod member_repair;
 mod planned_shutdown;
 pub(crate) mod voter_slots;
@@ -759,54 +761,100 @@ impl ConsensusConfigStore {
     /// majority. Pristine formation also retains the complete-fleet rule.
     /// Admission can be retried on this same store after a peer returns.
     pub async fn initialize_cluster(&self) -> Result<(), ConfigConsensusOpenError> {
-        self.inner.admitted.store(false, Ordering::Release);
-        let deadline = tokio::time::Instant::now()
-            .checked_add(self.inner.operation_timeout)
-            .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
-        let initialized = tokio::time::timeout_at(deadline, self.inner.raft.is_initialized())
-            .await
-            .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?
-            .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
-        let canonical_bootstrap = self.inner.members.first().copied();
-        if self.inner.voter_profile.is_none() {
-            self.inner
-                .compatibility
-                .verify(
-                    deadline,
-                    !initialized && !self.inner.repair_pending.load(Ordering::Acquire),
-                )
-                .await?;
-        }
-        if self.inner.repair_pending.load(Ordering::Acquire) {
-            self.recover_member_before_participation(deadline).await?;
-        }
-        if !initialized
-            && canonical_bootstrap == Some(self.inner.local_node_id)
-            && !self.inner.backend.retained_repair_only
-        {
-            let initialize = tokio::time::timeout_at(
-                deadline,
-                self.inner.raft.initialize(self.inner.members.clone()),
-            )
-            .await
-            .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?;
-            match initialize {
-                Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
-                Err(RaftError::APIError(InitializeError::NotInMembers(_))) => {
-                    return Err(ConfigConsensusOpenError::ClusterFormationRejected)
+        #[cfg(any(test, feature = "test-control"))]
+        let mut diagnostic =
+            diagnostics::DeadlineDiagnostic::new("config_consensus_initialization", "deadline");
+        let result = async {
+            self.inner.admitted.store(false, Ordering::Release);
+            let deadline = tokio::time::Instant::now()
+                .checked_add(self.inner.operation_timeout)
+                .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
+            #[cfg(any(test, feature = "test-control"))]
+            {
+                diagnostic.stage = "initialized-probe";
+                diagnostic.deadline = Some(deadline);
+            }
+            let initialized = tokio::time::timeout_at(deadline, self.inner.raft.is_initialized())
+                .await
+                .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?
+                .map_err(|_| ConfigConsensusOpenError::EngineUnavailable)?;
+            let canonical_bootstrap = self.inner.members.first().copied();
+            if self.inner.voter_profile.is_none() {
+                #[cfg(any(test, feature = "test-control"))]
+                {
+                    diagnostic.stage = "compatibility";
                 }
-                Err(RaftError::Fatal(_)) => {
-                    return Err(ConfigConsensusOpenError::EngineUnavailable)
+                self.inner
+                    .compatibility
+                    .verify(
+                        deadline,
+                        !initialized && !self.inner.repair_pending.load(Ordering::Acquire),
+                    )
+                    .await?;
+            }
+            if self.inner.repair_pending.load(Ordering::Acquire) {
+                #[cfg(any(test, feature = "test-control"))]
+                {
+                    diagnostic.stage = "repair";
+                }
+                self.recover_member_before_participation(deadline).await?;
+            }
+            if !initialized
+                && canonical_bootstrap == Some(self.inner.local_node_id)
+                && !self.inner.backend.retained_repair_only
+            {
+                #[cfg(any(test, feature = "test-control"))]
+                {
+                    diagnostic.stage = "canonical-initialize";
+                }
+                let initialize = tokio::time::timeout_at(
+                    deadline,
+                    self.inner.raft.initialize(self.inner.members.clone()),
+                )
+                .await
+                .map_err(|_| ConfigConsensusOpenError::ClusterFormationRejected)?;
+                match initialize {
+                    Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
+                    Err(RaftError::APIError(InitializeError::NotInMembers(_))) => {
+                        return Err(ConfigConsensusOpenError::ClusterFormationRejected)
+                    }
+                    Err(RaftError::Fatal(_)) => {
+                        return Err(ConfigConsensusOpenError::EngineUnavailable)
+                    }
                 }
             }
+            #[cfg(any(test, feature = "test-control"))]
+            {
+                diagnostic.stage = "membership";
+            }
+            self.wait_for_admissible_membership(deadline).await?;
+            self.inner.admitted.store(true, Ordering::Release);
+            #[cfg(any(test, feature = "test-control"))]
+            {
+                diagnostic.stage = "final-admission";
+            }
+            if !self.exact_membership_is_admitted() {
+                return Err(ConfigConsensusOpenError::ClusterFormationRejected);
+            }
+            self.publish_global_metrics();
+            Ok(())
         }
-        self.wait_for_admissible_membership(deadline).await?;
-        self.inner.admitted.store(true, Ordering::Release);
-        if !self.exact_membership_is_admitted() {
-            return Err(ConfigConsensusOpenError::ClusterFormationRejected);
+        .await;
+        #[cfg(any(test, feature = "test-control"))]
+        if let Err(error) = &result {
+            let metrics = self.inner.raft.metrics();
+            diagnostic.emit(format_args!(
+                "node={:?} operation_timeout={:?} error={:?} admitted={} repair_pending={} committed_index={:?} metrics={:?}",
+                self.inner.local_node_id,
+                self.inner.operation_timeout,
+                error,
+                self.inner.admitted.load(Ordering::Acquire),
+                self.inner.repair_pending.load(Ordering::Acquire),
+                self.inner.durable_progress.committed_index(),
+                *metrics.borrow(),
+            ));
         }
-        self.publish_global_metrics();
-        Ok(())
+        result
     }
 
     /// Fresh status sourced from Openraft metrics, never from a second state machine.
