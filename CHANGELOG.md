@@ -822,8 +822,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-store`: keep async SQLite worker deadlines on the caller's
   Tokio clock through SQL progress, acceptance readers, native reads, restore
-  scans and guarded-read completion. Paused-time setup no longer spends a
-  fresh worker's budget, and advancing Tokio time expires worker checks.
+  scans and the unit-test guarded-read route. Paused-time setup no longer spends
+  a fresh worker's budget, and advancing Tokio time expires worker checks.
   Independent real-time resource caps and existing timeout values are unchanged.
 
 - `opc-egress-fence`: keep empty and truncated L3 vectors in the independent
