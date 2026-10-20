@@ -3289,8 +3289,11 @@ struct ChildNode {
 
 impl ChildNode {
     #[cfg(feature = "test-control")]
-    fn try_send_failure_diagnostics(&mut self) -> bool {
-        if self.pending.is_some() || !matches!(self.child.try_wait(), Ok(None)) {
+    fn try_send_failure_diagnostics(&mut self, deadline: Instant) -> bool {
+        if Instant::now() >= deadline
+            || self.pending.is_some()
+            || !matches!(self.child.try_wait(), Ok(None))
+        {
             return false;
         }
         let Some(next) = self.next_command_sequence.checked_add(1) else {
@@ -3985,15 +3988,28 @@ fn transport_failures_in_window(
 }
 
 #[cfg(feature = "test-control")]
-fn retain_child_stderr(paths: &[PathBuf], destination: &Path) -> io::Result<PathBuf> {
+struct RetainedChildStderr {
+    path: PathBuf,
+    unavailable: Vec<(usize, io::ErrorKind)>,
+}
+
+#[cfg(feature = "test-control")]
+fn retain_child_stderr(paths: &[PathBuf], destination: &Path) -> io::Result<RetainedChildStderr> {
     fs::create_dir_all(destination)?;
     let retained = tempfile::Builder::new()
         .prefix("failed-fleet-")
+        .permissions(Permissions::from_mode(0o700))
         .tempdir_in(destination)?;
+    let mut unavailable = Vec::new();
     for (index, path) in paths.iter().enumerate() {
-        fs::copy(path, retained.path().join(format!("node-{index}.stderr")))?;
+        if let Err(error) = fs::copy(path, retained.path().join(format!("node-{index}.stderr"))) {
+            unavailable.push((index, error.kind()));
+        }
     }
-    Ok(retained.keep())
+    Ok(RetainedChildStderr {
+        path: retained.keep(),
+        unavailable,
+    })
 }
 
 #[cfg(feature = "test-control")]
@@ -4016,11 +4032,11 @@ impl Drop for Fleet {
         let sent = self
             .nodes
             .iter_mut()
-            .map(ChildNode::try_send_failure_diagnostics)
+            .map(|node| node.try_send_failure_diagnostics(deadline))
             .collect::<Vec<_>>();
         for (node, sent) in self.nodes.iter_mut().zip(sent) {
             if !sent {
-                failure_diagnostic!("qualification_failure_state node={} unavailable=pending-or-exited pending={:?}", node.node_index, node.pending);
+                failure_diagnostic!("qualification_failure_state node={} unavailable=deadline-pending-exited-or-send pending={:?}", node.node_index, node.pending);
                 continue;
             }
             match receive_qualification_reply_until(&node.replies, deadline) {
@@ -4071,8 +4087,8 @@ impl Drop for Fleet {
                         let expected = window.after.saturating_sub(window.before);
                         failure_diagnostic!("qualification_failure_attribution_count node={} before={} after={} expected={} attributed={} complete={}", node.node_index, window.before, window.after, expected, observed.len(), observed.len() as u64 == expected && events.iter().all(|event| event.connection_id != 0));
                     }
-                    // Keep the complete bytes below as well as files: a cluster
-                    // job's durable log survives removal of its temporary pod.
+                    // Retain the full text in the cluster log too, since that
+                    // survives the temporary pod. Files retain exact bytes.
                     failure_diagnostic!("qualification_child_stderr_begin node={} bytes={}\n{}\nqualification_child_stderr_end node={}", node.node_index, stderr.len(), String::from_utf8_lossy(&stderr), node.node_index);
                 }
                 Err(error) => failure_diagnostic!(
@@ -4089,8 +4105,12 @@ impl Drop for Fleet {
                     .join("../../target/evidence/qualification-failures")
             });
         match retain_child_stderr(&self.stderr_paths, &destination) {
-            Ok(path) => {
-                failure_diagnostic!("qualification_child_stderr_retained {}", path.display())
+            Ok(retained) => {
+                failure_diagnostic!(
+                    "qualification_child_stderr_retained {} unavailable={:?}",
+                    retained.path.display(),
+                    retained.unavailable
+                )
             }
             Err(error) => failure_diagnostic!(
                 "qualification_child_stderr_retention_failed kind={:?}",

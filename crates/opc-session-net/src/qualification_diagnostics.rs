@@ -86,7 +86,8 @@ pub(crate) fn update(update: impl FnOnce(&mut ConnectionFailure)) {
 
 pub(crate) fn stage(stage: &str) {
     update(|context| {
-        context.stage = stage.to_owned();
+        context.stage.clear();
+        context.stage.push_str(stage);
         context.io_kind = None;
     });
 }
@@ -118,7 +119,7 @@ pub(crate) fn record_transport_failure(outcome: &str, io_kind: Option<io::ErrorK
     event.counter = METRICS
         .session_net_connection_failure_transport
         .load(Ordering::Relaxed)
-        + 1;
+        .wrapping_add(1);
     event.outcome = outcome.to_owned();
     if let Some(kind) = io_kind {
         event.io_kind = Some(format!("{kind:?}"));
@@ -127,7 +128,7 @@ pub(crate) fn record_transport_failure(outcome: &str, io_kind: Option<io::ErrorK
         let mut line = TRANSPORT_FAILURE_PREFIX.as_bytes().to_vec();
         line.extend_from_slice(&json);
         line.push(b'\n');
-        // A full or closed sink cannot replace the original typed result.
+        // A failed write cannot replace the original typed result.
         let _ = io::stderr().lock().write_all(&line);
     }
     METRICS

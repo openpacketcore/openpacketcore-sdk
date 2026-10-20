@@ -51,9 +51,10 @@ fn transport_failure_preserves_complete_stderr_after_the_fleet_workspace_is_remo
         fs::write(path, &expected).expect("child stderr");
     }
     let retained = retain_child_stderr(&paths, evidence.path()).expect("retain exact bytes");
+    assert!(retained.unavailable.is_empty());
     drop(workspace);
     assert_eq!(
-        fs::metadata(&retained)
+        fs::metadata(&retained.path)
             .expect("retained directory")
             .permissions()
             .mode()
@@ -62,7 +63,7 @@ fn transport_failure_preserves_complete_stderr_after_the_fleet_workspace_is_remo
     );
     for node in 0..3 {
         assert_eq!(
-            fs::read(retained.join(format!("node-{node}.stderr"))).expect("retained stderr"),
+            fs::read(retained.path.join(format!("node-{node}.stderr"))).expect("retained stderr"),
             expected
         );
     }
@@ -95,7 +96,7 @@ fn transport_failure_diagnostics_never_queue_behind_an_outstanding_command() {
         next_command_sequence: 5,
         initialization_stderr: None,
     };
-    assert!(!node.try_send_failure_diagnostics());
+    assert!(!node.try_send_failure_diagnostics(Instant::now() + Duration::from_secs(1)));
     assert_eq!(node.next_command_sequence, 5);
     assert_eq!(node.pending.expect("original command retained").sequence, 4);
     assert!(node
@@ -105,8 +106,30 @@ fn transport_failure_diagnostics_never_queue_behind_an_outstanding_command() {
         .buffer()
         .is_empty());
     node.pending = None;
+    assert!(!node.try_send_failure_diagnostics(Instant::now()));
+    assert!(node.pending.is_none());
+    assert_eq!(node.next_command_sequence, 5);
     node.child.kill().expect("exit child");
     node.child.wait().expect("reap child");
-    assert!(!node.try_send_failure_diagnostics());
+    assert!(!node.try_send_failure_diagnostics(Instant::now() + Duration::from_secs(1)));
     assert_eq!(node.next_command_sequence, 5);
+}
+
+#[test]
+fn transport_failure_retains_available_children_when_one_stderr_file_is_missing() {
+    let workspace = tempfile::tempdir().expect("fleet workspace");
+    let evidence = tempfile::tempdir().expect("failure evidence");
+    let paths = [
+        workspace.path().join("missing"),
+        workspace.path().join("available"),
+    ];
+    fs::write(&paths[1], b"retained child outcome\n").expect("child stderr");
+    let retained =
+        retain_child_stderr(&paths, evidence.path()).expect("available evidence survives");
+    drop(workspace);
+    assert_eq!(retained.unavailable, vec![(0, io::ErrorKind::NotFound)]);
+    assert_eq!(
+        fs::read(retained.path.join("node-1.stderr")).expect("available child retained"),
+        b"retained child outcome\n"
+    );
 }
