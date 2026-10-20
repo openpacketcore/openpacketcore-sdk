@@ -522,9 +522,9 @@ jobs:
           (cd "${package_dir}" && sha256sum wireguard-tools.deb repositories.txt package-versions.txt > SHA256SUMS)
 
           image="${RUNNER_TEMP}/ubuntu-24.04-linux68.img"
-          curl --fail --location --retry 3 \
-            --output "${image}" \
-            https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-amd64.img
+          bash ci/download-image.sh \
+            https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-amd64.img \
+            "${image}"
           echo "ffe6203da54deeb6db5d2a98a83f9ec8e55f149d3f7ba622e1abe5fa966ee3d6  ${image}" \
             | sha256sum -c -
 
