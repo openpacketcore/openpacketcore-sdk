@@ -1441,15 +1441,21 @@ nonce-policy names use the same role-aware bounds. Existing group-1/SHA2-512/
 
 ## Child-SA key exchange validation
 
-CREATE_CHILD_SA builders and the dedicated-bearer and NWu opened-message
-boundaries validate KE public-value widths against the supplied group on build,
-request/response decode and response correlation. Group 1 retains its
+CREATE_CHILD_SA builders, response decoders and response correlation validate
+KE public-value widths against the supplied group. Dedicated-bearer and NWu
+request decoders verify that the KE names an offered group; policy selection
+compares it with the selected group before validating its width. A malformed
+value in an unselected group therefore still receives `INVALID_KE_PAYLOAD`,
+while a malformed value in the selected group is rejected. Group 1 retains its
 96-octet MODP encoding; the other supported MODP and ECP groups retain their
 fixed-width encodings. Agreement continues to validate the mathematical public
 value through the admitted crypto module.
 
 Generic Child-SA negotiation and NWu AEAD policy put group 1 after stronger
-common PFS groups. SDK-built Child-SA offers apply the same stable ordering.
+common PFS groups that the SDK implements. Generic selection ignores
+unimplemented DH transforms even under an accept-any requirement: an offer of
+groups `{1, 5}` can select group 1, while `{1, 31, 14}` requests group 14.
+SDK-built Child-SA offers apply the same stable ordering.
 `negotiate_child_sa` takes the peer KE alongside the SA and selectors. A selected
 common suite with a different KE produces a typed `KeyExchangeDhGroupMismatch`;
 `invalid_ke_notify()` constructs the `INVALID_KE_PAYLOAD` response Notify.

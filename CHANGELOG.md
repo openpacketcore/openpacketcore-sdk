@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Supply the received KE for CREATE_CHILD_SA probes and handle the typed retry;
   conforming initial Child-SA offers in IKE_AUTH omit DH. Generic Child-SA
   selection keeps non-group-1 wire order without a matching-KE fallback.
+  Unimplemented DH transforms are ineligible even under an accept-any DH
+  requirement, so they never displace a usable group 1 or appear in a retry.
   Group 1 follows stronger common Child-SA PFS groups in policies and offers;
   other transform positions are preserved. SDK-built initial and Child-SA
   request offers also renumber proposals; correlate responses against the
@@ -849,8 +851,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Config bus adapters expose the same lifecycle through their consensus store.
   Planned shutdown keeps automatic bounded handoff. (#1370)
 - `opc-proto-ikev2`: CREATE_CHILD_SA request/response construction, dedicated-bearer
-  decoding and response correlation, and NWu creation exchanges validate the
+  response decoding and correlation, and NWu creation responses validate the
   KE public-value width for the supplied DH group, including 96 octets for group 1.
+  Dedicated-bearer and NWu received requests check offered-group membership;
+  policy selection compares groups before checking width, returning
+  `INVALID_KE_PAYLOAD` for an unselected group even if its value has the wrong width.
 
 - `opc-proto-diameter`: SWm emergency identity recovery accepts ordinary root
   IMSI NAIs as a receive-side interoperability extension. The emergency

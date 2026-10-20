@@ -5,8 +5,8 @@ use super::{
 use crate::{
     build_create_child_sa_rekey_response_payloads,
     dedicated_bearer::{
-        validate_ke_view, validate_sa_build, validate_sa_view, validate_selected_key_exchange,
-        validate_selected_proposal,
+        validate_ke_view, validate_request_ke_view, validate_sa_build, validate_sa_view,
+        validate_selected_key_exchange, validate_selected_proposal,
     },
     Header, Ikev2CreateChildSaRekeyResponseBuild, Ikev2IkeAuthPayloadBuild,
     Ikev2KeyExchangePayload, Ikev2KeyExchangePayloadBuild, Ikev2NoncePayload,
@@ -153,6 +153,8 @@ impl<'a> CreateRequest<'a> {
     /// Decode a network-initiated request against the admitted inner families.
     /// Reject rekey notifications, missing or duplicate required fields, several
     /// UP addresses, narrowed selectors, and inconsistent KE/proposal shape.
+    /// The KE width is checked by [`super::AeadPolicy::select`] only after its
+    /// group matches the selection; decoding alone does not accept a DH value.
     pub fn decode(
         header: &Header,
         first: PayloadType,
@@ -357,7 +359,11 @@ impl<'a> Common<'a> {
         let sa = self.sa.ok_or(Error::Missing)?;
         let nonce = self.nonce.ok_or(Error::Missing)?;
         validate_sa_view(&sa, response).map_err(|_| Error::InvalidValue)?;
-        validate_ke_view(&sa, self.ke.as_ref()).map_err(|_| Error::Incompatible)?;
+        if response {
+            validate_ke_view(&sa, self.ke.as_ref()).map_err(|_| Error::Incompatible)?;
+        } else {
+            validate_request_ke_view(&sa, self.ke.as_ref()).map_err(|_| Error::Incompatible)?;
+        }
         let tsi = selector_families(&self.tsi.ok_or(Error::Missing)?)?;
         let tsr = selector_families(&self.tsr.ok_or(Error::Missing)?)?;
         if tsi != tsr {

@@ -1965,29 +1965,34 @@ fn dedicated_ke_response_build_enforces_group_width() {
 
 #[test]
 fn dedicated_ke_request_decode_enforces_group_width() {
+    // Received requests defer the width check until the offered group is selected.
+    // Retain every malformed width at that boundary rather than rejecting a guess.
     for (group, width) in CREATE_KE_WIDTHS {
         let mut input = create_request_build();
         create_ke_sa(&mut input.security_association, group);
         input.key_exchange = Some(create_ke(group, width));
         let wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(&input));
         let header = request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 71);
-        must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
+        let request = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
             &header,
             wire.first_payload(),
             wire.bytes(),
         ));
+        must_ok(select_dedicated_ke_for_group(&request, group));
         for actual in [1, width - 1, width + 1] {
             let bytes = replace_create_ke_width(wire.first_payload(), wire.bytes(), actual);
+            let request = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
+                &header,
+                wire.first_payload(),
+                &bytes,
+            ));
+            let key_exchange = request.key_exchange.as_ref().unwrap();
+            assert_eq!(key_exchange.dh_group, group);
+            assert_eq!(key_exchange.key_exchange_data.len(), actual);
             assert!(
                 matches!(
-                    decode_ikev2_dedicated_bearer_create_child_sa_request(
-                        &header, wire.first_payload(), &bytes,
-                    ),
-                    Err(Ikev2DedicatedBearerExchangeError::Crypto(
-                        Ikev2SaInitCryptoError::MalformedKeyExchange {
-                            group: received, expected_len, actual_len,
-                        }
-                    )) if received.transform_id() == group && expected_len == width && actual_len == actual
+                    select_dedicated_ke_for_group(&request, group),
+                    Err(opc_proto_ikev2::Ikev2ChildSaNegotiationError::InvalidKeyExchange)
                 ),
                 "group {group}, width {actual}"
             );

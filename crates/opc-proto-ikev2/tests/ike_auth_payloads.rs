@@ -1350,7 +1350,7 @@ fn assert_child_pfs_ke_guess_retry(guessed_group: u16, guessed_width: usize) {
     ke_wire[4] = 9;
     let ke = opc_proto_ikev2::Ikev2KeyExchangePayload::decode_body(&ke_wire)
         .expect("structurally valid received KE");
-    // RFC 7296 section 1.3.1 requires the selected-group retry before
+    // RFC 7296 sections 1.3 and 3.4 require the selected-group retry before
     // interpreting a KE for a different group, including an unimplemented one.
     let retry = negotiate_child_sa(Some(&ke), &sa, &ts, &ts, &policy)
         .expect_err("different KE group requests a retry");

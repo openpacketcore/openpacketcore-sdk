@@ -1840,7 +1840,8 @@ impl fmt::Debug for Ikev2CreateChildSaRekeyResponsePayloads {
 }
 
 /// Select a Child SA and selectors, preferring a stronger common PFS group
-/// over group 1. Other accepted alternatives retain wire order.
+/// over group 1. Only implemented non-NONE DH groups are eligible, including
+/// with an accept-any DH requirement. Other accepted alternatives retain wire order.
 ///
 /// Supply `key_exchange` for PFS; a different KE group returns a typed retry
 /// naming the selected group, including when the received group is unsupported.
@@ -2207,6 +2208,9 @@ fn select_transforms_for_policy(
         .map(|requirement| {
             let accepted = |transform: &&Ikev2SaTransform<'_>| {
                 transform.transform_type == requirement.transform_type
+                    && (transform.transform_type != IKEV2_TRANSFORM_TYPE_DH
+                        || transform.transform_id == IKEV2_TRANSFORM_ID_NONE
+                        || Ikev2DhGroup::from_transform_id(transform.transform_id).is_ok())
                     && (requirement.accepted_transform_ids.is_empty()
                         || requirement
                             .accepted_transform_ids

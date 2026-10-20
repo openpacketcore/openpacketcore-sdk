@@ -438,6 +438,9 @@ pub fn build_ikev2_dedicated_bearer_create_child_sa_request(
 ///
 /// The default uses conservative limits while preserving unknown non-critical
 /// extensions. It always rejects duplicate required/optional payloads.
+/// The KE must name an offered group. Call [`crate::negotiate_child_sa`] to
+/// select that group before validating its public-value width: a different
+/// selected group requires an `INVALID_KE_PAYLOAD` retry instead.
 ///
 /// # Errors
 ///
@@ -464,6 +467,8 @@ pub fn decode_ikev2_dedicated_bearer_create_child_sa_request<'a>(
 /// Structural validation is always upgraded to strict. The caller's unknown-IE
 /// policy controls preservation/rejection of unknown non-critical payloads and
 /// unrecognized Notify types.
+/// KE public-value width is validated by [`crate::negotiate_child_sa`] after
+/// comparing the received and selected groups, as in the default decoder.
 ///
 /// # Errors
 ///
@@ -722,7 +727,7 @@ impl<'a> CreateChildSaParts<'a> {
         let eps_qos = required(self.eps_qos, Ikev2DedicatedBearerPayloadRole::EpsQos)?;
         let tft = required(self.tft, Ikev2DedicatedBearerPayloadRole::Tft)?;
         validate_sa_view(&security_association, false)?;
-        validate_ke_view(&security_association, self.key_exchange.as_ref())?;
+        validate_request_ke_view(&security_association, self.key_exchange.as_ref())?;
         validate_create_tft(&tft)?;
         validate_extended_ambr_dependency(self.apn_ambr, self.extended_apn_ambr)?;
         validate_eps_qos_notify_profile(&eps_qos, self.extended_eps_qos)?;
@@ -1243,6 +1248,23 @@ pub(crate) fn validate_ke_view(
     sa: &Ikev2SaPayload<'_>,
     key_exchange: Option<&Ikev2KeyExchangePayload<'_>>,
 ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    validate_request_ke_view(sa, key_exchange)?;
+    if let Some(key_exchange) = key_exchange {
+        let group = Ikev2DhGroup::from_transform_id(key_exchange.dh_group)
+            .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
+        validate_peer_public_len(group, key_exchange.key_exchange_data)
+            .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
+    }
+    Ok(())
+}
+
+/// Validate received request shape without selecting a group. Policy selection
+/// must compare the received and selected groups before checking public width,
+/// so an unselected group's malformed guess can still receive INVALID_KE_PAYLOAD.
+pub(crate) fn validate_request_ke_view(
+    sa: &Ikev2SaPayload<'_>,
+    key_exchange: Option<&Ikev2KeyExchangePayload<'_>>,
+) -> Result<(), Ikev2DedicatedBearerExchangeError> {
     let mut dh_offered = false;
     let mut group_matches = false;
     for transform in sa
@@ -1265,12 +1287,6 @@ pub(crate) fn validate_ke_view(
         (false, Some(_), _) => Err(Ikev2DedicatedBearerExchangeError::UnexpectedKeyExchange),
         (true, Some(_), false) => {
             Err(Ikev2DedicatedBearerExchangeError::KeyExchangeDhGroupMismatch)
-        }
-        (true, Some(key_exchange), true) => {
-            let group = Ikev2DhGroup::from_transform_id(key_exchange.dh_group)
-                .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
-            validate_peer_public_len(group, key_exchange.key_exchange_data)
-                .map_err(Ikev2DedicatedBearerExchangeError::Crypto)
         }
         _ => Ok(()),
     }

@@ -5,8 +5,10 @@
 - **RFC 8247 §2.4 / RFC 9395 §7:** group 1 remains supported for legacy peers,
   including default software requirements, negotiation, providers and checkpoint
   restore. Existing explicit allowlists remain authoritative. Other admitted
-  common groups are preferred; group 1 is selected only when it is the only
-  common group. IKE and Child-SA PFS offers and policies move it last;
+  implemented common groups are preferred; group 1 is selected when it is the
+  only implemented common group. Generic Child-SA selection ignores
+  unimplemented DH transforms even with an accept-any requirement. IKE and
+  Child-SA PFS offers and policies move group 1 last;
   a different received KE produces a typed retry whose `INVALID_KE_PAYLOAD`
   Notify names the selected common group. Other groups retain caller/wire order;
   IKE-SA and NWu selection retain matching-KE fallback, while generic Child-SA
@@ -15,6 +17,10 @@
   response correlation uses the encoded or retained offer. A selected non-NONE
   DH group with no KE returns `KeyExchangeRequired`, including DH-bearing
   IKE_AUTH offers and DH-agnostic negotiation probes.
+  Dedicated-bearer and NWu request decoding checks offered-group membership,
+  leaving public-value width validation to selection after the group comparison.
+  This preserves the RFC 7296 §§1.3/3.4 retry for a malformed guess in an
+  unselected group. Builders, responses and correlation retain width validation.
 - **RFC 7296 §§2.10/2.13:** local generation uses admitted entropy and at least
   32 octets and half the PRF's preferred key length (32 for all supported PRFs).
   Every typed outgoing nonce builder enforces 32..=256 octets. Every public

@@ -1099,31 +1099,41 @@ fn nwu_ke_request_build_enforces_group_width() {
 
 #[test]
 fn nwu_ke_request_decode_enforces_group_width() {
+    // Compare groups during selection before interpreting the received value.
     for (group, width) in NWU_KE_WIDTHS {
         let (first, bytes) = must(encode_payloads(&must(
             nwu_ke_input(group, width).payloads(),
         )));
         let header = create_header(Peer::Network, false);
-        must(CreateRequest::decode(
+        let request = must(CreateRequest::decode(
             &header,
             first,
             &bytes,
             AddressFamilies::Ipv4,
             Limits::default(),
         ));
+        let policy = must(AeadPolicy::new(vec![must(AeadSuite::new(
+            Ikev2EncryptionAlgorithm::AesGcm16_128,
+            Some(must(opc_proto_ikev2::Ikev2DhGroup::from_transform_id(
+                group,
+            ))),
+            false,
+        ))]));
+        must(policy.select(&request));
         for actual in [1, width - 1, width + 1] {
             let malformed = replace_nwu_ke_width(first, &bytes, actual);
+            let request = must(CreateRequest::decode(
+                &header,
+                first,
+                &malformed,
+                AddressFamilies::Ipv4,
+                Limits::default(),
+            ));
+            let key_exchange = request.key_exchange().unwrap();
+            assert_eq!(key_exchange.dh_group, group);
+            assert_eq!(key_exchange.key_exchange_data.len(), actual);
             assert!(
-                matches!(
-                    CreateRequest::decode(
-                        &header,
-                        first,
-                        &malformed,
-                        AddressFamilies::Ipv4,
-                        Limits::default()
-                    ),
-                    Err(Error::Incompatible)
-                ),
+                matches!(policy.select(&request), Err(Error::InvalidValue)),
                 "group {group}, width {actual}"
             );
         }
