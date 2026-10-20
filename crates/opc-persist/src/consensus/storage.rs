@@ -2914,6 +2914,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frozen_setup_does_not_spend_new_backend_probe_budget() {
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        assert!(std::time::Instant::now() > (frozen + Duration::from_secs(3)).into_std());
+
+        let value = sqlite::run_backend_sqlite_with_timeout(
+            &backend,
+            Duration::from_secs(3),
+            |conn, cancellation| {
+                cancellation.check_io()?;
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                    .map_err(|_| sqlite::invalid_data("fresh backend query failed"))
+            },
+        )
+        .await;
+        tokio::time::resume();
+        assert_eq!(value.expect("new operation has its own three-second budget"), 1);
+    }
+
+    #[tokio::test]
     async fn pre_core_probe_timeout_never_queues_late_work_and_reuses_backend() {
         let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
             .await
