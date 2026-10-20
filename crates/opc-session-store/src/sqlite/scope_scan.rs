@@ -194,7 +194,7 @@ pub(crate) struct SqliteScopeScan {
 
 impl SqliteScopeScan {
     pub(crate) fn capture(
-        source: &PinnedSqliteFile,
+        source: &std::sync::Arc<PinnedSqliteFile>,
         identity: SessionConsensusIdentity,
         check: &dyn Fn() -> io::Result<()>,
     ) -> io::Result<Self> {

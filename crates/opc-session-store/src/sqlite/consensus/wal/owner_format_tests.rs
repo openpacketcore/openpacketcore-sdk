@@ -40,7 +40,7 @@ impl RootFixture {
         let owner = NativeOwner {
             parent: Arc::new(File::open(directory.path()).unwrap()),
             database_identity: identity(&database.metadata().unwrap()),
-            database,
+            database: Arc::new(database),
             database_name: "store.sqlite".into(),
             native_name: "store.sqlite.native-wal".into(),
             selected: AtomicBool::new(true),

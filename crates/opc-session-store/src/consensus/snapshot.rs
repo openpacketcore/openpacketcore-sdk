@@ -30,7 +30,36 @@ use super::SnapshotIntegrityPolicy;
 use crate::fenced_mutation_roster::PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES;
 
 #[cfg(target_os = "linux")]
-pub(crate) type RetainedSnapshotDatabaseFlock = Arc<nix::fcntl::Flock<std::fs::File>>;
+pub(crate) type RetainedSnapshotDatabaseFlock = Arc<SnapshotDatabaseFlock>;
+
+/// A lease lock on the backend's existing open file description. Dropping a
+/// lease unlocks its flock but never closes a second descriptor to SQLite's
+/// main file: any such close would release the process's POSIX record locks.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct SnapshotDatabaseFlock {
+    file: Arc<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl SnapshotDatabaseFlock {
+    pub(crate) fn lock(file: Arc<std::fs::File>) -> io::Result<Self> {
+        rustix::fs::flock(&*file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        Ok(Self { file })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SnapshotDatabaseFlock {
+    fn drop(&mut self) {
+        if let Err(error) = rustix::fs::flock(&*self.file, rustix::fs::FlockOperation::Unlock) {
+            // Match the retained namespace flock's failure semantics.
+            if !std::thread::panicking() {
+                panic!("failed to unlock snapshot database flock: {error}");
+            }
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) type RetainedSnapshotNamespaceSocket = Arc<OwnedFd>;
@@ -741,6 +770,27 @@ pub(crate) struct FileIdentity {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FileIdentity;
+
+impl FileIdentity {
+    /// Inspect SQLite's borrowed descriptor without opening, duplicating or
+    /// closing another handle to its inode.
+    pub(crate) fn for_connection(connection: &rusqlite::Connection) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let (device, inode) = opc_sqlite_file_control_sys::main_file_identity(connection)
+                .map_err(|_| io::Error::other("SQLite main file identity is unavailable"))?;
+            Ok(Self { device, inode })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = connection;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SQLite main file identity requires Linux",
+            ))
+        }
+    }
+}
 
 /// A regular SQLite file pinned to an existing OS handle.
 ///

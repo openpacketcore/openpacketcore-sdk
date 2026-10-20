@@ -7,7 +7,7 @@ use std::cell::Cell;
 
 struct Fixture {
     backend: SqliteSessionBackend,
-    source: PinnedSqliteFile,
+    source: Arc<PinnedSqliteFile>,
     directory: tempfile::TempDir,
 }
 
@@ -38,7 +38,7 @@ impl Fixture {
         drop(connection);
         Self {
             backend,
-            source,
+            source: Arc::new(source),
             directory,
         }
     }
@@ -118,7 +118,7 @@ fn sqlite_scope_scan_wal_admission_waits_ahead_of_later_writers() {
         let writer = fixture.backend.conn.lock().await;
         registry.set_wal_probe(crate::sqlite::scope_scan::wal_probe(
             Arc::downgrade(&fixture.backend.conn),
-            Arc::new(fixture.source),
+            fixture.source,
         ));
         let key = ScopeSchedulerKey::from_bytes([9; 32]);
         let mut admission = Box::pin(
@@ -447,9 +447,10 @@ fn sqlite_scope_scan_never_reports_an_unlinked_wal_as_zero() {
 }
 
 fn wal_probe(fixture: &Fixture) -> crate::scope_scan::registry::WalProbe {
+    fixture.source.verify_identity().unwrap();
     crate::sqlite::scope_scan::wal_probe(
         Arc::downgrade(&fixture.backend.conn),
-        Arc::new(fixture.source.try_clone().unwrap()),
+        Arc::clone(&fixture.source),
     )
 }
 

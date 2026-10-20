@@ -591,7 +591,6 @@ impl VerifiedSnapshotSource for VerifiedFile {
         self.file.try_clone()
     }
 
-    #[cfg(any(test, feature = "test-control"))]
     fn file_identity(&self) -> io::Result<(u64, u64)> {
         let metadata = self.file.metadata()?;
         Ok((metadata.dev(), metadata.ino()))

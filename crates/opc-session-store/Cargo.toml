@@ -67,7 +67,7 @@ futures-util = "0.3"
 rusqlite = { workspace = true, features = ["backup", "bundled", "hooks", "limits"] }
 
 [target.'cfg(unix)'.dependencies]
-opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0" }
+opc-sqlite-file-control-sys = { path = "../opc-sqlite-file-control-sys", version = "0.2.0", features = ["borrowed-file-identity"] }
 
 [dev-dependencies]
 opc-consensus = { path = "../opc-consensus", version = "0.2.0", features = ["dangerous-test-hooks"] }

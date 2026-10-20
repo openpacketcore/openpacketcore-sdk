@@ -5607,12 +5607,9 @@ fn verify_proactive_checkpoint_connection(
             "session consensus checkpoint descriptor moved",
         ));
     }
-    let actual = crate::consensus::snapshot::PinnedSqliteFile::from_file(
-        opc_sqlite_file_control_sys::main_file_descriptor(connection)
-            .map_err(|_| invalid_data("session consensus checkpoint descriptor is unavailable"))?,
-        source.path().to_path_buf(),
-    )?;
-    if actual.identity() != source.identity() {
+    let actual = crate::consensus::snapshot::FileIdentity::for_connection(connection)
+        .map_err(|_| invalid_data("session consensus checkpoint descriptor is unavailable"))?;
+    if actual != source.identity() {
         return Err(invalid_data(
             "session consensus checkpoint descriptor changed",
         ));
@@ -35714,12 +35711,9 @@ pub(crate) fn verify_pinned_snapshot_descriptor(
     {
         return Err(invalid_data("SQLite pinned snapshot descriptor moved"));
     }
-    let actual = crate::consensus::snapshot::PinnedSqliteFile::from_file(
-        opc_sqlite_file_control_sys::main_file_descriptor(connection)
-            .map_err(|_| invalid_data("SQLite pinned snapshot descriptor is unavailable"))?,
-        pinned.path().to_path_buf(),
-    )?;
-    if actual.identity() != pinned.identity() {
+    let actual = crate::consensus::snapshot::FileIdentity::for_connection(connection)
+        .map_err(|_| invalid_data("SQLite pinned snapshot descriptor is unavailable"))?;
+    if actual != pinned.identity() {
         return Err(invalid_data(
             "SQLite opened a different pinned snapshot descriptor",
         ));
@@ -35788,10 +35782,10 @@ const SNAPSHOT_COMPACTION_FOREGROUND_PROGRESS_OPS: i32 = 4_096;
 ///
 /// The live consensus connection is never moved into this reader. The reader
 /// is admitted only after its SQLite-owned main descriptor is compared with
-/// the duplicated descriptor taken from that live connection.
+/// the shared pin retained by the live owner.
 pub(crate) struct SnapshotReadConnection {
     pub(crate) connection: Connection,
-    source: crate::consensus::snapshot::PinnedSqliteFile,
+    source: Arc<crate::consensus::snapshot::PinnedSqliteFile>,
     wal: Mutex<Option<crate::consensus::snapshot::PinnedSqliteFile>>,
 }
 
@@ -35804,13 +35798,11 @@ pub(crate) fn verify_snapshot_read_connection(reader: &SnapshotReadConnection) -
             "session consensus snapshot reader main file moved",
         ));
     }
-    let actual_source = crate::consensus::snapshot::PinnedSqliteFile::from_file(
-        opc_sqlite_file_control_sys::main_file_descriptor(&reader.connection).map_err(|_| {
-            invalid_data("session consensus snapshot reader descriptor is unavailable")
-        })?,
-        reader.source.path().to_path_buf(),
-    )?;
-    if actual_source.identity() != reader.source.identity() {
+    let actual_source = crate::consensus::snapshot::FileIdentity::for_connection(
+        &reader.connection,
+    )
+    .map_err(|_| invalid_data("session consensus snapshot reader descriptor is unavailable"))?;
+    if actual_source != reader.source.identity() {
         return Err(invalid_data(
             "session consensus snapshot reader source descriptor changed",
         ));
@@ -35822,12 +35814,12 @@ pub(crate) fn verify_snapshot_read_connection(reader: &SnapshotReadConnection) -
 /// consensus connection. Its caller must still create exactly one read
 /// transaction before admitting a source cut.
 pub(crate) fn open_snapshot_read_connection(
-    source: &crate::consensus::snapshot::PinnedSqliteFile,
+    source: &Arc<crate::consensus::snapshot::PinnedSqliteFile>,
 ) -> io::Result<SnapshotReadConnection> {
     #[cfg(target_os = "linux")]
     {
         source.verify_identity()?;
-        let source = source.try_clone()?;
+        let source = Arc::clone(source);
         checked_snapshot_capture_workspace_bytes(&[source.file().metadata()?.len()])?;
         let conn = Connection::open_with_flags(
             source.path(),
@@ -46766,6 +46758,7 @@ mod tests {
             source_path.clone(),
         )
         .expect("pin source descriptor");
+        let source_file = Arc::new(source_file);
         let reader = open_snapshot_read_connection(&source_file).expect("open snapshot reader");
         let source_cut = begin_snapshot_read_sync(&reader, identity()).expect("begin source cut");
         let raw_path = directory.path().join("build-vacuum-test.sqlite");
@@ -47375,6 +47368,7 @@ mod tests {
         drop(replacement_connection);
         std::fs::rename(&replacement, &source).expect("replace source path");
 
+        let pinned = Arc::new(pinned);
         assert!(open_snapshot_read_connection(&pinned).is_err());
     }
 
@@ -47402,6 +47396,7 @@ mod tests {
             source_path.clone(),
         )
         .expect("pin source descriptor");
+        let pinned = Arc::new(pinned);
         let reader = open_snapshot_read_connection(&pinned).expect("open pinned reader");
         reader
             .connection
@@ -47446,6 +47441,7 @@ mod tests {
             source_path.clone(),
         )
         .expect("pin source descriptor");
+        let pinned = Arc::new(pinned);
         let reader = open_snapshot_read_connection(&pinned).expect("open pinned reader");
         reader
             .connection
@@ -47497,6 +47493,7 @@ mod tests {
             source_path,
         )
         .expect("pin source descriptor");
+        let pinned = Arc::new(pinned);
         let reader = open_snapshot_read_connection(&pinned).expect("open pinned reader");
         reader
             .connection
@@ -47546,6 +47543,7 @@ mod tests {
             source_path.clone(),
         )
         .expect("pin source descriptor");
+        let pinned = Arc::new(pinned);
         let reader = open_snapshot_read_connection(&pinned).expect("open pinned reader");
         reader
             .connection

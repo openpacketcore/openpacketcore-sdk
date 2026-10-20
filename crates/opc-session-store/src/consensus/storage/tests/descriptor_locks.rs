@@ -22,8 +22,8 @@ async fn snapshot_build_identity_fence_preserves_sqlite_record_locks() {
             "before the snapshot build identity fence",
         );
         {
-            let actual = snapshot_build_live_file(&connection, &source).unwrap();
-            assert_eq!(actual.identity(), source.identity());
+            let actual = snapshot_build_live_identity(&connection).unwrap();
+            assert_eq!(actual, source.identity());
         }
         probe::assert_state(
             &path,

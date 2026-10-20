@@ -106,7 +106,7 @@ pub(super) fn directory_path(file: &File) -> PathBuf {
 /// incomplete or closed selected owner cannot dispatch to the SQLite basis.
 pub(crate) struct NativeOwner {
     parent: Arc<File>,
-    database: File,
+    database: Arc<File>,
     database_name: OsString,
     database_identity: (u64, u64),
     native_name: OsString,
@@ -123,6 +123,10 @@ pub(crate) struct NativeOwner {
 }
 
 impl NativeOwner {
+    pub(crate) fn database_pin(&self) -> Arc<File> {
+        Arc::clone(&self.database)
+    }
+
     pub(crate) fn discover(path: &Path, conn: &Connection) -> io::Result<Self> {
         let parent = open_directory(
             path.parent()
@@ -152,7 +156,7 @@ impl NativeOwner {
         let selected = read_selection(&file)?.is_some() || namespace_exists;
         Ok(Self {
             parent,
-            database: file,
+            database: Arc::new(file),
             database_name,
             database_identity: identity(&metadata),
             native_name,
