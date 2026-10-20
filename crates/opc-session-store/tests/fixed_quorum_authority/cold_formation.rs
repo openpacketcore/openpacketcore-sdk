@@ -375,7 +375,7 @@ async fn pristine_member_join(
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             for (index, store) in stores.iter().enumerate() {
-                loop {
+                let status = loop {
                     match consensus_padding_receipt_status_for_test(store, request)
                         .await
                         .unwrap()
@@ -388,12 +388,18 @@ async fn pristine_member_join(
                                     raft_log_index: committed,
                                 }
                             );
-                            break;
+                            // The durable receipt and nonblocking admission
+                            // observation are separate. Keep both inside the
+                            // existing catch-up deadline and assert one
+                            // captured admitted status below.
+                            let status = observe_admission(index, store);
+                            if status.admitted {
+                                break status;
+                            }
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                let status = observe_admission(index, store);
+                };
                 assert!(status.admitted);
                 assert_eq!(status.leader_id, Some(leader));
                 assert!(store
