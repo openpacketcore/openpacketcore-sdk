@@ -123,7 +123,6 @@ async fn public_history_discards_actor_completion_delivered_at_or_after_deadline
         fixture.shutdown().await.unwrap();
         evidence.push(outcome);
     }
-    eprintln!("history handoff (late_ms, rejected, reads, mutations): {evidence:?}");
     assert!(
         evidence
             .iter()
@@ -195,7 +194,6 @@ async fn protected_history_discards_late_handoff_without_caching_authority() {
         fixture.shutdown().await.unwrap();
         evidence.push(outcome);
     }
-    eprintln!("protected handoff (late_ms, rejected, rows, fresh_reads, mutations): {evidence:?}");
     assert!(
         evidence
             .iter()

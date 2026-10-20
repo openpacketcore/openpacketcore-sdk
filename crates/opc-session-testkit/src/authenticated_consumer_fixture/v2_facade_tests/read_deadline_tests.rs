@@ -850,7 +850,6 @@ async fn concurrent_slow_receipts_use_one_call_each_with_v2_wait_counters() {
     )
     .await;
     fixture.shutdown().await.unwrap();
-    eprintln!("concurrent slow receipts (two callers): {evidence:?}");
     assert!(
         evidence.0 && evidence.1 && evidence.2 && evidence.3,
         "{evidence:?}"
@@ -953,7 +952,6 @@ async fn prepared_checkpoint_cas_keeps_successful_200_500_700ms_receipts() {
         evidence.push(entry);
         fixture.shutdown().await.unwrap();
     }
-    eprintln!("prepared CAS slow receipts: {evidence:?}");
     assert!(
         evidence
             .iter()
@@ -1039,7 +1037,6 @@ async fn prepared_checkpoint_lease_keeps_successful_200_500_700ms_receipts() {
         evidence.push(entry);
         fixture.shutdown().await.unwrap();
     }
-    eprintln!("prepared lease slow receipts: {evidence:?}");
     assert!(
         evidence
             .iter()

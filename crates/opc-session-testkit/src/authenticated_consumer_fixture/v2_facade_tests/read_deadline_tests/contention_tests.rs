@@ -221,10 +221,16 @@ async fn two_slow_receipts_preserve_competing_admission_including_emergency() {
             Competitor::EmergencyV2Transition,
         ] {
             let row = competing_case(hold_ms, competitor).await;
-            eprintln!("reserved read capacity: hold_ms={} competitor={:?} admission={:?} caller_ms={} successful_reads={} physical_reads={} target_reads={} v2_wait_before_caller={} v2_wait_max={} v1_wait_max={} v2_setups={} v2_mutations={}",
-                row.hold_ms, row.competitor, row.admission, row.caller_ms, row.successful_reads,
-                row.physical_reads, row.target_reads, row.v2_wait_before_caller, row.v2_wait_max,
-                row.v1_wait_max, row.v2_setups, row.v2_mutations);
+            assert!(
+                row.caller_ms < 100
+                    && row.target_reads == 1
+                    && row.v2_wait_before_caller == 1
+                    && row.v2_wait_max == 1
+                    && row.v1_wait_max == 0,
+                "hold_ms={} competitor={:?}: {row:?}",
+                row.hold_ms,
+                row.competitor,
+            );
             evidence.push(row);
         }
     }
