@@ -46,9 +46,10 @@ use crate::durable_relocation::{XfrmSaRelocationRecoveryProofKey, XfrmSaRelocati
 use crate::durable_roster::{XfrmObjectRosterRecoveryProofKey, XfrmObjectRosterRecoveryStore};
 use crate::model::{
     sa_uses_esn, validate_exact_remove_policy_request, validate_exact_remove_sa_request,
-    validate_policy_query, validate_relocate_sa_request, validate_sa_lookup_key,
-    validate_sa_output_mark, validate_sa_query, ExactRemovePolicyRequest, ExactRemoveSaRequest,
-    QueryPolicyRequest, SaKeySnapshot, SaLookupKey,
+    validate_policy_parameters, validate_policy_query, validate_relocate_sa_request,
+    validate_sa_lookup_key, validate_sa_output_mark, validate_sa_query, validate_same_family,
+    validate_selector_family, ExactRemovePolicyRequest, ExactRemoveSaRequest, QueryPolicyRequest,
+    SaKeySnapshot, SaLookupKey, XFRM_POLICY_TEMPLATE_LIMIT,
 };
 #[cfg(unix)]
 use crate::namespace::XfrmObjectRecoveryBindError;
@@ -80,7 +81,6 @@ const XFRM_USER_SA_ID_LEN: usize = 24;
 const XFRM_USER_POLICY_INFO_LEN: usize = 168;
 const XFRM_USER_POLICY_ID_LEN: usize = 64;
 const XFRM_USER_TEMPLATE_LEN: usize = 64;
-const XFRM_POLICY_TEMPLATE_LIMIT: usize = 6;
 const XFRM_USER_SPI_INFO_LEN: usize = 232;
 const XFRM_USER_MIGRATE_STATE_LEN: usize = 132;
 const XFRM_AEVENT_ID_LEN: usize = 48;
@@ -5147,70 +5147,6 @@ fn is_known_aead_algorithm(name: &str) -> bool {
         name,
         XFRM_AEAD_RFC4106_GCM_AES | "rfc4543(gcm(aes))" | "rfc7539esp(chacha20,poly1305)"
     )
-}
-
-fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
-    validate_selector_family(&parameters.selector)?;
-    crate::model::validate_forward_transit_parameters(parameters)?;
-    if parameters.templates.len() > XFRM_POLICY_TEMPLATE_LIMIT {
-        return Err(XfrmError::invalid_config(
-            "templates",
-            "policy supports at most six templates",
-        ));
-    }
-    if matches!(parameters.action, XfrmAction::Allow) && parameters.templates.is_empty() {
-        return Err(XfrmError::invalid_config(
-            "templates",
-            "allow policy requires at least one template",
-        ));
-    }
-    for template in &parameters.templates {
-        if template.id.spi == 0 && template.request_id.is_none() {
-            return Err(XfrmError::invalid_config(
-                "template.request_id",
-                "wildcard SPI requires a nonzero request ID",
-            ));
-        }
-        if template.id.protocol == 0 {
-            return Err(XfrmError::invalid_config(
-                "template.protocol",
-                "protocol must be nonzero",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_selector_family(selector: &XfrmSelector) -> Result<(), XfrmError> {
-    validate_same_family(selector.source, selector.destination, "selector.family")?;
-    let prefix_limit = if selector.source.is_ipv4() { 32 } else { 128 };
-    if selector.source_prefix_len > prefix_limit {
-        return Err(XfrmError::invalid_config(
-            "selector.source_prefix_len",
-            "prefix length exceeds address family",
-        ));
-    }
-    if selector.destination_prefix_len > prefix_limit {
-        return Err(XfrmError::invalid_config(
-            "selector.destination_prefix_len",
-            "prefix length exceeds address family",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_same_family(
-    left: IpAddress,
-    right: IpAddress,
-    field: &'static str,
-) -> Result<(), XfrmError> {
-    if address_family(left) != address_family(right) {
-        return Err(XfrmError::invalid_config(
-            field,
-            "addresses must use the same family",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_spi_range(min_spi: u32, max_spi: u32) -> Result<(), XfrmError> {

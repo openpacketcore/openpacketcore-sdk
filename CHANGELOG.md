@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-ipsec-xfrm`: invalid ordinary Allow/Block policies are refused before
+  namespace writer epochs, durable preparation, staged journal claims or
+  composite SA effects. Mock policy installs and updates now enforce the same
+  shape as Linux. `XfrmObjectInstallDurableError` and
+  `XfrmObjectRosterRequestError` add `InvalidPolicy`; update exhaustive matches.
+  Valid requests and kernel/stored encodings are unchanged.
+
 - `opc-session-store`: the unadvertised voter-slot profile requires explicit
   volume enrollment before open. The SDK generates incarnation keys and returns
   a signer; missing, mismatched or retired enrollment returns

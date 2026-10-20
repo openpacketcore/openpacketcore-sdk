@@ -2599,8 +2599,8 @@ impl NamespaceBoundLinuxXfrmBackend {
         request: XfrmObjectInstallRequest,
     ) -> Result<XfrmObjectInstallAdmissionAuthority, XfrmObjectInstallDurableError> {
         request
-            .validate_forward_transit()
-            .map_err(|_| XfrmObjectInstallDurableError::InvalidForwardTransit)?;
+            .validate_policy()
+            .map_err(XfrmObjectInstallDurableError::from_policy_validation)?;
         let operation = DurableObjectOperation {
             store: store.clone(),
             operation_id,
@@ -5484,23 +5484,21 @@ impl NamespaceCommand {
                 let _ = reply.send(result);
             }
             Self::InstallPolicy(request, reply) => {
-                let result =
-                    match crate::model::validate_forward_transit_parameters(&request.parameters)
-                        .and_then(|()| state.admit_xfrm_mutation())
-                    {
-                        Ok(()) => backend.install_policy(request).await,
-                        Err(error) => Err(error),
-                    };
+                let result = match crate::model::validate_policy_parameters(&request.parameters)
+                    .and_then(|()| state.admit_xfrm_mutation())
+                {
+                    Ok(()) => backend.install_policy(request).await,
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Self::RekeyPolicy(request, reply) => {
-                let result =
-                    match crate::model::validate_forward_transit_parameters(&request.parameters)
-                        .and_then(|()| state.admit_xfrm_mutation())
-                    {
-                        Ok(()) => backend.rekey_policy(request).await,
-                        Err(error) => Err(error),
-                    };
+                let result = match crate::model::validate_policy_parameters(&request.parameters)
+                    .and_then(|()| state.admit_xfrm_mutation())
+                {
+                    Ok(()) => backend.rekey_policy(request).await,
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(result);
             }
             Self::RemovePolicy(request, reply) => {

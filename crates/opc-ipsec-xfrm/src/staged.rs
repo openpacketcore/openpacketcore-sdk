@@ -1183,7 +1183,7 @@ impl XfrmStagedInstall {
     where
         B: XfrmBackend + ?Sized + 'static,
     {
-        crate::composite::validate_composite_forward_transit(&self.request)
+        crate::composite::validate_composite_policy(&self.request)
             .map_err(XfrmStagedInstallRunError::from)?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedInstallRunError::RuntimeUnavailable)?;

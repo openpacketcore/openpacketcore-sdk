@@ -886,6 +886,82 @@ impl PolicyParameters {
     }
 }
 
+pub(crate) const XFRM_POLICY_TEMPLATE_LIMIT: usize = 6;
+
+/// Validate the complete policy shape without admitting a writer or reading state.
+pub(crate) fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
+    validate_selector_family(&parameters.selector)?;
+    validate_forward_transit_parameters(parameters)?;
+    if parameters.templates.len() > XFRM_POLICY_TEMPLATE_LIMIT {
+        return Err(XfrmError::invalid_config(
+            "templates",
+            "policy supports at most six templates",
+        ));
+    }
+    if matches!(parameters.action, XfrmAction::Allow) && parameters.templates.is_empty() {
+        return Err(XfrmError::invalid_config(
+            "templates",
+            "allow policy requires at least one template",
+        ));
+    }
+    for template in &parameters.templates {
+        if template.id.spi == 0 && template.request_id.is_none() {
+            return Err(XfrmError::invalid_config(
+                "template.request_id",
+                "wildcard SPI requires a nonzero request ID",
+            ));
+        }
+        if template.id.protocol == 0 {
+            return Err(XfrmError::invalid_config(
+                "template.protocol",
+                "protocol must be nonzero",
+            ));
+        }
+    }
+    // Template endpoint-family checks also belong in pure preflight. The
+    // encoder performs the same check before emitting each template.
+    for template in &parameters.templates {
+        validate_same_family(
+            template.id.destination,
+            template.source_address,
+            "template.family",
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_selector_family(selector: &XfrmSelector) -> Result<(), XfrmError> {
+    validate_same_family(selector.source, selector.destination, "selector.family")?;
+    let prefix_limit = if selector.source.is_ipv4() { 32 } else { 128 };
+    if selector.source_prefix_len > prefix_limit {
+        return Err(XfrmError::invalid_config(
+            "selector.source_prefix_len",
+            "prefix length exceeds address family",
+        ));
+    }
+    if selector.destination_prefix_len > prefix_limit {
+        return Err(XfrmError::invalid_config(
+            "selector.destination_prefix_len",
+            "prefix length exceeds address family",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_same_family(
+    left: IpAddress,
+    right: IpAddress,
+    field: &'static str,
+) -> Result<(), XfrmError> {
+    if left.is_ipv4() != right.is_ipv4() {
+        return Err(XfrmError::invalid_config(
+            field,
+            "addresses must use the same family",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_forward_transit_parameters(
     parameters: &PolicyParameters,
 ) -> Result<(), XfrmError> {
@@ -2130,6 +2206,66 @@ impl XfrmProbe {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn policy_preflight_complete_shape_preserves_valid_profiles() {
+        for action in [XfrmAction::Allow, XfrmAction::Block] {
+            let mut valid = malformed_existing_policy_parameters(XfrmAction::Block);
+            valid.action = action;
+            valid.templates.truncate(1);
+            assert!(validate_policy_parameters(&valid).is_ok());
+            let mut invalid = Vec::new();
+            let mut changed = valid.clone();
+            changed.selector.destination = IpAddress::Ipv6([0; 16]);
+            invalid.push(("selector.family", changed));
+            let mut changed = valid.clone();
+            changed.selector.source_prefix_len = 33;
+            invalid.push(("selector.source_prefix_len", changed));
+            let mut changed = valid.clone();
+            changed.selector.destination_prefix_len = 33;
+            invalid.push(("selector.destination_prefix_len", changed));
+            let mut changed = valid.clone();
+            changed.templates = vec![changed.templates[0]; 7];
+            invalid.push(("templates", changed));
+            let mut changed = valid.clone();
+            changed.templates[0].id.spi = 0;
+            invalid.push(("template.request_id", changed));
+            let mut changed = valid.clone();
+            changed.templates[0].id.protocol = 0;
+            invalid.push(("template.protocol", changed));
+            let mut changed = valid.clone();
+            changed.templates[0].source_address = IpAddress::Ipv6([0; 16]);
+            invalid.push(("template.family", changed));
+            for (expected, parameters) in invalid {
+                assert!(
+                    matches!(validate_policy_parameters(&parameters), Err(XfrmError::InvalidConfig { field, .. }) if field == expected),
+                    "{action:?}: {expected}"
+                );
+            }
+            let mut wildcard = valid.clone();
+            wildcard.templates[0].id.spi = 0;
+            wildcard.templates[0].request_id = XfrmRequestId::new(42);
+            assert!(validate_policy_parameters(&wildcard).is_ok());
+            let mut ipv6 = valid.clone();
+            ipv6.selector =
+                XfrmSelector::new(IpAddress::Ipv6([1; 16]), IpAddress::Ipv6([2; 16]), 17);
+            assert!(
+                validate_policy_parameters(&ipv6).is_ok(),
+                "IPv6 inner selectors may use IPv4 tunnel endpoints"
+            );
+            for count in 1..=6 {
+                let mut bounded = valid.clone();
+                bounded.templates = vec![bounded.templates[0]; count];
+                assert!(validate_policy_parameters(&bounded).is_ok());
+            }
+            let mut empty = valid;
+            empty.templates.clear();
+            assert_eq!(
+                validate_policy_parameters(&empty).is_ok(),
+                action == XfrmAction::Block
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

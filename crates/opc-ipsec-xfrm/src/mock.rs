@@ -990,7 +990,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError> {
-        crate::model::validate_forward_transit_parameters(&request.parameters)?;
+        crate::model::validate_policy_parameters(&request.parameters)?;
         self.admit_mutation()?;
         let mut state = self
             .state
@@ -1015,7 +1015,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn rekey_policy(&self, request: RekeyPolicyRequest) -> Result<(), XfrmError> {
-        crate::model::validate_forward_transit_parameters(&request.parameters)?;
+        crate::model::validate_policy_parameters(&request.parameters)?;
         self.admit_mutation()?;
         let mut state = self
             .state

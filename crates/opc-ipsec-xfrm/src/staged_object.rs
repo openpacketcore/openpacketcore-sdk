@@ -62,12 +62,10 @@ pub enum XfrmObjectInstallRequest {
 }
 
 impl XfrmObjectInstallRequest {
-    /// Validate the explicit transit action without reading or mutating state.
-    pub(crate) fn validate_forward_transit(&self) -> Result<(), XfrmError> {
+    /// Validate every policy kind without reading or mutating state.
+    pub(crate) fn validate_policy(&self) -> Result<(), XfrmError> {
         match self {
-            Self::Policy(request) => {
-                crate::model::validate_forward_transit_parameters(&request.parameters)
-            }
+            Self::Policy(request) => crate::model::validate_policy_parameters(&request.parameters),
             Self::Sa(_) => Ok(()),
         }
     }
@@ -1133,7 +1131,7 @@ impl XfrmStagedObjectInstall {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedObjectInstallRunError::RuntimeUnavailable)?;
         let install_operation = self.journal.inner.install_operation;
-        self.request.validate_forward_transit().map_err(|source| {
+        self.request.validate_policy().map_err(|source| {
             XfrmStagedObjectInstallRunError::InstallFailed {
                 operation: install_operation,
                 source,
