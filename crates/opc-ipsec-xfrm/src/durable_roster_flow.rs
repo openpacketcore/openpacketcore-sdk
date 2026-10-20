@@ -3065,10 +3065,10 @@ mod tests {
                 crate::XfrmAction::Allow,
             ),
         });
-        assert!(
-            XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)])
-                .is_err()
-        );
+        assert!(matches!(
+            XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)]),
+            Err(XfrmObjectRosterRequestError::InvalidPolicy)
+        ));
     }
 
     #[test]
@@ -3078,10 +3078,10 @@ mod tests {
                 crate::XfrmAction::Block,
             ),
         });
-        assert!(
-            XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)])
-                .is_err()
-        );
+        assert!(matches!(
+            XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)]),
+            Err(XfrmObjectRosterRequestError::InvalidPolicy)
+        ));
     }
 
     #[test]

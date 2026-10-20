@@ -169,9 +169,9 @@ impl XfrmCompositeOutcome {
 /// Error returned by an SA-plus-policy install composite.
 #[derive(Debug, Clone)]
 pub enum XfrmCompositeInstallError {
-    /// SA install failed, or policy preflight refused before any mutation.
+    /// SA install failed, or composite preflight refused before any mutation.
     InstallSaFailed {
-        /// Backend error from SA install or the policy preflight error.
+        /// Backend error from SA install, or a policy-shape or rollback-mark preflight error.
         source: XfrmError,
         /// Composite outcome evidence.
         outcome: XfrmCompositeOutcome,
@@ -371,6 +371,28 @@ pub(crate) fn validate_composite_policy(
     })
 }
 
+fn validate_composite_install(
+    request: &XfrmCompositeInstallRequest,
+) -> Result<(), XfrmCompositeInstallError> {
+    validate_composite_policy(request)?;
+    // Both rollback paths delete by re-selecting on these lookup marks. A
+    // narrower canonical mask can match an object this call never installed,
+    // so refuse it before admitting either direction.
+    validate_exact_lookup_mark(request.sa.parameters.mark, "composite.sa.mark").map_err(
+        |source| XfrmCompositeInstallError::InstallSaFailed {
+            source,
+            outcome: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
+        },
+    )?;
+    validate_exact_lookup_mark(request.policy.parameters.mark, "composite.policy.mark").map_err(
+        |source| XfrmCompositeInstallError::InstallSaFailed {
+            source,
+            outcome: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
+        },
+    )?;
+    Ok(())
+}
+
 /// Install a Security Association and its Security Policy with best-effort rollback.
 ///
 /// Operation order is [`XFRM_COMPOSITE_INSTALL_ORDER`]. If policy install
@@ -388,25 +410,7 @@ pub async fn install_sa_policy_with_rollback<B>(
 where
     B: XfrmBackend + ?Sized,
 {
-    validate_composite_policy(&request)?;
-    // Refuse before installing anything. Both rollback paths below delete by
-    // re-selecting on these lookup marks, and that selection is never proven
-    // unique: a narrower canonical mask can match another stored object, so a
-    // rollback could remove something this call never installed. Rejecting up
-    // front leaves the kernel untouched, which a mid-rollback failure would
-    // not.
-    validate_exact_lookup_mark(request.sa.parameters.mark, "composite.sa.mark").map_err(
-        |source| XfrmCompositeInstallError::InstallSaFailed {
-            source,
-            outcome: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
-        },
-    )?;
-    validate_exact_lookup_mark(request.policy.parameters.mark, "composite.policy.mark").map_err(
-        |source| XfrmCompositeInstallError::InstallSaFailed {
-            source,
-            outcome: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
-        },
-    )?;
+    validate_composite_install(&request)?;
 
     if let Err(source) = backend.install_sa(request.sa.clone()).await {
         let outcome = if matches!(&source, XfrmError::StateIndeterminate { .. }) {
@@ -448,7 +452,8 @@ where
 ///
 /// Returns [`XfrmBidirectionalInstallError`] with outcome evidence preserving
 /// both the failed composite result and any rollback failure.
-/// Both requests are preflighted before installation. Refusal of either request
+/// Both requests' policy shapes and exact rollback lookup marks are preflighted
+/// before installation. A preflight refusal of either request
 /// returns [`XfrmBidirectionalInstallError::FirstInstallFailed`] with neither
 /// direction applied, including when only the second request is invalid.
 // The public error preserves both directional outcomes and rollback evidence;
@@ -463,7 +468,7 @@ where
 {
     let [first, second] = requests;
     for request in [&first, &second] {
-        validate_composite_policy(request).map_err(|source| {
+        validate_composite_install(request).map_err(|source| {
             XfrmBidirectionalInstallError::FirstInstallFailed {
                 outcome: XfrmBidirectionalInstallOutcome::first_failed(source.outcome()),
                 source,
@@ -985,6 +990,54 @@ mod tests {
             backend.operations()
         );
         assert!(result.is_err());
+    }
+
+    async fn assert_partial_second_mark_is_preflighted(sa_mark: bool) {
+        let backend = FailingCompositeBackend::default();
+        let mut second = install_request();
+        let partial = Some(crate::XfrmLookupMark::new(0x10, 0xf0).unwrap());
+        let field = if sa_mark {
+            second.sa.parameters.mark = partial;
+            "composite.sa.mark"
+        } else {
+            second.policy.parameters.mark = partial;
+            "composite.policy.mark"
+        };
+        let error =
+            install_bidirectional_sa_policy_with_rollback(&backend, [install_request(), second])
+                .await
+                .unwrap_err();
+        assert!(
+            backend.operations().is_empty(),
+            "invalid second-request {field} must precede every install and rollback: {:?}; {error:?}",
+            backend.operations()
+        );
+        let XfrmBidirectionalInstallError::FirstInstallFailed { source, outcome } = error else {
+            panic!("either request's mark preflight must return FirstInstallFailed");
+        };
+        assert!(matches!(
+            source,
+            XfrmCompositeInstallError::InstallSaFailed {
+                source: XfrmError::InvalidConfig { field: actual, .. },
+                ..
+            } if actual == field
+        ));
+        assert_eq!(
+            outcome,
+            XfrmBidirectionalInstallOutcome::first_failed(XfrmCompositeOutcome::not_applied(
+                XfrmCompositeOperation::InstallSa
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn bidirectional_preflight_rejects_partial_second_sa_mark_without_effects() {
+        assert_partial_second_mark_is_preflighted(true).await;
+    }
+
+    #[tokio::test]
+    async fn bidirectional_preflight_rejects_partial_second_policy_mark_without_effects() {
+        assert_partial_second_mark_is_preflighted(false).await;
     }
 
     #[tokio::test]

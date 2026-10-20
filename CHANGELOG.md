@@ -13,8 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace writer epochs, durable preparation, staged journal claims or
   composite SA effects. Mock policy installs and updates now enforce the same
   shape as Linux. `XfrmObjectInstallDurableError` and
-  `XfrmObjectRosterRequestError` add `InvalidPolicy`; update exhaustive matches.
+  `XfrmObjectRosterRequestError` are non-exhaustive and add `InvalidPolicy`;
+  callers classifying specific variants should handle it. Single and staged
+  composite helpers now report a malformed policy as `InstallSaFailed` instead
+  of `PolicyInstallRolledBack`.
   Valid requests and kernel/stored encodings are unchanged.
+  Before upgrading, recover or finalize unresolved durable install/roster
+  operations for malformed Allow/Block policies: the new release returns
+  `InvalidPolicy` for them and leaves their records blocking cooperating writes
+  until an exclusive namespace reset.
 
 - `opc-session-store`: the unadvertised voter-slot profile requires explicit
   volume enrollment before open. The SDK generates incarnation keys and returns
