@@ -175,6 +175,8 @@ jobs:
 
       - name: Test nohz guest reboot handoff
         run: |
+          python3 ci/test-download-image.py
+          bash -n ci/download-image.sh
           python3 ci/test-qualify-tft-nohz-vm.py
           bash -n ci/qualify-tft-nohz-vm.sh
 
