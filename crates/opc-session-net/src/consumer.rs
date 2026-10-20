@@ -21982,6 +21982,7 @@ mod tests {
     #[path = "prewarm_batch.rs"]
     mod prewarm_batch;
     mod read_deadline_tests;
+    mod v2_not_dispatched;
     #[path = "void_alpn_tests.rs"]
     mod void_alpn_tests;
     #[path = "void_wire_tests.rs"]
