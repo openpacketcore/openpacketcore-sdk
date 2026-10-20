@@ -213,8 +213,14 @@ Old receipts cannot supply new lease authority, and old leases cannot mutate a
 successor. V1/V2 history and watch retirement retain independently validated
 accounting and immutable request bindings. Incoming/outgoing engine operations
 and disk promises retain accepted responsibility after timeout/cancellation.
-Replacement rejects stale completion sets. Retrying an interrupted election
-prepares a newer durable range rather than forging or replaying a vote.
+Replacement rejects stale completion sets. After a deadline or lost commit
+reply, recovery checks the selected leader's current full committed vote,
+exact local round and accepted proposal status. An intact committed election
+resumes its owned work, including when no protected provider is configured;
+that progress check grants no application authority. An uncommitted election,
+failed accepted proposal or changed participant still requires a newer durable
+range rather than forging or replaying a vote. Caller deadlines and the
+all-member persisted-boundary and activation checks remain unchanged.
 
 Executed adversarial REDs found and corrected a missing owner fence after
 promise I/O failure, retired lease visibility in cached receipts, activation
