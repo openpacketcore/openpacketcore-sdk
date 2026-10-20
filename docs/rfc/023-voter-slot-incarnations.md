@@ -162,6 +162,21 @@ public keys/digests here; private keys never enter the replicated state. The
 table envelope starts with `OPVI`, version 1. Missing tables in an older
 storage format are not interpreted as all slots being pristine.
 
+Session Store enrollment creates the volume's incarnation key in the SDK and
+stores it with the installation, slot, incarnation and key digest in one private
+record. A matching local public anchor records whether consensus identity has
+been initialized; consuming enrollment and creating that identity share one
+transaction. Neither an absent anchor nor missing consensus tables on a consumed
+enrollment authorizes re-seeding. Open returns
+`VoterIdentityReplacementRequired` before starting an engine when enrollment
+does not match or the recovered committed table retires the local incarnation.
+The local anchor is excluded from portable snapshots, and private key material
+never enters SQL, the native basis, logs or snapshots. The consumer publishes
+the proved genesis digests once outside these volumes, before any voter starts
+Raft, and keeps that immutable publication across its own restart. Crossing this
+storage boundary is a fresh installation with no migration. The capability stays
+unadvertised until the consumer publication and automatic replacement paths exist.
+
 Under the pinned engine's `single-term-leader` profile, a full log ID contains
 only term and index. Never infer a proposer node ID from the local leader view.
 Version 1 is the Durable format. Add no speculative Async-only fields now;

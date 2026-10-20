@@ -21,11 +21,12 @@ pub use admission::{
     VoterResponseFenceEngine, VoterSlotStateReader,
 };
 pub use authentication::{
-    voter_candidate_possession_signing_input, voter_rpc_possession_signing_input,
-    AuthenticatedVoterEvidence, TrustedVoterTime, VerifiedVoterCandidate, VerifiedVoterReplacement,
-    VerifiedVoterRpc, VoterCandidateBinding, VoterCandidateChallenge, VoterChallengeIssuer,
-    VoterReplacementAuthorization, VoterReplacementVerifier, VoterRpcBinding, VoterRpcChallenge,
-    VoterRpcProofKind,
+    voter_candidate_possession_signing_input, voter_enrollment_possession_signing_input,
+    voter_rpc_possession_signing_input, AuthenticatedVoterEvidence, TrustedVoterTime,
+    VerifiedVoterCandidate, VerifiedVoterEnrollment, VerifiedVoterReplacement, VerifiedVoterRpc,
+    VoterCandidateBinding, VoterCandidateChallenge, VoterChallengeIssuer, VoterEnrollmentBinding,
+    VoterEnrollmentChallenge, VoterReplacementAuthorization, VoterReplacementVerifier,
+    VoterRpcBinding, VoterRpcChallenge, VoterRpcProofKind,
 };
 pub use codec::{
     decode_lost_voter_attestation, decode_voter_slot_table, encode_lost_voter_attestation,

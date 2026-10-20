@@ -111,13 +111,22 @@ pub(super) fn initialize(
 ) -> Result<(), SessionConsensusStorageError> {
     let stored = read_seed(conn).map_err(|_| SessionConsensusStorageError::CorruptState)?;
     match (selected, stored) {
-        (None, None) => Ok(()),
+        (None, None)
+            if !super::super::voter_identity::anchor_present(conn)
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)? =>
+        {
+            Ok(())
+        }
         (Some(selected), Some(stored))
             if selected.genesis == stored.genesis
                 && selected.identity().ok() == Some(identity)
                 && selected.members() == *members
                 && profile == ConsensusAuthorityProfile::FixedImmutable =>
         {
+            if !identity_exists {
+                return Err(SessionConsensusStorageError::VoterIdentityReplacementRequired);
+            }
+            super::super::voter_identity::require_seed_enrollment(conn, selected, true)?;
             Ok(())
         }
         (Some(selected), None)
@@ -126,6 +135,7 @@ pub(super) fn initialize(
                 && selected.members() == *members
                 && profile == ConsensusAuthorityProfile::FixedImmutable =>
         {
+            super::super::voter_identity::require_seed_enrollment(conn, selected, false)?;
             conn.execute_batch(SCHEMA)
                 .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
             let bytes = encode_voter_slot_table(&selected.genesis)
@@ -134,9 +144,16 @@ pub(super) fn initialize(
                 .and_then(|state| state.encode())
                 .map_err(|_| SessionConsensusStorageError::InvalidIdentity)?;
             conn.execute("INSERT INTO consensus_voter_slots (singleton, profile_version, genesis, state) VALUES (1, 1, ?1, ?2)", params![bytes, state]).map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
+            super::super::voter_identity::consume_enrollment(conn)?;
             Ok(())
         }
         (Some(_), Some(_)) => Err(SessionConsensusStorageError::IdentityMismatch),
+        (_, None)
+            if super::super::voter_identity::anchor_present(conn)
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)? =>
+        {
+            Err(SessionConsensusStorageError::VoterIdentityReplacementRequired)
+        }
         _ => Err(SessionConsensusStorageError::SchemaVersionMismatch),
     }
 }
@@ -208,13 +225,33 @@ pub(crate) fn preflight(
 ) -> Result<bool, SessionConsensusStorageError> {
     let retained = read_seed(conn).map_err(|_| SessionConsensusStorageError::CorruptState)?;
     match (selected, retained.as_ref()) {
-        (None, None) => Ok(false),
-        (Some(selected), Some(retained)) if selected.genesis == retained.genesis => Ok(true),
-        (Some(_), None)
+        (None, None)
+            if !super::super::voter_identity::anchor_present(conn)
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)? =>
+        {
+            Ok(false)
+        }
+        (Some(selected), Some(retained)) if selected.genesis == retained.genesis => {
+            if !table_exists(conn, "consensus_identity")
+                .map_err(|_| SessionConsensusStorageError::CorruptState)?
+            {
+                return Err(SessionConsensusStorageError::VoterIdentityReplacementRequired);
+            }
+            super::super::voter_identity::require_seed_enrollment(conn, selected, true)?;
+            Ok(true)
+        }
+        (Some(selected), None)
             if !table_exists(conn, "consensus_identity")
                 .map_err(|_| SessionConsensusStorageError::CorruptState)? =>
         {
+            super::super::voter_identity::require_seed_enrollment(conn, selected, false)?;
             Ok(true)
+        }
+        (_, None)
+            if super::super::voter_identity::anchor_present(conn)
+                .map_err(|_| SessionConsensusStorageError::BackendUnavailable)? =>
+        {
+            Err(SessionConsensusStorageError::VoterIdentityReplacementRequired)
         }
         _ => Err(SessionConsensusStorageError::SchemaVersionMismatch),
     }

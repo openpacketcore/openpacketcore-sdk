@@ -1106,6 +1106,7 @@ fn map_live_terminal_recovery_handoff_error(error: SessionConsensusStorageError)
         SessionConsensusStorageError::UnsupportedPlatform
         | SessionConsensusStorageError::RecoveryRequired
         | SessionConsensusStorageError::IdentityMismatch
+        | SessionConsensusStorageError::VoterIdentityReplacementRequired
         | SessionConsensusStorageError::PersistenceModeMismatch
         | SessionConsensusStorageError::SchemaVersionMismatch
         | SessionConsensusStorageError::FreshInstallationRequired

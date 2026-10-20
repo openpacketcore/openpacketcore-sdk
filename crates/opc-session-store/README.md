@@ -301,6 +301,33 @@ credential checks remain mandatory. `VoterPeerResolver` supplies authenticated
 incarnation routes. Legacy raw RPCs and unsupported activation families are
 refused. Async and legacy roots cannot be adopted into this profile.
 
+Before publishing genesis, explicitly call
+`SqliteSessionBackend::enroll_voter_identity` on each allocated volume. The SDK
+generates a private incarnation key and persists its installation, slot,
+incarnation and public-key digest together. `VoterIdentitySigner` proves that
+key through fresh, authenticated enrollment and RPC challenges; it never
+exports private material. The consumer publishes the complete immutable
+manifest once, outside the voter volumes, and chooses enroll or open from that
+publication record, never from whether a path is empty.
+
+Open only validates retained enrollment. Missing or mismatched enrollment,
+lost consensus bindings after first initialization, and a known retired
+incarnation return `VoterIdentityReplacementRequired` before Raft starts. The
+consumer treats this as storage-loss evidence and automatically allocates a
+new volume and incarnation through replacement; it never re-enrolls the lost
+identity. Peers require proof of the selected key before any bootstrap
+Pre-Vote grant or term change. Any enrolled genesis member may initialize the
+same full manifest, so an absent preferred initiator does not block a fresh
+majority. After formation, the committed `VoterSlotTable` is the authority.
+Initialization opens admission only after a fresh authenticated Openraft quorum
+barrier and local apply. The readiness probes use that same control route and
+never reuse a pre-restart admission observation or a cached reachability proof.
+
+The local enrollment binding is excluded from portable snapshots; installing
+a snapshot preserves the recipient's own binding and key. First initialization
+consumes its enrollment in the same transaction that creates consensus identity,
+so partial table loss cannot make a used volume pristine again.
+
 The native owner is the live authority for both the committed table and the
 provisional Prepare pointer. Durable log append, truncation, apply, native
 snapshot installation and selected-generation reopen preserve that ordering;
@@ -311,13 +338,20 @@ catch-up and then completes joint/uniform membership through Openraft. Startup
 reinstalls required response fences before RPCs or automatic voting. Read
 leases are disabled for this profile.
 
-The distinct native formats require a fresh installation. `replace_voter` and
-`voter_replacement_status` implement the controller control path; bootstrap and
-application activation continuity remain a later RFC slice. Those boundaries
+Crossing this enrollment/storage boundary requires a fresh installation; there
+is no migration. `replace_voter` and `voter_replacement_status` implement the
+controller control path; consumer manifest publication, automatic loss
+replacement and application activation continuity remain integration work.
+Those boundaries
 and adversarial process qualification must pass before replacement capability
 is advertised or applications depend on post-replacement readiness.
 
 ### Fixed durable-quorum consumer recipe
+
+The legacy constructor below has no volume enrollment and cannot distinguish
+erased storage from a pristine voter. Never reopen an erased volume as its old
+identity. Durable deployments need the enrolled profile and its consumer
+publication/replacement integration described above.
 
 For a fixed deployment, choose one `PlacementResiliencePolicy` and carry that
 same value through topology admission and the runtime. Build exactly three or
@@ -1142,11 +1176,14 @@ persisted Openraft membership.
 If the canonical member's first campaign runs before its peers start, automatic
 Pre-Vote retries recover once an admitted majority is reachable, including after
 the canonical member restarts. A fixed peer with no log, membership, snapshot or
-committed leader vote uses its admitted fixed topology to answer the inquiry.
-The reply changes no term, log, durable vote or election timer. Once engine
-membership or leader state exists, normal Pre-Vote eligibility, log-freshness and
-leader-lease checks apply. Application authority still requires the exact
+commit uses its admitted fixed topology to answer the inquiry. If it received a
+leader's committed vote before membership arrived, it refuses until that
+leader's lease expires. The reply changes no term, log, durable vote or election
+timer. Once engine history exists, normal Pre-Vote eligibility, log-freshness
+and leader-lease checks apply. Application authority still requires the exact
 membership to be committed and applied and a live quorum to be available.
+The application's startup loop may retry `initialize_cluster()` on the same
+open store as peers become reachable; this needs no operator action.
 
 The topology member vector contains only `QuorumReplicaDescriptor` values.
 The node's one local SQLite backend is supplied separately to

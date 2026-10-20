@@ -18,6 +18,7 @@ impl Receiver {
         let backend = SqliteSessionBackend::open(directory.path().join("seed.sqlite")).unwrap();
         let conn = backend.conn.blocking_lock();
         let identity = if slots {
+            crate::sqlite::voter_identity::enroll_projection_for_test(&conn, &fixture::genesis(3));
             initialize(&conn, &fixture::genesis(3), true).unwrap()
         } else {
             initialize_schema_with_storage_anchor_and_pending_and_bindings_and_fenced_profile(

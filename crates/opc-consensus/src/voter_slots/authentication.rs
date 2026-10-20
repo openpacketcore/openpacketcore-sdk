@@ -87,6 +87,51 @@ pub struct VoterCandidateChallenge {
     pub channel_binding: [u8; 32],
 }
 
+/// Pre-manifest enrollment coordinates, obtained over an authenticated channel.
+///
+/// This binding proves possession only. The consumer publishes the complete
+/// immutable genesis manifest once, before starting any genesis voter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoterEnrollmentBinding {
+    /// Installation whose consumer is collecting the genesis keys.
+    pub cluster_instance: ConsensusClusterId,
+    /// Allocated slot and incarnation; enrollment never allocates these itself.
+    pub identity: VoterSlotIdentity,
+    /// Digest of the SDK-generated compressed P-256 public key.
+    pub key_digest: [u8; 32],
+    /// Workload identity independently authenticated by the carrying channel.
+    pub spiffe_id: String,
+}
+
+/// One-use challenge for an enrolled volume before manifest publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoterEnrollmentChallenge {
+    /// Exact allocation and public key being enrolled.
+    pub binding: VoterEnrollmentBinding,
+    /// Fresh receiver-owned challenge.
+    pub challenge: [u8; 32],
+    /// Actual authenticated channel binding.
+    pub channel_binding: [u8; 32],
+}
+
+/// Canonical message for enrollment, distinct from RPC and replacement proofs.
+pub fn voter_enrollment_possession_signing_input(
+    challenge: &VoterEnrollmentChallenge,
+) -> Result<Vec<u8>, VoterReplacementError> {
+    let binding = &challenge.binding;
+    validate_spiffe(&binding.spiffe_id)?;
+    let mut bytes = b"openpacketcore/consensus/volume-enrollment/v1\0".to_vec();
+    bytes.extend_from_slice(binding.cluster_instance.as_bytes());
+    bytes.extend_from_slice(&binding.identity.slot().get().to_be_bytes());
+    bytes.extend_from_slice(&binding.identity.incarnation().get().to_be_bytes());
+    bytes.extend_from_slice(&binding.key_digest);
+    bytes.extend_from_slice(&(binding.spiffe_id.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(binding.spiffe_id.as_bytes());
+    bytes.extend_from_slice(&challenge.challenge);
+    bytes.extend_from_slice(&challenge.channel_binding);
+    Ok(bytes)
+}
+
 /// Emit the RFC 023 candidate signature message, using fixed-width big-endian fields.
 pub fn voter_candidate_possession_signing_input(
     challenge: &VoterCandidateChallenge,
@@ -166,6 +211,7 @@ pub fn voter_rpc_possession_signing_input(
 enum PendingBinding {
     Rpc(Box<VoterRpcChallenge>),
     Candidate(VoterCandidateChallenge),
+    Enrollment(VoterEnrollmentChallenge),
 }
 struct Pending {
     binding: PendingBinding,
@@ -194,6 +240,57 @@ impl VoterChallengeIssuer {
     /// Start an empty, process-local challenge registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Challenge an allocated volume before recording its immutable genesis key.
+    pub fn issue_enrollment(
+        &self,
+        binding: VoterEnrollmentBinding,
+        channel_binding: [u8; 32],
+        deadline: Instant,
+    ) -> Result<VoterEnrollmentChallenge, VoterReplacementError> {
+        self.issue(deadline, |challenge| {
+            let result = VoterEnrollmentChallenge {
+                binding,
+                challenge,
+                channel_binding,
+            };
+            voter_enrollment_possession_signing_input(&result)?;
+            Ok((result.clone(), PendingBinding::Enrollment(result)))
+        })
+    }
+
+    /// Verify an SDK-generated volume key on the actual authenticated channel.
+    ///
+    /// The result does not admit a voter or authorize re-enrollment after the
+    /// consumer has published its immutable manifest.
+    pub fn verify_enrollment(
+        &self,
+        challenge: &VoterEnrollmentChallenge,
+        authenticated_spiffe: &str,
+        actual_channel: [u8; 32],
+        key: [u8; 33],
+        signature: [u8; 64],
+    ) -> Result<VerifiedVoterEnrollment, VoterReplacementError> {
+        let expires = self.take(
+            challenge.challenge,
+            PendingBinding::Enrollment(challenge.clone()),
+        )?;
+        if authenticated_spiffe != challenge.binding.spiffe_id
+            || actual_channel != challenge.channel_binding
+            || key_digest(key) != challenge.binding.key_digest
+        {
+            return Err(UNAUTHORIZED);
+        }
+        verify_signature(
+            key,
+            signature,
+            &voter_enrollment_possession_signing_input(challenge)?,
+        )?;
+        Ok(VerifiedVoterEnrollment {
+            binding: challenge.binding.clone(),
+            expires,
+        })
     }
 
     fn issue<T>(
@@ -345,6 +442,24 @@ impl VoterChallengeIssuer {
             binding: challenge.binding.clone(),
             expires,
         })
+    }
+}
+
+/// Verified enrollment evidence for the consumer's one-time manifest publication.
+/// It cannot be deserialized or constructed from an unverified key digest.
+#[derive(Debug)]
+pub struct VerifiedVoterEnrollment {
+    binding: VoterEnrollmentBinding,
+    expires: Instant,
+}
+
+impl VerifiedVoterEnrollment {
+    /// Read the proved binding while the receiver's challenge is still fresh.
+    pub fn binding(&self) -> Result<&VoterEnrollmentBinding, VoterReplacementError> {
+        if Instant::now() >= self.expires {
+            return Err(VoterReplacementError::Deadline);
+        }
+        Ok(&self.binding)
     }
 }
 

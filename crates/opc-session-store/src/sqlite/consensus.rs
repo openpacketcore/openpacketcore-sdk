@@ -35219,6 +35219,11 @@ fn prepare_portable_snapshot_metadata_sync(conn: &Connection) -> io::Result<()> 
     // This local upgrade journal cannot authorize admission of an old
     // unsealed source after rebuilding a portable successor.
     strip_legacy_fixed_snapshot_reseed_from_snapshot_sync(conn)?;
+    // Enrollment belongs to the recipient volume, never to replicated state.
+    // Its private key is never in SQL; strip the local public/consumed binding
+    // from this disposable portable image as well.
+    conn.execute_batch("DROP TABLE IF EXISTS consensus_voter_anchor;")
+        .map_err(db_error)?;
     #[cfg(target_os = "linux")]
     conn.execute_batch("DROP TABLE IF EXISTS consensus_wal_application;")
         .map_err(db_error)?;

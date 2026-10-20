@@ -6,6 +6,14 @@ use opc_session_store::SessionConsensusRpcFamily;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::AtomicUsize;
 
+#[cfg(feature = "test-control")]
+#[path = "disk_loss.rs"]
+mod disk_loss;
+
+#[cfg(feature = "test-control")]
+#[path = "enrolled.rs"]
+mod enrolled;
+
 #[derive(Debug)]
 struct ObservedPeer {
     transport: ScopedLoopbackPeer,
@@ -113,11 +121,28 @@ async fn missed_bootstrap_campaign(restart_canonical: bool) {
     let mut stores = vec![fleet.open(0).await];
     let outcome = AssertUnwindSafe(async {
         // Both peer stores and listeners are absent, not merely delayed RPCs.
+        // Observe the real campaigns while initialization is pending, within
+        // its existing operation budget rather than starting another timeout.
+        let campaign_deadline = tokio::time::Instant::now()
+            + opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT;
+        let (initialization, campaigns) = tokio::join!(
+            stores[0].initialize_cluster(),
+            tokio::time::timeout_at(campaign_deadline, async {
+                while !fleet.peers[1..].iter().all(|peer| {
+                    peer.missed_votes.load(Ordering::SeqCst) > 0
+                        && peer.pre_votes.load(Ordering::SeqCst) > 0
+                }) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }),
+        );
         assert_eq!(
-            stores[0].initialize_cluster().await,
+            initialization,
             Err(ConsensusSessionStoreOpenError::ClusterFormationRejected),
             "a lone voter cannot admit itself"
         );
+        campaigns
+            .expect("observe missed real votes and automatic Pre-Votes within the operation bound");
         for peer in &fleet.peers[1..] {
             assert!(
                 peer.missed_votes.load(Ordering::SeqCst) > 0,
@@ -162,11 +187,20 @@ async fn missed_bootstrap_campaign(restart_canonical: bool) {
             assert!(!reopened.status().admitted);
             stores.push(reopened);
         }
+        // Opening installs the handler. Keep both routes unavailable until
+        // their pristine-state assertions finish so replication cannot race
+        // the second store's open or those assertions.
+        for peer in &fleet.peers[1..] {
+            peer.transport.set_enabled(false);
+        }
         stores.push(fleet.open(1).await);
         stores.push(fleet.open(2).await);
         for store in &stores[1..] {
             assert_eq!(store.status().last_log_index, None);
             assert!(!store.status().admitted);
+        }
+        for peer in &fleet.peers[1..] {
+            peer.transport.set_enabled(true);
         }
 
         // Retain the existing fixed-quorum 30-second readiness bound and every
@@ -241,6 +275,110 @@ async fn delayed_pristine_peers_recover_a_missed_bootstrap_campaign() {
 #[tokio::test]
 async fn delayed_pristine_peers_recover_after_the_bootstrap_voter_restarts() {
     missed_bootstrap_campaign(true).await;
+}
+
+#[cfg(feature = "test-control")]
+#[tokio::test]
+async fn pristine_member_joins_a_formed_quorum_without_losing_committed_history() {
+    use opc_session_store::test_support::{
+        append_consensus_padding_entry_for_test, consensus_padding_receipt_status_for_test,
+        ConsensusPaddingReceiptStatusForTest,
+    };
+
+    let fleet = ColdFleet::new();
+    let mut stores = vec![fleet.open(0).await, fleet.open(1).await];
+    let outcome = AssertUnwindSafe(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            join_all(stores.iter().map(|store| async {
+                loop {
+                    match store.initialize_cluster().await {
+                        Ok(()) => break,
+                        Err(ConsensusSessionStoreOpenError::ClusterFormationRejected) => {}
+                        other => panic!("unexpected initial majority admission: {other:?}"),
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }))
+            .await;
+        })
+        .await
+        .expect("initial majority forms within the existing readiness bound");
+        let leader = stores[0].status().leader_id.expect("formed quorum leader");
+        let leader_index = fleet
+            .peers
+            .iter()
+            .position(|peer| peer.node_id() == leader)
+            .unwrap();
+        let request = [0x74; 16];
+        let committed = append_consensus_padding_entry_for_test(&stores[leader_index], request)
+            .await
+            .expect("commit history before the third voter starts");
+
+        // The new member has never owned a log. Its listener remains closed
+        // until the empty-state checks finish, even though a leader is live.
+        fleet.peers[2].transport.set_enabled(false);
+        stores.push(fleet.open(2).await);
+        assert_eq!(stores[2].status().last_log_index, None);
+        assert!(!stores[2].status().admitted);
+        assert_eq!(
+            consensus_padding_receipt_status_for_test(&stores[2], request)
+                .await
+                .unwrap(),
+            ConsensusPaddingReceiptStatusForTest::NotFound
+        );
+        fleet.peers[2].transport.set_enabled(true);
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match stores[2].initialize_cluster().await {
+                    Ok(()) => break,
+                    Err(ConsensusSessionStoreOpenError::ClusterFormationRejected) => {}
+                    other => panic!("unexpected late member admission: {other:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            for store in &stores {
+                loop {
+                    match consensus_padding_receipt_status_for_test(store, request)
+                        .await
+                        .unwrap()
+                    {
+                        ConsensusPaddingReceiptStatusForTest::NotFound => {}
+                        recorded => {
+                            assert_eq!(
+                                recorded,
+                                ConsensusPaddingReceiptStatusForTest::Recorded {
+                                    raft_log_index: committed,
+                                }
+                            );
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(store.status().admitted);
+                assert_eq!(store.status().leader_id, Some(leader));
+                assert!(store
+                    .probe_fixed_durable_quorum_readiness()
+                    .await
+                    .traffic_authority()
+                    .is_granted());
+            }
+        })
+        .await
+        .expect("pristine member catches up within the existing readiness bound");
+    })
+    .catch_unwind()
+    .await;
+    for peer in &fleet.peers {
+        peer.transport.clear().await;
+    }
+    for result in join_all(stores.iter().map(ConsensusSessionStore::shutdown)).await {
+        result.expect("drain the quorum after the pristine member joins");
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]

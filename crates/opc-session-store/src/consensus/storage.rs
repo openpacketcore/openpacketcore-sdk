@@ -2465,6 +2465,10 @@ pub enum SessionConsensusStorageError {
     /// The persisted cluster/configuration/epoch differs from the requested scope.
     #[error("session consensus storage identity does not match this configuration")]
     IdentityMismatch,
+    /// The local voter enrollment is missing, mismatched, or already consumed
+    /// by consensus state that is no longer present.
+    #[error("voter identity replacement is required")]
+    VoterIdentityReplacementRequired,
     /// The database was created by another consensus storage schema.
     #[error("unsupported session consensus storage schema")]
     SchemaVersionMismatch,

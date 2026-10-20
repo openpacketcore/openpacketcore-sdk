@@ -129,6 +129,9 @@ pub mod store;
 pub mod topology;
 pub mod topology_attestation;
 pub mod ttl;
+pub mod voter_identity;
+
+pub use voter_identity::VoterIdentitySigner;
 
 #[cfg(test)]
 mod protected_fenced_transition_tests;

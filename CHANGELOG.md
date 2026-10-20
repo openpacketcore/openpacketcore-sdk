@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-session-store`: the unadvertised voter-slot profile requires explicit
+  volume enrollment before open. The SDK generates incarnation keys and returns
+  a signer; missing, mismatched or retired enrollment returns
+  `VoterIdentityReplacementRequired` before Raft starts. Consumed enrollment
+  cannot re-seed lost consensus tables. Formation and readiness require a fresh
+  authenticated quorum barrier before admission. Crossing this storage boundary requires
+  a fresh installation with no migration; consumer manifest publication and
+  automatic replacement remain required before advertising the capability.
+
 - `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
   `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
   must handle both variants. (#1334)
@@ -774,6 +783,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   injecting owner or fence drift in the renewal fixture. Exercise a lagging
   follower deterministically so quorum acknowledgement cannot race the direct
   database edits.
+
+- `opc-session-store`: a fixed voter that received a leader's committed vote
+  before its first membership can answer Pre-Vote after that leader's lease
+  expires. The decision preserves the full lease and reads one serialized
+  engine state without changing votes, logs, or election timers.
 
 - `opc-proto-diameter`: require request-bound authenticated peer evidence for
   SWm emergency authorization, including both answers in identity recovery.

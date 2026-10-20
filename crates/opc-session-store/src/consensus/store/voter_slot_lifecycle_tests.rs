@@ -35,8 +35,8 @@ async fn disconnect_drains_an_rpc_handler_before_the_store_reopens() {
         let directory = fleet.directories[1].path();
         let backend = SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap();
         ConsensusSessionStore::open_with_voter_slots_and_integrity(
-            topology(2),
-            genesis(),
+            fleet.topology(2),
+            fleet.genesis(),
             node,
             backend,
             directory.join("snapshots"),
