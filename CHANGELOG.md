@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callers classifying specific variants should handle it. Single and staged
   composite helpers now report a malformed policy as `InstallSaFailed` instead
   of `PolicyInstallRolledBack`.
+  The bidirectional helper now returns `FirstInstallFailed` instead of `SecondInstallRolledBack` for an invalid second-request rollback lookup mark, before installing either direction.
   Valid requests and kernel/stored encodings are unchanged.
   Before upgrading, recover or finalize unresolved durable install/roster
   operations for malformed Allow/Block policies: the new release returns

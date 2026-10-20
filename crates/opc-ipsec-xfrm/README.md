@@ -32,6 +32,7 @@ runners, roster admission and the mock backend. Invalid policies leave writer
 epochs, durable records, staged journals and backend state untouched; no SA
 install or compensating rollback starts. Both directions of a bidirectional
 install are checked before the first direction runs.
+The bidirectional helper now returns `FirstInstallFailed` instead of `SecondInstallRolledBack` for an invalid second-request rollback lookup mark, before installing either direction.
 
 Valid requests retain their operation order and encoded/stored bytes. Ordinary
 policy validation failures use `XfrmError::InvalidConfig` as their source, or
