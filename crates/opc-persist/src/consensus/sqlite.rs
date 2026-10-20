@@ -256,14 +256,17 @@ impl SqliteWorkCancellation {
     }
 
     fn cancel_before_commit(&self) -> bool {
-        self.state
-            .compare_exchange(
+        // Cancellation still owns the result when the worker's commit hook
+        // cancelled first, before the awaiting future observed its deadline.
+        matches!(
+            self.state.compare_exchange(
                 SQLITE_WORK_RUNNING,
                 SQLITE_WORK_CANCELLED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            )
-            .is_ok()
+            ),
+            Ok(_) | Err(SQLITE_WORK_CANCELLED)
+        )
     }
 
     fn authorize_commit(&self) -> Result<(), ConfigConsensusStorageError> {
