@@ -284,7 +284,7 @@ jobs:
         # The planner also lists the separate native-log proof shards. Its
         # plan check fails the run if the plan itself stops covering
         # everything, and the aggregator below fails if a shard is dropped.
-        shard: [misc, quiescent-o1, it-0, it-1, it-2, heavy-0, heavy-1]
+        shard: [misc, quiescent-o1, it-0, it-1, it-2, it-3, it-4, heavy-0, heavy-1]
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -304,9 +304,9 @@ jobs:
       # not add a `cargo clean` here, since rust-cache saves in a post-step
       # and would archive an empty target directory.
       # Per-shard keys: the legs build different target sets, so one shared
-      # key would make all seven race to save the same multi-gigabyte archive
+      # key would make all runners race to save the same multi-gigabyte archive
       # while giving each a worse hit rate than its own. Only main saves:
-      # seven archives per pull request would churn the repository's shared
+      # an archive per shard per pull request would churn the repository's shared
       # 10 GB cache quota and evict the entries the shards restore from.
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -399,8 +399,8 @@ jobs:
           done 3< shard-commands.txt
 
 
-  # Keep the 36-minute hosted store library off misc's serial critical path.
-  # Both runners preserve workspace feature unification and the O0 profile;
+  # Spread the ordinary library work with headroom below the 60-minute cap.
+  # All runners preserve workspace feature unification and the O0 profile;
   # exact names, including future tests, are distributed by a live inventory.
   rust-libraries:
     name: Rust library tests (${{ matrix.shard }})
@@ -409,7 +409,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1]
+        shard: [0, 1, 2]
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"

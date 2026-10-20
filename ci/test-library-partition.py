@@ -231,6 +231,8 @@ mod process {
                     plan = SHARDS.load_plan()
                     plan["lib_groups"] = [group] if mode == "moved" else []
                     plan["quiescent_lib_shards"] = {}
+                    plan["fixed_weights"] = {}
+                    plan["integration_groups"] = []
                     observed = []
 
                     def capture(argv, **kwargs):
