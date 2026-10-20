@@ -46,6 +46,10 @@ use crate::{
 #[path = "sqlite/scope_scan_schema_tests.rs"]
 mod scope_scan_schema_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "sqlite/descriptor_locks.rs"]
+mod descriptor_locks;
+
 const PATH_MAX_BYTES: usize = 4_096;
 #[cfg(any(target_os = "linux", test))]
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
