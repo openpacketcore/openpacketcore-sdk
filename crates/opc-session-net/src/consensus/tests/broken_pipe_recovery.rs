@@ -172,9 +172,15 @@ async fn expired_mtls_rpc_broken_pipe_recovers_head_with_original_parent_budget(
         "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/2",
     );
     let server_tls = material.config();
-    let client_tls = material.trusted_client_config(
+    let (client_source, client_tls) = material.trusted_client_config_with_source(
         "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/smf/instance/1",
     );
+    for status in [server_tls.material_status(), client_tls.material_status()] {
+        assert_eq!(
+            status.availability(),
+            opc_tls::TlsMaterialAvailability::Ready
+        );
+    }
     let server_epoch = server_tls.material_status().epoch();
     let client_epoch = client_tls.material_status().epoch();
     let handler = Arc::new(ResponsiveHeadHandler {
@@ -387,4 +393,5 @@ async fn expired_mtls_rpc_broken_pipe_recovers_head_with_original_parent_budget(
             .load(Ordering::Relaxed),
         0
     );
+    drop(client_source);
 }
