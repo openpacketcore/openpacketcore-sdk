@@ -1506,10 +1506,14 @@ impl Lab {
 
 fn test_run_skb_envelope(packet: &[u8]) -> Vec<u8> {
     let mut frame = vec![0_u8; 14];
+    // The kernel uses an IP EtherType to initialize the synthetic socket and
+    // rejects short IP headers before invoking the program. Use the local
+    // experimental EtherType for malformed L3 vectors so that the gate still
+    // receives their exact bytes, including an empty packet, after the L2 pull.
     let ethertype = match packet.first().map(|byte| byte >> 4) {
-        Some(4) => 0x0800_u16,
-        Some(6) => 0x86dd_u16,
-        _ => 0x0800_u16,
+        Some(4) if packet.len() >= 20 => 0x0800_u16,
+        Some(6) if packet.len() >= 40 => 0x86dd_u16,
+        _ => 0x88b5_u16,
     };
     frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
     frame.extend_from_slice(packet);
@@ -2039,6 +2043,40 @@ fn get_u64_le(value: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_l3_vectors_reach_the_gate_without_ip_transport_prevalidation() {
+        for (version, minimum_header_len) in [(4, 20), (6, 40)] {
+            for len in 0..minimum_header_len {
+                let mut packet = vec![0_u8; len];
+                if let Some(first) = packet.first_mut() {
+                    *first = version << 4;
+                }
+                let frame = test_run_skb_envelope(&packet);
+
+                // The kernel must pass these exact malformed L3 bytes to the
+                // gate instead of rejecting an incomplete IP transport header.
+                assert_eq!(&frame[12..14], &0x88b5_u16.to_be_bytes());
+                assert_eq!(frame.len(), 14 + packet.len());
+                assert_eq!(&frame[14..], packet);
+            }
+        }
+    }
+
+    #[test]
+    fn complete_ip_transport_headers_preserve_protocol_and_l3_bytes() {
+        for (version, minimum_header_len, ethertype) in [(4, 20, 0x0800_u16), (6, 40, 0x86dd_u16)] {
+            for len in [minimum_header_len, minimum_header_len + 16] {
+                let mut packet = vec![0xa5_u8; len];
+                packet[0] = version << 4;
+                let frame = test_run_skb_envelope(&packet);
+
+                assert_eq!(&frame[12..14], &ethertype.to_be_bytes());
+                assert_eq!(frame.len(), 14 + packet.len());
+                assert_eq!(&frame[14..], packet);
+            }
+        }
+    }
 
     #[test]
     fn top_level_failure_erases_error_and_path_content() {

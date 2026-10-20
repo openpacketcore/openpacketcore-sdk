@@ -814,6 +814,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-egress-fence`: keep empty and truncated L3 vectors in the independent
+  object oracle executable on kernels that reject short IP test-run transport
+  headers. Preserve the exact packet bytes and every gate assertion.
+
 - `opc-session-store`: register the accepted-proposal fixture's watch on its
   store's controlled clock before the timeout proof, keeping the original
   operation deadline and exact apply, receipt and retry assertions.
