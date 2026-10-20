@@ -1021,6 +1021,22 @@ impl RecoveryTrafficProgressTracker {
         // deadline as an absolute deadline would silently remove that allowance.
         absolute_deadline.map_or_else(|| self.progress_deadline(), |at| self.next_deadline(at))
     }
+
+    fn sleep_before_next_observation(
+        &self,
+        absolute_deadline: Option<Instant>,
+        now: impl FnOnce() -> Instant,
+        sleep: impl FnOnce(Duration),
+    ) {
+        // Use the current checkpoints after the nonqualifying observation;
+        // coverage or the existing availability allowance may have changed.
+        // A clipped sleep permits a final observation at the same boundary,
+        // but neither scheduler oversleep nor a late reply extends it.
+        let remaining = self
+            .observation_deadline(absolute_deadline)
+            .saturating_duration_since(now());
+        sleep(remaining.min(Duration::from_millis(20)));
+    }
 }
 
 struct RecoveryFaultSettlementContext<'a> {
@@ -6303,7 +6319,7 @@ impl Fleet {
             let observation_deadline = progress.observation_deadline(absolute_deadline);
             let observation_started = Instant::now();
             assert!(
-                observation_started < observation_deadline,
+                deadline_allows_completion(observation_started, observation_deadline),
                 "survivor traffic exhausted its next recovered-member observation boundary before dispatch: phase={phase}, pulse_elapsed={:?}, coverage_elapsed={:?}, observation_overrun={:?}, absolute_remaining={:?}, availability_recovery={}, baseline={availability_baseline:?}, pulse_checkpoint={:?}, coverage_checkpoint={:?}, stderr={:?}",
                 observation_started.saturating_duration_since(progress.pulse_observed_at),
                 observation_started.saturating_duration_since(progress.coverage_observed_at),
@@ -6412,7 +6428,7 @@ impl Fleet {
                 progress.pulse_checkpoint,
                 self.stderr_diagnostics()
             );
-            thread::sleep(Duration::from_millis(20));
+            progress.sleep_before_next_observation(absolute_deadline, Instant::now, thread::sleep);
         }
     }
 
@@ -20996,6 +21012,113 @@ fn member_recovery_survivor_origin_wave_has_no_cross_survivor_head_of_line_block
             (PendingCommandWaveStage::Collect, 4),
         ]
     );
+}
+
+#[test]
+fn member_recovery_observation_retry_reaches_the_boundary_without_sleep_overrun() {
+    let observed_at = Instant::now();
+    let (participants, before, after) = subset_traffic_fixture();
+    let progress = RecoveryTrafficProgressTracker::new(before.clone(), observed_at);
+    let deadline = progress.observation_deadline(None);
+    let clock = std::cell::Cell::new(deadline - Duration::from_millis(5));
+    assert!(!recovery_traffic_has_common_key_pulse(
+        &before,
+        &before,
+        &participants,
+    ));
+
+    // Exercise the harness's retry sleep with a deterministic clock. There is
+    // only 5 ms left after a nonqualifying observation; the old 20 ms sleep
+    // alone makes the final observation 15 ms late, without scheduler noise.
+    progress.sleep_before_next_observation(
+        None,
+        || clock.get(),
+        |delay| {
+            clock.set(clock.get() + delay);
+        },
+    );
+    let final_observed_at = clock.get();
+    assert!(
+        deadline_allows_completion(final_observed_at, deadline),
+        "retry sleep carried the final observation past its unchanged boundary by {:?}",
+        final_observed_at.saturating_duration_since(deadline),
+    );
+    assert_eq!(final_observed_at, deadline);
+    assert_eq!(progress.observation_deadline(None), deadline);
+    assert!(recovery_traffic_has_common_key_pulse(
+        &before,
+        &after,
+        &participants,
+    ));
+    assert!(!deadline_allows_completion(
+        final_observed_at + Duration::from_nanos(1),
+        deadline,
+    ));
+}
+
+#[test]
+fn member_recovery_observation_retry_preserves_all_existing_deadlines() {
+    let observed_at = Instant::now();
+    let initial = RecoveryTrafficProgressTracker::new(Vec::new(), observed_at);
+    let mut availability = initial.clone();
+    availability.extend_pulse_for_availability_recovery();
+    let mut coverage = initial.clone();
+    coverage.record_pulse(Vec::new(), observed_at + Duration::from_secs(20));
+
+    for (progress, absolute, expected_deadline) in [
+        (initial.clone(), None, observed_at + Duration::from_secs(13)),
+        (availability, None, observed_at + Duration::from_secs(26)),
+        (coverage, None, observed_at + Duration::from_secs(26)),
+        (
+            initial,
+            Some(observed_at + Duration::from_secs(8)),
+            observed_at + Duration::from_secs(8),
+        ),
+    ] {
+        assert_eq!(progress.observation_deadline(absolute), expected_deadline);
+        for (now, expected_delay) in [
+            (
+                expected_deadline - Duration::from_millis(100),
+                Duration::from_millis(20),
+            ),
+            (
+                expected_deadline - Duration::from_millis(20),
+                Duration::from_millis(20),
+            ),
+            (
+                expected_deadline - Duration::from_millis(5),
+                Duration::from_millis(5),
+            ),
+            (expected_deadline, Duration::ZERO),
+            (expected_deadline + Duration::from_nanos(1), Duration::ZERO),
+        ] {
+            let clock = std::cell::Cell::new(now);
+            progress.sleep_before_next_observation(
+                absolute,
+                || clock.get(),
+                |delay| {
+                    assert_eq!(delay, expected_delay);
+                    clock.set(clock.get() + delay);
+                },
+            );
+            assert_eq!(progress.observation_deadline(absolute), expected_deadline);
+            assert_eq!(
+                deadline_allows_completion(clock.get(), expected_deadline),
+                now <= expected_deadline,
+                "a retry cannot consume or renew the observation budget",
+            );
+        }
+
+        // Real sleep can resume late. Clipping the requested duration must
+        // not turn scheduler oversleep into an accepted observation.
+        let clock = std::cell::Cell::new(expected_deadline - Duration::from_millis(5));
+        progress.sleep_before_next_observation(
+            absolute,
+            || clock.get(),
+            |delay| clock.set(clock.get() + delay + Duration::from_nanos(1)),
+        );
+        assert!(!deadline_allows_completion(clock.get(), expected_deadline));
+    }
 }
 
 #[test]
