@@ -2939,6 +2939,13 @@ mod tests {
             .await
             .expect("activate exact voter roster");
         let directory = tempfile::tempdir().expect("private journal directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("private journal directory");
+        }
         let journal = Arc::new(
             FencedTransitionV2RecoveryJournal::create_new(
                 directory.path().join("recovery.sqlite3"),
@@ -3285,6 +3292,51 @@ mod tests {
             Err(FencedTransitionExecuteError::NotTransmitted)
         );
         assert!(harness.physical.voters().is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_resumed_handle_failed_preflight_retains_its_bound_row() {
+        let harness = harness(vec![Step::Commit]).await;
+        let original = harness.prepare().await;
+        let token = PersistentPreparedFencedTransitionV2Token::new(
+            Arc::clone(&harness.backend),
+            original.prepared.clone(),
+            budget(),
+            PreparedFencedV2HandleRouting {
+                voter_count: VOTERS,
+                route: Arc::clone(&harness.route),
+                history: Arc::clone(&harness.history),
+            },
+            PreparedRequestState::new(0),
+            false,
+        );
+        let journal = harness._directory.path().join("recovery.sqlite3");
+        std::fs::rename(&journal, journal.with_extension("moved")).unwrap();
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert!(harness.physical.voters().is_empty());
+        std::fs::rename(journal.with_extension("moved"), &journal).unwrap();
+        assert_eq!(harness.retained().await, 1);
+        assert_eq!(
+            token.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved),
+            "the current attempt's preflight cannot exclude an earlier bound request"
+        );
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            Ok(FencedTransitionV2Status::NotFound),
+            "the resumed handle must retain status recovery"
+        );
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert!(harness.physical.voters().is_empty());
+        assert_eq!(harness.retained().await, 1);
     }
 
     #[tokio::test]
