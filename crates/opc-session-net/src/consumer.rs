@@ -10992,6 +10992,8 @@ struct PersistentSessionConsumerV2Pool {
     // serializes aggregate V1/V2 physical setup and retains one cooldown.
     reconnect_control: Arc<PersistentConsumerReconnectControl>,
     idle: StdMutex<VecDeque<PersistentV2PoolEntry>>,
+    #[cfg(feature = "test-control")]
+    read_reconnect_wait: watch::Sender<Option<(tokio::time::Instant, Weak<()>)>>,
     shutdown: AtomicBool,
     shutdown_forced_tx: watch::Sender<bool>,
     shutdown_io: Arc<PersistentConsumerIoBarrier>,
@@ -11464,6 +11466,14 @@ impl PersistentSessionConsumerV2Pool {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
+        self.connect_once_classified(deadline, false).await
+    }
+
+    async fn connect_once_classified(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        _read_only: bool,
+    ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
         // Physical admission is deliberately outside the reconnect gate. A
         // caller which cannot own an aggregate socket slot is only locally
         // overloaded; it must not serialize or cool down unrelated recovery.
@@ -11477,12 +11487,25 @@ impl PersistentSessionConsumerV2Pool {
             Some(self.reconnect_control.as_ref()),
         );
         let (generation, material_epoch) = reconnect_setup.epoch();
+        // The controlled-clock fixture observes only read-side reconnect
+        // waits. It must not advance a mutation, an unrelated capability
+        // probe, or real resolver/TLS/Hello work. A weak lifetime makes a
+        // cancelled or immediately admitted wait unobservable as pending.
+        #[cfg(feature = "test-control")]
+        let read_wait = _read_only.then(|| {
+            let lifetime = Arc::new(());
+            self.read_reconnect_wait
+                .send_replace(Some((deadline, Arc::downgrade(&lifetime))));
+            lifetime
+        });
         let reconnect = poll_persistent_reconnect_setup(
             self.reconnect_control
                 .acquire(deadline, generation, material_epoch),
             &mut reconnect_setup,
         )
         .await??;
+        #[cfg(feature = "test-control")]
+        drop(read_wait);
         reconnect_setup.install_attempt(reconnect);
         match self
             .connect_once_admitted(deadline, admission, &mut reconnect_setup)
@@ -11953,7 +11976,16 @@ impl PersistentSessionConsumerV2Pool {
                         |cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause },
                     )?;
                 (
-                    self.connect_once(setup_deadline).await.map_err(|cause| {
+                    self.connect_once_classified(
+                        setup_deadline,
+                        matches!(
+                            request.operation(),
+                            SessionConsumerV2Operation::FencedTransitionV2HistoryState
+                                | SessionConsumerV2Operation::FencedTransitionV2Status { .. }
+                        ),
+                    )
+                    .await
+                    .map_err(|cause| {
                         PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }
                     })?,
                     true,
@@ -14933,6 +14965,8 @@ impl PersistentSessionConsumerClient {
             prewarm: request_prewarm,
             reconnect_control: Arc::clone(&pool.reconnect_control),
             idle: StdMutex::new(VecDeque::with_capacity(config.request_connections)),
+            #[cfg(feature = "test-control")]
+            read_reconnect_wait: watch::channel(None).0,
             shutdown: AtomicBool::new(false),
             shutdown_forced_tx: v2_shutdown_forced_tx,
             shutdown_io: Arc::new(PersistentConsumerIoBarrier::new()),
@@ -15350,6 +15384,19 @@ impl PersistentSessionConsumerClient {
     /// aggregate admission bounds.
     pub fn v2_diagnostics(&self) -> PersistentSessionConsumerV2Diagnostics {
         self.v2_pool.diagnostics()
+    }
+
+    /// Observe a read waiting for reconnect admission in controlled-clock tests.
+    ///
+    /// The published deadline is unchanged. Its weak lifetime is live only
+    /// while that read awaits the shared reconnect controller, before physical
+    /// setup. Immediate admission and cancelled probes leave no live wait.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn read_reconnect_wait_for_test(
+        &self,
+    ) -> watch::Receiver<Option<(tokio::time::Instant, Weak<()>)>> {
+        self.v2_pool.read_reconnect_wait.subscribe()
     }
 
     /// Return a conservative authenticated-idle-capacity snapshot for the

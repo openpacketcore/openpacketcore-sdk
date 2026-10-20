@@ -2,6 +2,26 @@
 
 use super::*;
 
+async fn next_read_reconnect_wait(
+    receivers: &mut [tokio::sync::watch::Receiver<
+        Option<(tokio::time::Instant, std::sync::Weak<()>)>,
+    >],
+) -> tokio::time::Instant {
+    loop {
+        let waits = receivers
+            .iter_mut()
+            .map(|receiver| Box::pin(receiver.changed()));
+        let (result, index, _) = futures_util::future::select_all(waits).await;
+        result.unwrap();
+        let observed = receivers[index].borrow_and_update().clone();
+        if let Some((deadline, lifetime)) = observed {
+            if lifetime.strong_count() != 0 {
+                return deadline;
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn silent_follower_does_not_stop_successive_reclaim_sweeps() {
     let fixture =
@@ -11,6 +31,10 @@ async fn silent_follower_does_not_stop_successive_reclaim_sweeps() {
     let fixture = with_fixture_protocol_clock("silent follower reclamation", async move {
         let clients = clients(&fixture);
         let facade = facade(&fixture, &clients).await;
+        let mut reconnect_waits: Vec<_> = clients
+            .iter()
+            .map(PersistentSessionConsumerClient::read_reconnect_wait_for_test)
+            .collect();
         let leader = fixture.cluster.store(0).status().leader_id.unwrap();
         let silent = fixture
             .voters
@@ -49,6 +73,16 @@ async fn silent_follower_does_not_stop_successive_reclaim_sweeps() {
                         result = &mut sweep => break result.unwrap(),
                         () = service.fenced_transition_v2_history_state_stalled.notified() => {},
                         () = service.fenced_transition_v2_status_stalled.notified() => {},
+                        deadline = next_read_reconnect_wait(&mut reconnect_waits) => {
+                            // A timed-out read or cancelled capability probe can
+                            // retire a lane. A subsequent read may then wait for
+                            // reconnect admission without reaching the service.
+                            // Drive that observed pre-write wait through its own
+                            // existing cap; keep the same absolute sweep budget.
+                            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                            tokio::time::advance(remaining + FIXTURE_TIMER_TICK).await;
+                            continue;
+                        }
                     }
                     total_stalls += 1;
                     tokio::time::advance(budget.physical_attempt_timeout() - FIXTURE_TIMER_TICK)
