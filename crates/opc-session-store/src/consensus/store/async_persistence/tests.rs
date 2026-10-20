@@ -102,7 +102,7 @@ impl SessionConsensusPeer for Peer {
         }
         let held_requests = self.held_requests.lock().unwrap().clone();
         if let Some(hold) = held_requests {
-            hold.wait().await;
+            hold.wait(&request).await;
         }
         let append_limit = *self.blocked_append_above.lock().unwrap();
         if let Some((sender, limit)) = append_limit {
