@@ -5074,7 +5074,11 @@ impl Fleet {
                     .collect::<Vec<_>>();
                 let traffic_after = self.traffic_statuses_on(&survivor_indices);
                 let restarted_traffic =
-                    self.nodes[node_index].invoke(&QualificationNodeCommand::TrafficStatus);
+                    self.nodes[node_index].invoke(&QualificationNodeCommand::TrafficStatus {
+                        budget: opc_session_testkit::qualification::QualificationTrafficStatusBudget::from_parent_deadline(
+                            Instant::now() + CHILD_TIMEOUT,
+                        ),
+                    });
                 let source_at_failure = self.projected_status(node_index);
                 let material_at_failure = self.material_status(node_index);
                 // Observe only after the unchanged readiness deadline failed.
@@ -6042,7 +6046,11 @@ impl Fleet {
 
     fn all_traffic_statuses(&mut self) -> Vec<QualificationTrafficStatus> {
         for node in &mut self.nodes {
-            node.send(&QualificationNodeCommand::TrafficStatus);
+            node.send(&QualificationNodeCommand::TrafficStatus {
+                budget: opc_session_testkit::qualification::QualificationTrafficStatusBudget::from_parent_deadline(
+                    Instant::now() + CHILD_TIMEOUT,
+                ),
+            });
         }
         self.nodes
             .iter_mut()
@@ -6077,7 +6085,9 @@ impl Fleet {
                 deadline_allows_completion(Instant::now(), deadline),
                 "traffic status command would start after its absolute deadline: node={node_index}"
             );
-            self.nodes[*node_index].send(&QualificationNodeCommand::TrafficStatus);
+            self.nodes[*node_index].send(&QualificationNodeCommand::TrafficStatus {
+                budget: opc_session_testkit::qualification::QualificationTrafficStatusBudget::from_parent_deadline(deadline),
+            });
         }
         node_indices
             .iter()

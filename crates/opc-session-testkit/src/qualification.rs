@@ -42,7 +42,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod control_budget;
 mod isolated_scale;
+pub use control_budget::QualificationTrafficStatusBudget;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod protected_recovery;
@@ -5508,8 +5510,10 @@ pub enum QualificationNodeCommand {
     /// Cooperatively stop and join the remaining applied-state watch task.
     StopTrafficWatch,
     /// Return bounded, plaintext-free workload progress and the local
-    /// linearizable replication head.
-    TrafficStatus,
+    /// linearizable replication head within the parent's remaining budget.
+    TrafficStatus {
+        budget: QualificationTrafficStatusBudget,
+    },
     /// Return only the existing bounded, plaintext-free workload observation
     /// without issuing a new backend operation. Recovery continuity polling
     /// uses this non-intrusive view; authoritative watch-head settlement keeps
@@ -5673,7 +5677,10 @@ impl fmt::Debug for QualificationNodeCommand {
             Self::StopTrafficWatch => {
                 formatter.write_str("QualificationNodeCommand::StopTrafficWatch")
             }
-            Self::TrafficStatus => formatter.write_str("QualificationNodeCommand::TrafficStatus"),
+            Self::TrafficStatus { budget } => formatter
+                .debug_struct("QualificationNodeCommand::TrafficStatus")
+                .field("budget", budget)
+                .finish(),
             Self::TrafficStatusSnapshot => {
                 formatter.write_str("QualificationNodeCommand::TrafficStatusSnapshot")
             }
@@ -5799,7 +5806,7 @@ impl QualificationNodeCommand {
             Self::StartTrafficMutation => QualificationNodeCommandKind::StartTrafficMutation,
             Self::StopTrafficMutation => QualificationNodeCommandKind::StopTrafficMutation,
             Self::StopTrafficWatch => QualificationNodeCommandKind::StopTrafficWatch,
-            Self::TrafficStatus => QualificationNodeCommandKind::TrafficStatus,
+            Self::TrafficStatus { .. } => QualificationNodeCommandKind::TrafficStatus,
             Self::TrafficStatusSnapshot => QualificationNodeCommandKind::TrafficStatusSnapshot,
             Self::StartConcurrentWatch { .. } => QualificationNodeCommandKind::StartConcurrentWatch,
             Self::FinishConcurrentWatch { .. } => {
@@ -5864,7 +5871,7 @@ impl QualificationNodeCommand {
             | Self::StartTrafficMutation
             | Self::StopTrafficMutation
             | Self::StopTrafficWatch
-            | Self::TrafficStatus
+            | Self::TrafficStatus { .. }
             | Self::TrafficStatusSnapshot
             | Self::Shutdown
             | Self::ConsumerTlsPeerCredentialRejections
@@ -8530,7 +8537,11 @@ mod tests {
             QualificationNodeCommand::StartTrafficMutation,
             QualificationNodeCommand::StopTrafficMutation,
             QualificationNodeCommand::StopTrafficWatch,
-            QualificationNodeCommand::TrafficStatus,
+            QualificationNodeCommand::TrafficStatus {
+                budget: QualificationTrafficStatusBudget::from_parent_deadline(
+                    std::time::Instant::now() + Duration::from_secs(45),
+                ),
+            },
             QualificationNodeCommand::TrafficStatusSnapshot,
             QualificationNodeCommand::StartConcurrentWatch {
                 subscription_id: QualificationConcurrentSubscriptionId::new("watch-a")
