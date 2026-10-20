@@ -43,6 +43,8 @@ use crate::{
 };
 
 pub mod audit;
+#[cfg(test)]
+mod caller_clock_tests;
 pub(crate) mod consensus;
 #[cfg(target_os = "linux")]
 mod native;
