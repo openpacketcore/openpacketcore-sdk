@@ -1289,6 +1289,10 @@ impl DiameterFailureMappingError {
             DiameterRequestClassificationError::FailureProvenanceMismatch => {
                 Self::ProvenanceMismatch
             }
+            DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest => {
+                // A routing-policy precondition has no generic decoder mapping.
+                Self::Unclassified
+            }
             DiameterRequestClassificationError::FailedAvpEncoding(error) => {
                 Self::FailedAvpEncoding(error)
             }
@@ -1319,6 +1323,8 @@ pub enum DiameterRequestClassificationError {
     RequestAvpFramingInvalid,
     /// Supplied application failure evidence does not belong to this request.
     FailureProvenanceMismatch,
+    /// Routing-policy rejection requires the inspected request's P bit to be set.
+    RoutePolicyRequiresProxiableRequest,
     /// Bounded construction of a proven Failed-AVP failed.
     FailedAvpEncoding(EncodeError),
 }
@@ -1337,6 +1343,9 @@ impl DiameterRequestClassificationError {
             Self::RequestAvpFramingInvalid => "diameter_request_classification_avp_framing_invalid",
             Self::FailureProvenanceMismatch => {
                 "diameter_request_classification_failure_provenance_mismatch"
+            }
+            Self::RoutePolicyRequiresProxiableRequest => {
+                "diameter_request_classification_route_policy_requires_proxiable_request"
             }
             Self::FailedAvpEncoding(_) => "diameter_request_classification_failed_avp_encoding",
         }
@@ -1654,12 +1663,16 @@ impl DiameterRequestEnvelope {
     /// Classification runs first: any selected header, application, command,
     /// P-bit, framing, or dictionary failure takes precedence over routing
     /// policy. Request mismatches and dictionary ambiguities remain errors.
+    /// If classification selects no failure, the request must have P set;
+    /// otherwise this returns
+    /// [`DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest`].
     /// The caller is responsible for command-specific validation and routing
     /// policy; this method does not decide whether a destination is served.
     /// The returned token composes with [`build_diameter_error_answer`] and
-    /// cannot be used with a different request envelope. Both route-policy results use
-    /// the generic error grammar with the Error bit set, retaining the
-    /// existing correlation, reflection, redaction, and size limits.
+    /// cannot be used with an envelope inspected from different request bytes.
+    /// Both route-policy results use the generic error grammar with the Error
+    /// bit set, retaining the existing correlation, reflection, redaction,
+    /// and size limits.
     pub fn bind_route_policy_rejection(
         &self,
         request: &[u8],
@@ -1668,6 +1681,9 @@ impl DiameterRequestEnvelope {
     ) -> Result<DiameterBoundRequestFailure, DiameterRequestClassificationError> {
         if let Some(first) = self.classify(request, dictionaries)? {
             return Ok(first);
+        }
+        if !self.proxiable {
+            return Err(DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest);
         }
         Ok(self.bind_failure(DiameterRequestFailure::RoutePolicy(rejection)))
     }

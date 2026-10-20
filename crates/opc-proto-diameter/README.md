@@ -818,7 +818,11 @@ and [§7.1.3](https://www.rfc-editor.org/rfc/rfc6733#section-7.1.3).
 The method takes the exact inspected request bytes and dictionaries, runs the
 existing classification first, and returns any earlier failure before the
 requested routing result. Dictionary ambiguity and request mismatches remain
-errors. The resulting bound token is passed to the same
+errors. If no earlier failure is selected, a request with P cleared returns
+`DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest`:
+such requests require local processing under
+[RFC 6733 §3](https://www.rfc-editor.org/rfc/rfc6733#section-3).
+The resulting bound token is passed to the same
 `build_diameter_error_answer` function; both route results require E and the
 §7.2 grammar, preserve the identifiers, P, Session-Id and ordered Proxy-Info,
 and keep the same redaction and size bounds. The SDK does not decide which

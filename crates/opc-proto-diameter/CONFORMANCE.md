@@ -146,12 +146,18 @@ remain downstream.
 - `DiameterRoutePolicyRejection` is limited to `UnableToDeliver` (3002) and
   `RealmNotServed` (3003). `bind_route_policy_rejection` reclassifies the exact
   inspected request first, preserves every earlier failure, and rejects request
-  mismatch or dictionary ambiguity. Only then does it bind the caller's routing
-  decision to the existing answer builder. Both results require E and the §7.2
-  grammar; they have no Failed-AVP and retain the same reflection, redaction and
-  size bounds. Command-specific validation and route selection remain caller
-  responsibilities. `DiameterRequestFailure::RoutePolicy` requires a new arm
-  in downstream exhaustive matches; no unrestricted numeric constructor exists.
+  mismatch or dictionary ambiguity. If no earlier failure is selected, a request
+  with P cleared returns
+  `DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest`,
+  preserving RFC 6733 §3's local-processing requirement. Only then does it bind
+  the caller's routing decision to the existing answer builder. Both results
+  require E and the §7.2 grammar; they have no Failed-AVP and retain the same
+  reflection, redaction and size bounds. Command-specific validation and route
+  selection remain caller responsibilities. `DiameterRequestFailure::RoutePolicy`
+  and
+  `DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest`
+  require new arms in downstream exhaustive matches; no unrestricted numeric
+  constructor exists.
 - `DiameterParserError` retains the original `DecodeError` plus a private
   fingerprint of the exact declared Diameter message boundary (following
   transport-buffer bytes are deliberately outside the binding). Its optional

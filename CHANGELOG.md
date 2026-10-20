@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- `opc-proto-diameter`: `DiameterRequestFailure` adds `RoutePolicy`;
-  downstream exhaustive matches must handle the typed routing-policy variant.
+- `opc-proto-diameter`: `DiameterRequestFailure` adds `RoutePolicy` and
+  `DiameterRequestClassificationError` adds `RoutePolicyRequiresProxiableRequest`;
+  downstream exhaustive matches must handle the new variants.
 
 - `opc-session-store`: the unadvertised voter-slot profile requires explicit
   volume enrollment before open. The SDK generates incarnation keys and returns
@@ -134,12 +135,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `opc-proto-diameter`: add request-bound `UnableToDeliver` (3002) and
-  `RealmNotServed` (3003) routing-policy rejections through the existing bounded
-  error-answer builder. Earlier framing and dictionary failures retain
-  precedence; both routing results require E and preserve correlation,
-  Session-Id, ordered Proxy-Info, redaction and size limits. Routing policy
-  remains caller-owned, and arbitrary numeric result codes are not accepted.
+- `opc-proto-diameter`: add `DiameterRoutePolicyRejection` with `UnableToDeliver`
+  (3002) and `RealmNotServed` (3003),
+  `DiameterRequestEnvelope::bind_route_policy_rejection`, and
+  `base::RESULT_CODE_DIAMETER_REALM_NOT_SERVED` for request-bound routing-policy
+  rejections through the existing bounded error-answer builder. Earlier framing
+  and dictionary failures retain precedence; otherwise non-proxiable requests
+  fail with `DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest`.
+  Both routing results require E and preserve correlation, Session-Id, ordered
+  Proxy-Info, redaction and size limits. Routing policy remains caller-owned,
+  and arbitrary numeric result codes are not accepted.
 
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.

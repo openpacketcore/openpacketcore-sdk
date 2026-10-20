@@ -156,6 +156,10 @@ fn route_policy_rejection_requires_proxiable_request() {
             .bind_route_policy_rejection(&request, policy, APP_DICTIONARIES)
             .expect_err("a locally processed request cannot acquire route-policy authority");
         assert_eq!(
+            error,
+            DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest
+        );
+        assert_eq!(
             error.as_str(),
             "diameter_request_classification_route_policy_requires_proxiable_request"
         );
