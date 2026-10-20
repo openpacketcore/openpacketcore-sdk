@@ -2,10 +2,11 @@
 
 use super::*;
 
+type ReadReconnectWaitReceiver =
+    tokio::sync::watch::Receiver<Option<(tokio::time::Instant, std::sync::Weak<()>)>>;
+
 async fn next_read_reconnect_wait(
-    receivers: &mut [tokio::sync::watch::Receiver<
-        Option<(tokio::time::Instant, std::sync::Weak<()>)>,
-    >],
+    receivers: &mut [ReadReconnectWaitReceiver],
 ) -> tokio::time::Instant {
     loop {
         let waits = receivers
