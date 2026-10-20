@@ -100,3 +100,69 @@ fn consensus_diagnostics_round_trips_nonempty_client_connections_within_control_
         );
     }
 }
+
+fn empty_diagnostics() -> QualificationNodeReply {
+    QualificationNodeReply::ConsensusDiagnostics {
+        metrics: Default::default(),
+        lifecycle: Box::new(lifecycle()),
+        client_connections: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn consensus_diagnostics_rejects_invalid_or_duplicate_peer_indexes() {
+    let encoded = serde_json::to_string(&empty_diagnostics()).unwrap();
+    for connections in [
+        r#"{"peer":null}"#.to_owned(),
+        r#"{"-1":null}"#.to_owned(),
+        r#"{"+1":null}"#.to_owned(),
+        r#"{"01":null}"#.to_owned(),
+        r#"{"1.0":null}"#.to_owned(),
+        r#"{"0":null,"0":true}"#.to_owned(),
+        format!(r#"{{"{}0":null}}"#, usize::MAX),
+        "null".to_owned(),
+        "[]".to_owned(),
+    ] {
+        let malformed = encoded.replace(
+            r#""client_connections":{}"#,
+            &format!(r#""client_connections":{connections}"#),
+        );
+        assert_ne!(malformed, encoded);
+        assert!(matches!(
+            read_bounded_json_line::<_, QualificationNodeReply>(&mut malformed.as_bytes()),
+            Err(QualificationLineError::Invalid)
+        ));
+    }
+}
+
+#[test]
+fn consensus_diagnostics_retains_strict_fields_and_control_line_bound() {
+    let mut encoded = serde_json::to_value(empty_diagnostics()).unwrap();
+    encoded["unexpected"] = serde_json::json!(true);
+    let mut bytes = Vec::new();
+    write_json_line(&mut bytes, &encoded).unwrap();
+    assert!(matches!(
+        read_bounded_json_line::<_, QualificationNodeReply>(&mut bytes.as_slice()),
+        Err(QualificationLineError::Invalid)
+    ));
+
+    let oversized = QualificationNodeReply::ConsensusDiagnostics {
+        metrics: Default::default(),
+        lifecycle: Box::new(lifecycle()),
+        client_connections: BTreeMap::from([(
+            0,
+            serde_json::json!("x".repeat(QUALIFICATION_MAX_CONTROL_LINE_BYTES)),
+        )]),
+    };
+    let mut bytes = Vec::new();
+    assert!(matches!(
+        write_json_line(&mut bytes, &oversized),
+        Err(QualificationLineError::TooLarge)
+    ));
+    assert!(bytes.is_empty());
+    let encoded = serde_json::to_vec(&oversized).unwrap();
+    assert!(matches!(
+        read_bounded_json_line::<_, QualificationNodeReply>(&mut encoded.as_slice()),
+        Err(QualificationLineError::TooLarge)
+    ));
+}

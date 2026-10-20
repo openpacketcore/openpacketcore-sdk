@@ -43,6 +43,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod control_budget;
+#[cfg(feature = "test-control")]
+mod diagnostic_connections;
 mod isolated_scale;
 pub use control_budget::QualificationTrafficStatusBudget;
 #[cfg(target_os = "linux")]
@@ -6280,6 +6282,7 @@ pub enum QualificationNodeReply {
         #[cfg(feature = "test-control")]
         lifecycle: Box<QualificationConnectionLifecycleMetrics>,
         #[cfg(feature = "test-control")]
+        #[serde(deserialize_with = "diagnostic_connections::deserialize")]
         client_connections: std::collections::BTreeMap<usize, serde_json::Value>,
     },
     ConsensusRpcAvailability {
