@@ -1634,3 +1634,116 @@ fn single_group_child_offer_preserves_other_transform_positions() {
         );
     }
 }
+
+fn generic_child_offer_for_groups(groups: &[u16], separate: bool) -> Ikev2SaPayloadBuild {
+    let mut offer = child_sa_pfs_payload_build(groups[0]);
+    for group in &groups[1..] {
+        if separate {
+            let mut proposal = child_sa_pfs_payload_build(*group).proposals.remove(0);
+            proposal.proposal_number = u8::try_from(offer.proposals.len() + 1).unwrap();
+            offer.proposals.push(proposal);
+        } else {
+            offer.proposals[0].transforms.push(Ikev2SaTransformBuild {
+                transform_type: 4,
+                transform_id: *group,
+                attributes: vec![],
+            });
+        }
+    }
+    offer
+}
+
+fn generic_child_any_dh_policy(accepted: Vec<u16>) -> Ikev2ChildSaNegotiationPolicy {
+    Ikev2ChildSaNegotiationPolicy {
+        accepted_protocol_ids: vec![3],
+        required_transforms: vec![
+            Ikev2ChildSaTransformRequirement {
+                transform_type: 1,
+                accepted_transform_ids: vec![20],
+            },
+            Ikev2ChildSaTransformRequirement {
+                transform_type: 4,
+                accepted_transform_ids: accepted,
+            },
+        ],
+        accepted_initiator_traffic_selectors: vec![],
+        accepted_responder_traffic_selectors: vec![],
+    }
+}
+
+#[test]
+fn received_ke_selection_order_keeps_legacy_group_one_over_unimplemented_groups() {
+    // RFC 7296 section 3.3.6: an unimplemented DH transform is unacceptable,
+    // rather than a stronger executable alternative to the legacy group.
+    let ts_wire = build_ike_auth_traffic_selector_payload(&ts_payload()).unwrap();
+    let ts = opc_proto_ikev2::Ikev2TrafficSelectorPayload::decode_body(&ts_wire).unwrap();
+    let mut ke_wire = vec![0, 1, 0, 0];
+    ke_wire.extend_from_slice(&[2; 96]);
+    let ke = opc_proto_ikev2::Ikev2KeyExchangePayload::decode_body(&ke_wire).unwrap();
+    for separate in [false, true] {
+        for unsupported in [5, 15, 31] {
+            for groups in [vec![1, unsupported], vec![unsupported, 1]] {
+                let wire =
+                    build_ike_auth_sa_payload(&generic_child_offer_for_groups(&groups, separate))
+                        .unwrap();
+                let sa = Ikev2SaPayload::decode_body(&wire).unwrap();
+                for accepted in [vec![], groups.clone()] {
+                    let selected = negotiate_child_sa(
+                        Some(&ke),
+                        &sa,
+                        &ts,
+                        &ts,
+                        &generic_child_any_dh_policy(accepted),
+                    )
+                    .expect("group 1 is the only implemented common DH group");
+                    assert_eq!(
+                        selected
+                            .transforms
+                            .iter()
+                            .find(|t| t.transform_type == 4)
+                            .unwrap()
+                            .transform_id,
+                        1
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn received_ke_selection_order_retries_only_an_implemented_stronger_group() {
+    let ts_wire = build_ike_auth_traffic_selector_payload(&ts_payload()).unwrap();
+    let ts = opc_proto_ikev2::Ikev2TrafficSelectorPayload::decode_body(&ts_wire).unwrap();
+    let mut ke_wire = vec![0, 1, 0, 0];
+    ke_wire.extend_from_slice(&[2; 96]);
+    let ke = opc_proto_ikev2::Ikev2KeyExchangePayload::decode_body(&ke_wire).unwrap();
+    for separate in [false, true] {
+        let groups = [1, 31, 5, 14];
+        let wire =
+            build_ike_auth_sa_payload(&generic_child_offer_for_groups(&groups, separate)).unwrap();
+        let sa = Ikev2SaPayload::decode_body(&wire).unwrap();
+        for accepted in [vec![], groups.to_vec()] {
+            let retry = negotiate_child_sa(
+                Some(&ke),
+                &sa,
+                &ts,
+                &ts,
+                &generic_child_any_dh_policy(accepted),
+            )
+            .unwrap_err();
+            assert_eq!(
+                retry,
+                Ikev2ChildSaNegotiationError::KeyExchangeDhGroupMismatch {
+                    received: 1,
+                    preferred: 14
+                }
+            );
+            assert_eq!(
+                opc_proto_ikev2::build_ike_auth_notify_payload(&retry.invalid_ke_notify().unwrap())
+                    .unwrap(),
+                [0, 0, 0, 17, 0, 14]
+            );
+        }
+    }
+}

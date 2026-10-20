@@ -2191,3 +2191,93 @@ fn outgoing_offer_rejects_invalid_proposal_numbers_before_normalization() {
         );
     }
 }
+
+fn select_dedicated_ke_for_group(
+    request: &opc_proto_ikev2::dedicated_bearer::Ikev2DedicatedBearerCreateChildSaRequest<'_>,
+    group: u16,
+) -> Result<(), opc_proto_ikev2::Ikev2ChildSaNegotiationError> {
+    let mut required_transforms: Vec<opc_proto_ikev2::Ikev2ChildSaTransformRequirement> = vec![];
+    for transform in &request.security_association.proposals[0].transforms {
+        if required_transforms
+            .iter()
+            .any(|r| r.transform_type == transform.transform_type)
+        {
+            continue;
+        }
+        required_transforms.push(opc_proto_ikev2::Ikev2ChildSaTransformRequirement {
+            transform_type: transform.transform_type,
+            accepted_transform_ids: if transform.transform_type == TRANSFORM_TYPE_DH {
+                vec![group]
+            } else {
+                request.security_association.proposals[0]
+                    .transforms
+                    .iter()
+                    .filter(|t| t.transform_type == transform.transform_type)
+                    .map(|t| t.transform_id)
+                    .collect()
+            },
+        });
+    }
+    opc_proto_ikev2::negotiate_child_sa(
+        request.key_exchange.as_ref(),
+        &request.security_association,
+        &request.traffic_selectors_initiator,
+        &request.traffic_selectors_responder,
+        &opc_proto_ikev2::Ikev2ChildSaNegotiationPolicy {
+            accepted_protocol_ids: vec![IKEV2_SECURITY_PROTOCOL_ID_ESP],
+            required_transforms,
+            accepted_initiator_traffic_selectors: vec![],
+            accepted_responder_traffic_selectors: vec![],
+        },
+    )
+    .map(|_| ())
+}
+
+#[test]
+fn received_ke_selection_order_defers_unselected_dedicated_width_until_policy() {
+    for (guessed, width, malformed) in [(19, 64, 65), (1, 96, 95)] {
+        for separate in [false, true] {
+            let mut input = create_request_build();
+            create_ke_sa(&mut input.security_association, guessed);
+            input.key_exchange = Some(create_ke(guessed, width));
+            if separate {
+                let mut proposal = input.security_association.proposals[0].clone();
+                proposal.proposal_number = 2;
+                proposal
+                    .transforms
+                    .iter_mut()
+                    .find(|t| t.transform_type == TRANSFORM_TYPE_DH)
+                    .unwrap()
+                    .transform_id = 14;
+                input.security_association.proposals.push(proposal);
+            } else {
+                create_ke_sa(&mut input.security_association, 14);
+            }
+            let wire = must_ok(build_ikev2_dedicated_bearer_create_child_sa_request(&input));
+            let received = replace_create_ke_width(wire.first_payload(), wire.bytes(), malformed);
+            let request = must_ok(decode_ikev2_dedicated_bearer_create_child_sa_request(
+                &request_header(EXCHANGE_TYPE_CREATE_CHILD_SA, 71),
+                wire.first_payload(),
+                &received,
+            ));
+            let retry = select_dedicated_ke_for_group(&request, 14).unwrap_err();
+            assert_eq!(
+                retry,
+                opc_proto_ikev2::Ikev2ChildSaNegotiationError::KeyExchangeDhGroupMismatch {
+                    received: guessed,
+                    preferred: 14
+                }
+            );
+            assert_eq!(
+                must_ok(build_ike_auth_notify_payload(
+                    &retry.invalid_ke_notify().unwrap()
+                )),
+                [0, 0, 0, 17, 0, 14]
+            );
+            assert_eq!(
+                select_dedicated_ke_for_group(&request, guessed),
+                Err(opc_proto_ikev2::Ikev2ChildSaNegotiationError::InvalidKeyExchange)
+            );
+        }
+    }
+}

@@ -1330,3 +1330,69 @@ fn nwu_pfs_ke_guess_keeps_other_caller_order_and_legacy_only_common_group() {
         Some(opc_proto_ikev2::Ikev2DhGroup::Modp768)
     );
 }
+
+#[test]
+fn received_ke_selection_order_defers_unselected_nwu_width_until_policy() {
+    // RFC 7296 sections 1.3 and 3.4: retry with the selected group before
+    // interpreting the guessed group's public value.
+    for (guessed, width, malformed) in [(19, 64, 65), (1, 96, 95)] {
+        for separate in [false, true] {
+            let mut input = nwu_ke_input(guessed, width);
+            if separate {
+                let mut proposal = input.security_association.proposals[0].clone();
+                proposal.proposal_number = 2;
+                proposal
+                    .transforms
+                    .iter_mut()
+                    .find(|t| t.transform_type == 4)
+                    .unwrap()
+                    .transform_id = 14;
+                input.security_association.proposals.push(proposal);
+            } else {
+                input.security_association.proposals[0]
+                    .transforms
+                    .push(Ikev2SaTransformBuild {
+                        transform_type: 4,
+                        transform_id: 14,
+                        attributes: vec![],
+                    });
+            }
+            let (first, bytes) = must(encode_payloads(&must(input.payloads())));
+            let received = replace_nwu_ke_width(first, &bytes, malformed);
+            let request = must(CreateRequest::decode(
+                &create_header(Peer::Network, false),
+                first,
+                &received,
+                AddressFamilies::Ipv4,
+                Limits::default(),
+            ));
+            let policy = must(AeadPolicy::new(vec![must(AeadSuite::new(
+                Ikev2EncryptionAlgorithm::AesGcm16_128,
+                Some(opc_proto_ikev2::Ikev2DhGroup::Modp2048),
+                false,
+            ))]));
+            let retry = policy.select(&request).unwrap_err();
+            assert_eq!(
+                retry,
+                Error::KeyExchangeDhGroupMismatch {
+                    received: guessed,
+                    preferred: 14
+                }
+            );
+            assert_eq!(
+                must(opc_proto_ikev2::build_ike_auth_notify_payload(
+                    &retry.invalid_ke_notify().unwrap()
+                )),
+                [0, 0, 0, 17, 0, 14]
+            );
+            let matching = must(AeadPolicy::new(vec![must(AeadSuite::new(
+                Ikev2EncryptionAlgorithm::AesGcm16_128,
+                Some(must(opc_proto_ikev2::Ikev2DhGroup::from_transform_id(
+                    guessed,
+                ))),
+                false,
+            ))]));
+            assert_eq!(matching.select(&request), Err(Error::InvalidValue));
+        }
+    }
+}
