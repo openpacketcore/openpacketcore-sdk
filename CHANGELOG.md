@@ -820,6 +820,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-egress-fence`: keep empty and truncated L3 vectors in the independent
+  object oracle executable on kernels that reject short IP test-run transport
+  headers. Preserve the exact packet bytes and every gate assertion.
 - `opc-session-net`: preserve valid slow quorum replies until the caller's
   original deadline for protected history, expiry and receipt reads, including
   prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight
