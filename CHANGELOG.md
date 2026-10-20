@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-diameter`: `DiameterRequestFailure` adds `RoutePolicy`;
+  downstream exhaustive matches must handle the typed routing-policy variant.
+
 - `opc-session-store`: the unadvertised voter-slot profile requires explicit
   volume enrollment before open. The SDK generates incarnation keys and returns
   a signer; missing, mismatched or retired enrollment returns
@@ -130,6 +133,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error for Configuration Update Command/Complete bodies.
 
 ### Added
+
+- `opc-proto-diameter`: add request-bound `UnableToDeliver` (3002) and
+  `RealmNotServed` (3003) routing-policy rejections through the existing bounded
+  error-answer builder. Earlier framing and dictionary failures retain
+  precedence; both routing results require E and preserve correlation,
+  Session-Id, ordered Proxy-Info, redaction and size limits. Routing policy
+  remains caller-owned, and arbitrary numeric result codes are not accepted.
 
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.

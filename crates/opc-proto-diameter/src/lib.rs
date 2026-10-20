@@ -34,7 +34,10 @@
 //! remain transport-owned.
 //! `error_answer` adds the bounded RFC 6733 request envelope and negative-
 //! answer boundary without exposing sensitive AVP contents or retaining an
-//! unbounded request suffix.
+//! unbounded request suffix. Its closed `DiameterRoutePolicyRejection` binds
+//! caller-selected 3002/3003 routing failures to the inspected request after
+//! earlier framing and dictionary failures have been selected; routing policy
+//! itself remains caller-owned.
 //! `parser_error` adds sealed, request-bound missing-AVP and grouped-set
 //! provenance for the typed CER, DWR, DPR, and SWm DER/STR/ASR/RAR/AAR parsers. Legacy parser
 //! signatures continue to return [`DecodeError`]; additive

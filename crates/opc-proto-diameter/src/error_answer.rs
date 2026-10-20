@@ -7,7 +7,7 @@
 //! and proxy-state octets remain in types whose diagnostic formatting is
 //! redacted.
 //!
-//! @spec IETF RFC6733 6.2, 7.1.3, 7.1.5, 7.2, 7.5
+//! @spec IETF RFC6733 6.1, 6.2, 7.1.3, 7.1.5, 7.2, 7.5
 //! @req REQ-IETF-RFC6733-ERROR-ANSWER-001
 
 use core::fmt;
@@ -27,6 +27,7 @@ use crate::base::{
     RESULT_CODE_DIAMETER_INVALID_AVP_BITS, RESULT_CODE_DIAMETER_INVALID_AVP_LENGTH,
     RESULT_CODE_DIAMETER_INVALID_AVP_VALUE, RESULT_CODE_DIAMETER_INVALID_BIT_IN_HEADER,
     RESULT_CODE_DIAMETER_INVALID_HDR_BITS, RESULT_CODE_DIAMETER_MISSING_AVP,
+    RESULT_CODE_DIAMETER_REALM_NOT_SERVED, RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
     RESULT_CODE_DIAMETER_UNSUPPORTED_VERSION,
 };
 use crate::parser_error::{DiameterGroupedAvpSetFailureKind, DiameterParserError};
@@ -684,11 +685,50 @@ impl fmt::Display for DiameterFailedAvp {
     }
 }
 
+/// A caller-selected RFC 6733 routing-policy rejection.
+///
+/// The caller owns routing policy and command-specific validation. This type
+/// does not inspect routing tables or infer a policy from destination AVPs.
+/// Bind it with [`DiameterRequestEnvelope::bind_route_policy_rejection`] before
+/// constructing an answer. Both results require the Error bit and the generic
+/// error-answer grammar from RFC 6733 sections 7.1.3 and 7.2.
+///
+/// @spec IETF RFC6733 6.1, 7.1.3, 7.2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiameterRoutePolicyRejection {
+    /// The request cannot be delivered (`DIAMETER_UNABLE_TO_DELIVER`, 3002).
+    UnableToDeliver,
+    /// The requested realm is not served (`DIAMETER_REALM_NOT_SERVED`, 3003).
+    RealmNotServed,
+}
+
+impl DiameterRoutePolicyRejection {
+    /// RFC 6733 Result-Code value for this routing-policy rejection.
+    #[must_use]
+    pub const fn result_code(self) -> u32 {
+        match self {
+            Self::UnableToDeliver => RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER,
+            Self::RealmNotServed => RESULT_CODE_DIAMETER_REALM_NOT_SERVED,
+        }
+    }
+
+    /// Stable redaction-safe failure code for logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnableToDeliver => "diameter_unable_to_deliver",
+            Self::RealmNotServed => "diameter_realm_not_served",
+        }
+    }
+}
+
 /// Typed RFC 6733 request failure selected for an error answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiameterRequestFailure {
     /// Unsupported command code (`DIAMETER_COMMAND_UNSUPPORTED`, 3001).
     UnknownCommand,
+    /// A caller-selected routing-policy rejection (3002 or 3003).
+    RoutePolicy(DiameterRoutePolicyRejection),
     /// Unsupported application (`DIAMETER_APPLICATION_UNSUPPORTED`, 3007).
     UnsupportedApplication,
     /// Invalid request-header flag combination (3008).
@@ -721,6 +761,7 @@ impl DiameterRequestFailure {
     pub const fn result_code(&self) -> u32 {
         match self {
             Self::UnknownCommand => RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED,
+            Self::RoutePolicy(rejection) => rejection.result_code(),
             Self::UnsupportedApplication => RESULT_CODE_DIAMETER_APPLICATION_UNSUPPORTED,
             Self::InvalidHeaderBits => RESULT_CODE_DIAMETER_INVALID_HDR_BITS,
             Self::InvalidAvpBits(_) => RESULT_CODE_DIAMETER_INVALID_AVP_BITS,
@@ -742,6 +783,7 @@ impl DiameterRequestFailure {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::UnknownCommand => "diameter_command_unsupported",
+            Self::RoutePolicy(rejection) => rejection.as_str(),
             Self::UnsupportedApplication => "diameter_application_unsupported",
             Self::InvalidHeaderBits => "diameter_invalid_header_bits",
             Self::InvalidAvpBits(_) => "diameter_invalid_avp_bits",
@@ -778,6 +820,7 @@ impl DiameterRequestFailure {
             | Self::MutuallyExclusiveAvps(value)
             | Self::InvalidAvpLength(value) => Some(value),
             Self::UnknownCommand
+            | Self::RoutePolicy(_)
             | Self::UnsupportedApplication
             | Self::InvalidHeaderBits
             | Self::UnsupportedVersion
@@ -1113,8 +1156,9 @@ impl DiameterRequestFailure {
 /// A typed failure cryptographically bound to one inspected request envelope.
 ///
 /// Values can be produced only by request classification, decoder-error
-/// mapping, or the checked application-failure binding API. This prevents a
-/// copied `Failed-AVP` from another request from being reflected in an answer.
+/// mapping, or the checked application-failure and route-policy binding APIs.
+/// This prevents a copied `Failed-AVP` or routing-policy token from another
+/// request from being reflected in an answer.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DiameterBoundRequestFailure {
     failure: DiameterRequestFailure,
@@ -1603,6 +1647,29 @@ impl DiameterRequestEnvelope {
             }
         }
         Ok(selected.map(|failure| self.bind_failure(failure)))
+    }
+
+    /// Bind a caller-selected routing-policy rejection to this exact request.
+    ///
+    /// Classification runs first: any selected header, application, command,
+    /// P-bit, framing, or dictionary failure takes precedence over routing
+    /// policy. Request mismatches and dictionary ambiguities remain errors.
+    /// The caller is responsible for command-specific validation and routing
+    /// policy; this method does not decide whether a destination is served.
+    /// The returned token composes with [`build_diameter_error_answer`] and
+    /// cannot be used with a different request envelope. Both route-policy results use
+    /// the generic error grammar with the Error bit set, retaining the
+    /// existing correlation, reflection, redaction, and size limits.
+    pub fn bind_route_policy_rejection(
+        &self,
+        request: &[u8],
+        rejection: DiameterRoutePolicyRejection,
+        dictionaries: DictionarySet<'_>,
+    ) -> Result<DiameterBoundRequestFailure, DiameterRequestClassificationError> {
+        if let Some(first) = self.classify(request, dictionaries)? {
+            return Ok(first);
+        }
+        Ok(self.bind_failure(DiameterRequestFailure::RoutePolicy(rejection)))
     }
 
     /// Bind a command-specific application failure to this exact request.
@@ -2404,7 +2471,8 @@ impl Encode for DiameterErrorAnswerPlan {
 /// only when [`DiameterErrorAnswerGrammar::Rfc6733ErrorBitFallback`] is chosen.
 /// `failure` must be a token produced from this exact envelope by
 /// [`DiameterRequestEnvelope::classify`],
-/// [`DiameterRequestEnvelope::bind_application_failure`], or
+/// [`DiameterRequestEnvelope::bind_application_failure`],
+/// [`DiameterRequestEnvelope::bind_route_policy_rejection`], or
 /// [`DiameterRequestFailure::from_decode_error`].
 pub fn build_diameter_error_answer(
     envelope: &DiameterRequestEnvelope,
@@ -3109,6 +3177,7 @@ fn validate_application_failure(
             validate_received_failed_avp(request, failed, dictionaries, max_depth)
         }
         DiameterRequestFailure::UnknownCommand
+        | DiameterRequestFailure::RoutePolicy(_)
         | DiameterRequestFailure::UnsupportedApplication
         | DiameterRequestFailure::InvalidHeaderBits
         | DiameterRequestFailure::UnsupportedVersion
