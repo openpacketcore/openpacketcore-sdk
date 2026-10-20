@@ -699,8 +699,10 @@ fn duplicate_sqlite_file_descriptor(
 }
 
 // Keep the pinned Unix VFS admission and layout read in one audited boundary.
-// Callers consume the descriptor synchronously and retain their moved-file
-// checks after inspection. SQLite retains ownership throughout the callback.
+// Inspection callers consume the descriptor synchronously and retain their
+// moved-file checks. RetainedSqliteFile instead keeps a non-closing File view
+// alongside its private connection for the entire pin lifetime. SQLite owns
+// the descriptor in both cases; the callback never transfers close authority.
 #[cfg(target_os = "linux")]
 fn with_borrowed_sqlite_descriptor<T>(
     connection: &Connection,

@@ -849,6 +849,40 @@ impl SqliteFilePin {
         }
     }
 
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        match self {
+            Self::Artifact(file) => file.metadata(),
+            #[cfg(target_os = "linux")]
+            Self::Database(file) => file.metadata(),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn read_exact_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        match self {
+            Self::Artifact(file) => file.read_exact_at(buffer, offset),
+            #[cfg(target_os = "linux")]
+            Self::Database(file) => file.read_exact_at(buffer, offset),
+        }
+    }
+
+    /// Raw File access is limited to ordinary artifacts. Live database pins
+    /// expose only operations that preserve their SQLite close owner.
+    pub(crate) fn artifact(&self) -> io::Result<&std::fs::File> {
+        match self {
+            Self::Artifact(file) => Ok(file),
+            #[cfg(target_os = "linux")]
+            Self::Database(_) => Err(invalid_data(
+                "live SQLite pin cannot expose raw close authority",
+            )),
+        }
+    }
+
+    pub(crate) fn sync_all(&self) -> io::Result<()> {
+        self.artifact()?.sync_all()
+    }
+
     pub(crate) fn into_artifact(self) -> io::Result<std::fs::File> {
         match self {
             Self::Artifact(file) => Ok(file),
@@ -866,34 +900,63 @@ impl From<std::fs::File> for SqliteFilePin {
     }
 }
 
-impl std::ops::Deref for SqliteFilePin {
-    type Target = std::fs::File;
-
-    fn deref(&self) -> &Self::Target {
+#[cfg(unix)]
+impl std::os::fd::AsFd for SqliteFilePin {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         match self {
-            Self::Artifact(file) => file,
+            Self::Artifact(file) => file.as_fd(),
             #[cfg(target_os = "linux")]
-            Self::Database(file) => file.file(),
+            Self::Database(file) => file.as_fd(),
         }
     }
 }
 
 #[cfg(unix)]
-impl std::os::fd::AsFd for SqliteFilePin {
-    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        std::ops::Deref::deref(self).as_fd()
+impl std::os::fd::AsRawFd for SqliteFilePin {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&std::os::fd::AsFd::as_fd(self))
     }
 }
 
 impl io::Read for SqliteFilePin {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        std::ops::Deref::deref(self).read(buffer)
+        (&*self).read(buffer)
+    }
+}
+
+impl io::Read for &SqliteFilePin {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            SqliteFilePin::Artifact(file) => (&*file).read(buffer),
+            #[cfg(target_os = "linux")]
+            SqliteFilePin::Database(file) => (&*file).read(buffer),
+        }
     }
 }
 
 impl io::Seek for SqliteFilePin {
     fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
-        std::ops::Deref::deref(self).seek(position)
+        (&*self).seek(position)
+    }
+}
+
+impl io::Seek for &SqliteFilePin {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        match self {
+            SqliteFilePin::Artifact(file) => (&*file).seek(position),
+            #[cfg(target_os = "linux")]
+            SqliteFilePin::Database(file) => (&*file).seek(position),
+        }
+    }
+}
+
+impl io::Write for &SqliteFilePin {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.artifact()?.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.artifact()?.flush()
     }
 }
 
@@ -1728,7 +1791,7 @@ impl PinnedSqliteFile {
     pub(crate) fn from_new_file(file: std::fs::File, path: PathBuf) -> io::Result<Self> {
         let mut pinned = Self::from_file(file, path)?;
         pinned.cleanup = Some(UnpublishedSnapshotArtifact::from_file(
-            &pinned.file,
+            pinned.file.artifact()?,
             pinned.path.clone(),
             true,
         )?);
@@ -1768,7 +1831,7 @@ impl PinnedSqliteFile {
         let mut pinned = Self::from_file(file, path)?;
         pinned.namespace = Some((Arc::clone(&namespace), name.to_os_string()));
         pinned.cleanup = Some(UnpublishedSnapshotArtifact::from_file_in_namespace(
-            &pinned.file,
+            pinned.file.artifact()?,
             namespace,
             name,
             true,
@@ -1787,7 +1850,7 @@ impl PinnedSqliteFile {
     }
 
     /// Borrow the pinned handle without resolving its pathname again.
-    pub(crate) fn file(&self) -> &std::fs::File {
+    pub(crate) fn file(&self) -> &SqliteFilePin {
         &self.file
     }
 
@@ -2014,7 +2077,7 @@ impl PinnedSqliteFile {
         let enabled = opc_fs_verity_sys::enable_fixed_profile(self.file.as_fd());
         #[cfg(test)]
         if let Err(error) = &enabled {
-            crate::test_process::record_snapshot_seal_failure(&self.file, error);
+            crate::test_process::record_snapshot_seal_failure(self.file.metadata(), error);
         }
         let digest = enabled.map_err(fs_verity_enable_error)?;
         let metadata = self.file.metadata()?;
@@ -2798,7 +2861,7 @@ pub(crate) fn readonly_nofollow(path: &Path) -> io::Result<std::fs::File> {
 }
 
 #[cfg(target_os = "linux")]
-fn fixed_verity_measurement(file: &std::fs::File) -> io::Result<[u8; 32]> {
+fn fixed_verity_measurement(file: &impl std::os::fd::AsFd) -> io::Result<[u8; 32]> {
     opc_fs_verity_sys::measure_exact_profile(file.as_fd()).map_err(fs_verity_measure_error)
 }
 
@@ -2807,7 +2870,7 @@ fn fixed_verity_measurement(file: &std::fs::File) -> io::Result<[u8; 32]> {
 /// read, hash, parse, or otherwise grant authority to the snapshot payload.
 /// Every other fs-verity error remains fail-closed.
 #[cfg(target_os = "linux")]
-pub(crate) fn fixed_verity_is_exactly_unsealed(file: &std::fs::File) -> io::Result<bool> {
+pub(crate) fn fixed_verity_is_exactly_unsealed(file: &impl std::os::fd::AsFd) -> io::Result<bool> {
     match opc_fs_verity_sys::measure(file.as_fd()) {
         // `FS_IOC_MEASURE_VERITY` is the only kernel operation whose ENODATA
         // has the narrow legacy meaning required here.  A measured artifact
@@ -2826,7 +2889,7 @@ pub(crate) fn fixed_verity_is_exactly_unsealed(file: &std::fs::File) -> io::Resu
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn fixed_verity_is_exactly_unsealed(_file: &std::fs::File) -> io::Result<bool> {
+pub(crate) fn fixed_verity_is_exactly_unsealed<T>(_file: &T) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "fixed snapshot sealing is unavailable",
@@ -2834,7 +2897,7 @@ pub(crate) fn fixed_verity_is_exactly_unsealed(_file: &std::fs::File) -> io::Res
 }
 
 #[cfg(not(target_os = "linux"))]
-fn fixed_verity_measurement(_file: &std::fs::File) -> io::Result<[u8; 32]> {
+fn fixed_verity_measurement<T>(_file: &T) -> io::Result<[u8; 32]> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "fixed snapshot sealing is unavailable",

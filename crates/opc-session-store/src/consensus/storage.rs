@@ -6128,8 +6128,10 @@ impl SqliteConsensusStateMachine {
                     ),
                 )));
             }
-            raw_artifact
-                .record_identity_from_file(raw_snapshot.file())
+            raw_snapshot
+                .file()
+                .artifact()
+                .and_then(|file| raw_artifact.record_identity_from_file(file))
                 .map_err(|error| {
                     storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
@@ -6231,8 +6233,10 @@ impl SqliteConsensusStateMachine {
                     ),
                 )));
             }
-            raw_artifact
-                .record_identity_from_file(raw_snapshot.file())
+            raw_snapshot
+                .file()
+                .artifact()
+                .and_then(|file| raw_artifact.record_identity_from_file(file))
                 .map_err(|error| {
                     storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
@@ -8175,7 +8179,8 @@ where
             destination_path,
         )?,
     };
-    let mut destination = tokio::fs::File::from_std(raw_snapshot.file().try_clone()?);
+    let mut destination =
+        tokio::fs::File::from_std(raw_snapshot.file().try_clone()?.into_artifact()?);
     let mut copied = 0_u64;
     let mut hasher = Sha256::new();
     // This buffer lives across reads. Keeping it inline also embeds 64 KiB

@@ -41,7 +41,7 @@ fn main_file_identity_accepts_sparse_files_larger_than_i32_max() {
     let expected = (metadata.dev(), metadata.ino());
     assert_eq!(main_file_identity(&connection), Ok(expected));
     let pin = RetainedSqliteFile::from_connection(&connection).expect("retain full-width inode");
-    let retained = pin.file().metadata().expect("retained file metadata");
+    let retained = pin.metadata().expect("retained file metadata");
     assert_eq!((retained.dev(), retained.ino()), expected);
     assert_eq!(retained.len(), size);
     drop(pin);

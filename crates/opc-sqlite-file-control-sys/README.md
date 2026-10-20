@@ -39,19 +39,19 @@ fences. Callers retain the owning connection for as long as they retain a
 same-process inode identity; persistent recovery still needs UUID and handle
 identity.
 
-`RetainedSqliteFile` first pins a regular inode with `O_PATH`, then opens only
-that exact descriptor through `/proc/self/fd`. It never resolves the descriptor
-back to a caller-controlled pathname. Clones share one reader, and a final name
-fence rejects substitution. Failed admission uses the same coordinated close.
+`RetainedSqliteFile` owns an unqueried, private SQLite connection for pins that
+must outlive their originating connection. Clones share this owner. Its final
+close participates in SQLite's Unix inode bookkeeping, which defers close while
+any SQLite connection to the inode holds POSIX locks. No SQL, checkpoint,
+process-wide VFS registration or descriptor duplication is used. The store
+enables the feature in its production Unix dependency as well as test controls.
 
-Final close follows the bundled SQLite 3.53.2 Unix VFS's global-then-inode mutex
-order and joins its deferred-close queue whenever a native connection retains
-POSIX locks. A shared, private, unqueried connection to the kernel-owned
-`/proc/self/stat` entry anchors the native inode list only while pins exist.
-Queue storage is reserved before the readable open and uses SQLite's allocator;
-SQLite frees queued descriptors after its final lock ends. Queued readers cannot
-be reused as native database handles. The boundary checks the exact bundled ABI
-and requires runtime mutexes; unsupported versions/configurations fail closed.
-No SQL, checkpoint, writable directory, temporary link, process-wide VFS change
-or descriptor duplication is used. The store enables the feature in its
-production Unix dependency as well as test controls.
+Admission checks a regular `O_PATH` inode, resolves its name, and asks SQLite to
+open it before comparing identities. A replacement can therefore be opened
+before rejection, and a substituted FIFO can block. The store's SDK-controlled
+namespace excludes root and noncooperating same-UID actors from its integrity
+model; those actors can already modify stored bytes. This API does not provide
+adversarial exact-inode pathname admission. SQLite's native pathname limit also
+applies (about 504 usable bytes with the bundled Unix VFS), so longer canonical
+names fail closed. Callers clone the retained wrapper, which shares close
+ownership; no `File` reference is exposed for raw descriptor duplication.

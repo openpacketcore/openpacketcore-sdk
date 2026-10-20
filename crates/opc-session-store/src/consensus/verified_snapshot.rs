@@ -9,7 +9,7 @@
 
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 

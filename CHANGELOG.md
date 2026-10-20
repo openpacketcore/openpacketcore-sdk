@@ -820,11 +820,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `opc-session-store`: retained SQLite pins open the exact previously admitted
-  regular descriptor, rejecting pathname substitution without opening a FIFO or
-  device. Final and failed-admission retirement coordinate with the bundled
-  SQLite Unix inode close queue, preserving independently owned record locks.
-
 - `opc-session-store`: retain the whole recovery journal owner in queued
   operations, keeping its admission lease until all predecessor descriptors
   retire even when a cancelled worker fails before running its operation.

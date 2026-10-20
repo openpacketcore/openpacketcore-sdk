@@ -563,6 +563,14 @@ fn snapshot_reader_final_pin_retirement_preserves_sqlite_record_locks() {
     let path = directory.path().join("source.sqlite");
     let backend = SqliteSessionBackend::open(&path).unwrap();
     let source = Arc::new(pin_live_database_file(&backend.conn.blocking_lock(), &path).unwrap());
+    assert!(source.file().artifact().is_err());
+    let shared = source.file().try_clone().unwrap();
+    assert_eq!(
+        std::os::fd::AsRawFd::as_raw_fd(source.file()),
+        std::os::fd::AsRawFd::as_raw_fd(&shared),
+        "a database clone shares its close owner without duplicating the fd"
+    );
+    assert!(shared.into_artifact().is_err());
     let reader = open_snapshot_read_connection(&source).unwrap();
     drop(source);
     {

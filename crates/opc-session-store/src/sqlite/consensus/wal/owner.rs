@@ -48,7 +48,9 @@ pub(crate) enum RootPointForTest {
 #[cfg(test)]
 pub(crate) type RootHookForTest = Arc<dyn Fn(RootPointForTest) -> io::Result<()> + Send + Sync>;
 
-fn read_selection(database: &File) -> io::Result<Option<[u8; ROOT_BYTES as usize]>> {
+fn read_selection(
+    database: &impl std::os::fd::AsFd,
+) -> io::Result<Option<[u8; ROOT_BYTES as usize]>> {
     let mut bytes = [0; ROOT_BYTES as usize];
     match rustix::fs::fgetxattr(database, SELECTION_ATTRIBUTE, &mut bytes[..]) {
         Ok(len) if len == bytes.len() => Ok(Some(bytes)),
