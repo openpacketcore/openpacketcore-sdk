@@ -846,6 +846,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child descriptor retirement, preventing inherited sockets from causing
   spurious `EADDRINUSE` while preserving live-owner exclusion checks.
 
+- `opc-session-net`: V2 client error and service outcome-unknown diagnostics
+  are emitted only with `test-control` (including `--all-features` qualification
+  builds). Client diagnostics cover every failed attempt, including transient
+  failures later recovered by the pool; service diagnostics cover both one-shot
+  and pooled calls. Builds without `test-control` perform no diagnostic stderr
+  writes in these paths. Isolated qualification logs mutation timing and client
+  counters, then voter state and a redacted receipt category after failure,
+  preserving the original result and 800 ms assertion.
+
 - `opc-session-store`: wait for the initial record on every replica before
   injecting owner or fence drift in the renewal fixture. Exercise a lagging
   follower deterministically so quorum acknowledgement cannot race the direct

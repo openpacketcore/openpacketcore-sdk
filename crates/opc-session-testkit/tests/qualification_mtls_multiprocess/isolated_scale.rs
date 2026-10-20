@@ -165,6 +165,69 @@ impl Fleet {
     }
 }
 
+fn receipt_diagnostic(
+    receipt: &Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError>,
+    request: &FencedTransitionV2Request,
+) -> (&'static str, bool) {
+    let category = match receipt {
+        Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(status))) => match status {
+            SessionConsumerV2FencedTransitionStatus::Recorded(result) => {
+                return match result.as_ref() {
+                    Ok(outcome) => ("recorded_success", outcome.matches_v2_request(request)),
+                    Err(_) => ("recorded_error", false),
+                };
+            }
+            SessionConsumerV2FencedTransitionStatus::RequestConflict => "request_conflict",
+            SessionConsumerV2FencedTransitionStatus::Expired => "expired",
+            SessionConsumerV2FencedTransitionStatus::Retired => "retired",
+            SessionConsumerV2FencedTransitionStatus::HistoryFull => "history_full",
+            SessionConsumerV2FencedTransitionStatus::NotFound => "not_found",
+            SessionConsumerV2FencedTransitionStatus::EpochNotActive => "epoch_not_active",
+            SessionConsumerV2FencedTransitionStatus::RetentionExhausted => "retention_exhausted",
+            SessionConsumerV2FencedTransitionStatus::LeaseDeferred { .. } => "lease_deferred",
+            _ => "other_status",
+        },
+        Ok(SessionConsumerV2Response::FencedTransitionV2Status(Err(_))) => "service_error",
+        Ok(SessionConsumerV2Response::Rejected(_)) => "rejected",
+        Ok(_) => "unexpected_response",
+        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { .. }) => "not_transmitted",
+        Err(PersistentSessionConsumerV2ExecuteError::ReadUnavailable { .. }) => "read_unavailable",
+        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { .. }) => "outcome_unknown",
+        Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknownBatch { .. }) => {
+            "outcome_unknown_batch"
+        }
+        Err(_) => "other_execute_error",
+    };
+    (category, false)
+}
+
+#[tokio::test]
+async fn receipt_diagnostics_distinguish_missing_recorded_and_service_errors() {
+    let request = qualification_fenced_transition_v2_request(3, 0).await;
+    for (status, expected) in [
+        (
+            Ok(SessionConsumerV2FencedTransitionStatus::NotFound),
+            "not_found",
+        ),
+        (
+            Ok(SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(
+                Err(SessionConsumerV2FencedTransitionError::LeaseExpired),
+            ))),
+            "recorded_error",
+        ),
+        (Err(SessionConsumerStoreError::Unavailable), "service_error"),
+        (
+            Ok(SessionConsumerV2FencedTransitionStatus::LeaseDeferred {
+                request_id: request.request_id(),
+            }),
+            "lease_deferred",
+        ),
+    ] {
+        let receipt = Ok(SessionConsumerV2Response::FencedTransitionV2Status(status));
+        assert_eq!(receipt_diagnostic(&receipt, &request), (expected, false));
+    }
+}
+
 fn run_isolated_scale_boundary(persistence: QualificationIsolatedPersistence) {
     let scale = QualificationIsolatedScaleConfig {
         persistence,
@@ -224,10 +287,38 @@ fn run_isolated_scale_boundary(persistence: QualificationIsolatedPersistence) {
                     request: Box::new(request.clone()),
                 },
             ))
-            .await
-            .expect("public scale boundary mutation");
+            .await;
+        let elapsed = started.elapsed();
+        eprintln!(
+            "sdk_scale_diagnostic persistence={persistence:?} phase=live elapsed={:?} result={:?} client={:?}",
+            elapsed, result.as_ref().map(|_| ()), client.v2_diagnostics()
+        );
+        if result.is_err() {
+            let diagnostics = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fleet.all_consensus_diagnostics()
+            }));
+            eprintln!("sdk_scale_diagnostic consensus={diagnostics:?}");
+            for (ordinal, stderr) in fleet.stderr_diagnostics().iter().enumerate() {
+                for line in stderr.lines().filter(|line| {
+                    line.starts_with("qualification_persistence_health ")
+                        || line.starts_with("qualification_consensus_progress ")
+                        || line.starts_with("qualification_local_durable_progress ")
+                        || line.starts_with("qualification_local_wal_costs_summary ")
+                }) {
+                    eprintln!("sdk_scale_diagnostic voter={ordinal} {line}");
+                }
+            }
+            let receipt = client.execute_v2(&SessionConsumerV2Request::new(scope,
+                SessionConsumerV2Operation::FencedTransitionV2Status { request: Box::new(request.clone()) },
+            )).await;
+            let (category, matches_request) = receipt_diagnostic(&receipt, &request);
+            eprintln!(
+                "sdk_scale_diagnostic original_result=failed receipt_category={category} recorded_success_matches_request={matches_request}"
+            );
+        }
+        let result = result.expect("public scale boundary mutation");
         assert!(
-            started.elapsed() < Duration::from_millis(800),
+            elapsed < Duration::from_millis(800),
             "original batch deadline"
         );
         let outcome = match result {
@@ -235,6 +326,18 @@ fn run_isolated_scale_boundary(persistence: QualificationIsolatedPersistence) {
             _ => panic!("scale mutation must have an exact successful outcome"),
         };
         assert!(outcome.matches_v2_request(&request));
+        let recorded = Ok(SessionConsumerV2Response::FencedTransitionV2Status(Ok(
+            SessionConsumerV2FencedTransitionStatus::Recorded(Box::new(Ok(outcome.clone()))),
+        )));
+        assert_eq!(
+            receipt_diagnostic(&recorded, &request),
+            ("recorded_success", true)
+        );
+        let other_request = qualification_fenced_transition_v2_request(3, 1).await;
+        assert_eq!(
+            receipt_diagnostic(&recorded, &other_request),
+            ("recorded_success", false)
+        );
         assert!(
             matches!(client.execute_v2(&SessionConsumerV2Request::new(scope,
                 SessionConsumerV2Operation::FencedTransitionV2Status { request: Box::new(request.clone()) },
