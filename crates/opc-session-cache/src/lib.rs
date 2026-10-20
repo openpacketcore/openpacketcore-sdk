@@ -729,6 +729,9 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
         StoreError::BackendUnavailable(_) => "backend_unavailable",
+        StoreError::FencedTransitionRecoveryJournalUnavailable => {
+            "fenced_transition_recovery_journal_unavailable"
+        }
         StoreError::InvalidKey(_) => "invalid_key",
         StoreError::InvalidReplicationSequence => "invalid_replication_sequence",
         StoreError::InvalidReplicationLogRange => "invalid_replication_log_range",

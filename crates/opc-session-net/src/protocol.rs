@@ -1896,7 +1896,10 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             StoreError::CapabilityNotSupported(message) => {
                 Self::CapabilityNotSupported(safe_capability_name(message))
             }
-            StoreError::BackendUnavailable(_) => Self::BackendUnavailable("backend unavailable"),
+            StoreError::BackendUnavailable(_)
+            | StoreError::FencedTransitionRecoveryJournalUnavailable => {
+                Self::BackendUnavailable("backend unavailable")
+            }
             StoreError::InvalidKey(_) => Self::InvalidKey("invalid key"),
             StoreError::InvalidReplicationSequence => Self::InvalidReplicationSequence,
             StoreError::InvalidReplicationLogRange => Self::InvalidReplicationLogRange,

@@ -2405,7 +2405,8 @@ impl From<StoreError> for SessionConsumerStoreError {
             | StoreError::FencedTransitionOutcomeUnknown
             | StoreError::FencedTransitionRequestExpired
             | StoreError::BackendOperationOutcomeUnavailable => Self::OutcomeUnavailable,
-            StoreError::BackendUnavailable(_) => Self::Unavailable,
+            StoreError::BackendUnavailable(_)
+            | StoreError::FencedTransitionRecoveryJournalUnavailable => Self::Unavailable,
             StoreError::CapabilityNotSupported(_) => Self::CapabilityNotSupported,
             StoreError::InvalidKey(_)
             | StoreError::InvalidReplicationSequence

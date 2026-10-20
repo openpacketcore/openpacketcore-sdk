@@ -1800,15 +1800,15 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             "session-store record expiry preflight limit exceeded",
         ),
         StoreError::CapabilityNotSupported(_) => IpsecLbError::Unsupported,
-        StoreError::ReplicationWatchCatchUpRequired | StoreError::BackendUnavailable(_) => {
-            IpsecLbError::io(
-                "session_store_get",
-                io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "session store unavailable",
-                ),
-            )
-        }
+        StoreError::ReplicationWatchCatchUpRequired
+        | StoreError::BackendUnavailable(_)
+        | StoreError::FencedTransitionRecoveryJournalUnavailable => IpsecLbError::io(
+            "session_store_get",
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "session store unavailable",
+            ),
+        ),
         StoreError::Crypto(_) | StoreError::Serialization(_) => IpsecLbError::invalid_config(
             "session_store.record",
             "session-store ownership record is unreadable",

@@ -397,6 +397,9 @@ exists, name its replacing head tests in `replacements`; a rename instead uses
 `behavior_deleted` to `true` and cite the deleting commit, PR, or source change
 in `deleting_change`. Deleted behavior needs no unrelated replacement test.
 A rename does not waive a separate assertion decrease or new gate.
+The informational `clock-source-changed` kind records a real/controlled time
+conversion without authorizing any coverage reduction. Keep the same assertions
+and numeric bounds, demonstrate the pre-fix failure, and retain a real-time check.
 
 Local runs default to the merge base of `HEAD` and `origin/main`. An explicit
 base must be an ancestor of both, so a branch-only base cannot hide the change.

@@ -4028,15 +4028,15 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             "session re-pin journal expiry is invalid",
         ),
         StoreError::CapabilityNotSupported(_) => IpsecLbError::Unsupported,
-        StoreError::BackendUnavailable(_) | StoreError::ReplicationWatchCatchUpRequired => {
-            IpsecLbError::io(
-                "session_repin_journal",
-                io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "session store unavailable",
-                ),
-            )
-        }
+        StoreError::BackendUnavailable(_)
+        | StoreError::ReplicationWatchCatchUpRequired
+        | StoreError::FencedTransitionRecoveryJournalUnavailable => IpsecLbError::io(
+            "session_repin_journal",
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "session store unavailable",
+            ),
+        ),
         StoreError::PayloadTooLarge { .. } => IpsecLbError::invalid_config(
             "session_repin.payload",
             "session re-pin journal payload exceeds the backend limit",

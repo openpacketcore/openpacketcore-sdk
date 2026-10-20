@@ -5674,10 +5674,16 @@ impl ActivatedFencedTransitionBackend {
         Ok(request)
     }
 
-    fn preparation_attempt_deadline(&self) -> Option<tokio::time::Instant> {
-        tokio::time::Instant::now()
-            .checked_add(self.preparation_attempt_timeout)
-            .map(|deadline| deadline.min(self.preparation_deadline))
+    fn preparation_read_budget(&self) -> Option<PreparedCheckpointBudget> {
+        (tokio::time::Instant::now() < self.preparation_deadline)
+            .then(|| {
+                PreparedCheckpointBudget::new(
+                    self.preparation_deadline,
+                    self.preparation_attempt_timeout,
+                )
+                .ok()
+            })
+            .flatten()
     }
 }
 
@@ -5766,34 +5772,27 @@ impl SessionBackend for ActivatedFencedTransitionBackend {
         // Expiry authority is a read-only RPC, but it is not local: pinning
         // it to voter A would make a non-origin A outage reject every affine
         // request before the exact prepared route can run. Traverse the same
-        // deterministic A/B/C order from this handle's origin. Each physical
-        // read has the caller's one-attempt cap and all reads share the
-        // immutable preparation deadline. Retrying an interrupted read is
-        // safe because it cannot mutate or spend dispatch authority.
+        // deterministic A/B/C order from this handle's origin. Setup and Call
+        // write keep the physical cap; the response uses the immutable
+        // preparation deadline. Advance only after a response or a proven
+        // pre-write failure, without overlapping physical reads.
         let mut last_unavailable = None;
         for offset in 0..self.router.clients.len() {
-            let Some(deadline) = self.preparation_attempt_deadline() else {
+            let Some(budget) = self.preparation_read_budget() else {
                 break;
             };
-            if deadline <= tokio::time::Instant::now() {
-                break;
-            }
             let client = &self.router.clients[prepared_voter_index(
                 self.route
                     .mutation_voter(self.router.clients.len())
                     .wrapping_add(offset),
                 self.router.clients.len(),
             )];
-            let request = SessionConsumerRequest::new(
-                self.router.scope,
-                SessionConsumerRequestId::new(),
-                SessionConsumerOperation::PreflightRecordExpiry {
-                    preflights: preflights.to_vec(),
-                },
-            );
             let response = tokio::time::timeout_at(
-                deadline,
-                client.execute_classified_before(&request, deadline, 1),
+                budget.original_deadline(),
+                client.execute_v1_read_with_budget(
+                    DeadlineV1Read::PreflightRecordExpiry(preflights.to_vec()),
+                    budget,
+                ),
             )
             .await;
             match response {
@@ -5958,8 +5957,8 @@ impl SessionBackend for ActivatedFencedTransitionBackend {
             self.route.take_retained_lane(voter).ok_or_else(|| {
                 StoreError::BackendUnavailable("prepared fenced receipt unavailable".into())
             })?;
-        // Status uses the same exact reservation discipline as mutation, but
-        // its outer caller may safely rotate after this read-only lane fails.
+        // Status retains the exact reservation proof. Only this typed entry
+        // may use the caller-owned response deadline carried by that lane.
         let consumer_request = SessionConsumerRequest::new(
             self.router.scope,
             consumer_fenced_transition_request_id(&request),
@@ -10106,6 +10105,9 @@ struct PersistentV2LaneCall {
     deadline: tokio::time::Instant,
     completion: oneshot::Sender<Result<SessionConsumerV2Response, SessionConsumerClientError>>,
     write_progress: Arc<FrameWriteProgress>,
+    // The actor and caller both retain this reservation. Cancelling a caller
+    // cannot release extended-read capacity while its wire read still runs.
+    read_capacity: Option<Arc<PersistentReadReservation>>,
 }
 
 enum PersistentV2PoolEntry {
@@ -10145,6 +10147,7 @@ struct PersistentV2CapacityAdmission {
     siblings: Arc<PersistentSessionConsumerSiblings>,
     pending: Option<OwnedSemaphorePermit>,
     lane: Option<OwnedSemaphorePermit>,
+    read_capacity: Option<Arc<PersistentReadReservation>>,
 }
 
 /// Holds a V2 caller's pending admission while its FIFO lane future is
@@ -10193,6 +10196,7 @@ impl PersistentV2CapacityAdmission {
             siblings,
             pending: Some(pending),
             lane: Some(lane),
+            read_capacity: None,
         }
     }
 }
@@ -10201,6 +10205,7 @@ impl Drop for PersistentV2CapacityAdmission {
     fn drop(&mut self) {
         drop(self.lane.take());
         drop(self.pending.take());
+        drop(self.read_capacity.take());
         self.siblings.warm_capacity_changed.notify_waiters();
     }
 }
@@ -10448,7 +10453,7 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             crate::protocol::read_frame_payload(&mut tracked_reader, MAX_NEGOTIATED_FRAME_SIZE);
         tokio::pin!(read);
 
-        if let Some((completion, response, retire_after_response)) = pending_completion.take() {
+        if let Some((completion, response, retire_after_response, _read_capacity)) = pending_completion.take() {
             // Poll the already-owned next-frame read once before publishing
             // the previous result. A coalesced extra frame is therefore
             // consumed and retires this lane before a successor Call can
@@ -10578,6 +10583,7 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             deadline,
             mut completion,
             write_progress,
+            read_capacity,
         } = command;
         #[cfg(test)]
         if let Some(hook) = &pre_call_test_hook {
@@ -10951,7 +10957,7 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             || calls >= MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
             || shutdown_io.is_forced()
             || lifecycle.retirement(tokio::time::Instant::now()).is_some();
-        pending_completion = Some((completion, response, retire_after_response));
+        pending_completion = Some((completion, response, retire_after_response, read_capacity));
         }
     }
     .await;
@@ -10980,11 +10986,14 @@ struct PersistentSessionConsumerV2Pool {
     physical_lanes: Arc<Semaphore>,
     actor_lanes: Arc<Semaphore>,
     pending: Arc<Semaphore>,
+    read_capacity: Arc<PersistentReadCapacity>,
     prewarm: Arc<Semaphore>,
     // This is the same recovery authority used by the V1 sibling. It
     // serializes aggregate V1/V2 physical setup and retains one cooldown.
     reconnect_control: Arc<PersistentConsumerReconnectControl>,
     idle: StdMutex<VecDeque<PersistentV2PoolEntry>>,
+    #[cfg(feature = "test-control")]
+    read_reconnect_wait: watch::Sender<Option<(tokio::time::Instant, Weak<()>)>>,
     shutdown: AtomicBool,
     shutdown_forced_tx: watch::Sender<bool>,
     shutdown_io: Arc<PersistentConsumerIoBarrier>,
@@ -11029,9 +11038,14 @@ struct PersistentSessionConsumerV2Pool {
 struct PersistentV2CallAttempt<'a> {
     operation_started: tokio::time::Instant,
     admission_started: tokio::time::Instant,
+    admission_deadline: tokio::time::Instant,
     pre_request_deadline: tokio::time::Instant,
     pre_request_budget_active: bool,
     deadline: tokio::time::Instant,
+    /// Only exact history/status reads may extend their response wait past
+    /// the ordinary attempt deadline. The transport checks the operation
+    /// before acquiring any admission or setup capacity.
+    read_response_deadline: Option<tokio::time::Instant>,
     status_write_accepted: Option<&'a AtomicBool>,
 }
 
@@ -11329,14 +11343,20 @@ impl PersistentSessionConsumerV2Pool {
         Ok(None)
     }
 
-    async fn admit_call(
+    async fn admit_call_with_read_capacity(
         self: &Arc<Self>,
         started: tokio::time::Instant,
         operation_deadline: tokio::time::Instant,
+        extended_read: bool,
     ) -> Result<PersistentV2CapacityAdmission, SessionConsumerClientError> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
+        let read_pending = if extended_read {
+            Some(self.read_capacity.try_pending()?)
+        } else {
+            None
+        };
         let pending = Arc::clone(&self.pending)
             .try_acquire_owned()
             .map_err(|_| SessionConsumerClientError::Overloaded)?;
@@ -11353,9 +11373,16 @@ impl PersistentSessionConsumerV2Pool {
         if tokio::time::Instant::now() >= wait_deadline {
             return Err(late_error);
         }
-        let lane_wait = Arc::clone(&self.lanes).acquire_owned();
+        let lane_wait = async {
+            let read_capacity = self.read_capacity.acquire(read_pending).await?;
+            let lane = Arc::clone(&self.lanes)
+                .acquire_owned()
+                .await
+                .map_err(|_| SessionConsumerClientError::ShuttingDown)?;
+            Ok::<_, SessionConsumerClientError>((lane, read_capacity))
+        };
         tokio::pin!(lane_wait);
-        let lane = match lane_wait.as_mut().now_or_never() {
+        let (lane, read_capacity) = match lane_wait.as_mut().now_or_never() {
             Some(result) => complete_before_deadline(
                 result.map_err(|_| SessionConsumerClientError::ShuttingDown)?,
                 wait_deadline,
@@ -11377,11 +11404,12 @@ impl PersistentSessionConsumerV2Pool {
                 complete_before_deadline(lane?, wait_deadline, late_error)?
             }
         };
-        let admission = PersistentV2CapacityAdmission::new(
+        let mut admission = PersistentV2CapacityAdmission::new(
             Arc::clone(&self.siblings),
             pending_admission.into_pending(),
             lane,
         );
+        admission.read_capacity = read_capacity;
         if self.shutdown.load(Ordering::Acquire) {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
@@ -11438,6 +11466,14 @@ impl PersistentSessionConsumerV2Pool {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
+        self.connect_once_classified(deadline, false).await
+    }
+
+    async fn connect_once_classified(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        _read_only: bool,
+    ) -> Result<PersistentV2Connection, SessionConsumerClientError> {
         // Physical admission is deliberately outside the reconnect gate. A
         // caller which cannot own an aggregate socket slot is only locally
         // overloaded; it must not serialize or cool down unrelated recovery.
@@ -11451,12 +11487,25 @@ impl PersistentSessionConsumerV2Pool {
             Some(self.reconnect_control.as_ref()),
         );
         let (generation, material_epoch) = reconnect_setup.epoch();
+        // The controlled-clock fixture observes only read-side reconnect
+        // waits. It must not advance a mutation, an unrelated capability
+        // probe, or real resolver/TLS/Hello work. A weak lifetime makes a
+        // cancelled or immediately admitted wait unobservable as pending.
+        #[cfg(feature = "test-control")]
+        let read_wait = _read_only.then(|| {
+            let lifetime = Arc::new(());
+            self.read_reconnect_wait
+                .send_replace(Some((deadline, Arc::downgrade(&lifetime))));
+            lifetime
+        });
         let reconnect = poll_persistent_reconnect_setup(
             self.reconnect_control
                 .acquire(deadline, generation, material_epoch),
             &mut reconnect_setup,
         )
         .await??;
+        #[cfg(feature = "test-control")]
+        drop(read_wait);
         reconnect_setup.install_attempt(reconnect);
         match self
             .connect_once_admitted(deadline, admission, &mut reconnect_setup)
@@ -11842,23 +11891,41 @@ impl PersistentSessionConsumerV2Pool {
         let PersistentV2CallAttempt {
             operation_started,
             admission_started,
+            admission_deadline,
             pre_request_deadline,
             pre_request_budget_active,
             deadline,
+            read_response_deadline,
             status_write_accepted,
         } = attempt;
+        if read_response_deadline.is_some()
+            && !matches!(
+                request.operation(),
+                SessionConsumerV2Operation::FencedTransitionV2HistoryState
+                    | SessionConsumerV2Operation::FencedTransitionV2Status { .. }
+            )
+        {
+            return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+                cause: SessionConsumerClientError::Protocol,
+            });
+        }
+        let deadline = read_response_deadline.unwrap_or(deadline);
         if tokio::time::Instant::now() >= deadline {
             return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                 cause: SessionConsumerClientError::Deadline,
             });
         }
-        let _admission = self
+        let admission = self
             // Pool admission is a bounded fairness window per retry attempt,
             // not part of the immutable operation lifetime. A safe status
             // retry which arrives after an earlier backend response must be
             // able to acquire a currently-free lane, while setup and Call
             // boundaries below remain pinned to `operation_started`.
-            .admit_call(admission_started, deadline)
+            .admit_call_with_read_capacity(
+                admission_started,
+                admission_deadline,
+                read_response_deadline.is_some(),
+            )
             .await
             .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?;
         let _activity = self
@@ -11909,7 +11976,16 @@ impl PersistentSessionConsumerV2Pool {
                         |cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause },
                     )?;
                 (
-                    self.connect_once(setup_deadline).await.map_err(|cause| {
+                    self.connect_once_classified(
+                        setup_deadline,
+                        matches!(
+                            request.operation(),
+                            SessionConsumerV2Operation::FencedTransitionV2HistoryState
+                                | SessionConsumerV2Operation::FencedTransitionV2Status { .. }
+                        ),
+                    )
+                    .await
+                    .map_err(|cause| {
                         PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause }
                     })?,
                     true,
@@ -11976,6 +12052,7 @@ impl PersistentSessionConsumerV2Pool {
                 deadline,
                 completion,
                 write_progress: Arc::clone(&write_progress),
+                read_capacity: admission.read_capacity.clone(),
             })
             .map_err(
                 |_| PersistentSessionConsumerV2ExecuteError::NotTransmitted {
@@ -12087,9 +12164,11 @@ impl PersistentSessionConsumerV2Pool {
                     PersistentV2CallAttempt {
                         operation_started: started,
                         admission_started,
+                        admission_deadline: deadline,
                         pre_request_deadline,
                         pre_request_budget_active,
                         deadline,
+                        read_response_deadline: None,
                         status_write_accepted: status_retry.then_some(&status_write_accepted),
                     },
                 )
@@ -12275,6 +12354,7 @@ impl PersistentSessionConsumerV2Pool {
         }
         self.pending.close();
         self.lanes.close();
+        self.read_capacity.close();
         self.prewarm.close();
         {
             let mut idle = self
@@ -12892,6 +12972,7 @@ struct PersistentSessionConsumerPool {
     lanes: Arc<Semaphore>,
     physical_lanes: Arc<Semaphore>,
     pending: Arc<Semaphore>,
+    read_capacity: Arc<PersistentReadCapacity>,
     watches: Arc<Semaphore>,
     prewarm: Arc<Semaphore>,
     // Full-width administrative prewarm and one-lane affine readiness have
@@ -13168,6 +13249,9 @@ struct PersistentRetainedRequestLane {
     activity: PersistentCallActivity,
     admission: PersistentCapacityAdmission,
     deadline: tokio::time::Instant,
+    // Set only by the affine status caller. The transport rejects this field
+    // for every operation except the closed V1 receipt lookup.
+    status_response_deadline: Option<tokio::time::Instant>,
     // The affine facade keeps a clone of this exact call-local observation
     // after it hands the checkout to the opaque wrapper. It is the only
     // evidence that a cancelled inner future crossed the wire boundary.
@@ -13181,6 +13265,7 @@ struct PersistentCapacityAdmission {
     pool: Arc<PersistentSessionConsumerPool>,
     pending: Option<OwnedSemaphorePermit>,
     lane: Option<OwnedSemaphorePermit>,
+    read_capacity: Option<Arc<PersistentReadReservation>>,
 }
 
 /// Owns pending admission while a caller is waiting for its FIFO lane.  It is
@@ -13225,6 +13310,7 @@ impl PersistentCapacityAdmission {
             pool,
             pending: Some(pending),
             lane: Some(lane),
+            read_capacity: None,
         }
     }
 }
@@ -13233,6 +13319,7 @@ impl Drop for PersistentCapacityAdmission {
     fn drop(&mut self) {
         drop(self.lane.take());
         drop(self.pending.take());
+        drop(self.read_capacity.take());
         self.pool.warm_capacity_changed.notify_waiters();
     }
 }
@@ -13882,11 +13969,31 @@ impl PersistentSessionConsumerPool {
         }
     }
 
+    #[cfg(test)]
     async fn admit_call(
         self: &Arc<Self>,
         started: tokio::time::Instant,
         operation_deadline: tokio::time::Instant,
     ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), SessionConsumerClientError> {
+        let (pending, lane, _) = self
+            .admit_call_with_read_capacity(started, operation_deadline, false)
+            .await?;
+        Ok((pending, lane))
+    }
+
+    async fn admit_call_with_read_capacity(
+        self: &Arc<Self>,
+        started: tokio::time::Instant,
+        operation_deadline: tokio::time::Instant,
+        extended_read: bool,
+    ) -> Result<
+        (
+            OwnedSemaphorePermit,
+            OwnedSemaphorePermit,
+            Option<Arc<PersistentReadReservation>>,
+        ),
+        SessionConsumerClientError,
+    > {
         if self.phase() != PersistentShutdownPhase::Running {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
@@ -13894,6 +14001,11 @@ impl PersistentSessionConsumerPool {
         // active plus queued caller futures. Lane acquisition always joins
         // Tokio's FIFO waiter queue; `try_acquire_owned` would let a late
         // caller take a released permit ahead of an already queued caller.
+        let read_pending = if extended_read {
+            Some(self.read_capacity.try_pending()?)
+        } else {
+            None
+        };
         let pending = Arc::clone(&self.pending)
             .try_acquire_owned()
             .map_err(|_| SessionConsumerClientError::Overloaded)?;
@@ -13909,9 +14021,16 @@ impl PersistentSessionConsumerPool {
         if tokio::time::Instant::now() >= wait_deadline {
             return Err(late_error);
         }
-        let lane_wait = Arc::clone(&self.lanes).acquire_owned();
+        let lane_wait = async {
+            let read_capacity = self.read_capacity.acquire(read_pending).await?;
+            let lane = Arc::clone(&self.lanes)
+                .acquire_owned()
+                .await
+                .map_err(|_| SessionConsumerClientError::ShuttingDown)?;
+            Ok::<_, SessionConsumerClientError>((lane, read_capacity))
+        };
         tokio::pin!(lane_wait);
-        let lane = match lane_wait.as_mut().now_or_never() {
+        let (lane, read_capacity) = match lane_wait.as_mut().now_or_never() {
             Some(result) => complete_before_deadline(
                 result.map_err(|_| SessionConsumerClientError::ShuttingDown)?,
                 wait_deadline,
@@ -13982,7 +14101,7 @@ impl PersistentSessionConsumerPool {
         if self.phase() != PersistentShutdownPhase::Running {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
-        Ok((pending_admission.into_pending(), lane))
+        Ok((pending_admission.into_pending(), lane, read_capacity))
     }
 
     fn take_idle(self: &Arc<Self>) -> Option<PersistentCheckedOutConnection> {
@@ -14211,6 +14330,7 @@ impl PersistentSessionConsumerPool {
         );
         self.pending.close();
         self.lanes.close();
+        self.read_capacity.close();
         self.watches.close();
         self.prewarm.close();
         self.clear_idle();
@@ -14779,6 +14899,10 @@ impl PersistentSessionConsumerClient {
                 .saturating_add(config.pending_calls),
         ));
         let request_prewarm = Arc::new(Semaphore::new(1));
+        let read_capacity = Arc::new(PersistentReadCapacity::new(
+            config.request_connections,
+            config.pending_calls,
+        ));
         let siblings = Arc::new(PersistentSessionConsumerSiblings::default());
         let pool = Arc::new(PersistentSessionConsumerPool {
             client,
@@ -14790,6 +14914,7 @@ impl PersistentSessionConsumerClient {
             // Includes active lane owners so `pending_calls == 0` is
             // fail-fast only once every request lane is occupied.
             pending: Arc::clone(&request_pending),
+            read_capacity: Arc::clone(&read_capacity),
             watches: Arc::new(Semaphore::new(config.watch_connections)),
             // One physical prewarm may run across the separately negotiated
             // V1/V2 lanes at a time. This bounds connection storms while
@@ -14836,9 +14961,12 @@ impl PersistentSessionConsumerClient {
             actor_lanes: Arc::new(Semaphore::new(config.request_connections)),
             // Includes active V1/V2 lane owners in one aggregate queue.
             pending: request_pending,
+            read_capacity,
             prewarm: request_prewarm,
             reconnect_control: Arc::clone(&pool.reconnect_control),
             idle: StdMutex::new(VecDeque::with_capacity(config.request_connections)),
+            #[cfg(feature = "test-control")]
+            read_reconnect_wait: watch::channel(None).0,
             shutdown: AtomicBool::new(false),
             shutdown_forced_tx: v2_shutdown_forced_tx,
             shutdown_io: Arc::new(PersistentConsumerIoBarrier::new()),
@@ -15258,6 +15386,19 @@ impl PersistentSessionConsumerClient {
         self.v2_pool.diagnostics()
     }
 
+    /// Observe a read waiting for reconnect admission in controlled-clock tests.
+    ///
+    /// The published deadline is unchanged. Its weak lifetime is live only
+    /// while that read awaits the shared reconnect controller, before physical
+    /// setup. Immediate admission and cancelled probes leave no live wait.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn read_reconnect_wait_for_test(
+        &self,
+    ) -> watch::Receiver<Option<(tokio::time::Instant, Weak<()>)>> {
+        self.v2_pool.read_reconnect_wait.subscribe()
+    }
+
     /// Return a conservative authenticated-idle-capacity snapshot for the
     /// ALPN-specific revision-5 V2 idle pool.
     pub async fn v2_readiness(&self) -> PersistentSessionConsumerReadiness {
@@ -15516,6 +15657,32 @@ impl PersistentSessionConsumerClient {
         deadline: tokio::time::Instant,
         connect_attempts: usize,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        self.execute_classified_with_deadlines(request, deadline, connect_attempts, None)
+            .await
+    }
+
+    async fn execute_classified_with_deadlines(
+        &self,
+        request: &SessionConsumerRequest,
+        deadline: tokio::time::Instant,
+        connect_attempts: usize,
+        call_boundary_deadline: Option<tokio::time::Instant>,
+    ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
+        if call_boundary_deadline.is_some()
+            && !matches!(
+                request.operation(),
+                SessionConsumerOperation::Get { .. }
+                    | SessionConsumerOperation::PreflightRecordExpiry { .. }
+                    | SessionConsumerOperation::CompareAndSetStatus { .. }
+                    | SessionConsumerOperation::LeaseMutationStatus { .. }
+            )
+        {
+            self.pool
+                .record_error(SessionConsumerClientError::Protocol, false, false);
+            return Err(SessionConsumerCallError::BeforeCallWrite(
+                SessionConsumerClientError::Protocol,
+            ));
+        }
         // A retained status lookup has one immutable operation deadline, but
         // each bounded transport attempt must enter the pool at its own
         // instant.  Reusing the original start here would make a response
@@ -15570,7 +15737,16 @@ impl PersistentSessionConsumerClient {
             &write_progress,
             consumer_operation_is_effectful(request.operation()),
         );
-        let (pending, lane) = match self.pool.admit_call(started, deadline).await {
+        let admission_deadline = call_boundary_deadline.map_or(deadline, |end| end.min(deadline));
+        let (pending, lane, read_capacity) = match self
+            .pool
+            .admit_call_with_read_capacity(
+                started,
+                admission_deadline,
+                call_boundary_deadline.is_some(),
+            )
+            .await
+        {
             Ok(admission) => admission,
             Err(error) => {
                 outcome.complete();
@@ -15578,7 +15754,8 @@ impl PersistentSessionConsumerClient {
                 return Err(SessionConsumerCallError::BeforeCallWrite(error));
             }
         };
-        let admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        let mut admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        admission.read_capacity = read_capacity;
         let activity = match self.pool.register_call() {
             Ok(activity) => activity,
             Err(error) => {
@@ -15595,6 +15772,7 @@ impl PersistentSessionConsumerClient {
                 deadline,
                 &write_progress,
                 connect_attempts,
+                call_boundary_deadline,
             )
             .await;
         // A warm maintainer may be waiting for a normal cold caller's lane
@@ -15654,6 +15832,7 @@ impl PersistentSessionConsumerClient {
             activity,
             admission,
             deadline,
+            status_response_deadline,
             write_progress,
         } = retained;
         let started = tokio::time::Instant::now();
@@ -15676,6 +15855,11 @@ impl PersistentSessionConsumerClient {
             )
             || matches!(request.operation(), SessionConsumerOperation::Watch { .. })
             || !consumer_request_has_exact_fenced_transition_id(request)
+            || (status_response_deadline.is_some()
+                && !matches!(
+                    request.operation(),
+                    SessionConsumerOperation::FencedTransitionStatus { .. }
+                ))
             || request.validate().is_err()
         {
             drop(activity);
@@ -15691,6 +15875,9 @@ impl PersistentSessionConsumerClient {
         }
         let (pre_request_deadline, pre_request_budget_active) =
             self.pool.client.pre_request_deadline(started, deadline);
+        let pre_request_budget_active =
+            pre_request_budget_active || status_response_deadline.is_some();
+        let response_deadline = status_response_deadline.unwrap_or(deadline);
         let outcome = PersistentCallOutcome::new(
             Arc::clone(&self.pool),
             &write_progress,
@@ -15709,7 +15896,7 @@ impl PersistentSessionConsumerClient {
                 request,
                 pre_request_deadline,
                 pre_request_budget_active,
-                deadline,
+                response_deadline,
                 Some((shutdown, &self.pool.shutdown_phase)),
                 &write_progress,
             )
@@ -15721,10 +15908,19 @@ impl PersistentSessionConsumerClient {
                     && !response_is_outcome_unknown(request.operation(), response)
         ) {
             connection.return_idle();
+        } else {
+            // A failed read must close its checked-out transport before waiting
+            // out the original deadline. The caller still cannot replay it.
+            drop(connection);
         }
         drop(activity);
         drop(admission);
         outcome.complete();
+        let result = if status_response_deadline.is_some() {
+            deadline_read::settle_v1_read_result(result, response_deadline).await
+        } else {
+            result
+        };
         match result {
             Ok(response) => {
                 match &response {
@@ -16355,9 +16551,17 @@ impl PersistentSessionConsumerClient {
         deadline: tokio::time::Instant,
         write_progress: &FrameWriteProgress,
         connect_attempts: usize,
+        call_boundary_deadline: Option<tokio::time::Instant>,
     ) -> Result<SessionConsumerResponse, SessionConsumerCallError> {
-        let (pre_request_deadline, pre_request_budget_active) =
+        let (configured_pre_request_deadline, configured_pre_request_budget_active) =
             self.pool.client.pre_request_deadline(started, deadline);
+        let (pre_request_deadline, pre_request_budget_active) = match call_boundary_deadline {
+            Some(boundary) => (boundary.min(configured_pre_request_deadline), true),
+            None => (
+                configured_pre_request_deadline,
+                configured_pre_request_budget_active,
+            ),
+        };
         let mut shutdown = self.pool.shutdown_tx.subscribe();
         let mut attempt = 0_usize;
         loop {
@@ -16956,14 +17160,19 @@ impl PersistentSessionConsumerClient {
     async fn reserve_retained_request_lane_before(
         &self,
         deadline: tokio::time::Instant,
+        extended_read: bool,
     ) -> Result<PersistentRetainedRequestLane, SessionConsumerClientError> {
         self.ensure_retained_request_lane_before(deadline).await?;
         let started = tokio::time::Instant::now();
         if started >= deadline {
             return Err(SessionConsumerClientError::Deadline);
         }
-        let (pending, lane) = self.pool.admit_call(started, deadline).await?;
-        let admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        let (pending, lane, read_capacity) = self
+            .pool
+            .admit_call_with_read_capacity(started, deadline, extended_read)
+            .await?;
+        let mut admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        admission.read_capacity = read_capacity;
         let activity = match self.pool.register_call() {
             Ok(activity) => activity,
             Err(error) => {
@@ -16981,6 +17190,7 @@ impl PersistentSessionConsumerClient {
             activity,
             admission,
             deadline,
+            status_response_deadline: None,
             write_progress: Arc::new(FrameWriteProgress::new()),
         };
         #[cfg(test)]
@@ -17435,10 +17645,10 @@ pub enum SessionConsumerPreparedFencedTransitionStatusError {
     NotExecuted,
     #[error("prepared fenced transition deadline elapsed")]
     Deadline,
-    /// One physical receipt attempt reached its configured cap while the
-    /// immutable outer deadline remains live. This is retryable only by the
-    /// SDK-owned status-only runner; callers must not infer any mutation
-    /// authority from it.
+    /// A V1 receipt attempt exhausted its pre-write admission or setup cap
+    /// while the immutable outer deadline remains live. V2 status attempts
+    /// do not return this variant. Only the SDK-owned status runner may retry;
+    /// this error grants no mutation authority.
     #[error("prepared fenced transition receipt attempt deadline elapsed")]
     AttemptDeadline,
     #[error("prepared fenced transition authority was revoked")]
@@ -17594,7 +17804,7 @@ impl PersistentPreparedFencedTransitionToken {
     > {
         let voter = self.route.status_voter(self.voter_count);
         match self.router.clients[voter]
-            .reserve_retained_request_lane_before(setup_deadline)
+            .reserve_retained_request_lane_before(setup_deadline, true)
             .await
         {
             Ok(lane) => Ok((voter, lane)),
@@ -17677,7 +17887,7 @@ impl PersistentPreparedFencedTransitionToken {
             // affine mutation attempt.
             let voter = self.route.mutation_voter(self.voter_count);
             let retained = match self.router.clients[voter]
-                .reserve_retained_request_lane_before(attempt_deadline)
+                .reserve_retained_request_lane_before(attempt_deadline, false)
                 .await
             {
                 Ok(retained) => retained,
@@ -17846,15 +18056,15 @@ impl PersistentPreparedFencedTransitionToken {
         if now >= deadline {
             return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
         }
-        // One immutable physical cap covers both candidate lane setup and the
-        // exact receipt RPC. A cold/blackholed voter therefore cannot consume
-        // an extra cap before the deterministic cursor reaches its successor.
+        // Candidate setup and Call write retain one physical cap. Once the
+        // read is written, its response may use the remaining original
+        // deadline; a silent voter cannot cause overlapping receipt reads.
         let attempt_deadline = deadline.min(
             now.checked_add(self.budget.physical_attempt_timeout())
                 .ok_or(SessionConsumerPreparedFencedTransitionStatusError::Deadline)?,
         );
         let physical_cap_active = attempt_deadline < deadline;
-        let (voter, retained) = self
+        let (voter, mut retained) = self
             .ensure_status_readiness(attempt_deadline, deadline, physical_cap_active)
             .await?;
         let now = tokio::time::Instant::now();
@@ -17882,6 +18092,7 @@ impl PersistentPreparedFencedTransitionToken {
         if !self.state.status_allowed() {
             return Err(SessionConsumerPreparedFencedTransitionStatusError::NotExecuted);
         }
+        retained.status_response_deadline = Some(deadline);
         let write_boundary = Arc::new(PreparedFencedTransitionWriteBoundary::new(
             Arc::clone(&retained.write_progress),
             Arc::clone(&self.route),
@@ -17891,19 +18102,19 @@ impl PersistentPreparedFencedTransitionToken {
             .install_retained_lane(voter, retained, write_boundary);
         let _retained_lane = PreparedFencedTransitionLaneGuard::new(Arc::clone(&self.route));
         let result = match tokio::time::timeout_at(
-            attempt_deadline,
+            deadline,
             self.backend.fenced_transition_status(&self._prepared),
         )
         .await
         {
+            Ok(Ok(_)) if tokio::time::Instant::now() >= deadline => {
+                Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline)
+            }
             Ok(Ok(status)) => Ok(status),
             Ok(Err(StoreError::TopologyAuthorityRevoked)) => {
                 Err(SessionConsumerPreparedFencedTransitionStatusError::TopologyAuthorityRevoked)
             }
             Ok(Err(_)) => Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
-            Err(_) if physical_cap_active => {
-                Err(SessionConsumerPreparedFencedTransitionStatusError::AttemptDeadline)
-            }
             Err(_) => Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
         };
         match result {
@@ -18272,7 +18483,9 @@ impl PersistentPreparedCompareAndSetToken {
         let client = self.router.receipt_client(&self.state.status_cursor);
         match client.ensure_warm_request_capacity_before(deadline).await {
             Ok(()) => {}
-            Err(SessionConsumerClientError::Scope) => {
+            Err(
+                SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked,
+            ) => {
                 return self.terminal_receipt(Err(
                     PreparedCompareAndSetStatusError::TopologyAuthorityRevoked,
                 ));
@@ -18286,14 +18499,32 @@ impl PersistentPreparedCompareAndSetToken {
         if deadline <= now {
             return Err(PreparedCompareAndSetStatusError::Deadline);
         }
-        let attempt_deadline = deadline.min(
-            now.checked_add(self.budget.physical_attempt_timeout())
-                .ok_or(PreparedCompareAndSetStatusError::Deadline)?,
-        );
+        let budget =
+            PreparedCheckpointBudget::new(deadline, self.budget.physical_attempt_timeout())
+                .map_err(|_| PreparedCompareAndSetStatusError::Deadline)?;
+        let SessionConsumerOperation::CompareAndSetStatus { request } =
+            self.receipt_request().operation()
+        else {
+            return Err(PreparedCompareAndSetStatusError::Unavailable);
+        };
         let result = match client
-            .execute_classified_before(self.receipt_request(), attempt_deadline, 1)
+            .execute_v1_read_with_budget(
+                DeadlineV1Read::CompareAndSetStatus(request.clone()),
+                budget,
+            )
             .await
         {
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::ScopeMismatch
+                | SessionConsumerRejection::TopologyMismatch
+                | SessionConsumerRejection::Unauthorized,
+            )) => Err(PreparedCompareAndSetStatusError::TopologyAuthorityRevoked),
+            Err(error) if deadline_read::read_authority_revoked(&error) => {
+                Err(PreparedCompareAndSetStatusError::TopologyAuthorityRevoked)
+            }
+            Ok(_) if tokio::time::Instant::now() >= deadline => {
+                Err(PreparedCompareAndSetStatusError::Deadline)
+            }
             Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
                 SessionConsumerCompareAndSetStatus::Recorded(
                     SessionConsumerCompareAndSetReceiptOutcome::Applied,
@@ -18321,13 +18552,6 @@ impl PersistentPreparedCompareAndSetToken {
             Ok(SessionConsumerResponse::CompareAndSetStatus(Ok(
                 SessionConsumerCompareAndSetStatus::NotFound,
             ))) => Ok(PreparedCasStatus::NotFound),
-            Ok(SessionConsumerResponse::Rejected(
-                SessionConsumerRejection::ScopeMismatch
-                | SessionConsumerRejection::TopologyMismatch,
-            ))
-            | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope)) => {
-                Err(PreparedCompareAndSetStatusError::TopologyAuthorityRevoked)
-            }
             Ok(_) | Err(_) => Err(PreparedCompareAndSetStatusError::Unavailable),
         };
         match result {
@@ -18634,7 +18858,9 @@ impl PersistentPreparedLeaseAcquireToken {
         let client = self.router.receipt_client(&self.state.status_cursor);
         match client.ensure_warm_request_capacity_before(deadline).await {
             Ok(()) => {}
-            Err(SessionConsumerClientError::Scope) => {
+            Err(
+                SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked,
+            ) => {
                 return self.terminal_receipt(Err(
                     PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked,
                 ));
@@ -18648,19 +18874,33 @@ impl PersistentPreparedLeaseAcquireToken {
         if deadline <= now {
             return Err(PreparedLeaseAcquireStatusError::Deadline);
         }
-        let deadline = deadline.min(
-            now.checked_add(self.budget.physical_attempt_timeout())
-                .ok_or(PreparedLeaseAcquireStatusError::Deadline)?,
-        );
+        let budget =
+            PreparedCheckpointBudget::new(deadline, self.budget.physical_attempt_timeout())
+                .map_err(|_| PreparedLeaseAcquireStatusError::Deadline)?;
+        let SessionConsumerOperation::LeaseMutationStatus { request } =
+            self.receipt_request().operation()
+        else {
+            return Err(PreparedLeaseAcquireStatusError::Unavailable);
+        };
         let result = match client
-            .execute_classified_before(self.receipt_request(), deadline, 1)
+            .execute_v1_read_with_budget(
+                DeadlineV1Read::LeaseMutationStatus(request.clone()),
+                budget,
+            )
             .await
         {
-            Ok(SessionConsumerResponse::LeaseMutationStatus(Ok(status))) => Ok(status),
-            Ok(SessionConsumerResponse::Rejected(SessionConsumerRejection::ScopeMismatch))
-            | Err(SessionConsumerCallError::BeforeCallWrite(SessionConsumerClientError::Scope)) => {
+            Ok(SessionConsumerResponse::Rejected(
+                SessionConsumerRejection::ScopeMismatch
+                | SessionConsumerRejection::TopologyMismatch
+                | SessionConsumerRejection::Unauthorized,
+            )) => Err(PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked),
+            Err(error) if deadline_read::read_authority_revoked(&error) => {
                 Err(PreparedLeaseAcquireStatusError::TopologyAuthorityRevoked)
             }
+            Ok(_) if tokio::time::Instant::now() >= deadline => {
+                Err(PreparedLeaseAcquireStatusError::Deadline)
+            }
+            Ok(SessionConsumerResponse::LeaseMutationStatus(Ok(status))) => Ok(status),
             Ok(_) | Err(_) => Err(PreparedLeaseAcquireStatusError::Unavailable),
         };
         match result {
@@ -21717,6 +21957,11 @@ where
         Err(error) => Err(ProtocolError::Io(error)),
     }
 }
+mod deadline_read;
+use deadline_read::{DeadlineV1Read, DeadlineV2Read};
+mod read_capacity;
+use read_capacity::{PersistentReadCapacity, PersistentReadReservation};
+
 mod prepared_fenced_v2;
 
 pub use prepared_fenced_v2::{
@@ -21736,6 +21981,7 @@ mod tests {
     mod lease_deferral_wire_tests;
     #[path = "prewarm_batch.rs"]
     mod prewarm_batch;
+    mod read_deadline_tests;
     #[path = "void_alpn_tests.rs"]
     mod void_alpn_tests;
     #[path = "void_wire_tests.rs"]
@@ -22391,6 +22637,7 @@ mod tests {
                 lane,
             ),
             deadline,
+            status_response_deadline: None,
             write_progress: Arc::clone(&write_progress),
         };
         let route = Arc::new(PreparedFencedTransitionRoute::new(
@@ -25214,9 +25461,9 @@ mod tests {
                         }
                         PublicProtectedFencedStatusBehavior::Timeout => {
                             // Cross the real authenticated service boundary,
-                            // then deliberately outlive the client's physical
-                            // attempt cap. This keeps the original caller
-                            // deadline available for the next voter.
+                            // then withhold the response through the caller's
+                            // deadline. A written read must not be overlapped
+                            // by a speculative request to the next voter.
                             tokio::time::sleep(Duration::from_millis(250)).await;
                             std::future::pending::<SessionConsumerResponse>().await
                         }
@@ -27506,7 +27753,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_protected_fenced_transition_rotates_b_attempt_timeout_to_c() {
+    async fn public_protected_fenced_transition_waits_for_written_b_receipt_until_original_deadline(
+    ) {
         let fixture = public_protected_fenced_acceptance_fixture(
             [
                 PublicProtectedFencedStatusBehavior::Unavailable,
@@ -27533,26 +27781,49 @@ mod tests {
             prepared.execute_once().await,
             Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })
         );
-        let status = prepared.status_until_terminal(deadline).await;
-        let recorded = fixture
+        let status = {
+            let status = prepared.status_until_terminal(deadline);
+            tokio::pin!(status);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut status)
+                    .await
+                    .is_err(),
+                "a written receipt read remains pending beyond the physical cap"
+            );
+            status.await
+        };
+        assert_eq!(
+            status,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+            "a silent written B read consumes the immutable caller deadline"
+        );
+        assert!(tokio::time::Instant::now() >= deadline);
+        assert_eq!(
+            prepared.status_until_terminal(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+            "an expired caller deadline cannot dispatch another receipt read"
+        );
+        assert!(fixture
             .recorded_outcome
             .lock()
             .expect("recorded outcome lock")
-            .clone()
-            .expect("C records the exact successful receipt");
-        assert_eq!(
-            status,
-            Ok(FencedTransitionStatus::Recorded(Box::new(Ok(recorded)))),
-            "a capped B attempt is retryable while the original deadline remains available"
-        );
+            .is_none());
         assert_eq!(
             fixture
                 .status_order
                 .lock()
                 .expect("status order lock")
                 .as_slice(),
-            ["B", "C"],
-            "cold/timed-out B consumes only its one physical-attempt cap before C"
+            ["B"],
+            "no speculative C read overlaps the unanswered B read"
+        );
+        assert_eq!(
+            fixture
+                .status_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 1, 0],
+            "the logical read submits exactly one physical receipt request"
         );
         assert_eq!(
             fixture
@@ -27562,6 +27833,7 @@ mod tests {
             [1, 0, 0],
             "the status timeout cannot restore mutation authority"
         );
+        assert_public_protected_fenced_journal_row_retained(&fixture);
         fixture.shutdown().await;
     }
 
@@ -27627,7 +27899,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_protected_fenced_transition_exhausts_all_receipt_voters_without_replay() {
+    async fn public_protected_fenced_transition_exhausts_replying_voters_then_waits_for_silent_a() {
         let fixture = public_protected_fenced_acceptance_fixture(
             [
                 PublicProtectedFencedStatusBehavior::Timeout,
@@ -27664,13 +27936,19 @@ mod tests {
             .lock()
             .expect("status order lock")
             .clone();
-        assert!(
-            status_order.len() > 3
-                && status_order
-                    .iter()
-                    .enumerate()
-                    .all(|(index, voter)| *voter == ["B", "C", "A"][index % 3]),
-            "one absolute budget continues deterministic full read-only voter rounds"
+        assert_eq!(
+            status_order,
+            ["B", "C", "A"],
+            "unavailable replies permit traversal, then written silence spends the remaining deadline"
+        );
+        assert!(tokio::time::Instant::now() >= deadline);
+        assert_eq!(
+            fixture
+                .status_calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [1, 1, 1],
+            "a silent written read cannot start another voter round"
         );
         assert_eq!(
             fixture
@@ -27680,7 +27958,26 @@ mod tests {
             [1, 0, 0],
             "all unavailable/deadline receipts remain read-only"
         );
+        assert_public_protected_fenced_journal_row_retained(&fixture);
         fixture.shutdown().await;
+    }
+
+    fn assert_public_protected_fenced_journal_row_retained(
+        fixture: &PublicProtectedFencedAcceptanceFixture,
+    ) {
+        let connection = rusqlite::Connection::open_with_flags(
+            &fixture.journal_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("read the prepared journal after an unresolved receipt");
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM prepared_fenced_transition_journal",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained prepared journal rows");
+        assert_eq!(rows, 1, "written silence cannot erase the ambiguity marker");
     }
 
     async fn v2_effectful_request(nonce: u8) -> SessionConsumerV2Request {
@@ -28588,6 +28885,7 @@ mod tests {
                 deadline,
                 completion,
                 write_progress: Arc::clone(&progress),
+                read_capacity: None,
             })
             .expect("one V2 Call reaches the reused actor");
         let task = tokio::spawn(run_persistent_v2_lane(actor));
