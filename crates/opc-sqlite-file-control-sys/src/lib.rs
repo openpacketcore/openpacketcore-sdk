@@ -519,6 +519,9 @@ fn sqlite_file_has_moved(
 /// The returned descriptor is independent of its pathname and remains valid
 /// after a rename. It fails closed on a moved file, an unavailable file-control
 /// opcode, or a VFS other than the bundled Unix implementations.
+/// Dropping the returned `File` releases this process's POSIX record locks on
+/// the inode, including SQLite's; for a live database, borrow through
+/// `with_main_file` or retain a `RetainedSqliteFile` instead.
 #[cfg(target_os = "linux")]
 pub fn main_file_descriptor(connection: &Connection) -> Result<std::fs::File, FileControlError> {
     duplicate_sqlite_file_descriptor(connection, c"main", ffi::SQLITE_FCNTL_FILE_POINTER)
@@ -655,6 +658,9 @@ pub fn with_main_file<T>(
 ///
 /// The database name is passed only to SQLite's file-control API; it is never
 /// opened as a filesystem path.
+/// Dropping the returned `File` releases this process's POSIX record locks on
+/// the inode, including SQLite's; for a live database, borrow through
+/// `with_main_file` or retain a `RetainedSqliteFile` instead.
 #[cfg(target_os = "linux")]
 pub fn database_file_descriptor(
     connection: &Connection,

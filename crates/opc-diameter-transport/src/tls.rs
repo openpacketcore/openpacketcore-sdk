@@ -1508,6 +1508,13 @@ fn tcp_with_shutdown_handle(
     Ok((tcp, shutdown))
 }
 
+#[cfg_attr(
+    unix,
+    expect(
+        clippy::disallowed_methods,
+        reason = "the TCP socket needs an independent shutdown handle; it cannot be a SQLite inode"
+    )
+)]
 fn duplicate_shutdown_socket(tcp: &TcpStream) -> io::Result<std::net::TcpStream> {
     #[cfg(unix)]
     {

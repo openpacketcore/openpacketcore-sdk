@@ -54,4 +54,15 @@ model; those actors can already modify stored bytes. This API does not provide
 adversarial exact-inode pathname admission. SQLite's native pathname limit also
 applies (about 504 usable bytes with the bundled Unix VFS), so longer canonical
 names fail closed. Callers clone the retained wrapper, which shares close
-ownership; no `File` reference is exposed for raw descriptor duplication.
+ownership; no `File` reference is exposed. `AsFd` and `AsRawFd` still expose
+borrowed descriptors and must only be used for operations that neither duplicate
+nor close them. Keep the wrapper alive while using its raw descriptor.
+Safe Rust can still obtain an owned duplicate through
+`pin.as_fd().try_clone_to_owned()`. Closing that duplicate releases the process's
+POSIX locks on the inode and bypasses SQLite's close bookkeeping.
+
+The repository's Clippy configuration rejects `BorrowedFd::try_clone_to_owned`,
+with narrow documented exceptions for other resource kinds. This guards that
+method in repository Clippy checks; it does not make duplication impossible in
+Rust or constrain consumers that do not use this configuration. Clone the pin
+wrapper to share its close owner, rather than duplicating its descriptor.

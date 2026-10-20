@@ -832,6 +832,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`, `opc-sqlite-file-control-sys`: clarify that retained pins
+  hide `File` references but still expose borrowed descriptors, which callers
+  must not duplicate or close. Repository Clippy checks reject
+  `BorrowedFd::try_clone_to_owned`, `rustix::io::dup`,
+  `rustix::io::fcntl_dupfd_cloexec` and `nix::unistd::dup`, with local exceptions
+  for directory, socket, BPF and interpreter handles.
+
 - CI: balance native GTP-U qualification across datapath, regression and a new
   required workload-reset job. Reuse the regression job's library build for
   kernel provenance and control proofs, and move the 21 strict/exclusive reset

@@ -91,6 +91,10 @@ pub struct ObservedProgram {
     fd: OwnedFd,
 }
 impl ObservedProgram {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "retain the observed BPF program handle, not a SQLite main-file descriptor"
+    )]
     pub fn from_fd(fd: BorrowedFd<'_>) -> Result<Self, InspectionError> {
         fd.try_clone_to_owned()
             .map(|fd| Self { fd })
@@ -215,6 +219,10 @@ fn pin_kind(contents: &str) -> io::Result<PinKind> {
 }
 
 impl ObservedMap {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "retain the observed BPF map handle, not a SQLite main-file descriptor"
+    )]
     pub fn from_fd(fd: BorrowedFd<'_>) -> Result<Self, InspectionError> {
         fd.try_clone_to_owned()
             .map(|fd| Self { fd })

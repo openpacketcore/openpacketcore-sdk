@@ -1824,6 +1824,10 @@ fn verify_interpreter_descriptor<Fd: AsFd>(
 async fn verified_interpreter_proc_path(
     interpreter: &PreparedInterpreter,
 ) -> Result<(OwnedFd, PathBuf), QualificationKubernetesConcurrentV5ArtifactError> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the descriptor pins an interpreter executable, not a SQLite database"
+    )]
     let descriptor = rustix::io::fcntl_dupfd_cloexec(&interpreter.descriptor, 0)
         .map_err(|_| QualificationKubernetesConcurrentV5ArtifactError::InterpreterUnavailable)?;
     let expected = interpreter.identity.clone();
