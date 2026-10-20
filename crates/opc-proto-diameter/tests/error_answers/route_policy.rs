@@ -42,14 +42,25 @@ fn route_policy_rejections_match_independent_wire_answers_for_rar_and_asr() {
         }
         let envelope = envelope(&request);
         assert_eq!(envelope.classify(&request, APP_DICTIONARIES), Ok(None));
-        for (policy, code, expected) in [
-            (POLICIES[0], 3002, UNABLE_TO_DELIVER_ANSWER),
-            (POLICIES[1], 3003, REALM_NOT_SERVED_ANSWER),
+        for (policy, code, failure_code, expected) in [
+            (
+                POLICIES[0],
+                3002,
+                "diameter_unable_to_deliver",
+                UNABLE_TO_DELIVER_ANSWER,
+            ),
+            (
+                POLICIES[1],
+                3003,
+                "diameter_realm_not_served",
+                REALM_NOT_SERVED_ANSWER,
+            ),
         ] {
             let bound = envelope
                 .bind_route_policy_rejection(&request, policy, APP_DICTIONARIES)
                 .expect("closed route policy binds to the inspected request");
             assert_eq!(bound.result_code(), code);
+            assert_eq!(bound.as_str(), failure_code);
             assert_eq!(
                 bound.failure(),
                 &DiameterRequestFailure::RoutePolicy(policy)
@@ -67,6 +78,7 @@ fn route_policy_rejections_match_independent_wire_answers_for_rar_and_asr() {
                     EncodeContext::default(),
                 )
                 .expect("routing errors use the bounded error-answer builder");
+                assert_eq!(plan.failure_code(), failure_code);
                 assert_eq!(
                     plan.grammar(),
                     DiameterErrorAnswerGrammar::Rfc6733ErrorBitFallback
@@ -122,6 +134,35 @@ fn route_policy_rejections_match_independent_wire_answers_for_rar_and_asr() {
 }
 
 #[test]
+fn route_policy_rejection_requires_proxiable_request() {
+    let mut avps = encode_avp(AvpHeader::ietf(AVP_ORIGIN_HOST, true), b"peer.invalid");
+    avps.extend(encode_avp(
+        AvpHeader::ietf(AVP_ORIGIN_REALM, true),
+        b"invalid",
+    ));
+    let request = encode_request(
+        CommandFlags::request(false),
+        COMMAND_DEVICE_WATCHDOG,
+        APPLICATION_ID_COMMON_MESSAGES,
+        &avps,
+    );
+    let message = decode_message(&request);
+    parse_device_watchdog_request(&message, DecodeContext::conservative())
+        .expect("the non-proxiable watchdog has valid command grammar");
+    let envelope = envelope(&request);
+    assert_eq!(envelope.classify(&request, APP_DICTIONARIES), Ok(None));
+    for policy in POLICIES {
+        let error = envelope
+            .bind_route_policy_rejection(&request, policy, APP_DICTIONARIES)
+            .expect_err("a locally processed request cannot acquire route-policy authority");
+        assert_eq!(
+            error.as_str(),
+            "diameter_request_classification_route_policy_requires_proxiable_request"
+        );
+    }
+}
+
+#[test]
 fn route_policy_rejection_keeps_earlier_header_framing_and_dictionary_failures() {
     let mut error_bit = fixture(ROUTE_REQUEST);
     error_bit[4] |= CommandFlags::ERROR;
@@ -129,6 +170,8 @@ fn route_policy_rejection_keeps_earlier_header_framing_and_dictionary_failures()
     reserved_bit[4] |= 1;
     let mut version = fixture(ROUTE_REQUEST);
     version[0] = 2;
+    let mut not_proxiable = fixture(ROUTE_REQUEST);
+    not_proxiable[4] &= !CommandFlags::PROXIABLE;
     let wrong_m = encode_request(
         CommandFlags::request(false),
         COMMAND_DEVICE_WATCHDOG,
@@ -145,6 +188,7 @@ fn route_policy_rejection_keeps_earlier_header_framing_and_dictionary_failures()
         (error_bit, 3008),
         (reserved_bit, 5013),
         (version, 5011),
+        (not_proxiable, 3008),
         (wrong_m, 3009),
         (malformed, 5014),
         (fixture(UNKNOWN_COMMAND_REQUEST), 3001),
