@@ -735,7 +735,8 @@ if errors: raise errors[0]
         directory = self.candidate("autoclear-budget")
         guardian = self.guardian()
         guardian.reap_descendants = unittest.mock.Mock()
-        clock = [time.monotonic()]
+        # A fixed origin keeps exact budget assertions independent of host uptime.
+        clock = [0.0]
         started = clock[0]
         inventories = []
 
