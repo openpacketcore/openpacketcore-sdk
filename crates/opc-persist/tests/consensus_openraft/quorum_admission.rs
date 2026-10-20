@@ -129,11 +129,7 @@ impl RetainedFleet {
         let cluster =
             ThreeNodeCluster::build_with_storage([[0x55; 32]; 3], FixtureStorage::RetainedNew)
                 .await;
-        let (one, two, three) = tokio::join!(
-            cluster.stores[0].initialize_cluster(),
-            cluster.stores[1].initialize_cluster(),
-            cluster.stores[2].initialize_cluster()
-        );
+        let (one, two, three) = fixture_formation::initialize(cluster.stores.clone()).await;
         one.expect("initial first voter");
         two.expect("initial second voter");
         three.expect("initial third voter");
@@ -326,17 +322,28 @@ async fn retained_majority_reopens_without_the_third_voter() {
 async fn rolling_restart_hands_off_each_current_leader_and_preserves_writes() {
     let mut fleet = RetainedFleet::start().await;
     let mut stopped = BTreeSet::new();
-    for _ in 0..3 {
+    for iteration in 1..=3 {
         let leader = (0..3)
             .find(|index| {
                 let status = fleet.store(*index).status();
                 status.leader_id == Some(status.node_id)
             })
             .expect("current writable leader");
-        let term = fleet.store(leader).status().term;
+        let status = fleet.store(leader).status();
+        let term = status.term;
+        let shutdown_started = tokio::time::Instant::now();
+        eprintln!(
+            "rolling restart: iteration={iteration} node={:?} term={term} phase=shutdown-start",
+            status.node_id
+        );
         let report = fleet.store(leader).shutdown_with_report().await.unwrap();
+        eprintln!(
+            "rolling restart: iteration={iteration} node={:?} term={term} elapsed={:?} report={report:?}",
+            status.node_id,
+            shutdown_started.elapsed(),
+        );
         let opc_consensus::PlannedShutdownOutcome::LeaderTransferred { successor } = report else {
-            panic!("planned leader restart did not hand off: {report:?}");
+            panic!("planned leader restart did not hand off: iteration={iteration} node={:?} term={term} report={report:?}", status.node_id);
         };
         stopped.insert(leader);
         fleet.stop(leader).await;
