@@ -194,6 +194,30 @@ mod admission_tests {
     }
 
     #[test]
+    fn retained_pin_accepts_descriptor_only_paths_beyond_sqlite_path_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut path = directory.path().to_path_buf();
+        for index in 0..10 {
+            path.push(format!("component-{index}-{}", "x".repeat(52)));
+            std::fs::create_dir(&path).unwrap();
+        }
+        path.push("artifact");
+        let contents = b"descriptor-only recovery artifact";
+        std::fs::write(&path, contents).unwrap();
+        let path = path.canonicalize().unwrap();
+        assert!(
+            path.as_os_str().as_bytes().len() > 512,
+            "exercise a path beyond the native Unix VFS pathname limit"
+        );
+        let expected = identity(&std::fs::metadata(&path).unwrap());
+        let mut pin = RetainedSqliteFile::open_nofollow(&path).unwrap();
+        assert_eq!(identity(&pin.file().metadata().unwrap()), expected);
+        let mut observed = Vec::new();
+        pin.read_to_end(&mut observed).unwrap();
+        assert_eq!(observed, contents);
+    }
+
+    #[test]
     fn retained_pin_rejects_non_regular_before_readable_open() {
         let directory = tempfile::tempdir().unwrap();
         let fifo_path = directory.path().join("fifo");
