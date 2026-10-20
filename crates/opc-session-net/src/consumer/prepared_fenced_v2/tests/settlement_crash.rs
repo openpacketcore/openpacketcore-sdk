@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 const CHILD: &str =
-    "consumer::prepared_fenced_v2::tests::settlement_crash::preflight_settlement_crash_child";
+    "consumer::prepared_fenced_v2::tests::settlement_crash::preflight_settlement_crash_retains_an_unknown_row";
 const DIRECTORY: &str = "OPC_V2_SETTLEMENT_CRASH_DIRECTORY";
 const OWNED: &str = "OPC_V2_SETTLEMENT_CRASH_OWNED";
 
@@ -70,8 +70,6 @@ fn token(
     )
 }
 
-#[tokio::test]
-#[ignore = "controlled subprocess killed during local settlement"]
 async fn preflight_settlement_crash_child() {
     let directory = std::path::PathBuf::from(std::env::var_os(DIRECTORY).expect("child directory"));
     let path = directory.join("recovery.sqlite3");
@@ -121,6 +119,10 @@ impl Drop for CrashChild {
 
 #[tokio::test]
 async fn preflight_settlement_crash_retains_an_unknown_row() {
+    if std::env::var_os(DIRECTORY).is_some() {
+        preflight_settlement_crash_child().await;
+        return;
+    }
     for owned in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -128,7 +130,7 @@ async fn preflight_settlement_crash_retains_an_unknown_row() {
         let output = std::fs::File::create(&output_path).unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["--ignored", "--exact", CHILD, "--nocapture"])
+            .args(["--exact", CHILD, "--nocapture"])
             .env(DIRECTORY, directory.path())
             .env_remove(OWNED)
             .stdin(Stdio::null())
