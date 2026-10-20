@@ -2971,6 +2971,16 @@ mod tests {
             &request,
         )
         .unwrap();
+        // Independently encoded with action byte 3 and the fixed synthetic key.
+        assert_eq!(
+            expected,
+            [
+                0xc9, 0xb0, 0x80, 0xab, 0x0e, 0x12, 0x92, 0x08, 0xfa, 0xb7, 0x64, 0xde, 0xfa, 0xc5,
+                0x0a, 0x9f, 0x93, 0x0b, 0xa5, 0x8c, 0xab, 0x39, 0x41, 0x37, 0xf9, 0x40, 0xfa, 0x44,
+                0xbf, 0x01, 0x2f, 0xf9,
+            ],
+            "transit install-request encoding changed"
+        );
         for change in ["action", "mark", "priority", "direction"] {
             let mut changed = parameters.clone();
             match change {

@@ -6088,6 +6088,16 @@ mod tests {
         fn path(&self) -> &Path {
             &self.0
         }
+
+        fn bytes(&self) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+            fs::read_dir(self.path())
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect()
+        }
     }
 
     #[cfg(unix)]
@@ -7656,6 +7666,128 @@ mod tests {
             "acquired"
         );
         assert_eq!(transport.operations(), vec!["query_sa", "install_sa"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forward_transit_namespace_refusal_preserves_store_epoch_and_admission() {
+        for parameters in crate::model::malformed_forward_transit_parameters() {
+            for rekey in [false, true] {
+                let root = DurableTestRoot::new();
+                let transport = RecordingSuccessTransport::default();
+                let (backend, store) = LinuxXfrmBackend::with_transport(transport.clone())
+                    .bind_current_network_namespace_with_object_recovery(
+                        root.path().to_path_buf(),
+                        XfrmObjectRecoveryProofKey::new([0x71; 32]).unwrap(),
+                    )
+                    .unwrap();
+                let operation = XfrmObjectInstallOperationId::generate().unwrap();
+                let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+                let request = durable_object_requests()[0].clone();
+                let authority = backend
+                    .prepare_durable_object_install(&store, operation, generation, request.clone())
+                    .await
+                    .unwrap();
+                let record = store
+                    .restore(
+                        operation,
+                        generation,
+                        request.object(),
+                        store.fingerprints_for_request(&request).unwrap(),
+                    )
+                    .unwrap();
+                let before = root.bytes();
+                let result = if rekey {
+                    backend
+                        .rekey_policy(RekeyPolicyRequest {
+                            parameters: parameters.clone(),
+                        })
+                        .await
+                } else {
+                    backend
+                        .install_policy(InstallPolicyRequest {
+                            parameters: parameters.clone(),
+                        })
+                        .await
+                };
+                assert_eq!(
+                    root.bytes(),
+                    before,
+                    "invalid transit must not change durable bytes"
+                );
+                assert!(store.record_writer_epoch_is_current(&record).unwrap());
+                assert!(matches!(
+                    result,
+                    Err(XfrmError::InvalidConfig {
+                        field: "forward_transit",
+                        ..
+                    })
+                ));
+                assert!(transport.operations().is_empty());
+                assert_eq!(
+                    backend
+                        .run_durable_object_install(authority)
+                        .await
+                        .unwrap()
+                        .as_str(),
+                    "acquired"
+                );
+                assert_eq!(transport.operations(), vec!["query_sa", "install_sa"]);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forward_transit_durable_refusal_preserves_prepared_store_and_authority() {
+        for parameters in crate::model::malformed_forward_transit_parameters() {
+            let root = DurableTestRoot::new();
+            let transport = RecordingSuccessTransport::default();
+            let (backend, store) = LinuxXfrmBackend::with_transport(transport.clone())
+                .bind_current_network_namespace_with_object_recovery(
+                    root.path().to_path_buf(),
+                    XfrmObjectRecoveryProofKey::new([0x72; 32]).unwrap(),
+                )
+                .unwrap();
+            let authority = backend
+                .prepare_durable_object_install(
+                    &store,
+                    XfrmObjectInstallOperationId::generate().unwrap(),
+                    XfrmObjectInstallOperationGeneration::new(1).unwrap(),
+                    durable_object_requests()[0].clone(),
+                )
+                .await
+                .unwrap();
+            let before = root.bytes();
+            let invalid = XfrmObjectInstallRequest::Policy(InstallPolicyRequest { parameters });
+            let result = backend
+                .prepare_durable_object_install(
+                    &store,
+                    XfrmObjectInstallOperationId::generate().unwrap(),
+                    XfrmObjectInstallOperationGeneration::new(1).unwrap(),
+                    invalid.clone(),
+                )
+                .await;
+            assert_eq!(root.bytes(), before);
+            assert!(result.is_err());
+            assert!(prepare_object_install(
+                &store,
+                XfrmObjectInstallOperationId::generate().unwrap(),
+                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
+                &invalid
+            )
+            .is_err());
+            assert_eq!(root.bytes(), before);
+            assert!(transport.operations().is_empty());
+            assert_eq!(
+                backend
+                    .run_durable_object_install(authority)
+                    .await
+                    .unwrap()
+                    .as_str(),
+                "acquired"
+            );
+        }
     }
 
     #[tokio::test]

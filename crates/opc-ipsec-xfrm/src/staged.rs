@@ -2140,6 +2140,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_transit_staged_refuses_before_journal_or_sa_effects() {
+        for parameters in crate::model::malformed_forward_transit_parameters() {
+            let backend = Arc::new(GatedBackend::new());
+            let mut request = install_request();
+            request.policy.parameters = parameters;
+            let staged = XfrmStagedInstall::new(request);
+            let journal = staged.journal();
+            assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+            assert!(staged.run(backend.clone()).await.is_err());
+            assert!(backend.operations().is_empty());
+            assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+        }
+    }
+
+    #[tokio::test]
     async fn successful_install_commits_across_every_journal_clone() {
         let backend = Arc::new(GatedBackend::new());
         let staged = XfrmStagedInstall::new(install_request());

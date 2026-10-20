@@ -3137,6 +3137,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn forward_transit_roster_refuses_an_invalid_later_member() {
+        for parameters in crate::model::malformed_forward_transit_parameters() {
+            let result = XfrmObjectRosterRequest::new(vec![
+                XfrmObjectRosterMemberRequest::new(sa_request(0)),
+                XfrmObjectRosterMemberRequest::new(XfrmObjectInstallRequest::Policy(
+                    crate::InstallPolicyRequest { parameters },
+                )),
+            ]);
+            assert!(
+                result.is_err(),
+                "the complete roster must validate before any preparation"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn applied_roster_follows_the_declared_member_order() {
         let root = TestRoot::new();

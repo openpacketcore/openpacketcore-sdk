@@ -899,6 +899,53 @@ pub(crate) fn validate_forward_transit_parameters(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn malformed_forward_transit_parameters() -> Vec<PolicyParameters> {
+    let valid = PolicyParameters::forward_transit(
+        XfrmSelector::new(
+            IpAddress::Ipv4([192, 0, 2, 1]),
+            IpAddress::Ipv4([192, 0, 2, 2]),
+            17,
+        ),
+        100,
+        XfrmLookupMark::full(0x4000_0001),
+    )
+    .unwrap();
+    let mut malformed = Vec::new();
+    for direction in [XfrmDirection::In, XfrmDirection::Out] {
+        let mut parameters = valid.clone();
+        parameters.direction = direction;
+        malformed.push(parameters);
+    }
+    for mark in [
+        None,
+        Some(XfrmLookupMark::full(0)),
+        Some(XfrmLookupMark::new(0x10, 0xf0).unwrap()),
+    ] {
+        let mut parameters = valid.clone();
+        parameters.mark = mark;
+        malformed.push(parameters);
+    }
+    for if_id in [0, 42] {
+        let mut parameters = valid.clone();
+        parameters.if_id = Some(if_id);
+        malformed.push(parameters);
+    }
+    let mut parameters = valid;
+    parameters.templates.push(XfrmTemplate {
+        id: XfrmId {
+            destination: IpAddress::Ipv4([192, 0, 2, 2]),
+            spi: 256,
+            protocol: 50,
+        },
+        source_address: IpAddress::Ipv4([192, 0, 2, 1]),
+        request_id: None,
+        mode: XfrmMode::Tunnel,
+    });
+    malformed.push(parameters);
+    malformed
+}
+
 /// Template describing an SA that may satisfy a policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct XfrmTemplate {

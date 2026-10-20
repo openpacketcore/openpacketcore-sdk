@@ -744,6 +744,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_transit_composite_refuses_before_any_sa_effect_in_either_direction() {
+        for parameters in crate::model::malformed_forward_transit_parameters() {
+            for invalid_second in [false, true] {
+                let backend = FailingCompositeBackend::default();
+                let mut invalid = install_request();
+                invalid.policy.parameters = parameters.clone();
+                if invalid_second {
+                    assert!(install_bidirectional_sa_policy_with_rollback(
+                        &backend,
+                        [install_request(), invalid.clone()]
+                    )
+                    .await
+                    .is_err());
+                } else {
+                    assert!(install_sa_policy_with_rollback(&backend, invalid.clone())
+                        .await
+                        .is_err());
+                }
+                assert!(
+                    backend.operations().is_empty(),
+                    "preflight must precede the first SA install"
+                );
+                assert!(rekey_sa_policy(
+                    &backend,
+                    RekeySaRequest {
+                        parameters: invalid.sa.parameters
+                    },
+                    RekeyPolicyRequest {
+                        parameters: invalid.policy.parameters
+                    }
+                )
+                .await
+                .is_err());
+                assert!(backend.operations().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn composite_install_applies_sa_then_policy() {
         let backend = FailingCompositeBackend::default();
 
