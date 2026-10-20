@@ -108,7 +108,7 @@ remain downstream.
   `peer` and application parsers (see below), not by the raw or command-
   cardinality validator.
 
-### 4. Request-bound error answers (RFC 6733 §6.2 and §7)
+### 4. Request-bound error answers (RFC 6733 §6.1, §6.2 and §7)
 
 - `inspect_diameter_request` requires a complete trusted request header and a
   message boundary within `DecodeContext::max_message_len`; fragments,
@@ -124,7 +124,7 @@ remain downstream.
   arbitrary suffix. Classification returns a private-construction
   `DiameterBoundRequestFailure` tied to that request digest. The answer builder
   accepts only this bound token, not an unbound failure enum.
-- Typed failures cover RFC result codes 3001, 3007, 3008, 3009, 5001, 5004,
+- Typed failures cover RFC result codes 3001, 3002, 3003, 3007, 3008, 3009, 5001, 5004,
   5005, 5008, 5009, 5011, 5013, and 5014. Reserved Diameter-header bits map to
   5013, while an E/P combination inconsistent with a uniquely resolved command
   maps to 3008. Dictionary lookup distinguishes missing application/command
@@ -143,6 +143,21 @@ remain downstream.
   Header/P/dictionary failures and AVP offsets have deterministic first-failure
   precedence across classification, decoder mapping, application binding, and
   answer construction.
+- `DiameterRoutePolicyRejection` is limited to `UnableToDeliver` (3002) and
+  `RealmNotServed` (3003). `bind_route_policy_rejection` reclassifies the exact
+  inspected request first, preserves every earlier failure, and rejects request
+  mismatch or dictionary ambiguity. If no earlier failure is selected, a request
+  with P cleared returns
+  `DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest`,
+  preserving RFC 6733 §3's local-processing requirement. Only then does it bind
+  the caller's routing decision to the existing answer builder. Both results
+  require E and the §7.2 grammar; they have no Failed-AVP and retain the same
+  reflection, redaction and size bounds. Command-specific validation and route
+  selection remain caller responsibilities. `DiameterRequestFailure::RoutePolicy`
+  and
+  `DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest`
+  require new arms in downstream exhaustive matches; no unrestricted numeric
+  constructor exists.
 - `DiameterParserError` retains the original `DecodeError` plus a private
   fingerprint of the exact declared Diameter message boundary (following
   transport-buffer bytes are deliberately outside the binding). Its optional
@@ -196,7 +211,7 @@ remain downstream.
   Protocol errors set E and always report the effective RFC 6733 §7.2 grammar.
   Permanent errors keep E clear unless the caller explicitly selects the
   §7.1.5-permitted §7.2 fallback grammar.
-- Independently authored fixtures cover 3001, 3007, 5001, 5004, 5005, 5008,
+- Independently authored fixtures cover 3001, 3002, 3003, 3007, 5001, 5004, 5005, 5008,
   and 5009 across base and SWm requests. Focused tests also cover the remaining
   listed result codes, DWA/DPA application-grammar decoding, P-bit and
   dictionary ambiguity, M/P/V and Vendor-Id-zero handling, canonical
@@ -213,6 +228,11 @@ remain downstream.
   depth/count limits, pre-allocation U24 bounds, exact correlation, unrelated,
   non-Grouped, mislocated, embedded-OctetString, root/path-presence,
   unknown-schema, and excessive-depth ancestry rejection, and redaction.
+  Route-policy tests cover valid RAR/ASR, both answer-grammar requests, exact
+  bytes for 3002/3003, ordered Proxy-Info and Session-Id reflection, earlier
+  framing/dictionary failures, ambiguous dictionaries, changed request bytes,
+  cross-request token rejection, diagnostic redaction, inspection bounds and
+  encoding failure before output mutation.
   Corpus replay and `decode_message`
   fuzzing run the inspector under conservative, zero-depth, and one-IE limits
   on hostile and truncated input.

@@ -76,6 +76,20 @@ This clarification does not relax independent wire evidence, adversarial
 tests, fuzz registration, bounded parsing, or value-free diagnostics. General
 GRE forwarding would require a separate declared contract and qualification.
 
+### Caller-selected Diameter routing errors
+
+RFC 6733 §6.1 and §7.1.3 routing outcomes depend on the caller's routing
+policy. The SDK exposes only the closed `UnableToDeliver` (3002) and
+`RealmNotServed` (3003) choices, bound to an inspected request after existing
+framing and dictionary failures take precedence. If no earlier failure is
+selected, the binding requires P set and fails locally with a typed reason
+when P is cleared, preserving RFC 6733 §3's local-processing requirement.
+This does not certify a routing decision or replace command-specific
+validation. Independent request and answer fixtures must prove the E-bit
+grammar, identifiers, permitted reflection and size bounds through the
+existing error-answer builder; no arbitrary numeric Result-Code constructor
+is introduced.
+
 ### General consequences
 
 - Writing a codec costs more up front: authoring fixtures from the spec is

@@ -810,6 +810,25 @@ remain consumer policy. `DiameterErrorAnswerPlan::to_owned_message` is an
 explicit sensitive escape: `OwnedMessage` has raw-byte `Debug` output and must
 not be logged.
 
+After command-specific validation, callers whose routing policy rejects a
+request can use `DiameterRequestEnvelope::bind_route_policy_rejection` with
+`DiameterRoutePolicyRejection::UnableToDeliver` (3002) or `RealmNotServed`
+(3003), as defined by [RFC 6733 §6.1](https://www.rfc-editor.org/rfc/rfc6733#section-6.1)
+and [§7.1.3](https://www.rfc-editor.org/rfc/rfc6733#section-7.1.3).
+The method takes the exact inspected request bytes and dictionaries, runs the
+existing classification first, and returns any earlier failure before the
+requested routing result. Dictionary ambiguity and request mismatches remain
+errors. If no earlier failure is selected, a request with P cleared returns
+`DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest`:
+such requests require local processing under
+[RFC 6733 §3](https://www.rfc-editor.org/rfc/rfc6733#section-3).
+The resulting bound token is passed to the same
+`build_diameter_error_answer` function; both route results require E and the
+§7.2 grammar, preserve the identifiers, P, Session-Id and ordered Proxy-Info,
+and keep the same redaction and size bounds. The SDK does not decide which
+destinations are served or perform routing-table lookups. This is a closed
+policy enum, not an arbitrary Result-Code constructor.
+
 Command-specific parsers use `DiameterRequestEnvelope::bind_application_failure`
 or `DiameterRequestFailure::from_decode_error` to obtain the bound token. A
 5009 mapping requires an explicit `ZeroOrOne` command rule; `ZeroOrMore`, a
