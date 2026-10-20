@@ -182,6 +182,8 @@ struct RecoveryJournalInner {
     conn: Mutex<Connection>,
     key: FencedTransitionV2RecoveryJournalKey,
     progress_budget: Arc<JournalSqliteProgressBudget>,
+    #[cfg(test)]
+    before_worker_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     // Retire every main-file descriptor before releasing the admission lease:
     // a successor may acquire SQLite locks as soon as path_guard is dropped.
     ownership: Option<Arc<RecoveryOwnership>>,
@@ -475,6 +477,8 @@ impl FencedTransitionV2RecoveryJournal {
                 conn: Mutex::new(conn),
                 key,
                 progress_budget,
+                #[cfg(test)]
+                before_worker_lock: None,
                 #[cfg(unix)]
                 path_guard: path.path_guard,
                 ownership,
@@ -919,6 +923,10 @@ impl FencedTransitionV2RecoveryJournal {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            #[cfg(test)]
+            if let Some(before_lock) = &inner.before_worker_lock {
+                before_lock();
+            }
             let mut conn = inner.conn.lock().map_err(|_| recovery_unavailable())?;
             #[cfg(unix)]
             inner
