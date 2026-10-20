@@ -838,6 +838,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lane and admission slot for other calls, preserving their bounded queues
   and deadlines without increasing the connection cap.
 
+- `opc-session-store`: register the accepted-proposal fixture's watch on its
+  store's controlled clock before the timeout proof, keeping the original
+  operation deadline and exact apply, receipt and retry assertions.
+
+- `opc-session-store`: synchronize unit-test snapshot namespace reopen with
+  child descriptor retirement, preventing inherited sockets from causing
+  spurious `EADDRINUSE` while preserving live-owner exclusion checks.
+
 - `opc-session-store`: wait for the initial record on every replica before
   injecting owner or fence drift in the renewal fixture. Exercise a lagging
   follower deterministically so quorum acknowledgement cannot race the direct
