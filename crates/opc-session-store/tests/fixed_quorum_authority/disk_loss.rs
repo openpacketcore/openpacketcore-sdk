@@ -36,7 +36,11 @@ async fn initialize(stores: &[Option<OpenVoter>]) {
     .await;
 }
 
-async fn wait_for_receipt(store: &ConsensusSessionStore, request: [u8; 16], index: u64) {
+async fn wait_for_receipt(
+    store: &ConsensusSessionStore,
+    request: [u8; 16],
+    index: u64,
+) -> opc_session_store::SessionConsensusStatus {
     tokio::time::timeout(
         opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
         async {
@@ -53,7 +57,10 @@ async fn wait_for_receipt(store: &ConsensusSessionStore, request: [u8; 16], inde
                                 raft_log_index: index,
                             }
                         );
-                        return;
+                        let status = store.status();
+                        if status.admitted {
+                            return status;
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -61,7 +68,7 @@ async fn wait_for_receipt(store: &ConsensusSessionStore, request: [u8; 16], inde
         },
     )
     .await
-    .expect("voter applies the exact committed receipt");
+    .expect("voter applies the exact committed receipt and observes admission")
 }
 
 async fn drain(fleet: &ColdFleet, stores: &mut [Option<OpenVoter>]) {
@@ -378,8 +385,8 @@ async fn enrolled_majority_forms_without_the_preferred_genesis_initiator() {
         .await
         .expect("the majority commits without the preferred initiator");
         for store in stores.iter().flatten() {
-            assert!(store.status().admitted);
-            wait_for_receipt(store, COMMITTED, committed).await;
+            let status = wait_for_receipt(store, COMMITTED, committed).await;
+            assert!(status.admitted);
             assert_eq!(
                 store.voter_slot_state().await.unwrap().table(),
                 &fleet.genesis

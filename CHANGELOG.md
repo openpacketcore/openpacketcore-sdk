@@ -820,6 +820,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: fixed-quorum formation, receipt and reopen tests observe
+  admission within their existing catch-up or operation bounds and retain that
+  status for subsequent assertions. A deterministic owner-contention regression
+  runs the same scenario and assertions; catch-up timeouts identify the last
+  member, receipt and status. Document that nonblocking diagnostic admission can
+  read false while the native storage owner is busy, and that a panicking
+  test-control owner callback poisons and fences the store.
+
 - `opc-session-store`: isolate the snapshot seal descriptor-retirement fixture
   in a child process so its deliberate write-gate hold cannot stall or poison
   unrelated seals and store opens. Verify its parent marker against the actual

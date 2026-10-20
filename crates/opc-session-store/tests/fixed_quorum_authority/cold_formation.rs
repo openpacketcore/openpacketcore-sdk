@@ -225,11 +225,16 @@ async fn missed_bootstrap_campaign(restart_canonical: bool) {
                         .map(|store| store.probe_fixed_durable_quorum_readiness()),
                 )
                 .await;
+                let statuses = stores
+                    .iter()
+                    .map(ConsensusSessionStore::status)
+                    .collect::<Vec<_>>();
                 if reports
                     .iter()
                     .all(|report| report.traffic_authority().is_granted())
+                    && statuses.iter().all(|status| status.admitted)
                 {
-                    break;
+                    break statuses;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -243,11 +248,12 @@ async fn missed_bootstrap_campaign(restart_canonical: bool) {
                 .map(ConsensusSessionStore::status)
                 .collect::<Vec<_>>()
         );
-        let leader = stores[0].status().leader_id.expect("elected leader");
-        for store in &stores {
-            assert!(store.status().admitted);
-            assert_eq!(store.status().leader_id, Some(leader));
-            assert!(store.status().applied_index.is_some());
+        let statuses = formed.unwrap();
+        let leader = statuses[0].leader_id.expect("elected leader");
+        for (store, status) in stores.iter().zip(statuses) {
+            assert!(status.admitted);
+            assert_eq!(status.leader_id, Some(leader));
+            assert!(status.applied_index.is_some());
             store
                 .max_replication_sequence()
                 .await
@@ -280,6 +286,48 @@ async fn delayed_pristine_peers_recover_after_the_bootstrap_voter_restarts() {
 #[cfg(feature = "test-control")]
 #[tokio::test]
 async fn pristine_member_joins_a_formed_quorum_without_losing_committed_history() {
+    pristine_member_join(|_, store| store.status()).await;
+}
+
+#[cfg(all(target_os = "linux", feature = "test-control"))]
+#[tokio::test]
+async fn pristine_member_waits_for_admission_after_receipt_publication() {
+    use opc_session_store::test_support::with_consensus_native_authority_held_for_test;
+
+    let mut held_after_receipt = false;
+    pristine_member_join(|index, store| {
+        if index == 2 && !held_after_receipt {
+            held_after_receipt = true;
+            // The real receipt has already been read. Delay the independent
+            // admission observation with actual owner contention, then release
+            // it immediately so the next observation can make normal progress.
+            let status = with_consensus_native_authority_held_for_test(store, || store.status())
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "could not acquire store {index}'s native authority within the hook's \
+                         25 ms bound for the forced nonblocking observation: {error:?}"
+                    )
+                });
+            assert!(
+                !status.admitted,
+                "a recorded receipt cannot grant admission while its owner is busy"
+            );
+            status
+        } else {
+            store.status()
+        }
+    })
+    .await;
+    assert!(held_after_receipt, "the late member reached the forced cut");
+}
+
+#[cfg(feature = "test-control")]
+async fn pristine_member_join(
+    mut observe_admission: impl FnMut(
+        usize,
+        &ConsensusSessionStore,
+    ) -> opc_session_store::SessionConsensusStatus,
+) {
     use opc_session_store::test_support::{
         append_consensus_padding_entry_for_test, consensus_padding_receipt_status_for_test,
         ConsensusPaddingReceiptStatusForTest,
@@ -328,8 +376,10 @@ async fn pristine_member_joins_a_formed_quorum_without_losing_committed_history(
         );
         fleet.peers[2].transport.set_enabled(true);
 
+        let mut last_observation = (2, None, stores[2].status());
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
+                last_observation = (2, None, stores[2].status());
                 match stores[2].initialize_cluster().await {
                     Ok(()) => break,
                     Err(ConsensusSessionStoreOpenError::ClusterFormationRejected) => {}
@@ -337,13 +387,14 @@ async fn pristine_member_joins_a_formed_quorum_without_losing_committed_history(
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            for store in &stores {
-                loop {
-                    match consensus_padding_receipt_status_for_test(store, request)
+            for (index, store) in stores.iter().enumerate() {
+                last_observation = (index, None, store.status());
+                let status = loop {
+                    let receipt = consensus_padding_receipt_status_for_test(store, request)
                         .await
-                        .unwrap()
-                    {
-                        ConsensusPaddingReceiptStatusForTest::NotFound => {}
+                        .unwrap();
+                    let status = match receipt {
+                        ConsensusPaddingReceiptStatusForTest::NotFound => store.status(),
                         recorded => {
                             assert_eq!(
                                 recorded,
@@ -351,13 +402,24 @@ async fn pristine_member_joins_a_formed_quorum_without_losing_committed_history(
                                     raft_log_index: committed,
                                 }
                             );
-                            break;
+                            // The durable receipt and nonblocking admission
+                            // observation are separate. Keep both inside the
+                            // existing catch-up deadline and assert one
+                            // captured admitted status below.
+                            observe_admission(index, store)
                         }
+                    };
+                    last_observation = (index, Some(receipt), status);
+                    if matches!(
+                        receipt,
+                        ConsensusPaddingReceiptStatusForTest::Recorded { .. }
+                    ) && status.admitted
+                    {
+                        break status;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                assert!(store.status().admitted);
-                assert_eq!(store.status().leader_id, Some(leader));
+                };
+                assert_eq!(status.leader_id, Some(leader));
                 assert!(store
                     .probe_fixed_durable_quorum_readiness()
                     .await
@@ -366,7 +428,13 @@ async fn pristine_member_joins_a_formed_quorum_without_losing_committed_history(
             }
         })
         .await
-        .expect("pristine member catches up within the existing readiness bound");
+        .unwrap_or_else(|error| {
+            let (index, receipt, status) = last_observation;
+            panic!(
+                "pristine member catch-up exceeded the existing 30 s readiness bound: \
+                 store {index}, last receipt {receipt:?}, last status {status:?}: {error}"
+            )
+        });
     })
     .catch_unwind()
     .await;

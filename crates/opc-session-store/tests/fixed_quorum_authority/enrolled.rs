@@ -556,10 +556,7 @@ async fn missed_enrolled_bootstrap_campaign(restart_canonical: bool) {
             .await
             .expect("the formed quorum durably commits a new command");
         for store in &stores {
-            assert!(store.status().admitted);
-            assert_eq!(store.status().leader_id, Some(leader));
-            assert!(store.status().applied_index.is_some());
-            tokio::time::timeout(
+            let status = tokio::time::timeout(
                 opc_session_store::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                 async {
                     loop {
@@ -575,7 +572,10 @@ async fn missed_enrolled_bootstrap_campaign(restart_canonical: bool) {
                                         raft_log_index: committed,
                                     }
                                 );
-                                break;
+                                let status = store.status();
+                                if status.admitted {
+                                    break status;
+                                }
                             }
                         }
                         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -586,6 +586,9 @@ async fn missed_enrolled_bootstrap_campaign(restart_canonical: bool) {
             .expect(
                 "every enrolled voter applies the committed command within the operation bound",
             );
+            assert!(status.admitted);
+            assert_eq!(status.leader_id, Some(leader));
+            assert!(status.applied_index.is_some());
         }
     })
     .catch_unwind()
