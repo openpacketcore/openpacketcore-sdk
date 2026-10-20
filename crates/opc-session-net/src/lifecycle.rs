@@ -1361,6 +1361,16 @@ pub(crate) fn material_status_matches_admission(
 #[cfg(test)]
 mod reconnect_clock_tests;
 
+/// Preserve the production counter while test-control builds retain attribution.
+pub(crate) fn record_transport_failure(_outcome: &str, _io_kind: Option<std::io::ErrorKind>) {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::record_transport_failure(_outcome, _io_kind);
+    #[cfg(not(feature = "test-control"))]
+    METRICS
+        .session_net_connection_failure_transport
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

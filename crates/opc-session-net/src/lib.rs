@@ -64,6 +64,9 @@ pub mod membership;
 mod protocol;
 #[cfg(feature = "legacy-session-net-compat")]
 pub mod protocol;
+#[cfg(feature = "test-control")]
+#[doc(hidden)]
+pub mod qualification_diagnostics;
 pub mod scope;
 #[cfg(feature = "legacy-session-net-compat")]
 pub mod server;
