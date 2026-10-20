@@ -863,6 +863,78 @@ async fn consumer_void_inherited_row_is_reclaimed_without_the_previous_call_dead
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_void_settlement_window_recovers_unknown_then_records_no_effect() {
+    let fixture =
+        AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable_with_void([scope()])
+            .await
+            .unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        let facade = fixture
+            .open_local_aead_v2(CountingProvider::new(), "void-settlement-window")
+            .await
+            .unwrap();
+        let mut original = facade
+            .prepare_fenced_transition(create(request_id(935), 935, PAYLOAD), budget(soon()))
+            .await
+            .unwrap();
+        let journal = &fixture.recovery_journal_path;
+        std::fs::rename(journal, journal.with_extension("moved")).unwrap();
+        assert_eq!(
+            original.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert_eq!(
+            original.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::Unavailable)
+        );
+        std::fs::rename(journal.with_extension("moved"), journal).unwrap();
+        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 1);
+        assert_eq!(fixture.diagnostics().fenced_transition_v2_calls(), 0);
+        // Forget every process-local handle and reopen the unchanged durable
+        // row. The subprocess regression separately kills an owner at this
+        // boundary; here real voters establish the terminal void receipt.
+        drop(original);
+        drop(facade);
+        let reopened = fixture
+            .open_local_aead_v2(CountingProvider::new(), "void-settlement-window")
+            .await
+            .unwrap();
+        let mut recovered = recovered_v2(
+            reopened
+                .recover_fenced_transition_status(request_id(935), budget(soon()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            recovered.status_once(soon()).await,
+            Ok(FencedTransitionV2Status::NotFound)
+        );
+        assert_eq!(
+            recovered.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved)
+        );
+        assert_eq!(reopened.retained_fenced_transitions().await.unwrap(), 1);
+        let progress = drain_void_rows(&reopened, 8, soon(), |_| {}).await;
+        assert_eq!(progress.voided(), 1, "{progress:?}");
+        assert_eq!(progress.reclaimed(), 1, "{progress:?}");
+        assert!(matches!(
+            recovered.status_until_terminal(soon()).await,
+            Ok(FencedTransitionV2Status::Recorded(result))
+                if matches!(*result, Err(StoreError::FencedTransitionVoided))
+        ));
+        recovered.release_resolved().await.unwrap();
+        assert_eq!(reopened.retained_fenced_transitions().await.unwrap(), 0);
+        assert_eq!(fixture.diagnostics().fenced_transition_v2_calls(), 0);
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await.unwrap();
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consumer_void_drains_after_the_leader_loses_authority_during_the_original_call() {
     let fixture =
         AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable_with_void([scope()])

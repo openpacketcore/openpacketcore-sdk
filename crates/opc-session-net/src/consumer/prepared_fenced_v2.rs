@@ -2485,6 +2485,9 @@ fn prepared_fenced_v2_status_retryable_before(
 mod tests {
     use std::collections::VecDeque;
 
+    #[cfg(unix)]
+    mod settlement_crash;
+
     use bytes::Bytes;
     use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
     use opc_session_store::{
