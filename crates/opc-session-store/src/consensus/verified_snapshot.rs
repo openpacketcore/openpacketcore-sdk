@@ -17,6 +17,8 @@ use opc_sqlite_file_control_sys::{RegisteredSnapshot, VerifiedSnapshotSource};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
+use super::snapshot::SqliteFilePin;
+
 const MIN_BLOCK_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
@@ -378,7 +380,7 @@ struct CachedBlocks {
 }
 
 pub(crate) struct VerifiedFile {
-    file: File,
+    file: SqliteFilePin,
     generation: Generation,
     block_bytes: usize,
     blocks: Box<[[u8; DIGEST_BYTES]]>,
@@ -392,15 +394,16 @@ pub(crate) struct VerifiedFile {
 }
 
 impl VerifiedFile {
-    pub(crate) fn capture(file: File, maximum: u64) -> io::Result<Arc<Self>> {
+    pub(crate) fn capture(file: impl Into<SqliteFilePin>, maximum: u64) -> io::Result<Arc<Self>> {
         Self::capture_checked(file, maximum, || Ok(()))
     }
 
     fn capture_checked(
-        file: File,
+        file: impl Into<SqliteFilePin>,
         maximum: u64,
         mut check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Arc<Self>> {
+        let file = file.into();
         check()?;
         let before = Generation::read_linked(&file.metadata()?)?;
         if before.length == 0 || before.length > maximum {
@@ -588,7 +591,9 @@ impl VerifiedSnapshotSource for VerifiedFile {
     }
 
     fn duplicate_descriptor(&self) -> io::Result<File> {
-        self.file.try_clone()
+        // A raw duplicate would escape SQLite's coordinated close ownership.
+        // Callers inspecting managed database pins must borrow the file.
+        self.file.try_clone()?.into_artifact()
     }
 
     fn borrowed_file(&self) -> io::Result<&File> {
@@ -607,13 +612,13 @@ pub(crate) struct PortableSnapshot {
 }
 
 impl PortableSnapshot {
-    pub(crate) fn capture(file: File, maximum: u64) -> io::Result<Arc<Self>> {
+    pub(crate) fn capture(file: impl Into<SqliteFilePin>, maximum: u64) -> io::Result<Arc<Self>> {
         let source = VerifiedFile::capture(file, maximum)?;
         Self::register(source)
     }
 
     pub(crate) fn capture_checked(
-        file: File,
+        file: impl Into<SqliteFilePin>,
         maximum: u64,
         check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Arc<Self>> {

@@ -10904,9 +10904,9 @@ impl PinnedSnapshotFile {
                     if self.portable.is_none() {
                         self.portable = Some(
                             crate::consensus::verified_snapshot::PortableSnapshot::capture_checked(
-                                // This branch captures an immutable snapshot artifact,
-                                // never a live database main file.
-                                std::ops::Deref::deref(&self.file)
+                                // Keep the close owner even if an independently
+                                // opened SQLite connection still uses this inode.
+                                self.file
                                     .try_clone()
                                     .map_err(|_| RecoveryError::FileOperationFailed)?,
                                 maximum,

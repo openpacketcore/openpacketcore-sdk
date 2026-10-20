@@ -851,8 +851,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   processing requests, and retiring owners, leases and readers. Identity
   checks borrow SQLite's descriptor; retained database pins close through
   SQLite's inode bookkeeping even across independent connections and cancelled
-  workers. Persistent recovery identity and cross-process flock fences remain
-  enforced.
+  workers and through portable verification. Recovery journal handover keeps
+  admission excluded until every predecessor descriptor has closed. Persistent
+  recovery identity and cross-process flock fences remain enforced.
 
 - `opc-session-store`: wait for the initial record on every replica before
   injecting owner or fence drift in the renewal fixture. Exercise a lagging

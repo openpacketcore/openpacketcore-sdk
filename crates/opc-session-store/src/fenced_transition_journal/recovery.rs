@@ -182,9 +182,11 @@ struct RecoveryJournalInner {
     conn: Mutex<Connection>,
     key: FencedTransitionV2RecoveryJournalKey,
     progress_budget: Arc<JournalSqliteProgressBudget>,
+    // Retire every main-file descriptor before releasing the admission lease:
+    // a successor may acquire SQLite locks as soon as path_guard is dropped.
+    ownership: Option<Arc<RecoveryOwnership>>,
     #[cfg(unix)]
     path_guard: SecureJournalPathGuard,
-    ownership: Option<Arc<RecoveryOwnership>>,
 }
 
 /// SDK-owned durable binding of caller-stable IDs to sealed V2 requests.

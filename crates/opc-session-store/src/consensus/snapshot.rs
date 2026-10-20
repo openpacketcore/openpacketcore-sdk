@@ -849,7 +849,7 @@ impl SqliteFilePin {
         }
     }
 
-    fn into_artifact(self) -> io::Result<std::fs::File> {
+    pub(crate) fn into_artifact(self) -> io::Result<std::fs::File> {
         match self {
             Self::Artifact(file) => Ok(file),
             #[cfg(target_os = "linux")]
@@ -857,6 +857,12 @@ impl SqliteFilePin {
                 "live SQLite pin cannot transfer close authority",
             )),
         }
+    }
+}
+
+impl From<std::fs::File> for SqliteFilePin {
+    fn from(file: std::fs::File) -> Self {
+        Self::Artifact(file)
     }
 }
 
