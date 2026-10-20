@@ -49,10 +49,12 @@ pub(crate) mod consensus;
 #[cfg(target_os = "linux")]
 mod native;
 mod voter_identity;
+mod worker_deadline;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use native::startup_pressure;
 #[cfg(target_os = "linux")]
 pub(crate) use native::AuthorityBackoff;
+use worker_deadline::SqliteWorkDeadline;
 
 /// Non-production consensus timing hooks for deterministic integration tests.
 #[cfg(feature = "test-control")]
@@ -958,8 +960,8 @@ impl SqliteTaskCompletion {
         }
     }
 
-    fn result_deadline_expired(self, deadline: std::time::Instant) -> bool {
-        !self.interrupt_on_caller_drop() && std::time::Instant::now() >= deadline
+    fn result_deadline_expired(self, deadline: &SqliteWorkDeadline) -> bool {
+        !self.interrupt_on_caller_drop() && deadline.is_elapsed()
     }
 }
 
@@ -972,7 +974,7 @@ enum SqliteWorkerFailure {
 fn install_sqlite_operation_progress_handler(
     conn: &Connection,
     cancellation: Option<Arc<AtomicBool>>,
-    deadline: std::time::Instant,
+    deadline: SqliteWorkDeadline,
 ) -> SqliteOperationProgressGuard<'_> {
     conn.progress_handler(
         SQLITE_OPERATION_PROGRESS_INTERVAL,
@@ -980,7 +982,7 @@ fn install_sqlite_operation_progress_handler(
             cancellation
                 .as_ref()
                 .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
-                || std::time::Instant::now() >= deadline
+                || deadline.is_elapsed()
         }),
     )
     .expect("SQLite worker owns its connection");
@@ -1774,11 +1776,12 @@ impl SqliteSessionBackend {
     where
         T: Send + 'static,
         E: Send + 'static,
-        F: FnOnce(&Connection, std::time::Instant) -> Result<T, E> + Send + 'static,
+        F: FnOnce(&Connection, &SqliteWorkDeadline) -> Result<T, E> + Send + 'static,
     {
         let deadline = tokio::time::Instant::now()
             .checked_add(SQLITE_OPERATION_MAX_WORK)
             .ok_or(SqliteWorkerFailure::Admission)?;
+        let operation_deadline = SqliteWorkDeadline::tokio(deadline);
         let worker_permit = tokio::time::timeout_at(deadline, workers.acquire_owned())
             .await
             .map_err(|_| {
@@ -1804,7 +1807,7 @@ impl SqliteSessionBackend {
         let interrupt = completion
             .interrupt_on_caller_drop()
             .then(|| conn.get_interrupt_handle());
-        let operation_deadline = deadline.into_std();
+        let task_deadline = operation_deadline.clone();
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((conn, worker_permit, operation))));
         let task_job = Arc::clone(&queued_job);
@@ -1821,12 +1824,12 @@ impl SqliteSessionBackend {
                     completion
                         .interrupt_on_caller_drop()
                         .then(|| Arc::clone(&task_cancellation)),
-                    operation_deadline,
+                    task_deadline.clone(),
                 );
                 if task_cancellation.load(Ordering::Acquire) {
                     Err(SqliteWorkerFailure::OutcomeUnavailable)
                 } else {
-                    Ok(operation(&conn, operation_deadline))
+                    Ok(operation(&conn, &task_deadline))
                 }
             };
             #[cfg(test)]
@@ -1839,7 +1842,7 @@ impl SqliteSessionBackend {
                     serde_json::json!({
                         "thread": format!("{:?}", std::thread::current().id()),
                         "cancelled": task_cancellation.load(Ordering::Acquire),
-                        "own_deadline_expired": std::time::Instant::now() >= operation_deadline,
+                        "own_deadline_expired": task_deadline.is_elapsed(),
                         "elapsed_us": operation_started.elapsed().as_micros(),
                         "autocommit": conn.is_autocommit(),
                         "database_file": conn.path().and_then(|path| std::path::Path::new(path).file_name()).and_then(|name| name.to_str()),
@@ -1886,7 +1889,7 @@ impl SqliteSessionBackend {
                 // Tokio polls a ready result before its timer. A retained
                 // owner may have validated on time while this receiver was
                 // delayed: reject the late response without fencing it.
-                if completion.result_deadline_expired(operation_deadline) {
+                if completion.result_deadline_expired(&operation_deadline) {
                     Err(SqliteWorkerFailure::OutcomeUnavailable)
                 } else {
                     result
@@ -1983,6 +1986,7 @@ impl SqliteSessionBackend {
         let deadline = tokio::time::Instant::now()
             .checked_add(SQLITE_OPERATION_MAX_WORK)
             .ok_or(SqliteWorkerFailure::Admission)?;
+        let operation_deadline = SqliteWorkDeadline::tokio(deadline);
         let worker_permit =
             tokio::time::timeout_at(deadline, Arc::clone(&pool.workers).acquire_owned())
                 .await
@@ -1996,7 +2000,6 @@ impl SqliteSessionBackend {
         let conn = pool.checkout(deadline).await?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let interrupt = Some(conn.get_interrupt_handle());
-        let operation_deadline = deadline.into_std();
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((
             ConsensusAcceptanceReaderLease::new(Arc::clone(&pool), conn, worker_permit),
@@ -3908,6 +3911,7 @@ impl SqliteSessionBackend {
         deadline: tokio::time::Instant,
         profile: RestoreScanValidationProfile,
     ) -> Result<RestoreScanPage, StoreError> {
+        let operation_deadline = SqliteWorkDeadline::tokio(deadline);
         let cancellation = Arc::new(AtomicBool::new(false));
         // Admission happens before `spawn_blocking` and the owned permit stays
         // with the blocking closure. A timed-out caller therefore cannot
@@ -3926,7 +3930,6 @@ impl SqliteSessionBackend {
         let conn = tokio::time::timeout_at(deadline, Arc::clone(&self.conn).lock_owned())
             .await
             .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?;
-        let operation_deadline = deadline.into_std();
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((conn, worker_permit, request))));
         let task_job = Arc::clone(&queued_job);

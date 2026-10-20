@@ -73869,7 +73869,9 @@ BEGIN IMMEDIATE;
             },
             timestamp(1),
             Arc::new(AtomicBool::new(false)),
-            std::time::Instant::now() + Duration::from_secs(5),
+            crate::sqlite::SqliteWorkDeadline::RealTime(
+                std::time::Instant::now() + Duration::from_secs(5),
+            ),
             RestoreScanValidationProfile::Consensus,
         )
         .expect_err("snapshot install creates a new cursor incarnation");
@@ -73883,7 +73885,9 @@ BEGIN IMMEDIATE;
             },
             timestamp(1),
             Arc::new(AtomicBool::new(false)),
-            std::time::Instant::now() + Duration::from_secs(5),
+            crate::sqlite::SqliteWorkDeadline::RealTime(
+                std::time::Instant::now() + Duration::from_secs(5),
+            ),
             RestoreScanValidationProfile::Consensus,
         )
         .expect("restart from first page");
@@ -73931,7 +73935,9 @@ BEGIN IMMEDIATE;
             },
             timestamp(1),
             Arc::new(AtomicBool::new(false)),
-            std::time::Instant::now() + Duration::from_secs(5),
+            crate::sqlite::SqliteWorkDeadline::RealTime(
+                std::time::Instant::now() + Duration::from_secs(5),
+            ),
             RestoreScanValidationProfile::Consensus,
         )
         .expect_err("same snapshot still yields node-local cursor incarnations");

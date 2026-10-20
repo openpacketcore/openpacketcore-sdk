@@ -723,7 +723,9 @@ fn reject_restore_cursor(conn: &rusqlite::Connection, cursor: RestoreScanCursor)
         },
         timestamp(1),
         Arc::new(AtomicBool::new(false)),
-        std::time::Instant::now() + Duration::from_secs(5),
+        crate::sqlite::SqliteWorkDeadline::RealTime(
+            std::time::Instant::now() + Duration::from_secs(5),
+        ),
         RestoreScanValidationProfile::Consensus,
     )
     .unwrap_err();
@@ -782,7 +784,9 @@ fn snapshot_install_preserves_original_revision_and_invalidates_source_and_targe
             },
             timestamp(1),
             Arc::new(AtomicBool::new(false)),
-            std::time::Instant::now() + Duration::from_secs(5),
+            crate::sqlite::SqliteWorkDeadline::RealTime(
+                std::time::Instant::now() + Duration::from_secs(5),
+            ),
             RestoreScanValidationProfile::Consensus,
         )
         .unwrap();

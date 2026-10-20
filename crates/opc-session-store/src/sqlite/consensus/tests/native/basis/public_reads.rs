@@ -35,6 +35,85 @@ async fn backend(
     (directory, Arc::new(backend), core, wal)
 }
 
+#[tokio::test]
+async fn sqlite_clock_frozen_setup_preserves_native_read_budget() {
+    let (_directory, backend, core, wal) = backend(Arc::new(|_| Ok(()))).await;
+    if let Some(lane) = core.proactive_checkpoint_lane() {
+        lane.shutdown().await;
+    }
+    if let Some(lane) = core.consensus_log_prune_lane() {
+        lane.shutdown().await;
+    }
+    tokio::time::pause();
+    let frozen = tokio::time::Instant::now();
+    std::thread::sleep(crate::sqlite::SQLITE_OPERATION_MAX_WORK + Duration::from_millis(20));
+    assert_eq!(tokio::time::Instant::now(), frozen);
+    let value = backend
+        .native_read_task(|_, check| {
+            check().map_err(|error| StoreError::BackendUnavailable(error.to_string()))?;
+            Ok(7)
+        })
+        .await
+        .expect("a fresh native read retains its frozen caller budget");
+    assert_eq!(value, 7);
+    assert_eq!(tokio::time::Instant::now(), frozen);
+    tokio::time::resume();
+    tokio::task::spawn_blocking(move || wal.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_clock_advance_expires_native_read_without_polling_caller() {
+    let (_directory, backend, core, wal) = backend(Arc::new(|_| Ok(()))).await;
+    if let Some(lane) = core.proactive_checkpoint_lane() {
+        lane.shutdown().await;
+    }
+    if let Some(lane) = core.consensus_log_prune_lane() {
+        lane.shutdown().await;
+    }
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    tokio::time::pause();
+    let mut operation = std::pin::pin!(backend.native_read_task(move |_, check| {
+        ready_tx.send(()).expect("native reader ready");
+        release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("native reader release");
+        let result = check();
+        result_tx
+            .send(matches!(&result, Err(error) if error.kind() == io::ErrorKind::TimedOut))
+            .expect("native deadline result");
+        result.map_err(|error| StoreError::BackendUnavailable(error.to_string()))
+    }));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("native reader starts");
+    tokio::time::advance(crate::sqlite::SQLITE_OPERATION_MAX_WORK).await;
+    release_tx.send(()).expect("release expired native reader");
+    let expired = result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("native reader finishes");
+    let result = operation.await;
+    assert!(
+        expired,
+        "the native worker must check its caller's advanced clock"
+    );
+    assert!(result.is_err());
+    tokio::time::resume();
+    tokio::task::spawn_blocking(move || wal.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_public_dispatch_ignores_sql_lanes_and_rejects_retained_closed_owner() {
     let (_directory, backend, _core, wal) = backend(Arc::new(|_| Ok(()))).await;

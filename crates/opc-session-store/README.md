@@ -559,6 +559,12 @@ independent HA placement.
   `BackendOperationOutcomeUnavailable`, or
   `LeaseError::OperationOutcomeUnavailable`, respectively. Reads remain
   retryable. Consensus-gated SQLite reads use the same supervised worker path.
+  Async worker deadlines retain the caller's Tokio clock through blocking SQL
+  progress, acceptance-reader and native-read checks, restore row loading, and
+  guarded-read completion. Paused or advanced Tokio time therefore applies to
+  the whole operation. The separate one-second restore-query resource cap
+  stays on real elapsed time; the native authority timerfd backoff also keeps
+  its real-time minimum delay. Neither is an extension of the caller's budget.
   In the explicit Linux unit-test `PrivateWalTest` legacy SQL route, an
   already-started guarded read completes its before/after cache validation
   under the WAL lock after caller cancellation. The original pre-admission
