@@ -8104,6 +8104,72 @@ mod tests {
         assert_eq!(if_id, &9_u32.to_ne_bytes());
     }
 
+    fn marked_forward_transit_parameters() -> PolicyParameters {
+        let mut parameters = policy_parameters();
+        parameters.direction = XfrmDirection::Forward;
+        parameters.templates.clear();
+        parameters.mark = Some(XfrmLookupMark::full(0x4000_0001));
+        parameters
+    }
+
+    #[tokio::test]
+    async fn marked_forward_transit_installs_allow_without_tunnel_template() {
+        let parameters = marked_forward_transit_parameters();
+        let transport = CapturingTransport::default();
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: parameters.clone(),
+            })
+            .await
+            .unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_NEWPOLICY);
+        let body = netlink_body(&requests[0]);
+        assert_eq!(body[160], XFRM_POLICY_FWD);
+        assert_eq!(body[161], XFRM_POLICY_ALLOW);
+        assert!(route_attr_payload_from(body, XFRM_USER_POLICY_INFO_LEN, XFRMA_TMPL).is_none());
+        assert_eq!(
+            route_attr_payload_from(body, XFRM_USER_POLICY_INFO_LEN, XFRMA_MARK),
+            Some(encode_mark(parameters.mark.unwrap()).as_slice())
+        );
+        assert_eq!(parse_policy_state(body).unwrap().parameters, parameters);
+    }
+
+    #[tokio::test]
+    async fn marked_forward_transit_exact_readback_and_removal_preserve_identity() {
+        let parameters = marked_forward_transit_parameters();
+        let response = encode_policy_info(&parameters).unwrap().to_vec();
+        let transport = ScriptedTransport::new(vec![Ok(Some(response)), Ok(None)]);
+        let backend = LinuxXfrmBackend::with_transport(transport.clone());
+        let mark = parameters.mark.unwrap();
+        let query = QueryPolicyRequest::new(parameters.selector.clone(), XfrmDirection::Forward)
+            .with_mark(mark);
+        assert_eq!(backend.query_policy(query).await.unwrap(), parameters);
+        backend
+            .remove_policy_exact(ExactRemovePolicyRequest::new(
+                RemovePolicyRequest::new(parameters.selector.clone(), XfrmDirection::Forward)
+                    .with_mark(mark),
+            ))
+            .await
+            .unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(netlink_message_type(&requests[0]), XFRM_MSG_GETPOLICY);
+        assert_eq!(netlink_message_type(&requests[1]), XFRM_MSG_DELPOLICY);
+        for request in &requests {
+            let body = netlink_body(request);
+            assert_eq!(body[XFRM_SELECTOR_LEN + 4], XFRM_POLICY_FWD);
+            assert_eq!(
+                route_attr_payload_from(body, XFRM_USER_POLICY_ID_LEN, XFRMA_MARK),
+                Some(encode_mark(mark).as_slice())
+            );
+        }
+    }
+
     #[test]
     fn encodes_exact_policy_removal_with_if_id_attr() {
         let body = encode_policy_id(
