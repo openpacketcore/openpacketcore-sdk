@@ -10,6 +10,7 @@ use opc_session_store::{
 };
 use opc_types::Timestamp;
 
+mod capacity_tests;
 mod contention_tests;
 mod handoff_tests;
 mod maintenance_tests;
@@ -51,6 +52,14 @@ fn held(fixture: &AuthenticatedPreparedFencedTransitionFixture, kind: usize) -> 
 fn clients(
     fixture: &AuthenticatedPreparedFencedTransitionFixture,
 ) -> Vec<PersistentSessionConsumerClient> {
+    clients_with_capacity(fixture, 2, 16)
+}
+
+fn clients_with_capacity(
+    fixture: &AuthenticatedPreparedFencedTransitionFixture,
+    request_connections: usize,
+    pending_calls: usize,
+) -> Vec<PersistentSessionConsumerClient> {
     fixture
         .voters
         .iter()
@@ -66,8 +75,8 @@ fn clients(
             PersistentSessionConsumerClient::try_from_stateless(
                 client,
                 PersistentSessionConsumerConfig::try_new(
-                    2,
-                    16,
+                    request_connections,
+                    pending_calls,
                     Duration::from_millis(100),
                     1,
                     Duration::from_millis(600),

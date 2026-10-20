@@ -10105,6 +10105,9 @@ struct PersistentV2LaneCall {
     deadline: tokio::time::Instant,
     completion: oneshot::Sender<Result<SessionConsumerV2Response, SessionConsumerClientError>>,
     write_progress: Arc<FrameWriteProgress>,
+    // The actor and caller both retain this reservation. Cancelling a caller
+    // cannot release extended-read capacity while its wire read still runs.
+    read_capacity: Option<Arc<PersistentReadReservation>>,
 }
 
 enum PersistentV2PoolEntry {
@@ -10144,6 +10147,7 @@ struct PersistentV2CapacityAdmission {
     siblings: Arc<PersistentSessionConsumerSiblings>,
     pending: Option<OwnedSemaphorePermit>,
     lane: Option<OwnedSemaphorePermit>,
+    read_capacity: Option<Arc<PersistentReadReservation>>,
 }
 
 /// Holds a V2 caller's pending admission while its FIFO lane future is
@@ -10192,6 +10196,7 @@ impl PersistentV2CapacityAdmission {
             siblings,
             pending: Some(pending),
             lane: Some(lane),
+            read_capacity: None,
         }
     }
 }
@@ -10200,6 +10205,7 @@ impl Drop for PersistentV2CapacityAdmission {
     fn drop(&mut self) {
         drop(self.lane.take());
         drop(self.pending.take());
+        drop(self.read_capacity.take());
         self.siblings.warm_capacity_changed.notify_waiters();
     }
 }
@@ -10447,7 +10453,7 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             crate::protocol::read_frame_payload(&mut tracked_reader, MAX_NEGOTIATED_FRAME_SIZE);
         tokio::pin!(read);
 
-        if let Some((completion, response, retire_after_response)) = pending_completion.take() {
+        if let Some((completion, response, retire_after_response, _read_capacity)) = pending_completion.take() {
             // Poll the already-owned next-frame read once before publishing
             // the previous result. A coalesced extra frame is therefore
             // consumed and retires this lane before a successor Call can
@@ -10577,6 +10583,7 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             deadline,
             mut completion,
             write_progress,
+            read_capacity,
         } = command;
         #[cfg(test)]
         if let Some(hook) = &pre_call_test_hook {
@@ -10950,7 +10957,7 @@ async fn run_persistent_v2_lane(actor: PersistentV2LaneActor) {
             || calls >= MAX_SESSION_QUORUM_CONSUMER_REQUESTS_PER_CONNECTION
             || shutdown_io.is_forced()
             || lifecycle.retirement(tokio::time::Instant::now()).is_some();
-        pending_completion = Some((completion, response, retire_after_response));
+        pending_completion = Some((completion, response, retire_after_response, read_capacity));
         }
     }
     .await;
@@ -10979,6 +10986,7 @@ struct PersistentSessionConsumerV2Pool {
     physical_lanes: Arc<Semaphore>,
     actor_lanes: Arc<Semaphore>,
     pending: Arc<Semaphore>,
+    read_capacity: Arc<PersistentReadCapacity>,
     prewarm: Arc<Semaphore>,
     // This is the same recovery authority used by the V1 sibling. It
     // serializes aggregate V1/V2 physical setup and retains one cooldown.
@@ -11333,14 +11341,20 @@ impl PersistentSessionConsumerV2Pool {
         Ok(None)
     }
 
-    async fn admit_call(
+    async fn admit_call_with_read_capacity(
         self: &Arc<Self>,
         started: tokio::time::Instant,
         operation_deadline: tokio::time::Instant,
+        extended_read: bool,
     ) -> Result<PersistentV2CapacityAdmission, SessionConsumerClientError> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
+        let read_pending = if extended_read {
+            Some(self.read_capacity.try_pending()?)
+        } else {
+            None
+        };
         let pending = Arc::clone(&self.pending)
             .try_acquire_owned()
             .map_err(|_| SessionConsumerClientError::Overloaded)?;
@@ -11357,9 +11371,16 @@ impl PersistentSessionConsumerV2Pool {
         if tokio::time::Instant::now() >= wait_deadline {
             return Err(late_error);
         }
-        let lane_wait = Arc::clone(&self.lanes).acquire_owned();
+        let lane_wait = async {
+            let read_capacity = self.read_capacity.acquire(read_pending).await?;
+            let lane = Arc::clone(&self.lanes)
+                .acquire_owned()
+                .await
+                .map_err(|_| SessionConsumerClientError::ShuttingDown)?;
+            Ok::<_, SessionConsumerClientError>((lane, read_capacity))
+        };
         tokio::pin!(lane_wait);
-        let lane = match lane_wait.as_mut().now_or_never() {
+        let (lane, read_capacity) = match lane_wait.as_mut().now_or_never() {
             Some(result) => complete_before_deadline(
                 result.map_err(|_| SessionConsumerClientError::ShuttingDown)?,
                 wait_deadline,
@@ -11381,11 +11402,12 @@ impl PersistentSessionConsumerV2Pool {
                 complete_before_deadline(lane?, wait_deadline, late_error)?
             }
         };
-        let admission = PersistentV2CapacityAdmission::new(
+        let mut admission = PersistentV2CapacityAdmission::new(
             Arc::clone(&self.siblings),
             pending_admission.into_pending(),
             lane,
         );
+        admission.read_capacity = read_capacity;
         if self.shutdown.load(Ordering::Acquire) {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
@@ -11870,13 +11892,17 @@ impl PersistentSessionConsumerV2Pool {
                 cause: SessionConsumerClientError::Deadline,
             });
         }
-        let _admission = self
+        let admission = self
             // Pool admission is a bounded fairness window per retry attempt,
             // not part of the immutable operation lifetime. A safe status
             // retry which arrives after an earlier backend response must be
             // able to acquire a currently-free lane, while setup and Call
             // boundaries below remain pinned to `operation_started`.
-            .admit_call(admission_started, admission_deadline)
+            .admit_call_with_read_capacity(
+                admission_started,
+                admission_deadline,
+                read_response_deadline.is_some(),
+            )
             .await
             .map_err(|cause| PersistentSessionConsumerV2ExecuteError::NotTransmitted { cause })?;
         let _activity = self
@@ -11994,6 +12020,7 @@ impl PersistentSessionConsumerV2Pool {
                 deadline,
                 completion,
                 write_progress: Arc::clone(&write_progress),
+                read_capacity: admission.read_capacity.clone(),
             })
             .map_err(
                 |_| PersistentSessionConsumerV2ExecuteError::NotTransmitted {
@@ -12295,6 +12322,7 @@ impl PersistentSessionConsumerV2Pool {
         }
         self.pending.close();
         self.lanes.close();
+        self.read_capacity.close();
         self.prewarm.close();
         {
             let mut idle = self
@@ -12912,6 +12940,7 @@ struct PersistentSessionConsumerPool {
     lanes: Arc<Semaphore>,
     physical_lanes: Arc<Semaphore>,
     pending: Arc<Semaphore>,
+    read_capacity: Arc<PersistentReadCapacity>,
     watches: Arc<Semaphore>,
     prewarm: Arc<Semaphore>,
     // Full-width administrative prewarm and one-lane affine readiness have
@@ -13204,6 +13233,7 @@ struct PersistentCapacityAdmission {
     pool: Arc<PersistentSessionConsumerPool>,
     pending: Option<OwnedSemaphorePermit>,
     lane: Option<OwnedSemaphorePermit>,
+    read_capacity: Option<Arc<PersistentReadReservation>>,
 }
 
 /// Owns pending admission while a caller is waiting for its FIFO lane.  It is
@@ -13248,6 +13278,7 @@ impl PersistentCapacityAdmission {
             pool,
             pending: Some(pending),
             lane: Some(lane),
+            read_capacity: None,
         }
     }
 }
@@ -13256,6 +13287,7 @@ impl Drop for PersistentCapacityAdmission {
     fn drop(&mut self) {
         drop(self.lane.take());
         drop(self.pending.take());
+        drop(self.read_capacity.take());
         self.pool.warm_capacity_changed.notify_waiters();
     }
 }
@@ -13905,11 +13937,31 @@ impl PersistentSessionConsumerPool {
         }
     }
 
+    #[cfg(test)]
     async fn admit_call(
         self: &Arc<Self>,
         started: tokio::time::Instant,
         operation_deadline: tokio::time::Instant,
     ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), SessionConsumerClientError> {
+        let (pending, lane, _) = self
+            .admit_call_with_read_capacity(started, operation_deadline, false)
+            .await?;
+        Ok((pending, lane))
+    }
+
+    async fn admit_call_with_read_capacity(
+        self: &Arc<Self>,
+        started: tokio::time::Instant,
+        operation_deadline: tokio::time::Instant,
+        extended_read: bool,
+    ) -> Result<
+        (
+            OwnedSemaphorePermit,
+            OwnedSemaphorePermit,
+            Option<Arc<PersistentReadReservation>>,
+        ),
+        SessionConsumerClientError,
+    > {
         if self.phase() != PersistentShutdownPhase::Running {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
@@ -13917,6 +13969,11 @@ impl PersistentSessionConsumerPool {
         // active plus queued caller futures. Lane acquisition always joins
         // Tokio's FIFO waiter queue; `try_acquire_owned` would let a late
         // caller take a released permit ahead of an already queued caller.
+        let read_pending = if extended_read {
+            Some(self.read_capacity.try_pending()?)
+        } else {
+            None
+        };
         let pending = Arc::clone(&self.pending)
             .try_acquire_owned()
             .map_err(|_| SessionConsumerClientError::Overloaded)?;
@@ -13932,9 +13989,16 @@ impl PersistentSessionConsumerPool {
         if tokio::time::Instant::now() >= wait_deadline {
             return Err(late_error);
         }
-        let lane_wait = Arc::clone(&self.lanes).acquire_owned();
+        let lane_wait = async {
+            let read_capacity = self.read_capacity.acquire(read_pending).await?;
+            let lane = Arc::clone(&self.lanes)
+                .acquire_owned()
+                .await
+                .map_err(|_| SessionConsumerClientError::ShuttingDown)?;
+            Ok::<_, SessionConsumerClientError>((lane, read_capacity))
+        };
         tokio::pin!(lane_wait);
-        let lane = match lane_wait.as_mut().now_or_never() {
+        let (lane, read_capacity) = match lane_wait.as_mut().now_or_never() {
             Some(result) => complete_before_deadline(
                 result.map_err(|_| SessionConsumerClientError::ShuttingDown)?,
                 wait_deadline,
@@ -14005,7 +14069,7 @@ impl PersistentSessionConsumerPool {
         if self.phase() != PersistentShutdownPhase::Running {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
-        Ok((pending_admission.into_pending(), lane))
+        Ok((pending_admission.into_pending(), lane, read_capacity))
     }
 
     fn take_idle(self: &Arc<Self>) -> Option<PersistentCheckedOutConnection> {
@@ -14234,6 +14298,7 @@ impl PersistentSessionConsumerPool {
         );
         self.pending.close();
         self.lanes.close();
+        self.read_capacity.close();
         self.watches.close();
         self.prewarm.close();
         self.clear_idle();
@@ -14802,6 +14867,10 @@ impl PersistentSessionConsumerClient {
                 .saturating_add(config.pending_calls),
         ));
         let request_prewarm = Arc::new(Semaphore::new(1));
+        let read_capacity = Arc::new(PersistentReadCapacity::new(
+            config.request_connections,
+            config.pending_calls,
+        ));
         let siblings = Arc::new(PersistentSessionConsumerSiblings::default());
         let pool = Arc::new(PersistentSessionConsumerPool {
             client,
@@ -14813,6 +14882,7 @@ impl PersistentSessionConsumerClient {
             // Includes active lane owners so `pending_calls == 0` is
             // fail-fast only once every request lane is occupied.
             pending: Arc::clone(&request_pending),
+            read_capacity: Arc::clone(&read_capacity),
             watches: Arc::new(Semaphore::new(config.watch_connections)),
             // One physical prewarm may run across the separately negotiated
             // V1/V2 lanes at a time. This bounds connection storms while
@@ -14859,6 +14929,7 @@ impl PersistentSessionConsumerClient {
             actor_lanes: Arc::new(Semaphore::new(config.request_connections)),
             // Includes active V1/V2 lane owners in one aggregate queue.
             pending: request_pending,
+            read_capacity,
             prewarm: request_prewarm,
             reconnect_control: Arc::clone(&pool.reconnect_control),
             idle: StdMutex::new(VecDeque::with_capacity(config.request_connections)),
@@ -15620,7 +15691,15 @@ impl PersistentSessionConsumerClient {
             consumer_operation_is_effectful(request.operation()),
         );
         let admission_deadline = call_boundary_deadline.map_or(deadline, |end| end.min(deadline));
-        let (pending, lane) = match self.pool.admit_call(started, admission_deadline).await {
+        let (pending, lane, read_capacity) = match self
+            .pool
+            .admit_call_with_read_capacity(
+                started,
+                admission_deadline,
+                call_boundary_deadline.is_some(),
+            )
+            .await
+        {
             Ok(admission) => admission,
             Err(error) => {
                 outcome.complete();
@@ -15628,7 +15707,8 @@ impl PersistentSessionConsumerClient {
                 return Err(SessionConsumerCallError::BeforeCallWrite(error));
             }
         };
-        let admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        let mut admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        admission.read_capacity = read_capacity;
         let activity = match self.pool.register_call() {
             Ok(activity) => activity,
             Err(error) => {
@@ -17033,14 +17113,19 @@ impl PersistentSessionConsumerClient {
     async fn reserve_retained_request_lane_before(
         &self,
         deadline: tokio::time::Instant,
+        extended_read: bool,
     ) -> Result<PersistentRetainedRequestLane, SessionConsumerClientError> {
         self.ensure_retained_request_lane_before(deadline).await?;
         let started = tokio::time::Instant::now();
         if started >= deadline {
             return Err(SessionConsumerClientError::Deadline);
         }
-        let (pending, lane) = self.pool.admit_call(started, deadline).await?;
-        let admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        let (pending, lane, read_capacity) = self
+            .pool
+            .admit_call_with_read_capacity(started, deadline, extended_read)
+            .await?;
+        let mut admission = PersistentCapacityAdmission::new(Arc::clone(&self.pool), pending, lane);
+        admission.read_capacity = read_capacity;
         let activity = match self.pool.register_call() {
             Ok(activity) => activity,
             Err(error) => {
@@ -17672,7 +17757,7 @@ impl PersistentPreparedFencedTransitionToken {
     > {
         let voter = self.route.status_voter(self.voter_count);
         match self.router.clients[voter]
-            .reserve_retained_request_lane_before(setup_deadline)
+            .reserve_retained_request_lane_before(setup_deadline, true)
             .await
         {
             Ok(lane) => Ok((voter, lane)),
@@ -17755,7 +17840,7 @@ impl PersistentPreparedFencedTransitionToken {
             // affine mutation attempt.
             let voter = self.route.mutation_voter(self.voter_count);
             let retained = match self.router.clients[voter]
-                .reserve_retained_request_lane_before(attempt_deadline)
+                .reserve_retained_request_lane_before(attempt_deadline, false)
                 .await
             {
                 Ok(retained) => retained,
@@ -21827,6 +21912,8 @@ where
 }
 mod deadline_read;
 use deadline_read::{DeadlineV1Read, DeadlineV2Read};
+mod read_capacity;
+use read_capacity::{PersistentReadCapacity, PersistentReadReservation};
 
 mod prepared_fenced_v2;
 
@@ -28751,6 +28838,7 @@ mod tests {
                 deadline,
                 completion,
                 write_progress: Arc::clone(&progress),
+                read_capacity: None,
             })
             .expect("one V2 Call reaches the reused actor");
         let task = tokio::spawn(run_persistent_v2_lane(actor));

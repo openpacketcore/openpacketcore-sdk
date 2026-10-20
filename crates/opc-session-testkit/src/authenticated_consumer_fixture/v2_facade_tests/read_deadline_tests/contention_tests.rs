@@ -11,7 +11,6 @@ use opc_session_store::{
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::pin::Pin;
-use std::task::Poll;
 
 #[derive(Clone, Copy, Debug)]
 enum Competitor {
@@ -65,12 +64,11 @@ struct Evidence {
     competitor: Competitor,
     admission: Admission,
     caller_ms: u128,
-    early_read_completions: usize,
     successful_reads: usize,
     physical_reads: usize,
-    v2_wait_current_queued: u64,
+    target_reads: usize,
+    v2_wait_before_caller: u64,
     v2_wait_max: u64,
-    v1_wait_current_queued: u64,
     v1_wait_max: u64,
     v2_setups: u64,
     v2_mutations: usize,
@@ -106,25 +104,22 @@ async fn competing_case(hold_ms: u64, competitor: Competitor) -> Evidence {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         for voter in &fixture.voters { *voter.service.reply_gates[STATUS].lock().unwrap() = Some(Arc::clone(&gate)); }
         let started = tokio::time::Instant::now();
-        let mut first_read = Box::pin(first.status_once(budget.original_deadline()));
-        let mut second_read = Box::pin(second.status_once(budget.original_deadline()));
-        {
-        let entered = async {
-            loop {
-                let notified = fixture.voters[target].service.held_reply_started[STATUS].notified();
-                if fixture.voters[target].service.held_replies[STATUS].load(Ordering::SeqCst) == 2 { break; }
-                notified.await;
+        let mut first_read = Box::pin(first.status_until_terminal(budget.original_deadline()));
+        let mut second_read = Box::pin(second.status_until_terminal(budget.original_deadline()));
+        loop {
+            assert!(futures_util::poll!(first_read.as_mut()).is_pending());
+            assert!(futures_util::poll!(second_read.as_mut()).is_pending());
+            if held(&fixture, STATUS) == 1 && clients[target].v2_diagnostics().pool_wait_current == 1 {
+                break;
             }
-        };
-        tokio::pin!(entered);
-        tokio::select! {
-            result = &mut first_read => panic!("first read completed before its held reply: {result:?}"),
-            result = &mut second_read => panic!("second read completed before its held reply: {result:?}"),
-            () = &mut entered => {},
+            // A second written read on this voter would consume the reserved
+            // lane. Waiting for the first reply cannot make that safe.
+            assert!(held(&fixture, STATUS) <= 1);
+            tokio::task::yield_now().await;
         }
-        }
-        assert_eq!(held(&fixture, STATUS), 2, "both reads occupy this same voter's two lanes");
-        assert_eq!(clients[target].v2_diagnostics().idle, 0);
+        assert_eq!(fixture.voters[target].service.held_replies[STATUS].load(Ordering::SeqCst), 1);
+        assert_eq!(clients[target].v2_diagnostics().idle, 1);
+        let v2_wait_before_caller = clients[target].v2_diagnostics().pool_wait_current;
         let setups_before = clients[target].v2_diagnostics().setup_attempts;
         tokio::time::advance(Duration::from_millis(50)).await;
         let caller_started = tokio::time::Instant::now();
@@ -132,7 +127,7 @@ async fn competing_case(hold_ms: u64, competitor: Competitor) -> Evidence {
             key: session_key(1600), owner: owner(), ttl: Duration::from_secs(30),
         });
         let v2_request = SessionConsumerV2Request::new(clients[target].scope(), SessionConsumerV2Operation::FencedTransitionV2Capability);
-        let mut competing: Pin<Box<dyn Future<Output = Admission> + Send + '_>> = match competitor {
+        let competing: Pin<Box<dyn Future<Output = Admission> + Send + '_>> = match competitor {
             Competitor::OrdinaryV1Lease => Box::pin(async {
                 match clients[target].execute(&v1_request).await {
                     Ok(SessionConsumerResponse::AcquireLease(Ok(_))) => Admission::Success,
@@ -158,54 +153,50 @@ async fn competing_case(hold_ms: u64, competitor: Competitor) -> Evidence {
                 }
             }),
         };
-        loop {
-            assert!(futures_util::poll!(competing.as_mut()).is_pending(), "the competing caller must join the occupied pool");
-            let waiting = match competitor {
-                Competitor::OrdinaryV1Lease => clients[target].diagnostics().await.pool_wait_current,
-                _ => clients[target].v2_diagnostics().pool_wait_current,
-            };
-            if waiting == 1 { break; }
-            tokio::task::yield_now().await;
-        }
-        let v2_wait_current_queued = clients[target].v2_diagnostics().pool_wait_current;
-        let v1_wait_current_queued = clients[target].diagnostics().await.pool_wait_current;
-        // Poll both readers after the old 100 ms cutoff. On the base this
-        // releases their cancelled logical permits. On the head they remain
-        // occupied by the same written reads until their real replies arrive.
-        tokio::time::advance(Duration::from_millis(51)).await;
-        let first_early = match futures_util::poll!(first_read.as_mut()) { Poll::Ready(result) => Some(result), Poll::Pending => None };
-        let second_early = match futures_util::poll!(second_read.as_mut()) { Poll::Ready(result) => Some(result), Poll::Pending => None };
-        let early_read_completions = usize::from(first_early.is_some()) + usize::from(second_early.is_some());
-        assert!(early_read_completions == 0 || early_read_completions == 2, "both reads have the same clock and attempt bound");
-        if early_read_completions == 0 {
-            // The queued caller still has its original 100 ms admission cap.
-            // One timer tick exposes expiry; no caller deadline is extended.
-            tokio::time::advance(Duration::from_millis(50)).await;
-        }
+        // Complete the competing call before releasing either slow reply and
+        // before advancing the clock to the read's pre-write admission cap.
         let admission = competing.await;
         let caller_ms = caller_started.elapsed().as_millis();
+        assert_eq!(admission, Admission::Success);
+        assert!(caller_ms < 100);
         assert!(tokio::time::Instant::now() < emergency_budget.original_deadline());
-        tokio::time::advance(Duration::from_millis(hold_ms) - started.elapsed()).await;
+        assert_eq!(held(&fixture, STATUS), 1);
+        tokio::time::advance(Duration::from_millis(101) - started.elapsed()).await;
+        loop {
+            assert!(futures_util::poll!(first_read.as_mut()).is_pending());
+            assert!(futures_util::poll!(second_read.as_mut()).is_pending());
+            if held(&fixture, STATUS) == 2 { break; }
+            tokio::task::yield_now().await;
+        }
+        // The second logical reader advanced only after a proven pre-write
+        // refusal. Both readers now have exactly one written physical read,
+        // on different voters, and retain their original shared deadline.
+        let target_reads = fixture.voters[target].service.held_replies[STATUS].load(Ordering::SeqCst);
+        assert_eq!(target_reads, 1);
+        tokio::time::advance(Duration::from_millis(hold_ms)).await;
+        assert!(tokio::time::Instant::now() < budget.original_deadline());
         gate.add_permits(2);
-        let first_result = match first_early { Some(result) => result, None => first_read.as_mut().await };
-        let second_result = match second_early { Some(result) => result, None => second_read.as_mut().await };
+        let (first_result, second_result) = tokio::join!(first_read.as_mut(), second_read.as_mut());
         drop(first_read);
         drop(second_read);
         let exact = |result: &Result<FencedTransitionV2Status, _>| matches!(result,
             Ok(FencedTransitionV2Status::Recorded(outcome)) if outcome.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_request(&original)));
         let successful_reads = usize::from(exact(&first_result)) + usize::from(exact(&second_result));
+        assert_eq!(successful_reads, 2);
         let v2 = clients[target].v2_diagnostics();
         let v1 = clients[target].diagnostics().await;
         let evidence = Evidence {
-            hold_ms, competitor, admission, caller_ms, early_read_completions, successful_reads,
-            physical_reads: held(&fixture, STATUS), v2_wait_current_queued, v2_wait_max: v2.pool_wait_max,
-            v1_wait_current_queued, v1_wait_max: v1.pool_wait_max,
+            hold_ms, competitor, admission, caller_ms, successful_reads,
+            physical_reads: held(&fixture, STATUS), target_reads, v2_wait_before_caller,
+            v2_wait_max: v2.pool_wait_max, v1_wait_max: v1.pool_wait_max,
             v2_setups: v2.setup_attempts - setups_before,
             v2_mutations: fixture.diagnostics().fenced_transition_v2_calls(),
         };
         assert_eq!(evidence.physical_reads, 2, "neither caller hedges or repeats its read");
+        assert_eq!(evidence.v2_setups, 0);
         assert_eq!(v2.pool_wait_current, 0);
         assert_eq!(v1.pool_wait_current, 0);
+        assert_eq!(evidence.v2_mutations, if matches!(competitor, Competitor::EmergencyV2Transition) { 2 } else { 1 });
         drop(emergency);
         drop(first);
         drop(second);
@@ -227,10 +218,10 @@ async fn two_slow_receipts_preserve_competing_admission_including_emergency() {
             Competitor::EmergencyV2Transition,
         ] {
             let row = competing_case(hold_ms, competitor).await;
-            eprintln!("shared-pool contention: hold_ms={} competitor={:?} admission={:?} caller_ms={} early_read_completions={} successful_reads={} physical_reads={} v2_wait_current_queued={} v2_wait_max={} v1_wait_current_queued={} v1_wait_max={} v2_setups={} v2_mutations={}",
-                row.hold_ms, row.competitor, row.admission, row.caller_ms, row.early_read_completions, row.successful_reads,
-                row.physical_reads, row.v2_wait_current_queued, row.v2_wait_max, row.v1_wait_current_queued, row.v1_wait_max,
-                row.v2_setups, row.v2_mutations);
+            eprintln!("reserved read capacity: hold_ms={} competitor={:?} admission={:?} caller_ms={} successful_reads={} physical_reads={} target_reads={} v2_wait_before_caller={} v2_wait_max={} v1_wait_max={} v2_setups={} v2_mutations={}",
+                row.hold_ms, row.competitor, row.admission, row.caller_ms, row.successful_reads,
+                row.physical_reads, row.target_reads, row.v2_wait_before_caller, row.v2_wait_max,
+                row.v1_wait_max, row.v2_setups, row.v2_mutations);
             evidence.push(row);
         }
     }
@@ -240,4 +231,5 @@ async fn two_slow_receipts_preserve_competing_admission_including_emergency() {
             .all(|row| row.admission == Admission::Success),
         "slow reads must not introduce any competing admission refusal: {evidence:?}"
     );
+    assert!(evidence.iter().all(|row| row.successful_reads == 2));
 }

@@ -834,6 +834,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal `TopologyAuthorityRevoked` and cache it. Budget-bearing GET/expiry
   reads preserve the legacy wire-rejection mapping. Both split-deadline
   transports enforce a read-only operation guard before admission or setup.
+  In pools with at least two lanes, extended V1/V2 reads reserve one existing
+  lane and admission slot for other calls, preserving their bounded queues
+  and deadlines without increasing the connection cap.
 
 - `opc-session-store`: wait for the initial record on every replica before
   injecting owner or fence drift in the renewal fixture. Exercise a lagging

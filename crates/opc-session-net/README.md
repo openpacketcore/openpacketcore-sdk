@@ -605,6 +605,15 @@ reads preserve their legacy wire-rejection mapping, including `Unauthorized`
 to `BackendUnavailable`. Both split-deadline transports reject operations
 outside their closed set of reads before admission or setup.
 
+When a pool has at least two request lanes, extended reads share at most all
+but one of its existing lanes and total-admission slots across V1 and V2.
+The remaining capacity stays available to ordinary calls and mutations. Read
+queueing uses the same original pre-write and pool-wait limits; a proven
+pre-write refusal permits a quorum caller to try its next voter. A written
+read still waits for its original response deadline. No connection or queue
+bound is increased. A one-lane configuration remains usable, but cannot
+reserve a separate lane for competing calls.
+
 Background reclamation keeps its bounded per-voter wait and can advance past
 a silent voter within the original sweep budget. It has no ingress caller's
 response deadline to preserve. Activation's optional history-cache priming
