@@ -636,3 +636,26 @@ async fn failed_core_initialization_preserves_sqlite_record_locks() {
     drop(backend);
     probe::assert_state(&path, TEST, false, "after final connection shutdown");
 }
+
+#[test]
+fn terminal_snapshot_digest_preserves_sqlite_record_locks() {
+    const TEST: &str = "sqlite::consensus::tests::descriptor_locks::terminal_snapshot_digest_preserves_sqlite_record_locks";
+    if probe::child() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source.sqlite");
+    let backend = SqliteSessionBackend::open(&path).unwrap();
+    let source = pin_live_database_file(&backend.conn.blocking_lock(), &path).unwrap();
+    {
+        let connection = backend.conn.blocking_lock();
+        probe::begin(&connection);
+        probe::assert_state(&path, TEST, true, "before terminal snapshot hashing");
+        terminal_snapshot_raw_digest(source.file()).unwrap();
+        probe::assert_state(&path, TEST, true, "after terminal snapshot hashing");
+        connection.execute_batch("ROLLBACK;").unwrap();
+    }
+    drop(source);
+    drop(backend);
+    probe::assert_state(&path, TEST, false, "after final connection shutdown");
+}
