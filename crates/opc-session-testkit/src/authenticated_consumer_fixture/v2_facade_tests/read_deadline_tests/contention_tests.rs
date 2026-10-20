@@ -104,6 +104,7 @@ async fn competing_case(hold_ms: u64, competitor: Competitor) -> Evidence {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         for voter in &fixture.voters { *voter.service.reply_gates[STATUS].lock().unwrap() = Some(Arc::clone(&gate)); }
         let started = tokio::time::Instant::now();
+        let reads_before = fixture.diagnostics().fenced_transition_v2_status_calls();
         let mut first_read = Box::pin(first.status_until_terminal(budget.original_deadline()));
         let mut second_read = Box::pin(second.status_until_terminal(budget.original_deadline()));
         loop {
@@ -187,12 +188,14 @@ async fn competing_case(hold_ms: u64, competitor: Competitor) -> Evidence {
         let v1 = clients[target].diagnostics().await;
         let evidence = Evidence {
             hold_ms, competitor, admission, caller_ms, successful_reads,
-            physical_reads: held(&fixture, STATUS), target_reads, v2_wait_before_caller,
+            physical_reads: fixture.diagnostics().fenced_transition_v2_status_calls() - reads_before,
+            target_reads, v2_wait_before_caller,
             v2_wait_max: v2.pool_wait_max, v1_wait_max: v1.pool_wait_max,
             v2_setups: v2.setup_attempts - setups_before,
             v2_mutations: fixture.diagnostics().fenced_transition_v2_calls(),
         };
         assert_eq!(evidence.physical_reads, 2, "neither caller hedges or repeats its read");
+        assert_eq!(held(&fixture, STATUS), 2, "both written reads produce their held replies");
         assert_eq!(evidence.v2_setups, 0);
         assert_eq!(v2.pool_wait_current, 0);
         assert_eq!(v1.pool_wait_current, 0);
