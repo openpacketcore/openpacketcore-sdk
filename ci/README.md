@@ -8,14 +8,26 @@ to reproduce the shards with the profile and disk setup in
 
 The hosted `misc` runner uses `plan --shard misc --split-libraries` for binary
 unit tests, example compilation, doctests and the heavy-target remainder. Its
-library phase runs on two required `Rust library tests` runners, with the same
+library phase runs on three required `Rust library tests` runners, with the same
 workspace package selection, features, ordinary profile and four test threads.
 Each runner compiles/lists every library and verifies that its compiled targets
 match Cargo metadata. Exact-name exclusions partition the live inventory using
-the first eight SHA-256 bytes modulo two. Duplicate names in different libraries
+the first eight SHA-256 bytes modulo three. Duplicate names in different libraries
 share an owner; new tests are assigned automatically. The uploaded mapping
 records the revision, identities, ignored status and exact commands. The logical
 `plan --shard misc` remains available to reproduce the complete unsplit phase.
+
+Five integration runners pack target runtime estimates after reserving their
+fixed library work. The `recovery_profile` target has an exact named group on
+`it-4` and a complementary remainder assigned by the planner. Future tests
+automatically belong to the remainder. Both owners compile/list the real target
+and verify that the group and remainder cover every test exactly once before
+execution. The named tests must resolve exactly once and remain enabled.
+Filters for a split target never apply to another target's same-named tests.
+All invocations retain the workspace features, ordinary profile and four test
+threads; the existing isolated timing contracts retain their serial commands.
+The 60-minute job limits are unchanged. Runtime weights are estimates rather
+than deadlines and should be refreshed as the hosted workload changes.
 
 The scope-payload decode regression and the three-large-child observation refusal
 test each run in a fresh serial process first on library shard `0` and egress

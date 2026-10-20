@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shlex
 import subprocess
@@ -306,7 +307,7 @@ def integration_targets(packages: list[dict] | None = None) -> list[str]:
 def assign(plan: dict, targets: list[str]) -> dict[str, list[str]]:
     """Longest-processing-time-first packing.
 
-    A pure function of (sorted target names, weights, shard count), so every
+    Reserve the measured fixed work before packing target remainders. Every
     shard and the verifier independently compute the same assignment.
     """
     heavy = plan["heavy"]["target"]
@@ -315,7 +316,12 @@ def assign(plan: dict, targets: list[str]) -> dict[str, list[str]]:
     count = int(plan["integration_shards"])
 
     buckets: dict[str, list[str]] = {f"it-{i}": [] for i in range(count)}
-    load = [0.0] * count
+    load = [
+        float(plan.get("fixed_weights", {}).get(f"it-{i}", 0))
+        + sum(float(group["weight"]) for group in plan.get("integration_groups", [])
+              if group["shard"] == f"it-{i}")
+        for i in range(count)
+    ]
     ordered = sorted(
         (t for t in targets if t != heavy),
         key=lambda t: (-float(weights.get(t, default)), t),
@@ -450,6 +456,113 @@ def quiescent_contracts() -> tuple:
     )
 
 
+def integration_group_command(group: dict) -> list[str]:
+    return SELECTION + [
+        "--test", group["target"], "--", *HARNESS, "--exact", *group["tests"],
+    ]
+
+
+def integration_remainder_command(plan: dict, target: str) -> list[str]:
+    names = [name for group in plan.get("integration_groups", [])
+             if group["target"] == target for name in group["tests"]]
+    return SELECTION + [
+        "--test", target, "--", *HARNESS, "--exact",
+        *[arg for name in names for arg in ("--skip", name)],
+    ]
+
+
+def integration_commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
+    """Keep named slices disjoint, including future tests on the remainder."""
+    buckets = assign(plan, targets)
+    if shard not in buckets:
+        sys.exit(f"unknown shard id: {shard}")
+    groups = plan.get("integration_groups", [])
+    split_targets = {group["target"] for group in groups}
+    ordinary_targets = [name for name in buckets[shard] if name not in split_targets]
+    contracts = [contract for contract in quiescent_contracts()
+                 if contract[0] in ordinary_targets]
+    result = []
+    if ordinary_targets:
+        selected = [arg for name in ordinary_targets for arg in ("--test", name)]
+        skips = [arg for _, names, _ in contracts for name in names
+                 for arg in ("--skip", name)]
+        result.append(SELECTION + selected + ["--", *HARNESS]
+                      + (["--exact", *skips] if contracts else []))
+        result.extend(command(name) for _, names, command in contracts for name in names)
+    # A skip for one target must never filter an unrelated target's same-named
+    # test. Run each split target's remainder in its own Cargo invocation.
+    result.extend(integration_remainder_command(plan, target)
+                  for target in buckets[shard] if target in split_targets)
+    result.extend(integration_group_command(group) for group in groups
+                  if group["shard"] == shard)
+    return result
+
+
+def verify_integration_groups(plan: dict, targets: list[str]) -> None:
+    shards = {f"it-{i}" for i in range(int(plan["integration_shards"]))}
+    if not shards:
+        sys.exit("the integration plan must have at least one shard")
+
+    def weight(value):
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            sys.exit("shard weights must be finite nonnegative seconds")
+
+    weight(plan["default_weight"])
+    for value in plan["weights"].values():
+        weight(value)
+    for shard, value in plan.get("fixed_weights", {}).items():
+        if shard not in shards:
+            sys.exit(f"fixed weight names unknown shard {shard!r}")
+        weight(value)
+    excluded = {plan["heavy"]["target"], *(row[0] for row in quiescent_contracts())}
+    seen = set()
+    for group in plan.get("integration_groups", []):
+        if group["shard"] not in shards:
+            sys.exit("integration group names an unknown shard")
+        if group["target"] not in targets or group["target"] in excluded:
+            sys.exit("integration group target is absent or already has a specialized partition")
+        weight(group["weight"])
+        if not group["tests"]:
+            sys.exit("integration groups must name at least one exact test")
+        for name in group["tests"]:
+            identity = group["target"], name
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*", name):
+                sys.exit("integration groups require literal Rust test names")
+            if identity in seen:
+                sys.exit("an integration test is claimed by more than one group")
+            seen.add(identity)
+
+
+def list_integration_tests(target: str, filters: list[str]) -> list[str]:
+    output = subprocess.run(
+        SELECTION + ["--test", target, "--", "--list", *filters],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True,
+    ).stdout
+    return [line.removesuffix(": test") for line in output.splitlines()
+            if line.endswith(": test")]
+
+
+def verify_grouped_integration(plan: dict, target: str) -> None:
+    """Resolve the real libtest filters before either half starts executing."""
+    groups = [group for group in plan.get("integration_groups", [])
+              if group["target"] == target]
+    inventory = list_integration_tests(target, [])
+    if not inventory or len(inventory) != len(set(inventory)):
+        sys.exit(f"{target}: empty or ambiguous integration inventory")
+    remainder = integration_remainder_command(plan, target)
+    selected = Counter(list_integration_tests(target, remainder[remainder.index("--") + 1:]))
+    for group in groups:
+        names = list_integration_tests(target, ["--exact", *group["tests"]])
+        if Counter(names) != Counter(group["tests"]):
+            sys.exit(f"{target}: integration group names are stale or ambiguous")
+        if list_integration_tests(target, ["--ignored", "--exact", *group["tests"]]):
+            sys.exit(f"{target}: named integration tests must remain enabled")
+        selected.update(names)
+    if selected != Counter(inventory):
+        sys.exit(f"{target}: integration groups overlap or leave tests without an owner")
+    print(f"{target}: exact integration partition verified for {len(inventory)} tests")
+
+
 def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
     """The cargo invocations for one shard."""
     heavy = plan["heavy"]
@@ -505,40 +618,10 @@ def commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
         ]
 
 
-    buckets = assign(plan, targets)
-    if shard not in buckets:
-        sys.exit(f"unknown shard id: {shard}")
-    selected = [arg for name in buckets[shard] for arg in ("--test", name)]
-    if not selected:
+    selected = integration_commands(plan, shard, targets)
+    if not selected and not extra:
         sys.exit(f"shard {shard} selected no targets; the plan is broken")
-    contracts = [
-        contract
-        for contract in quiescent_contracts()
-        if contract[0] in buckets[shard]
-    ]
-    if not contracts:
-        return [SELECTION + selected + ["--", *HARNESS], *extra]
-
-    # libtest's skip filter is substring-based unless --exact is present. The
-    # ordinary invocation still runs every other test in this target, while a
-    # fresh process runs each timing contract alone with no competing runtime.
-    skips = [
-        arg
-        for _, names, _ in contracts
-        for name in names
-        for arg in ("--skip", name)
-    ]
-    ordinary = (
-        SELECTION
-        + selected
-        + ["--", *HARNESS, "--exact", *skips]
-    )
-    isolated = [
-        command(name)
-        for _, names, command in contracts
-        for name in names
-    ]
-    return [ordinary, *isolated, *extra]
+    return [*selected, *extra]
 
 
 def hosted_commands(plan: dict, shard: str, targets: list[str]) -> list[list[str]]:
@@ -654,6 +737,7 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
     dropping (say) the doctest command cannot pass unnoticed.
     """
     verify_lib_plan(plan)
+    verify_integration_groups(plan, targets)
     if plan["heavy"]["target"] != realtime_qualification.TARGET:
         sys.exit("real-time qualification manifest target differs from the heavy target")
     named = [name for group in plan["heavy"]["shards"] for name in group]
@@ -730,6 +814,10 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
         expected = (serial if shard == "misc" else []) + extra_lib_commands(plan, shard)
         if library_commands != expected:
             sys.exit(f"{shard} must run every assigned library group exactly once")
+        if shard.startswith("it-"):
+            expected = integration_commands(plan, shard, targets) + extra_lib_commands(plan, shard)
+            if actual != expected:
+                sys.exit(f"{shard} changes the exact integration partition commands")
     for index, group in enumerate(plan["heavy"]["shards"]):
         if not group:
             # `--exact` with no names disables filtering, so an empty group
@@ -842,7 +930,7 @@ def verify_lib_plan(plan: dict) -> None:
 
 
 def verify(plan: dict, targets: list[str]) -> None:
-    """Prove every target runs exactly once across the shard set."""
+    """Verify target ownership and the exact command partition."""
     verify_workflow(plan)
     verify_commands(plan, targets)
     buckets = assign(plan, targets)
@@ -880,7 +968,10 @@ def verify(plan: dict, targets: list[str]) -> None:
     default = float(plan["default_weight"])
     for shard in sorted(buckets):
         total = sum(float(weights.get(n, default)) for n in buckets[shard])
-        print(f"  {shard}: {len(buckets[shard]):3d} targets, ~{total:.0f}s")
+        total += float(plan.get("fixed_weights", {}).get(shard, 0))
+        total += sum(float(group["weight"]) for group in plan.get("integration_groups", [])
+                     if group["shard"] == shard)
+        print(f"  {shard}: {len(buckets[shard]):3d} target remainders, ~{total:.0f}s including fixed work")
 
 
 def list_heavy_tests(plan: dict, extra: list[str]) -> list[str]:
@@ -1024,6 +1115,12 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
         )
     buckets = assign(plan, targets)
     if shard in buckets:
+        grouped = {
+            group["target"] for group in plan.get("integration_groups", [])
+            if group["shard"] == shard or group["target"] in buckets[shard]
+        }
+        for target in sorted(grouped):
+            verify_grouped_integration(plan, target)
         contracts = [
             contract
             for contract in quiescent_contracts()
