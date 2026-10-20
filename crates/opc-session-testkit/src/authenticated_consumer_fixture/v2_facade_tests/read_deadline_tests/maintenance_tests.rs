@@ -60,6 +60,9 @@ async fn silent_follower_does_not_stop_successive_reclaim_sweeps() {
             assert!(!report.interrupted(), "pass {pass}: {report:?}");
             assert_eq!(report.examined(), 4);
             assert_eq!(report.reclaimed(), 4);
+            assert_eq!(report.voided(), 4);
+            assert_eq!(report.unsupported(), 0);
+            assert_eq!(report.waiting_callers(), 0);
             assert_eq!(report.retained(), 0);
             assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
             assert!(tokio::time::Instant::now() < budget.original_deadline());

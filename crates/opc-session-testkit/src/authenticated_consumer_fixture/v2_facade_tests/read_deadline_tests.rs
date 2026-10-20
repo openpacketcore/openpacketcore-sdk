@@ -72,6 +72,11 @@ fn clients_with_capacity(
             )
             .with_operation_timeout(Duration::from_millis(250))
             .with_pre_request_connection_timeout(Duration::from_millis(100));
+            let client = if fixture.owned_recovery_journal {
+                client.with_fenced_transition_v2_void_transport()
+            } else {
+                client
+            };
             PersistentSessionConsumerClient::try_from_stateless(
                 client,
                 PersistentSessionConsumerConfig::try_new(
