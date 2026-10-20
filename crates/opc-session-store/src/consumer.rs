@@ -3469,6 +3469,15 @@ pub trait SessionQuorumConsumer: Send + Sync {
     /// implementation fail-closed on the new lane. Implementations that
     /// advertise V2 override this method and must perform the same scope and
     /// durable leader checks as [`Self::execute`].
+    ///
+    /// For a V2 transition or batch, `Rejected(Unavailable)` proves that this
+    /// voter refused before submitting the operation's own consensus intent.
+    /// Implementations may return it only before that submission; for a batch,
+    /// no item may have been submitted. After a possible submission, a timeout
+    /// or other uncertainty must use the operation's typed unknown result,
+    /// never this refusal. The transport may report the refusal as
+    /// `NotTransmitted`, allowing the identical request to advance to another
+    /// voter without an additional effect.
     async fn execute_v2(
         &self,
         _authorization: &SessionConsumerAuthorization,

@@ -329,8 +329,9 @@ struct PreparedFencedTransitionV2Route {
     status_cursor: AtomicUsize,
     attempt_deadline: StdMutex<Option<tokio::time::Instant>>,
     // Set immediately before the adapter enters a physical V2 mutation call
-    // and cleared only by that call's authoritative pre-write
-    // classification. A handle cancelled while this is set may have sent.
+    // and cleared only by that call's authoritative no-dispatch classification,
+    // including a complete, correlated pre-dispatch refusal. A handle cancelled
+    // while this is set may have sent.
     dispatch_admitted: AtomicBool,
 }
 
@@ -1778,11 +1779,20 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     ///
     /// A possible send permanently removes dispatch authority and returns
     /// `OutcomeUnknown` with the caller-stable ID; use receipt status only
-    /// afterwards. When every candidate voter proved a pre-dispatch failure,
-    /// topology authority was revoked before any Call byte, or the V2 history
-    /// definitively rejected the request without binding it, this handle
-    /// removes its own retained row. If that removal fails or is cancelled,
-    /// the handle stays resolved and `release_resolved` retries it.
+    /// afterwards. When an original handle fails preflight, every candidate
+    /// voter proves a pre-dispatch failure, topology authority is revoked
+    /// before any Call byte, or the V2 history definitively rejects the
+    /// request without binding it, this handle removes its own retained row.
+    /// A resumed deferred request retains its earlier binding and status
+    /// recovery when the current attempt fails preflight.
+    ///
+    /// If local removal fails or is cancelled, the original handle stays
+    /// resolved and `release_resolved` retries it. This no-effect decision is
+    /// not persisted separately: a crash before deletion commits leaves an
+    /// ordinary unresolved row, recovered through status only. An owned
+    /// journal with the void profile can settle that row through a terminal
+    /// void receipt; otherwise the existing epoch lifecycle applies. The
+    /// missing in-memory decision never authorizes deletion after restart.
     pub async fn execute_once(
         &mut self,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
@@ -2178,7 +2188,15 @@ impl PersistentPreparedFencedTransitionV2Token {
             .await,
             Ok(Ok(()))
         ) {
-            preparation.terminal();
+            // Only an original handle proves that no earlier execution
+            // could bind this row. A resumed deferral still needs its receipt.
+            if self.original {
+                preparation.terminal();
+                self.set_resolution(V2Resolution::Resolved);
+                self.discard_own_unbound_row().await;
+            } else {
+                preparation.receipt_only();
+            }
             return Err(FencedTransitionExecuteError::NotTransmitted);
         }
         for _ in 0..self.voter_count {
@@ -2273,9 +2291,9 @@ impl PersistentPreparedFencedTransitionV2Token {
                 }
             }
         }
-        // Every candidate proved that no Call byte was accepted, and only this
-        // handle can dispatch the row, so no copy of the request was sent. A
-        // failed or cancelled discard therefore stays releasable.
+        // Every candidate proved a pre-dispatch failure, and only this
+        // original handle can dispatch the row, so no copy can take effect.
+        // A failed or cancelled discard therefore stays releasable.
         if self.original {
             preparation.terminal();
             self.set_resolution(V2Resolution::Resolved);
@@ -2484,6 +2502,9 @@ fn prepared_fenced_v2_status_retryable_before(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+
+    #[cfg(unix)]
+    mod settlement_crash;
 
     use bytes::Bytes;
     use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing, AES_256_GCM_SIV_KEY_LEN};
@@ -2832,6 +2853,195 @@ mod tests {
         }
     }
 
+    struct PreDispatchRefusalConsumer {
+        refuse: bool,
+        calls: AtomicUsize,
+        dispatched: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for PreDispatchRefusalConsumer {
+        async fn execute(
+            &self,
+            _authorization: &SessionConsumerAuthorization,
+            _request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn execute_v2(
+            &self,
+            _authorization: &SessionConsumerAuthorization,
+            request: SessionConsumerV2Request,
+        ) -> SessionConsumerV2Response {
+            match request.operation() {
+                SessionConsumerV2Operation::FencedTransitionV2Capability => {
+                    SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+                        FencedTransitionV2Capability::V2,
+                    ))
+                }
+                SessionConsumerV2Operation::FencedTransitionV2HistoryState => {
+                    SessionConsumerV2Response::FencedTransitionV2HistoryState(Ok(history_state(
+                        1, 1, 0,
+                    )))
+                }
+                SessionConsumerV2Operation::FencedTransitionV2 { .. } => {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    if self.refuse {
+                        SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+                    } else {
+                        self.dispatched.notify_one();
+                        std::future::pending().await
+                    }
+                }
+                _ => SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable),
+            }
+        }
+
+        async fn watch(
+            &self,
+            _authorization: &SessionConsumerAuthorization,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
+    async fn assert_v2_network_refusal_settlement(refuse: bool) {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = opc_types::SpiffeId::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/v2-refusal",
+        )
+        .expect("client identity");
+        let server_identity = opc_types::SpiffeId::new(
+            "spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/v2-voter",
+        )
+        .expect("server identity");
+        let material = crate::test_support::RotatableClientMaterial::new(client_identity.as_str());
+        let scope = test_consumer_voter_authority().scope();
+        let service = Arc::new(PreDispatchRefusalConsumer {
+            refuse,
+            calls: AtomicUsize::new(0),
+            dispatched: Notify::new(),
+        });
+        let grant = opc_session_store::SessionConsumerAuthorizationGrant::try_new(
+            client_identity,
+            [opc_session_store::SessionConsumerTenantNfScope::new(
+                tenant(),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("tenant/NF grant");
+        let manifest = test_consumer_roster()
+            .authorization_manifest(test_consumer_voter_authority().node_id(), [grant])
+            .expect("consumer manifest");
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service.clone(),
+            material.trusted_server_config(server_identity.as_str()),
+            SessionConsumerAuthorizer::try_new(manifest).expect("authorizer"),
+        )
+        .listen("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("listen");
+        let client = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_unattested_for_test(
+                address,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                server_identity,
+                scope,
+                material.config(),
+            ),
+        )
+        .expect("persistent client");
+        let voters =
+            SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster(
+                [client.clone()],
+            )
+            .await
+            .expect("activate exact voter roster");
+        let directory = tempfile::tempdir().expect("private journal directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("private journal directory");
+        }
+        let journal = Arc::new(
+            FencedTransitionV2RecoveryJournal::create_new(
+                directory.path().join("recovery.sqlite3"),
+                FencedTransitionV2RecoveryJournalKey::from_bytes([0x71; 32]),
+            )
+            .expect("recovery journal"),
+        );
+        let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(
+            voters,
+            Arc::new(MemoryKeyProvider::new()),
+            "prepared-fenced-v2-unit",
+            journal,
+        )
+        .expect("protected facade");
+        let request_id = FencedTransitionRequestId::from_bytes([0x74; 16]);
+        let mut handle = facade
+            .prepare_fenced_transition(delete_request(request_id), budget())
+            .await
+            .expect("prepare");
+        assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 1);
+        let result = if refuse {
+            let result = handle.execute_once().await;
+            server.abort_and_wait().await;
+            result
+        } else {
+            let execute = handle.execute_once();
+            tokio::pin!(execute);
+            tokio::select! {
+                result = &mut execute => panic!("the transport fixture returned before dispatch: {result:?}"),
+                _ = service.dispatched.notified() => {}
+            }
+            server.abort_and_wait().await;
+            execute.await
+        };
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        if refuse {
+            assert_eq!(result, Err(FencedTransitionExecuteError::NotTransmitted));
+            assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
+            assert_eq!(handle.release_resolved().await, Ok(()));
+        } else {
+            assert_eq!(
+                result,
+                Err(FencedTransitionExecuteError::OutcomeUnknown { request_id })
+            );
+            assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 1);
+            assert_eq!(
+                handle.release_resolved().await,
+                Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved)
+            );
+        }
+        assert_eq!(
+            handle.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "neither a settled nor an ambiguous handle may dispatch again"
+        );
+        assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+        let _ = client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v2_handle_pre_dispatch_refusal_discards_its_unsent_row() {
+        assert_v2_network_refusal_settlement(true).await;
+    }
+
+    #[tokio::test]
+    async fn v2_handle_transport_failure_retains_its_recovery_row() {
+        assert_v2_network_refusal_settlement(false).await;
+    }
+
     #[tokio::test]
     async fn v2_handle_abandons_a_never_executed_row_without_dispatch() {
         let harness = harness(vec![]).await;
@@ -3053,6 +3263,110 @@ mod tests {
             Err(FencedTransitionExecuteError::NotTransmitted),
             "a terminal handle never dispatches again"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn v2_handle_failed_preflight_discards_its_unsent_row() {
+        let harness = harness(vec![Step::Commit]).await;
+        let token = harness.prepare().await;
+        assert_eq!(harness.retained().await, 1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert!(harness.physical.voters().is_empty());
+        assert_eq!(
+            harness.retained().await,
+            0,
+            "a failed preflight must settle the original handle's never-dispatched row"
+        );
+        assert_eq!(token.release_resolved().await, Ok(()));
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "settlement cannot restore dispatch authority"
+        );
+        assert!(harness.physical.voters().is_empty());
+        assert!(matches!(
+            harness
+                .backend
+                .recover_protected_fenced_transition_v2(harness.request_id)
+                .await,
+            Ok(PreparedFencedTransitionV2Lookup::Absent)
+        ));
+    }
+
+    #[tokio::test]
+    async fn v2_handle_failed_preflight_keeps_failed_deletion_releasable() {
+        let harness = harness(vec![Step::Commit]).await;
+        let token = harness.prepare().await;
+        let journal = harness._directory.path().join("recovery.sqlite3");
+        std::fs::rename(&journal, journal.with_extension("moved")).unwrap();
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert!(harness.physical.voters().is_empty());
+        assert_eq!(
+            token.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::Unavailable),
+            "a failed deletion stays releasable"
+        );
+        std::fs::rename(journal.with_extension("moved"), &journal).unwrap();
+        assert_eq!(harness.retained().await, 1);
+        assert_eq!(token.release_resolved().await, Ok(()));
+        assert_eq!(harness.retained().await, 0);
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert!(harness.physical.voters().is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_resumed_handle_failed_preflight_retains_its_bound_row() {
+        let harness = harness(vec![Step::Commit]).await;
+        let original = harness.prepare().await;
+        let token = PersistentPreparedFencedTransitionV2Token::new(
+            Arc::clone(&harness.backend),
+            original.prepared.clone(),
+            budget(),
+            PreparedFencedV2HandleRouting {
+                voter_count: VOTERS,
+                route: Arc::clone(&harness.route),
+                history: Arc::clone(&harness.history),
+            },
+            PreparedRequestState::new(0),
+            false,
+        );
+        let journal = harness._directory.path().join("recovery.sqlite3");
+        std::fs::rename(&journal, journal.with_extension("moved")).unwrap();
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert!(harness.physical.voters().is_empty());
+        std::fs::rename(journal.with_extension("moved"), &journal).unwrap();
+        assert_eq!(harness.retained().await, 1);
+        assert_eq!(
+            token.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved),
+            "the current attempt's preflight cannot exclude an earlier bound request"
+        );
+        assert_eq!(
+            token
+                .status_once(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            Ok(FencedTransitionV2Status::NotFound),
+            "the resumed handle must retain status recovery"
+        );
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert!(harness.physical.voters().is_empty());
+        assert_eq!(harness.retained().await, 1);
     }
 
     #[tokio::test]

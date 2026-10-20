@@ -874,6 +874,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through signer reopen and consensus preflight. Missing selected native WAL
   roots in the enrolled voter profile return `VoterIdentityReplacementRequired`
   while retaining the existing startup refusal.
+- `opc-session-net`: classify complete, correlated V2 transition and batch
+  pre-dispatch refusals as `NotTransmitted` and send those refusals from the
+  server instead of closing the connection. Settle an original prepared V2
+  handle's exact recovery row after failed local preflight or proven all-voter
+  non-dispatch. Ambiguous sends and resumed deferred requests retain status
+  recovery; void replies retain their typed identity checks. Older peers
+  conservatively report unknown and retain recovery. (#1405)
+
 - `opc-session-net`: preserve valid slow quorum replies until the caller's
   original deadline for protected history, expiry and receipt reads, including
   prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight
