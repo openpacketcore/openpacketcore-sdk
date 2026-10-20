@@ -2770,17 +2770,28 @@ enum ConsumerV2WireResponse {
     Response(ConsumerV2CallResponse),
 }
 
+fn v2_rejection_proves_not_dispatched(
+    operation: &SessionConsumerV2Operation,
+    rejection: SessionConsumerRejection,
+) -> bool {
+    matches!(
+        operation,
+        SessionConsumerV2Operation::FencedTransitionV2 { .. }
+            | SessionConsumerV2Operation::FencedTransitionV2Batch { .. }
+    ) && consumer_rejection_proves_not_dispatched(rejection)
+}
+
 fn v2_response_matches_operation(
     operation: &SessionConsumerV2Operation,
     response: &SessionConsumerV2Response,
 ) -> bool {
     match (operation, response) {
-        // Only a closed pre-dispatch refusal can complete an effectful Call
-        // without a V2 receipt. The wire boundary must still authenticate the
-        // complete correlation, attempt nonce and request commitment.
+        // A closed pre-dispatch refusal can complete a transition or batch
+        // without a receipt, after the wire boundary authenticates the full
+        // tuple. Void results retain their typed original-identity contract.
         (_, SessionConsumerV2Response::Rejected(rejection)) => {
             !v2_operation_is_effectful(operation)
-                || consumer_rejection_proves_not_dispatched(*rejection)
+                || v2_rejection_proves_not_dispatched(operation, *rejection)
         }
         (
             SessionConsumerV2Operation::FencedTransitionV2Capability,
@@ -10031,8 +10042,8 @@ impl fmt::Debug for PersistentSessionConsumerV2Diagnostics {
 #[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PersistentSessionConsumerV2ExecuteError {
-    /// No Call bytes were accepted, or a complete matching reply proves that
-    /// the voter refused the request before dispatch.
+    /// No Call bytes were accepted, or a complete matching transition or
+    /// batch reply proves that the voter refused the request before dispatch.
     #[error("V2 request was not transmitted")]
     NotTransmitted { cause: SessionConsumerClientError },
     #[error("V2 read is unavailable")]
@@ -12508,13 +12519,11 @@ fn classify_v2_completed_response(
     request: &SessionConsumerV2Request,
     response: SessionConsumerV2Response,
 ) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
-    if v2_operation_is_effectful(request.operation())
-        && matches!(
-            &response,
-            SessionConsumerV2Response::Rejected(rejection)
-                if consumer_rejection_proves_not_dispatched(*rejection)
-        )
-    {
+    if matches!(
+        &response,
+        SessionConsumerV2Response::Rejected(rejection)
+            if v2_rejection_proves_not_dispatched(request.operation(), *rejection)
+    ) {
         return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
             cause: SessionConsumerClientError::Unavailable,
         });

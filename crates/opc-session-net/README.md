@@ -824,9 +824,11 @@ samples are retained in
 For stateless and persistent V2 calls, `execute_v2` returns the same exact
 effect-boundary error. `NotTransmitted` means the transport proved that zero
 Call-frame bytes were accepted, or received a complete `Rejected(Unavailable)`
-reply with the exact correlation, attempt nonce and request commitment, proving
-that the voter refused before dispatch. This received refusal does not restart
-the transport's connection retry loop. Partial replies, transport loss,
+reply to a transition or batch with the exact correlation, attempt nonce and
+request commitment, proving that the voter refused before dispatch. Void
+operations retain their typed, identity-bearing reply requirement. This
+received refusal does not restart the transport's connection retry loop.
+Partial replies, transport loss,
 uncorrelated replies and results from a voter that may have proposed remain
 unknown for effectful calls. `ReadUnavailable` means a post-write read failed
 for a non-effectful V2 capability/history/status operation and can be retried as
