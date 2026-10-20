@@ -362,7 +362,7 @@ async fn expired_mtls_rpc_broken_pipe_recovers_head_with_original_parent_budget(
         opc_tls::TlsMaterialAvailability::Ready
     );
     eprintln!(
-        "SDK-KJHF: real rpc-write/BrokenPipe; head=80; resolutions=2; parent_remaining={:?}",
+        "late-write recovery: real rpc-write/BrokenPipe; head=80; resolutions=2; parent_remaining={:?}",
         parent_deadline.duration_since(tokio::time::Instant::now())
     );
 
