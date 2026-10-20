@@ -12,6 +12,12 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::{with_borrowed_sqlite_descriptor, with_main_file};
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_READABLE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// A regular file whose descriptor is owned and closed by SQLite.
 ///
 /// Clones share ownership; they never duplicate the OS descriptor. The private
@@ -67,6 +73,12 @@ impl RetainedSqliteFile {
         // substituted symlink, and the descriptor fence below rejects every
         // different inode. No SQL is executed on the newly opened connection.
         let path = std::fs::read_link(format!("/proc/self/fd/{}", expected.as_raw_fd()))?;
+        #[cfg(test)]
+        BEFORE_READABLE_OPEN.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let connection = Connection::open_with_flags_and_vfs(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -149,4 +161,126 @@ fn identity(metadata: &std::fs::Metadata) -> (u64, u64) {
 
 fn unavailable() -> io::Error {
     io::Error::other("SQLite retained file is unavailable")
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn fifo(path: &Path) {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live NUL-terminated pathname; mkfifo retains no pointer.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(result, 0);
+    }
+
+    struct ResetHook;
+
+    impl Drop for ResetHook {
+        fn drop(&mut self) {
+            BEFORE_READABLE_OPEN.with(|hook| {
+                hook.borrow_mut().take();
+            });
+        }
+    }
+
+    #[test]
+    fn retained_pin_rejects_non_regular_before_readable_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo_path = directory.path().join("fifo");
+        fifo(&fifo_path);
+        let socket_path = directory.path().join("socket");
+        let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let link_path = directory.path().join("link");
+        std::os::unix::fs::symlink(&fifo_path, &link_path).unwrap();
+        for path in [directory.path(), &fifo_path, &socket_path, &link_path] {
+            let opened = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = opened.clone();
+            let _reset = ResetHook;
+            BEFORE_READABLE_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || observed.set(true)));
+            });
+            assert!(RetainedSqliteFile::open_nofollow(path).is_err());
+            assert!(!opened.get(), "non-regular input reached the readable open");
+        }
+    }
+
+    #[test]
+    fn retained_pin_fifo_substitution_without_writer_does_not_block() {
+        const CHILD_PATH: &str = "OPC_RETAINED_PIN_FIFO_CHILD_PATH";
+        const READY: &str = "retained-pin-substituted";
+        const TEST: &str =
+            "retained_file::admission_tests::retained_pin_fifo_substitution_without_writer_does_not_block";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = std::path::PathBuf::from(path);
+            let substituted = path.clone();
+            BEFORE_READABLE_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::rename(&substituted, substituted.with_extension("pinned")).unwrap();
+                    fifo(&substituted);
+                    println!("{READY}");
+                    std::io::stdout().flush().unwrap();
+                }));
+            });
+            assert!(RetainedSqliteFile::open_nofollow(&path).is_err());
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database");
+        std::fs::write(&path, []).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env(CHILD_PATH, &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (ready, observed) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            for line in std::io::BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                if line == READY {
+                    ready.send(()).unwrap();
+                }
+                output.push_str(&line);
+                output.push('\n');
+            }
+            output
+        });
+        let substituted = observed.recv_timeout(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let completed = loop {
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if substituted.is_err() || Instant::now() >= deadline {
+                child.kill().unwrap();
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stdout = reader.join().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            substituted.is_ok(),
+            "child never substituted the FIFO: {stdout}\n{stderr}"
+        );
+        assert!(
+            completed,
+            "opening a substituted FIFO without a writer blocked: {stdout}\n{stderr}"
+        );
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+            "isolated FIFO admission must reject exactly once: {stdout}\n{stderr}"
+        );
+    }
 }
