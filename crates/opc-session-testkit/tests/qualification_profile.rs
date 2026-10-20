@@ -1814,7 +1814,7 @@ fn cargo_metadata_matches_the_exact_openraft_and_foundation_feature_profile() {
             "consumer-fixture": ["dep:rcgen", "dep:rustls-pki-types"],
             "default": [],
             "foundation-insecure": ["opc-session-net/insecure-test"],
-            "test-control": ["opc-session-store/test-control"]
+            "test-control": ["opc-session-store/test-control", "opc-session-net/test-control"]
         })
     );
     let foundation_network = testkit["dependencies"]
