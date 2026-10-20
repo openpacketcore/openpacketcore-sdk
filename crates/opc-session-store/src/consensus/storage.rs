@@ -11528,6 +11528,12 @@ mod tests {
     fn fixed_snapshot_seal_waits_for_test_child_descriptor_retirement() {
         use std::io::Write as _;
 
+        const PARENT_PID: &str = "OPC_SNAPSHOT_SEAL_RETIREMENT_PARENT_PID";
+        let fixture_pid = std::process::id();
+        let parent_pid = std::env::var(PARENT_PID)
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(fixture_pid);
+
         let directory = fs_verity_snapshot_tempdir("child-descriptor-seal-");
         let path = directory.path().join("snapshot");
         let writer = std::fs::OpenOptions::new()
@@ -11548,6 +11554,10 @@ mod tests {
         );
         // Model a child paused before exec with the parent's writable open
         // description still retained. CLOEXEC does not close it until exec.
+        assert_ne!(
+            fixture_pid, parent_pid,
+            "the descriptor-retirement write hold must run outside the shared test process"
+        );
         let launch = crate::test_process::SNAPSHOT_PROCESS_FD_GATE
             .write()
             .unwrap();
