@@ -12,9 +12,10 @@
     "main runs on 2026-10-19/20, including isolated commands for that target.",
     "Unlisted measured targets took at most default_weight; future targets use it too.",
     "Fixed weights reserve attached library work (545s on it-0, 461s on it-1).",
-    "The full recovery_profile took 2451s. Its two slices each have an estimated",
-    "1700s runtime budget, plus 800s for compilation/setup (observed max 781s),",
-    "to aim below 70% of the unchanged 60m cap. Remeasure the split on hosted CI.",
+    "The full recovery_profile took 2451s. Its named group includes the longest",
+    "crossed-rekey test and is estimated at 1900s; the remainder is estimated at",
+    "1300s. Reserve 800s for compilation/setup (observed max 781s), placing the",
+    "longest lane near 75% of the unchanged 60m cap. Remeasure on hosted CI.",
     "All recovery matrices keep their original four-thread profile and bounds."
   ],
   "integration_shards": 5,
@@ -27,9 +28,10 @@
     {
       "target": "recovery_profile",
       "shard": "it-4",
-      "weight": 1700,
+      "weight": 1900,
       "tests": [
         "crash::responder_ke_restart_replays_committed_response_and_keys_without_checkpoint",
+        "crossed_tests::crossed_rekey_commits_loser_then_transfers_children_once_and_deletes_only_old_and_loser",
         "handoff_process::atomic_rekey_process_crashes_across_profiles_roles_modes_and_commit_cuts",
         "terminal_process::terminal_checkpoint_process_crashes_across_outcomes_profiles_roles_modes_and_cuts"
       ]
@@ -120,7 +122,7 @@
     "qualification_history_v5": 2,
     "qualification_multiprocess": 96,
     "qualification_profile": 2,
-    "recovery_profile": 1700,
+    "recovery_profile": 1300,
     "required_config_audit": 13,
     "rotation_bootstrap_retirement": 6,
     "rotation_fault_matrix": 28,
@@ -505,24 +507,5 @@
         "caller_deadline_accepts_in_time_and_rejects_late_valid_replies"
       ]
     }
-  ],
-  "_balance_comment": [
-    "2026-10-06 rebalance after #1128 misc exceeded its unchanged 60-minute limit.",
-    "Hosted baseline #1125: https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/37405076185",
-    "Hosted train #1128: https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/37425986614",
-    "The completed train prefix plus the main heavy remainder estimates the old misc job at 3632.5 seconds.",
-    "Moved ordinary groups measured locally with the exact CI workspace selection and Rust 1.99.0: void 168.7s wall / 166.31s harness, async persistence 657.8s / 657.52s, publication failover 230.2s / 229.81s.",
-    "The unchanged exact isolated commands measured in hosted #1128: five void contracts 26.32s; five older contracts 261.66s.",
-    "For misc subtract the moved harness times and hosted isolated command times, then add a 60s reserve. For each destination use the larger baseline/train job time, add moved command time and a 300s compilation reserve.",
-    "These are workload estimates, not job timeouts or a completed hosted rerun; remeasure when the test mix changes."
-  ],
-  "_estimated_hosted_seconds": {
-    "misc": 2351,
-    "quiescent-o1": 1282,
-    "it-0": 1343,
-    "it-1": 843,
-    "it-2": 1452,
-    "heavy-0": 1506,
-    "heavy-1": 950
-  }
+  ]
 }

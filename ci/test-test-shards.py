@@ -485,6 +485,43 @@ class IntegrationBalanceTests(unittest.TestCase):
         )
         self.assertEqual(buckets, TEST_SHARDS.assign(plan, list(reversed(targets))))
 
+    def test_verifier_rejects_mutated_split_commands_from_the_generator(self):
+        plan = TEST_SHARDS.load_plan()
+        targets = TEST_SHARDS.integration_targets()
+        group = plan["integration_groups"][0]
+        original = TEST_SHARDS.integration_commands
+        with patch("sys.stdout", new_callable=io.StringIO):
+            TEST_SHARDS.verify_commands(plan, targets)
+        for remainder in (False, True):
+            for mutation in ("duplicate", "missing-name", "nonexact", "threads", "profile", "neighbor"):
+                def changed(plan, shard, targets):
+                    commands = copy.deepcopy(original(plan, shard, targets))
+                    for index, command in enumerate(commands):
+                        if group["target"] not in command or ("--skip" in command) != remainder:
+                            continue
+                        if mutation == "duplicate":
+                            commands.insert(index, command.copy())
+                        elif mutation == "missing-name":
+                            name_index = command.index(group["tests"][0])
+                            del command[name_index - int(remainder):name_index + 1]
+                        elif mutation == "nonexact":
+                            command.remove("--exact")
+                        elif mutation == "threads":
+                            command[command.index("--test-threads=4")] = "--test-threads=1"
+                        elif mutation == "profile":
+                            commands[index] = ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", *command]
+                        else:
+                            cut = command.index("--")
+                            command[cut:cut] = ["--test", next(name for name in targets
+                                                            if name != group["target"])]
+                        break
+                    return commands
+
+                with self.subTest(remainder=remainder, mutation=mutation), \
+                        patch.object(TEST_SHARDS, "integration_commands", side_effect=changed), \
+                        self.assertRaisesRegex(SystemExit, "split integration"):
+                    TEST_SHARDS.verify_commands(plan, targets)
+
     def test_remainder_filters_cannot_skip_another_targets_same_named_test(self):
         plan = self.plan()
         moved = plan["integration_groups"][0]["tests"][0]

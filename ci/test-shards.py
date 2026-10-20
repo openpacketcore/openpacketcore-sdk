@@ -800,6 +800,23 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
             "the optimized private-lib shard must run its timing contracts "
             "once each, in their declared module-qualified name order"
         )
+    # Build this contract directly from the manifest, not the command helpers
+    # being checked: a generator defect must not change both sides of the audit.
+    buckets = assign(plan, targets)
+    split_targets = {group["target"] for group in plan.get("integration_groups", [])}
+    expected_split = Counter()
+    for shard, names in buckets.items():
+        for target in sorted(split_targets.intersection(names)):
+            skips = [arg for group in plan["integration_groups"] if group["target"] == target
+                     for name in group["tests"] for arg in ("--skip", name)]
+            command = SELECTION + ["--test", target, "--", *HARNESS, "--exact", *skips]
+            expected_split[shard, tuple(command)] += 1
+    for group in plan.get("integration_groups", []):
+        command = SELECTION + [
+            "--test", group["target"], "--", *HARNESS, "--exact", *group["tests"],
+        ]
+        expected_split[group["shard"], tuple(command)] += 1
+    actual_split = Counter()
     metadata = cargo_test_selection.workspace_metadata(ROOT)
     for shard in shard_ids(plan):
         actual = commands(plan, shard, targets)
@@ -814,17 +831,19 @@ def verify_commands(plan: dict, targets: list[str]) -> None:
         expected = (serial if shard == "misc" else []) + extra_lib_commands(plan, shard)
         if library_commands != expected:
             sys.exit(f"{shard} must run every assigned library group exactly once")
-        if shard.startswith("it-"):
-            expected = integration_commands(plan, shard, targets) + extra_lib_commands(plan, shard)
-            if actual != expected:
-                sys.exit(f"{shard} changes the exact integration partition commands")
+        for command in actual:
+            cargo = command[:command.index("--")] if "--" in command else command
+            if any(option == "--test" and target in split_targets
+                   for option, target in zip(cargo, cargo[1:])):
+                actual_split[shard, tuple(command)] += 1
+    if actual_split != expected_split:
+        sys.exit("split integration targets must run each exact remainder and named group once on its assigned shard")
     for index, group in enumerate(plan["heavy"]["shards"]):
         if not group:
             # `--exact` with no names disables filtering, so an empty group
             # would silently re-run the entire heavy target.
             sys.exit(f"heavy-{index} names no tests; remove the group instead")
 
-    buckets = assign(plan, targets)
     declared_names: set[str] = set()
     for target, names, _ in quiescent_contracts():
         if not names:
@@ -1056,7 +1075,7 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
     """
     # Every shard re-checks the plan itself: rust-tests legs start alongside
     # rust-gates rather than after it, so without this a broken plan would
-    # burn seven runners before the gates job reported it.
+    # burn the entire runner matrix before the gates job reported it.
     targets = integration_targets()
     verify(plan, targets)
     if shard == "misc":
