@@ -909,7 +909,7 @@ impl SqliteFilePin {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn read_exact_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt as _;
         match self {
