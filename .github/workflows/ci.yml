@@ -429,6 +429,12 @@ jobs:
           shared-key: opc-rust-libraries
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Check V2 production silence without test-control
+        if: matrix.shard == 0
+        run: |
+          cargo test --locked -p opc-session-net --no-default-features --lib \
+            consumer::tests::v2_diagnostics_tests:: -- --test-threads=1
+
       - name: Run exact library partition
         shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}
         run: |
