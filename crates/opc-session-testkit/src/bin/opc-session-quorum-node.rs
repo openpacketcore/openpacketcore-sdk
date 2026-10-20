@@ -2815,7 +2815,10 @@ impl QualificationNode {
             };
         };
         let replication_head =
-            refresh_traffic_status_for_control(&self.protected, &traffic.observation, budget).await;
+            refresh_traffic_status_for_control(&self.protected, &traffic.observation, || {
+                budget.remaining()
+            })
+            .await;
         self.traffic_status_with_replication_head(replication_head)
     }
 
@@ -4492,10 +4495,14 @@ async fn wait_for_traffic_recovery_retry(deadline: tokio::time::Instant) -> bool
 async fn refresh_traffic_status_for_control<B: TrafficWatchBackend + ?Sized>(
     backend: &B,
     observation: &QualificationTrafficObservation,
-    budget: QualificationTrafficStatusBudget,
+    remaining: impl FnOnce() -> Duration,
 ) -> u64 {
     let recovery_started_at = tokio::time::Instant::now();
-    let deadline = recovery_started_at + budget.remaining();
+    // Sample the shared budget after the local instant so sampling cannot
+    // extend the deadline. An injected sample also keeps paused-clock backend
+    // regressions independent of host scheduling; budget arithmetic and wire
+    // delivery boundaries are tested separately in qualification::control_budget.
+    let deadline = recovery_started_at + remaining();
     refresh_traffic_status_authoritative_head(backend, observation, recovery_started_at, deadline)
         .await
 }
@@ -8651,14 +8658,11 @@ mod tests {
             Some(Duration::from_secs(2)),
         );
         let observation = QualificationTrafficObservation::new(41, 3);
-        let parent_remaining = Duration::from_millis(
-            opc_session_testkit::qualification::QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS,
-        ) + Duration::from_millis(100);
-        let budget = QualificationTrafficStatusBudget::from_parent_deadline(
-            std::time::Instant::now() + parent_remaining,
-        );
         let started = tokio::time::Instant::now();
-        let head = refresh_traffic_status_for_control(&backend, &observation, budget).await;
+        let head = refresh_traffic_status_for_control(&backend, &observation, || {
+            Duration::from_millis(100)
+        })
+        .await;
         assert_eq!(head, 41, "a late head must not become qualified progress");
         assert!(started.elapsed() <= Duration::from_millis(100));
         assert_eq!(backend.head_requests().await, 1);
@@ -8678,14 +8682,9 @@ mod tests {
     async fn traffic_status_parent_budget_exhausted_at_delivery_starts_no_backend_work() {
         let backend = ScriptedTrafficWatchBackend::new([Ok(47)], [], []);
         let observation = QualificationTrafficObservation::new(41, 3);
-        let budget = QualificationTrafficStatusBudget::from_parent_deadline(
-            std::time::Instant::now()
-                + Duration::from_millis(
-                    opc_session_testkit::qualification::QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS,
-                ),
-        );
         let started = tokio::time::Instant::now();
-        let head = refresh_traffic_status_for_control(&backend, &observation, budget).await;
+        let head =
+            refresh_traffic_status_for_control(&backend, &observation, || Duration::ZERO).await;
         assert_eq!(backend.head_requests().await, 0);
         assert_eq!(head, 41);
         assert_eq!(started.elapsed(), Duration::ZERO);
@@ -8704,10 +8703,9 @@ mod tests {
             Some(Duration::from_millis(100)),
         );
         let observation = QualificationTrafficObservation::new(41, 3);
-        let budget = QualificationTrafficStatusBudget::from_parent_deadline(
-            std::time::Instant::now() + Duration::from_secs(2),
-        );
-        let head = refresh_traffic_status_for_control(&backend, &observation, budget).await;
+        let head =
+            refresh_traffic_status_for_control(&backend, &observation, || Duration::from_secs(1))
+                .await;
         assert_eq!(head, 47);
         assert_eq!(backend.head_requests().await, 1);
         assert!(observation.failure().is_none());
