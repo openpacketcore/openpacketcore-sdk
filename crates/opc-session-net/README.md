@@ -574,15 +574,58 @@ rotatable `NotTransmitted` result, and terminalizes the handle.
 
 Receipt-only status is read-only. `status_once` uses the next deterministic
 successor voter, while `status_until_terminal` repeats bounded canonical-roster
-passes under the one immutable caller absolute deadline, with each physical
-attempt capped by the prepared physical-attempt budget. It may finish with a
-deadline rather than a terminal receipt; a `NotFound`, unavailable, or
-per-attempt deadline result remains nonterminal while outer budget remains.
-None of those outcomes proves that a delayed mutation cannot commit. A terminal
-receipt is cached locally. After restart,
+passes under the one immutable caller absolute deadline, with one physical read
+in flight. Admission, setup and Call write retain the physical-attempt cap and
+any earlier configured limit; the response may use the remaining caller
+deadline. Only a reply or a proven pre-write failure permits the next voter.
+A written read without a reply spends the remaining deadline, including when
+its transport closes. There is no speculative failover. Observed revocation is
+terminal, and replies at or after the deadline are dropped. `NotFound`, an
+unavailable reply or a pre-write failure remains nonterminal while budget
+remains. None proves that a delayed mutation cannot commit or clears ambiguity.
+A terminal receipt is cached locally. After restart,
 `recover_fenced_transition_status` returns only
 `SessionConsumerRecoveredFencedTransitionStatus`, which has receipt/status
 authority and deliberately no execution method.
+
+Protected V1/V2 expiry preflights, V2 history reads and prepared CAS/lease
+receipts share this response budget. Prepared checkpoint receipts retain their
+existing separate warmup admission. Mutations keep their existing physical cap.
+Ordinary callers opt in with `get_with_budget`,
+`preflight_record_expiry_with_budget`, or
+`fenced_transition_v2_history_state_with_budget`, passing their existing
+`PreparedCheckpointBudget` and any earlier lease deadline. These narrow methods
+cannot submit a transition, batch or void. Their response wait follows the
+caller budget, including when that deadline exceeds the legacy 10-second
+operation ceiling; transport lifecycle retirement still applies. Legacy read
+methods without a caller deadline retain their configured operation timeout.
+Prepared CAS/lease receipts classify observed authority rejection as terminal
+`TopologyAuthorityRevoked` and cache that result. Budget-bearing GET/expiry
+reads preserve their legacy wire-rejection mapping, including `Unauthorized`
+to `BackendUnavailable`. Both split-deadline transports reject operations
+outside their closed set of reads before admission or setup.
+
+When a pool has at least two request lanes, extended reads share at most all
+but one of its existing lanes and total-admission slots across V1 and V2.
+The remaining capacity stays available to ordinary calls and mutations. Read
+queueing uses the same original pre-write and pool-wait limits; a proven
+pre-write refusal permits a quorum caller to try its next voter. A written
+read still waits for its original response deadline. No connection or queue
+bound is increased. A one-lane configuration remains usable, but cannot
+reserve a separate lane for competing calls.
+
+Background reclamation keeps its bounded per-voter wait and can advance past
+a silent voter within the original sweep budget. It has no ingress caller's
+response deadline to preserve. Activation's optional history-cache priming
+uses the configured operation timeout. Caller-driven preparation, recovery
+and deferred resume retain the caller's original read deadline.
+
+The local protected V2 journal reports
+`StoreError::FencedTransitionRecoveryJournalUnavailable`. It remains distinct
+from a journal held by another live owner and from remote unavailability; wire
+errors map it to ordinary unavailability. This condition alone does not permit
+another preparation. Callers must still prove absence of the exact retained
+identity through the journal's ordered lookup within the original budget.
 
 `observe_fenced_transition` is the facade's separate read-only recovery
 surface. It reads one exact record head and durable fence floor through the
@@ -661,8 +704,10 @@ backoff deadline plus bounded jitter;
 waiting callers do not create per-caller resolver/TCP/TLS/Hello storms. With
 two attempts the first backoff floor is 50 ms by default plus at most 25 ms
 jitter, clipped to its logical deadline. The existing 5-second idle,
-10-second operation, 16 MiB frame, 256-server-connection, and TLS lifecycle
-bounds remain in force; shutdown drain is at most 5 seconds.
+16 MiB frame, 256-server-connection, and TLS lifecycle bounds remain in force;
+shutdown drain is at most 5 seconds. Ordinary calls retain the 10-second
+operation ceiling. Budget-bearing read responses instead use their caller's
+original deadline, as described above.
 One constant pool-wide maintenance task (not one task per lane or subscriber)
 physically retires cached lanes at the earliest idle/lifecycle deadline.
 An accepted material-epoch change schedules each already-admitted lane on a

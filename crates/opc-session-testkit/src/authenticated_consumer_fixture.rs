@@ -1933,6 +1933,16 @@ async fn start_fixture_listener(
 /// Response-loss decorator around the real store-owned quorum service.
 struct FixtureConsumer {
     inner: Arc<dyn SessionQuorumConsumer>,
+    #[cfg(test)]
+    reply_clock: Mutex<Option<tokio::sync::mpsc::UnboundedSender<FixtureReplyHold>>>,
+    #[cfg(test)]
+    reply_holds: [std::sync::atomic::AtomicU64; 10],
+    #[cfg(test)]
+    held_replies: [AtomicUsize; 10],
+    #[cfg(test)]
+    held_reply_started: [tokio::sync::Notify; 10],
+    #[cfg(test)]
+    reply_gates: [Mutex<Option<Arc<tokio::sync::Semaphore>>>; 10],
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
@@ -1948,6 +1958,10 @@ struct FixtureConsumer {
     last_fenced_transition_v2_request: Mutex<Option<opc_session_store::FencedTransitionV2Request>>,
     #[cfg(test)]
     stall_fenced_transition_v2_status: AtomicBool,
+    #[cfg(test)]
+    stall_fenced_transition_v2_history_state: AtomicBool,
+    #[cfg(test)]
+    fenced_transition_v2_history_state_stalled: tokio::sync::Notify,
     #[cfg(test)]
     fenced_transition_v2_status_fault: std::sync::atomic::AtomicU8,
     #[cfg(test)]
@@ -1981,6 +1995,16 @@ impl FixtureConsumer {
     ) -> Self {
         Self {
             inner,
+            #[cfg(test)]
+            reply_clock: Mutex::new(None),
+            #[cfg(test)]
+            reply_holds: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            held_replies: std::array::from_fn(|_| AtomicUsize::new(0)),
+            #[cfg(test)]
+            held_reply_started: std::array::from_fn(|_| tokio::sync::Notify::new()),
+            #[cfg(test)]
+            reply_gates: std::array::from_fn(|_| Mutex::new(None)),
             lose_next_fenced_transition_response,
             lose_next_fenced_transition_v2_response,
             fenced_transition_status_misses_remaining,
@@ -1996,6 +2020,10 @@ impl FixtureConsumer {
             last_fenced_transition_v2_request: Mutex::new(None),
             #[cfg(test)]
             stall_fenced_transition_v2_status: AtomicBool::new(false),
+            #[cfg(test)]
+            stall_fenced_transition_v2_history_state: AtomicBool::new(false),
+            #[cfg(test)]
+            fenced_transition_v2_history_state_stalled: tokio::sync::Notify::new(),
             #[cfg(test)]
             fenced_transition_v2_status_fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
@@ -2018,6 +2046,41 @@ impl FixtureConsumer {
             voter,
         }
     }
+
+    /// Hold only a successful response produced by the real quorum service.
+    #[cfg(test)]
+    async fn hold_reply(&self, kind: usize) {
+        let millis = self.reply_holds[kind].load(Ordering::Acquire);
+        let gate = self.reply_gates[kind].lock().unwrap().clone();
+        let clock = self.reply_clock.lock().unwrap().clone();
+        if millis != 0 || gate.is_some() {
+            self.held_replies[kind].fetch_add(1, Ordering::SeqCst);
+            self.held_reply_started[kind].notify_one();
+            if let Some(clock) = clock {
+                let (release, released) = tokio::sync::oneshot::channel();
+                // The same hold duration runs on the controlled client clock.
+                // The actual quorum operation above remains on the voter runtime.
+                // A dropped receiver only cancels fixture teardown after a failure.
+                let _ = clock.send(FixtureReplyHold {
+                    kind,
+                    delay: Duration::from_millis(millis),
+                    release,
+                });
+                let _ = released.await;
+            } else if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            } else {
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+struct FixtureReplyHold {
+    kind: usize,
+    delay: Duration,
+    release: tokio::sync::oneshot::Sender<()>,
 }
 
 #[async_trait]
@@ -2053,6 +2116,19 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .fetch_add(1, Ordering::SeqCst);
         }
         let response = self.inner.execute(authorization, request).await;
+        #[cfg(test)]
+        match &response {
+            SessionConsumerResponse::Get(Ok(_)) => self.hold_reply(0).await,
+            SessionConsumerResponse::PreflightRecordExpiry(Ok(())) => self.hold_reply(1).await,
+            SessionConsumerResponse::FencedTransitionStatus(Ok(_)) => self.hold_reply(5).await,
+            SessionConsumerResponse::CompareAndSetStatus(Ok(_)) => self.hold_reply(6).await,
+            SessionConsumerResponse::LeaseMutationStatus(Ok(_)) => self.hold_reply(7).await,
+            SessionConsumerResponse::CompareAndSet(Ok(CompareAndSetResult::Success)) => {
+                self.hold_reply(8).await;
+            }
+            SessionConsumerResponse::AcquireLease(Ok(_)) => self.hold_reply(9).await,
+            _ => {}
+        }
         if let Some(gate) = ordinary_fault {
             match ordinary_call {
                 FixtureOrdinaryCasCall::Mutation if gate.observe_committed_success(&response) => {
@@ -2200,6 +2276,14 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .fetch_add(1, Ordering::SeqCst);
             #[cfg(test)]
             if self
+                .stall_fenced_transition_v2_history_state
+                .load(Ordering::Acquire)
+            {
+                self.fenced_transition_v2_history_state_stalled.notify_one();
+                std::future::pending::<()>().await;
+            }
+            #[cfg(test)]
+            if self
                 .fail_next_fenced_transition_v2_history_state
                 .swap(false, Ordering::AcqRel)
             {
@@ -2209,6 +2293,17 @@ impl SessionQuorumConsumer for FixtureConsumer {
             }
         }
         let response = self.inner.execute_v2(authorization, request).await;
+        #[cfg(test)]
+        match &response {
+            SessionConsumerV2Response::FencedTransitionV2HistoryState(Ok(_)) => {
+                self.hold_reply(2).await;
+            }
+            SessionConsumerV2Response::FencedTransitionV2Status(Ok(_)) => {
+                self.hold_reply(3).await;
+            }
+            SessionConsumerV2Response::FencedTransitionV2(Ok(_)) => self.hold_reply(4).await,
+            _ => {}
+        }
         #[cfg(test)]
         if matches!(
             &response,

@@ -40,6 +40,8 @@ rcgen = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Native clock tests observe reconnect waits without changing their deadlines.
+opc-session-net = { path = "../opc-session-net", version = "0.2.0", features = ["test-control"] }
 # Scripted election negative controls are confined to this crate's tests.
 opc-session-store = { path = "../opc-session-store", version = "0.2.0", features = ["test-control"] }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0", features = ["dangerous-test-hooks"] }

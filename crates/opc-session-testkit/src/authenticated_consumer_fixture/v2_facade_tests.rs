@@ -31,6 +31,7 @@ use opc_types::{NetworkFunctionKind, TenantId};
 use super::*;
 
 mod lease_deferral_tests;
+mod read_deadline_tests;
 mod void_tests;
 
 const PAYLOAD: &[u8] = b"fixture-v2-facade-payload";

@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a fresh installation with no migration; consumer manifest publication and
   automatic replacement remain required before advertising the capability.
 
+- `opc-session-store`: add the local-only
+  `StoreError::FencedTransitionRecoveryJournalUnavailable` variant; exhaustive
+  matches must handle it. Existing serialized discriminants remain unchanged,
+  and consumer wire errors continue to expose ordinary unavailability. The
+  typed condition alone grants no preparation retry or proof of non-execution.
+
 - `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
   `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
   must handle both variants. (#1334)
@@ -817,6 +823,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-egress-fence`: keep empty and truncated L3 vectors in the independent
   object oracle executable on kernels that reject short IP test-run transport
   headers. Preserve the exact packet bytes and every gate assertion.
+- `opc-session-net`: preserve valid slow quorum replies until the caller's
+  original deadline for protected history, expiry and receipt reads, including
+  prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight
+  and V2 history methods also bypass the ordinary response timeout. Setup and
+  Call write keep their existing caps, mutations keep their physical budgets,
+  and an unanswered written caller read cannot trigger speculative voter
+  failover. Reject successful V2 replies delivered to the caller at or after
+  its original deadline, while preserving terminal authority revocation.
+  Background reclamation keeps bounded per-voter waits and failover;
+  activation history priming uses the configured operation timeout.
+  Prepared CAS/lease receipts classify authenticated authority rejection as
+  terminal `TopologyAuthorityRevoked` and cache it. Budget-bearing GET/expiry
+  reads preserve the legacy wire-rejection mapping. Both split-deadline
+  transports enforce a read-only operation guard before admission or setup.
+  In pools with at least two lanes, extended V1/V2 reads reserve one existing
+  lane and admission slot for other calls, preserving their bounded queues
+  and deadlines without increasing the connection cap.
 
 - `opc-session-store`: register the accepted-proposal fixture's watch on its
   store's controlled clock before the timeout proof, keeping the original
