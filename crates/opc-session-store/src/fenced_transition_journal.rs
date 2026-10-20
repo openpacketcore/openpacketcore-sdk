@@ -490,7 +490,7 @@ struct SecureJournalFileIdentity {
 struct SecureJournalOpenLease {
     identity: SecureJournalFileIdentity,
     #[cfg(test)]
-    after_release: Option<Box<dyn FnOnce() + Send>>,
+    after_release: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 /// SDK-owned durable binding of transition IDs to opaque prepared requests.

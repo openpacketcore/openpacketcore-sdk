@@ -8439,7 +8439,7 @@ fn prepare_staged_database(
         .metadata()
         .map_err(|_| RecoveryError::FileOperationFailed)?
         .len();
-    let temporary_file = copy_file_bounded_from(&mut staged.file, &temporary, max)?;
+    let temporary_file = copy_file_bounded_from(&staged.file, &temporary, max)?;
     let conn = open_read_write_pinned(&temporary_file)?;
     ops::rotate_restore_scan_incarnation_sync(&conn)
         .map_err(|_| RecoveryError::FileOperationFailed)?;
@@ -11660,7 +11660,7 @@ fn open_read_write_created(_writer: &File) -> Result<Connection, RecoveryError> 
 }
 
 fn copy_file_bounded_from(
-    source_file: &mut File,
+    mut source_file: &File,
     destination: &Path,
     max: u64,
 ) -> Result<PinnedSnapshotFile, RecoveryError> {

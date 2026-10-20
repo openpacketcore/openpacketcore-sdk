@@ -71,6 +71,7 @@ impl RetainedSqliteFile {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
             "unix",
         )

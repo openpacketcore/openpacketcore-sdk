@@ -109,3 +109,38 @@ fn rollback_journal_recovery_pin_retirement_preserves_sqlite_record_locks() {
     drop(connection);
     probe::assert_state(&path, TEST, false, "after final connection shutdown");
 }
+
+#[test]
+fn recovery_portable_pin_retirement_preserves_sqlite_record_locks() {
+    const TEST: &str = "recovery::sqlite::descriptor_locks::recovery_portable_pin_retirement_preserves_sqlite_record_locks";
+    if probe::child() {
+        return;
+    }
+    let (_directory, path, connection, mut source) = fixture();
+    // The verification source must retain the same close owner even when an
+    // independent SQLite connection holds a lock on the captured inode.
+    source
+        .admit_fixed_integrity(
+            SnapshotIntegrityPolicy::PortableVerified,
+            SNAPSHOT_DATABASE_MAX_BYTES,
+        )
+        .unwrap();
+    assert!(source.portable.is_some());
+    probe::begin(&connection);
+    probe::assert_state(
+        &path,
+        TEST,
+        true,
+        "before final portable recovery pin retirement",
+    );
+    drop(source);
+    probe::assert_state(
+        &path,
+        TEST,
+        true,
+        "after final portable recovery pin retirement",
+    );
+    connection.execute_batch("ROLLBACK;").unwrap();
+    drop(connection);
+    probe::assert_state(&path, TEST, false, "after final connection shutdown");
+}
