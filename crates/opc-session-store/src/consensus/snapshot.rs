@@ -809,6 +809,58 @@ pub(crate) enum SqliteFilePin {
     Database(opc_sqlite_file_control_sys::RetainedSqliteFile),
 }
 
+/// Read and inspect either an ordinary file or a managed database pin without
+/// exposing descriptor duplication or close authority to shared callers.
+pub(crate) trait SqliteFileRead {
+    fn file_metadata(&self) -> io::Result<std::fs::Metadata>;
+    fn read_bytes(&self, buffer: &mut [u8]) -> io::Result<usize>;
+    fn seek_bytes(&self, position: io::SeekFrom) -> io::Result<u64>;
+    #[cfg(target_os = "linux")]
+    fn borrow_descriptor(&self) -> std::os::fd::BorrowedFd<'_>;
+}
+
+impl SqliteFileRead for std::fs::File {
+    fn file_metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.metadata()
+    }
+
+    fn read_bytes(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut reader = self;
+        reader.read(buffer)
+    }
+
+    fn seek_bytes(&self, position: io::SeekFrom) -> io::Result<u64> {
+        let mut reader = self;
+        reader.seek(position)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn borrow_descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.as_fd()
+    }
+}
+
+impl SqliteFileRead for SqliteFilePin {
+    fn file_metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.metadata()
+    }
+
+    fn read_bytes(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut reader = self;
+        reader.read(buffer)
+    }
+
+    fn seek_bytes(&self, position: io::SeekFrom) -> io::Result<u64> {
+        let mut reader = self;
+        reader.seek(position)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn borrow_descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.as_fd()
+    }
+}
+
 impl SqliteFilePin {
     pub(crate) fn from_connection(connection: &rusqlite::Connection) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
@@ -880,7 +932,20 @@ impl SqliteFilePin {
     }
 
     pub(crate) fn sync_all(&self) -> io::Result<()> {
-        self.artifact()?.sync_all()
+        match self {
+            Self::Artifact(file) => file.sync_all(),
+            #[cfg(target_os = "linux")]
+            Self::Database(file) => file.sync_all(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sync_data(&self) -> io::Result<()> {
+        match self {
+            Self::Artifact(file) => file.sync_data(),
+            #[cfg(target_os = "linux")]
+            Self::Database(file) => file.sync_data(),
+        }
     }
 
     pub(crate) fn into_artifact(self) -> io::Result<std::fs::File> {
@@ -927,9 +992,15 @@ impl io::Read for SqliteFilePin {
 impl io::Read for &SqliteFilePin {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
-            SqliteFilePin::Artifact(file) => (&*file).read(buffer),
+            SqliteFilePin::Artifact(file) => {
+                let mut reader = file;
+                reader.read(buffer)
+            }
             #[cfg(target_os = "linux")]
-            SqliteFilePin::Database(file) => (&*file).read(buffer),
+            SqliteFilePin::Database(file) => {
+                let mut reader = file;
+                reader.read(buffer)
+            }
         }
     }
 }
@@ -943,9 +1014,15 @@ impl io::Seek for SqliteFilePin {
 impl io::Seek for &SqliteFilePin {
     fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
         match self {
-            SqliteFilePin::Artifact(file) => (&*file).seek(position),
+            SqliteFilePin::Artifact(file) => {
+                let mut reader = file;
+                reader.seek(position)
+            }
             #[cfg(target_os = "linux")]
-            SqliteFilePin::Database(file) => (&*file).seek(position),
+            SqliteFilePin::Database(file) => {
+                let mut reader = file;
+                reader.seek(position)
+            }
         }
     }
 }
@@ -957,6 +1034,16 @@ impl io::Write for &SqliteFilePin {
 
     fn flush(&mut self) -> io::Result<()> {
         self.artifact()?.flush()
+    }
+}
+
+impl io::Write for SqliteFilePin {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        io::Write::write(&mut &*self, buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::Write::flush(&mut &*self)
     }
 }
 

@@ -596,8 +596,9 @@ impl VerifiedSnapshotSource for VerifiedFile {
         self.file.try_clone()?.into_artifact()
     }
 
-    fn borrowed_file(&self) -> io::Result<&File> {
-        Ok(&self.file)
+    fn borrowed_descriptor(&self) -> io::Result<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd as _;
+        Ok(self.file.as_fd())
     }
 
     fn file_identity(&self) -> io::Result<(u64, u64)> {
@@ -681,6 +682,7 @@ mod journal_page_memory_tests;
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::os::unix::fs::FileExt as _;
 
     #[test]
     fn verification_reservation_split_preserves_total_until_each_owner_drops() {

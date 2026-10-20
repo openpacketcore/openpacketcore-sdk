@@ -820,6 +820,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: hash terminal snapshot envelopes through the retained
+  reader without duplicating and closing its descriptor, preserving SQLite
+  record locks. Managed pins expose narrow read and identity operations.
+
 - `opc-session-store`: retain the whole recovery journal owner in queued
   operations, keeping its admission lease until all predecessor descriptors
   retire even when a cancelled worker fails before running its operation.
@@ -849,7 +853,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-store`: synchronize unit-test snapshot namespace reopen with
   child descriptor retirement, preventing inherited sockets from causing
   spurious `EADDRINUSE` while preserving live-owner exclusion checks.
-
 
 - `opc-session-store`: preserve SQLite's POSIX record locks while checking
   snapshot, checkpoint and recovery file identities, reopening databases,

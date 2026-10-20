@@ -143,6 +143,16 @@ impl RetainedSqliteFile {
     pub fn read_exact_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<()> {
         self.file().read_exact_at(buffer, offset)
     }
+
+    /// Synchronize this inode without transferring or duplicating its handle.
+    pub fn sync_all(&self) -> io::Result<()> {
+        self.file().sync_all()
+    }
+
+    /// Synchronize data without transferring or duplicating the handle.
+    pub fn sync_data(&self) -> io::Result<()> {
+        self.file().sync_data()
+    }
 }
 
 /// Borrow only for descriptor operations that do not duplicate or close it.

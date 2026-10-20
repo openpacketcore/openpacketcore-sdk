@@ -589,8 +589,17 @@ fn with_sqlite_file<T>(
         return Err(FileControlError);
     }
     let result = if let Some(source) = verified_snapshot::retained_source(connection, database)? {
+        use std::os::fd::AsRawFd as _;
+
         source.validate().map_err(|_| FileControlError)?;
-        let result = inspect(source.borrowed_file().map_err(|_| FileControlError)?);
+        let descriptor = source.borrowed_descriptor().map_err(|_| FileControlError)?;
+        let file = std::mem::ManuallyDrop::new(
+            // SAFETY: source retains this borrowed descriptor throughout the
+            // synchronous callback. ManuallyDrop prevents any close, including
+            // on unwind. The File reference cannot escape this inspection.
+            unsafe { std::fs::File::from_raw_fd(descriptor.as_raw_fd()) },
+        );
+        let result = inspect(&file);
         source.validate().map_err(|_| FileControlError)?;
         result
     } else {

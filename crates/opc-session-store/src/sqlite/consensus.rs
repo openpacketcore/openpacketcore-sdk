@@ -54,7 +54,9 @@ use crate::backend::{
     ReplicationTxId, REPLICATION_TX_ID_MAX_BYTES, REPLICATION_TX_ID_MIN_BYTES,
 };
 use crate::capability::BackendCapabilities;
-use crate::consensus::snapshot::{SNAPSHOT_DATABASE_MAX_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES};
+use crate::consensus::snapshot::{
+    SqliteFileRead, SNAPSHOT_DATABASE_MAX_BYTES, SNAPSHOT_ENVELOPE_MAX_BYTES,
+};
 use crate::consensus::storage::{ConsensusAuthorityProfile, SessionConsensusStorageError};
 use crate::consensus::store::{CapabilityActivationKind, ConsensusStoreDiagnosticCounters};
 use crate::consensus::types::{
@@ -640,7 +642,7 @@ pub(crate) enum LiveTerminalRecoveryHandoffProbe {
 
 pub(crate) fn operator_recovery_terminal_snapshot(
     path: &Path,
-    file: &File,
+    file: &impl SqliteFileRead,
     fixed_immutable: bool,
 ) -> io::Result<OperatorRecoveryTerminalSnapshot> {
     #[cfg(unix)]
@@ -1088,9 +1090,9 @@ fn force_persistent_identity_failure_for_test(
 }
 
 #[cfg(target_os = "linux")]
-fn operator_recovery_file_incarnation(file: &File) -> io::Result<OperatorRecoveryFileIncarnation> {
-    use std::os::fd::AsFd as _;
-
+fn operator_recovery_file_incarnation(
+    file: &impl SqliteFileRead,
+) -> io::Result<OperatorRecoveryFileIncarnation> {
     #[cfg(test)]
     if let Some(failure) = FORCED_PERSISTENT_IDENTITY_FAILURE.with(|forced| forced.get()) {
         let message = match failure {
@@ -1111,7 +1113,7 @@ fn operator_recovery_file_incarnation(file: &File) -> io::Result<OperatorRecover
     }
 
     let persistent =
-        opc_fs_verity_sys::persistent_file_identity(file.as_fd()).map_err(|error| {
+        opc_fs_verity_sys::persistent_file_identity(file.borrow_descriptor()).map_err(|error| {
             let message = match error.persistent_file_identity_failure() {
                 opc_fs_verity_sys::PersistentFileIdentityFailure::FilesystemUuidUnsupported => {
                     "session operator recovery database incarnation is unavailable (filesystem-uuid-unsupported)"
@@ -1147,7 +1149,9 @@ fn operator_recovery_file_incarnation(file: &File) -> io::Result<OperatorRecover
 }
 
 #[cfg(not(target_os = "linux"))]
-fn operator_recovery_file_incarnation(_file: &File) -> io::Result<OperatorRecoveryFileIncarnation> {
+fn operator_recovery_file_incarnation(
+    _file: &impl SqliteFileRead,
+) -> io::Result<OperatorRecoveryFileIncarnation> {
     Err(invalid_data(
         "session operator recovery terminal is unsupported",
     ))
@@ -1268,17 +1272,16 @@ fn terminal_snapshot_is_coherent(
 /// handoff capacity bound.  This intentionally does not use recovery's
 /// domain-separated workflow digest: normal startup consumes raw envelope
 /// bytes and terminal evidence must bind those same bytes.
-fn terminal_snapshot_raw_digest(file: &File) -> io::Result<[u8; 32]> {
-    let mut reader = file.try_clone()?;
-    // `try_clone` duplicates the descriptor but not its open-file
-    // description. Classification, recovery, or storage may have consumed
-    // the shared cursor already, so always rewind this exact retained inode.
-    reader.seek(SeekFrom::Start(0))?;
+fn terminal_snapshot_raw_digest(file: &impl SqliteFileRead) -> io::Result<[u8; 32]> {
+    // Borrow the retained reader: closing a raw duplicate would release every
+    // POSIX lock on this inode. Classification or recovery may have consumed
+    // the shared cursor already, so rewind it before hashing the envelope.
+    file.seek_bytes(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = file.read_bytes(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -1730,7 +1733,7 @@ pub(crate) fn active_operator_recovery_latch_sync(
 pub(crate) fn operator_recovery_latch_phase_sync(
     database: &Path,
     expected: OperatorRecoveryLatch,
-    database_file: &File,
+    database_file: &impl SqliteFileRead,
     expected_snapshot: Option<Option<&OperatorRecoveryTerminalSnapshot>>,
 ) -> io::Result<OperatorRecoveryLatchPhase> {
     let database_incarnation = operator_recovery_file_incarnation(database_file)?;
@@ -2364,7 +2367,7 @@ pub(crate) fn set_operator_recovery_latch_audit_pending_sync(
 pub(crate) fn terminalize_operator_recovery_latch_sync(
     database: &Path,
     expected: OperatorRecoveryLatch,
-    database_file: &File,
+    database_file: &impl SqliteFileRead,
     snapshot: Option<OperatorRecoveryTerminalSnapshot>,
 ) -> io::Result<()> {
     let mut pinned = match read_operator_recovery_latch_record_pinned(database)? {
@@ -2469,10 +2472,13 @@ fn revalidate_terminal_database_path_binding(
 /// comparisons separately retain the filesystem UUID and opaque file handle;
 /// metadata alone is never accepted as persistent recovery identity.
 #[cfg(target_os = "linux")]
-fn revalidate_database_path_binding(database: &Path, database_file: &File) -> io::Result<()> {
+fn revalidate_database_path_binding(
+    database: &Path,
+    database_file: &impl SqliteFileRead,
+) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let descriptor_metadata = database_file.metadata()?;
+    let descriptor_metadata = database_file.file_metadata()?;
     let path_metadata = std::fs::symlink_metadata(database)?;
     if !descriptor_metadata.is_file()
         || !path_metadata.is_file()
@@ -2487,7 +2493,10 @@ fn revalidate_database_path_binding(database: &Path, database_file: &File) -> io
 }
 
 #[cfg(not(target_os = "linux"))]
-fn revalidate_database_path_binding(_database: &Path, _database_file: &File) -> io::Result<()> {
+fn revalidate_database_path_binding(
+    _database: &Path,
+    _database_file: &impl SqliteFileRead,
+) -> io::Result<()> {
     Err(invalid_data(
         "session operator recovery descriptor binding is unsupported",
     ))
@@ -46041,6 +46050,8 @@ mod tests {
             .expect("create sparse source descriptor");
         source
             .file()
+            .artifact()
+            .expect("sparse source is an ordinary staging artifact")
             .set_len(SNAPSHOT_DATABASE_MAX_BYTES + 1)
             .expect("make sparse C+1 source without reserving disk blocks");
         let compacted = create_pinned_snapshot_database(&directory.path().join("target.sqlite"))

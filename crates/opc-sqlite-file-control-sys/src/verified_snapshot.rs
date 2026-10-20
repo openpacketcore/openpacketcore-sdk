@@ -42,14 +42,14 @@ pub trait VerifiedSnapshotSource: Send + Sync + 'static {
     /// Duplicate the held descriptor for identity inspection, not content I/O.
     fn duplicate_descriptor(&self) -> io::Result<File>;
 
-    /// Borrow the retained file for descriptor-bound filesystem identity
+    /// Borrow the retained descriptor for filesystem identity
     /// inspection. The source keeps close authority; callers must not duplicate
     /// or close the descriptor. Unsupported sources fail closed.
     #[cfg(feature = "borrowed-file-identity")]
-    fn borrowed_file(&self) -> io::Result<&File> {
+    fn borrowed_descriptor(&self) -> io::Result<std::os::fd::BorrowedFd<'_>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "snapshot source has no borrowed file",
+            "snapshot source has no borrowed descriptor",
         ))
     }
 
