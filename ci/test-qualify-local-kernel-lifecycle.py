@@ -569,6 +569,52 @@ class WorkflowTests(unittest.TestCase):
         "OPC_GTPU_SIBLING_SCAN_PROVEN site=legacy_artifact_owner",
         "OPC_GTPU_SIBLING_SCAN_PROVEN site=workload_references",
     ]
+    NATIVE_GTPU_DATAPATH_MARKERS = [
+        "OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN",
+        "OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN",
+        "OPC_GTPU_TFT_IPV4_LIVE_PROVEN",
+        "OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:",
+        "OPC_GTPU_TFT_REMOVAL_CONTINUITY_PROVEN:",
+        "OPC_GTPU_TFT_FRAGMENT_ESP_PAIR_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_EXACT_KEY_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_CONFLICTING_FIRST_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_OVERLAP_AND_RANGE_BOUND_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_CLASSIFIER_IDENTITY_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_LIFECYCLE_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_MALFORMED_RETAINED_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_EXPIRY_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_AUTHORITY_REVOCATION_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_CAPACITY_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_CROSS_ATTACHMENT_PROVEN",
+        "OPC_GTPU_TFT_FRAGMENT_PORT_ONLY_CONTROL_PROVEN",
+        "OPC_GTPU_REQUIRED_EXTENSION_CONTROL_PROVEN:",
+        "OPC_GTPU_UNKNOWN_TEID_CONTROL_PROVEN:",
+        "OPC_GTPU_BACKEND_CONTROL_LIFETIME_PROVEN:",
+        "OPC_GTPU_BACKEND_GROUPED_CONTROL_PROVEN:",
+        "OPC_GTPU_BACKEND_REASSEMBLY_CONSUMER_PROVEN:",
+        "OPC_GTPU_BACKEND_GROUPED_REASSEMBLY_CONSUMER_PROVEN:",
+        "OPC_GTPU_BACKEND_CONSUMER_CHURN_PROVEN:",
+        "OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_PROVEN:",
+        "OPC_GTPU_DOWNLINK_PACKET_TOO_BIG_BASELINE_PROVEN:",
+        "OPC_GTPU_DOWNLINK_INNER_FRAGMENTATION_PROVEN:",
+        "OPC_GTPU_DOWNLINK_INNER_FRAGMENT_HAND_OFF_PROVEN:",
+        "OPC_GTPU_DOWNLINK_HAND_OFF_CONSUMER_PROVEN:",
+        "OPC_GTPU_DOWNLINK_HAND_OFF_VRF_PROVEN:",
+        "OPC_GTPU_ATTACHMENT_RECEIVE_INTERFACE_PROVEN:",
+        "OPC_GTPU_ATTACHMENT_LEAF_MATRIX_COMPLETE: cases=12 ",
+        "OPC_GTPU_ATTACHMENT_BELOW_STACKED_DEVICE_PROVEN:",
+        "OPC_GTPU_ATTACHMENT_BELOW_MACVLAN_IN_VRF_PROVEN:",
+        "OPC_GTPU_DOWNLINK_VLAN_FRAMES_PROVEN:",
+        "OPC_GTPU_BACKEND_ORDINARY_IPV6_REASSEMBLY_CONSUMER_PROVEN:",
+        "OPC_GTPU_N3_FIXED_FLOW_PROVEN:",
+        "OPC_GTPU_N3_END_MARKER_PROVEN:",
+        "OPC_GTPU_TRAFFIC_CONTINUITY_PROOF_PROVEN",
+        "OPC_GTPU_TRAFFIC_CONTINUITY_IPV6_PROOF_PROVEN",
+        "OPC_GTPU_ORDINARY_INNER_IPV6_PROVEN",
+        "OPC_GTPU_ORDINARY_INNER_IPV6_CLEANUP_PROVEN",
+        "OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN",
+        "OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN",
+    ]
 
     def test_native_gtpu_jobs_build_in_their_cached_target(self):
         jobs = workflow_jobs("gtpu-privileged.yml")
@@ -685,10 +731,16 @@ class WorkflowTests(unittest.TestCase):
 
     def test_native_gtpu_proof_checks_reject_incomplete_or_skipped_runs(self):
         jobs = workflow_jobs("gtpu-privileged.yml")
+        self.assertEqual(len(set(self.NATIVE_GTPU_DATAPATH_MARKERS)), 44)
+        leaf_markers = [f"OPC_GTPU_ATTACHMENT_LEAF_PASSED: kind={kind} case={case} "
+                        for kind in ("macvlan", "ipvlan", "veth")
+                        for case in ("plain", "vrf", "collision", "siblings")]
         for job, step_name, count, markers in [
             ("privileged-gtpu-regressions", "Prove eBPF kernel provenance and recovery", 14,
              self.NATIVE_GTPU_PROVENANCE_MARKERS),
             ("privileged-gtpu-resets", "Prove workload resets in a fresh netns", 21, []),
+            ("privileged-gtpu", "Run privileged eBPF GTP-U datapath test in a fresh netns", 60,
+             self.NATIVE_GTPU_DATAPATH_MARKERS + leaf_markers),
         ]:
             steps = re.split(r"^      - name: ", jobs[job], flags=re.M)[1:]
             step = next(step for step in steps if step.startswith(step_name + "\n"))
@@ -708,6 +760,9 @@ class WorkflowTests(unittest.TestCase):
             if job == "privileged-gtpu-resets":
                 cases += [(f"only-{family}", success.replace("21 passed", f"{family_count} passed"), False)
                           for family, family_count in [("strict", 13), ("exclusive", 8)]]
+            if job == "privileged-gtpu":
+                cases += [("duplicate-" + marker, success + marker + "\n", False)
+                          for marker in leaf_markers]
             with tempfile.TemporaryDirectory() as directory:
                 log = Path(directory) / "proof.log"
                 for case, output, passed in cases:
