@@ -167,9 +167,40 @@ const SQLITE_WORK_RUNNING: u8 = 0;
 const SQLITE_WORK_CANCELLED: u8 = 1;
 const SQLITE_WORK_COMMITTING: u8 = 2;
 
+/// Keep each deadline with its clock. Async worker budgets use the caller's
+/// runtime; synchronous retained-store admission uses real elapsed time.
+enum SqliteWorkDeadline {
+    Tokio {
+        at: tokio::time::Instant,
+        clock: tokio::runtime::Handle,
+    },
+    RealTime(std::time::Instant),
+}
+
+impl SqliteWorkDeadline {
+    fn tokio(at: tokio::time::Instant) -> Self {
+        Self::Tokio {
+            at,
+            clock: tokio::runtime::Handle::current(),
+        }
+    }
+
+    fn is_elapsed(&self) -> bool {
+        match self {
+            Self::Tokio { at, clock } => {
+                // SQLite callbacks may run on a blocking thread. Retain the
+                // originating runtime's clock even outside its entered context.
+                let _entered = clock.enter();
+                tokio::time::Instant::now() >= *at
+            }
+            Self::RealTime(at) => std::time::Instant::now() >= *at,
+        }
+    }
+}
+
 pub(crate) struct SqliteWorkCancellation {
     state: AtomicU8,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<SqliteWorkDeadline>,
 }
 
 struct SqliteWorkCancelOnDrop {
@@ -206,31 +237,36 @@ impl SqliteWorkCancellation {
         }
     }
 
-    fn with_deadline(deadline: std::time::Instant) -> Self {
+    fn with_deadline(deadline: SqliteWorkDeadline) -> Self {
         Self {
             state: AtomicU8::new(SQLITE_WORK_RUNNING),
             deadline: Some(deadline),
         }
     }
 
+    fn deadline_elapsed(&self) -> bool {
+        self.deadline
+            .as_ref()
+            .is_some_and(SqliteWorkDeadline::is_elapsed)
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
         let state = self.state.load(Ordering::Acquire);
-        state == SQLITE_WORK_CANCELLED
-            || state == SQLITE_WORK_RUNNING
-                && self
-                    .deadline
-                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        state == SQLITE_WORK_CANCELLED || state == SQLITE_WORK_RUNNING && self.deadline_elapsed()
     }
 
     fn cancel_before_commit(&self) -> bool {
-        self.state
-            .compare_exchange(
+        // Cancellation still owns the result when the worker's commit hook
+        // cancelled first, before the awaiting future observed its deadline.
+        matches!(
+            self.state.compare_exchange(
                 SQLITE_WORK_RUNNING,
                 SQLITE_WORK_CANCELLED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            )
-            .is_ok()
+            ),
+            Ok(_) | Err(SQLITE_WORK_CANCELLED)
+        )
     }
 
     fn authorize_commit(&self) -> Result<(), ConfigConsensusStorageError> {
@@ -433,9 +469,7 @@ impl ConfigConsensusCore {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
             .ok_or(ConfigConsensusStorageError::BackendUnavailable)?;
-        let std_deadline = std::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or(ConfigConsensusStorageError::BackendUnavailable)?;
+        let worker_deadline = SqliteWorkDeadline::tokio(deadline);
         let worker_gate = backend.config_consensus_worker_gate();
         let permit = tokio::time::timeout_at(deadline, worker_gate.clone().acquire_owned())
             .await
@@ -449,7 +483,7 @@ impl ConfigConsensusCore {
         let worker_audit_key = backend.audit_key().clone();
         let worker_backend = backend.clone();
         let retained = backend.retained_binding.is_some();
-        let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
+        let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(worker_deadline));
         let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
         let worker_cancellation = cancellation.clone();
         let mut worker = tokio::task::spawn_blocking(move || {
@@ -658,7 +692,7 @@ where
     if deadline <= tokio::time::Instant::now() {
         return Err(timed_out("config consensus SQLite deadline elapsed"));
     }
-    let std_deadline = deadline.into_std();
+    let worker_deadline = SqliteWorkDeadline::tokio(deadline);
     let permit = tokio::time::timeout_at(deadline, worker_gate.acquire_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite admission timed out"))?
@@ -666,7 +700,7 @@ where
     let conn = tokio::time::timeout_at(deadline, conn.lock_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite connection timed out"))?;
-    let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(std_deadline));
+    let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(worker_deadline));
     let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
     let worker_cancellation = cancellation.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
@@ -687,8 +721,7 @@ where
             .progress_handler(
                 1_000,
                 Some(move || {
-                    progress_cancellation.is_cancelled()
-                        || std::time::Instant::now() >= std_deadline
+                    progress_cancellation.is_cancelled() || progress_cancellation.deadline_elapsed()
                 }),
             )
             .map_err(db_error)?;
@@ -745,7 +778,9 @@ pub(crate) fn provision_retained_schema(
         topology.members(),
         audit_key,
         None,
-        &Arc::new(SqliteWorkCancellation::with_deadline(deadline)),
+        &Arc::new(SqliteWorkCancellation::with_deadline(
+            SqliteWorkDeadline::RealTime(deadline),
+        )),
         None,
     )
 }
@@ -763,7 +798,7 @@ pub(crate) fn validate_retained_schema(
         topology.members(),
         audit_key,
         false,
-        &SqliteWorkCancellation::with_deadline(deadline),
+        &SqliteWorkCancellation::with_deadline(SqliteWorkDeadline::RealTime(deadline)),
     )
 }
 
@@ -4047,6 +4082,44 @@ mod tests {
         CONFIG_CONSENSUS_COMMAND_VERSION,
     };
     use crate::types::CommitRecord;
+
+    #[tokio::test(start_paused = true)]
+    async fn sqlite_clock_cancellation_keeps_its_runtime_outside_tokio() {
+        let budget = Duration::from_millis(20);
+        let cancellation = SqliteWorkCancellation::with_deadline(SqliteWorkDeadline::tokio(
+            tokio::time::Instant::now() + budget,
+        ));
+        let cancellation = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            std::thread::sleep(Duration::from_millis(40));
+            cancellation
+                .check_io()
+                .expect("the caller's clock is frozen");
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            cancellation
+        })
+        .join()
+        .expect("foreign thread");
+        tokio::time::advance(budget).await;
+        assert_eq!(
+            cancellation.check_io().expect_err("caller deadline").kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sqlite_clock_realtime_deadline_expires_while_tokio_is_paused() {
+        let frozen = tokio::time::Instant::now();
+        let cancellation = SqliteWorkCancellation::with_deadline(SqliteWorkDeadline::RealTime(
+            std::time::Instant::now() + Duration::from_millis(20),
+        ));
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        assert_eq!(
+            cancellation.check_io().expect_err("real deadline").kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 
     fn identity() -> ConsensusIdentity {
         ConsensusIdentity::new(

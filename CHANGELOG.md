@@ -824,6 +824,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: keep SQLite worker admission, initialization, progress and
+  commit checks on the caller's Tokio clock. Paused time no longer spends a
+  fresh operation's budget, and advancing time expires the worker's deadline
+  before a late commit. Synchronous retained-store admission keeps its real-time
+  deadline, and commit permission and timeout bounds are unchanged. A worker
+  that cancels its own expired commit now retains the timeout result instead
+  of allowing a late callback success to override it.
+
 - `opc-session-store`: fixed-quorum formation, receipt and reopen tests observe
   admission within their existing catch-up or operation bounds and retain that
   status for subsequent assertions. A deterministic owner-contention regression

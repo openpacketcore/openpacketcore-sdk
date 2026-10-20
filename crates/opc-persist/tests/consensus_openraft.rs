@@ -324,6 +324,19 @@ impl ConsensusPeer for LoopbackPeer {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn frozen_setup_does_not_spend_new_store_budget() {
+    scripted_election::schedule::with_frozen_time(async {
+        let frozen = tokio::time::Instant::now();
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        assert!(std::time::Instant::now() > (frozen + Duration::from_secs(3)).into_std());
+        let cluster = ThreeNodeCluster::build([[0x55; 32]; 3]).await;
+        cluster.shutdown().await;
+    })
+    .await;
+}
+
 #[derive(Clone, Copy)]
 enum FixtureStorage {
     Legacy,
