@@ -6278,7 +6278,7 @@ pub enum QualificationNodeReply {
     ConsensusDiagnostics {
         metrics: opc_session_store::ConsensusStoreDiagnosticSnapshot,
         #[cfg(feature = "test-control")]
-        lifecycle: QualificationConnectionLifecycleMetrics,
+        lifecycle: Box<QualificationConnectionLifecycleMetrics>,
         #[cfg(feature = "test-control")]
         client_connections: std::collections::BTreeMap<usize, serde_json::Value>,
     },

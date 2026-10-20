@@ -1790,7 +1790,9 @@ impl QualificationNode {
                 QualificationNodeReply::ConsensusDiagnostics {
                     metrics: self.store.diagnostic_snapshot(),
                     #[cfg(feature = "test-control")]
-                    lifecycle: lifecycle_metrics(self.empty_vote_dispatches.load(Ordering::SeqCst)),
+                    lifecycle: Box::new(lifecycle_metrics(
+                        self.empty_vote_dispatches.load(Ordering::SeqCst),
+                    )),
                     #[cfg(feature = "test-control")]
                     client_connections: match &self.transport {
                         QualificationTransportRuntime::FoundationPlaintext => BTreeMap::new(),
