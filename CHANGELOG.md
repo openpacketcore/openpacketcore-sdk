@@ -155,7 +155,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cancelled calls relinquish their registrations while admitted blocking work
   keeps its progress budget and completion lifetime. Bound pre-dispatch journal
   authentication and no-effect cleanup by the caller budget, and standalone
-  cleanup/read calls by the existing default operation window. Physical
+  cleanup/read calls by the existing default operation window. An expired
+  original handle stays resolved and releasable, never dispatchable. Existing
+  scheduled reclamation completes cleanup prevented by the deadline without
+  an operator or a later request; before-expiry settlement is unchanged. Physical
   mutation lifetime, transmission classification, durability and authority
   are unchanged.
 

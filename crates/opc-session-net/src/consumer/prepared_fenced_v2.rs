@@ -1976,7 +1976,10 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     /// afterwards. When an original handle fails preflight, every candidate
     /// voter proves a pre-dispatch failure, topology authority is revoked
     /// before any Call byte, or the V2 history definitively rejects the
-    /// request without binding it, this handle removes its own retained row.
+    /// request without binding it, this handle removes its own retained row
+    /// within the original caller deadline. If expiry prevents cleanup, the
+    /// handle remains resolved and cannot dispatch again; the existing
+    /// scheduled reclamation completes cleanup under its maintenance budget.
     /// A resumed deferred request retains its earlier binding and status
     /// recovery when the current attempt fails preflight.
     ///
@@ -3688,10 +3691,18 @@ mod tests {
         assert!(harness.physical.voters().is_empty());
         assert_eq!(
             harness.retained().await,
-            0,
-            "a failed preflight must settle the original handle's never-dispatched row"
+            1,
+            "expiry prevents deletion but leaves the never-dispatched row releasable"
         );
+        assert!(token.resolution() == V2Resolution::Resolved);
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "retaining the expired row cannot restore dispatch authority"
+        );
+        assert!(harness.physical.voters().is_empty());
         assert_eq!(token.release_resolved().await, Ok(()));
+        assert_eq!(harness.retained().await, 0);
         assert_eq!(
             token.execute_once().await,
             Err(FencedTransitionExecuteError::NotTransmitted),

@@ -2405,6 +2405,18 @@ calls use the existing ten-second default operation window. Cleanup MAY be
 retried with a fresh window after the execution deadline, without restoring
 dispatch authority. No original caller deadline is extended.
 
+An original handle whose preflight fails at or after its caller deadline MUST
+remain resolved and releasable, with dispatch permanently disabled. It MUST
+NOT admit journal cleanup after that deadline. The existing scheduled
+`reclaim_resolved_fenced_transitions` sweep completes cleanup prevented by the
+deadline under its own bounded maintenance budget, independently of a later
+request or an operator. An owned journal with the void profile obtains an
+exact terminal no-effect receipt and removes the row, even while the expired
+handle is alive; ordinary journals retain their existing epoch-reclamation
+rules. Integrations MUST keep this maintenance running without depending on
+new requests. Reclamation MUST NOT restore the original handle's dispatch
+authority. Before-expiry settlement and crash-recovery rules are unchanged.
+
 The recovery journal holds at most 4,096 live rows. That count is an
 authenticated admission fence, not an absorbing lifetime: a row is removed by
 exact compare-and-delete only after an original handle's failed local journal
