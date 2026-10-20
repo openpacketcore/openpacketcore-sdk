@@ -1366,11 +1366,31 @@ public profile constructors already enforce the same contract.
 
 MODP-768, MODP-1024, PRF-HMAC-SHA1, and AUTH-HMAC-SHA1-96 exist only to
 interoperate with peers that cannot negotiate the stronger profiles above.
-RFC 8247 marks MODP group 1 as `MUST NOT`, group 2 as `SHOULD NOT`, and the
-SHA-1 PRF/integrity transforms for deprecation; RFC 9395 also deprecates group
-1. The SDK deliberately has no default proposal policy, and recognizing these
-typed algorithms does not offer or select them. A product must explicitly add
-the exact compatibility profile to its `Ikev2SaInitNegotiationPolicy`:
+The SDK deliberately retains group 1 for legacy peer compatibility despite
+RFC 8247 section 2.4's `MUST NOT` and RFC 9395's deprecation. Default software
+requirements include group 1, and every existing executable, provider and
+checkpoint path supports it. The caller's explicit profile allowlist remains
+authoritative; no new configuration switch is added.
+
+Every other admitted common DH group is preferred over group 1. The existing
+ordered policy moves group-1 profiles last while preserving caller order among
+other profiles. Initial initiator offers likewise place group-1 alternatives
+and group-1-only proposals last. Responder selection, including IKE-SA rekey in
+either original IKE role, requests a stronger KE with `INVALID_KE_PAYLOAD` when
+necessary instead of accepting a group-1 KE while a stronger common suite exists.
+Caller order among non-group-1 groups remains unchanged; IKE-SA and NWu selection
+retain their matching-KE fallback. Generic Child-SA selection retains wire order
+without that fallback. There is no global group-strength ranking. Group 1 remains usable
+when it is the only common group. Generic Child-SA PFS negotiation and NWu AEAD
+policy apply the same group-1-last rule and expose a typed retry Notify. Generic,
+dedicated-bearer and NWu Child-SA request offers put group 1 last while preserving
+other proposal order. The single-profile rekey initiator builder encodes an
+already-selected profile; choose from the existing policy's ordered common
+profiles when more than one is available.
+
+The SDK has no implicit proposal list. A product adds its exact compatibility
+profile to `Ikev2SaInitNegotiationPolicy` as before. Group 2 and SHA1 remain
+explicit compatibility choices under RFC 8247's recommendations:
 
 ```rust
 use opc_proto_ikev2::{
@@ -1395,6 +1415,63 @@ fn compatibility_policy(
 Keep stronger profiles earlier in the caller-owned preference list. No DES,
 3DES, MD5, unauthenticated CBC, or other legacy algorithm is enabled by this
 compatibility boundary.
+
+### Local and received nonces
+
+`Ikev2NoncePayloadBuild::generate(prf)` uses admitted entropy for fresh local
+nonces of at least 32 octets and half the PRF's preferred key length (32 octets
+for every supported PRF). Every typed outgoing IKE_SA_INIT, IKE-SA rekey and
+Child-SA creation/rekey builder enforces a flat 32-octet local floor. Raw payload
+encoders remain available for caller-supplied wire fixtures.
+
+All public IKE/Child-SA KDFs require `Ikev2NonceLocalRole`. It identifies the
+initiator or responder of the exchange that produced Ni and Nr, independently
+of the original IKE-SA role during rekey. The local nonce must be 32..=256
+octets; the peer nonce may be 16..=256 for every PRF. Both XFRM derivation helpers
+also require this role: Ni is local for an initiator, and Nr is local for a
+responder. Their key slots retain initiator-to-responder `inbound` and
+responder-to-initiator `outbound` material; an exchange initiator swaps the slots
+for local installation. Below-floor inputs return typed errors before derivation.
+
+Accepting a 16-octet SHA2-512 peer nonce deliberately relaxes RFC 7296 section
+2.10's half-PRF-key requirement for legacy compatibility. Both initial
+nonce-policy names use the same role-aware bounds. Existing group-1/SHA2-512/
+16-octet Ni reference vectors remain positive with the local responder's
+32-octet Nr. The deviations are recorded in `CONFORMANCE.md`.
+
+## Child-SA key exchange validation
+
+CREATE_CHILD_SA builders, response decoders and response correlation validate
+KE public-value widths against the supplied group. Dedicated-bearer and NWu
+request decoders verify that the KE names an offered group; policy selection
+compares it with the selected group before validating its width. A malformed
+value in an unselected group therefore still receives `INVALID_KE_PAYLOAD`,
+while a malformed value in the selected group is rejected. Group 1 retains its
+96-octet MODP encoding; the other supported MODP and ECP groups retain their
+fixed-width encodings. Agreement continues to validate the mathematical public
+value through the admitted crypto module.
+
+Generic Child-SA negotiation and NWu AEAD policy put group 1 after stronger
+common PFS groups that the SDK implements. Generic selection ignores
+unimplemented DH transforms even under an accept-any requirement: an offer of
+groups `{1, 5}` can select group 1, while `{1, 31, 14}` requests group 14.
+SDK-built Child-SA offers apply the same stable ordering.
+`negotiate_child_sa` takes the peer KE alongside the SA and selectors. A selected
+common suite with a different KE produces a typed `KeyExchangeDhGroupMismatch`;
+`invalid_ke_notify()` constructs the `INVALID_KE_PAYLOAD` response Notify.
+A group-1-only common offer remains usable. The generic helper keeps wire order
+among other groups and has no matching-KE fallback: it requests the selected
+group even if a later accepted non-group-1 choice matches the received KE.
+IKE-SA and NWu policy retain their existing matching-KE fallback.
+
+Migration: passing `None` with a selected non-NONE DH group now returns
+`KeyExchangeRequired`. This includes an IKE_AUTH SAi2 carrying DH and DH-agnostic
+policy probes. RFC 7296 section 1.2 initial Child-SA offers in IKE_AUTH omit DH;
+CREATE_CHILD_SA probes must supply the received KE and handle the typed group
+mismatch instead of using KE-less selection to choose a retry response.
+SDK-built initial and Child-SA request offers reorder and renumber proposals.
+Correlate responses against the encoded or retained offer, including its proposal
+numbers. Selected response proposal numbers retain that request correlation.
 
 ## Authenticated-only ESP Child SAs
 
@@ -1637,8 +1714,8 @@ contain exactly `SA, Nr, [KEr], TSi, TSr`. The selected ESP proposal must be
 executable and drawn from the exact offer. `DH=NONE` may be represented by
 omission where RFC 7296 permits it, but ESP always requires one explicit
 SN/ESN transform (ID 0 means no extended sequence numbers). PFS requires the
-offered KE group and a valid group public value. Ni and Nr must each be at
-least half the established PRF's preferred key length, and both returned
+offered KE group and a valid group public value. Local Ni requires 32..=256
+octets; received Nr accepts 16..=256 independently of PRF. Both returned
 selector sets must cover the current Child SA while remaining within the
 request offer. Selector containment compares the exact union of complete
 protocol × port × IPv4/IPv6-address boxes, so adjacent or overlapping entries

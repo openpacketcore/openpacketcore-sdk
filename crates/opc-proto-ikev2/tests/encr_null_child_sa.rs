@@ -80,7 +80,7 @@ fn published_encr_null_fixture_negotiates_and_reencodes_exact_transform() {
         .unwrap_or_else(|error| panic!("TSi fixture failed to decode: {error:?}"));
     let tsr = Ikev2TrafficSelectorPayload::decode_body(TSR)
         .unwrap_or_else(|error| panic!("TSr fixture failed to decode: {error:?}"));
-    let negotiation = negotiate_child_sa(&sa, &tsi, &tsr, &policy(true))
+    let negotiation = negotiate_child_sa(None, &sa, &tsi, &tsr, &policy(true))
         .unwrap_or_else(|error| panic!("ENCR_NULL fixture failed negotiation: {error:?}"));
     let profile = Ikev2ChildSaCryptoProfile::from_child_sa_negotiation(
         Ikev2PrfAlgorithm::HmacSha2_256,
@@ -160,7 +160,7 @@ fn encr_null_without_integrity_fails_closed() {
         .unwrap_or_else(|error| panic!("TSi fixture failed to decode: {error:?}"));
     let tsr = Ikev2TrafficSelectorPayload::decode_body(TSR)
         .unwrap_or_else(|error| panic!("TSr fixture failed to decode: {error:?}"));
-    let negotiation = negotiate_child_sa(&sa, &tsi, &tsr, &policy(false))
+    let negotiation = negotiate_child_sa(None, &sa, &tsi, &tsr, &policy(false))
         .unwrap_or_else(|error| panic!("NULL-only fixture selection failed: {error:?}"));
 
     assert_eq!(
@@ -188,7 +188,7 @@ fn encr_null_key_length_attribute_is_rejected() {
         .unwrap_or_else(|error| panic!("TSi fixture failed to decode: {error:?}"));
     let tsr = Ikev2TrafficSelectorPayload::decode_body(TSR)
         .unwrap_or_else(|error| panic!("TSr fixture failed to decode: {error:?}"));
-    let negotiation = negotiate_child_sa(&sa, &tsi, &tsr, &policy(true))
+    let negotiation = negotiate_child_sa(None, &sa, &tsi, &tsr, &policy(true))
         .unwrap_or_else(|error| panic!("attributed NULL fixture selection failed: {error:?}"));
 
     assert_eq!(

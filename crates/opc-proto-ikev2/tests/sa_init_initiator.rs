@@ -146,10 +146,10 @@ fn request_preserves_caller_preference_and_public_key_custody() {
 fn request_rejects_invalid_offer_and_uses_strongest_prf_nonce_minimum() {
     let key = key();
     let mut offered = offer();
-    for len in [0, 15, 257] {
+    for len in [0, 15, 16, 24, 31, 257] {
         assert!(build_ike_sa_init_request(SPI_I, &offered, &key, &vec![0x61; len], &[]).is_err());
     }
-    for len in [16, 256] {
+    for len in [32, 256] {
         assert!(build_ike_sa_init_request(SPI_I, &offered, &key, &vec![0x61; len], &[]).is_ok());
     }
     offered.proposals[0].transforms.push(transform(2, 7));
@@ -286,15 +286,32 @@ fn admission_rejects_ke_group_and_public_value_and_nonce_mismatches() {
                 .map(|_| ())
                 .unwrap(),
             3 => payloads.key_exchange.key_exchange_data.fill(0),
-            _ => payloads.nonce.nonce = vec![0x72; 16],
+            _ => payloads.nonce.nonce = vec![0x72; 32],
         }
         if mutation == 4 {
-            // SHA-512 selection requires 32 octets even though §3.9 allows 16.
+            // A received SHA-512 nonce may retain the legacy 16-octet size.
             let mut offered = offer();
             offered.proposals[0].transforms[1].transform_id = 7;
             let request = self::request(&offered);
             payloads.security_association = offered;
-            assert_rejected(&request, &response(&request, &payloads));
+            let mut peer_response = response(&request, &payloads);
+            peer_response.raw_payloads = support::nonce::replace_nonce(
+                peer_response.header.next_payload,
+                &peer_response.raw_payloads,
+                &[0x72; 16],
+            )
+            .into();
+            peer_response.header.length =
+                28 + u32::try_from(peer_response.raw_payloads.len()).expect("fixture length");
+            assert!(matches!(
+                admit_ike_sa_init_response(
+                    &request,
+                    &peer_response.as_borrowed(),
+                    DecodeContext::default()
+                )
+                .unwrap(),
+                Ikev2SaInitResponse::Accepted(_)
+            ));
         } else {
             assert_rejected(&request, &response(&request, &payloads));
         }

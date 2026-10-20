@@ -70,16 +70,17 @@ impl AeadSuite {
         out
     }
 }
-/// Strict caller-order ESP selection. No implicit suite, integrity transform,
-/// or fallback is added. Selection has no crypto, key, SPI-allocation or backend
+/// Caller-ordered ESP selection with group-1 PFS suites last. No implicit suite
+/// or integrity transform is added. Selection has no crypto, key, SPI-allocation or backend
 /// operation effects; it produces intent for those separate boundaries.
 #[derive(Debug, Clone)]
 pub struct AeadPolicy {
     preferred: Vec<AeadSuite>,
 }
 impl AeadPolicy {
-    /// Configure most-preferred first; reject empty or duplicated suites.
-    pub fn new(preferred: Vec<AeadSuite>) -> Result<Self, Error> {
+    /// Configure preferred order, stably moving group-1 PFS suites last.
+    /// Reject empty or duplicated suites.
+    pub fn new(mut preferred: Vec<AeadSuite>) -> Result<Self, Error> {
         if preferred.is_empty() {
             return Err(Error::Missing);
         }
@@ -91,13 +92,24 @@ impl AeadPolicy {
                 return Err(Error::Duplicate);
             }
         }
+        preferred.sort_by_key(|suite| suite.dh == Some(Ikev2DhGroup::Modp768));
         Ok(Self { preferred })
     }
-    /// Try caller suite order before peer proposal order. A preferred DH group
-    /// must match the supplied KE and its exact public-value size. Disjoint or
-    /// non-AEAD-only offers fail without producing negotiation intent.
+    /// Try effective suite order before peer proposal order. A stronger common
+    /// group requests an `INVALID_KE_PAYLOAD` retry instead of falling back to
+    /// group 1. Caller order and matching-KE fallback among other groups remain.
+    /// KE public widths must match; disjoint/non-AEAD offers produce no intent.
     pub fn select(&self, request: &CreateRequest<'_>) -> Result<AeadSelection, Error> {
+        let mut mismatched = None;
         for suite in self.preferred.iter().copied() {
+            if suite.dh == Some(Ikev2DhGroup::Modp768) {
+                if let Some(preferred) = mismatched {
+                    return Err(Error::KeyExchangeDhGroupMismatch {
+                        received: request.key_exchange().map_or(0, |ke| ke.dh_group),
+                        preferred,
+                    });
+                }
+            }
             for p in &request.security_association().proposals {
                 if p.transforms.iter().any(|t| t.transform_type == 3) {
                     continue;
@@ -130,6 +142,7 @@ impl AeadPolicy {
                         continue;
                     };
                     if ke.dh_group != group.transform_id() {
+                        mismatched.get_or_insert(group.transform_id());
                         continue;
                     }
                     if ke.key_exchange_data.len() != group.public_value_len() {
@@ -143,7 +156,13 @@ impl AeadPolicy {
                 });
             }
         }
-        Err(Error::Incompatible)
+        match mismatched {
+            Some(preferred) => Err(Error::KeyExchangeDhGroupMismatch {
+                received: request.key_exchange().map_or(0, |ke| ke.dh_group),
+                preferred,
+            }),
+            None => Err(Error::Incompatible),
+        }
     }
 }
 /// Selected suite and peer inbound SPI, before any operation or key derivation.

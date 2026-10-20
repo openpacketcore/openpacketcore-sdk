@@ -192,6 +192,7 @@ pub fn run() {
     let shared = key.agree(accepted.key_exchange()).unwrap();
     assert_eq!(&shared[..], fixture("dh_shared"));
     let keys = derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Initiator,
         profile,
         request.message().header.initiator_spi.to_be_bytes(),
         accepted.responder_spi().to_be_bytes(),

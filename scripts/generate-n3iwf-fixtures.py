@@ -2678,7 +2678,7 @@ def protocol_key_known_answers(subset_dir: Path) -> list[dict]:
 
 def protocol_key_lifecycle(subset_dir: Path) -> list[dict]:
     source = "crates/opc-n3iwf-fixtures/oracles/key-lifecycle.json"
-    digest = "f6328da8ee70fd01cf642ebd334cb59a0900ffbb0ce59378b22d922867f79e14"
+    digest = "d1fc7983e727e2f6131887d9d9fb6a4eda0ec2684ee7ef57d030f9777346c187"
     path = ROOT / source
     if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         raise ValueError("n3iwf_custody_reference_digest")
@@ -3265,7 +3265,7 @@ def xfrm_roster_lifecycle(subset_dir: Path) -> list[dict]:
 
 def xfrm_child_sa_profiles(subset_dir: Path) -> list[dict]:
     source = "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json"
-    digest = "b092689801a0f85e2d32580ee5ab66b9a103291aa5db36baaf55d815504b3f55"
+    digest = "76fee6c1a58eb38aa89ff39bf8fd4e0a29f8048e40a294abbef8639e9c9bbd97"
     path = ROOT / source
     if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         raise ValueError("n3iwf_child_sa_profile_digest")

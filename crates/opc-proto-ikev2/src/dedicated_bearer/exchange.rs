@@ -25,7 +25,8 @@ use crate::{
         Ikev2SaTransformBuild,
     },
     sa_init_crypto::{
-        Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm, Ikev2SaInitCryptoError,
+        validate_peer_public_len, Ikev2DhGroup, Ikev2EncryptionAlgorithm, Ikev2IntegrityAlgorithm,
+        Ikev2SaInitCryptoError,
     },
 };
 
@@ -390,6 +391,8 @@ pub fn build_ikev2_dedicated_bearer_create_child_sa_request(
     input: &Ikev2DedicatedBearerCreateChildSaRequestBuild,
 ) -> Result<Ikev2DedicatedBearerCleartextPayloads, Ikev2DedicatedBearerExchangeError> {
     validate_sa_build(&input.security_association, false)?;
+    let mut input = input.clone();
+    crate::sa_init_negotiation::prefer_stronger_dh_groups(&mut input.security_association);
     validate_create_tft(&input.tft)?;
     validate_extended_ambr_dependency(input.apn_ambr, input.extended_apn_ambr)?;
     validate_eps_qos_notify_profile(&input.eps_qos, input.extended_eps_qos)?;
@@ -435,6 +438,9 @@ pub fn build_ikev2_dedicated_bearer_create_child_sa_request(
 ///
 /// The default uses conservative limits while preserving unknown non-critical
 /// extensions. It always rejects duplicate required/optional payloads.
+/// The KE must name an offered group. Call [`crate::negotiate_child_sa`] to
+/// select that group before validating its public-value width: a different
+/// selected group requires an `INVALID_KE_PAYLOAD` retry instead.
 ///
 /// # Errors
 ///
@@ -461,6 +467,8 @@ pub fn decode_ikev2_dedicated_bearer_create_child_sa_request<'a>(
 /// Structural validation is always upgraded to strict. The caller's unknown-IE
 /// policy controls preservation/rejection of unknown non-critical payloads and
 /// unrecognized Notify types.
+/// KE public-value width is validated by [`crate::negotiate_child_sa`] after
+/// comparing the received and selected groups, as in the default decoder.
 ///
 /// # Errors
 ///
@@ -719,7 +727,7 @@ impl<'a> CreateChildSaParts<'a> {
         let eps_qos = required(self.eps_qos, Ikev2DedicatedBearerPayloadRole::EpsQos)?;
         let tft = required(self.tft, Ikev2DedicatedBearerPayloadRole::Tft)?;
         validate_sa_view(&security_association, false)?;
-        validate_ke_view(&security_association, self.key_exchange.as_ref())?;
+        validate_request_ke_view(&security_association, self.key_exchange.as_ref())?;
         validate_create_tft(&tft)?;
         validate_extended_ambr_dependency(self.apn_ambr, self.extended_apn_ambr)?;
         validate_eps_qos_notify_profile(&eps_qos, self.extended_eps_qos)?;
@@ -1240,6 +1248,23 @@ pub(crate) fn validate_ke_view(
     sa: &Ikev2SaPayload<'_>,
     key_exchange: Option<&Ikev2KeyExchangePayload<'_>>,
 ) -> Result<(), Ikev2DedicatedBearerExchangeError> {
+    validate_request_ke_view(sa, key_exchange)?;
+    if let Some(key_exchange) = key_exchange {
+        let group = Ikev2DhGroup::from_transform_id(key_exchange.dh_group)
+            .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
+        validate_peer_public_len(group, key_exchange.key_exchange_data)
+            .map_err(Ikev2DedicatedBearerExchangeError::Crypto)?;
+    }
+    Ok(())
+}
+
+/// Validate received request shape without selecting a group. Policy selection
+/// must compare the received and selected groups before checking public width,
+/// so an unselected group's malformed guess can still receive INVALID_KE_PAYLOAD.
+pub(crate) fn validate_request_ke_view(
+    sa: &Ikev2SaPayload<'_>,
+    key_exchange: Option<&Ikev2KeyExchangePayload<'_>>,
+) -> Result<(), Ikev2DedicatedBearerExchangeError> {
     let mut dh_offered = false;
     let mut group_matches = false;
     for transform in sa
@@ -1486,7 +1511,7 @@ pub enum Ikev2DedicatedBearerExchangeError {
     Payload(Ikev2IkeAuthPayloadError),
     /// Typed Notify decode failed.
     Notify(Ikev2NotifyPayloadError),
-    /// Supported-algorithm or transform-attribute validation failed.
+    /// Supported-algorithm, transform-attribute, or KE public-value width validation failed.
     Crypto(Ikev2SaInitCryptoError),
     /// TS 24.302 typed Notify validation failed.
     ThreeGpp(Ikev2DedicatedBearerError),
@@ -2167,6 +2192,8 @@ pub fn validate_ikev2_dedicated_bearer_create_child_sa_response_correlation(
     else {
         return Ok(());
     };
+    validate_ke_view(&request.security_association, request.key_exchange.as_ref())
+        .map_err(|_| Ikev2DedicatedBearerExchangeError::ResponseKeyExchangeMismatch)?;
     let selected = security_association
         .proposals
         .first()
@@ -2240,6 +2267,7 @@ pub(crate) enum Ikev2SelectedKeyExchangeError {
     Unexpected,
     Required,
     GroupMismatch,
+    ValueInvalid(Ikev2SaInitCryptoError),
 }
 
 pub(crate) fn validate_selected_key_exchange(
@@ -2255,7 +2283,10 @@ pub(crate) fn validate_selected_key_exchange(
         (Some(group), Some(response))
             if request_group == Some(group) && response.dh_group == group =>
         {
-            Ok(())
+            let group = Ikev2DhGroup::from_transform_id(group)
+                .map_err(Ikev2SelectedKeyExchangeError::ValueInvalid)?;
+            validate_peer_public_len(group, response.key_exchange_data)
+                .map_err(Ikev2SelectedKeyExchangeError::ValueInvalid)
         }
         (Some(_), Some(_)) => Err(Ikev2SelectedKeyExchangeError::GroupMismatch),
     }

@@ -4,7 +4,7 @@
   "context": {
     "source_vector": {
       "path": "crates/opc-n3iwf-fixtures/oracles/key-lifecycle.json",
-      "sha256": "f6328da8ee70fd01cf642ebd334cb59a0900ffbb0ce59378b22d922867f79e14",
+      "sha256": "d1fc7983e727e2f6131887d9d9fb6a4eda0ec2684ee7ef57d030f9777346c187",
       "case": "drop-key"
     },
     "key_recipe": "32-zero-octets",

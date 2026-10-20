@@ -31,6 +31,7 @@ fn material() -> &'static Ikev2SaInitKeyMaterial {
         install_ikev2_software_crypto_module(policy, requirements).unwrap();
         // Fixed synthetic SA keys are fuzz inputs, never deployed custody.
         derive_ike_sa_init_key_material(
+opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
             profile(),
             [1; 8],
             [2; 8],

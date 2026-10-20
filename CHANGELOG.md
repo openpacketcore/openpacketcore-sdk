@@ -21,6 +21,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-store`: `StoreError` adds `FencedTransitionLeaseDeferred`, and
   `FencedTransitionV2Status` adds `LeaseDeferred`; downstream exhaustive matches
   must handle both variants. (#1334)
+- `opc-proto-ikev2`: every typed IKE and Child-SA outgoing nonce builder now
+  requires at least 32 octets. Public IKE/Child-SA key-derivation functions require
+  an explicit `Ikev2NonceLocalRole`, enforce 32..=256 locally, and accept
+  16..=256 from peers for every PRF.
+- `opc-ipsec-xfrm`: `derive_child_sa_xfrm_keys` and
+  `derive_initial_child_sa_xfrm_keys` require `Ikev2NonceLocalRole` as their first
+  argument. Pass the role in the exchange that produced Ni and Nr: the local
+  nonce requires 32..=256 octets, and the peer nonce accepts 16..=256 for every
+  PRF. Key slots retain their exchange-relative directions; initiator callers
+  continue swapping the slots for local installation.
+- `opc-proto-ikev2`: `Ikev2IkeAuthBuildError` adds `KeyExchangeValueInvalid`;
+  exhaustive matches must handle it. Generic CREATE_CHILD_SA builders now reject
+  unsupported DH groups and KE public values whose width does not match the group.
+- `opc-proto-ikev2`: `negotiate_child_sa` now requires the peer KE context for PFS.
+  `Ikev2ChildSaNegotiationError` adds `KeyExchangeRequired`,
+  `InvalidKeyExchange` and `KeyExchangeDhGroupMismatch`, and `nwu::Error` adds `KeyExchangeDhGroupMismatch`;
+  exhaustive matches must handle them. Retry errors expose `invalid_ke_notify()`.
+  Passing `None` with a selected non-NONE DH group returns `KeyExchangeRequired`,
+  including DH-bearing IKE_AUTH SAi2 offers and DH-agnostic negotiation probes.
+  Supply the received KE for CREATE_CHILD_SA probes and handle the typed retry;
+  conforming initial Child-SA offers in IKE_AUTH omit DH. Generic Child-SA
+  selection keeps non-group-1 wire order without a matching-KE fallback.
+  Unimplemented DH transforms are ineligible even under an accept-any DH
+  requirement, so they never displace a usable group 1 or appear in a retry.
+  Group 1 follows stronger common Child-SA PFS groups in policies and offers;
+  other transform positions are preserved. SDK-built initial and Child-SA
+  request offers also renumber proposals; correlate responses against the
+  encoded or retained offer rather than pre-build proposal numbers.
+  `ResponderNonceTooShortForPrf` is deprecated as an unconstructed compatibility
+  diagnostic; peer nonce errors use the absolute 16-octet floor.
 
 - `opc-session-net`: the first fenced roster reconcile closes prepare and
   execute for the entire admission, including older handles and equal-fence
@@ -561,6 +591,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `opc-proto-ikev2`: prefer other common DH groups over group 1 in ordered
+  policies and initial initiator offers; initial/rekey selection requests a
+  stronger KE instead of accepting a group-1 fallback. Group 1 remains supported
+  for legacy peers, including default software requirements and checkpoint restore.
+
 - `opc-mgmt-authz`, `opc-gnmi-server`, `opc-netconf-server` and `opc-yanggen`: reads authorize each requested node with every composite and ancestor-list key in one policy context, using the Read or Subscribe action. An entry with a denied or unknown key is omitted before stored rows or providers are read, in gNMI Get and Subscribe and in NETCONF `<get>`, `<get-config>` and `<get-data>`; NETCONF previously failed with `operation-failed` when such an entry existed. NETCONF list-child selections now carry their keys. gNMI reads lists whose sensitive keys allow cleartext; security-secret, lawful-intercept and secret-name keys keep the fixed gNMI refusal and masked NETCONF elements. NETCONF XPath filters accept equalities on configuration list keys whose data class allows cleartext. ON_CHANGE compares authorized content without timestamps, `updates_only` seeds that comparison without sending it, and a lag resync sends `sync_response` only when that content changed. (#1269)
 
 - `opc-yanggen`: JSON, XML, gNMI reads, canonical configuration, diff and apply
@@ -793,6 +828,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after a caller deadline, avoiding repeated reservation and lease waits under
   load while retaining every boundary, persistence and activation check.
 
+- `opc-proto-ikev2`: Child-SA negotiation returns `INVALID_KE_PAYLOAD` naming
+  the selected group before interpreting a different received KE group, including
+  groups the SDK does not implement. Matching-group KE widths remain validated.
+
 - `opc-proto-diameter`: require request-bound authenticated peer evidence for
   SWm emergency authorization, including both answers in identity recovery.
   `correlate_answer_from_connection` retains the existing wire checks and
@@ -811,6 +850,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   storage drain with the original caller bounds and native reopen-proof checks.
   Config bus adapters expose the same lifecycle through their consensus store.
   Planned shutdown keeps automatic bounded handoff. (#1370)
+- `opc-proto-ikev2`: CREATE_CHILD_SA request/response construction, dedicated-bearer
+  response decoding and correlation, and NWu creation responses validate the
+  KE public-value width for the supplied DH group, including 96 octets for group 1.
+  Dedicated-bearer and NWu received requests check offered-group membership;
+  policy selection compares groups before checking width, returning
+  `INVALID_KE_PAYLOAD` for an unselected group even if its value has the wrong width.
 
 - `opc-proto-diameter`: SWm emergency identity recovery accepts ordinary root
   IMSI NAIs as a receive-side interoperability extension. The emergency

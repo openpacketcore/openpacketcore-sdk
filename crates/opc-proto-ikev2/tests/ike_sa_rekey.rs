@@ -205,6 +205,7 @@ fn independent_aead_vector_decodes_selects_kdf_profile_and_builds_exact_response
     let new_responder_spi = [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8];
 
     let key_material = derive_ike_sa_rekey_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         Ikev2PrfAlgorithm::HmacSha2_256,
         &[0x91; 32],
         negotiation.profile(),
@@ -277,6 +278,7 @@ fn independent_encrypt_then_mac_vector_decodes_selects_and_builds_exact_response
     let new_responder_spi = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8];
     let shared_secret = vec![0x94; Ikev2DhGroup::Modp2048.shared_secret_len()];
     let key_material = derive_ike_sa_rekey_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         Ikev2PrfAlgorithm::HmacSha2_256,
         &[0x93; 32],
         negotiation.profile(),
@@ -325,7 +327,7 @@ fn independent_encrypt_then_mac_vector_decodes_selects_and_builds_exact_response
 #[test]
 fn rekey_kdf_requires_each_group_fixed_width_shared_secret() {
     support::ensure_ike_crypto();
-    let nonce = [0x11; 16];
+    let nonce = [0x11; 32];
     for (group, expected_len) in [
         (Ikev2DhGroup::Modp768, 96),
         (Ikev2DhGroup::Modp1024, 128),
@@ -344,6 +346,7 @@ fn rekey_kdf_requires_each_group_fixed_width_shared_secret() {
 
         let exact_secret = vec![0x55; expected_len];
         derive_ike_sa_rekey_key_material(
+            opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
             Ikev2PrfAlgorithm::HmacSha2_256,
             &[0x22; 32],
             profile,
@@ -358,6 +361,7 @@ fn rekey_kdf_requires_each_group_fixed_width_shared_secret() {
         for actual_len in [0, expected_len - 1, expected_len + 1] {
             let invalid_secret = vec![0x55; actual_len];
             let error = derive_ike_sa_rekey_key_material(
+                opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
                 Ikev2PrfAlgorithm::HmacSha2_256,
                 &[0x22; 32],
                 profile,
@@ -1099,6 +1103,7 @@ fn initiator_aead_vector_builds_exact_request_decodes_response_and_feeds_kdf() {
     assert!(response.unknown_noncritical_payloads().is_empty());
 
     let key_material = derive_ike_sa_rekey_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Initiator,
         Ikev2PrfAlgorithm::HmacSha2_256,
         &[0x91; 32],
         response.profile(),
@@ -1189,6 +1194,7 @@ fn initiator_encrypt_then_mac_vector_builds_exact_request_and_decodes_response()
 
     let shared_secret = vec![0x94; Ikev2DhGroup::Modp2048.shared_secret_len()];
     let key_material = derive_ike_sa_rekey_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Initiator,
         Ikev2PrfAlgorithm::HmacSha2_256,
         &[0x93; 32],
         response.profile(),

@@ -222,6 +222,7 @@ fn software_prf_plus_reproduces_the_independent_sha512_ike_sa_kdf_vector_byte_fo
     )
     .expect("valid vector profile");
     let material = derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile,
         initiator_spi,
         responder_spi,
@@ -748,6 +749,7 @@ fn signature_profile() -> Ikev2SaInitCryptoProfile {
 fn signature_key_material() -> Ikev2SaInitKeyMaterial {
     support::ensure_ike_crypto();
     derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         signature_profile(),
         [0x11; 8],
         [0x22; 8],

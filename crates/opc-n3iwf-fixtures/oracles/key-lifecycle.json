@@ -4,7 +4,7 @@
   "policy": "SDK volatile custody; not a wire-standard obligation",
   "sources": {
     "crates/opc-proto-ikev2/src/protocol_key.rs": "782b456e3a17fe51be226d9c0920f89e53cb341e9ddc58ac0b36dd35bef5ec7a",
-    "crates/opc-proto-ikev2/src/protocol_key/tests.rs": "b12635232fc117e33bd2c49ac82cd1eda2df986682dd8a33f32d9661fe5dc24f",
+    "crates/opc-proto-ikev2/src/protocol_key/tests.rs": "50fc7d9566974d1d95e35f47b1ebb33675d28ae3b486cd988f885c57c2546fdd",
     "crates/opc-n3iwf-fixtures/oracles/ike-auth-sha256.json": "e1db7a997007bd2341226d770db34d0c76e89cf56418e92497c63f0e0422667f"
   },
   "key_recipe": "32 zero octets; independent synthetic NGAP placeholder only",

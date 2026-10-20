@@ -882,6 +882,27 @@ pub struct Ikev2NoncePayloadBuild {
     pub nonce: Vec<u8>,
 }
 
+impl Ikev2NoncePayloadBuild {
+    /// Generate a fresh local nonce through the admitted entropy provider.
+    ///
+    /// For either role, initial exchanges and rekeys, the length is at least
+    /// 32 octets and half the PRF's preferred key length. Peer nonces may be
+    /// shorter; decoding and transcript KDFs accept 16..=256 octets.
+    ///
+    /// # Errors
+    /// Returns a typed crypto error if entropy admission or generation fails.
+    pub fn generate(
+        prf: crate::sa_init_crypto::Ikev2PrfAlgorithm,
+    ) -> Result<Self, crate::sa_init_crypto::Ikev2SaInitCryptoError> {
+        let mut nonce = vec![0; prf.output_len().div_ceil(2).max(32)];
+        crate::crypto_module::with_entropy_operation(|module| module.fill_random(&mut nonce))
+            .map_err(|error| {
+                crate::sa_init_crypto::Ikev2SaInitCryptoError::CryptoModuleFailure { error }
+            })?;
+        Ok(Self { nonce })
+    }
+}
+
 impl fmt::Debug for Ikev2NoncePayloadBuild {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ikev2NoncePayloadBuild")
@@ -1301,7 +1322,7 @@ pub fn build_ike_sa_init_response(
     ));
     entries.push((
         PayloadType::Nonce,
-        encode_nonce_payload_build(&payloads.nonce)?,
+        encode_outgoing_nonce_payload_build(&payloads.nonce)?,
     ));
     for notify in &payloads.notifies {
         entries.push((PayloadType::Notify, encode_notify_payload_build(notify)?));
@@ -1673,12 +1694,22 @@ pub(crate) fn encode_ke_payload_build(
     Ok(out)
 }
 
-/// Encode an IKEv2 Nonce payload body from a typed builder.
+/// Encode a local nonce, enforcing the 32-to-256-octet send range.
+pub(crate) fn encode_outgoing_nonce_payload_build(
+    payload: &Ikev2NoncePayloadBuild,
+) -> Result<Vec<u8>, Ikev2SaInitBuildError> {
+    if payload.nonce.len() < 32 {
+        return Err(Ikev2SaInitBuildError::NonceTooShort);
+    }
+    encode_nonce_payload_build(payload)
+}
+
+/// Encode caller-supplied wire nonce bytes, including legacy peer fixtures.
+/// Typed send builders separately enforce the 32-octet local minimum.
 ///
 /// # Errors
 ///
-/// Returns [`Ikev2SaInitBuildError`] when the nonce is outside the RFC 7296
-/// 16-to-256-octet range.
+/// Returns [`Ikev2SaInitBuildError`] outside the 16-to-256-octet wire range.
 pub fn encode_nonce_payload_build(
     payload: &Ikev2NoncePayloadBuild,
 ) -> Result<Vec<u8>, Ikev2SaInitBuildError> {

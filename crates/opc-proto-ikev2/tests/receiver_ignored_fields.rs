@@ -211,6 +211,7 @@ fn auth_uses_exact_received_id_body_and_every_transcript_mutation_fails() {
     support::ensure_ike_crypto();
     let profile = crypto_profile();
     let key_material = derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile,
         [0x11; 8],
         [0x22; 8],

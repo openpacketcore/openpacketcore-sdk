@@ -28,7 +28,8 @@ pub use qos::{AdditionalQos, QosInfo, QosParameter};
 
 use std::{error::Error as StdError, fmt};
 
-/// Redacted profile rejection. No error retains packet or deployment values.
+/// Redacted profile rejection. Errors retain public group identifiers for KE
+/// retries, without packet bodies or deployment values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// Generic payload framing is invalid.
@@ -47,6 +48,25 @@ pub enum Error {
     Incompatible,
     /// A known, unsupported profile field is present.
     Unsupported,
+    /// A common PFS suite requires a different KE and an `INVALID_KE_PAYLOAD` retry.
+    KeyExchangeDhGroupMismatch {
+        /// Peer-supplied DH group.
+        received: u16,
+        /// Common DH group requested for the retry.
+        preferred: u16,
+    },
+}
+
+impl Error {
+    /// Build the RFC 7296 `INVALID_KE_PAYLOAD` Notify for a KE retry.
+    pub fn invalid_ke_notify(self) -> Option<crate::Ikev2NotifyPayloadBuild> {
+        match self {
+            Self::KeyExchangeDhGroupMismatch { preferred, .. } => {
+                Some(crate::ike_auth::child_sa_invalid_ke_notify(preferred))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -60,6 +80,7 @@ impl fmt::Display for Error {
             Self::Limit => "nwu_limit",
             Self::Incompatible => "nwu_incompatible",
             Self::Unsupported => "nwu_unsupported",
+            Self::KeyExchangeDhGroupMismatch { .. } => "nwu_ke_dh_group_mismatch",
         })
     }
 }

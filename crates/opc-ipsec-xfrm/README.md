@@ -196,6 +196,12 @@ hosted qualification and does not prove that the kernel refused the SUB flush.
   SA carry the same nonzero request ID.
 - With feature `ikev2`, the crate also exports Child SA KEYMAT and negotiation
   mappers from `opc-proto-ikev2` into explicit XFRM install requests.
+  `derive_child_sa_xfrm_keys` and `derive_initial_child_sa_xfrm_keys` require the
+  explicit `Ikev2NonceLocalRole` for the nonce-producing exchange: local nonces
+  require 32..=256 octets and received nonces accept 16..=256 for every PRF.
+  The key slots retain initiator-to-responder `inbound` and
+  responder-to-initiator `outbound` material; an exchange initiator swaps them
+  for local installation.
   `Ikev2ChildSaXfrmOptions` can carry one shared request ID and exact
   directional initial NAT-T templates without changing the established public
   request struct.

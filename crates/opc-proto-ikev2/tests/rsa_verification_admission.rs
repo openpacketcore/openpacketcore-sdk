@@ -50,6 +50,7 @@ fn default_build_admits_rsa_verification_but_rejects_private_rsa_signing() {
         .expect("RSA verification-only configuration admits");
 
     let material = derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile,
         1_u64.to_be_bytes(),
         2_u64.to_be_bytes(),

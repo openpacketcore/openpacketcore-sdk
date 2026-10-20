@@ -63,6 +63,7 @@ fn profile_256() -> Ikev2SaInitCryptoProfile {
 fn key_material(profile: Ikev2SaInitCryptoProfile) -> opc_proto_ikev2::Ikev2SaInitKeyMaterial {
     support::ensure_ike_crypto();
     match derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile,
         INITIATOR_SPI.to_be_bytes(),
         RESPONDER_SPI.to_be_bytes(),

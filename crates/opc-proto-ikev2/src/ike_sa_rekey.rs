@@ -31,7 +31,7 @@ use crate::{
     notify::{Ikev2NotifyPayload, Ikev2NotifyPayloadError, IKEV2_NOTIFY_REKEY_SA},
     payload::{PayloadChain, PayloadType},
     sa_init::{
-        encode_ke_payload_build, encode_nonce_payload_build, Ikev2KeyExchangePayload,
+        encode_ke_payload_build, encode_outgoing_nonce_payload_build, Ikev2KeyExchangePayload,
         Ikev2KeyExchangePayloadBuild, Ikev2KeyExchangePayloadError, Ikev2NoncePayload,
         Ikev2NoncePayloadBuild, Ikev2NoncePayloadError, Ikev2SaInitBuildError, Ikev2SaInitPayloads,
         Ikev2SaPayload, Ikev2SaPayloadBuild, Ikev2SaPayloadError, Ikev2SaProposal,
@@ -802,8 +802,8 @@ pub fn build_ike_sa_rekey_response(
     };
     let sa_body = build_ike_auth_sa_payload(&security_association)
         .map_err(Ikev2IkeSaRekeyBuildError::SecurityAssociation)?;
-    let nonce_body =
-        encode_nonce_payload_build(&input.nonce).map_err(Ikev2IkeSaRekeyBuildError::Nonce)?;
+    let nonce_body = encode_outgoing_nonce_payload_build(&input.nonce)
+        .map_err(Ikev2IkeSaRekeyBuildError::Nonce)?;
     let key_exchange_body = encode_ke_payload_build(&input.key_exchange)
         .map_err(Ikev2IkeSaRekeyBuildError::KeyExchange)?;
     let entries = [
@@ -1000,7 +1000,7 @@ pub fn build_ike_sa_rekey_request(
     };
     let sa_body = build_ike_auth_sa_payload(&security_association)
         .map_err(Ikev2IkeSaRekeyRequestBuildError::SecurityAssociation)?;
-    let nonce_body = encode_nonce_payload_build(&input.nonce)
+    let nonce_body = encode_outgoing_nonce_payload_build(&input.nonce)
         .map_err(Ikev2IkeSaRekeyRequestBuildError::Nonce)?;
     let key_exchange_body = encode_ke_payload_build(&input.key_exchange)
         .map_err(Ikev2IkeSaRekeyRequestBuildError::KeyExchange)?;

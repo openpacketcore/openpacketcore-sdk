@@ -77,6 +77,7 @@ fn pending_key() -> (
 fn material() -> Ikev2SaInitKeyMaterial {
     ensure_ike_crypto();
     derive_ike_sa_init_key_material(
+        crate::Ikev2NonceLocalRole::Responder,
         profile(),
         [1; 8],
         [2; 8],
@@ -373,6 +374,7 @@ fn bound_profile_rejects_wrong_sk_width_before_auth() {
     )
     .unwrap();
     let wrong_material = derive_ike_sa_init_key_material(
+        crate::Ikev2NonceLocalRole::Responder,
         wrong_profile,
         [1; 8],
         [2; 8],

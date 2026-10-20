@@ -156,6 +156,7 @@ fn mac_precedes_traffic_decrypt_and_ordinary_sealing_draws_one_iv(module: &Count
     };
     let profile = cbc_profile(Encryption::AesCbc128);
     let keys = derive_ike_sa_init_key_material(
+        crate::Ikev2NonceLocalRole::Responder,
         profile,
         1_u64.to_be_bytes(),
         2_u64.to_be_bytes(),

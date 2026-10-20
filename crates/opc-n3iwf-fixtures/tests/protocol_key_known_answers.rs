@@ -154,6 +154,7 @@ impl Inputs {
         ensure_crypto();
         Self {
             material: derive_ike_sa_init_key_material(
+                opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
                 profile(),
                 octets(&value["initiator_spi"])
                     .as_slice()

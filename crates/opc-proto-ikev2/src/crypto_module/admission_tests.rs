@@ -1167,6 +1167,11 @@ fn child_sa_pfs_requirements_include_dh_and_entropy_capabilities() {
 }
 
 fn assert_not_installed() {
+    assert_module_failure(
+        opc_proto_ikev2::Ikev2NoncePayloadBuild::generate(Ikev2PrfAlgorithm::HmacSha2_512)
+            .expect_err("local handshake nonce generation requires admission"),
+        Ikev2CryptoModuleErrorCode::NotInstalled,
+    );
     let error =
         ikev2_nat_detection_hash(1, 2, "192.0.2.10:500".parse().expect("synthetic endpoint"))
             .expect_err("failed admission must leave the slot unset");
@@ -1405,6 +1410,40 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
         .effective_capabilities()
         .contains_all(requirements.required_capabilities()));
 
+    let nonce_calls = module.counts.entropy.load(Ordering::SeqCst);
+    let nonce_bytes = module.counts.entropy_bytes.load(Ordering::SeqCst);
+    module.sync_entropy_mode.store(1, Ordering::SeqCst);
+    module.sync_entropy_byte.store(0xa5, Ordering::SeqCst);
+    for prf in [
+        Ikev2PrfAlgorithm::HmacSha1,
+        Ikev2PrfAlgorithm::HmacSha2_256,
+        Ikev2PrfAlgorithm::HmacSha2_384,
+        Ikev2PrfAlgorithm::HmacSha2_512,
+    ] {
+        let nonce = opc_proto_ikev2::Ikev2NoncePayloadBuild::generate(prf)
+            .expect("admitted nonce generation");
+        assert_eq!(nonce.nonce, [0xa5; 32]);
+    }
+    assert_eq!(
+        module.counts.entropy.load(Ordering::SeqCst),
+        nonce_calls + 4
+    );
+    assert_eq!(
+        module.counts.entropy_bytes.load(Ordering::SeqCst),
+        nonce_bytes + 128
+    );
+    module.sync_entropy_mode.store(2, Ordering::SeqCst);
+    assert_module_failure(
+        opc_proto_ikev2::Ikev2NoncePayloadBuild::generate(Ikev2PrfAlgorithm::HmacSha2_256)
+            .expect_err("provider failure has no fallback"),
+        Ikev2CryptoModuleErrorCode::OperationFailed,
+    );
+    assert_eq!(
+        module.counts.entropy.load(Ordering::SeqCst),
+        nonce_calls + 5
+    );
+    module.sync_entropy_mode.store(0, Ordering::SeqCst);
+
     let before_pre_admission_inspection = module.counts.snapshot();
     let inspection = inspect_ikev2_signature_key_pkcs8_der(P256_PKCS8_DER)
         .expect("inspection remains independent after module installation");
@@ -1439,6 +1478,7 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     }
     assert_eq!(module.counts.hash.load(Ordering::SeqCst), hash_count);
     let material = derive_ike_sa_init_key_material(
+        crate::Ikev2NonceLocalRole::Responder,
         profile,
         1_u64.to_be_bytes(),
         2_u64.to_be_bytes(),
@@ -1467,6 +1507,7 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
 
     let aead_profile = aead_profile();
     let aead_material = derive_ike_sa_init_key_material(
+        crate::Ikev2NonceLocalRole::Responder,
         aead_profile,
         1_u64.to_be_bytes(),
         2_u64.to_be_bytes(),
@@ -1657,6 +1698,7 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     let prf_count = module.counts.prf.load(Ordering::SeqCst);
     assert_module_failure(
         derive_ike_sa_init_key_material(
+            crate::Ikev2NonceLocalRole::Responder,
             unadmitted_profile,
             1_u64.to_be_bytes(),
             2_u64.to_be_bytes(),
@@ -1673,6 +1715,7 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     module.reject_prf_support.store(true, Ordering::SeqCst);
     assert_module_failure(
         derive_ike_sa_init_key_material(
+            crate::Ikev2NonceLocalRole::Responder,
             profile,
             1_u64.to_be_bytes(),
             2_u64.to_be_bytes(),
@@ -1753,6 +1796,7 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     module.set_malformed_output(MalformedOutput::Prf);
     assert_module_failure(
         derive_ike_sa_init_key_material(
+            crate::Ikev2NonceLocalRole::Responder,
             profile,
             1_u64.to_be_bytes(),
             2_u64.to_be_bytes(),
@@ -1767,6 +1811,7 @@ fn one_admitted_module_handles_every_operation_and_withdrawal_never_falls_back()
     module.set_malformed_output(MalformedOutput::PrfPlus);
     assert_module_failure(
         derive_ike_sa_init_key_material(
+            crate::Ikev2NonceLocalRole::Responder,
             profile,
             1_u64.to_be_bytes(),
             2_u64.to_be_bytes(),

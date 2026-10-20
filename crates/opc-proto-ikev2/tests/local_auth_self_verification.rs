@@ -35,6 +35,7 @@ fn profile() -> Ikev2SaInitCryptoProfile {
 fn key_material(seed: u8) -> Ikev2SaInitKeyMaterial {
     support::ensure_ike_crypto();
     derive_ike_sa_init_key_material(
+        opc_proto_ikev2::Ikev2NonceLocalRole::Responder,
         profile(),
         [seed; 8],
         [seed.wrapping_add(1); 8],
