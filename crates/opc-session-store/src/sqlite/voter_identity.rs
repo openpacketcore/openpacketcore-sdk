@@ -172,12 +172,30 @@ fn read_private_anchor(
     if file.metadata().map_err(|_| refused())?.len() != crate::voter_identity::RECORD_BYTES as u64 {
         return Err(refused());
     }
+    read_private_record(&mut file)
+}
+
+fn read_private_record(
+    reader: &mut impl Read,
+) -> Result<VoterIdentitySigner, ConsensusSessionStoreOpenError> {
     let mut bytes = Zeroizing::new([0; crate::voter_identity::RECORD_BYTES]);
-    file.read_exact(bytes.as_mut()).map_err(|_| refused())?;
+    reader.read_exact(bytes.as_mut()).map_err(|_| refused())?;
     VoterIdentitySigner::from_record(&bytes)
 }
 
 impl SqliteSessionBackend {
+    /// Read the completed enrollment's public coordinates after a process restart.
+    ///
+    /// This reads only the public anchor and neither provisions an identity nor
+    /// returns private key material. It is metadata, not possession proof or
+    /// consensus admission; use [`Self::voter_identity_signer`] to prove the
+    /// retained key against the published or selected binding.
+    pub async fn voter_identity_binding(
+        &self,
+    ) -> Result<crate::VoterIdentityBinding, ConsensusSessionStoreOpenError> {
+        Err(ConsensusSessionStoreOpenError::StorageUnavailable)
+    }
+
     /// Explicitly enroll a new volume, before publishing its immutable manifest.
     ///
     /// The SDK generates the private incarnation key. Its installation, slot,
@@ -303,6 +321,10 @@ impl SqliteSessionBackend {
             .is_some_and(|path| std::fs::symlink_metadata(key_path(path)).is_ok()))
     }
 }
+
+#[cfg(test)]
+#[path = "voter_identity_followup_tests.rs"]
+mod followup_tests;
 
 #[cfg(test)]
 mod tests {

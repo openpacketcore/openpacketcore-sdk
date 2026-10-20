@@ -21,6 +21,42 @@ use crate::ConsensusSessionStoreOpenError;
 const MAGIC: &[u8; 16] = b"OPC-VOTER-KEY-V1";
 pub(crate) const RECORD_BYTES: usize = 154;
 
+/// Public coordinates retained by a completed volume enrollment.
+///
+/// This contains no private key and grants no voting or application authority.
+/// The manifest publisher must still authenticate fresh possession of the key;
+/// the store opener checks the selected binding and committed retirement floor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct VoterIdentityBinding {
+    pub(crate) cluster: ConsensusClusterId,
+    pub(crate) identity: VoterSlotIdentity,
+    pub(crate) key_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for VoterIdentityBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoterIdentityBinding")
+            .finish_non_exhaustive()
+    }
+}
+
+impl VoterIdentityBinding {
+    /// Installation recorded by enrollment.
+    pub fn cluster_instance(&self) -> ConsensusClusterId {
+        self.cluster
+    }
+
+    /// Allocated logical slot and incarnation.
+    pub fn identity(&self) -> VoterSlotIdentity {
+        self.identity
+    }
+
+    /// Public key commitment for manifest collection and signer reopening.
+    pub fn key_digest(&self) -> [u8; 32] {
+        self.key_digest
+    }
+}
+
 /// Signer backed by one SDK-enrolled volume's incarnation key.
 ///
 /// Obtain this from [`crate::SqliteSessionBackend::enroll_voter_identity`] or
