@@ -575,3 +575,147 @@ fn owned_journal_void_excludes_another_process_and_recovers_after_crash() {
     assert!(denied);
     assert!(FencedTransitionV2RecoveryJournal::open_existing_owned(&path, key()).is_ok());
 }
+
+#[cfg(target_os = "linux")]
+mod descriptor_locks {
+    use super::*;
+    use crate::test_process::sqlite_lock_probe as probe;
+
+    #[test]
+    fn cancelled_recovery_worker_early_error_preserves_successor_record_locks() {
+        const TEST: &str = "fenced_transition_journal::recovery::void_ownership_tests::descriptor_locks::cancelled_recovery_worker_early_error_preserves_successor_record_locks";
+        if probe::child() {
+            return;
+        }
+        let directory = directory();
+        let path = directory.path().join("cancelled-retirement.sqlite3");
+        let moved = directory.path().join("temporarily-moved.sqlite3");
+        let mut journal =
+            FencedTransitionV2RecoveryJournal::create_new_owned(&path, key()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(journal.ensure_scope(SCOPE)).unwrap();
+
+        let (started, starting) = tokio::sync::oneshot::channel();
+        let started = Mutex::new(Some(started));
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(released);
+        let inner = Arc::get_mut(&mut journal.inner).unwrap();
+        inner.before_worker_lock = Some(Arc::new(move || {
+            started.lock().unwrap().take().unwrap().send(()).unwrap();
+            released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }));
+        let successor = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&successor);
+        let next_path = path.clone();
+        let moved_path = moved.clone();
+        let lease = &mut inner.path_guard._open_lease;
+        let identity = lease.identity;
+        lease.after_release = Some(Box::new(move || {
+            // The initial connection verification failed while this path was
+            // absent. Restore it only when admission first becomes available.
+            std::fs::rename(&moved_path, &next_path).unwrap();
+            let next_lease =
+                super::super::super::SecureJournalOpenLease::acquire(identity).unwrap();
+            let connection = Connection::open(&next_path).unwrap();
+            let count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {RECOVERY_TABLE}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "the cancelled worker never invoked its insert");
+            connection
+                .execute_batch("PRAGMA locking_mode=NORMAL; BEGIN IMMEDIATE;")
+                .unwrap();
+            probe::assert_state(&next_path, TEST, true, "after successor admission");
+            *observed.lock().unwrap() = Some((connection, next_lease));
+        }));
+
+        runtime.block_on(async {
+            let pending = journal.clone();
+            let caller = tokio::spawn(async move {
+                pending
+                    .insert(
+                        SCOPE,
+                        FencedTransitionRequestId::from_bytes([0x6d; 16]),
+                        &request(),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), starting)
+                .await
+                .unwrap()
+                .unwrap();
+            std::fs::rename(&path, &moved).unwrap();
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            drop(journal);
+            release.send(()).unwrap();
+            // The sole blocking worker must retire its cancelled operation
+            // before this sentinel can run, including all closure captures.
+            tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| ()))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        probe::assert_state(&path, TEST, true, "after cancelled worker retirement");
+        let (connection, next_lease) = successor.lock().unwrap().take().unwrap();
+        connection.execute_batch("ROLLBACK;").unwrap();
+        drop(connection);
+        drop(next_lease);
+        probe::assert_state(&path, TEST, false, "after successor shutdown");
+    }
+
+    #[test]
+    fn recovery_journal_successor_preserves_sqlite_record_locks() {
+        const TEST: &str = "fenced_transition_journal::recovery::void_ownership_tests::descriptor_locks::recovery_journal_successor_preserves_sqlite_record_locks";
+        if probe::child() {
+            return;
+        }
+        let directory = directory();
+        let path = directory.path().join("retirement.sqlite3");
+        let mut journal =
+            FencedTransitionV2RecoveryJournal::create_new_owned(&path, key()).unwrap();
+        let successor = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&successor);
+        let next_path = path.clone();
+        let lease = &mut Arc::get_mut(&mut journal.inner)
+            .unwrap()
+            .path_guard
+            ._open_lease;
+        let identity = lease.identity;
+        lease.after_release = Some(Box::new(move || {
+            // Admit a successor at the first instant the process-local lease
+            // permits it. The previous SQLite connection has already closed.
+            let next_lease =
+                super::super::super::SecureJournalOpenLease::acquire(identity).unwrap();
+            let connection = Connection::open(&next_path).unwrap();
+            connection
+                .execute_batch("PRAGMA locking_mode=NORMAL; BEGIN IMMEDIATE;")
+                .unwrap();
+            probe::assert_state(&next_path, TEST, true, "after successor lock acquisition");
+            *observed.lock().unwrap() = Some((connection, next_lease));
+        }));
+        drop(journal);
+        probe::assert_state(
+            &path,
+            TEST,
+            true,
+            "after predecessor ownership descriptor retirement",
+        );
+        let (connection, next_lease) = successor.lock().unwrap().take().unwrap();
+        connection.execute_batch("ROLLBACK;").unwrap();
+        drop(connection);
+        drop(next_lease);
+        probe::assert_state(&path, TEST, false, "after successor shutdown");
+    }
+}

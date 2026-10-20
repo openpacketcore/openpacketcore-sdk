@@ -42,6 +42,17 @@ pub trait VerifiedSnapshotSource: Send + Sync + 'static {
     /// Duplicate the held descriptor for identity inspection, not content I/O.
     fn duplicate_descriptor(&self) -> io::Result<File>;
 
+    /// Borrow the retained descriptor for filesystem identity
+    /// inspection. The source keeps close authority; callers must not duplicate
+    /// or close the descriptor. Unsupported sources fail closed.
+    #[cfg(feature = "borrowed-file-identity")]
+    fn borrowed_descriptor(&self) -> io::Result<std::os::fd::BorrowedFd<'_>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "snapshot source has no borrowed descriptor",
+        ))
+    }
+
     /// Read `(device, inode)` from the retained source without opening,
     /// duplicating or closing a descriptor. Unsupported sources fail closed.
     #[cfg(feature = "borrowed-file-identity")]
@@ -536,6 +547,33 @@ pub(super) fn duplicate_descriptor(
         .map_err(|_| FileControlError)?;
     source.validate().map_err(|_| FileControlError)?;
     Ok(Some(descriptor))
+}
+
+#[cfg(feature = "borrowed-file-identity")]
+pub(super) fn retained_source(
+    connection: &Connection,
+    database: &CStr,
+) -> Result<Option<Arc<dyn VerifiedSnapshotSource>>, FileControlError> {
+    let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+    // SAFETY: SQLite writes its borrowed file pointer into file; all inputs
+    // remain valid throughout this synchronous connection borrow.
+    let result = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            database.as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            (&mut file as *mut *mut ffi::sqlite3_file).cast::<c_void>(),
+        )
+    };
+    if result != ffi::SQLITE_OK || file.is_null() {
+        return Err(FileControlError);
+    }
+    // SAFETY: source checks the exact method table before inspecting its own
+    // SnapshotFile layout. The live connection keeps that source owned.
+    let Some(source) = (unsafe { source(file) }) else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::clone(source)))
 }
 
 #[cfg(feature = "borrowed-file-identity")]

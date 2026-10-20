@@ -827,6 +827,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-egress-fence`: keep empty and truncated L3 vectors in the independent
   object oracle executable on kernels that reject short IP test-run transport
   headers. Preserve the exact packet bytes and every gate assertion.
+- `opc-session-store`: hash terminal snapshot envelopes through the retained
+  reader without duplicating and closing its descriptor, preserving SQLite
+  record locks. Managed pins expose narrow read and identity operations.
+
+- `opc-session-store`: retain the whole recovery journal owner in queued
+  operations, keeping its admission lease until all predecessor descriptors
+  retire even when a cancelled worker fails before running its operation.
+
 - `opc-session-net`: preserve valid slow quorum replies until the caller's
   original deadline for protected history, expiry and receipt reads, including
   prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight
@@ -863,6 +871,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes in these paths. Isolated qualification logs mutation timing and client
   counters, then voter state and a redacted receipt category after failure,
   preserving the original result and 800 ms assertion.
+
+- `opc-session-store`: preserve SQLite's POSIX record locks while checking
+  snapshot, checkpoint and recovery file identities, reopening databases,
+  processing requests, and retiring owners, leases and readers. Identity
+  checks borrow SQLite's descriptor; retained database pins close through
+  SQLite's inode bookkeeping even across independent connections and cancelled
+  workers and through portable verification. Recovery journal handover keeps
+  admission excluded until every predecessor descriptor has closed. Persistent
+  recovery identity and cross-process flock fences remain enforced.
 
 - `opc-session-store`: wait for the initial record on every replica before
   injecting owner or fence drift in the renewal fixture. Exercise a lagging

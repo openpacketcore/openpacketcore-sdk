@@ -48,7 +48,9 @@ pub(crate) enum RootPointForTest {
 #[cfg(test)]
 pub(crate) type RootHookForTest = Arc<dyn Fn(RootPointForTest) -> io::Result<()> + Send + Sync>;
 
-fn read_selection(database: &File) -> io::Result<Option<[u8; ROOT_BYTES as usize]>> {
+fn read_selection(
+    database: &impl std::os::fd::AsFd,
+) -> io::Result<Option<[u8; ROOT_BYTES as usize]>> {
     let mut bytes = [0; ROOT_BYTES as usize];
     match rustix::fs::fgetxattr(database, SELECTION_ATTRIBUTE, &mut bytes[..]) {
         Ok(len) if len == bytes.len() => Ok(Some(bytes)),
@@ -106,7 +108,7 @@ pub(super) fn directory_path(file: &File) -> PathBuf {
 /// incomplete or closed selected owner cannot dispatch to the SQLite basis.
 pub(crate) struct NativeOwner {
     parent: Arc<File>,
-    database: File,
+    database: Arc<crate::consensus::snapshot::SqliteFilePin>,
     database_name: OsString,
     database_identity: (u64, u64),
     native_name: OsString,
@@ -123,6 +125,10 @@ pub(crate) struct NativeOwner {
 }
 
 impl NativeOwner {
+    pub(crate) fn database_pin(&self) -> Arc<crate::consensus::snapshot::SqliteFilePin> {
+        Arc::clone(&self.database)
+    }
+
     pub(crate) fn discover(path: &Path, conn: &Connection) -> io::Result<Self> {
         let parent = open_directory(
             path.parent()
@@ -134,8 +140,7 @@ impl NativeOwner {
             .to_os_string();
         let mut native_name = database_name.clone();
         native_name.push(".native-wal");
-        let file = opc_sqlite_file_control_sys::main_file_descriptor(conn)
-            .map_err(|_| invalid_data("native database descriptor unavailable"))?;
+        let file = crate::consensus::snapshot::SqliteFilePin::from_connection(conn)?;
         let metadata = file.metadata()?;
         let named = fs::symlink_metadata(directory_path(&parent).join(&database_name))?;
         if !metadata.is_file() || !named.is_file() || identity(&metadata) != identity(&named) {
@@ -152,7 +157,7 @@ impl NativeOwner {
         let selected = read_selection(&file)?.is_some() || namespace_exists;
         Ok(Self {
             parent,
-            database: file,
+            database: Arc::new(file),
             database_name,
             database_identity: identity(&metadata),
             native_name,

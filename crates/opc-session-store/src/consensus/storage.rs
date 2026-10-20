@@ -490,7 +490,7 @@ struct SnapshotDirectoryLease {
     #[cfg(unix)]
     _namespace_socket: Arc<std::os::fd::OwnedFd>,
     #[cfg(unix)]
-    _database_lock: Option<Arc<nix::fcntl::Flock<std::fs::File>>>,
+    _database_lock: Option<Arc<super::snapshot::SnapshotDatabaseFlock>>,
 }
 
 /// Stable identity of the durable SQLite main file while a lease is held.
@@ -552,7 +552,7 @@ struct SnapshotDatabaseLeaseAdmissionBarrierGuard {
     hook: Arc<SnapshotDatabaseLeaseAdmissionHook>,
     // Pin the identity for the entire installation, even if the backend is
     // dropped before the guard. An unrelated file cannot reuse this inode.
-    _database_file: std::fs::File,
+    _database_file: Arc<super::snapshot::SqliteFilePin>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -561,9 +561,9 @@ impl SnapshotDatabaseLeaseAdmissionBarrierGuard {
         use std::os::linux::fs::MetadataExt as _;
 
         let database_file = backend
-            .duplicate_main_file_descriptor_for_snapshot_lease()
+            .main_file_pin_for_snapshot_lease()
             .await
-            .expect("duplicate admission barrier database")
+            .expect("share admission barrier database")
             .expect("admission barrier requires a durable database");
         let metadata = database_file
             .metadata()
@@ -727,7 +727,7 @@ async fn acquire_snapshot_directory(
     // instead of attempting a self-conflicting second flock.
     #[cfg(target_os = "linux")]
     let database_file = backend
-        .duplicate_main_file_descriptor_for_snapshot_lease()
+        .main_file_pin_for_snapshot_lease()
         .await?
         .ok_or_else(|| {
             io::Error::new(
@@ -933,13 +933,7 @@ async fn acquire_snapshot_directory(
         ))? {
             Some(lock) => lock,
             None => {
-                let lock = Arc::new(
-                    nix::fcntl::Flock::lock(
-                        database_file,
-                        nix::fcntl::FlockArg::LockExclusiveNonblock,
-                    )
-                    .map_err(|(_, error)| io::Error::from(error))?,
-                );
+                let lock = Arc::new(super::snapshot::SnapshotDatabaseFlock::lock(database_file)?);
                 lease.namespace.install_trusted_database_lock(
                     (database_identity.device, database_identity.inode),
                     Arc::clone(&lock),
@@ -956,7 +950,7 @@ async fn acquire_snapshot_directory(
     #[cfg(all(unix, not(target_os = "linux")))]
     let lease = {
         let database_file = backend
-            .duplicate_main_file_descriptor_for_snapshot_lease()
+            .main_file_pin_for_snapshot_lease()
             .await?
             .ok_or_else(|| {
                 io::Error::new(
@@ -964,9 +958,7 @@ async fn acquire_snapshot_directory(
                     "session consensus snapshot storage requires a file-backed SQLite backend",
                 )
             })?;
-        let database_lock =
-            nix::fcntl::Flock::lock(database_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-                .map_err(|(_, error)| io::Error::from(error))?;
+        let database_lock = super::snapshot::SnapshotDatabaseFlock::lock(database_file)?;
         Arc::new(SnapshotDirectoryLease {
             canonical_directory: canonical_directory.clone(),
             namespace,
@@ -2831,7 +2823,7 @@ async fn derive_private_wal_install_source(
     )
     .await?;
     let raw_pin = raw.pin_readonly_from_writer()?;
-    let (file, cleanup) = raw.into_file_with_cleanup();
+    let (file, cleanup) = raw.into_file_with_cleanup()?;
     let cleanup = cleanup.ok_or_else(|| {
         consensus::invalid_data("private WAL install derivative cleanup is missing")
     })?;
@@ -6136,8 +6128,10 @@ impl SqliteConsensusStateMachine {
                     ),
                 )));
             }
-            raw_artifact
-                .record_identity_from_file(raw_snapshot.file())
+            raw_snapshot
+                .file()
+                .artifact()
+                .and_then(|file| raw_artifact.record_identity_from_file(file))
                 .map_err(|error| {
                     storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
@@ -6157,7 +6151,14 @@ impl SqliteConsensusStateMachine {
                     error,
                 )
             })?;
-            let (raw_file, raw_snapshot_cleanup) = raw_snapshot.into_file_with_cleanup();
+            let (raw_file, raw_snapshot_cleanup) =
+                raw_snapshot.into_file_with_cleanup().map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        error,
+                    )
+                })?;
             raw_file.sync_all().map_err(|error| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
@@ -6232,8 +6233,10 @@ impl SqliteConsensusStateMachine {
                     ),
                 )));
             }
-            raw_artifact
-                .record_identity_from_file(raw_snapshot.file())
+            raw_snapshot
+                .file()
+                .artifact()
+                .and_then(|file| raw_artifact.record_identity_from_file(file))
                 .map_err(|error| {
                     storage_error(
                         ErrorSubject::Snapshot(Some(meta.signature())),
@@ -6734,6 +6737,16 @@ fn create_vacuum_raw_snapshot_intermediate(
     ))
 }
 
+// Keep the snapshot builder's live-source descriptor fence independently
+// exercisable without involving the offline copier or destination files.
+fn snapshot_build_live_identity(
+    connection: &rusqlite::Connection,
+) -> io::Result<super::snapshot::FileIdentity> {
+    super::snapshot::FileIdentity::for_connection(connection).map_err(|_| {
+        consensus::invalid_data("session consensus live source descriptor is unavailable")
+    })
+}
+
 /// Build a file-backed snapshot from one independently owned WAL reader. The
 /// live consensus connection is held only long enough to admit and compare the
 /// exact applied/membership cut; backup and offline finalization never retain
@@ -6841,17 +6854,9 @@ async fn build_file_backed_snapshot_database(
         core.with_application_cache_read(&conn, || {
             match consensus::begin_snapshot_read_sync(&worker.reader, core.storage_identity) {
                 Ok(source_cut) => {
-                    let live_file = opc_sqlite_file_control_sys::main_file_descriptor(&conn)
-                        .map_err(|_| {
-                            consensus::invalid_data(
-                                "session consensus live source descriptor is unavailable",
-                            )
-                        })
-                        .and_then(|file| {
-                            PinnedSqliteFile::from_file(file, database_file.path().to_path_buf())
-                        });
+                    let live_file = snapshot_build_live_identity(&conn);
                     match live_file {
-                        Ok(live_file) if live_file.identity() != database_file.identity() => {
+                        Ok(live_file) if live_file != database_file.identity() => {
                             Err(consensus::invalid_data(
                                 "session consensus live source descriptor changed",
                             ))
@@ -7797,7 +7802,7 @@ async fn seal_snapshot_database_in_place(
     } else {
         None
     };
-    let (raw_file, output_cleanup) = raw_snapshot.into_file_with_cleanup();
+    let (raw_file, output_cleanup) = raw_snapshot.into_file_with_cleanup()?;
     // This is the cleanup owner for the already-created, descriptor-pinned
     // compaction inode. It must remain armed through every async hash, footer,
     // sync, and later atomic rename; otherwise cancellation could retain an
@@ -7990,7 +7995,7 @@ pub(crate) async fn inspect_voter_snapshot(
         )
         .await?;
         let raw_pin = raw.pin_readonly_from_writer()?;
-        let (raw_file, raw_cleanup) = raw.into_file_with_cleanup();
+        let (raw_file, raw_cleanup) = raw.into_file_with_cleanup()?;
         raw_file.sync_all()?;
         drop(raw_file);
         let raw_pin = seal_snapshot_pin(
@@ -8174,7 +8179,8 @@ where
             destination_path,
         )?,
     };
-    let mut destination = tokio::fs::File::from_std(raw_snapshot.file().try_clone()?);
+    let mut destination =
+        tokio::fs::File::from_std(raw_snapshot.file().try_clone()?.into_artifact()?);
     let mut copied = 0_u64;
     let mut hasher = Sha256::new();
     // This buffer lives across reads. Keeping it inline also embeds 64 KiB
@@ -8505,7 +8511,7 @@ async fn track_previous_snapshot_artifact(
             None,
         )
         .await?;
-        pinned.into_file()
+        pinned.into_file()?
     } else {
         let file = open_snapshot_child_in_namespace(
             Arc::clone(&namespace_lease.namespace),
@@ -8713,6 +8719,8 @@ fn reject_indeterminate_snapshot_publication(core: &SqliteConsensusCore) -> io::
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod descriptor_locks;
     #[cfg(target_os = "linux")]
     mod native_log_retained_bound;
     #[cfg(target_os = "linux")]
@@ -15527,7 +15535,7 @@ mod tests {
             state_machine
                 .core
                 .database_file
-                .as_deref()
+                .as_ref()
                 .expect("file-backed store retains its snapshot source"),
         )
         .expect("open deferred snapshot reader");

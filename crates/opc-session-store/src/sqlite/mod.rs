@@ -635,6 +635,10 @@ pub struct SqliteSessionBackend {
     pub(crate) voter_signer: Option<crate::VoterIdentitySigner>,
     #[cfg(target_os = "linux")]
     pub(crate) native_owner: Option<Arc<consensus::wal::owner::NativeOwner>>,
+    // Retain the owner's startup descriptor even in fixtures that switch the
+    // native owner off. Lease retirement must never close a live database FD.
+    #[cfg(target_os = "linux")]
+    main_file_pin: Option<Arc<crate::consensus::snapshot::SqliteFilePin>>,
     #[cfg(target_os = "linux")]
     native_reopen_pending: Arc<AtomicBool>,
     #[cfg(all(test, target_os = "linux"))]
@@ -1442,6 +1446,9 @@ impl SqliteSessionBackend {
             .map_err(|_| native::unavailable())?;
 
         #[cfg(target_os = "linux")]
+        let main_file_pin = native_owner.as_ref().map(|owner| owner.database_pin());
+
+        #[cfg(target_os = "linux")]
         let native_selected = native_owner.as_ref().is_some_and(|owner| owner.selected());
         #[cfg(not(target_os = "linux"))]
         let native_selected = false;
@@ -1474,6 +1481,8 @@ impl SqliteSessionBackend {
             voter_signer: None,
             #[cfg(target_os = "linux")]
             native_owner,
+            #[cfg(target_os = "linux")]
+            main_file_pin,
             #[cfg(target_os = "linux")]
             native_reopen_pending: Arc::new(AtomicBool::new(native_selected)),
             #[cfg(all(test, target_os = "linux"))]
@@ -2192,22 +2201,22 @@ impl SqliteSessionBackend {
         self.database_path.is_some()
     }
 
-    /// Duplicate the exact SQLite main-database descriptor for a snapshot
+    /// Share the backend-owned SQLite main-database descriptor for a snapshot
     /// lease acquired before consensus-core construction.
     ///
     /// The returned descriptor is tied to SQLite's live VFS object, not a
     /// fresh pathname open.  File-backed stores fail closed if SQLite reports
     /// a moved main file or if the canonical name no longer resolves to that
     /// same object. In-memory stores have no descriptor and return `None`.
-    pub(crate) async fn duplicate_main_file_descriptor_for_snapshot_lease(
+    pub(crate) async fn main_file_pin_for_snapshot_lease(
         &self,
-    ) -> std::io::Result<Option<File>> {
+    ) -> std::io::Result<Option<Arc<crate::consensus::snapshot::SqliteFilePin>>> {
         let Some(database_path) = self.database_path.as_ref() else {
             return Ok(None);
         };
         let connection = self.conn.lock().await;
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::MetadataExt as _;
 
@@ -2216,29 +2225,28 @@ impl SqliteSessionBackend {
                     "SQLite main file descriptor is unavailable for snapshot lease",
                 )
             };
-            if opc_sqlite_file_control_sys::main_file_has_moved(&connection)
-                .map_err(|_| unavailable())?
-            {
-                return Err(unavailable());
-            }
-            let descriptor = opc_sqlite_file_control_sys::main_file_descriptor(&connection)
+            let identity = opc_sqlite_file_control_sys::main_file_identity(&connection)
                 .map_err(|_| unavailable())?;
-            let path_pin = open_regular_read_nofollow(database_path.as_ref())?;
-            let path_metadata = path_pin.metadata()?;
+            let descriptor = self.main_file_pin.as_ref().ok_or_else(unavailable)?;
+            // lstat preserves the no-follow admission fence without opening a
+            // temporary FD whose close would release SQLite's record locks.
+            let path_metadata = std::fs::symlink_metadata(database_path.as_ref())?;
             let descriptor_metadata = descriptor.metadata()?;
-            if path_metadata.dev() != descriptor_metadata.dev()
-                || path_metadata.ino() != descriptor_metadata.ino()
+            if !path_metadata.is_file()
+                || !descriptor_metadata.is_file()
+                || (path_metadata.dev(), path_metadata.ino()) != identity
+                || (descriptor_metadata.dev(), descriptor_metadata.ino()) != identity
                 || opc_sqlite_file_control_sys::main_file_has_moved(&connection)
                     .map_err(|_| unavailable())?
             {
                 return Err(unavailable());
             }
-            Ok(Some(descriptor))
+            Ok(Some(Arc::clone(descriptor)))
         }
 
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
-            let _ = connection;
+            let _ = (connection, database_path);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "SQLite main file descriptor is unavailable for snapshot lease",

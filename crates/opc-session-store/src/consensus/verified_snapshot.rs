@@ -9,13 +9,15 @@
 
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use opc_sqlite_file_control_sys::{RegisteredSnapshot, VerifiedSnapshotSource};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
+
+use super::snapshot::SqliteFilePin;
 
 const MIN_BLOCK_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
@@ -378,7 +380,7 @@ struct CachedBlocks {
 }
 
 pub(crate) struct VerifiedFile {
-    file: File,
+    file: SqliteFilePin,
     generation: Generation,
     block_bytes: usize,
     blocks: Box<[[u8; DIGEST_BYTES]]>,
@@ -392,15 +394,16 @@ pub(crate) struct VerifiedFile {
 }
 
 impl VerifiedFile {
-    pub(crate) fn capture(file: File, maximum: u64) -> io::Result<Arc<Self>> {
+    pub(crate) fn capture(file: impl Into<SqliteFilePin>, maximum: u64) -> io::Result<Arc<Self>> {
         Self::capture_checked(file, maximum, || Ok(()))
     }
 
     fn capture_checked(
-        file: File,
+        file: impl Into<SqliteFilePin>,
         maximum: u64,
         mut check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Arc<Self>> {
+        let file = file.into();
         check()?;
         let before = Generation::read_linked(&file.metadata()?)?;
         if before.length == 0 || before.length > maximum {
@@ -588,10 +591,16 @@ impl VerifiedSnapshotSource for VerifiedFile {
     }
 
     fn duplicate_descriptor(&self) -> io::Result<File> {
-        self.file.try_clone()
+        // A raw duplicate would escape SQLite's coordinated close ownership.
+        // Callers inspecting managed database pins must borrow the file.
+        self.file.try_clone()?.into_artifact()
     }
 
-    #[cfg(any(test, feature = "test-control"))]
+    fn borrowed_descriptor(&self) -> io::Result<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd as _;
+        Ok(self.file.as_fd())
+    }
+
     fn file_identity(&self) -> io::Result<(u64, u64)> {
         let metadata = self.file.metadata()?;
         Ok((metadata.dev(), metadata.ino()))
@@ -604,13 +613,13 @@ pub(crate) struct PortableSnapshot {
 }
 
 impl PortableSnapshot {
-    pub(crate) fn capture(file: File, maximum: u64) -> io::Result<Arc<Self>> {
+    pub(crate) fn capture(file: impl Into<SqliteFilePin>, maximum: u64) -> io::Result<Arc<Self>> {
         let source = VerifiedFile::capture(file, maximum)?;
         Self::register(source)
     }
 
     pub(crate) fn capture_checked(
-        file: File,
+        file: impl Into<SqliteFilePin>,
         maximum: u64,
         check: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Arc<Self>> {
@@ -673,6 +682,7 @@ mod journal_page_memory_tests;
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::os::unix::fs::FileExt as _;
 
     #[test]
     fn verification_reservation_split_preserves_total_until_each_owner_drops() {

@@ -164,7 +164,6 @@ pub(super) fn admit_native_snapshots(
         readonly_nofollow, PinnedSqliteFile, SNAPSHOT_ENVELOPE_FOOTER_BYTES, SNAPSHOT_MAX_BYTES,
     };
     use std::io::Write;
-    use std::os::unix::fs::FileExt;
     let mut admitted = AdmittedNativeSnapshots {
         pins: Vec::new(),
         installation: None,
