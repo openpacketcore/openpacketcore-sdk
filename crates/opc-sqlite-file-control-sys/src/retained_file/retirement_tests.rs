@@ -105,6 +105,42 @@ fn retained_pin_failed_name_fence_preserves_native_record_locks() {
 }
 
 #[test]
+fn retained_pin_sequential_retirement_stays_within_descriptor_budget() {
+    const TEST: &str = "retained_file::retirement_tests::retained_pin_sequential_retirement_stays_within_descriptor_budget";
+    if probe_child() || isolate(TEST) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("database");
+    let connection = locked_database(&path);
+    probe(&path, TEST, true);
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes a complete rlimit into this live initialized value.
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(result, 0);
+    limit.rlim_cur = limit.rlim_cur.min(64);
+    // SAFETY: only this isolated child lowers its own soft descriptor limit;
+    // the hard limit is preserved and the parent harness is unaffected.
+    let result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    assert_eq!(result, 0);
+    for _ in 0..128 {
+        let mut pin = RetainedSqliteFile::open_nofollow(&path)
+            .expect("sequential pins must not exhaust the descriptor budget");
+        let mut header = [0; 16];
+        pin.read_exact(&mut header).unwrap();
+        assert_eq!(&header, b"SQLite format 3\0");
+        drop(pin);
+    }
+    probe(&path, TEST, true);
+    connection.execute_batch("ROLLBACK;").unwrap();
+    drop(connection);
+    probe(&path, TEST, false);
+}
+
+#[test]
 fn retained_pin_native_queue_preserves_locks_and_reclaims_descriptors() {
     const TEST: &str = "retained_file::retirement_tests::retained_pin_native_queue_preserves_locks_and_reclaims_descriptors";
     if probe_child() || isolate(TEST) {
