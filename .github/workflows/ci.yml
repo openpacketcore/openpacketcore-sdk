@@ -1091,10 +1091,13 @@ jobs:
       # Widened beyond opc-session-net: opc-protocol is the shared error type
       # whose layout every protocol crate depends on, and opc-proto-gtpv2c
       # carries the caller-supplied absolute usize base offsets whose checked
-      # arithmetic is width-sensitive.
+      # arithmetic is width-sensitive. The SQLite file-control regression
+      # also requires i686 to expose a narrow stat ABI on large sparse files.
       - name: Run 32-bit portability tests
         if: matrix.slice == 'ordinary-integration'
-        run: cargo test --locked -p opc-protocol -p opc-proto-gtpv2c --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
+        run: |
+          cargo test --locked -p opc-protocol -p opc-proto-gtpv2c --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
+          cargo test --locked -p opc-sqlite-file-control-sys --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
 
   # Keep the existing required-check job key and display name stable while
   # requiring both ordinary shards and the contracts slice to succeed.

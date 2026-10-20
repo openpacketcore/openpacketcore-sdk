@@ -990,7 +990,10 @@ fn map_store_error(error: StoreError) -> FencedOwnershipError {
             FencedOwnershipError::OutcomeUnavailable
         }
         StoreError::CapabilityNotSupported(_) => FencedOwnershipError::CapabilityNotSupported,
-        StoreError::BackendUnavailable(_) => FencedOwnershipError::BackendUnavailable,
+        StoreError::BackendUnavailable(_)
+        | StoreError::FencedTransitionRecoveryJournalUnavailable => {
+            FencedOwnershipError::BackendUnavailable
+        }
         StoreError::LeaseHeld => FencedOwnershipError::Contended,
         StoreError::LeaseExpired => FencedOwnershipError::Expired,
         StoreError::NotFound => FencedOwnershipError::NotFound,
