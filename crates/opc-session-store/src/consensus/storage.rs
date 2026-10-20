@@ -2491,6 +2491,15 @@ pub enum SessionConsensusStorageError {
 }
 
 impl SessionConsensusStorageError {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_native_validation_error(error: io::Error, enrolled: bool) -> Self {
+        if enrolled && consensus::wal::owner::is_missing_native_root(&error) {
+            Self::VoterIdentityReplacementRequired
+        } else {
+            Self::from_validation_error(error)
+        }
+    }
+
     pub(crate) fn from_validation_error(error: io::Error) -> Self {
         match error
             .get_ref()
@@ -3803,7 +3812,12 @@ async fn open_with_member_bindings_for_profile(
             persistence,
         )
         .await
-        .map_err(SessionConsensusStorageError::from_validation_error)?;
+        .map_err(|error| {
+            SessionConsensusStorageError::from_native_validation_error(
+                error,
+                backend.voter_seed.is_some(),
+            )
+        })?;
     }
     #[cfg(all(test, target_os = "linux"))]
     if let Some(test) = backend.private_wal_test.as_ref() {

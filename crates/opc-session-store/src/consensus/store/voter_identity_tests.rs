@@ -1,5 +1,53 @@
 use super::*;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_opener_reports_lost_native_root_as_identity_replacement() {
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    let mut fleet = Fleet::open().await;
+    let outcome = AssertUnwindSafe(async {
+        let storage_identity = fleet.nodes[0].inner.storage_identity;
+        while let Some(store) = fleet.nodes.pop() {
+            fleet.network.disconnect_and_shutdown(&store).await;
+        }
+        let directory = fleet.directories[0].path();
+        let path = directory.join("session.sqlite");
+        let root = directory.join("session.sqlite.native-wal");
+        let key = directory.join("session.sqlite.voter-identity");
+        let before = zeroize::Zeroizing::new(std::fs::read(&key).unwrap());
+        std::fs::rename(&root, directory.join("lost-native-root")).unwrap();
+        let backend = SqliteSessionBackend::open(&path).unwrap();
+        assert_eq!(
+            backend
+                .native_persistence_preflight(storage_identity, |_| async { Ok(()) })
+                .await,
+            Err(crate::consensus::storage::SessionConsensusStorageError::CorruptState),
+            "the legacy profile must retain its existing recovery refusal"
+        );
+        let result = ConsensusSessionStore::open_with_voter_slots_and_integrity(
+            fleet.topology(1),
+            fleet.genesis(),
+            member(1, 1).identity.node_id(),
+            backend,
+            directory.join("snapshots"),
+            Arc::new(Resolver(fleet.network.clone())),
+            super::super::super::SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await;
+        if let Ok(store) = &result {
+            store.shutdown().await.unwrap();
+        }
+        assert!(matches!(result, Err(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired)), "a lost selected native root must trigger automatic incarnation replacement: {result:?}");
+        assert!(!root.exists(), "refusal must not rebuild an empty native history");
+        assert!(std::fs::read(key).unwrap() == *before, "refusal must preserve the retained private key");
+        assert!(fleet.network.handlers.read().unwrap().is_empty());
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 #[tokio::test]
 async fn voter_opener_refuses_missing_or_mismatched_enrollment_before_raft() {
     for fault in 0..4 {

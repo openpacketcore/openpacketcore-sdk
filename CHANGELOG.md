@@ -131,6 +131,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-store`: `SqliteSessionBackend::voter_identity_binding` returns
+  an enrolled volume's public installation, slot, incarnation and key digest
+  after restart, without exporting private key material or granting admission.
+
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
   Live predecessor-lease contention retains one nonterminal binding with a
@@ -843,6 +847,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations, keeping its admission lease until all predecessor descriptors
   retire even when a cancelled worker fails before running its operation.
 
+- `opc-session-store`: transient enrollment read failures remain retryable
+  through signer reopen and consensus preflight. Missing selected native WAL
+  roots in the enrolled voter profile return `VoterIdentityReplacementRequired`
+  while retaining the existing startup refusal.
 - `opc-session-net`: preserve valid slow quorum replies until the caller's
   original deadline for protected history, expiry and receipt reads, including
   prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight

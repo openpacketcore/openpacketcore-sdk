@@ -6483,14 +6483,18 @@ impl ConsensusSessionStore {
 
     /// Initialize pristine members with the exact admitted voting set.
     ///
-    /// Concurrent calls are expected, but only the canonical lowest pristine
-    /// member invokes Openraft initialization. Other pristine members wait for
-    /// replicated membership, avoiding fixed-timeout split-vote lockstep.
-    /// Clean first formation fails closed if the canonical member is absent.
-    /// Fixed peers with no engine history answer Pre-Vote using the admitted
-    /// topology after any observed leader lease expires, so a missed first
-    /// campaign can recover through automatic elections without changing this
-    /// initialization rule.
+    /// Concurrent calls are expected. In the enrolled voter-slot profile, any
+    /// admitted pristine genesis member may initialize the same complete
+    /// immutable manifest. Formation therefore does not require a preferred
+    /// initiator, and admission follows a fresh authenticated quorum barrier
+    /// and local apply.
+    ///
+    /// In the legacy fixed profile, only the canonical lowest pristine member
+    /// invokes Openraft initialization. Other pristine members wait for replicated
+    /// membership, avoiding fixed-timeout split-vote lockstep; clean formation
+    /// requires the canonical member. Fixed peers with no engine history answer
+    /// Pre-Vote using the admitted topology after any observed leader lease
+    /// expires, so a missed first campaign can recover through automatic elections.
     ///
     /// A cold Async voter requires a fresh live-quorum cut and actual catch-up,
     /// or supported unanimous retained-owner recovery when no compatible live
