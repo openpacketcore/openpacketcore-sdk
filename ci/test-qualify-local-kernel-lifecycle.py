@@ -551,6 +551,49 @@ def workflow_jobs(name):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_native_gtpu_jobs_build_in_their_cached_target(self):
+        jobs = workflow_jobs("gtpu-privileged.yml")
+        for name in ["privileged-gtpu", "privileged-gtpu-regressions"]:
+            with self.subTest(job=name):
+                job = jobs[name]
+                target = re.search(r"^      CARGO_TARGET_DIR: \$\{\{ github.workspace \}\}/([^\n]+)$", job, re.M)
+                self.assertIsNotNone(target, "declare the actual build target before restoring its cache")
+                self.assertEqual(job.count("uses: Swatinem/rust-cache@v2\n"), 1)
+                self.assertIn(f"workspaces: . -> {target[1]}\n", job)
+                self.assertNotRegex(job, r"(?:export |env )CARGO_TARGET_DIR=")
+                self.assertNotIn("CARGO_PROFILE_", job)
+                self.assertNotIn("continue-on-error", job)
+
+    def test_native_gtpu_proofs_use_both_existing_required_jobs_once(self):
+        jobs = workflow_jobs("gtpu-privileged.yml")
+        native = {name: jobs[name] for name in ["privileged-gtpu", "privileged-gtpu-regressions"]}
+        library_filters = (
+            "program_tag_candidates_match_the_running_kernel "
+            "pre_redirect_tag_candidates_match_the_running_kernel "
+            "historical_25_tag_candidates_match_the_running_kernel "
+            "historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex "
+            "historical_25_attached_frozen_graph_is_refused_without_mutation "
+            "detach_accepts_unrelated_program_retirement_ "
+            "detach_keeps_foreign_reference_despite_unrelated_program_retirement sibling_scan_"
+        )
+        selections = {
+            "cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1": "privileged-gtpu",
+            "cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 " + library_filters: "privileged-gtpu-regressions",
+            'sudo unshare -n -- bash ci/qualify-gtpu-control-native.sh': "privileged-gtpu-regressions",
+        }
+        for command, owner in selections.items():
+            with self.subTest(command=command):
+                self.assertEqual(sum(job.count(command) for job in native.values()), 1)
+                self.assertIn(command, native[owner])
+        for name, minutes in [("privileged-gtpu", 30), ("privileged-gtpu-regressions", 20)]:
+            self.assertIn(f"timeout-minutes: {minutes}\n", native[name])
+            self.assertIn("runs-on: ubuntu-latest\n", native[name])
+            self.assertNotRegex(native[name], r"(?m)^    (needs|if):")
+        aggregate = jobs["privileged-gtpu-result"]
+        self.assertIn("needs: [privileged-gtpu, privileged-gtpu-regressions]\n", aggregate)
+        self.assertIn('test "$DATAPATH_RESULT" = success', aggregate)
+        self.assertIn('test "$REGRESSIONS_RESULT" = success', aggregate)
+
     def test_host_qualification_has_one_owner_with_its_own_preflight_and_cleanup(self):
         jobs = workflow_jobs("ci.yml")
         host = jobs["rust-local-kernel-lifecycle"]

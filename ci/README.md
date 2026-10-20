@@ -322,14 +322,26 @@ namespace. The **Privileged Linux GTP-U and route regressions** job in
 [gtpu-privileged.yml](../.github/workflows/gtpu-privileged.yml) runs the three
 empty historical hierarchy normalization tests on a private bpffs mount, plus
 the route-steering tests for distinct IPv4/IPv6 mark-only rules and locked-MTU
-ICMP signaling in both families. The required **Privileged Linux GTP-U** check
-requires both this job and the datapath job to succeed. Both workflows run on
-PRs and main pushes.
+ICMP signaling in both families. It also runs the 14 eBPF library proofs for
+kernel program identity, historical recovery and retirement races, and the
+three native control-queue and injection contracts. These reuse the library
+binary built for normalization. Their counts, anti-skip checks, success markers
+and native control artifacts remain mandatory.
 
-These commands select exact ignored names and require their exact executed
-counts with zero ignored tests. Normalization and locked-MTU tests must also
-emit their success markers, so an unset privileged flag cannot produce a
-passing gate without exercising the kernel. Build as the ordinary user, then
+The **Privileged Linux GTP-U datapath** job keeps the host parser tests,
+map-in-map reader-grace proof, Linux GTP-U integration suite and complete eBPF
+integration suite with its source-derived count and evidence checks. The two
+native jobs retain their 30-minute datapath and 20-minute regression budgets.
+Both build in `target/gtpu-native`, which is also their explicit Rust cache
+target; each hosted job has its own checkout and job-specific cache key.
+Cache misses still compile and execute the complete selection. The required
+**Privileged Linux GTP-U** check requires both native jobs to succeed. Both
+workflows run on PRs and main pushes.
+
+The normalization, route and native control commands select exact ignored names
+and require their exact executed counts with zero ignored tests. Normalization
+and locked-MTU tests must also emit their success markers, so an unset privileged
+flag cannot produce a passing gate without exercising the kernel. Build as the ordinary user, then
 run the resulting test binary with the namespace privileges it needs.
 
 ## Exact, temporary qualification manifest

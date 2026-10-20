@@ -820,6 +820,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI: balance native GTP-U qualification across the existing datapath and
+  regression jobs, reusing the regression job's library build for kernel
+  provenance and control proofs. Cache the actual build target in both jobs
+  while retaining every test, evidence check and the 30/20-minute job deadlines.
+
 - `opc-egress-fence`: keep empty and truncated L3 vectors in the independent
   object oracle executable on kernels that reject short IP test-run transport
   headers. Preserve the exact packet bytes and every gate assertion.
