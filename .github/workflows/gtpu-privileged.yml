@@ -913,21 +913,9 @@ jobs:
           image="${RUNNER_TEMP}/rocky94-el9.qcow2"
           # Hosted HTTP/2 transfers from this vault have repeatedly ended with
           # curl error 92 before completion. Use HTTP/1.1 for this pinned image.
-          # Retry every curl error, including partial transfers (18). Separate
-          # invocations resume the saved bytes instead of resetting the output.
-          for attempt in 1 2 3 4; do
-            if curl --http1.1 --fail --location --continue-at - \
-              --output "${image}" \
-              https://dl.rockylinux.org/vault/rocky/9.4/images/x86_64/Rocky-9-GenericCloud-Base-9.4-20240609.1.x86_64.qcow2; then
-              break
-            else
-              status=$?
-            fi
-            if [ "${attempt}" -eq 4 ]; then
-              exit "${status}"
-            fi
-            sleep "$((1 << (attempt - 1)))"
-          done
+          bash ci/download-image.sh \
+            https://dl.rockylinux.org/vault/rocky/9.4/images/x86_64/Rocky-9-GenericCloud-Base-9.4-20240609.1.x86_64.qcow2 \
+            "${image}"
           echo "2179864f4fa9799f11c0824c439666c2451d6751450494e20034efd4f3fa0559  ${image}" \
             | sha256sum -c -
 

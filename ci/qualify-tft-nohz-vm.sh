@@ -44,7 +44,7 @@ printf 'profile=%s\nrevision=%s\nimage=%s\nimage_sha256=%s\nvcpus=2\nmem_mib=307
 # Reuse the ordinary qualification images, CPU/memory shape and boot bounds.
 # The EL9 vault requires HTTP/1.1, as in the ordinary EL9 job.
 image="${private}/guest.qcow2"
-curl --http1.1 --fail --location --retry 3 --output "$image" "$image_url"
+bash "${repository}/ci/download-image.sh" "$image_url" "$image"
 printf '%s  %s\n' "$image_sha" "$image" | sha256sum -c -
 key="${private}/ssh-key"
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$key"
