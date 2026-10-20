@@ -22022,6 +22022,7 @@ mod payload_profile;
 #[cfg(test)]
 mod tests {
     mod lease_deferral_wire_tests;
+    mod lease_status_budget;
     #[path = "prewarm_batch.rs"]
     mod prewarm_batch;
     mod read_deadline_tests;
