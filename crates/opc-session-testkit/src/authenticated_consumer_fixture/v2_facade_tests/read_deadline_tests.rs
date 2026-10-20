@@ -11,9 +11,13 @@ use opc_session_store::{
 use opc_types::Timestamp;
 
 mod capacity_tests;
+mod clock_support;
 mod contention_tests;
 mod handoff_tests;
 mod maintenance_tests;
+mod realtime_tests;
+
+use clock_support::{shutdown_clients, ReplyClock};
 
 const HOLDS: [u64; 3] = [200, 500, 700];
 const GET: usize = 0;
@@ -147,21 +151,33 @@ async fn ordinary_get_keeps_successful_200_500_700ms_replies() {
         let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
             .await
             .unwrap();
-        let clients = clients(&fixture);
-        clients[0].prewarm().await.unwrap();
-        hold(&fixture, GET, millis);
-        let budget = read_budget();
-        let result = clients[0]
-            .get_with_budget(session_key(millis), budget)
-            .await;
-        let in_deadline = tokio::time::Instant::now() < budget.original_deadline();
-        evidence.push((
-            millis,
-            matches!(result, Ok(None)),
-            in_deadline,
-            held(&fixture, GET),
-        ));
-        close(fixture, clients).await;
+        let (fixture, entry) = with_fixture_protocol_clock(
+            "ordinary_get_keeps_successful_200_500_700ms_replies",
+            async move {
+                let mut clock = ReplyClock::new(&fixture);
+                let clients = clients(&fixture);
+                clients[0].prewarm().await.unwrap();
+                hold(&fixture, GET, millis);
+                let budget = read_budget();
+                let result = clock
+                    .read(GET, clients[0].get_with_budget(session_key(millis), budget))
+                    .await;
+                let in_deadline = tokio::time::Instant::now() < budget.original_deadline();
+                let entry = (
+                    millis,
+                    matches!(result, Ok(None)),
+                    in_deadline,
+                    held(&fixture, GET),
+                );
+
+                clock.finish().await;
+                shutdown_clients(clients).await;
+                (fixture, entry)
+            },
+        )
+        .await;
+        evidence.push(entry);
+        fixture.shutdown().await.unwrap();
     }
     assert!(
         evidence
@@ -178,23 +194,38 @@ async fn ordinary_expiry_keeps_successful_200_500_700ms_replies() {
         let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
             .await
             .unwrap();
-        let clients = clients(&fixture);
-        clients[0].prewarm().await.unwrap();
-        hold(&fixture, EXPIRY, millis);
-        let budget = read_budget();
-        let result = clients[0]
-            .preflight_record_expiry_with_budget(
-                vec![RecordExpiryPreflight::from_record(&finite_record(millis))],
-                budget,
-            )
-            .await;
-        evidence.push((
-            millis,
-            result.is_ok(),
-            tokio::time::Instant::now() < budget.original_deadline(),
-            held(&fixture, EXPIRY),
-        ));
-        close(fixture, clients).await;
+        let (fixture, entry) = with_fixture_protocol_clock(
+            "ordinary_expiry_keeps_successful_200_500_700ms_replies",
+            async move {
+                let mut clock = ReplyClock::new(&fixture);
+                let clients = clients(&fixture);
+                clients[0].prewarm().await.unwrap();
+                hold(&fixture, EXPIRY, millis);
+                let budget = read_budget();
+                let result = clock
+                    .read(
+                        EXPIRY,
+                        clients[0].preflight_record_expiry_with_budget(
+                            vec![RecordExpiryPreflight::from_record(&finite_record(millis))],
+                            budget,
+                        ),
+                    )
+                    .await;
+                let entry = (
+                    millis,
+                    result.is_ok(),
+                    tokio::time::Instant::now() < budget.original_deadline(),
+                    held(&fixture, EXPIRY),
+                );
+
+                clock.finish().await;
+                shutdown_clients(clients).await;
+                (fixture, entry)
+            },
+        )
+        .await;
+        evidence.push(entry);
+        fixture.shutdown().await.unwrap();
     }
     assert!(
         evidence
@@ -217,22 +248,40 @@ async fn protected_history_keeps_successful_200_500_700ms_replies() {
                 .fail_next_fenced_transition_v2_history_state
                 .store(true, Ordering::Release);
         }
-        let clients = clients(&fixture);
-        let facade = facade(&fixture, &clients).await;
-        hold(&fixture, HISTORY, millis);
-        let budget = read_budget();
-        let result = facade
-            .prepare_fenced_transition(create(request_id(millis), millis, PAYLOAD), budget)
-            .await;
-        evidence.push((
-            millis,
-            result.is_ok(),
-            tokio::time::Instant::now() < budget.original_deadline(),
-            held(&fixture, HISTORY),
-        ));
-        drop(result);
-        drop(facade);
-        close(fixture, clients).await;
+        let (fixture, entry) = with_fixture_protocol_clock(
+            "protected_history_keeps_successful_200_500_700ms_replies",
+            async move {
+                let mut clock = ReplyClock::new(&fixture);
+                let clients = clients(&fixture);
+                let facade = facade(&fixture, &clients).await;
+                hold(&fixture, HISTORY, millis);
+                let budget = read_budget();
+                let result = clock
+                    .read(
+                        HISTORY,
+                        facade.prepare_fenced_transition(
+                            create(request_id(millis), millis, PAYLOAD),
+                            budget,
+                        ),
+                    )
+                    .await;
+                let entry = (
+                    millis,
+                    result.is_ok(),
+                    tokio::time::Instant::now() < budget.original_deadline(),
+                    held(&fixture, HISTORY),
+                );
+                drop(result);
+                drop(facade);
+
+                clock.finish().await;
+                shutdown_clients(clients).await;
+                (fixture, entry)
+            },
+        )
+        .await;
+        evidence.push(entry);
+        fixture.shutdown().await.unwrap();
     }
     assert!(
         evidence
@@ -249,34 +298,48 @@ async fn protected_expiry_keeps_successful_200_500_700ms_replies() {
         let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
             .await
             .unwrap();
-        let clients = clients(&fixture);
-        let facade = facade(&fixture, &clients).await;
-        // The two ALPN pools share capacity. Expiry deliberately starts cold,
-        // exercising the unchanged short setup/write budget as well.
-        hold(&fixture, EXPIRY, millis);
-        let request = FencedTransitionRequest::new(
-            request_id(millis),
-            FencedTransitionLease::acquire(
-                session_key(millis),
-                owner(),
-                FenceToken::new(0),
-                Duration::from_secs(30),
-            )
-            .unwrap(),
-            FencedTransitionMutation::create(finite_record(millis)),
+        let (fixture, entry) = with_fixture_protocol_clock(
+            "protected_expiry_keeps_successful_200_500_700ms_replies",
+            async move {
+                let mut clock = ReplyClock::new(&fixture);
+                let clients = clients(&fixture);
+                let facade = facade(&fixture, &clients).await;
+                // The two ALPN pools share capacity. Expiry deliberately starts cold,
+                // exercising the unchanged short setup/write budget as well.
+                hold(&fixture, EXPIRY, millis);
+                let request = FencedTransitionRequest::new(
+                    request_id(millis),
+                    FencedTransitionLease::acquire(
+                        session_key(millis),
+                        owner(),
+                        FenceToken::new(0),
+                        Duration::from_secs(30),
+                    )
+                    .unwrap(),
+                    FencedTransitionMutation::create(finite_record(millis)),
+                )
+                .unwrap();
+                let budget = read_budget();
+                let result = clock
+                    .read(EXPIRY, facade.prepare_fenced_transition(request, budget))
+                    .await;
+                let entry = (
+                    millis,
+                    result.is_ok(),
+                    tokio::time::Instant::now() < budget.original_deadline(),
+                    held(&fixture, EXPIRY),
+                );
+                drop(result);
+                drop(facade);
+
+                clock.finish().await;
+                shutdown_clients(clients).await;
+                (fixture, entry)
+            },
         )
-        .unwrap();
-        let budget = read_budget();
-        let result = facade.prepare_fenced_transition(request, budget).await;
-        evidence.push((
-            millis,
-            result.is_ok(),
-            tokio::time::Instant::now() < budget.original_deadline(),
-            held(&fixture, EXPIRY),
-        ));
-        drop(result);
-        drop(facade);
-        close(fixture, clients).await;
+        .await;
+        evidence.push(entry);
+        fixture.shutdown().await.unwrap();
     }
     assert!(
         evidence
@@ -293,36 +356,58 @@ async fn protected_status_keeps_slow_replies_without_extending_mutations() {
         let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
             .await
             .unwrap();
-        let clients = clients(&fixture);
-        let facade = facade(&fixture, &clients).await;
-        let budget = read_budget();
-        let request = create(request_id(millis), millis, PAYLOAD);
-        let mut prepared = facade
-            .prepare_fenced_transition(request.clone(), budget)
-            .await
-            .unwrap();
-        hold(&fixture, MUTATION, millis);
-        hold(&fixture, STATUS, millis);
-        let mutation = prepared.execute_once().await;
-        let unknown = matches!(
-            mutation,
-            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
-        );
-        let result = prepared
-            .status_until_terminal(budget.original_deadline())
-            .await;
-        let matches = matches!(result, Ok(FencedTransitionV2Status::Recorded(ref outcome)) if outcome.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_request(&request)));
-        evidence.push((
-            millis,
-            unknown,
-            matches,
-            held(&fixture, MUTATION),
-            held(&fixture, STATUS),
-            fixture.diagnostics().fenced_transition_v2_calls(),
-        ));
-        drop(prepared);
-        drop(facade);
-        close(fixture, clients).await;
+        let (fixture, entry) = with_fixture_protocol_clock(
+            "protected_status_keeps_slow_replies_without_extending_mutations",
+            async move {
+                let mut clock = ReplyClock::new(&fixture);
+                let clients = clients(&fixture);
+                let facade = facade(&fixture, &clients).await;
+                let budget = read_budget();
+                let request = create(request_id(millis), millis, PAYLOAD);
+                let mut prepared = facade
+                    .prepare_fenced_transition(request.clone(), budget)
+                    .await
+                    .unwrap();
+                hold(&fixture, MUTATION, millis);
+                hold(&fixture, STATUS, millis);
+                let mutation = clock
+                    .mutation(
+                        MUTATION,
+                        1,
+                        budget.physical_attempt_timeout(),
+                        prepared.execute_once(),
+                    )
+                    .await;
+                let unknown = matches!(
+                    mutation,
+                    Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+                );
+                let result = clock
+                    .read(
+                        STATUS,
+                        prepared.status_until_terminal(budget.original_deadline()),
+                    )
+                    .await;
+                let matches = matches!(result, Ok(FencedTransitionV2Status::Recorded(ref outcome)) if outcome.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_request(&request)));
+                let entry = (
+                    millis,
+                    unknown,
+                    matches,
+                    held(&fixture, MUTATION),
+                    held(&fixture, STATUS),
+                    fixture.diagnostics().fenced_transition_v2_calls(),
+                );
+                drop(prepared);
+                drop(facade);
+
+                clock.finish().await;
+                shutdown_clients(clients).await;
+                (fixture, entry)
+            },
+        )
+        .await;
+        evidence.push(entry);
+        fixture.shutdown().await.unwrap();
     }
     assert!(
         evidence
@@ -358,32 +443,46 @@ async fn legacy_expiry_keeps_successful_200_500_700ms_replies() {
         let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
             .await
             .unwrap();
-        let clients = clients(&fixture);
-        let facade = legacy_facade(&fixture, &clients).await;
-        hold(&fixture, EXPIRY, millis);
-        let request = FencedTransitionRequest::new(
-            request_id(millis),
-            FencedTransitionLease::acquire(
-                session_key(millis),
-                owner(),
-                FenceToken::new(0),
-                Duration::from_secs(30),
-            )
-            .unwrap(),
-            FencedTransitionMutation::create(finite_record(millis)),
+        let (fixture, entry) = with_fixture_protocol_clock(
+            "legacy_expiry_keeps_successful_200_500_700ms_replies",
+            async move {
+                let mut clock = ReplyClock::new(&fixture);
+                let clients = clients(&fixture);
+                let facade = legacy_facade(&fixture, &clients).await;
+                hold(&fixture, EXPIRY, millis);
+                let request = FencedTransitionRequest::new(
+                    request_id(millis),
+                    FencedTransitionLease::acquire(
+                        session_key(millis),
+                        owner(),
+                        FenceToken::new(0),
+                        Duration::from_secs(30),
+                    )
+                    .unwrap(),
+                    FencedTransitionMutation::create(finite_record(millis)),
+                )
+                .unwrap();
+                let budget = read_budget();
+                let result = clock
+                    .read(EXPIRY, facade.prepare_fenced_transition(request, budget))
+                    .await;
+                let entry = (
+                    millis,
+                    result.is_ok(),
+                    tokio::time::Instant::now() < budget.original_deadline(),
+                    held(&fixture, EXPIRY),
+                );
+                drop(result);
+                drop(facade);
+
+                clock.finish().await;
+                shutdown_clients(clients).await;
+                (fixture, entry)
+            },
         )
-        .unwrap();
-        let budget = read_budget();
-        let result = facade.prepare_fenced_transition(request, budget).await;
-        evidence.push((
-            millis,
-            result.is_ok(),
-            tokio::time::Instant::now() < budget.original_deadline(),
-            held(&fixture, EXPIRY),
-        ));
-        drop(result);
-        drop(facade);
-        close(fixture, clients).await;
+        .await;
+        evidence.push(entry);
+        fixture.shutdown().await.unwrap();
     }
     assert!(
         evidence
@@ -400,35 +499,56 @@ async fn legacy_status_keeps_successful_200_500_700ms_replies() {
         let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
             .await
             .unwrap();
-        let clients = clients(&fixture);
-        let facade = legacy_facade(&fixture, &clients).await;
-        let budget = read_budget();
-        let request = create(request_id(millis), millis, PAYLOAD);
-        let mut prepared = facade
-            .prepare_fenced_transition(request.clone(), budget)
-            .await
-            .unwrap();
-        fixture.lose_next_fenced_transition_response();
-        hold(&fixture, V1_STATUS, millis);
-        let mutation = prepared.execute_once().await;
-        let unknown = matches!(
-            mutation,
-            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
-        );
-        let result = prepared
-            .status_until_terminal(budget.original_deadline())
-            .await;
-        let matches = matches!(result, Ok(FencedTransitionStatus::Recorded(ref outcome)) if outcome.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_request(&request)));
-        evidence.push((
-            millis,
-            unknown,
-            matches,
-            held(&fixture, V1_STATUS),
-            fixture.diagnostics().fenced_transition_calls(),
-        ));
-        drop(prepared);
-        drop(facade);
-        close(fixture, clients).await;
+        let (fixture, entry) = with_fixture_protocol_clock(
+            "legacy_status_keeps_successful_200_500_700ms_replies",
+            async move {
+                let mut clock = ReplyClock::new(&fixture);
+                let clients = clients(&fixture);
+                let facade = legacy_facade(&fixture, &clients).await;
+                let budget = read_budget();
+                let request = create(request_id(millis), millis, PAYLOAD);
+                let mut prepared = facade
+                    .prepare_fenced_transition(request.clone(), budget)
+                    .await
+                    .unwrap();
+                fixture.lose_next_fenced_transition_response();
+                hold(&fixture, V1_STATUS, millis);
+                let mutation = clock
+                    .lost_mutation(
+                        &fixture,
+                        budget.physical_attempt_timeout(),
+                        prepared.execute_once(),
+                    )
+                    .await;
+                let unknown = matches!(
+                    mutation,
+                    Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+                );
+                let result = clock
+                    .read(
+                        V1_STATUS,
+                        prepared.status_until_terminal(budget.original_deadline()),
+                    )
+                    .await;
+                let matches = matches!(result, Ok(FencedTransitionStatus::Recorded(ref outcome)) if outcome.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_request(&request)));
+                let entry = (
+                    millis,
+                    unknown,
+                    matches,
+                    held(&fixture, V1_STATUS),
+                    fixture.diagnostics().fenced_transition_calls(),
+                );
+                drop(prepared);
+                drop(facade);
+
+                clock.finish().await;
+                shutdown_clients(clients).await;
+                (fixture, entry)
+            },
+        )
+        .await;
+        evidence.push(entry);
+        fixture.shutdown().await.unwrap();
     }
     assert!(
         evidence
@@ -649,69 +769,87 @@ async fn concurrent_slow_receipts_use_one_call_each_with_v2_wait_counters() {
     let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
         .await
         .unwrap();
-    let clients = clients(&fixture);
-    let facade = facade(&fixture, &clients).await;
-    let budget = read_budget();
-    let first_request = create(request_id(910), 910, PAYLOAD);
-    let second_request = create(request_id(911), 911, PAYLOAD);
-    let mut first = facade
-        .prepare_fenced_transition(first_request.clone(), budget)
-        .await
-        .unwrap();
-    let mut second = facade
-        .prepare_fenced_transition(second_request.clone(), budget)
-        .await
-        .unwrap();
-    hold(&fixture, MUTATION, 700);
-    hold(&fixture, STATUS, 700);
-    let (first_mutation, second_mutation) =
-        tokio::join!(first.execute_once(), second.execute_once());
-    let setups_before: u64 = clients
-        .iter()
-        .map(|client| client.v2_diagnostics().setup_attempts)
-        .sum();
-    let (first_receipt, second_receipt) = tokio::join!(
-        first.status_until_terminal(budget.original_deadline()),
-        second.status_until_terminal(budget.original_deadline()),
-    );
-    let setups_after: u64 = clients
-        .iter()
-        .map(|client| client.v2_diagnostics().setup_attempts)
-        .sum();
-    let mut current_waiters = 0;
-    let mut max_waiters = 0;
-    for client in &clients {
-        let diagnostics = client.v2_diagnostics();
-        current_waiters += diagnostics.pool_wait_current;
-        max_waiters = max_waiters.max(diagnostics.pool_wait_max);
-    }
-    let exact = |result: &Result<FencedTransitionV2Status, _>,
-                 request: &FencedTransitionRequest| {
-        matches!(result, Ok(FencedTransitionV2Status::Recorded(outcome))
+    let (fixture, evidence) = with_fixture_protocol_clock(
+        "concurrent_slow_receipts_use_one_call_each_with_v2_wait_counters",
+        async move {
+            let mut clock = ReplyClock::new(&fixture);
+            let clients = clients(&fixture);
+            let facade = facade(&fixture, &clients).await;
+            let budget = read_budget();
+            let first_request = create(request_id(910), 910, PAYLOAD);
+            let second_request = create(request_id(911), 911, PAYLOAD);
+            let mut first = facade
+                .prepare_fenced_transition(first_request.clone(), budget)
+                .await
+                .unwrap();
+            let mut second = facade
+                .prepare_fenced_transition(second_request.clone(), budget)
+                .await
+                .unwrap();
+            hold(&fixture, MUTATION, 700);
+            hold(&fixture, STATUS, 700);
+            let (first_mutation, second_mutation) = clock
+                .mutation(MUTATION, 2, budget.physical_attempt_timeout(), async {
+                    tokio::join!(first.execute_once(), second.execute_once())
+                })
+                .await;
+            let setups_before: u64 = clients
+                .iter()
+                .map(|client| client.v2_diagnostics().setup_attempts)
+                .sum();
+            let (first_receipt, second_receipt) = clock
+                .concurrent_reads(&clients, budget.physical_attempt_timeout(), async {
+                    tokio::join!(
+                        first.status_until_terminal(budget.original_deadline()),
+                        second.status_until_terminal(budget.original_deadline()),
+                    )
+                })
+                .await;
+            let setups_after: u64 = clients
+                .iter()
+                .map(|client| client.v2_diagnostics().setup_attempts)
+                .sum();
+            let mut current_waiters = 0;
+            let mut max_waiters = 0;
+            for client in &clients {
+                let diagnostics = client.v2_diagnostics();
+                current_waiters += diagnostics.pool_wait_current;
+                max_waiters = max_waiters.max(diagnostics.pool_wait_max);
+            }
+            let exact = |result: &Result<FencedTransitionV2Status, _>,
+                         request: &FencedTransitionRequest| {
+                matches!(result, Ok(FencedTransitionV2Status::Recorded(outcome))
             if outcome.as_ref().as_ref().is_ok_and(|outcome| outcome.matches_request(request)))
-    };
-    let evidence = (
-        matches!(
-            first_mutation,
-            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
-        ),
-        matches!(
-            second_mutation,
-            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
-        ),
-        exact(&first_receipt, &first_request),
-        exact(&second_receipt, &second_request),
-        held(&fixture, MUTATION),
-        held(&fixture, STATUS),
-        fixture.diagnostics().fenced_transition_v2_calls(),
-        setups_after - setups_before,
-        current_waiters,
-        max_waiters,
-    );
-    drop(first);
-    drop(second);
-    drop(facade);
-    close(fixture, clients).await;
+            };
+            let evidence = (
+                matches!(
+                    first_mutation,
+                    Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+                ),
+                matches!(
+                    second_mutation,
+                    Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+                ),
+                exact(&first_receipt, &first_request),
+                exact(&second_receipt, &second_request),
+                held(&fixture, MUTATION),
+                held(&fixture, STATUS),
+                fixture.diagnostics().fenced_transition_v2_calls(),
+                setups_after - setups_before,
+                current_waiters,
+                max_waiters,
+            );
+            drop(first);
+            drop(second);
+            drop(facade);
+
+            clock.finish().await;
+            shutdown_clients(clients).await;
+            (fixture, evidence)
+        },
+    )
+    .await;
+    fixture.shutdown().await.unwrap();
     eprintln!("concurrent slow receipts (two callers): {evidence:?}");
     assert!(
         evidence.0 && evidence.1 && evidence.2 && evidence.3,
@@ -736,61 +874,84 @@ async fn prepared_checkpoint_cas_keeps_successful_200_500_700ms_receipts() {
         let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
             .await
             .unwrap();
-        let clients = clients(&fixture);
-        for client in &clients {
-            client.prewarm().await.unwrap();
-        }
-        let protected = Arc::new(EncryptingSessionBackend::new(
-            Arc::new(FixtureGeneralConsumerBackend::new(
-                clients.clone(),
-                Arc::clone(&fixture.ordinary_cas_fault),
-            )),
-            CountingProvider::new(),
-            "read-deadline-checkpoint",
-        ));
-        let key = session_key(930);
-        let lease = protected
-            .acquire(&key, owner(), Duration::from_secs(30))
-            .await
-            .unwrap();
-        let mut record = finite_record(930);
-        record.fence = lease.fence();
-        let composite =
-            SessionConsumerPreparedCheckpointBackend::persistent(protected, clients.clone())
+        let (fixture, entry) = with_fixture_protocol_clock(
+            "prepared_checkpoint_cas_keeps_successful_200_500_700ms_receipts",
+            async move {
+                let mut clock = ReplyClock::new(&fixture);
+                let clients = clients(&fixture);
+                for client in &clients {
+                    client.prewarm().await.unwrap();
+                }
+                let protected = Arc::new(EncryptingSessionBackend::new(
+                    Arc::new(FixtureGeneralConsumerBackend::new(
+                        clients.clone(),
+                        Arc::clone(&fixture.ordinary_cas_fault),
+                    )),
+                    CountingProvider::new(),
+                    "read-deadline-checkpoint",
+                ));
+                let key = session_key(930);
+                let lease = protected
+                    .acquire(&key, owner(), Duration::from_secs(30))
+                    .await
+                    .unwrap();
+                let mut record = finite_record(930);
+                record.fence = lease.fence();
+                let composite = SessionConsumerPreparedCheckpointBackend::persistent(
+                    protected,
+                    clients.clone(),
+                )
                 .unwrap();
-        let budget = read_budget();
-        let mut prepared = composite
-            .prepare_compare_and_set(
-                SessionConsumerRequestId::new(),
-                CompareAndSet {
-                    key,
-                    lease,
-                    expected_generation: None,
-                    new_record: record,
-                },
-                budget,
-            )
-            .await
-            .unwrap();
-        hold(&fixture, CAS_MUTATION, 700);
-        hold(&fixture, CAS_STATUS, millis);
-        let mutation = prepared.execute_once().await;
-        let receipt = prepared.status_once(budget.original_deadline()).await;
-        evidence.push((
-            millis,
-            mutation == Err(PreparedCompareAndSetExecuteError::OutcomeUnknown),
-            matches!(
-                receipt,
-                Ok(PreparedCompareAndSetStatus::Recorded(
-                    PreparedCompareAndSetOutcome::Applied
-                ))
-            ),
-            held(&fixture, CAS_MUTATION),
-            held(&fixture, CAS_STATUS),
-        ));
-        drop(prepared);
-        drop(composite);
-        close(fixture, clients).await;
+                let budget = read_budget();
+                let mut prepared = composite
+                    .prepare_compare_and_set(
+                        SessionConsumerRequestId::new(),
+                        CompareAndSet {
+                            key,
+                            lease,
+                            expected_generation: None,
+                            new_record: record,
+                        },
+                        budget,
+                    )
+                    .await
+                    .unwrap();
+                hold(&fixture, CAS_MUTATION, 700);
+                hold(&fixture, CAS_STATUS, millis);
+                let mutation = clock
+                    .mutation(
+                        CAS_MUTATION,
+                        1,
+                        budget.physical_attempt_timeout(),
+                        prepared.execute_once(),
+                    )
+                    .await;
+                let receipt = clock
+                    .read(CAS_STATUS, prepared.status_once(budget.original_deadline()))
+                    .await;
+                let entry = (
+                    millis,
+                    mutation == Err(PreparedCompareAndSetExecuteError::OutcomeUnknown),
+                    matches!(
+                        receipt,
+                        Ok(PreparedCompareAndSetStatus::Recorded(
+                            PreparedCompareAndSetOutcome::Applied
+                        ))
+                    ),
+                    held(&fixture, CAS_MUTATION),
+                    held(&fixture, CAS_STATUS),
+                );
+                drop(prepared);
+                drop(composite);
+
+                clock.finish().await;
+                shutdown_clients(clients).await;
+                (fixture, entry)
+            },
+        )
+        .await;
+        evidence.push(entry);
+        fixture.shutdown().await.unwrap();
     }
     eprintln!("prepared CAS slow receipts: {evidence:?}");
     assert!(
@@ -811,51 +972,72 @@ async fn prepared_checkpoint_lease_keeps_successful_200_500_700ms_receipts() {
         let fixture = AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable([scope()])
             .await
             .unwrap();
-        let clients = clients(&fixture);
-        for client in &clients {
-            client.prewarm().await.unwrap();
-        }
-        let protected = Arc::new(EncryptingSessionBackend::new(
-            Arc::new(FixtureGeneralConsumerBackend::new(
-                clients.clone(),
-                Arc::clone(&fixture.ordinary_cas_fault),
-            )),
-            CountingProvider::new(),
-            "read-deadline-checkpoint",
-        ));
-        let composite =
-            SessionConsumerPreparedCheckpointBackend::persistent(protected, clients.clone())
-                .unwrap();
-        let key = session_key(931);
-        let budget = read_budget();
-        let mut prepared = composite
-            .prepare_acquire_with_id(
-                SessionConsumerRequestId::new(),
-                key.clone(),
-                owner(),
-                Duration::from_secs(30),
-                budget,
-            )
-            .unwrap();
-        hold(&fixture, LEASE_MUTATION, 700);
-        hold(&fixture, LEASE_STATUS, millis);
-        let mutation = prepared.execute_once().await;
-        let receipt = prepared.status_once(budget.original_deadline()).await;
-        evidence.push((
-            millis,
-            mutation == Err(PreparedLeaseAcquireExecuteError::OutcomeUnknown),
-            matches!(
-                receipt,
-                Ok(SessionConsumerLeaseMutationStatus::Recorded(result))
-                    if matches!(*result, Ok(SessionConsumerLeaseMutationResult::Acquire(ref lease))
-                        if lease.key() == &key)
-            ),
-            held(&fixture, LEASE_MUTATION),
-            held(&fixture, LEASE_STATUS),
-        ));
-        drop(prepared);
-        drop(composite);
-        close(fixture, clients).await;
+        let (fixture, entry) = with_fixture_protocol_clock(
+            "prepared_checkpoint_lease_keeps_successful_200_500_700ms_receipts",
+            async move {
+                let mut clock = ReplyClock::new(&fixture);
+                let clients = clients(&fixture);
+                for client in &clients {
+                    client.prewarm().await.unwrap();
+                }
+                let protected = Arc::new(EncryptingSessionBackend::new(
+                    Arc::new(FixtureGeneralConsumerBackend::new(
+                        clients.clone(),
+                        Arc::clone(&fixture.ordinary_cas_fault),
+                    )),
+                    CountingProvider::new(),
+                    "read-deadline-checkpoint",
+                ));
+                let composite =
+                    SessionConsumerPreparedCheckpointBackend::persistent(protected, clients.clone())
+                        .unwrap();
+                let key = session_key(931);
+                let budget = read_budget();
+                let mut prepared = composite
+                    .prepare_acquire_with_id(
+                        SessionConsumerRequestId::new(),
+                        key.clone(),
+                        owner(),
+                        Duration::from_secs(30),
+                        budget,
+                    )
+                    .unwrap();
+                hold(&fixture, LEASE_MUTATION, 700);
+                hold(&fixture, LEASE_STATUS, millis);
+                let mutation = clock
+                    .mutation(
+                        LEASE_MUTATION,
+                        1,
+                        budget.physical_attempt_timeout(),
+                        prepared.execute_once(),
+                    )
+                    .await;
+                let receipt = clock
+                    .read(LEASE_STATUS, prepared.status_once(budget.original_deadline()))
+                    .await;
+                let entry = (
+                    millis,
+                    mutation == Err(PreparedLeaseAcquireExecuteError::OutcomeUnknown),
+                    matches!(
+                        receipt,
+                        Ok(SessionConsumerLeaseMutationStatus::Recorded(result))
+                            if matches!(*result, Ok(SessionConsumerLeaseMutationResult::Acquire(ref lease))
+                                if lease.key() == &key)
+                    ),
+                    held(&fixture, LEASE_MUTATION),
+                    held(&fixture, LEASE_STATUS),
+                );
+                drop(prepared);
+                drop(composite);
+
+                clock.finish().await;
+                shutdown_clients(clients).await;
+                (fixture, entry)
+            },
+        )
+        .await;
+        evidence.push(entry);
+        fixture.shutdown().await.unwrap();
     }
     eprintln!("prepared lease slow receipts: {evidence:?}");
     assert!(

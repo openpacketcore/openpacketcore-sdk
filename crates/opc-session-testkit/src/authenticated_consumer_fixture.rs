@@ -1934,6 +1934,8 @@ async fn start_fixture_listener(
 struct FixtureConsumer {
     inner: Arc<dyn SessionQuorumConsumer>,
     #[cfg(test)]
+    reply_clock: Mutex<Option<tokio::sync::mpsc::UnboundedSender<FixtureReplyHold>>>,
+    #[cfg(test)]
     reply_holds: [std::sync::atomic::AtomicU64; 10],
     #[cfg(test)]
     held_replies: [AtomicUsize; 10],
@@ -1994,6 +1996,8 @@ impl FixtureConsumer {
         Self {
             inner,
             #[cfg(test)]
+            reply_clock: Mutex::new(None),
+            #[cfg(test)]
             reply_holds: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             held_replies: std::array::from_fn(|_| AtomicUsize::new(0)),
@@ -2048,16 +2052,35 @@ impl FixtureConsumer {
     async fn hold_reply(&self, kind: usize) {
         let millis = self.reply_holds[kind].load(Ordering::Acquire);
         let gate = self.reply_gates[kind].lock().unwrap().clone();
+        let clock = self.reply_clock.lock().unwrap().clone();
         if millis != 0 || gate.is_some() {
             self.held_replies[kind].fetch_add(1, Ordering::SeqCst);
             self.held_reply_started[kind].notify_one();
-            if let Some(gate) = gate {
+            if let Some(clock) = clock {
+                let (release, released) = tokio::sync::oneshot::channel();
+                // The same hold duration runs on the controlled client clock.
+                // The actual quorum operation above remains on the voter runtime.
+                // A dropped receiver only cancels fixture teardown after a failure.
+                let _ = clock.send(FixtureReplyHold {
+                    kind,
+                    delay: Duration::from_millis(millis),
+                    release,
+                });
+                let _ = released.await;
+            } else if let Some(gate) = gate {
                 gate.acquire().await.unwrap().forget();
             } else {
                 tokio::time::sleep(Duration::from_millis(millis)).await;
             }
         }
     }
+}
+
+#[cfg(test)]
+struct FixtureReplyHold {
+    kind: usize,
+    delay: Duration,
+    release: tokio::sync::oneshot::Sender<()>,
 }
 
 #[async_trait]

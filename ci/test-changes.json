@@ -262,6 +262,66 @@
       "renamed_to": "rust:crates/opc-session-net::lib=lib::consumer::tests::public_protected_fenced_transition_exhausts_replying_voters_then_waits_for_silent_a",
       "reason": "Keep traversal after completed unavailable replies, then require the unanswered written A read to consume the remaining original three-second deadline without another voter round. The replacement checks exact B/C/A order and call counts, the unchanged single mutation on A, the typed deadline result and a retained journal row. Completed NotFound retry rounds remain covered separately; no caller bound is increased.",
       "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::ordinary_get_keeps_successful_200_500_700ms_replies",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::ordinary_expiry_keeps_successful_200_500_700ms_replies",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::protected_history_keeps_successful_200_500_700ms_replies",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::protected_expiry_keeps_successful_200_500_700ms_replies",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::protected_status_keeps_slow_replies_without_extending_mutations",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::legacy_expiry_keeps_successful_200_500_700ms_replies",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::legacy_status_keeps_successful_200_500_700ms_replies",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::concurrent_slow_receipts_use_one_call_each_with_v2_wait_counters",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::prepared_checkpoint_cas_keeps_successful_200_500_700ms_receipts",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
+    },
+    {
+      "test": "rust:crates/opc-session-testkit::lib=lib::authenticated_consumer_fixture::v2_facade_tests::read_deadline_tests::prepared_checkpoint_lease_keeps_successful_200_500_700ms_receipts",
+      "kind": "clock-source-changed",
+      "reason": "Wall-clock scheduling under host load, not product timing: use the existing controlled client clock after the real voter produces each successful reply. Preserve every assertion, original deadline, hold duration, mutation bound and call count. The required heavy-shard real-time boundary test retains in-deadline acceptance and late-reply rejection.",
+      "issue": 1328
     }
   ]
 }

@@ -260,6 +260,16 @@ are `{"version": 1, "changes": []}`; keep all records after their changes land.
 
 ### Local validation and boundaries
 
+The informational `clock-source-changed` kind records a functional test's
+conversion between real and controlled time. It uses only `test`, `kind`,
+`reason`, and `issue`; the exact head test must exist and its source file must
+change. This also permits recording a conversion made while a new test is
+still under review. It never authorizes fewer assertions, a new gate, removal,
+or another coverage reduction: those findings remain independent. Review must
+check every numeric deadline, hold, mutation bound and assertion, the pre-fix
+RED, and the retained real-time qualification. Static inventory cannot prove
+that two time sources preserve a test's meaning.
+
 Use Python 3.11–3.14 on Linux and a stable worktree-local environment:
 
 ```bash
