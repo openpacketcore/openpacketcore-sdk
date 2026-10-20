@@ -1246,6 +1246,30 @@ required link is fail-closed. `Debug`/`Display` for observation types print
 only labels and non-sensitive metadata—never addresses, ports, SPIs, marks,
 or interface identities.
 
+## Exact-mark forward transit
+
+`PolicyParameters::forward_transit(selector, priority, mark)` explicitly builds
+an unscoped `Forward` policy with `XfrmAction::AllowForwardTransit`, a nonzero
+full-mask `XfrmLookupMark`, and no transform template. Pass it through the usual
+`InstallPolicyRequest` and `XfrmBackend::install_policy`. Linux and the mock
+reject any other shape carrying this action before dispatch. Ordinary `Allow`
+installations continue to require a template on Linux.
+
+This policy permits matching forwarded plaintext without requiring an inbound
+IPsec security path. It supplies no tunnel, encryption or source authentication.
+The caller must constrain the selector, ensure that only authorized packet
+producers set the complete mark, and activate routing and protection together
+before opening traffic. It does not permit local output or inbound delivery.
+
+Use `QueryPolicyRequest` with the exact selector, `Forward`, and the full mark.
+Readback returns the explicit transit action only for that complete kernel
+shape. `ExactRemovePolicyRequest` uses the same selector/direction/mark identity;
+retain namespace-wide writer exclusion through readback, recovery and removal,
+as for other policies. Staged/durable installs bind the transit action and full
+request into their existing authenticated fingerprints. Existing records and
+ordinary policy bytes are unchanged. Crash recovery uses the same store and
+exact policy readback; no external cleanup is introduced.
+
 ## Lookup marks and what "exact" can mean
 
 An SA or policy lookup mark is [`XfrmLookupMark`], not a raw value/mask pair,

@@ -4365,17 +4365,22 @@ fn parse_policy_state(payload: &[u8]) -> Result<PolicyState, XfrmError> {
             ));
         }
     }
-    Ok(PolicyState {
-        parameters: PolicyParameters {
-            selector,
-            direction: decode_policy_direction(read_u8(payload, 160)?)?,
-            action: decode_policy_action(read_u8(payload, 161)?)?,
-            priority: read_u32_ne(payload, 152)?,
-            templates,
-            mark,
-            if_id,
-        },
-    })
+    let mut parameters = PolicyParameters {
+        selector,
+        direction: decode_policy_direction(read_u8(payload, 160)?)?,
+        action: decode_policy_action(read_u8(payload, 161)?)?,
+        priority: read_u32_ne(payload, 152)?,
+        templates,
+        mark,
+        if_id,
+    };
+    if parameters.action == XfrmAction::Allow {
+        parameters.action = XfrmAction::AllowForwardTransit;
+        if crate::model::validate_forward_transit_parameters(&parameters).is_err() {
+            parameters.action = XfrmAction::Allow;
+        }
+    }
+    Ok(PolicyState { parameters })
 }
 
 /// Prove that `GETPOLICY` honored a scoped lookup before unconditional delete.
@@ -5146,6 +5151,7 @@ fn is_known_aead_algorithm(name: &str) -> bool {
 
 fn validate_policy_parameters(parameters: &PolicyParameters) -> Result<(), XfrmError> {
     validate_selector_family(&parameters.selector)?;
+    crate::model::validate_forward_transit_parameters(parameters)?;
     if parameters.templates.len() > XFRM_POLICY_TEMPLATE_LIMIT {
         return Err(XfrmError::invalid_config(
             "templates",
@@ -5325,6 +5331,7 @@ fn encode_action(action: XfrmAction) -> u8 {
     match action {
         XfrmAction::Allow => XFRM_POLICY_ALLOW,
         XfrmAction::Block => XFRM_POLICY_BLOCK,
+        XfrmAction::AllowForwardTransit => XFRM_POLICY_ALLOW,
     }
 }
 
@@ -8105,11 +8112,107 @@ mod tests {
     }
 
     fn marked_forward_transit_parameters() -> PolicyParameters {
-        let mut parameters = policy_parameters();
-        parameters.direction = XfrmDirection::Forward;
-        parameters.templates.clear();
-        parameters.mark = Some(XfrmLookupMark::full(0x4000_0001));
-        parameters
+        PolicyParameters::forward_transit(selector(), 100, XfrmLookupMark::full(0x4000_0001))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn marked_forward_transit_refuses_every_broader_shape_before_dispatch() {
+        let valid = marked_forward_transit_parameters();
+        for change in [
+            "in",
+            "out",
+            "unmarked",
+            "zero",
+            "partial",
+            "template",
+            "interface",
+        ] {
+            let mut parameters = valid.clone();
+            match change {
+                "in" => parameters.direction = XfrmDirection::In,
+                "out" => parameters.direction = XfrmDirection::Out,
+                "unmarked" => parameters.mark = None,
+                "zero" => parameters.mark = Some(XfrmLookupMark::full(0)),
+                "partial" => parameters.mark = Some(XfrmLookupMark::new(0x40, 0xf0).unwrap()),
+                "template" => parameters.templates = policy_parameters().templates,
+                _ => parameters.if_id = Some(9),
+            }
+            let transport = CapturingTransport::default();
+            let backend = LinuxXfrmBackend::with_transport(transport.clone());
+            assert!(
+                matches!(
+                    backend
+                        .install_policy(InstallPolicyRequest {
+                            parameters: parameters.clone()
+                        })
+                        .await,
+                    Err(XfrmError::InvalidConfig {
+                        field: "forward_transit",
+                        ..
+                    })
+                ),
+                "{change}"
+            );
+            assert!(
+                matches!(
+                    backend
+                        .rekey_policy(RekeyPolicyRequest { parameters })
+                        .await,
+                    Err(XfrmError::InvalidConfig {
+                        field: "forward_transit",
+                        ..
+                    })
+                ),
+                "{change}"
+            );
+            assert!(transport.requests().is_empty(), "{change}");
+        }
+        for mark in [
+            XfrmLookupMark::full(0),
+            XfrmLookupMark::new(0x40, 0xf0).unwrap(),
+        ] {
+            assert!(PolicyParameters::forward_transit(selector(), 100, mark).is_err());
+        }
+        for direction in [
+            XfrmDirection::In,
+            XfrmDirection::Out,
+            XfrmDirection::Forward,
+        ] {
+            let mut ordinary = valid.clone();
+            ordinary.direction = direction;
+            ordinary.action = XfrmAction::Allow;
+            assert!(matches!(
+                encode_policy_info(&ordinary),
+                Err(XfrmError::InvalidConfig {
+                    field: "templates",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_forward_transit_readback_refuses_other_marks_and_directions() {
+        let parameters = marked_forward_transit_parameters();
+        for (direction, mark) in [
+            (XfrmDirection::Forward, XfrmLookupMark::full(0x4000_0002)),
+            (XfrmDirection::Out, parameters.mark.unwrap()),
+        ] {
+            let transport = CapturingTransport::with_response(
+                encode_policy_info(&parameters).unwrap().to_vec(),
+            );
+            let backend = LinuxXfrmBackend::with_transport(transport);
+            assert!(matches!(
+                backend
+                    .query_policy(
+                        QueryPolicyRequest::new(parameters.selector.clone(), direction)
+                            .with_mark(mark)
+                    )
+                    .await,
+                Err(XfrmError::NotFound)
+            ));
+        }
     }
 
     #[tokio::test]

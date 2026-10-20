@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 
 use opc_ipsec_xfrm::{
     Algorithm, AuthAlgorithm, EspCounterProofRequirement, EspCounterResumeApplyRequest,
-    EspCounterResumeBinding, EspCounterResumeProofSet, InstallPolicyRequest, InstallSaRequest,
-    InstalledOutboundSaBinding, IpAddress, KeyMaterial, LifetimeConfig, LinuxXfrmBackend,
-    NamespaceBoundLinuxXfrmBackend, PolicyParameters, QuerySaRequest, RemovePolicyRequest,
-    RemoveSaRequest, SaParameters, XfrmAction, XfrmBackend, XfrmCompositeInstallRequest,
-    XfrmDirection, XfrmId, XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstall, XfrmTemplate,
+    EspCounterResumeBinding, EspCounterResumeProofSet, ExactRemovePolicyRequest,
+    InstallPolicyRequest, InstallSaRequest, InstalledOutboundSaBinding, IpAddress, KeyMaterial,
+    LifetimeConfig, LinuxXfrmBackend, NamespaceBoundLinuxXfrmBackend, PolicyParameters,
+    QueryPolicyRequest, QuerySaRequest, RemovePolicyRequest, RemoveSaRequest, SaParameters,
+    XfrmAction, XfrmBackend, XfrmCompositeInstallRequest, XfrmDirection, XfrmId, XfrmLookupMark,
+    XfrmMode, XfrmRequestId, XfrmSelector, XfrmStagedInstall, XfrmTemplate,
 };
 
 const IPPROTO_ESP: u8 = 50;
@@ -457,6 +458,55 @@ async fn identical_sas_remain_isolated_between_namespace_bound_actors(
     let state_b = backend_b.query_sa(query).await?;
     assert_eq!(state_a.id, state_b.id);
     assert_eq!(state_a.selector, state_b.selector);
+
+    // Template-free transit is an explicit, exact full-mark policy. Prove its
+    // real kernel readback and deletion in each independent namespace too.
+    let transit = PolicyParameters::forward_transit(
+        state_a.selector.clone(),
+        10,
+        XfrmLookupMark::full(0x4000_0001),
+    )?;
+    let policy_query = QueryPolicyRequest::new(transit.selector.clone(), XfrmDirection::Forward)
+        .with_mark(
+            transit
+                .mark
+                .ok_or_else(|| io::Error::other("transit mark missing"))?,
+        );
+    for backend in [&backend_a, &backend_b] {
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: transit.clone(),
+            })
+            .await?;
+        assert_eq!(backend.query_policy(policy_query.clone()).await?, transit);
+        assert!(matches!(
+            backend
+                .query_policy(
+                    QueryPolicyRequest::new(transit.selector.clone(), XfrmDirection::Forward)
+                        .with_mark(XfrmLookupMark::full(0x4000_0002)),
+                )
+                .await,
+            Err(opc_ipsec_xfrm::XfrmError::NotFound)
+        ));
+    }
+    let policy_remove = ExactRemovePolicyRequest::new(
+        RemovePolicyRequest::new(transit.selector.clone(), XfrmDirection::Forward).with_mark(
+            transit
+                .mark
+                .ok_or_else(|| io::Error::other("transit mark missing"))?,
+        ),
+    );
+    backend_a.remove_policy_exact(policy_remove.clone()).await?;
+    assert!(matches!(
+        backend_a.query_policy(policy_query.clone()).await,
+        Err(opc_ipsec_xfrm::XfrmError::NotFound)
+    ));
+    assert_eq!(backend_b.query_policy(policy_query.clone()).await?, transit);
+    backend_b.remove_policy_exact(policy_remove).await?;
+    assert!(matches!(
+        backend_b.query_policy(policy_query).await,
+        Err(opc_ipsec_xfrm::XfrmError::NotFound)
+    ));
 
     let remove = RemoveSaRequest::new(ip([192, 0, 2, 2]), IPPROTO_ESP, SHARED_SPI);
     backend_a.remove_sa(remove).await?;

@@ -586,6 +586,7 @@ fn hash_action(digest: &mut Sha256, action: XfrmAction) {
     digest.update([match action {
         XfrmAction::Allow => 0,
         XfrmAction::Block => 1,
+        XfrmAction::AllowForwardTransit => 2,
     }]);
 }
 

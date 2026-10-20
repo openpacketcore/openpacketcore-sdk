@@ -2457,6 +2457,7 @@ pub(crate) fn mac_action(mac: &mut HmacSha256, action: XfrmAction) {
         match action {
             XfrmAction::Allow => 1,
             XfrmAction::Block => 2,
+            XfrmAction::AllowForwardTransit => 3,
         },
     );
 }
@@ -2946,6 +2947,52 @@ mod tests {
                 if_id: Some(600),
             },
         })
+    }
+
+    #[test]
+    fn forward_transit_install_fingerprint_binds_explicit_intent_and_exact_mark() {
+        let proof_key = key(9);
+        let parameters = crate::PolicyParameters::forward_transit(
+            XfrmSelector::new(
+                IpAddress::Ipv4([10, 0, 0, 1]),
+                IpAddress::Ipv4([10, 0, 0, 2]),
+                17,
+            ),
+            100,
+            XfrmLookupMark::full(0x4000_0001),
+        )
+        .unwrap();
+        let request = XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+            parameters: parameters.clone(),
+        });
+        let expected = authenticate_install_request(
+            proof_key.canonical_mac_key(),
+            INSTALL_REQUEST_AUTH_DOMAIN,
+            &request,
+        )
+        .unwrap();
+        for change in ["action", "mark", "priority", "direction"] {
+            let mut changed = parameters.clone();
+            match change {
+                "action" => changed.action = XfrmAction::Allow,
+                "mark" => changed.mark = Some(XfrmLookupMark::full(0x4000_0002)),
+                "priority" => changed.priority += 1,
+                _ => changed.direction = XfrmDirection::Out,
+            }
+            let changed = XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+                parameters: changed,
+            });
+            assert_ne!(
+                expected,
+                authenticate_install_request(
+                    proof_key.canonical_mac_key(),
+                    INSTALL_REQUEST_AUTH_DOMAIN,
+                    &changed
+                )
+                .unwrap(),
+                "{change}"
+            );
+        }
     }
 
     /// Byte-pinned canonical encodings for the object family.

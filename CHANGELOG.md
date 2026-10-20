@@ -131,6 +131,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-ipsec-xfrm`: `PolicyParameters::forward_transit` and the explicit
+  `XfrmAction::AllowForwardTransit` install an unscoped Forward allow with a
+  nonzero full-mask mark and no transform template. Exact readback, removal and
+  durable fingerprints retain the complete identity. Other transit shapes are
+  rejected before dispatch; ordinary Allow policies keep their template requirement.
+
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
   Live predecessor-lease contention retains one nonterminal binding with a
