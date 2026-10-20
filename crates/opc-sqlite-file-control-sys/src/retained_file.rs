@@ -222,7 +222,7 @@ mod admission_tests {
                 *hook.borrow_mut() = Some(Box::new(move || {
                     std::fs::rename(&substituted, substituted.with_extension("pinned")).unwrap();
                     fifo(&substituted);
-                    println!("{READY}");
+                    println!("\n{READY}");
                     std::io::stdout().flush().unwrap();
                 }));
             });
