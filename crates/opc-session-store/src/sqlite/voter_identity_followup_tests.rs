@@ -19,7 +19,7 @@ fn member(signer: &VoterIdentitySigner) -> VoterSlotMember {
     }
 }
 
-fn seed(signer: &VoterIdentitySigner) -> consensus::voter_slots::Seed {
+fn enrolled_voter_seed(signer: &VoterIdentitySigner) -> consensus::voter_slots::Seed {
     consensus::voter_slots::Seed::genesis(VoterSlotTable {
         cluster_instance: installation(),
         manifest_digest: [0xb3; 32],
@@ -60,7 +60,7 @@ async fn voter_anchor_busy_remains_retryable_through_signer_preflight_and_seed()
         .enroll_voter_identity(installation(), identity())
         .await
         .unwrap();
-    let seed = seed(&signer);
+    let seed = enrolled_voter_seed(&signer);
     backend.voter_signer = Some(signer.clone());
     backend.voter_seed = Some(Arc::new(seed.clone()));
     // Close the idle WAL readers before selecting rollback-journal locking
