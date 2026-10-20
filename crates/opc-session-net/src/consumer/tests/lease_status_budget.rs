@@ -104,6 +104,18 @@ async fn receipt_client(
     PersistentSessionConsumerClient,
     super::super::SessionQuorumConsumerServerHandle,
 ) {
+    let (client, server) = receipt_client_for_voter(service, 0).await;
+    client.prewarm().await.unwrap();
+    (client, server)
+}
+
+async fn receipt_client_for_voter(
+    service: Arc<dyn SessionQuorumConsumer>,
+    expected_voter: usize,
+) -> (
+    PersistentSessionConsumerClient,
+    super::super::SessionQuorumConsumerServerHandle,
+) {
     let client_identity = material_spiffe("ordinary-lease-budget-client");
     let identities = [
         material_spiffe("ordinary-lease-budget-a"),
@@ -112,7 +124,8 @@ async fn receipt_client(
     ];
     let material = RotatableClientMaterial::new(client_identity.as_str());
     let roster = test_consumer_roster_for(&identities);
-    let authority = voter_authority_for_identity(&roster, &identities[0]);
+    let server_authority = voter_authority_for_identity(&roster, &identities[0]);
+    let authority = voter_authority_for_identity(&roster, &identities[expected_voter]);
     let grant = opc_session_store::SessionConsumerAuthorizationGrant::try_new(
         client_identity,
         [SessionConsumerTenantNfScope::new(
@@ -123,7 +136,7 @@ async fn receipt_client(
     .unwrap();
     let authorizer = SessionConsumerAuthorizer::try_new(
         roster
-            .authorization_manifest(authority.node_id(), [grant])
+            .authorization_manifest(server_authority.node_id(), [grant])
             .unwrap(),
     )
     .unwrap();
@@ -155,7 +168,6 @@ async fn receipt_client(
     )
     .unwrap();
     let client = PersistentSessionConsumerClient::try_from_stateless(stateless, config).unwrap();
-    client.prewarm().await.unwrap();
     (client, server)
 }
 
@@ -429,9 +441,9 @@ async fn ordinary_lease_receipt_budget_rejects_success_at_or_after_original_dead
                 budget.original_deadline() + Duration::from_millis(after_deadline_ms)
             );
             service.release_receipt.notify_one();
-            // Release at exactly D (or D + 1), then drain timer-wheel rounding.
-            // A rejection may become ready on the next tick; no late success
-            // is accepted and the original response deadline never changes.
+            // The next advance moves the clock before yielding, so the reply
+            // is handled at D + 1 ms (or D + 2 ms), not exactly D. The direct
+            // result-mapping test covers equality at the original deadline.
             tokio::time::advance(Duration::from_millis(1)).await;
             assert!(matches!(
                 receipt.await.unwrap(),
@@ -444,6 +456,39 @@ async fn ordinary_lease_receipt_budget_rejects_success_at_or_after_original_dead
             server.abort_and_wait().await;
             tokio::time::resume();
         }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ordinary_lease_receipt_budget_identity_mismatch_is_terminal() {
+    wall_bounded(async {
+        let service = held_service().await;
+        // The trusted server presents voter A's identity; this client expects
+        // voter B from the same roster. No Call may reach the receipt service.
+        // Use independent pools so the legacy failure's reconnect cooldown
+        // cannot delay the budgeted method's first authority observation.
+        let (legacy_client, legacy_server) = receipt_client_for_voter(service.clone(), 1).await;
+        let (client, server) = receipt_client_for_voter(service.clone(), 1).await;
+        tokio::time::pause();
+        let anchor = clock_anchor();
+        let budget = receipt_budget();
+        assert!(matches!(
+            legacy_client.lease_mutation_status(&service.expected).await,
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        assert_eq!(
+            client
+                .lease_mutation_status_with_budget(&service.expected, budget)
+                .await,
+            Err(StoreError::TopologyAuthorityRevoked)
+        );
+        assert!(tokio::time::Instant::now() < budget.original_deadline());
+        assert_eq!(service.receipts.load(Ordering::SeqCst), 0);
+        assert_eq!(service.mutations.load(Ordering::SeqCst), 0);
+        anchor.abort();
+        legacy_server.abort_and_wait().await;
+        server.abort_and_wait().await;
     })
     .await;
 }

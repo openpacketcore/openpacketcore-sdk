@@ -50,36 +50,24 @@ impl PersistentSessionConsumerClient {
     /// immediately. Any other possibly transmitted failure spends the remaining
     /// original deadline, preventing an overlapping retry. A newly observed
     /// successful status at or after that deadline is unavailable.
+    /// `NotFound` before the deadline leaves the outcome open; it is not proof
+    /// that the original acquire never committed or cannot still commit.
     pub async fn lease_mutation_status_with_budget(
         &self,
         request: &SessionConsumerLeaseMutationRequest,
         budget: PreparedCheckpointBudget,
     ) -> Result<SessionConsumerLeaseMutationStatus, StoreError> {
-        match self
+        let result = self
             .execute_v1_read_with_budget(
                 DeadlineV1Read::LeaseMutationStatus(Box::new(request.clone())),
                 budget,
             )
-            .await
-        {
-            Ok(SessionConsumerResponse::LeaseMutationStatus(Ok(status)))
-                if tokio::time::Instant::now() < budget.original_deadline() =>
-            {
-                Ok(status)
-            }
-            Ok(SessionConsumerResponse::LeaseMutationStatus(Err(error))) => {
-                Err(error.into_store_error())
-            }
-            Ok(SessionConsumerResponse::Rejected(rejection)) => {
-                Err(rejection_into_store_error(rejection))
-            }
-            Err(error) if read_authority_revoked(&error) => {
-                Err(StoreError::TopologyAuthorityRevoked)
-            }
-            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
-                "consumer lease receipt status unavailable".into(),
-            )),
-        }
+            .await;
+        lease_mutation_status_result(
+            result,
+            budget.original_deadline(),
+            tokio::time::Instant::now(),
+        )
     }
 
     /// Read authoritative state within the caller's immutable checkpoint budget.
@@ -290,6 +278,28 @@ impl PersistentSessionConsumerClient {
     }
 }
 
+fn lease_mutation_status_result(
+    result: Result<SessionConsumerResponse, SessionConsumerCallError>,
+    deadline: tokio::time::Instant,
+    observed_at: tokio::time::Instant,
+) -> Result<SessionConsumerLeaseMutationStatus, StoreError> {
+    match result {
+        Ok(SessionConsumerResponse::LeaseMutationStatus(Ok(status))) if observed_at < deadline => {
+            Ok(status)
+        }
+        Ok(SessionConsumerResponse::LeaseMutationStatus(Err(error))) => {
+            Err(error.into_store_error())
+        }
+        Ok(SessionConsumerResponse::Rejected(rejection)) => {
+            Err(rejection_into_store_error(rejection))
+        }
+        Err(error) if read_authority_revoked(&error) => Err(StoreError::TopologyAuthorityRevoked),
+        Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+            "consumer lease receipt status unavailable".into(),
+        )),
+    }
+}
+
 pub(super) async fn settle_v1_read_result(
     result: Result<SessionConsumerResponse, SessionConsumerCallError>,
     deadline: tokio::time::Instant,
@@ -313,4 +323,37 @@ pub(super) fn read_authority_revoked(error: &SessionConsumerCallError) -> bool {
             SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked
         )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_lease_receipt_budget_result_rejects_success_at_or_after_deadline() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        for status in [
+            SessionConsumerLeaseMutationStatus::NotFound,
+            SessionConsumerLeaseMutationStatus::RequestConflict,
+            SessionConsumerLeaseMutationStatus::Recorded(Box::new(Ok(
+                SessionConsumerLeaseMutationResult::Release,
+            ))),
+        ] {
+            let response = SessionConsumerResponse::LeaseMutationStatus(Ok(status.clone()));
+            assert_eq!(
+                lease_mutation_status_result(
+                    Ok(response.clone()),
+                    deadline,
+                    deadline - std::time::Duration::from_nanos(1),
+                ),
+                Ok(status),
+            );
+            for observed_at in [deadline, deadline + std::time::Duration::from_nanos(1)] {
+                assert!(matches!(
+                    lease_mutation_status_result(Ok(response.clone()), deadline, observed_at),
+                    Err(StoreError::BackendUnavailable(_))
+                ));
+            }
+        }
+    }
 }
