@@ -485,6 +485,8 @@ pub enum XfrmObjectInstallDurableError {
     NonExactRemovalIdentity,
     /// An explicit Forward transit policy has a broader, unsupported shape.
     InvalidForwardTransit,
+    /// A policy's selector or transform-template parameters are invalid.
+    InvalidPolicy,
     /// The exact operation record is absent.
     NotFound,
     /// The bounded store has no safe publication slot remaining.
@@ -492,6 +494,20 @@ pub enum XfrmObjectInstallDurableError {
 }
 
 impl XfrmObjectInstallDurableError {
+    pub(crate) fn from_policy_validation(source: crate::XfrmError) -> Self {
+        if matches!(
+            source,
+            crate::XfrmError::InvalidConfig {
+                field: "forward_transit",
+                ..
+            }
+        ) {
+            Self::InvalidForwardTransit
+        } else {
+            Self::InvalidPolicy
+        }
+    }
+
     /// Stable machine-readable, value-free error code.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -509,6 +525,7 @@ impl XfrmObjectInstallDurableError {
             Self::InvalidTransition => "xfrm_object_recovery_invalid_transition",
             Self::NonExactRemovalIdentity => "xfrm_object_recovery_non_exact_removal_identity",
             Self::InvalidForwardTransit => "xfrm_object_recovery_invalid_forward_transit",
+            Self::InvalidPolicy => "xfrm_object_recovery_invalid_policy",
             Self::NotFound => "xfrm_object_recovery_not_found",
             Self::CapacityExceeded => "xfrm_object_recovery_capacity_exceeded",
         }
@@ -1108,8 +1125,8 @@ impl XfrmObjectInstallRecoveryStore {
         request: &XfrmObjectInstallRequest,
     ) -> Result<DurableObjectFingerprints, XfrmObjectInstallDurableError> {
         request
-            .validate_forward_transit()
-            .map_err(|_| XfrmObjectInstallDurableError::InvalidForwardTransit)?;
+            .validate_policy()
+            .map_err(XfrmObjectInstallDurableError::from_policy_validation)?;
         let removal = request.removal();
         validate_exact_lookup_mark(removal.lookup_mark(), "durable_object.install.mark")
             .map_err(|_| XfrmObjectInstallDurableError::NonExactRemovalIdentity)?;
@@ -2768,6 +2785,21 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn policy_preflight_invalid_policy_error_preserves_transit_classification() {
+        let ordinary = XfrmObjectInstallDurableError::from_policy_validation(
+            crate::XfrmError::invalid_config("templates", "invalid"),
+        );
+        assert_eq!(ordinary, XfrmObjectInstallDurableError::InvalidPolicy);
+        assert_eq!(ordinary.as_str(), "xfrm_object_recovery_invalid_policy");
+        assert_eq!(
+            XfrmObjectInstallDurableError::from_policy_validation(
+                crate::XfrmError::invalid_config("forward_transit", "invalid")
+            ),
+            XfrmObjectInstallDurableError::InvalidForwardTransit
+        );
+    }
+
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
 

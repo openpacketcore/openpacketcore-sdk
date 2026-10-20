@@ -112,6 +112,8 @@ pub enum XfrmObjectRosterRequestError {
     NonExactRemovalIdentity,
     /// A member's explicit Forward transit policy has an unsupported shape.
     InvalidForwardTransit,
+    /// A policy's selector or transform-template parameters are invalid.
+    InvalidPolicy,
     /// Two members share one exact deletion identity, which would make reverse
     /// compensation ambiguous.
     DuplicateDeletionIdentity,
@@ -138,6 +140,20 @@ pub enum XfrmObjectRosterRequestError {
 }
 
 impl XfrmObjectRosterRequestError {
+    pub(crate) fn from_policy_validation(source: crate::XfrmError) -> Self {
+        if matches!(
+            source,
+            crate::XfrmError::InvalidConfig {
+                field: "forward_transit",
+                ..
+            }
+        ) {
+            Self::InvalidForwardTransit
+        } else {
+            Self::InvalidPolicy
+        }
+    }
+
     /// Stable machine-readable, value-free error code.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -148,6 +164,7 @@ impl XfrmObjectRosterRequestError {
                 "xfrm_object_roster_request_non_exact_removal_identity"
             }
             Self::InvalidForwardTransit => "xfrm_object_roster_request_invalid_forward_transit",
+            Self::InvalidPolicy => "xfrm_object_roster_request_invalid_policy",
             Self::DuplicateDeletionIdentity => {
                 "xfrm_object_roster_request_duplicate_deletion_identity"
             }
@@ -237,8 +254,8 @@ impl XfrmObjectRosterRequest {
         for member in &members {
             member
                 .request
-                .validate_forward_transit()
-                .map_err(|_| XfrmObjectRosterRequestError::InvalidForwardTransit)?;
+                .validate_policy()
+                .map_err(XfrmObjectRosterRequestError::from_policy_validation)?;
             if let Some((identity, _)) = member.identity {
                 if identity.iter().all(|byte| *byte == 0) {
                     return Err(XfrmObjectRosterRequestError::MalformedMemberIdentity);
@@ -2431,6 +2448,25 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn policy_preflight_invalid_policy_error_preserves_transit_classification() {
+        let ordinary = XfrmObjectRosterRequestError::from_policy_validation(
+            crate::XfrmError::invalid_config("templates", "invalid"),
+        );
+        assert_eq!(ordinary, XfrmObjectRosterRequestError::InvalidPolicy);
+        assert_eq!(
+            ordinary.as_str(),
+            "xfrm_object_roster_request_invalid_policy"
+        );
+        assert_eq!(
+            XfrmObjectRosterRequestError::from_policy_validation(crate::XfrmError::invalid_config(
+                "forward_transit",
+                "invalid"
+            )),
+            XfrmObjectRosterRequestError::InvalidForwardTransit
+        );
+    }
+
     mod independent;
 
     use std::{
@@ -3020,6 +3056,32 @@ mod tests {
 
     fn descending(from: usize) -> Vec<usize> {
         (0..from).rev().collect()
+    }
+
+    #[test]
+    fn policy_preflight_allow_roster_refuses_invalid_member() {
+        let request = crate::XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+            parameters: crate::model::malformed_existing_policy_parameters(
+                crate::XfrmAction::Allow,
+            ),
+        });
+        assert!(
+            XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn policy_preflight_block_roster_refuses_invalid_member() {
+        let request = crate::XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+            parameters: crate::model::malformed_existing_policy_parameters(
+                crate::XfrmAction::Block,
+            ),
+        });
+        assert!(
+            XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)])
+                .is_err()
+        );
     }
 
     #[test]

@@ -62,12 +62,10 @@ pub enum XfrmObjectInstallRequest {
 }
 
 impl XfrmObjectInstallRequest {
-    /// Validate the explicit transit action without reading or mutating state.
-    pub(crate) fn validate_forward_transit(&self) -> Result<(), XfrmError> {
+    /// Validate every policy kind without reading or mutating state.
+    pub(crate) fn validate_policy(&self) -> Result<(), XfrmError> {
         match self {
-            Self::Policy(request) => {
-                crate::model::validate_forward_transit_parameters(&request.parameters)
-            }
+            Self::Policy(request) => crate::model::validate_policy_parameters(&request.parameters),
             Self::Sa(_) => Ok(()),
         }
     }
@@ -1133,7 +1131,7 @@ impl XfrmStagedObjectInstall {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedObjectInstallRunError::RuntimeUnavailable)?;
         let install_operation = self.journal.inner.install_operation;
-        self.request.validate_forward_transit().map_err(|source| {
+        self.request.validate_policy().map_err(|source| {
             XfrmStagedObjectInstallRunError::InstallFailed {
                 operation: install_operation,
                 source,
@@ -1226,6 +1224,44 @@ mod tests {
         RekeyPolicyRequest, RekeySaRequest, SaParameters, SaState, SpiAllocation, XfrmAction,
         XfrmDirection, XfrmId, XfrmLookupMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
     };
+
+    #[tokio::test]
+    async fn policy_preflight_allow_staged_has_no_journal_or_backend_effects() {
+        let backend = Arc::new(crate::MockXfrmBackend::new());
+        let staged =
+            XfrmStagedObjectInstall::new(XfrmObjectInstallRequest::Policy(InstallPolicyRequest {
+                parameters: crate::model::malformed_existing_policy_parameters(
+                    crate::XfrmAction::Allow,
+                ),
+            }));
+        let journal = staged.journal();
+        let result = staged.run(backend.clone()).await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must not install or roll back any object"
+        );
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::NotStarted);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_block_staged_has_no_journal_or_backend_effects() {
+        let backend = Arc::new(crate::MockXfrmBackend::new());
+        let staged =
+            XfrmStagedObjectInstall::new(XfrmObjectInstallRequest::Policy(InstallPolicyRequest {
+                parameters: crate::model::malformed_existing_policy_parameters(
+                    crate::XfrmAction::Block,
+                ),
+            }));
+        let journal = staged.journal();
+        let result = staged.run(backend.clone()).await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must not install or roll back any object"
+        );
+        assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::NotStarted);
+        assert!(result.is_err());
+    }
 
     #[tokio::test]
     async fn forward_transit_staged_object_refuses_before_journal_or_backend_effects() {

@@ -21,6 +21,25 @@ creation/switching, product SA/SPD policy, or deployment defaults. It can bind
 backend execution to a calling thread's already-selected Linux network
 namespace.
 
+## Policy preflight
+
+All policy kinds (`Allow`, `Block` and `AllowForwardTransit`) are validated
+before namespace writer admission, durable object preparation, or a composite
+SA operation. The same pure checks cover selectors, prefix lengths, the
+six-template limit, ordinary Allow's required template, and template protocol,
+request-ID and endpoint-family constraints. They also apply to rekey, staged
+runners, roster admission and the mock backend. Invalid policies leave writer
+epochs, durable records, staged journals and backend state untouched; no SA
+install or compensating rollback starts. Both directions of a bidirectional
+install are checked before the first direction runs.
+
+Valid requests retain their operation order and encoded/stored bytes. Ordinary
+policy failures return `XfrmError::InvalidConfig`, or `InvalidPolicy` from
+`XfrmObjectInstallDurableError`/`XfrmObjectRosterRequestError` at those admission
+boundaries. Existing explicit transit-shape failures retain
+`InvalidForwardTransit`. Update exhaustive matches for the new enum variants;
+mock callers must supply policies that satisfy the same shape as Linux.
+
 ## Network-namespace binding
 
 `LinuxXfrmBackend::bind_current_network_namespace` captures the calling

@@ -990,7 +990,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError> {
-        crate::model::validate_forward_transit_parameters(&request.parameters)?;
+        crate::model::validate_policy_parameters(&request.parameters)?;
         self.admit_mutation()?;
         let mut state = self
             .state
@@ -1015,7 +1015,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn rekey_policy(&self, request: RekeyPolicyRequest) -> Result<(), XfrmError> {
-        crate::model::validate_forward_transit_parameters(&request.parameters)?;
+        crate::model::validate_policy_parameters(&request.parameters)?;
         self.admit_mutation()?;
         let mut state = self
             .state
@@ -1169,6 +1169,56 @@ mod tests {
             }],
             mark: None,
             if_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_allow_mock_install_and_rekey_have_no_effects() {
+        for rekey in [false, true] {
+            let backend = MockXfrmBackend::new();
+            let parameters = crate::model::malformed_existing_policy_parameters(XfrmAction::Allow);
+            let result = if rekey {
+                backend
+                    .rekey_policy(RekeyPolicyRequest { parameters })
+                    .await
+            } else {
+                backend
+                    .install_policy(InstallPolicyRequest { parameters })
+                    .await
+            };
+            assert!(backend.operations().is_empty());
+            assert!(matches!(
+                result,
+                Err(XfrmError::InvalidConfig {
+                    field: "templates",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_block_mock_install_and_rekey_have_no_effects() {
+        for rekey in [false, true] {
+            let backend = MockXfrmBackend::new();
+            let parameters = crate::model::malformed_existing_policy_parameters(XfrmAction::Block);
+            let result = if rekey {
+                backend
+                    .rekey_policy(RekeyPolicyRequest { parameters })
+                    .await
+            } else {
+                backend
+                    .install_policy(InstallPolicyRequest { parameters })
+                    .await
+            };
+            assert!(backend.operations().is_empty());
+            assert!(matches!(
+                result,
+                Err(XfrmError::InvalidConfig {
+                    field: "templates",
+                    ..
+                })
+            ));
         }
     }
 
@@ -1670,7 +1720,9 @@ mod tests {
 
         let mut replacement = params.clone();
         replacement.priority = params.priority.wrapping_add(100);
-        replacement.templates.clear();
+        replacement.templates[0].mode = XfrmMode::Transport;
+        assert_ne!(replacement.templates, params.templates);
+        assert!(crate::model::validate_policy_parameters(&replacement).is_ok());
         let error = backend
             .install_policy(InstallPolicyRequest {
                 parameters: replacement,
