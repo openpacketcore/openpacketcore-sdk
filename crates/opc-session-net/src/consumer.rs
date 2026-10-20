@@ -8611,6 +8611,8 @@ impl StatelessSessionConsumerClient {
             Err(cause) => return Err(v2_persistent_error(request, true, cause)),
         };
         if v2_response_is_outcome_unknown(&response) {
+            #[cfg(feature = "test-control")]
+            eprintln!("sdk_v2_diagnostic_origin=service_outcome_unknown");
             return Err(v2_outcome_unknown(request).unwrap_or(
                 PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                     cause: SessionConsumerClientError::Protocol,
@@ -12120,6 +12122,8 @@ impl PersistentSessionConsumerV2Pool {
                 .push_back(PersistentV2PoolEntry::Lane(connection));
         }
         if service_outcome_unknown {
+            #[cfg(feature = "test-control")]
+            eprintln!("sdk_v2_diagnostic_origin=service_outcome_unknown");
             return Err(v2_outcome_unknown(request).unwrap_or(
                 PersistentSessionConsumerV2ExecuteError::NotTransmitted {
                     cause: SessionConsumerClientError::Protocol,
@@ -12499,6 +12503,8 @@ fn v2_persistent_error(
     wrote: bool,
     cause: SessionConsumerClientError,
 ) -> PersistentSessionConsumerV2ExecuteError {
+    #[cfg(feature = "test-control")]
+    eprintln!("sdk_v2_diagnostic_origin=client wrote={wrote} cause={cause:?}");
     if wrote && v2_operation_is_effectful(request.operation()) {
         if let Some(error) = v2_outcome_unknown(request) {
             return error;
@@ -21982,6 +21988,7 @@ mod tests {
     #[path = "prewarm_batch.rs"]
     mod prewarm_batch;
     mod read_deadline_tests;
+    mod v2_diagnostics_tests;
     #[path = "void_alpn_tests.rs"]
     mod void_alpn_tests;
     #[path = "void_wire_tests.rs"]
