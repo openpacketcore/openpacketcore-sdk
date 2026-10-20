@@ -30,6 +30,7 @@ use opc_types::{NetworkFunctionKind, TenantId};
 
 use super::*;
 
+mod journal_priority_tests;
 mod lease_deferral_tests;
 mod read_deadline_tests;
 mod void_tests;

@@ -143,6 +143,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordinary Allow policies keep their template requirement. The durable-install
   and roster-request errors add `InvalidForwardTransit` for this refusal.
 
+- `opc-session-store` and `opc-session-net`: order V2 recovery-journal work
+  by the existing `ScopeWorkClass` ranks with FIFO operations within each
+  class. Consumer calls retain priority across consecutive local journal
+  steps, releasing it before remote I/O, sealing and backoff. One active
+  higher-ranked local sequence defers lower work until that sequence ends.
+  Prepared, recovered and deferred-resume handles carry the selected class.
+  Inventory reads during preparation or retry, observations and reclamation
+  accept an explicit class instead of falling back to ordinary admission.
+  Default methods inherit the journal view's class, initially `Normal`.
+  Cancelled calls relinquish their registrations while admitted blocking work
+  keeps its progress budget and completion lifetime. Bound pre-dispatch journal
+  authentication and no-effect cleanup by the caller budget, and standalone
+  cleanup/read calls by the existing default operation window. Physical
+  mutation lifetime, transmission classification, durability and authority
+  are unchanged.
+
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
   Live predecessor-lease contention retains one nonterminal binding with a
