@@ -483,6 +483,8 @@ pub enum XfrmObjectInstallDurableError {
     InvalidTransition,
     /// The request cannot produce an exact unconditional removal identity.
     NonExactRemovalIdentity,
+    /// An explicit Forward transit policy has a broader, unsupported shape.
+    InvalidForwardTransit,
     /// The exact operation record is absent.
     NotFound,
     /// The bounded store has no safe publication slot remaining.
@@ -506,6 +508,7 @@ impl XfrmObjectInstallDurableError {
             Self::Stale => "xfrm_object_recovery_stale",
             Self::InvalidTransition => "xfrm_object_recovery_invalid_transition",
             Self::NonExactRemovalIdentity => "xfrm_object_recovery_non_exact_removal_identity",
+            Self::InvalidForwardTransit => "xfrm_object_recovery_invalid_forward_transit",
             Self::NotFound => "xfrm_object_recovery_not_found",
             Self::CapacityExceeded => "xfrm_object_recovery_capacity_exceeded",
         }
@@ -1104,6 +1107,9 @@ impl XfrmObjectInstallRecoveryStore {
         &self,
         request: &XfrmObjectInstallRequest,
     ) -> Result<DurableObjectFingerprints, XfrmObjectInstallDurableError> {
+        request
+            .validate_forward_transit()
+            .map_err(|_| XfrmObjectInstallDurableError::InvalidForwardTransit)?;
         let removal = request.removal();
         validate_exact_lookup_mark(removal.lookup_mark(), "durable_object.install.mark")
             .map_err(|_| XfrmObjectInstallDurableError::NonExactRemovalIdentity)?;

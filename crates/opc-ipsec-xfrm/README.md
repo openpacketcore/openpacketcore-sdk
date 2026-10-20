@@ -1255,6 +1255,13 @@ full-mask `XfrmLookupMark`, and no transform template. Pass it through the usual
 reject any other shape carrying this action before dispatch. Ordinary `Allow`
 installations continue to require a template on Linux.
 
+The same pure transit-shape check runs before namespace writer admission,
+durable preparation, staged journal admission and the first composite effect.
+Rosters and bidirectional installs preflight every policy member before starting
+any member. Invalid transit preparation returns `InvalidForwardTransit` from
+`XfrmObjectInstallDurableError` or `XfrmObjectRosterRequestError`, without
+changing store bytes, writer epochs or existing prepared authorities.
+
 This policy permits matching forwarded plaintext without requiring an inbound
 IPsec security path. It supplies no tunnel, encryption or source authentication.
 The caller must constrain the selector, ensure that only authorized packet

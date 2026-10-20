@@ -355,6 +355,18 @@ impl Error for XfrmBidirectionalInstallError {
     }
 }
 
+/// Preflight the explicit transit action before admitting any composite effect.
+pub(crate) fn validate_composite_forward_transit(
+    request: &XfrmCompositeInstallRequest,
+) -> Result<(), XfrmCompositeInstallError> {
+    crate::model::validate_forward_transit_parameters(&request.policy.parameters).map_err(
+        |source| XfrmCompositeInstallError::InstallSaFailed {
+            source,
+            outcome: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
+        },
+    )
+}
+
 /// Install a Security Association and its Security Policy with best-effort rollback.
 ///
 /// Operation order is [`XFRM_COMPOSITE_INSTALL_ORDER`]. If policy install
@@ -372,6 +384,7 @@ pub async fn install_sa_policy_with_rollback<B>(
 where
     B: XfrmBackend + ?Sized,
 {
+    validate_composite_forward_transit(&request)?;
     // Refuse before installing anything. Both rollback paths below delete by
     // re-selecting on these lookup marks, and that selection is never proven
     // unique: a narrower canonical mask can match another stored object, so a
@@ -442,6 +455,14 @@ where
     B: XfrmBackend + ?Sized,
 {
     let [first, second] = requests;
+    for request in [&first, &second] {
+        validate_composite_forward_transit(request).map_err(|source| {
+            XfrmBidirectionalInstallError::FirstInstallFailed {
+                outcome: XfrmBidirectionalInstallOutcome::first_failed(source.outcome()),
+                source,
+            }
+        })?;
+    }
 
     let first_outcome = match install_sa_policy_with_rollback(backend, first.clone()).await {
         Ok(outcome) => outcome,
@@ -511,6 +532,7 @@ pub async fn rekey_sa_policy<B>(
 where
     B: XfrmBackend + ?Sized,
 {
+    crate::model::validate_forward_transit_parameters(&policy.parameters)?;
     backend.rekey_sa(sa).await?;
     backend.rekey_policy(policy).await?;
     Ok(XfrmCompositeOutcome::applied())

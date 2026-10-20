@@ -1183,6 +1183,8 @@ impl XfrmStagedInstall {
     where
         B: XfrmBackend + ?Sized + 'static,
     {
+        crate::composite::validate_composite_forward_transit(&self.request)
+            .map_err(XfrmStagedInstallRunError::from)?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedInstallRunError::RuntimeUnavailable)?;
         // Same reason as `install_sa_policy_with_rollback` and

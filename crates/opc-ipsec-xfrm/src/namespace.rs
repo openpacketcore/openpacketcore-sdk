@@ -2598,6 +2598,9 @@ impl NamespaceBoundLinuxXfrmBackend {
         operation_generation: XfrmObjectInstallOperationGeneration,
         request: XfrmObjectInstallRequest,
     ) -> Result<XfrmObjectInstallAdmissionAuthority, XfrmObjectInstallDurableError> {
+        request
+            .validate_forward_transit()
+            .map_err(|_| XfrmObjectInstallDurableError::InvalidForwardTransit)?;
         let operation = DurableObjectOperation {
             store: store.clone(),
             operation_id,
@@ -5481,17 +5484,23 @@ impl NamespaceCommand {
                 let _ = reply.send(result);
             }
             Self::InstallPolicy(request, reply) => {
-                let result = match state.admit_xfrm_mutation() {
-                    Ok(()) => backend.install_policy(request).await,
-                    Err(error) => Err(error),
-                };
+                let result =
+                    match crate::model::validate_forward_transit_parameters(&request.parameters)
+                        .and_then(|()| state.admit_xfrm_mutation())
+                    {
+                        Ok(()) => backend.install_policy(request).await,
+                        Err(error) => Err(error),
+                    };
                 let _ = reply.send(result);
             }
             Self::RekeyPolicy(request, reply) => {
-                let result = match state.admit_xfrm_mutation() {
-                    Ok(()) => backend.rekey_policy(request).await,
-                    Err(error) => Err(error),
-                };
+                let result =
+                    match crate::model::validate_forward_transit_parameters(&request.parameters)
+                        .and_then(|()| state.admit_xfrm_mutation())
+                    {
+                        Ok(()) => backend.rekey_policy(request).await,
+                        Err(error) => Err(error),
+                    };
                 let _ = reply.send(result);
             }
             Self::RemovePolicy(request, reply) => {
@@ -7769,7 +7778,10 @@ mod tests {
                 )
                 .await;
             assert_eq!(root.bytes(), before);
-            assert!(result.is_err());
+            assert!(matches!(
+                result,
+                Err(XfrmObjectInstallDurableError::InvalidForwardTransit)
+            ));
             assert!(prepare_object_install(
                 &store,
                 XfrmObjectInstallOperationId::generate().unwrap(),
@@ -7788,6 +7800,49 @@ mod tests {
                 "acquired"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forward_transit_valid_durable_install_keeps_normal_prepared_and_acquired_flow() {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace_with_object_recovery(
+                root.path().to_path_buf(),
+                XfrmObjectRecoveryProofKey::new([0x73; 32]).unwrap(),
+            )
+            .unwrap();
+        let request = XfrmObjectInstallRequest::Policy(InstallPolicyRequest {
+            parameters: PolicyParameters::forward_transit(
+                policy_parameters().selector,
+                100,
+                XfrmLookupMark::full(0x4000_0001),
+            )
+            .unwrap(),
+        });
+        let authority = backend
+            .prepare_durable_object_install(
+                &store,
+                XfrmObjectInstallOperationId::generate().unwrap(),
+                XfrmObjectInstallOperationGeneration::new(1).unwrap(),
+                request,
+            )
+            .await
+            .unwrap();
+        assert!(transport.operations().is_empty());
+        assert_eq!(
+            backend
+                .run_durable_object_install(authority)
+                .await
+                .unwrap()
+                .as_str(),
+            "acquired"
+        );
+        assert_eq!(
+            transport.operations(),
+            vec!["query_policy", "install_policy"]
+        );
     }
 
     #[tokio::test]
