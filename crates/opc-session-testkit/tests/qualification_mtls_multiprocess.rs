@@ -3,6 +3,10 @@
 #[path = "qualification_mtls_multiprocess/isolated_scale.rs"]
 mod isolated_scale;
 
+#[cfg(feature = "test-control")]
+#[path = "qualification_mtls_multiprocess/diagnostics_tests.rs"]
+mod diagnostics_tests;
+
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
@@ -1709,6 +1713,9 @@ fn assert_lifecycle_delta_bounds_with_expected_outcomes(
     expected_authentication_failures: &[u64],
     superseded_bounds: &[u64],
 ) {
+    #[cfg(feature = "test-control")]
+    record_transport_failure_windows(before, after);
+
     assert_eq!(before.len(), member_count);
     assert_eq!(after.len(), member_count);
     assert_eq!(expected_authentication_failures.len(), member_count);
@@ -3281,6 +3288,30 @@ struct ChildNode {
 }
 
 impl ChildNode {
+    #[cfg(feature = "test-control")]
+    fn try_send_failure_diagnostics(&mut self) -> bool {
+        if self.pending.is_some() || !matches!(self.child.try_wait(), Ok(None)) {
+            return false;
+        }
+        let Some(next) = self.next_command_sequence.checked_add(1) else {
+            return false;
+        };
+        let Some(stdin) = self.stdin.as_mut() else {
+            return false;
+        };
+        let command = QualificationNodeCommand::ConsensusDiagnostics;
+        if write_json_line(stdin, &command).is_err() {
+            return false;
+        }
+        self.pending = Some(PendingCommand {
+            kind: PendingCommandKind::from_command(&command),
+            sequence: self.next_command_sequence,
+            sent_at: Instant::now(),
+        });
+        self.next_command_sequence = next;
+        true
+    }
+
     fn spawn(
         config: &Path,
         node_index: usize,
@@ -3899,6 +3930,176 @@ impl CandidateEvidenceInputs {
     }
 }
 
+#[cfg(feature = "test-control")]
+#[derive(Debug, Clone, Copy)]
+struct TransportFailureWindow {
+    node_index: usize,
+    before: u64,
+    after: u64,
+}
+
+#[cfg(feature = "test-control")]
+thread_local! {
+    static TRANSPORT_FAILURE_WINDOWS: std::cell::RefCell<Vec<TransportFailureWindow>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(feature = "test-control")]
+fn record_transport_failure_windows(
+    before: &[QualificationConnectionLifecycleMetrics],
+    after: &[QualificationConnectionLifecycleMetrics],
+) {
+    TRANSPORT_FAILURE_WINDOWS.with(|windows| {
+        *windows.borrow_mut() = before
+            .iter()
+            .zip(after)
+            .enumerate()
+            .filter_map(|(node_index, (before, after))| {
+                (before.connection_failure_transport != after.connection_failure_transport)
+                    .then_some(TransportFailureWindow {
+                        node_index,
+                        before: before.connection_failure_transport,
+                        after: after.connection_failure_transport,
+                    })
+            })
+            .collect();
+    });
+}
+
+#[cfg(feature = "test-control")]
+fn transport_failures_in_window(
+    stderr: &[u8],
+    process_id: u32,
+    window: TransportFailureWindow,
+) -> Vec<opc_session_net::qualification_diagnostics::ConnectionFailure> {
+    use opc_session_net::qualification_diagnostics::{ConnectionFailure, TRANSPORT_FAILURE_PREFIX};
+    stderr
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(TRANSPORT_FAILURE_PREFIX.as_bytes()))
+        .filter_map(|json| serde_json::from_slice::<ConnectionFailure>(json).ok())
+        .filter(|event| {
+            event.process_id == process_id
+                && event.counter > window.before
+                && event.counter <= window.after
+        })
+        .collect()
+}
+
+#[cfg(feature = "test-control")]
+fn retain_child_stderr(paths: &[PathBuf], destination: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(destination)?;
+    let retained = tempfile::Builder::new()
+        .prefix("failed-fleet-")
+        .tempdir_in(destination)?;
+    for (index, path) in paths.iter().enumerate() {
+        fs::copy(path, retained.path().join(format!("node-{index}.stderr")))?;
+    }
+    Ok(retained.keep())
+}
+
+#[cfg(feature = "test-control")]
+macro_rules! failure_diagnostic {
+    ($($argument:tt)*) => {{
+        let _ = writeln!(std::io::stderr().lock(), $($argument)*);
+    }};
+}
+
+#[cfg(feature = "test-control")]
+impl Drop for Fleet {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            return;
+        }
+        // One bounded wave over the existing command channel. Never queue a
+        // second command behind an unfinished one or mask the original panic.
+        let deadline = Instant::now()
+            + Duration::from_millis(QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS);
+        let sent = self
+            .nodes
+            .iter_mut()
+            .map(ChildNode::try_send_failure_diagnostics)
+            .collect::<Vec<_>>();
+        for (node, sent) in self.nodes.iter_mut().zip(sent) {
+            if !sent {
+                failure_diagnostic!("qualification_failure_state node={} unavailable=pending-or-exited pending={:?}", node.node_index, node.pending);
+                continue;
+            }
+            match receive_qualification_reply_until(&node.replies, deadline) {
+                Ok(ReaderMessage::Reply(reply)) => {
+                    node.pending = None;
+                    failure_diagnostic!(
+                        "qualification_failure_state node={} reply={reply:?}",
+                        node.node_index
+                    );
+                }
+                Ok(ReaderMessage::Invalid) => failure_diagnostic!(
+                    "qualification_failure_state node={} unavailable=invalid",
+                    node.node_index
+                ),
+                Err(error) => failure_diagnostic!(
+                    "qualification_failure_state node={} unavailable={error:?}",
+                    node.node_index
+                ),
+            }
+        }
+        for node in &mut self.nodes {
+            if node.child.try_wait().ok().flatten().is_none() {
+                let _ = node.child.kill();
+                let _ = node.child.wait();
+            }
+        }
+        let windows =
+            TRANSPORT_FAILURE_WINDOWS.with(|windows| std::mem::take(&mut *windows.borrow_mut()));
+        for node in &self.nodes {
+            match fs::read(&node.stderr_path) {
+                Ok(stderr) => {
+                    for window in windows
+                        .iter()
+                        .filter(|window| window.node_index == node.node_index)
+                    {
+                        let events =
+                            transport_failures_in_window(&stderr, node.process_id(), *window);
+                        for event in &events {
+                            failure_diagnostic!(
+                                "qualification_failure_attribution node={} {event:?}",
+                                node.node_index
+                            );
+                        }
+                        let observed = events
+                            .iter()
+                            .map(|event| event.counter)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        let expected = window.after.saturating_sub(window.before);
+                        failure_diagnostic!("qualification_failure_attribution_count node={} before={} after={} expected={} attributed={} complete={}", node.node_index, window.before, window.after, expected, observed.len(), observed.len() as u64 == expected && events.iter().all(|event| event.connection_id != 0));
+                    }
+                    // Keep the complete bytes below as well as files: a cluster
+                    // job's durable log survives removal of its temporary pod.
+                    failure_diagnostic!("qualification_child_stderr_begin node={} bytes={}\n{}\nqualification_child_stderr_end node={}", node.node_index, stderr.len(), String::from_utf8_lossy(&stderr), node.node_index);
+                }
+                Err(error) => failure_diagnostic!(
+                    "qualification_child_stderr_unavailable node={} kind={:?}",
+                    node.node_index,
+                    error.kind()
+                ),
+            }
+        }
+        let destination = env::var_os("OPC_QUALIFICATION_FAILURE_EVIDENCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/evidence/qualification-failures")
+            });
+        match retain_child_stderr(&self.stderr_paths, &destination) {
+            Ok(path) => {
+                failure_diagnostic!("qualification_child_stderr_retained {}", path.display())
+            }
+            Err(error) => failure_diagnostic!(
+                "qualification_child_stderr_retention_failed kind={:?}",
+                error.kind()
+            ),
+        }
+    }
+}
+
 struct Fleet {
     nodes: Vec<ChildNode>,
     // Keep the workspace alive until every child has been killed on panic.
@@ -4338,6 +4539,9 @@ impl Fleet {
             opc_session_testkit::qualification::QualificationIsolatedScaleConfig,
         >,
     ) -> Self {
+        #[cfg(feature = "test-control")]
+        TRANSPORT_FAILURE_WINDOWS.with(|windows| windows.borrow_mut().clear());
+
         assert!(matches!(member_count, 3 | 5));
         assert!(isolated_scale.is_none() || release_provenance.is_none());
         let (source_revision, source_tree_status, source_worktree_sha256) =
@@ -5722,7 +5926,7 @@ impl Fleet {
         self.nodes
             .iter_mut()
             .map(|node| match node.receive_until(deadline) {
-                QualificationNodeReply::ConsensusDiagnostics { metrics } => metrics,
+                QualificationNodeReply::ConsensusDiagnostics { metrics, .. } => metrics,
                 reply => panic!("unexpected consensus diagnostics response: {reply:?}"),
             })
             .collect()
@@ -8482,11 +8686,14 @@ fn assert_fault_lifecycle_failures_unchanged(
     before: &[QualificationConnectionLifecycleMetrics],
     after: &[QualificationConnectionLifecycleMetrics],
 ) {
+    #[cfg(feature = "test-control")]
+    record_transport_failure_windows(before, after);
+
     assert_eq!(before.len(), after.len());
     for (node_index, (before, after)) in before.iter().zip(after).enumerate() {
         assert_eq!(
             after.connection_failure_transport, before.connection_failure_transport,
-            "consensus admission loss changed the transport failure ledger: node={node_index}"
+            "consensus admission loss changed the transport failure ledger: node={node_index}, before={before:?}, after={after:?}"
         );
         assert_eq!(
             after.connection_failure_authentication, before.connection_failure_authentication,

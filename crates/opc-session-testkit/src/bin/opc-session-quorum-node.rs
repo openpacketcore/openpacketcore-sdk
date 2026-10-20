@@ -1271,6 +1271,8 @@ struct QualificationProjectedMtlsRuntime {
 }
 
 struct QualificationDirectedPeer {
+    #[cfg(feature = "test-control")]
+    diagnostic_peer: Arc<RemoteSessionConsensusPeer>,
     peer: QualificationGatedConsensusPeer,
     resolver_evidence: QualificationResolverEvidence,
     required_resolution: Option<QualificationRequiredResolution>,
@@ -1733,7 +1735,9 @@ impl QualificationNode {
                 }
             }
             QualificationNodeCommand::ConsensusDiagnostics => {
+                #[cfg(feature = "test-control")]
                 let health = self.store.persistence_health();
+                #[cfg(feature = "test-control")]
                 let status = self.store.status();
                 #[cfg(all(target_os = "linux", feature = "test-control"))]
                 if let Ok(Some(costs)) =
@@ -1764,12 +1768,14 @@ impl QualificationNode {
                         })
                     );
                 }
+                #[cfg(feature = "test-control")]
                 eprintln!(
                     "qualification_consensus_progress term={} leader_known={} local_leader={} last_log_index={:?} applied_index={:?} admitted={} completed_snapshot_count={}",
                     status.term, status.leader_id.is_some(),
                     status.leader_id == Some(status.node_id), status.last_log_index,
                     status.applied_index, status.admitted, status.completed_snapshot_count,
                 );
+                #[cfg(feature = "test-control")]
                 eprintln!(
                     "qualification_persistence_health mode={:?} engine_running={} storage_state={:?} storage_failure={:?}",
                     health.mode, health.engine_running, health.storage_state, health.storage_failure,
@@ -1783,6 +1789,22 @@ impl QualificationNode {
                 );
                 QualificationNodeReply::ConsensusDiagnostics {
                     metrics: self.store.diagnostic_snapshot(),
+                    #[cfg(feature = "test-control")]
+                    lifecycle: lifecycle_metrics(self.empty_vote_dispatches.load(Ordering::SeqCst)),
+                    #[cfg(feature = "test-control")]
+                    client_connections: match &self.transport {
+                        QualificationTransportRuntime::FoundationPlaintext => BTreeMap::new(),
+                        QualificationTransportRuntime::ProjectedMtls(runtime) => runtime
+                            .directed_peers
+                            .iter()
+                            .map(|(index, peer)| {
+                                (
+                                    *index,
+                                    peer.diagnostic_peer.qualification_connection_snapshot(),
+                                )
+                            })
+                            .collect(),
+                    },
                 }
             }
             QualificationNodeCommand::SetConsensusRpcAvailability { availability } => {
@@ -4468,11 +4490,10 @@ async fn wait_for_traffic_recovery_retry(deadline: tokio::time::Instant) -> bool
 async fn refresh_traffic_status_for_control<B: TrafficWatchBackend + ?Sized>(
     backend: &B,
     observation: &QualificationTrafficObservation,
-    _budget: QualificationTrafficStatusBudget,
+    budget: QualificationTrafficStatusBudget,
 ) -> u64 {
     let recovery_started_at = tokio::time::Instant::now();
-    let deadline = recovery_started_at
-        + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
+    let deadline = recovery_started_at + budget.remaining();
     refresh_traffic_status_authoritative_head(backend, observation, recovery_started_at, deadline)
         .await
 }
@@ -5880,11 +5901,14 @@ async fn prepare_transport(
                 )
                 .with_connection_lifecycle(lifecycle)
                 .with_reauthentication_control(reauthentication.clone());
+                let remote_peer = Arc::new(remote_peer);
                 let peer =
-                    QualificationGatedConsensusPeer::new(Arc::new(remote_peer), rpc_gate.clone());
+                    QualificationGatedConsensusPeer::new(remote_peer.clone(), rpc_gate.clone());
                 directed_peers.insert(
                     member.node_index,
                     QualificationDirectedPeer {
+                        #[cfg(feature = "test-control")]
+                        diagnostic_peer: remote_peer.clone(),
                         peer: peer.clone(),
                         resolver_evidence,
                         required_resolution: None,
@@ -8667,6 +8691,24 @@ mod tests {
             observation.failure().expect("expired control budget").code,
             QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_parent_budget_accepts_a_head_within_the_shared_deadline() {
+        let backend = ScriptedTrafficWatchBackend::with_head_delay(
+            [Ok(47)],
+            [],
+            [],
+            Some(Duration::from_millis(100)),
+        );
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let budget = QualificationTrafficStatusBudget::from_parent_deadline(
+            std::time::Instant::now() + Duration::from_secs(2),
+        );
+        let head = refresh_traffic_status_for_control(&backend, &observation, budget).await;
+        assert_eq!(head, 47);
+        assert_eq!(backend.head_requests().await, 1);
+        assert!(observation.failure().is_none());
     }
 
     #[tokio::test(start_paused = true)]

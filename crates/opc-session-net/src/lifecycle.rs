@@ -2228,3 +2228,13 @@ mod tests {
         assert!(jitters.len() > 10, "directed edges must not collapse");
     }
 }
+
+/// Preserve the production counter while test-control builds retain attribution.
+pub(crate) fn record_transport_failure(_outcome: &str, _io_kind: Option<std::io::ErrorKind>) {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::record_transport_failure(_outcome, _io_kind);
+    #[cfg(not(feature = "test-control"))]
+    METRICS
+        .session_net_connection_failure_transport
+        .fetch_add(1, Ordering::Relaxed);
+}

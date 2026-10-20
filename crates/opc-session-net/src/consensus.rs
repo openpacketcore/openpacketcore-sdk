@@ -254,6 +254,10 @@ impl tokio_rustls::rustls::server::ProducesTickets for DisabledSessionTickets {
 }
 
 fn map_protocol_error(error: &ProtocolError) -> SessionConsensusPeerError {
+    #[cfg(feature = "test-control")]
+    if let ProtocolError::Io(error) = error {
+        crate::qualification_diagnostics::io_error(error);
+    }
     match error {
         ProtocolError::Io(error) if error.kind() == io::ErrorKind::TimedOut => {
             SessionConsensusPeerError::Timeout
@@ -292,7 +296,10 @@ fn record_consensus_server_connection_failure(error: &ProtocolError) {
             crate::test_support::record_connection_timeout_failure();
             &METRICS.session_net_connection_failure_timeout
         }
-        ProtocolError::Io(_) => &METRICS.session_net_connection_failure_transport,
+        ProtocolError::Io(error) => {
+            crate::lifecycle::record_transport_failure("Io", Some(error.kind()));
+            return;
+        }
         ProtocolError::Authentication => &METRICS.session_net_connection_failure_authentication,
         ProtocolError::BackendUnavailable(_) => &METRICS.session_net_connection_failure_backend,
         _ => &METRICS.session_net_connection_failure_protocol,
@@ -302,7 +309,10 @@ fn record_consensus_server_connection_failure(error: &ProtocolError) {
 
 fn record_consensus_client_connection_failure(error: SessionConsensusPeerError) {
     match error {
-        SessionConsensusPeerError::Unavailable => &METRICS.session_net_connection_failure_transport,
+        SessionConsensusPeerError::Unavailable => {
+            crate::lifecycle::record_transport_failure("Unavailable", None);
+            return;
+        }
         SessionConsensusPeerError::Timeout => &METRICS.session_net_connection_failure_timeout,
         SessionConsensusPeerError::Authentication => {
             &METRICS.session_net_connection_failure_authentication
@@ -327,6 +337,8 @@ fn record_consensus_server_connection_outcome(result: &Result<(), ProtocolError>
 }
 
 fn map_tls_connect_error(error: io::Error) -> SessionConsensusPeerError {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::io_error(&error);
     match classify_tls_io_error(error) {
         ProtocolError::Authentication => SessionConsensusPeerError::Authentication,
         ProtocolError::Io(_) => SessionConsensusPeerError::Unavailable,
@@ -1328,22 +1340,43 @@ impl ConsensusColdConnector {
                 .run_handshake(|attempt| {
                     let connector = self.clone();
                     async move {
-                        let addr = connector
-                            .target
-                            .resolve()
-                            .await
-                            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                        let tcp = TcpStream::connect(addr)
-                            .await
-                            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-                        configure_consensus_tcp_socket(&tcp)
-                            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
+                        #[cfg(feature = "test-control")]
+                        crate::qualification_diagnostics::stage("resolve");
+                        let addr = connector.target.resolve().await.map_err(|error| {
+                            #[cfg(feature = "test-control")]
+                            crate::qualification_diagnostics::io_error(&error);
+                            let _ = error;
+                            SessionConsensusPeerError::Unavailable
+                        })?;
+                        #[cfg(feature = "test-control")]
+                        crate::qualification_diagnostics::update(|context| {
+                            context.stage = "connect".to_owned();
+                            context.peer_addr = Some(addr);
+                        });
+                        let tcp = TcpStream::connect(addr).await.map_err(|error| {
+                            #[cfg(feature = "test-control")]
+                            crate::qualification_diagnostics::io_error(&error);
+                            let _ = error;
+                            SessionConsensusPeerError::Unavailable
+                        })?;
+                        #[cfg(feature = "test-control")]
+                        crate::qualification_diagnostics::socket(&tcp);
+                        #[cfg(feature = "test-control")]
+                        crate::qualification_diagnostics::stage("configure-socket");
+                        configure_consensus_tcp_socket(&tcp).map_err(|error| {
+                            #[cfg(feature = "test-control")]
+                            crate::qualification_diagnostics::io_error(&error);
+                            let _ = error;
+                            SessionConsensusPeerError::Unavailable
+                        })?;
                         let tls_connector =
                             tokio_rustls::TlsConnector::from(consensus_client_tls_config(
                                 attempt.rustls_config(),
                                 connector.compatibility.is_some(),
                             ));
                         let server_name = connector.target.tls_server_name(addr)?;
+                        #[cfg(feature = "test-control")]
+                        crate::qualification_diagnostics::stage("tls");
                         let tls_stream = tls_connector
                             .connect(server_name, tcp)
                             .await
@@ -1408,6 +1441,8 @@ impl ConsensusColdConnector {
                     }
                     opc_tls::TlsHandshakeRunError::Operation(error) => error,
                 })?;
+            #[cfg(feature = "test-control")]
+            crate::qualification_diagnostics::stage("material-admission");
             let admission = outcome.admission();
             if Some(admission.epoch()) != epoch.material_epoch {
                 return Err(SessionConsensusPeerError::Unavailable);
@@ -1435,15 +1470,35 @@ impl ConsensusColdConnector {
             });
         }
 
-        let addr = self
-            .target
-            .resolve()
-            .await
-            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-        let tcp = TcpStream::connect(addr)
-            .await
-            .map_err(|_| SessionConsensusPeerError::Unavailable)?;
-        configure_consensus_tcp_socket(&tcp).map_err(|_| SessionConsensusPeerError::Unavailable)?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::stage("resolve");
+        let addr = self.target.resolve().await.map_err(|error| {
+            #[cfg(feature = "test-control")]
+            crate::qualification_diagnostics::io_error(&error);
+            let _ = error;
+            SessionConsensusPeerError::Unavailable
+        })?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::update(|context| {
+            context.stage = "connect".to_owned();
+            context.peer_addr = Some(addr);
+        });
+        let tcp = TcpStream::connect(addr).await.map_err(|error| {
+            #[cfg(feature = "test-control")]
+            crate::qualification_diagnostics::io_error(&error);
+            let _ = error;
+            SessionConsensusPeerError::Unavailable
+        })?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::socket(&tcp);
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::stage("configure-socket");
+        configure_consensus_tcp_socket(&tcp).map_err(|error| {
+            #[cfg(feature = "test-control")]
+            crate::qualification_diagnostics::io_error(&error);
+            let _ = error;
+            SessionConsensusPeerError::Unavailable
+        })?;
         let (mut reader, mut writer) = tokio::io::split(tcp);
         let established_at = tokio::time::Instant::now();
         let (response_frame_size, request_frame_size, compatibility) = self
@@ -1500,9 +1555,13 @@ impl ConsensusColdConnector {
             handshake_nonce: nonce,
             requested_response_frame_size: requested_frame_size,
         });
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::stage("hello-write");
         write_frame_bounded_until(writer, &hello, MAX_HANDSHAKE_FRAME_SIZE, deadline)
             .await
             .map_err(bootstrap_protocol_error_to_peer_error)?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::stage("ack-read");
         let ack: SessionConsensusBootstrapResponse = read_frame(reader, MAX_HANDSHAKE_FRAME_SIZE)
             .await
             .map_err(bootstrap_protocol_error_to_peer_error)?;
@@ -1572,6 +1631,38 @@ enum ConsensusColdConnectionAction {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_detached_consensus_connection_attempt(
+    connector: ConsensusColdConnector,
+    coordinator: Arc<ConsensusColdConnectionCoordinator>,
+    reconnect_gate: Arc<ReconnectGate>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    attempt_id: uuid::Uuid,
+    epoch: ConsensusColdConnectionEpoch,
+    attempt_deadline: tokio::time::Instant,
+) {
+    #[cfg(feature = "test-control")]
+    let context = crate::qualification_diagnostics::context(
+        "consensus-outbound",
+        Some(connector.binding.local_consensus_node_id()),
+        Some(connector.binding.remote_consensus_node_id()),
+        epoch.reauthentication_generation,
+        epoch.material_epoch,
+    );
+    let attempt = run_detached_consensus_connection_attempt_inner(
+        connector,
+        coordinator,
+        reconnect_gate,
+        shutdown,
+        attempt_id,
+        epoch,
+        attempt_deadline,
+    );
+    #[cfg(feature = "test-control")]
+    let attempt = crate::qualification_diagnostics::scope(context, attempt);
+    attempt.await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_detached_consensus_connection_attempt_inner(
     connector: ConsensusColdConnector,
     coordinator: Arc<ConsensusColdConnectionCoordinator>,
     reconnect_gate: Arc<ReconnectGate>,
@@ -1998,6 +2089,47 @@ impl fmt::Debug for RemoteSessionConsensusPeer {
 }
 
 impl RemoteSessionConsensusPeer {
+    /// Non-blocking, body-free pool state for qualification failure attribution.
+    #[cfg(feature = "test-control")]
+    #[doc(hidden)]
+    pub fn qualification_connection_snapshot(&self) -> serde_json::Value {
+        fn pool_snapshot(pool: &ConsensusConnectionPool) -> serde_json::Value {
+            fn lane_snapshot(lane: &ConsensusConnectionLaneState) -> serde_json::Value {
+                serde_json::json!({
+                    "available_permits": lane.in_flight.available_permits(),
+                    "cached_connection": lane.connection.try_lock().ok().map(|connection| connection.is_some()),
+                })
+            }
+            let cold = pool.cold_connection.state.try_lock().ok().map(|state| {
+                let (phase, failure) = match &state.phase {
+                    ConsensusColdConnectionPhase::Idle => ("idle", None),
+                    ConsensusColdConnectionPhase::Connecting { .. } => ("connecting", None),
+                    ConsensusColdConnectionPhase::Ready { .. } => ("ready", None),
+                    ConsensusColdConnectionPhase::Failed { error, .. } => {
+                        ("failed", Some(format!("{error:?}")))
+                    }
+                };
+                serde_json::json!({
+                    "phase": phase, "failure": failure,
+                    "remote_retirement_probe_gate": state.remote_retirement_probe_gate.is_some(),
+                })
+            });
+            serde_json::json!({
+                "primary": lane_snapshot(&pool.primary),
+                "overflow": lane_snapshot(&pool.overflow),
+                "cold": cold,
+            })
+        }
+        serde_json::json!({
+            "local_node": self.binding.local_consensus_node_id(),
+            "remote_node": self.binding.remote_consensus_node_id(),
+            "generation": self.reauthentication.generation(),
+            "material_epoch": self.tls_config.as_ref().map(|config| config.material_status().epoch().get()),
+            "pool": pool_snapshot(&self.connection_pool),
+            "classified_pools": self.class_transports.as_ref().map(|classes| classes.iter().map(|class| pool_snapshot(&class.pool)).collect::<Vec<_>>()),
+        })
+    }
+
     /// Current redaction-safe health of the credentials this peer authenticates
     /// with, or `None` when the peer is running without TLS.
     ///
@@ -3330,7 +3462,22 @@ impl SessionConsensusServer {
                 let reauthentication = reauthentication.clone();
                 #[cfg(test)]
                 let post_accept_setup_hook = post_accept_setup_hook.clone();
-                let handle = tokio::spawn(async move {
+                #[cfg(feature = "test-control")]
+                let context = {
+                    let mut context = crate::qualification_diagnostics::context(
+                        "consensus-inbound",
+                        None,
+                        None,
+                        reauthentication.generation(),
+                        tls_config
+                            .as_ref()
+                            .map(|config| config.material_status().epoch()),
+                    );
+                    context.local_addr = stream.local_addr().ok();
+                    context.peer_addr = stream.peer_addr().ok();
+                    context
+                };
+                let connection = async move {
                     let _permit = permit;
                     #[cfg(test)]
                     if let Some(hook) = post_accept_setup_hook {
@@ -3356,7 +3503,10 @@ impl SessionConsensusServer {
                     .await;
                     record_consensus_server_connection_outcome(&result);
                     attempt_metrics.finish();
-                });
+                };
+                #[cfg(feature = "test-control")]
+                let connection = crate::qualification_diagnostics::scope(context, connection);
+                let handle = tokio::spawn(connection);
                 registry.handles.push(handle);
             }
         });
@@ -3685,6 +3835,8 @@ async fn handle_consensus_connection(
             handshake.rustls_config(),
             handler.compatibility().is_some(),
         ));
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::stage("tls");
         let tls_stream = tokio::time::timeout_at(setup_deadline, acceptor.accept(stream))
             .await
             .map_err(|_| consensus_setup_timeout_error())?
@@ -3780,6 +3932,9 @@ async fn reject_consensus_bootstrap<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("bootstrap-rejection-write");
+
     // `Rejected` is the bootstrap-only retirement sentinel. Keeping it out of
     // this ordinary error path proves that a real authentication, scope,
     // contract, or protocol rejection cannot be masked as a retryable local
@@ -3805,6 +3960,9 @@ async fn retire_consensus_bootstrap<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("bootstrap-retirement-write");
+
     tracing::debug!(
         reason = "rotation_bootstrap_retired",
         "retiring authenticated consensus connection before request admission"
@@ -3903,6 +4061,8 @@ where
         .tls_config
         .as_ref()
         .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("hello-read");
     let hello: SessionConsensusBootstrapRequest = {
         let hello_read =
             tokio::time::timeout_at(setup_deadline, read_frame(reader, MAX_HANDSHAKE_FRAME_SIZE));
@@ -4146,6 +4306,11 @@ where
     };
     drop(_bootstrap_hard_task);
     let connection_cancellation = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::update(|context| {
+        context.local_node = Some(binding.local_consensus_node_id());
+        context.remote_node = Some(hello.sender_node_id);
+    });
     let admitted_generation = lifecycle.admitted_generation();
     let mut admission_shutdown = server_shutdown.clone();
     let (_lifecycle_task, mut retirement_rx, mut hard_rx) = spawn_consensus_lifecycle(
@@ -4225,6 +4390,8 @@ where
     let mut acknowledgement_started = false;
     let retired = {
         let acknowledgement = async {
+            #[cfg(feature = "test-control")]
+            crate::qualification_diagnostics::stage("ack-write");
             acknowledgement_started = true;
             write_frame_bounded_until_cancellable(
                 writer,
@@ -4285,6 +4452,8 @@ where
         if *retirement_rx.borrow() || *hard_rx.borrow() {
             return Ok(());
         }
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::stage("rpc-read");
         let inbound_result = tokio::select! {
             biased;
             _ = hard_rx.changed() => return Ok(()),
@@ -4399,6 +4568,8 @@ where
         let deadline = tokio::time::Instant::now()
             .checked_add(idle_timeout)
             .ok_or(ProtocolError::InvalidWireValue)?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::stage("rpc-write");
         let outbound = SessionConsensusTransportResponse::Call { call_id, response };
         tokio::select! {
             biased;
@@ -4418,6 +4589,7 @@ where
 mod tests {
     mod classified;
     mod negotiated_loss;
+    mod transport_diagnostics;
 
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;

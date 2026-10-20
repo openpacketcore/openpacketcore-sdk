@@ -10,7 +10,7 @@ default = []
 foundation-insecure = ["opc-session-net/insecure-test"]
 consumer-fixture = ["dep:rcgen", "dep:rustls-pki-types"]
 # Non-production storage fault controls and redacted engine/storage diagnostics.
-test-control = ["opc-session-store/test-control"]
+test-control = ["opc-session-store/test-control", "opc-session-net/test-control"]
 
 [dependencies]
 hex = "0.4.3"
