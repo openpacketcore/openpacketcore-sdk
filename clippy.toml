@@ -1,0 +1,7 @@
+# Closing any duplicate of a live SQLite main file releases this process's
+# POSIX locks on the inode. Retained pins must share their SQLite close owner.
+# BorrowedFd erases the resource kind, so the few directory/socket/BPF clones
+# require a local, documented lint expectation at the audited call site.
+disallowed-methods = [
+    { path = "std::os::fd::BorrowedFd::try_clone_to_owned", reason = "Do not duplicate retained SQLite descriptors: closing the duplicate releases the process's POSIX locks. Clone the retained pin wrapper instead; other resource kinds need a local documented exception." },
+]

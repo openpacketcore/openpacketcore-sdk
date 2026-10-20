@@ -801,7 +801,10 @@ impl FileIdentity {
 }
 
 /// Distinguish ordinary immutable/staging artifacts from live database pins.
-/// Database clones share SQLite's close owner; they never become raw Files.
+/// Cloning a database pin shares SQLite's close owner without duplicating the
+/// descriptor. Database pins expose no `&File`, but their borrowed/raw descriptor
+/// APIs still permit duplication. Callers must neither duplicate nor close those
+/// descriptors: closing a duplicate releases this process's SQLite POSIX locks.
 #[derive(Debug)]
 pub(crate) enum SqliteFilePin {
     Artifact(std::fs::File),
@@ -810,7 +813,9 @@ pub(crate) enum SqliteFilePin {
 }
 
 /// Read and inspect either an ordinary file or a managed database pin without
-/// exposing descriptor duplication or close authority to shared callers.
+/// exposing a `&File`. Descriptor borrows are only for operations that neither
+/// duplicate nor close them; `BorrowedFd` itself does not enforce that contract.
+/// Closing a database descriptor duplicate releases this process's POSIX locks.
 pub(crate) trait SqliteFileRead {
     fn file_metadata(&self) -> io::Result<std::fs::Metadata>;
     fn read_bytes(&self, buffer: &mut [u8]) -> io::Result<usize>;
@@ -919,8 +924,8 @@ impl SqliteFilePin {
         }
     }
 
-    /// Raw File access is limited to ordinary artifacts. Live database pins
-    /// expose only operations that preserve their SQLite close owner.
+    /// Raw File access is limited to ordinary artifacts. For live database pins,
+    /// borrow descriptors only for operations that neither duplicate nor close.
     pub(crate) fn artifact(&self) -> io::Result<&std::fs::File> {
         match self {
             Self::Artifact(file) => Ok(file),
@@ -966,6 +971,8 @@ impl From<std::fs::File> for SqliteFilePin {
 }
 
 #[cfg(unix)]
+/// Borrow without duplicating or closing the descriptor. For database pins,
+/// closing a duplicate releases the process's POSIX locks on the inode.
 impl std::os::fd::AsFd for SqliteFilePin {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         match self {
@@ -977,6 +984,8 @@ impl std::os::fd::AsFd for SqliteFilePin {
 }
 
 #[cfg(unix)]
+/// Inspect without taking ownership, duplicating or closing the descriptor.
+/// Keep the pin alive during inspection; clone it to retain SQLite's close owner.
 impl std::os::fd::AsRawFd for SqliteFilePin {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         std::os::fd::AsRawFd::as_raw_fd(&std::os::fd::AsFd::as_fd(self))

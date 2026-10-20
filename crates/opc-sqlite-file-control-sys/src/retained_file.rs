@@ -23,7 +23,7 @@ mod retirement_tests;
 /// another SQLite connection holds POSIX locks on this inode. This also covers
 /// independently opened connections and cancelled workers.
 ///
-/// Clone the wrapper to retain close ownership. A raw `File` cannot be obtained:
+/// Clone the wrapper to retain close ownership. No `&File` accessor is exposed:
 ///
 /// ```compile_fail
 /// use opc_sqlite_file_control_sys::RetainedSqliteFile;
@@ -31,6 +31,15 @@ mod retirement_tests;
 ///     let _ = pin.file().try_clone();
 /// }
 /// ```
+///
+/// [`AsFd`] and [`AsRawFd`] still expose borrowed descriptors for operations
+/// that neither duplicate nor close them. Keep the wrapper alive while using
+/// its raw descriptor. The type system does not enforce
+/// this restriction: `pin.as_fd().try_clone_to_owned()` can create an owned
+/// duplicate in safe Rust. Do not do this. Closing any duplicate releases the
+/// process's POSIX locks on the inode, bypassing SQLite's close bookkeeping.
+/// The repository's Clippy configuration rejects that method; it is a lint
+/// guard, not a guarantee that every possible duplication route is unavailable.
 #[derive(Clone)]
 pub struct RetainedSqliteFile {
     inner: Arc<Inner>,
@@ -156,13 +165,15 @@ impl RetainedSqliteFile {
 }
 
 /// Borrow only for descriptor operations that do not duplicate or close it.
-/// Closing a duplicate would bypass SQLite's lock-preserving close owner.
+/// Closing a duplicate releases this process's POSIX locks on the inode.
 impl AsFd for RetainedSqliteFile {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.file().as_fd()
     }
 }
 
+/// Inspect the raw descriptor without taking ownership, duplicating or closing it.
+/// Keep the wrapper alive during inspection; clone it when another owner is needed.
 impl AsRawFd for RetainedSqliteFile {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.file().as_raw_fd()

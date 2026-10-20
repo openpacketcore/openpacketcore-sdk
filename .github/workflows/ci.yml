@@ -253,6 +253,7 @@ jobs:
 
       - name: Run clippy
         run: |
+          python3 ci/test-clippy-fd-guard.py
           cargo clippy --locked -p opc-ipsec-xfrm --lib --no-default-features -- -D warnings
           cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
