@@ -2775,10 +2775,13 @@ fn v2_response_matches_operation(
     response: &SessionConsumerV2Response,
 ) -> bool {
     match (operation, response) {
-        // A generic rejection does not carry a V2 transition identity. It is
-        // safe only for the V2 read surface; an effectful Call that may have
-        // reached the service must retain its exact recovery identity.
-        (_, SessionConsumerV2Response::Rejected(_)) => !v2_operation_is_effectful(operation),
+        // Only a closed pre-dispatch refusal can complete an effectful Call
+        // without a V2 receipt. The wire boundary must still authenticate the
+        // complete correlation, attempt nonce and request commitment.
+        (_, SessionConsumerV2Response::Rejected(rejection)) => {
+            !v2_operation_is_effectful(operation)
+                || consumer_rejection_proves_not_dispatched(*rejection)
+        }
         (
             SessionConsumerV2Operation::FencedTransitionV2Capability,
             SessionConsumerV2Response::FencedTransitionV2Capability(_),
@@ -8617,7 +8620,7 @@ impl StatelessSessionConsumerClient {
                 },
             ));
         }
-        Ok(response)
+        classify_v2_completed_response(request, response)
     }
 
     async fn execute_classified(
@@ -10028,6 +10031,8 @@ impl fmt::Debug for PersistentSessionConsumerV2Diagnostics {
 #[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PersistentSessionConsumerV2ExecuteError {
+    /// No Call bytes were accepted, or a complete matching reply proves that
+    /// the voter refused the request before dispatch.
     #[error("V2 request was not transmitted")]
     NotTransmitted { cause: SessionConsumerClientError },
     #[error("V2 read is unavailable")]
@@ -11828,6 +11833,7 @@ impl PersistentSessionConsumerV2Pool {
             ),
         )
         .await
+        .and_then(|response| classify_v2_completed_response(request, response))
     }
 
     /// Execute one V2 operation whose complete lifetime is also bounded by a
@@ -11876,6 +11882,7 @@ impl PersistentSessionConsumerV2Pool {
             ),
         )
         .await
+        .and_then(|response| classify_v2_completed_response(request, response))
     }
 
     /// Execute one fresh V2 attempt within a caller-owned absolute deadline.
@@ -12492,6 +12499,27 @@ impl PersistentSessionConsumerV2Pool {
             ready_request_connections,
         }
     }
+}
+
+/// Classify only a complete response whose wire tuple and request shape have
+/// already matched. For pooled calls this runs after the transport retry
+/// budget, so a received refusal cannot trigger a hidden same-voter replay.
+fn classify_v2_completed_response(
+    request: &SessionConsumerV2Request,
+    response: SessionConsumerV2Response,
+) -> Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError> {
+    if v2_operation_is_effectful(request.operation())
+        && matches!(
+            &response,
+            SessionConsumerV2Response::Rejected(rejection)
+                if consumer_rejection_proves_not_dispatched(*rejection)
+        )
+    {
+        return Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
+            cause: SessionConsumerClientError::Unavailable,
+        });
+    }
+    Ok(response)
 }
 
 fn v2_persistent_error(

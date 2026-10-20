@@ -823,7 +823,12 @@ samples are retained in
 
 For stateless and persistent V2 calls, `execute_v2` returns the same exact
 effect-boundary error. `NotTransmitted` means the transport proved that zero
-Call-frame bytes were accepted. `ReadUnavailable` means a post-write read failed
+Call-frame bytes were accepted, or received a complete `Rejected(Unavailable)`
+reply with the exact correlation, attempt nonce and request commitment, proving
+that the voter refused before dispatch. This received refusal does not restart
+the transport's connection retry loop. Partial replies, transport loss,
+uncorrelated replies and results from a voter that may have proposed remain
+unknown for effectful calls. `ReadUnavailable` means a post-write read failed
 for a non-effectful V2 capability/history/status operation and can be retried as
 that read. `OutcomeUnknown { request_id }` means a V2 fenced transition may have
 reached the service; the lane is discarded, the caller retains that exact stable
@@ -835,6 +840,15 @@ matching ID rather than blindly replaying any mutation. Reauthentication,
 accepted material rotation, idle/lifecycle retirement, and the public bounded
 shutdown apply to both ALPN-isolated pools; shutdown begins both drains together
 so V2 cannot add a second drain window.
+
+An original prepared V2 handle settles its exact journal row when preflight
+fails or every voter proves that dispatch never occurred. Failed or cancelled
+deletion leaves that handle resolved so `release_resolved` can retry. The
+no-effect decision is held in memory until deletion commits: a crash in that
+window leaves an ordinary unknown row and status-only recovery. Applications
+using owned journals and the void profile can reclaim it after a terminal
+no-effect receipt; other journals follow the existing epoch lifecycle. A resumed
+deferred request retains its earlier binding when a later preflight fails.
 
 The revision-2 persistent-consumer transport qualification contract remains
 recorded in the v7 profile and the published v6 profile remains the unchanged

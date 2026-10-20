@@ -1778,11 +1778,20 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     ///
     /// A possible send permanently removes dispatch authority and returns
     /// `OutcomeUnknown` with the caller-stable ID; use receipt status only
-    /// afterwards. When every candidate voter proved a pre-dispatch failure,
-    /// topology authority was revoked before any Call byte, or the V2 history
-    /// definitively rejected the request without binding it, this handle
-    /// removes its own retained row. If that removal fails or is cancelled,
-    /// the handle stays resolved and `release_resolved` retries it.
+    /// afterwards. When an original handle fails preflight, every candidate
+    /// voter proves a pre-dispatch failure, topology authority is revoked
+    /// before any Call byte, or the V2 history definitively rejects the
+    /// request without binding it, this handle removes its own retained row.
+    /// A resumed deferred request retains its earlier binding and status
+    /// recovery when the current attempt fails preflight.
+    ///
+    /// If local removal fails or is cancelled, the original handle stays
+    /// resolved and `release_resolved` retries it. This no-effect decision is
+    /// not persisted separately: a crash before deletion commits leaves an
+    /// ordinary unresolved row, recovered through status only. An owned
+    /// journal with the void profile can settle that row through a terminal
+    /// void receipt; otherwise the existing epoch lifecycle applies. The
+    /// missing in-memory decision never authorizes deletion after restart.
     pub async fn execute_once(
         &mut self,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
@@ -2178,7 +2187,15 @@ impl PersistentPreparedFencedTransitionV2Token {
             .await,
             Ok(Ok(()))
         ) {
-            preparation.terminal();
+            // Only an original handle proves that no earlier execution
+            // could bind this row. A resumed deferral still needs its receipt.
+            if self.original {
+                preparation.terminal();
+                self.set_resolution(V2Resolution::Resolved);
+                self.discard_own_unbound_row().await;
+            } else {
+                preparation.receipt_only();
+            }
             return Err(FencedTransitionExecuteError::NotTransmitted);
         }
         for _ in 0..self.voter_count {
@@ -2273,9 +2290,9 @@ impl PersistentPreparedFencedTransitionV2Token {
                 }
             }
         }
-        // Every candidate proved that no Call byte was accepted, and only this
-        // handle can dispatch the row, so no copy of the request was sent. A
-        // failed or cancelled discard therefore stays releasable.
+        // Every candidate proved a pre-dispatch failure, and only this
+        // original handle can dispatch the row, so no copy can take effect.
+        // A failed or cancelled discard therefore stays releasable.
         if self.original {
             preparation.terminal();
             self.set_resolution(V2Resolution::Resolved);
