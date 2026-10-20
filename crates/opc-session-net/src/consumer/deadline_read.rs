@@ -51,7 +51,7 @@ impl PersistentSessionConsumerClient {
     /// original deadline, preventing an overlapping retry. A newly observed
     /// successful status at or after that deadline is unavailable.
     /// `NotFound` before the deadline leaves the outcome open; it is not proof
-    /// that the original acquire never committed or cannot still commit.
+    /// that the original lease mutation never committed or cannot still commit.
     pub async fn lease_mutation_status_with_budget(
         &self,
         request: &SessionConsumerLeaseMutationRequest,
