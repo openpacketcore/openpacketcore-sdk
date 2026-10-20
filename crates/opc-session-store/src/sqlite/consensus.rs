@@ -5617,6 +5617,17 @@ fn verify_proactive_checkpoint_connection(
     Ok(())
 }
 
+fn pin_live_database_file(
+    connection: &Connection,
+    path: &Path,
+) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
+    let file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
+        .map_err(|_| invalid_data("SQLite main file descriptor is unavailable"))?;
+    // The canonical path is only the reader's WAL lookup hint. The live
+    // descriptor remains authoritative throughout core and reader lifetime.
+    crate::consensus::snapshot::PinnedSqliteFile::from_file(file, std::fs::canonicalize(path)?)
+}
+
 /// Shared persistence resources used by the log store, state machine, and
 /// snapshot builder. One async mutex serializes every vote/log/state write.
 ///
@@ -6405,17 +6416,8 @@ impl SqliteConsensusCore {
                 protected_roster_diagnostic_occupancy_sync(&conn, storage_identity);
             let database_file = match &backend.database_path {
                 Some(path) => {
-                    let file = opc_sqlite_file_control_sys::main_file_descriptor(&conn)
+                    let pinned = pin_live_database_file(&conn, path.as_ref())
                         .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-                    // The canonical path is only the reader's WAL lookup hint.
-                    // The duplicated live descriptor remains authoritative.
-                    let canonical_path = std::fs::canonicalize(path.as_ref())
-                        .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
-                    let pinned = crate::consensus::snapshot::PinnedSqliteFile::from_file(
-                        file,
-                        canonical_path,
-                    )
-                    .map_err(|_| SessionConsensusStorageError::BackendUnavailable)?;
                     Some(Arc::new(pinned))
                 }
                 None => None,

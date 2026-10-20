@@ -76,3 +76,36 @@ fn recovery_pin_retirement_preserves_sqlite_record_locks() {
     drop(connection);
     probe::assert_state(&path, TEST, false, "after final connection shutdown");
 }
+
+#[test]
+fn rollback_journal_recovery_pin_retirement_preserves_sqlite_record_locks() {
+    const TEST: &str = "recovery::sqlite::descriptor_locks::rollback_journal_recovery_pin_retirement_preserves_sqlite_record_locks";
+    if probe::child() {
+        return;
+    }
+    let (_directory, path, connection, source) = fixture();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "delete"
+    );
+    connection.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    probe::assert_state(
+        &path,
+        TEST,
+        true,
+        "before rollback-journal recovery pin retirement",
+    );
+    drop(source);
+    probe::assert_state(
+        &path,
+        TEST,
+        true,
+        "after rollback-journal recovery pin retirement",
+    );
+    connection.execute_batch("ROLLBACK;").unwrap();
+    drop(connection);
+    probe::assert_state(&path, TEST, false, "after final connection shutdown");
+}

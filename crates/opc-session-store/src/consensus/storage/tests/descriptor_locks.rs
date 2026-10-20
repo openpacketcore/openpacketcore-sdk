@@ -72,3 +72,38 @@ async fn snapshot_lease_preserves_sqlite_record_locks() {
     drop(backend);
     probe::assert_state(&path, TEST, false, "after final connection shutdown");
 }
+
+#[tokio::test]
+async fn snapshot_lease_final_pin_retirement_preserves_sqlite_record_locks() {
+    const TEST: &str = "consensus::storage::tests::descriptor_locks::snapshot_lease_final_pin_retirement_preserves_sqlite_record_locks";
+    if probe::child() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source.sqlite");
+    let backend = SqliteSessionBackend::open(&path).unwrap();
+    let lease = acquire_snapshot_directory_lease(&backend, &directory.path().join("snapshots"))
+        .await
+        .unwrap();
+    drop(backend);
+    // Establish a new real SQLite lock only after admission and retirement of
+    // all original backend connections. This RED isolates the lease's close.
+    let surviving = rusqlite::Connection::open(&path).unwrap();
+    probe::begin(&surviving);
+    probe::assert_state(
+        &path,
+        TEST,
+        true,
+        "after lease admission, before final pin retirement",
+    );
+    drop(lease);
+    probe::assert_state(
+        &path,
+        TEST,
+        true,
+        "after the lease retires its final database pin",
+    );
+    surviving.execute_batch("ROLLBACK;").unwrap();
+    drop(surviving);
+    probe::assert_state(&path, TEST, false, "after final connection shutdown");
+}

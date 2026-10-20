@@ -40,6 +40,19 @@ pub(crate) fn child() -> bool {
 
 #[track_caller]
 pub(crate) fn assert_state(path: &Path, test: &str, blocked: bool, phase: &str) {
+    if let Err(error) = check_state(path, test, blocked, phase) {
+        panic!("{error}");
+    }
+}
+
+/// Retain every phase's result when a regression must exercise later requests
+/// even after detecting admission-time lock loss. Callers must assert all results.
+pub(crate) fn check_state(
+    path: &Path,
+    test: &str,
+    blocked: bool,
+    phase: &str,
+) -> Result<(), String> {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--test-threads=4", "--nocapture"])
         .env(PATH, path)
@@ -48,10 +61,13 @@ pub(crate) fn assert_state(path: &Path, test: &str, blocked: bool, phase: &str) 
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
-        "independent lock probe {phase}: {stdout}\n{stderr}"
-    );
+    if output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;") {
+        Ok(())
+    } else {
+        Err(format!(
+            "independent lock probe {phase}: {stdout}\n{stderr}"
+        ))
+    }
 }
 
 pub(crate) fn begin(connection: &rusqlite::Connection) {
