@@ -90,6 +90,24 @@ pub fn close_consensus_application_admission_for_test(store: &ConsensusSessionSt
     store.inner.admitted.store(false, Ordering::Release);
 }
 
+/// Observe a store while its actual native authority owner is exclusively held.
+///
+/// The callback must use only nonblocking observations: an operation that waits
+/// for the owner would deadlock. The owner is released when the callback returns
+/// or unwinds. No admission latch, durable record, or deadline is changed.
+#[cfg(target_os = "linux")]
+pub fn with_consensus_native_authority_held_for_test<T>(
+    store: &ConsensusSessionStore,
+    observe: impl FnOnce() -> T,
+) -> std::io::Result<T> {
+    store
+        .inner
+        .private_wal
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("native storage is absent"))?
+        .with_native_owner_held_for_test(observe)
+}
+
 /// Make this store's restore-scan dispatch return a fixed unavailable result
 /// after its real logical-time barrier, without changing exact-record reads.
 pub fn set_consensus_restore_scan_unavailable_for_test(

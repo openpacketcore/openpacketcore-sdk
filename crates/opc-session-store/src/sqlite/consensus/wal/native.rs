@@ -868,7 +868,7 @@ impl Wal {
     }
 
     /// Hold the actual native authority owner while a finite test fault runs.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-control"))]
     pub(crate) fn with_native_owner_held_for_test<T>(
         &self,
         held: impl FnOnce() -> T,
