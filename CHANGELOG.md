@@ -820,6 +820,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: keep SQLite worker admission, initialization, progress and
+  commit checks on the caller's Tokio clock. Paused time no longer spends a
+  fresh operation's budget, and advancing time expires the worker's deadline
+  before a late commit. Synchronous retained-store admission keeps its real-time
+  deadline, and commit/cancellation arbitration and timeout bounds are unchanged.
+
 - `opc-session-net`: preserve valid slow quorum replies until the caller's
   original deadline for protected history, expiry and receipt reads, including
   prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight
