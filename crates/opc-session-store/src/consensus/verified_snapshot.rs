@@ -590,6 +590,12 @@ impl VerifiedSnapshotSource for VerifiedFile {
     fn duplicate_descriptor(&self) -> io::Result<File> {
         self.file.try_clone()
     }
+
+    #[cfg(any(test, feature = "test-control"))]
+    fn file_identity(&self) -> io::Result<(u64, u64)> {
+        let metadata = self.file.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
 }
 
 pub(crate) struct PortableSnapshot {
@@ -1125,6 +1131,12 @@ mod tests {
         assert!(reader.execute("UPDATE state SET value = 42", []).is_err());
         let descriptor = opc_sqlite_file_control_sys::main_file_descriptor(&reader)
             .expect("retain verified descriptor identity");
+        let metadata = descriptor.metadata().expect("verified descriptor metadata");
+        assert_eq!(
+            opc_sqlite_file_control_sys::main_file_identity(&reader)
+                .expect("borrow verified source identity without another descriptor"),
+            (metadata.dev(), metadata.ino())
+        );
         assert_eq!(
             descriptor.metadata().expect("descriptor metadata").ino(),
             File::open(&path)

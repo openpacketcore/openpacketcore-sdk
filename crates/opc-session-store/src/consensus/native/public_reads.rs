@@ -266,6 +266,13 @@ impl NativeState {
         check: &dyn Fn() -> io::Result<()>,
         read: impl FnOnce(&dyn RosterCommandStore, Timestamp) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        #[cfg(any(test, feature = "test-control"))]
+        let _terminal_hydration =
+            crate::sqlite::consensus::terminal_observer::HydrationScope::enter(
+                self.terminal_observation_database
+                    .as_ref()
+                    .map(|database| database.key()),
+            );
         check().map_err(|_| unavailable())?;
         if identity != self.identity {
             return Err(unavailable());

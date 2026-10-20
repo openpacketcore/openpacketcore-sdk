@@ -193,7 +193,8 @@ fn protected_roster_v2_read_result_sync(
     )?;
     #[cfg(any(test, feature = "test-control"))]
     record_protected_roster_v2_terminal_status_validation_stage(
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.authority_verified,
+        store.terminal_observation_database(),
+        |stages| &mut stages.authority_verified,
     );
     let registration = BackendRegistration::from_consensus_parts(
         roster_registration_handle(record.binding()),
@@ -210,6 +211,8 @@ fn protected_roster_v2_read_result_sync(
         .membership_scope(identity)
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
     validate_hydrated_protected_roster_v2_attestations_sync(
+        #[cfg(any(test, feature = "test-control"))]
+        store.terminal_observation_database(),
         &root,
         &membership_scope,
         record.binding(),
@@ -243,7 +246,8 @@ fn protected_roster_v2_read_result_sync(
                 .clone();
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_v2_terminal_status_validation_stage(
-                &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.retained_shape_verified,
+                store.terminal_observation_database(),
+                |stages| &mut stages.retained_shape_verified,
             );
             Ok(ProtectedRosterV2ReadResult::Terminalized(Box::new(
                 ProtectedRosterV2TerminalRead {
@@ -443,7 +447,8 @@ pub(crate) fn read_protected_roster_v2_terminal_status_sync(
         .map_err(ProtectedRosterApplyError::store_error)?;
     #[cfg(any(test, feature = "test-control"))]
     record_protected_roster_v2_terminal_status_validation_stage(
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.record_decoded,
+        store.terminal_observation_database(),
+        |stages| &mut stages.record_decoded,
     );
     if record.record().state() == ProductionReservationStateV2::Tombstone {
         let tombstone = record
@@ -546,7 +551,8 @@ pub(crate) fn read_protected_roster_v2_terminal_status_sync(
         }
         #[cfg(any(test, feature = "test-control"))]
         record_protected_roster_v2_terminal_status_validation_stage(
-            &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.retained_evidence_invariant,
+            store.terminal_observation_database(),
+            |stages| &mut stages.retained_evidence_invariant,
         );
     }
     protected_roster_v2_read_result_sync(

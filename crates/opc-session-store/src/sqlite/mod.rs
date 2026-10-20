@@ -56,12 +56,7 @@ pub(crate) use native::AuthorityBackoff;
 #[doc(hidden)]
 pub mod test_support {
     pub use super::consensus::{
-        protected_roster_terminal_apply_timing_test_guard,
-        protected_roster_terminal_apply_timings_for_test,
-        protected_roster_v2_terminal_status_validation_stages_for_test,
-        reset_protected_roster_terminal_apply_timings_for_test,
-        reset_protected_roster_v2_terminal_status_validation_stages_for_test,
-        ProtectedRosterTerminalApplyTimings,
+        ProtectedRosterTerminalApplyTimings, ProtectedRosterTerminalObservationForTest,
         ProtectedRosterV2TerminalStatusValidationStagesForTest,
     };
 

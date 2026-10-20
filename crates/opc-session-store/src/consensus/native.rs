@@ -413,9 +413,16 @@ impl Serialize for NativeFrontierValues {
     }
 }
 
+/// Resident native state. In tests and `test-control` builds, attached states
+/// and their clones retain the backend's SQLite connection until they are
+/// dropped, preserving the observation identity even without an observer.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeState {
+    #[cfg(any(test, feature = "test-control"))]
+    #[serde(skip)]
+    pub(crate) terminal_observation_database:
+        Option<crate::sqlite::consensus::terminal_observer::PinnedDatabase>,
     identity: SessionConsensusIdentity,
     members: BTreeSet<SessionConsensusNodeId>,
     frontiers: NativeFrontiers,
@@ -489,6 +496,8 @@ impl Clone for NativeState {
             roster_root: self.roster_root.clone(),
             snapshot_origin: self.snapshot_origin.clone(),
             local_restore: self.local_restore.clone(),
+            #[cfg(any(test, feature = "test-control"))]
+            terminal_observation_database: self.terminal_observation_database.clone(),
             proof: self.proof.clone(),
             changes: None,
         }
@@ -768,6 +777,8 @@ impl NativeState {
             roster_root,
             snapshot_origin: None,
             local_restore: None,
+            #[cfg(any(test, feature = "test-control"))]
+            terminal_observation_database: None,
             proof: None,
             changes: None,
         };

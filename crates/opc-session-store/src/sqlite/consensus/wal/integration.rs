@@ -437,6 +437,14 @@ impl PrivateWalTest {
             if let Some(diagnostics) = &core.diagnostics {
                 wal.publish_native_roster_occupancy(diagnostics);
             }
+            wal.bind_terminal_observation_database_for_test(
+                consensus::terminal_observer::PinnedDatabase::from_identity(
+                    opc_sqlite_file_control_sys::main_file_identity(&conn).map_err(|_| {
+                        invalid_data("native fixture database identity unavailable")
+                    })?,
+                    Arc::clone(&core.conn),
+                ),
+            )?;
             let wal = Arc::new(wal);
             *self
                 .current

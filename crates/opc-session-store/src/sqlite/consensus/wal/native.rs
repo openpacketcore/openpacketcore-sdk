@@ -2192,6 +2192,20 @@ impl Wal {
         )
     }
 
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) fn bind_terminal_observation_database_for_test(
+        &self,
+        database: crate::sqlite::consensus::terminal_observer::PinnedDatabase,
+    ) -> io::Result<()> {
+        let mut state = lock_state(&self.shared)?;
+        let native = state
+            .native
+            .as_mut()
+            .ok_or_else(|| invalid_data("native observation owner missing"))?;
+        native.business.terminal_observation_database = Some(database);
+        Ok(())
+    }
+
     pub(crate) fn with_native_read<T>(
         &self,
         read: impl FnOnce(&NativeState) -> io::Result<T>,

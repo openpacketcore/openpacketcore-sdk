@@ -6,6 +6,8 @@ use super::*;
 use crate::consensus::verified_snapshot::VerificationMemory;
 use std::mem::size_of;
 
+/// Detached application state. In tests and `test-control` builds, its native
+/// state also keeps the backend's SQLite connection open until capture drop.
 pub(crate) struct ApplicationCapture {
     state: NativeState,
     // Covers the bounded frontiers/membership copy and persistent map roots.
@@ -41,6 +43,14 @@ impl ApplicationCapture {
         check: &impl Fn() -> io::Result<()>,
         before_receipt_read: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<ApplicationPublication> {
+        #[cfg(any(test, feature = "test-control"))]
+        let _terminal_hydration =
+            crate::sqlite::consensus::terminal_observer::HydrationScope::enter(
+                self.state
+                    .terminal_observation_database
+                    .as_ref()
+                    .map(|database| database.key()),
+            );
         check()?;
         #[cfg(feature = "test-control")]
         let started = std::time::Instant::now();

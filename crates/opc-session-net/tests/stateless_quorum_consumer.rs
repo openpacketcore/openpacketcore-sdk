@@ -111,13 +111,7 @@ use opc_session_store::fenced_mutation_roster::{
     RosterProfileV2CompactAdmissionProvenanceSigningInputV1,
 };
 #[cfg(feature = "test-control")]
-use opc_session_store::sqlite::test_support::{
-    protected_roster_terminal_apply_timing_test_guard,
-    protected_roster_terminal_apply_timings_for_test,
-    protected_roster_v2_terminal_status_validation_stages_for_test,
-    reset_protected_roster_terminal_apply_timings_for_test,
-    reset_protected_roster_v2_terminal_status_validation_stages_for_test,
-};
+use opc_session_store::sqlite::test_support::ProtectedRosterTerminalObservationForTest;
 #[cfg(feature = "test-control")]
 use opc_session_store::test_support::{
     append_consensus_padding_entry_for_test, consensus_local_durable_progress_for_test,
@@ -175,10 +169,6 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-#[cfg(feature = "test-control")]
-static PROTECTED_ROSTER_TERMINAL_APPLY_TIMING_TEST_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
-
 opc_consensus::engine::declare_raft_types!(
     TestSessionRaftTypeConfig:
         D = SessionConsensusCommand,
@@ -200,8 +190,10 @@ fn transported_capabilities() -> BackendCapabilities {
 }
 
 #[cfg(feature = "test-control")]
-fn protected_roster_terminal_apply_timing_diagnostic() -> String {
-    let timings = protected_roster_terminal_apply_timings_for_test();
+fn protected_roster_terminal_apply_timing_diagnostic(
+    observation: &ProtectedRosterTerminalObservationForTest,
+) -> String {
+    let timings = observation.timings();
     format!(
         "decode_and_proof_count={}; decode_and_proof_nanos={}; terminalization_preparation_count={}; terminalization_preparation_nanos={}; production_apply_count={}; production_apply_nanos={}; committed_outcome_count={}; committed_outcome_nanos={}; replication_notification_count={}; replication_notification_nanos={}; transaction_remainder_commit_count={}; transaction_remainder_commit_nanos={}",
         timings.decode_and_proof_count,
@@ -220,7 +212,9 @@ fn protected_roster_terminal_apply_timing_diagnostic() -> String {
 }
 
 #[cfg(not(feature = "test-control"))]
-fn protected_roster_terminal_apply_timing_diagnostic() -> &'static str {
+fn protected_roster_terminal_apply_timing_diagnostic(
+    _observation: &ProtectedRosterTerminalObservationForTest,
+) -> &'static str {
     "test-control-disabled"
 }
 
@@ -270,6 +264,7 @@ fn protected_roster_terminal_status_response_diagnostic(
 /// protected terminal material.
 #[cfg(feature = "test-control")]
 fn protected_roster_terminal_status_barrier_diagnostic(
+    observation: &ProtectedRosterTerminalObservationForTest,
     fleet: &ThreeVoterConsumerFleet,
     read_barrier_calls_before: usize,
     diagnostics_before: &[(u64, u64, u64, u64)],
@@ -318,7 +313,7 @@ fn protected_roster_terminal_status_barrier_diagnostic(
             )
         })
         .collect::<Vec<_>>();
-    let validation_after = protected_roster_v2_terminal_status_validation_stages_for_test();
+    let validation_after = observation.validation_stages();
     let v2_validation_stage_delta = (
         validation_after
             .record_decoded
@@ -352,6 +347,7 @@ fn protected_roster_terminal_status_barrier_diagnostic(
 
 #[cfg(not(feature = "test-control"))]
 fn protected_roster_terminal_status_barrier_diagnostic(
+    _observation: &ProtectedRosterTerminalObservationForTest,
     _fleet: &ThreeVoterConsumerFleet,
     _read_barrier_calls_before: usize,
     _diagnostics_before: &[(u64, u64, u64, u64)],
@@ -8508,11 +8504,9 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
         .await
         .expect("bind the six proofs to one exact terminal body");
     #[cfg(feature = "test-control")]
-    let _terminal_apply_timing_guard = PROTECTED_ROSTER_TERMINAL_APPLY_TIMING_TEST_LOCK
-        .lock()
-        .await;
-    #[cfg(feature = "test-control")]
-    reset_protected_roster_terminal_apply_timings_for_test();
+    let terminal_observation = ProtectedRosterTerminalObservationForTest::new(&fleet.backends)
+        .await
+        .expect("observe the three actual terminal storage backends");
     let terminalize_started = Instant::now();
     let terminalize_outcome = roster_client
         .terminalize(&mut terminal)
@@ -8599,7 +8593,7 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
                     .roster_terminal_response_elapsed_millis
                     .load(Ordering::SeqCst),
                 protected_roster_terminal_status_response_diagnostic(transport.as_ref()),
-                protected_roster_terminal_apply_timing_diagnostic(),
+                protected_roster_terminal_apply_timing_diagnostic(&terminal_observation),
             )
             }
         }
@@ -8609,7 +8603,7 @@ async fn persistent_three_voter_protected_roster_commits_maximum_plan_and_result
         .await;
     #[cfg(feature = "test-control")]
     {
-        let timings = protected_roster_terminal_apply_timings_for_test();
+        let timings = terminal_observation.timings();
         assert_eq!(
             [
                 timings.decode_and_proof_count,
@@ -9075,16 +9069,9 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
         .await
         .expect("bind the six proofs to one exact terminal body");
     #[cfg(feature = "test-control")]
-    let _terminal_apply_timing_guard = PROTECTED_ROSTER_TERMINAL_APPLY_TIMING_TEST_LOCK
-        .lock()
-        .await;
-    #[cfg(feature = "test-control")]
-    let _terminal_apply_timing_store_guard =
-        protected_roster_terminal_apply_timing_test_guard().await;
-    #[cfg(feature = "test-control")]
-    reset_protected_roster_terminal_apply_timings_for_test();
-    #[cfg(feature = "test-control")]
-    reset_protected_roster_v2_terminal_status_validation_stages_for_test();
+    let terminal_observation = ProtectedRosterTerminalObservationForTest::new(&fleet.backends)
+        .await
+        .expect("observe the three actual terminal storage backends");
     let terminalize_started = Instant::now();
     let terminalize_outcome = roster_client
         .terminalize(&mut terminal)
@@ -9159,7 +9146,7 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
             let terminal_status_v2_stage_before = Vec::new();
             #[cfg(feature = "test-control")]
             let terminal_status_v2_validation_stage_before = {
-                let snapshot = protected_roster_v2_terminal_status_validation_stages_for_test();
+                let snapshot = terminal_observation.validation_stages();
                 (
                     snapshot.record_decoded,
                     snapshot.retained_evidence_invariant,
@@ -9251,13 +9238,14 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
                         .load(Ordering::SeqCst),
                     protected_roster_terminal_status_response_diagnostic(transport.as_ref()),
                     protected_roster_terminal_status_barrier_diagnostic(
+                        &terminal_observation,
                         &fleet,
                         terminal_status_barriers_before,
                         &terminal_status_diagnostics_before,
                         &terminal_status_v2_stage_before,
                         terminal_status_v2_validation_stage_before,
                     ),
-                    protected_roster_terminal_apply_timing_diagnostic(),
+                    protected_roster_terminal_apply_timing_diagnostic(&terminal_observation),
                 )
             }
         }
@@ -9267,7 +9255,7 @@ async fn persistent_three_voter_protected_roster_creates_absent_record_then_esta
         .await;
     #[cfg(feature = "test-control")]
     {
-        let timings = protected_roster_terminal_apply_timings_for_test();
+        let timings = terminal_observation.timings();
         assert_eq!(
             [
                 timings.decode_and_proof_count,

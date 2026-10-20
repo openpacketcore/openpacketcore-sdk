@@ -217,8 +217,8 @@ fn protected_roster_reclaim_hydrated_rows_for_test() -> usize {
 /// Aggregate-only terminal apply timings used by the bounded max-frame test.
 ///
 /// These are test-only counters: they retain no command, terminal, identity,
-/// error, or wall-clock data.  A caller must hold the companion test guard
-/// while resetting, applying, and snapshotting to isolate parallel tests.
+/// error, or wall-clock data. Each observation selects its actual backing
+/// databases and owns fresh counters across their storage worker threads.
 #[cfg(any(test, feature = "test-control"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProtectedRosterTerminalApplyTimings {
@@ -249,147 +249,6 @@ pub struct ProtectedRosterTerminalApplyTimings {
     pub transaction_remainder_commit_nanos: u64,
 }
 
-#[cfg(any(test, feature = "test-control"))]
-struct ProtectedRosterTerminalApplyTimingCounters {
-    decode_and_proof_count: AtomicU64,
-    decode_and_proof_nanos: AtomicU64,
-    terminalization_preparation_count: AtomicU64,
-    terminalization_preparation_nanos: AtomicU64,
-    production_apply_count: AtomicU64,
-    production_apply_nanos: AtomicU64,
-    committed_outcome_count: AtomicU64,
-    committed_outcome_nanos: AtomicU64,
-    replication_notification_count: AtomicU64,
-    replication_notification_nanos: AtomicU64,
-    transaction_remainder_commit_count: AtomicU64,
-    transaction_remainder_commit_nanos: AtomicU64,
-}
-
-#[cfg(any(test, feature = "test-control"))]
-static PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS: ProtectedRosterTerminalApplyTimingCounters =
-    ProtectedRosterTerminalApplyTimingCounters {
-        decode_and_proof_count: AtomicU64::new(0),
-        decode_and_proof_nanos: AtomicU64::new(0),
-        terminalization_preparation_count: AtomicU64::new(0),
-        terminalization_preparation_nanos: AtomicU64::new(0),
-        production_apply_count: AtomicU64::new(0),
-        production_apply_nanos: AtomicU64::new(0),
-        committed_outcome_count: AtomicU64::new(0),
-        committed_outcome_nanos: AtomicU64::new(0),
-        replication_notification_count: AtomicU64::new(0),
-        replication_notification_nanos: AtomicU64::new(0),
-        transaction_remainder_commit_count: AtomicU64::new(0),
-        transaction_remainder_commit_nanos: AtomicU64::new(0),
-    };
-
-#[cfg(feature = "test-control")]
-static PROTECTED_ROSTER_TERMINAL_APPLY_TIMING_TEST_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
-
-#[cfg(any(test, feature = "test-control"))]
-fn record_protected_roster_terminal_apply_timing(
-    count: &AtomicU64,
-    nanos: &AtomicU64,
-    start: Instant,
-) {
-    count.fetch_add(1, Ordering::Relaxed);
-    nanos.fetch_add(
-        u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        Ordering::Relaxed,
-    );
-}
-
-#[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
-pub(crate) fn record_native_roster_notification_timing(start: Instant) {
-    record_protected_roster_terminal_apply_timing(
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_nanos,
-        start,
-    );
-}
-
-#[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
-pub(crate) fn record_native_roster_publication_timing(start: Instant) {
-    record_protected_roster_terminal_apply_timing(
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_nanos,
-        start,
-    );
-}
-
-/// Serialize terminal timing probes while a test resets and snapshots them.
-#[cfg(feature = "test-control")]
-pub async fn protected_roster_terminal_apply_timing_test_guard(
-) -> tokio::sync::MutexGuard<'static, ()> {
-    PROTECTED_ROSTER_TERMINAL_APPLY_TIMING_TEST_LOCK
-        .lock()
-        .await
-}
-
-/// Reset the aggregate-only terminal apply timing counters.
-#[cfg(feature = "test-control")]
-pub fn reset_protected_roster_terminal_apply_timings_for_test() {
-    for counter in [
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_nanos,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_nanos,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_nanos,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_nanos,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_nanos,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_nanos,
-    ] {
-        counter.store(0, Ordering::Relaxed);
-    }
-}
-
-/// Snapshot the aggregate-only terminal apply timing counters.
-#[cfg(feature = "test-control")]
-pub fn protected_roster_terminal_apply_timings_for_test() -> ProtectedRosterTerminalApplyTimings {
-    ProtectedRosterTerminalApplyTimings {
-        decode_and_proof_count: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .decode_and_proof_count
-            .load(Ordering::Relaxed),
-        decode_and_proof_nanos: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .decode_and_proof_nanos
-            .load(Ordering::Relaxed),
-        terminalization_preparation_count: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .terminalization_preparation_count
-            .load(Ordering::Relaxed),
-        terminalization_preparation_nanos: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .terminalization_preparation_nanos
-            .load(Ordering::Relaxed),
-        production_apply_count: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .production_apply_count
-            .load(Ordering::Relaxed),
-        production_apply_nanos: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .production_apply_nanos
-            .load(Ordering::Relaxed),
-        committed_outcome_count: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .committed_outcome_count
-            .load(Ordering::Relaxed),
-        committed_outcome_nanos: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .committed_outcome_nanos
-            .load(Ordering::Relaxed),
-        replication_notification_count: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .replication_notification_count
-            .load(Ordering::Relaxed),
-        replication_notification_nanos: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .replication_notification_nanos
-            .load(Ordering::Relaxed),
-        transaction_remainder_commit_count: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .transaction_remainder_commit_count
-            .load(Ordering::Relaxed),
-        transaction_remainder_commit_nanos: PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS
-            .transaction_remainder_commit_nanos
-            .load(Ordering::Relaxed),
-    }
-}
-
 /// Fixed, aggregate-only checkpoints reached while Profile-V2 terminal-status
 /// rehydrates its retained durable state.  This is available solely to the
 /// opt-in integration-test control surface.  It contains neither row data nor
@@ -415,83 +274,49 @@ pub struct ProtectedRosterV2TerminalStatusValidationStagesForTest {
 }
 
 #[cfg(any(test, feature = "test-control"))]
-struct ProtectedRosterV2TerminalStatusValidationStageCounters {
-    record_decoded: AtomicU64,
-    retained_evidence_invariant: AtomicU64,
-    authority_verified: AtomicU64,
-    admission_attestation_verified: AtomicU64,
-    terminal_attestation_verified: AtomicU64,
-    terminal_proof_and_ingress_verified: AtomicU64,
-    retained_shape_verified: AtomicU64,
-}
-
-#[cfg(any(test, feature = "test-control"))]
-static PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES:
-    ProtectedRosterV2TerminalStatusValidationStageCounters =
-    ProtectedRosterV2TerminalStatusValidationStageCounters {
-        record_decoded: AtomicU64::new(0),
-        retained_evidence_invariant: AtomicU64::new(0),
-        authority_verified: AtomicU64::new(0),
-        admission_attestation_verified: AtomicU64::new(0),
-        terminal_attestation_verified: AtomicU64::new(0),
-        terminal_proof_and_ingress_verified: AtomicU64::new(0),
-        retained_shape_verified: AtomicU64::new(0),
-    };
-
-#[cfg(any(test, feature = "test-control"))]
-fn record_protected_roster_v2_terminal_status_validation_stage(counter: &AtomicU64) {
-    counter.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Reset the fixed Profile-V2 terminal-status validation-stage counters.
-///
-/// Integration tests must serialize reset/snapshot with the existing
-/// terminal-apply timing test guard.
+pub(crate) mod terminal_observer;
 #[cfg(feature = "test-control")]
-#[doc(hidden)]
-pub fn reset_protected_roster_v2_terminal_status_validation_stages_for_test() {
-    for counter in [
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.record_decoded,
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.retained_evidence_invariant,
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.authority_verified,
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.admission_attestation_verified,
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.terminal_attestation_verified,
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.terminal_proof_and_ingress_verified,
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.retained_shape_verified,
-    ] {
-        counter.store(0, Ordering::Relaxed);
-    }
+pub use terminal_observer::ProtectedRosterTerminalObservationForTest;
+#[cfg(any(test, feature = "test-control"))]
+use terminal_observer::{
+    record_stage as record_protected_roster_v2_terminal_status_validation_stage,
+    record_timing as record_protected_roster_terminal_apply_timing,
+};
+
+#[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
+pub(crate) fn record_native_roster_notification_timing(
+    database: Option<terminal_observer::DatabaseKey>,
+    start: Instant,
+) {
+    record_protected_roster_terminal_apply_timing(
+        database,
+        |timings| {
+            (
+                &mut timings.replication_notification_count,
+                &mut timings.replication_notification_nanos,
+            )
+        },
+        start,
+    );
 }
 
-/// Snapshot the fixed Profile-V2 terminal-status validation-stage counters.
-#[cfg(feature = "test-control")]
-#[doc(hidden)]
-pub fn protected_roster_v2_terminal_status_validation_stages_for_test(
-) -> ProtectedRosterV2TerminalStatusValidationStagesForTest {
-    ProtectedRosterV2TerminalStatusValidationStagesForTest {
-        record_decoded: PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES
-            .record_decoded
-            .load(Ordering::Relaxed),
-        retained_evidence_invariant: PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES
-            .retained_evidence_invariant
-            .load(Ordering::Relaxed),
-        authority_verified: PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES
-            .authority_verified
-            .load(Ordering::Relaxed),
-        admission_attestation_verified: PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES
-            .admission_attestation_verified
-            .load(Ordering::Relaxed),
-        terminal_attestation_verified: PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES
-            .terminal_attestation_verified
-            .load(Ordering::Relaxed),
-        terminal_proof_and_ingress_verified: PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES
-            .terminal_proof_and_ingress_verified
-            .load(Ordering::Relaxed),
-        retained_shape_verified: PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES
-            .retained_shape_verified
-            .load(Ordering::Relaxed),
-    }
+#[cfg(all(target_os = "linux", any(test, feature = "test-control")))]
+pub(crate) fn record_native_roster_publication_timing(
+    database: Option<terminal_observer::DatabaseKey>,
+    start: Instant,
+) {
+    record_protected_roster_terminal_apply_timing(
+        database,
+        |timings| {
+            (
+                &mut timings.transaction_remainder_commit_count,
+                &mut timings.transaction_remainder_commit_nanos,
+            )
+        },
+        start,
+    );
 }
+
 const MEMBERSHIP_SCOPE_MEMBERS_MAX_BYTES: usize = 1_024;
 const MEMBERSHIP_SCOPE_BINDINGS_MAX_BYTES: usize = 32 * 1_024;
 const MEMBERSHIP_HISTORY_MAX_ENTRIES: usize = 4_096;
@@ -11575,6 +11400,7 @@ fn validate_hydrated_protected_roster_attestations_sync(
 /// evidence domains; this function must therefore never call a V1 verifier or
 /// use a V1 capsule commitment as a compatibility fallback.
 fn validate_hydrated_protected_roster_v2_attestations_sync(
+    #[cfg(any(test, feature = "test-control"))] database: Option<terminal_observer::DatabaseKey>,
     root: &RosterAttestationTrustRootV1,
     membership_scope: &MembershipValidationScope,
     binding: RequestBindingKey,
@@ -11631,9 +11457,9 @@ fn validate_hydrated_protected_roster_v2_attestations_sync(
         )
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
     #[cfg(any(test, feature = "test-control"))]
-    record_protected_roster_v2_terminal_status_validation_stage(
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.admission_attestation_verified,
-    );
+    record_protected_roster_v2_terminal_status_validation_stage(database, |stages| {
+        &mut stages.admission_attestation_verified
+    });
 
     if record.state() == ProductionReservationStateV2::Live {
         return Ok(());
@@ -11710,9 +11536,9 @@ fn validate_hydrated_protected_roster_v2_attestations_sync(
     })
     .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
     #[cfg(any(test, feature = "test-control"))]
-    record_protected_roster_v2_terminal_status_validation_stage(
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.terminal_attestation_verified,
-    );
+    record_protected_roster_v2_terminal_status_validation_stage(database, |stages| {
+        &mut stages.terminal_attestation_verified
+    });
     // A Q2 terminal ingress is a fresh `/4` statement, deliberately distinct
     // from the retained Q1 admission ingress.  Authenticate it against the
     // exact terminal capsule instead of comparing the two ingress envelopes.
@@ -11731,9 +11557,9 @@ fn validate_hydrated_protected_roster_v2_attestations_sync(
         )
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
     #[cfg(any(test, feature = "test-control"))]
-    record_protected_roster_v2_terminal_status_validation_stage(
-        &PROTECTED_ROSTER_V2_TERMINAL_STATUS_VALIDATION_STAGES.terminal_proof_and_ingress_verified,
-    );
+    record_protected_roster_v2_terminal_status_validation_stage(database, |stages| {
+        &mut stages.terminal_proof_and_ingress_verified
+    });
     Ok(())
 }
 
@@ -12838,6 +12664,8 @@ fn validate_protected_roster_v2_state_sync(
             .map_err(|_| invalid_data("protected roster V2 trust root is invalid"))?
             .ok_or_else(|| invalid_data("protected roster V2 trust root is missing"))?;
         validate_hydrated_protected_roster_v2_attestations_sync(
+            #[cfg(any(test, feature = "test-control"))]
+            terminal_observer::database_key(conn),
             &root,
             membership_scope,
             binding,
@@ -13771,6 +13599,8 @@ fn protected_roster_v2_authenticate_hydration_sync(
             let original =
                 protected_roster_v2_original_authority_sync(conn, identity, binding, admission)?;
             validate_hydrated_protected_roster_v2_attestations_sync(
+                #[cfg(any(test, feature = "test-control"))]
+                terminal_observer::database_key(conn),
                 &root,
                 &membership_scope,
                 binding,
@@ -14551,6 +14381,11 @@ fn advance_terminal_key_fence_sync(
 // The shared evaluator retains the original SQLite transaction implementation.
 // It receives the caller's connection and never creates its own transaction.
 impl roster_engine::RosterCommandStore for &Connection {
+    #[cfg(any(test, feature = "test-control"))]
+    fn terminal_observation_database(&self) -> Option<terminal_observer::DatabaseKey> {
+        terminal_observer::database_key(self)
+    }
+
     fn trust_root(
         &self,
     ) -> Result<Option<RosterAttestationTrustRootV1>, SessionConsensusStorageError> {
@@ -32230,8 +32065,13 @@ fn apply_protected_roster_command_sync(
         )?);
         #[cfg(any(test, feature = "test-control"))]
         record_protected_roster_terminal_apply_timing(
-            &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_count,
-            &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.replication_notification_nanos,
+            terminal_observer::database_key(tx),
+            |timings| {
+                (
+                    &mut timings.replication_notification_count,
+                    &mut timings.replication_notification_nanos,
+                )
+            },
             replication_notification_started,
         );
     }
@@ -33276,8 +33116,13 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
     #[cfg(any(test, feature = "test-control"))]
     if let Some(started) = terminal_transaction_remainder_started {
         record_protected_roster_terminal_apply_timing(
-            &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_count,
-            &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.transaction_remainder_commit_nanos,
+            terminal_observer::database_key(conn),
+            |timings| {
+                (
+                    &mut timings.transaction_remainder_commit_count,
+                    &mut timings.transaction_remainder_commit_nanos,
+                )
+            },
             started,
         );
     }
@@ -67827,10 +67672,171 @@ BEGIN IMMEDIATE;
         }
     }
 
+    #[cfg(all(feature = "test-control", target_os = "linux"))]
+    fn terminal_observer_fixture(
+        backend: &SqliteSessionBackend,
+    ) -> ProtectedRosterTerminalObservationForTest {
+        terminal_observer::ProtectedRosterTerminalObservationForTest::from_backend(backend)
+            .expect("observe the fixture's actual database descriptor")
+    }
+
+    #[cfg(all(feature = "test-control", target_os = "linux"))]
+    fn apply_and_read_terminal_observer_fixture(path: &Path) {
+        initialize_protected_roster_v2_recovery_fixture(
+            path,
+            ProtectedRosterV2RecoveryFixtureState::Established,
+        )
+        .expect("real V2 membership, admission and terminal apply");
+        let backend = SqliteSessionBackend::open(path).expect("reopen real V2 writer");
+        let conn = backend.conn.blocking_lock();
+        let fixture = crate::consensus::types::roster_v2_persistence_fixture();
+        let terminal = TerminalRecord::from_canonical_bytes(
+            fixture.terminal_command.record_bytes(),
+            &fixture.admission,
+        )
+        .expect("exact terminal body");
+        let evidence = fixture
+            .terminal_command
+            .terminal_evidence()
+            .expect("V2 evidence");
+        assert!(matches!(
+            read_protected_roster_v2_terminal_status_sync(
+                &conn,
+                fixture.identity,
+                fixture.terminal_command.binding(),
+                ProtectedRosterV2TerminalStatusRequest {
+                    registration_parts: fixture.terminal_command.registration_parts(),
+                    current_authority: &fixture.authority,
+                    terminal_body_commitment: terminal.body_commitment(),
+                    terminal_evidence: &evidence,
+                    logical_time: v2_persistence_logical_time(),
+                },
+            ).expect("real terminal status"),
+            ProtectedRosterV2ReadResult::Terminalized(ref read)
+                if read.committed.record() == &terminal
+        ));
+    }
+
+    #[cfg(all(feature = "test-control", target_os = "linux"))]
+    #[test]
+    fn terminal_apply_timings_ignore_an_unrelated_database() {
+        let directory = tempfile::tempdir().expect("independent terminal databases");
+        let passive = SqliteSessionBackend::open(directory.path().join("passive.sqlite"))
+            .expect("observed passive database");
+        let active_path = directory.path().join("active.sqlite");
+        let active = SqliteSessionBackend::open(&active_path).expect("unrelated active database");
+        let passive_observation = terminal_observer_fixture(&passive);
+        let active_observation = terminal_observer_fixture(&active);
+        let before = passive_observation.timings();
+        std::thread::spawn(move || apply_and_read_terminal_observer_fixture(&active_path))
+            .join()
+            .expect("independent storage worker");
+        let active_counts = active_observation.timings();
+        assert_eq!(
+            [
+                active_counts.decode_and_proof_count,
+                active_counts.terminalization_preparation_count,
+                active_counts.production_apply_count,
+                active_counts.committed_outcome_count,
+                active_counts.replication_notification_count,
+                active_counts.transaction_remainder_commit_count,
+            ],
+            [1; 6],
+            "positive control observes all six real Q2 phases exactly once",
+        );
+        assert_eq!(
+            passive_observation.timings(),
+            before,
+            "another database's real terminal apply must not contaminate the selected fixture"
+        );
+    }
+
+    #[cfg(all(feature = "test-control", target_os = "linux"))]
+    #[test]
+    fn terminal_validation_stages_ignore_an_unrelated_database() {
+        let directory = tempfile::tempdir().expect("independent validation databases");
+        let passive = SqliteSessionBackend::open(directory.path().join("passive.sqlite"))
+            .expect("observed passive database");
+        let active_path = directory.path().join("active.sqlite");
+        let active = SqliteSessionBackend::open(&active_path).expect("unrelated active database");
+        let passive_observation = terminal_observer_fixture(&passive);
+        let active_observation = terminal_observer_fixture(&active);
+        let before = passive_observation.validation_stages();
+        std::thread::spawn(move || apply_and_read_terminal_observer_fixture(&active_path))
+            .join()
+            .expect("independent storage worker");
+        let active_counts = active_observation.validation_stages();
+        assert_eq!(
+            active_counts,
+            ProtectedRosterV2TerminalStatusValidationStagesForTest {
+                record_decoded: 1,
+                retained_evidence_invariant: 1,
+                authority_verified: 1,
+                admission_attestation_verified: 3,
+                terminal_attestation_verified: 2,
+                terminal_proof_and_ingress_verified: 2,
+                retained_shape_verified: 1,
+            },
+            "positive control observes every real apply, hydration and status checkpoint",
+        );
+        assert_eq!(
+            passive_observation.validation_stages(),
+            before,
+            "another database's real validation must not contaminate the selected fixture"
+        );
+    }
+
+    #[cfg(all(feature = "test-control", target_os = "linux"))]
+    #[test]
+    fn terminal_observations_retire_independently_for_the_same_database() {
+        let directory = tempfile::tempdir().expect("independent observation owners");
+        let first_path = directory.path().join("first.sqlite");
+        let second_path = directory.path().join("second.sqlite");
+        let first_backend = SqliteSessionBackend::open(&first_path).expect("first database");
+        let second_backend = SqliteSessionBackend::open(&second_path).expect("second database");
+        let retired = terminal_observer_fixture(&first_backend);
+        let first = terminal_observer_fixture(&first_backend);
+        let second = terminal_observer_fixture(&second_backend);
+        drop(retired);
+
+        std::thread::spawn(move || apply_and_read_terminal_observer_fixture(&first_path))
+            .join()
+            .expect("first independent storage worker");
+        let first_timings = first.timings();
+        let first_stages = first.validation_stages();
+        assert_eq!(
+            first_timings.production_apply_count, 1,
+            "retiring one observer must not remove another for the same database"
+        );
+        assert_eq!(first_stages.record_decoded, 1);
+        assert_eq!(
+            second.timings(),
+            ProtectedRosterTerminalApplyTimings::default()
+        );
+        assert_eq!(
+            second.validation_stages(),
+            ProtectedRosterV2TerminalStatusValidationStagesForTest::default()
+        );
+
+        // Both databases now use the identical signed fixture and consensus
+        // identity. Only their real database ownership distinguishes them.
+        std::thread::spawn(move || apply_and_read_terminal_observer_fixture(&second_path))
+            .join()
+            .expect("second independent storage worker");
+        assert_eq!(second.timings().production_apply_count, 1);
+        assert_eq!(second.validation_stages().record_decoded, 1);
+        assert_eq!(
+            first.timings(),
+            first_timings,
+            "same signed work on a different database cannot change the first observation"
+        );
+        assert_eq!(first.validation_stages(), first_stages);
+    }
+
     #[cfg(feature = "test-control")]
     #[test]
     fn protected_roster_v2_terminal_status_validation_stages_are_fixed_and_redacted() {
-        let snapshot = protected_roster_v2_terminal_status_validation_stages_for_test();
+        let snapshot = ProtectedRosterV2TerminalStatusValidationStagesForTest::default();
         let value = serde_json::to_value(snapshot).expect("serialize V2 validation stages");
         let object = value.as_object().expect("V2 validation-stage object");
         assert_eq!(object.len(), 7);

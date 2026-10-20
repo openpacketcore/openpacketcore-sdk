@@ -10,6 +10,9 @@ use super::*;
 /// these two failure classes distinct and preserve the cross-profile vacancy
 /// and business-key reservation checks in the prepared transaction.
 pub(crate) trait RosterCommandStore {
+    #[cfg(any(test, feature = "test-control"))]
+    fn terminal_observation_database(&self) -> Option<terminal_observer::DatabaseKey>;
+
     fn trust_root(
         &self,
     ) -> Result<Option<RosterAttestationTrustRootV1>, SessionConsensusStorageError>;
@@ -644,8 +647,13 @@ pub(crate) fn terminal_v1(
     .map_err(|_| ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::Authority))?;
     #[cfg(any(test, feature = "test-control"))]
     record_protected_roster_terminal_apply_timing(
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_nanos,
+        store.terminal_observation_database(),
+        |timings| {
+            (
+                &mut timings.decode_and_proof_count,
+                &mut timings.decode_and_proof_nanos,
+            )
+        },
         decode_and_proof_started,
     );
     match state {
@@ -675,8 +683,13 @@ pub(crate) fn terminal_v1(
                     .map_err(ProtectedRosterCommandApplyError::fatal)?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_nanos,
+                store.terminal_observation_database(),
+                |timings| {
+                    (
+                        &mut timings.committed_outcome_count,
+                        &mut timings.committed_outcome_nanos,
+                    )
+                },
                 committed_outcome_started,
             );
             Ok((outcome, None))
@@ -722,8 +735,13 @@ pub(crate) fn terminal_v1(
             let replication = protected_roster_established_replication(&prepared, &authority)?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_nanos,
+                store.terminal_observation_database(),
+                |timings| {
+                    (
+                        &mut timings.terminalization_preparation_count,
+                        &mut timings.terminalization_preparation_nanos,
+                    )
+                },
                 terminalization_preparation_started,
             );
             #[cfg(any(test, feature = "test-control"))]
@@ -733,8 +751,13 @@ pub(crate) fn terminal_v1(
                 .map_err(ProtectedRosterCommandApplyError::fatal)?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_nanos,
+                store.terminal_observation_database(),
+                |timings| {
+                    (
+                        &mut timings.production_apply_count,
+                        &mut timings.production_apply_nanos,
+                    )
+                },
                 production_apply_started,
             );
             #[cfg(any(test, feature = "test-control"))]
@@ -744,8 +767,13 @@ pub(crate) fn terminal_v1(
                     .map_err(ProtectedRosterCommandApplyError::fatal)?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_nanos,
+                store.terminal_observation_database(),
+                |timings| {
+                    (
+                        &mut timings.committed_outcome_count,
+                        &mut timings.committed_outcome_nanos,
+                    )
+                },
                 committed_outcome_started,
             );
             Ok((outcome, replication))
@@ -1278,8 +1306,13 @@ pub(crate) fn terminal_v2(
         })?;
     #[cfg(any(test, feature = "test-control"))]
     record_protected_roster_terminal_apply_timing(
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_count,
-        &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.decode_and_proof_nanos,
+        store.terminal_observation_database(),
+        |timings| {
+            (
+                &mut timings.decode_and_proof_count,
+                &mut timings.decode_and_proof_nanos,
+            )
+        },
         decode_and_proof_started,
     );
 
@@ -1321,8 +1354,13 @@ pub(crate) fn terminal_v2(
                     .map_err(ProtectedRosterCommandApplyError::fatal)?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_nanos,
+                store.terminal_observation_database(),
+                |timings| {
+                    (
+                        &mut timings.committed_outcome_count,
+                        &mut timings.committed_outcome_nanos,
+                    )
+                },
                 committed_outcome_started,
             );
             Ok((outcome, None))
@@ -1395,8 +1433,13 @@ pub(crate) fn terminal_v2(
                 .map_err(protected_roster_terminalization_reservation_error)?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.terminalization_preparation_nanos,
+                store.terminal_observation_database(),
+                |timings| {
+                    (
+                        &mut timings.terminalization_preparation_count,
+                        &mut timings.terminalization_preparation_nanos,
+                    )
+                },
                 terminalization_preparation_started,
             );
             // The predicate read, V2-row compare-and-swap, optional
@@ -1422,8 +1465,13 @@ pub(crate) fn terminal_v2(
             )?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.production_apply_nanos,
+                store.terminal_observation_database(),
+                |timings| {
+                    (
+                        &mut timings.production_apply_count,
+                        &mut timings.production_apply_nanos,
+                    )
+                },
                 production_apply_started,
             );
             #[cfg(any(test, feature = "test-control"))]
@@ -1433,8 +1481,13 @@ pub(crate) fn terminal_v2(
                     .map_err(ProtectedRosterCommandApplyError::fatal)?;
             #[cfg(any(test, feature = "test-control"))]
             record_protected_roster_terminal_apply_timing(
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_count,
-                &PROTECTED_ROSTER_TERMINAL_APPLY_TIMINGS.committed_outcome_nanos,
+                store.terminal_observation_database(),
+                |timings| {
+                    (
+                        &mut timings.committed_outcome_count,
+                        &mut timings.committed_outcome_nanos,
+                    )
+                },
                 committed_outcome_started,
             );
             Ok((outcome, replication))

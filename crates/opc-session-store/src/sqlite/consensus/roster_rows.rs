@@ -574,7 +574,13 @@ fn hydrate_original_with_reservation(
                     let admission = row.admission().ok_or(ProtectedRosterApplyError::Corrupt)?;
                     let original = original.for_admission(admission)?;
                     validate_hydrated_protected_roster_v2_attestations_sync(
-                        root, scope, binding, &row, &original,
+                        #[cfg(any(test, feature = "test-control"))]
+                        terminal_observer::hydration_database(),
+                        root,
+                        scope,
+                        binding,
+                        &row,
+                        &original,
                     )?;
                     (
                         admission_slots(Profile::V2, binding, admission)?,
