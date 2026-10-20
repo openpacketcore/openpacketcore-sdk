@@ -575,3 +575,53 @@ fn owned_journal_void_excludes_another_process_and_recovers_after_crash() {
     assert!(denied);
     assert!(FencedTransitionV2RecoveryJournal::open_existing_owned(&path, key()).is_ok());
 }
+
+#[cfg(target_os = "linux")]
+mod descriptor_locks {
+    use super::*;
+    use crate::test_process::sqlite_lock_probe as probe;
+
+    #[test]
+    fn recovery_journal_successor_preserves_sqlite_record_locks() {
+        const TEST: &str = "fenced_transition_journal::recovery::void_ownership_tests::descriptor_locks::recovery_journal_successor_preserves_sqlite_record_locks";
+        if probe::child() {
+            return;
+        }
+        let directory = directory();
+        let path = directory.path().join("retirement.sqlite3");
+        let mut journal =
+            FencedTransitionV2RecoveryJournal::create_new_owned(&path, key()).unwrap();
+        let successor = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&successor);
+        let next_path = path.clone();
+        let lease = &mut Arc::get_mut(&mut journal.inner)
+            .unwrap()
+            .path_guard
+            ._open_lease;
+        let identity = lease.identity;
+        lease.after_release = Some(Box::new(move || {
+            // Admit a successor at the first instant the process-local lease
+            // permits it. The previous SQLite connection has already closed.
+            let next_lease =
+                super::super::super::SecureJournalOpenLease::acquire(identity).unwrap();
+            let connection = Connection::open(&next_path).unwrap();
+            connection
+                .execute_batch("PRAGMA locking_mode=NORMAL; BEGIN IMMEDIATE;")
+                .unwrap();
+            probe::assert_state(&next_path, TEST, true, "after successor lock acquisition");
+            *observed.lock().unwrap() = Some((connection, next_lease));
+        }));
+        drop(journal);
+        probe::assert_state(
+            &path,
+            TEST,
+            true,
+            "after predecessor ownership descriptor retirement",
+        );
+        let (connection, next_lease) = successor.lock().unwrap().take().unwrap();
+        connection.execute_batch("ROLLBACK;").unwrap();
+        drop(connection);
+        drop(next_lease);
+        probe::assert_state(&path, TEST, false, "after successor shutdown");
+    }
+}

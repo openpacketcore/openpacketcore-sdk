@@ -552,7 +552,7 @@ struct SnapshotDatabaseLeaseAdmissionBarrierGuard {
     hook: Arc<SnapshotDatabaseLeaseAdmissionHook>,
     // Pin the identity for the entire installation, even if the backend is
     // dropped before the guard. An unrelated file cannot reuse this inode.
-    _database_file: Arc<std::fs::File>,
+    _database_file: Arc<super::snapshot::SqliteFilePin>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -2823,7 +2823,7 @@ async fn derive_private_wal_install_source(
     )
     .await?;
     let raw_pin = raw.pin_readonly_from_writer()?;
-    let (file, cleanup) = raw.into_file_with_cleanup();
+    let (file, cleanup) = raw.into_file_with_cleanup()?;
     let cleanup = cleanup.ok_or_else(|| {
         consensus::invalid_data("private WAL install derivative cleanup is missing")
     })?;
@@ -6149,7 +6149,14 @@ impl SqliteConsensusStateMachine {
                     error,
                 )
             })?;
-            let (raw_file, raw_snapshot_cleanup) = raw_snapshot.into_file_with_cleanup();
+            let (raw_file, raw_snapshot_cleanup) =
+                raw_snapshot.into_file_with_cleanup().map_err(|error| {
+                    storage_error(
+                        ErrorSubject::Snapshot(Some(meta.signature())),
+                        ErrorVerb::Write,
+                        error,
+                    )
+                })?;
             raw_file.sync_all().map_err(|error| {
                 storage_error(
                     ErrorSubject::Snapshot(Some(meta.signature())),
@@ -7791,7 +7798,7 @@ async fn seal_snapshot_database_in_place(
     } else {
         None
     };
-    let (raw_file, output_cleanup) = raw_snapshot.into_file_with_cleanup();
+    let (raw_file, output_cleanup) = raw_snapshot.into_file_with_cleanup()?;
     // This is the cleanup owner for the already-created, descriptor-pinned
     // compaction inode. It must remain armed through every async hash, footer,
     // sync, and later atomic rename; otherwise cancellation could retain an
@@ -7984,7 +7991,7 @@ pub(crate) async fn inspect_voter_snapshot(
         )
         .await?;
         let raw_pin = raw.pin_readonly_from_writer()?;
-        let (raw_file, raw_cleanup) = raw.into_file_with_cleanup();
+        let (raw_file, raw_cleanup) = raw.into_file_with_cleanup()?;
         raw_file.sync_all()?;
         drop(raw_file);
         let raw_pin = seal_snapshot_pin(
@@ -8499,7 +8506,7 @@ async fn track_previous_snapshot_artifact(
             None,
         )
         .await?;
-        pinned.into_file()
+        pinned.into_file()?
     } else {
         let file = open_snapshot_child_in_namespace(
             Arc::clone(&namespace_lease.namespace),

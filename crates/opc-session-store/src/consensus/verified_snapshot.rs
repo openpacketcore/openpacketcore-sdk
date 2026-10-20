@@ -591,6 +591,10 @@ impl VerifiedSnapshotSource for VerifiedFile {
         self.file.try_clone()
     }
 
+    fn borrowed_file(&self) -> io::Result<&File> {
+        Ok(&self.file)
+    }
+
     fn file_identity(&self) -> io::Result<(u64, u64)> {
         let metadata = self.file.metadata()?;
         Ok((metadata.dev(), metadata.ino()))

@@ -32,18 +32,18 @@ use crate::fenced_mutation_roster::PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES;
 #[cfg(target_os = "linux")]
 pub(crate) type RetainedSnapshotDatabaseFlock = Arc<SnapshotDatabaseFlock>;
 
-/// A lease lock on the backend's existing open file description. Dropping a
-/// lease unlocks its flock but never closes a second descriptor to SQLite's
-/// main file: any such close would release the process's POSIX record locks.
+/// A lease lock retaining SQLite's close owner. Dropping the lease unlocks
+/// its flock; the final pin close goes through SQLite's Unix VFS and is
+/// deferred while any other connection still holds locks on the main inode.
 #[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct SnapshotDatabaseFlock {
-    file: Arc<std::fs::File>,
+    file: Arc<SqliteFilePin>,
 }
 
 #[cfg(unix)]
 impl SnapshotDatabaseFlock {
-    pub(crate) fn lock(file: Arc<std::fs::File>) -> io::Result<Self> {
+    pub(crate) fn lock(file: Arc<SqliteFilePin>) -> io::Result<Self> {
         rustix::fs::flock(&*file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
         Ok(Self { file })
     }
@@ -775,20 +775,119 @@ impl FileIdentity {
     /// Inspect SQLite's borrowed descriptor without opening, duplicating or
     /// closing another handle to its inode.
     pub(crate) fn for_connection(connection: &rusqlite::Connection) -> io::Result<Self> {
+        Self::for_database(connection, "main")
+    }
+
+    pub(crate) fn for_database(
+        connection: &rusqlite::Connection,
+        database: &str,
+    ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            let (device, inode) = opc_sqlite_file_control_sys::main_file_identity(connection)
-                .map_err(|_| io::Error::other("SQLite main file identity is unavailable"))?;
+            let (device, inode) =
+                opc_sqlite_file_control_sys::database_file_identity(connection, database)
+                    .map_err(|_| io::Error::other("SQLite main file identity is unavailable"))?;
             Ok(Self { device, inode })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (connection, database);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SQLite main file identity requires Linux",
+            ))
+        }
+    }
+}
+
+/// Distinguish ordinary immutable/staging artifacts from live database pins.
+/// Database clones share SQLite's close owner; they never become raw Files.
+#[derive(Debug)]
+pub(crate) enum SqliteFilePin {
+    Artifact(std::fs::File),
+    #[cfg(target_os = "linux")]
+    Database(opc_sqlite_file_control_sys::RetainedSqliteFile),
+}
+
+impl SqliteFilePin {
+    pub(crate) fn from_connection(connection: &rusqlite::Connection) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            opc_sqlite_file_control_sys::RetainedSqliteFile::from_connection(connection)
+                .map(Self::Database)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = connection;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "SQLite main file identity requires Linux",
+                "SQLite pins require Linux",
             ))
         }
+    }
+
+    pub(crate) fn open_database(path: &Path) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            opc_sqlite_file_control_sys::RetainedSqliteFile::open_nofollow(path).map(Self::Database)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SQLite pins require Linux",
+            ))
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        match self {
+            Self::Artifact(file) => file.try_clone().map(Self::Artifact),
+            #[cfg(target_os = "linux")]
+            Self::Database(file) => Ok(Self::Database(file.clone())),
+        }
+    }
+
+    fn into_artifact(self) -> io::Result<std::fs::File> {
+        match self {
+            Self::Artifact(file) => Ok(file),
+            #[cfg(target_os = "linux")]
+            Self::Database(_) => Err(invalid_data(
+                "live SQLite pin cannot transfer close authority",
+            )),
+        }
+    }
+}
+
+impl std::ops::Deref for SqliteFilePin {
+    type Target = std::fs::File;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Artifact(file) => file,
+            #[cfg(target_os = "linux")]
+            Self::Database(file) => file.file(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for SqliteFilePin {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::ops::Deref::deref(self).as_fd()
+    }
+}
+
+impl io::Read for SqliteFilePin {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        std::ops::Deref::deref(self).read(buffer)
+    }
+}
+
+impl io::Seek for SqliteFilePin {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        std::ops::Deref::deref(self).seek(position)
     }
 }
 
@@ -798,7 +897,7 @@ impl FileIdentity {
 /// as authorization that an operation still targets this handle.
 #[allow(dead_code)]
 pub(crate) struct PinnedSqliteFile {
-    file: std::fs::File,
+    file: SqliteFilePin,
     /// Descriptor namespace/name used for every post-admission identity
     /// re-open. `path` remains a SQLite-only spelling where an API cannot
     /// accept an fd.
@@ -1599,6 +1698,10 @@ pub(crate) fn create_unpublished_snapshot_file_in_namespace(
 impl PinnedSqliteFile {
     /// Pin an already-open regular SQLite file to its current handle identity.
     pub(crate) fn from_file(file: std::fs::File, path: PathBuf) -> io::Result<Self> {
+        Self::from_pin(SqliteFilePin::Artifact(file), path)
+    }
+
+    pub(crate) fn from_pin(file: SqliteFilePin, path: PathBuf) -> io::Result<Self> {
         let metadata = file.metadata()?;
         ensure_regular_file(&metadata)?;
         let identity = file_identity(&metadata)?;
@@ -1705,18 +1808,18 @@ impl PinnedSqliteFile {
     }
 
     /// Consume the wrapper and return the already-open OS handle.
-    pub(crate) fn into_file(mut self) -> std::fs::File {
+    pub(crate) fn into_file(mut self) -> io::Result<std::fs::File> {
         self.cleanup = None;
-        self.file
+        self.file.into_artifact()
     }
 
     /// Transfer cleanup ownership alongside the descriptor for an
     /// unpublished SDK-created artifact.
     pub(crate) fn into_file_with_cleanup(
         mut self,
-    ) -> (std::fs::File, Option<UnpublishedSnapshotArtifact>) {
+    ) -> io::Result<(std::fs::File, Option<UnpublishedSnapshotArtifact>)> {
         let cleanup = self.cleanup.take();
-        (self.file, cleanup)
+        Ok((self.file.into_artifact()?, cleanup))
     }
 
     /// Mark the SDK-created database as intentionally retained by its caller.
@@ -1938,8 +2041,10 @@ impl PinnedSqliteFile {
         // before the later authenticated envelope scan and publication fence.
         #[cfg(test)]
         block_fixed_prepublication_scan(&self.path);
-        let portable =
-            PortableSnapshot::capture(self.file.try_clone()?, SNAPSHOT_ENVELOPE_MAX_BYTES)?;
+        let portable = PortableSnapshot::capture(
+            self.file.try_clone()?.into_artifact()?,
+            SNAPSHOT_ENVELOPE_MAX_BYTES,
+        )?;
         let metadata = self.file.metadata()?;
         self.immutable_generation = Some(ImmutableFileGeneration {
             length: portable.source.length(),
@@ -1979,7 +2084,7 @@ impl PinnedSqliteFile {
         if let Some(portable) = &self.portable {
             return Ok(PinnedSnapshotReader::Portable(portable.source.reader()));
         }
-        Ok(PinnedSnapshotReader::File(self.file.try_clone()?))
+        Ok(PinnedSnapshotReader::Pinned(self.file.try_clone()?))
     }
 
     /// Bind an extracted raw SQLite image to its already-validated envelope.
@@ -2640,12 +2745,8 @@ impl PinnedSqliteFile {
         ))
     }
 
-    /// Compare a pathname with the pinned identity through a fresh
-    /// `O_NOFOLLOW | O_NONBLOCK` descriptor.
-    ///
-    /// The re-open makes this suitable for final authorization checks: a
-    /// symlink cannot be substituted for a same-inode path while the identity
-    /// comparison is in progress.
+    /// Compare a no-follow pathname observation with the held inode. A live
+    /// database check must never open and close another readable descriptor.
     pub(crate) fn path_matches_identity(&self, path: &Path) -> io::Result<bool> {
         if let Some((namespace, name)) = &self.namespace {
             if path.file_name() != Some(name.as_os_str()) {
@@ -2658,7 +2759,7 @@ impl PinnedSqliteFile {
             return Ok(file_identity(&metadata)? == self.identity);
         }
         #[cfg(target_os = "linux")]
-        let metadata = readonly_nofollow(path)?.metadata()?;
+        let metadata = std::fs::symlink_metadata(path)?;
         #[cfg(not(target_os = "linux"))]
         let metadata = std::fs::metadata(path)?;
         if !metadata.is_file() {
@@ -2791,7 +2892,7 @@ impl fmt::Debug for PinnedSqliteFile {
 }
 
 pub(crate) enum PinnedSnapshotReader {
-    File(std::fs::File),
+    Pinned(SqliteFilePin),
     #[cfg(target_os = "linux")]
     Portable(super::verified_snapshot::VerifiedReader),
 }
@@ -2799,7 +2900,7 @@ pub(crate) enum PinnedSnapshotReader {
 impl io::Read for PinnedSnapshotReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::File(file) => file.read(buffer),
+            Self::Pinned(file) => file.read(buffer),
             #[cfg(target_os = "linux")]
             Self::Portable(reader) => reader.read(buffer),
         }
@@ -2809,7 +2910,7 @@ impl io::Read for PinnedSnapshotReader {
 impl io::Seek for PinnedSnapshotReader {
     fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
         match self {
-            Self::File(file) => file.seek(position),
+            Self::Pinned(file) => file.seek(position),
             #[cfg(target_os = "linux")]
             Self::Portable(reader) => reader.seek(position),
         }
@@ -3774,7 +3875,7 @@ impl SessionSnapshotFile {
         }
         #[cfg(target_os = "linux")]
         let portable = pinned.portable.clone();
-        let snapshot = Self::from_std(pinned.into_file(), path).await?;
+        let snapshot = Self::from_std(pinned.into_file()?, path).await?;
         #[cfg(target_os = "linux")]
         let snapshot = {
             let mut snapshot = snapshot;

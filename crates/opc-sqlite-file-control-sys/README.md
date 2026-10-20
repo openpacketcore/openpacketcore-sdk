@@ -22,20 +22,26 @@ temporary opens and delegates every named open to the bundled default VFS. It
 exists solely to prove snapshot compaction does not rely on a process-global
 temporary path.
 
-The crate exposes only owned descriptor duplicates, owned snapshot
-registrations, and bounded typed results. It does not expose SQLite's borrowed
-handles or a general-purpose FFI surface, and unsupported platforms fail closed.
+The crate exposes typed file controls, owned snapshot registrations and narrow
+file-inspection callbacks. It does not expose raw SQLite handles or a general
+purpose FFI surface. Unsupported platforms fail closed. Raw descriptor
+duplicates remain available for immutable artifacts and WAL data files; they
+must not be used for temporary inspection or retention of a live main inode.
 
 The crate is source-build only and is not published independently.
 
-The optional `borrowed-file-identity` feature adds `main_file_identity` and the
-defaulted `VerifiedSnapshotSource::file_identity` method for non-owning
-device/inode inspection. It reads full-width metadata, including on i686, from
-SQLite's borrowed Unix descriptor or the verified snapshot source's retained
-descriptor, without opening, duplicating or closing a file. Unix identity
-inspection and descriptor duplication share the VFS admission and descriptor
-lookup. The caller must retain the owning connection for as long as it retains
-the identity. This avoids cancelling SQLite's POSIX record locks through an
-independently owned descriptor's close. The store enables this feature through
-`test-control` and its test dependencies; observations and test native states
-and captures keep their backend connections open until they are dropped.
+The optional `borrowed-file-identity` feature provides full-width main and
+named-database identities, including on i686, without opening, duplicating or
+closing descriptors. `with_main_file` also permits filesystem UUID, persistent
+file-handle and attribute checks through a synchronous borrowed file. Both Unix
+VFS and verified snapshot sources preserve their moved-file and generation
+fences. Callers retain the owning connection for as long as they retain a
+same-process inode identity; persistent recovery still needs UUID and handle
+identity.
+
+`RetainedSqliteFile` owns an unqueried, private SQLite connection for pins that
+must outlive their originating connection. Clones share this owner. Its final
+close participates in SQLite's Unix inode bookkeeping, which defers close while
+any SQLite connection to the inode holds POSIX locks. No SQL, checkpoint,
+process-wide VFS registration or descriptor duplication is used. The store
+enables the feature in its production Unix dependency as well as test controls.

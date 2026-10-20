@@ -489,6 +489,8 @@ struct SecureJournalFileIdentity {
 #[cfg(unix)]
 struct SecureJournalOpenLease {
     identity: SecureJournalFileIdentity,
+    #[cfg(test)]
+    after_release: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// SDK-owned durable binding of transition IDs to opaque prepared requests.
@@ -5139,7 +5141,11 @@ impl SecureJournalOpenLease {
         if !identities.insert(identity) {
             return Err(StoreError::BackendUnavailable(JOURNAL_OWNER_LOCKED.into()));
         }
-        Ok(Self { identity })
+        Ok(Self {
+            identity,
+            #[cfg(test)]
+            after_release: None,
+        })
     }
 }
 
@@ -5152,6 +5158,13 @@ impl Drop for SecureJournalOpenLease {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         identities.remove(&self.identity);
+        #[cfg(test)]
+        {
+            drop(identities);
+            if let Some(after_release) = self.after_release.take() {
+                after_release();
+            }
+        }
     }
 }
 

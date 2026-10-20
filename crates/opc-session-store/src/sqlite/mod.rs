@@ -638,7 +638,7 @@ pub struct SqliteSessionBackend {
     // Retain the owner's startup descriptor even in fixtures that switch the
     // native owner off. Lease retirement must never close a live database FD.
     #[cfg(target_os = "linux")]
-    main_file_pin: Option<Arc<File>>,
+    main_file_pin: Option<Arc<crate::consensus::snapshot::SqliteFilePin>>,
     #[cfg(target_os = "linux")]
     native_reopen_pending: Arc<AtomicBool>,
     #[cfg(all(test, target_os = "linux"))]
@@ -2210,7 +2210,7 @@ impl SqliteSessionBackend {
     /// same object. In-memory stores have no descriptor and return `None`.
     pub(crate) async fn main_file_pin_for_snapshot_lease(
         &self,
-    ) -> std::io::Result<Option<Arc<File>>> {
+    ) -> std::io::Result<Option<Arc<crate::consensus::snapshot::SqliteFilePin>>> {
         let Some(database_path) = self.database_path.as_ref() else {
             return Ok(None);
         };

@@ -1379,68 +1379,56 @@ pub(crate) fn probe_live_terminal_recovery_handoff_with_connection_sync(
         {
             return Err(invalid_data("session operator recovery descriptor moved"));
         }
-        let database_file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
-            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?;
-
-        // Retain the descriptor across the final sidecar and database fences.
-        // The terminal branches intentionally stop here: their snapshot
-        // binding is proved only by the full retained-namespace path.
-        let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
-        if pinned_sidecar.is_none() {
-            revalidate_absent_operator_recovery_latch(database, connection, &database_file)?;
-            return Ok(LiveTerminalRecoveryHandoffProbe::Clear);
-        }
-        let incarnation = operator_recovery_file_incarnation(&database_file)?;
-        let path_file = open_nofollow_read(database)?;
-        if !path_file.metadata()?.is_file()
-            || operator_recovery_file_incarnation(&path_file)? != incarnation
-        {
-            return Err(invalid_data(
-                "session operator recovery pathname does not match SQLite descriptor",
-            ));
-        }
-        let probe = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
-            Some(OperatorRecoveryLatchRecord::Active(latch)) => {
-                active_latch_is_coherent_with_admitted_connection(connection, *latch)?;
-                LiveTerminalRecoveryHandoffProbe::Active
+        opc_sqlite_file_control_sys::with_main_file(connection, |database_file| {
+            // Retain the descriptor across the final sidecar and database fences.
+            // The terminal branches intentionally stop here: their snapshot
+            // binding is proved only by the full retained-namespace path.
+            let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
+            if pinned_sidecar.is_none() {
+                revalidate_absent_operator_recovery_latch(database, connection, database_file)?;
+                return Ok(LiveTerminalRecoveryHandoffProbe::Clear);
             }
-            Some(OperatorRecoveryLatchRecord::Terminal(_)) => {
-                LiveTerminalRecoveryHandoffProbe::TerminalNeedsSnapshot
-            }
-            None => unreachable!("absent sidecar returned before persistent identity"),
-        };
+            let incarnation = operator_recovery_file_incarnation(database_file)?;
+            revalidate_database_path_binding(database, database_file)?;
+            let probe = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
+                Some(OperatorRecoveryLatchRecord::Active(latch)) => {
+                    active_latch_is_coherent_with_admitted_connection(connection, *latch)?;
+                    LiveTerminalRecoveryHandoffProbe::Active
+                }
+                Some(OperatorRecoveryLatchRecord::Terminal(_)) => {
+                    LiveTerminalRecoveryHandoffProbe::TerminalNeedsSnapshot
+                }
+                None => unreachable!("absent sidecar returned before persistent identity"),
+            };
 
-        // Preserve the classifier's final descriptor/path/sidecar fence for
-        // both Clear and Active.  In particular, a sidecar which appears
-        // after the first absent read must fail closed rather than becoming a
-        // cached Clear observation.
-        if opc_sqlite_file_control_sys::main_file_has_moved(connection)
-            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
-        {
-            return Err(invalid_data("session operator recovery descriptor moved"));
-        }
-        let post_path_file = open_nofollow_read(database)?;
-        if !post_path_file.metadata()?.is_file()
-            || operator_recovery_file_incarnation(&post_path_file)? != incarnation
-        {
-            return Err(invalid_data(
-                "session operator recovery pathname changed during classification",
-            ));
-        }
-        #[cfg(all(test, target_os = "linux"))]
-        run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
-        match pinned_sidecar.as_mut() {
-            Some(sidecar) => revalidate_operator_recovery_latch_record_path(database, sidecar)?,
-            None => {
-                if read_operator_recovery_latch_record_pinned(database)?.is_some() {
-                    return Err(invalid_data(
-                        "session operator recovery latch appeared during classification",
-                    ));
+            // Preserve the classifier's final descriptor/path/sidecar fence for
+            // both Clear and Active.  In particular, a sidecar which appears
+            // after the first absent read must fail closed rather than becoming a
+            // cached Clear observation.
+            if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+                .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+            {
+                return Err(invalid_data("session operator recovery descriptor moved"));
+            }
+            revalidate_database_path_binding(database, database_file)?;
+            #[cfg(all(test, target_os = "linux"))]
+            run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(
+                database,
+            )?);
+            match pinned_sidecar.as_mut() {
+                Some(sidecar) => revalidate_operator_recovery_latch_record_path(database, sidecar)?,
+                None => {
+                    if read_operator_recovery_latch_record_pinned(database)?.is_some() {
+                        return Err(invalid_data(
+                            "session operator recovery latch appeared during classification",
+                        ));
+                    }
                 }
             }
-        }
-        revalidate_terminal_database_path_binding(database, connection, incarnation)?;
-        Ok(probe)
+            revalidate_terminal_database_path_binding(database, connection, incarnation)?;
+            Ok(probe)
+        })
+        .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1469,147 +1457,136 @@ pub(crate) fn classify_operator_recovery_latch_with_connection_and_admitted_snap
         {
             return Err(invalid_data("session operator recovery descriptor moved"));
         }
-        let database_file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
-            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?;
-        let mut terminal_handoff = None;
-        let mut consumed_terminal = None;
-        // Keep the sidecar descriptor through every semantic check below.
-        // It is only moved into a pending handoff after the final path fence.
-        let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
-        if pinned_sidecar.is_none() {
-            revalidate_absent_operator_recovery_latch(database, connection, &database_file)?;
-            return Ok(OperatorRecoveryLatchClassification {
-                latch: None,
-                terminal_handoff: None,
-                consumed_terminal: None,
-            });
-        }
-        let incarnation = operator_recovery_file_incarnation(&database_file)?;
-        let path_file = open_nofollow_read(database)?;
-        if !path_file.metadata()?.is_file()
-            || operator_recovery_file_incarnation(&path_file)? != incarnation
-        {
-            return Err(invalid_data(
-                "session operator recovery pathname does not match SQLite descriptor",
-            ));
-        }
-        let latch = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
-            Some(OperatorRecoveryLatchRecord::Active(latch)) => {
-                active_latch_is_coherent_with_connection(connection, *latch)?;
-                Some(*latch)
+        opc_sqlite_file_control_sys::with_main_file(connection, |database_file| {
+            let mut terminal_handoff = None;
+            let mut consumed_terminal = None;
+            // Keep the sidecar descriptor through every semantic check below.
+            // It is only moved into a pending handoff after the final path fence.
+            let mut pinned_sidecar = read_operator_recovery_latch_record_pinned(database)?;
+            if pinned_sidecar.is_none() {
+                revalidate_absent_operator_recovery_latch(database, connection, database_file)?;
+                return Ok(OperatorRecoveryLatchClassification {
+                    latch: None,
+                    terminal_handoff: None,
+                    consumed_terminal: None,
+                });
             }
-            Some(OperatorRecoveryLatchRecord::Terminal(terminal)) => {
-                let OperatorRecoveryTerminalRecord {
-                    latch,
-                    database: expected_incarnation,
-                    phase,
-                    snapshot,
-                } = terminal.as_ref().clone();
-                match phase {
-                    OperatorRecoveryTerminalPhase::PendingHandoff => {
-                        let snapshot_file = terminal_latch_is_coherent_with_connection(
-                            connection,
-                            &database_file,
-                            latch,
-                            expected_incarnation,
-                            snapshot.as_ref(),
-                            admitted_snapshot_file,
-                        )?;
-                        terminal_handoff = Some(OperatorRecoveryTerminalHandoff {
-                            latch,
-                            database: expected_incarnation,
-                            snapshot,
-                            snapshot_file,
-                            sidecar_file: None,
-                            sidecar_incarnation: None,
-                        });
-                        // Do not admit ordinary backend traffic between the
-                        // terminal proof and consensus initialization.  The
-                        // core consumes this exact descriptor and atomically
-                        // converts the sidecar to a database-only tombstone.
-                        Some(latch)
+            let incarnation = operator_recovery_file_incarnation(database_file)?;
+            revalidate_database_path_binding(database, database_file)?;
+            let latch = match pinned_sidecar.as_ref().map(|sidecar| &sidecar.record) {
+                Some(OperatorRecoveryLatchRecord::Active(latch)) => {
+                    active_latch_is_coherent_with_connection(connection, *latch)?;
+                    Some(*latch)
+                }
+                Some(OperatorRecoveryLatchRecord::Terminal(terminal)) => {
+                    let OperatorRecoveryTerminalRecord {
+                        latch,
+                        database: expected_incarnation,
+                        phase,
+                        snapshot,
+                    } = terminal.as_ref().clone();
+                    match phase {
+                        OperatorRecoveryTerminalPhase::PendingHandoff => {
+                            let snapshot_file = terminal_latch_is_coherent_with_connection(
+                                connection,
+                                database_file,
+                                latch,
+                                expected_incarnation,
+                                snapshot.as_ref(),
+                                admitted_snapshot_file,
+                            )?;
+                            terminal_handoff = Some(OperatorRecoveryTerminalHandoff {
+                                latch,
+                                database: expected_incarnation,
+                                snapshot,
+                                snapshot_file,
+                                sidecar_file: None,
+                                sidecar_incarnation: None,
+                            });
+                            // Do not admit ordinary backend traffic between the
+                            // terminal proof and consensus initialization.  The
+                            // core consumes this exact descriptor and atomically
+                            // converts the sidecar to a database-only tombstone.
+                            Some(latch)
+                        }
+                        OperatorRecoveryTerminalPhase::Consumed => {
+                            terminal_latch_database_is_coherent_with_connection(
+                                connection,
+                                database_file,
+                                latch,
+                                expected_incarnation,
+                            )?;
+                            // Do not collapse a proven consumed tombstone into
+                            // the same readiness result as an absent sidecar.
+                            // The exact pinned descriptor is retained after the
+                            // final path fence below for recovery-manager retry.
+                            consumed_terminal = Some((latch, expected_incarnation));
+                            None
+                        }
                     }
-                    OperatorRecoveryTerminalPhase::Consumed => {
-                        terminal_latch_database_is_coherent_with_connection(
-                            connection,
-                            &database_file,
-                            latch,
-                            expected_incarnation,
-                        )?;
-                        // Do not collapse a proven consumed tombstone into
-                        // the same readiness result as an absent sidecar.
-                        // The exact pinned descriptor is retained after the
-                        // final path fence below for recovery-manager retry.
-                        consumed_terminal = Some((latch, expected_incarnation));
-                        None
+                }
+                None => unreachable!("absent sidecar returned before persistent identity"),
+            };
+            // `main_file_has_moved` validates SQLite's VFS object and the fresh
+            // no-follow metadata validates the public pathname.  Both must
+            // remain exact through semantic inspection, not merely before it.
+            if opc_sqlite_file_control_sys::main_file_has_moved(connection)
+                .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
+            {
+                return Err(invalid_data("session operator recovery descriptor moved"));
+            }
+            revalidate_database_path_binding(database, database_file)?;
+            #[cfg(all(test, target_os = "linux"))]
+            run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(
+                database,
+            )?);
+            match pinned_sidecar.as_mut() {
+                Some(sidecar) => revalidate_operator_recovery_latch_record_path(database, sidecar)?,
+                None => {
+                    // A pristine database is ready only while the latch remains
+                    // absent.  Otherwise a concurrent recovery can create an
+                    // Active sidecar after the first read and have ordinary
+                    // startup incorrectly return ready.
+                    if read_operator_recovery_latch_record_pinned(database)?.is_some() {
+                        return Err(invalid_data(
+                            "session operator recovery latch appeared during classification",
+                        ));
                     }
                 }
             }
-            None => unreachable!("absent sidecar returned before persistent identity"),
-        };
-        // `main_file_has_moved` validates SQLite's VFS object and the fresh
-        // nofollow descriptor validates the public pathname.  Both must
-        // remain exact through semantic inspection, not merely before it.
-        if opc_sqlite_file_control_sys::main_file_has_moved(connection)
-            .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
-        {
-            return Err(invalid_data("session operator recovery descriptor moved"));
-        }
-        let post_path_file = open_nofollow_read(database)?;
-        if !post_path_file.metadata()?.is_file()
-            || operator_recovery_file_incarnation(&post_path_file)? != incarnation
-        {
-            return Err(invalid_data(
-                "session operator recovery pathname changed during classification",
-            ));
-        }
-        #[cfg(all(test, target_os = "linux"))]
-        run_latch_classify_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
-        match pinned_sidecar.as_mut() {
-            Some(sidecar) => revalidate_operator_recovery_latch_record_path(database, sidecar)?,
-            None => {
-                // A pristine database is ready only while the latch remains
-                // absent.  Otherwise a concurrent recovery can create an
-                // Active sidecar after the first read and have ordinary
-                // startup incorrectly return ready.
-                if read_operator_recovery_latch_record_pinned(database)?.is_some() {
-                    return Err(invalid_data(
-                        "session operator recovery latch appeared during classification",
-                    ));
-                }
+            // Sidecar evidence is now final, so take one last exact fence over
+            // the SQLite VFS descriptor and the public database name.  Without
+            // this, an absent or already-consumed sidecar could return ready for
+            // an unlinked SQLite object after the prior path check but before the
+            // final sidecar/absence check.
+            revalidate_terminal_database_path_binding(database, connection, incarnation)?;
+            if let Some(handoff) = terminal_handoff.as_mut() {
+                let sidecar = pinned_sidecar.take().ok_or_else(|| {
+                    invalid_data("session operator recovery terminal sidecar is unavailable")
+                })?;
+                handoff.sidecar_file = Some(sidecar.file);
+                handoff.sidecar_incarnation = Some(sidecar.incarnation);
             }
-        }
-        // Sidecar evidence is now final, so take one last exact fence over
-        // the SQLite VFS descriptor and the public database name.  Without
-        // this, an absent or already-consumed sidecar could return ready for
-        // an unlinked SQLite object after the prior path check but before the
-        // final sidecar/absence check.
-        revalidate_terminal_database_path_binding(database, connection, incarnation)?;
-        if let Some(handoff) = terminal_handoff.as_mut() {
-            let sidecar = pinned_sidecar.take().ok_or_else(|| {
-                invalid_data("session operator recovery terminal sidecar is unavailable")
-            })?;
-            handoff.sidecar_file = Some(sidecar.file);
-            handoff.sidecar_incarnation = Some(sidecar.incarnation);
-        }
-        let consumed_terminal = if let Some((latch, database)) = consumed_terminal {
-            let sidecar = pinned_sidecar.take().ok_or_else(|| {
-                invalid_data("session operator recovery consumed sidecar is unavailable")
-            })?;
-            Some(OperatorRecoveryConsumedTerminal {
-                _latch: latch,
-                _database: database,
-                _sidecar_file: sidecar.file,
-                _sidecar_incarnation: sidecar.incarnation,
+            let consumed_terminal = if let Some((latch, database)) = consumed_terminal {
+                let sidecar = pinned_sidecar.take().ok_or_else(|| {
+                    invalid_data("session operator recovery consumed sidecar is unavailable")
+                })?;
+                Some(OperatorRecoveryConsumedTerminal {
+                    _latch: latch,
+                    _database: database,
+                    _sidecar_file: sidecar.file,
+                    _sidecar_incarnation: sidecar.incarnation,
+                })
+            } else {
+                None
+            };
+            Ok(OperatorRecoveryLatchClassification {
+                latch,
+                terminal_handoff,
+                consumed_terminal,
             })
-        } else {
-            None
-        };
-        Ok(OperatorRecoveryLatchClassification {
-            latch,
-            terminal_handoff,
-            consumed_terminal,
         })
+        .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1757,14 +1734,7 @@ pub(crate) fn operator_recovery_latch_phase_sync(
     expected_snapshot: Option<Option<&OperatorRecoveryTerminalSnapshot>>,
 ) -> io::Result<OperatorRecoveryLatchPhase> {
     let database_incarnation = operator_recovery_file_incarnation(database_file)?;
-    let path_file = open_nofollow_read(database)?;
-    if !path_file.metadata()?.is_file()
-        || operator_recovery_file_incarnation(&path_file)? != database_incarnation
-    {
-        return Err(invalid_data(
-            "session operator recovery pathname does not match pinned database",
-        ));
-    }
+    revalidate_database_path_binding(database, database_file)?;
     let mut pinned = read_operator_recovery_latch_record_pinned(database)?
         .ok_or_else(|| invalid_data("session operator recovery latch is missing"))?;
     let phase = match &pinned.record {
@@ -1805,14 +1775,7 @@ pub(crate) fn operator_recovery_latch_phase_sync(
         }
     };
     revalidate_operator_recovery_latch_record_path(database, &mut pinned)?;
-    let post_path_file = open_nofollow_read(database)?;
-    if !post_path_file.metadata()?.is_file()
-        || operator_recovery_file_incarnation(&post_path_file)? != database_incarnation
-    {
-        return Err(invalid_data(
-            "session operator recovery pathname changed during classification",
-        ));
-    }
+    revalidate_database_path_binding(database, database_file)?;
     Ok(phase)
 }
 
@@ -2482,49 +2445,35 @@ pub(crate) fn terminalize_operator_recovery_latch_sync(
 
 /// Bind a terminal recovery transition to SQLite's exact live main file and
 /// to the public database name at the same instant.  The VFS descriptor is
-/// the writer authority; the no-follow path open prevents a recovery sidecar
+/// the writer authority; the no-follow metadata fence prevents a recovery sidecar
 /// transition from succeeding after an attacker has redirected the public
 /// database name to a different, even byte-identical, inode.
 fn revalidate_terminal_database_path_binding(
     database: &Path,
     connection: &Connection,
     expected: OperatorRecoveryFileIncarnation,
-) -> io::Result<File> {
-    if opc_sqlite_file_control_sys::main_file_has_moved(connection)
-        .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
-    {
-        return Err(invalid_data("session operator recovery descriptor moved"));
-    }
-    let database_file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
-        .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?;
-    if operator_recovery_file_incarnation(&database_file)? != expected {
-        return Err(invalid_data(
-            "session operator recovery terminal database does not match",
-        ));
-    }
-    let path_file = open_nofollow_read(database)?;
-    if operator_recovery_file_incarnation(&path_file)? != expected {
-        return Err(invalid_data(
-            "session operator recovery pathname does not match SQLite descriptor",
-        ));
-    }
-    Ok(database_file)
+) -> io::Result<()> {
+    opc_sqlite_file_control_sys::with_main_file(connection, |database_file| {
+        if operator_recovery_file_incarnation(database_file)? != expected {
+            return Err(invalid_data(
+                "session operator recovery terminal database does not match",
+            ));
+        }
+        revalidate_database_path_binding(database, database_file)
+    })
+    .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
 }
 
-/// Fence an ordinary, sidecar-free observation to the SQLite VFS descriptor.
-///
-/// This comparison is intentionally limited to one live process and must
-/// never be used for a durable recovery record: `(st_dev, st_ino)` alone can
-/// be reused after a crash. It is sufficient only after two no-follow reads
-/// have both proved that no recovery sidecar exists, because that state has no
-/// recovery artifact which could be replayed across a restart.
+/// Bind a public name to an inode that is still held open. This live fence
+/// cannot suffer inode reuse while the descriptor is held. Durable sidecar
+/// comparisons separately retain the filesystem UUID and opaque file handle;
+/// metadata alone is never accepted as persistent recovery identity.
 #[cfg(target_os = "linux")]
-fn revalidate_clear_database_path_binding(database: &Path, database_file: &File) -> io::Result<()> {
+fn revalidate_database_path_binding(database: &Path, database_file: &File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
     let descriptor_metadata = database_file.metadata()?;
-    let path_file = open_nofollow_read(database)?;
-    let path_metadata = path_file.metadata()?;
+    let path_metadata = std::fs::symlink_metadata(database)?;
     if !descriptor_metadata.is_file()
         || !path_metadata.is_file()
         || descriptor_metadata.dev() != path_metadata.dev()
@@ -2537,6 +2486,13 @@ fn revalidate_clear_database_path_binding(database: &Path, database_file: &File)
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn revalidate_database_path_binding(_database: &Path, _database_file: &File) -> io::Result<()> {
+    Err(invalid_data(
+        "session operator recovery descriptor binding is unsupported",
+    ))
+}
+
 /// Prove a fresh recovery observation without asking the filesystem for a
 /// crash-persistent file identity. Once a sidecar exists, callers take the
 /// persistent-identity path instead and failures remain fail-closed.
@@ -2547,7 +2503,7 @@ fn revalidate_absent_operator_recovery_latch(
     database_file: &File,
 ) -> io::Result<()> {
     ensure_absent_operator_recovery_latch_is_ready(connection)?;
-    revalidate_clear_database_path_binding(database, database_file)?;
+    revalidate_database_path_binding(database, database_file)?;
     if opc_sqlite_file_control_sys::main_file_has_moved(connection)
         .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
     {
@@ -2560,7 +2516,7 @@ fn revalidate_absent_operator_recovery_latch(
             "session operator recovery latch appeared during classification",
         ));
     }
-    revalidate_clear_database_path_binding(database, database_file)?;
+    revalidate_database_path_binding(database, database_file)?;
     if opc_sqlite_file_control_sys::main_file_has_moved(connection)
         .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
     {
@@ -2581,59 +2537,60 @@ pub(crate) fn consume_operator_recovery_terminal_handoff_sync(
     handoff: &OperatorRecoveryTerminalHandoff,
     admitted_snapshot_file: Option<&File>,
 ) -> io::Result<()> {
-    let database_file =
+    opc_sqlite_file_control_sys::with_main_file(connection, |database_file| {
         revalidate_terminal_database_path_binding(database, connection, handoff.database)?;
-    let sidecar_file = handoff
-        .sidecar_file
-        .as_ref()
-        .ok_or_else(|| invalid_data("session operator recovery terminal sidecar is unavailable"))?;
-    let sidecar_incarnation = handoff
-        .sidecar_incarnation
-        .ok_or_else(|| invalid_data("session operator recovery terminal sidecar is unavailable"))?;
-    let expected_record = OperatorRecoveryLatchRecord::terminal(
-        handoff.latch,
-        handoff.database,
-        OperatorRecoveryTerminalPhase::PendingHandoff,
-        handoff.snapshot.clone(),
-    );
-    let mut pinned_sidecar = PinnedOperatorRecoveryLatchRecord {
-        record: expected_record,
-        file: sidecar_file.try_clone()?,
-        incarnation: sidecar_incarnation,
-    };
-    terminal_latch_is_coherent_with_connection(
-        connection,
-        &database_file,
-        handoff.latch,
-        handoff.database,
-        handoff.snapshot.as_ref(),
-        admitted_snapshot_file,
-    )?;
-    #[cfg(test)]
-    run_latch_consume_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
-    // The handoff's original sidecar descriptor and the public sidecar name
-    // must still be the one classified above immediately before atomic
-    // replacement.  A byte-identical substitute has a distinct persistent
-    // handle and therefore cannot be consumed as this recovery terminal.
-    revalidate_operator_recovery_latch_record_path(database, &mut pinned_sidecar)?;
-    revalidate_terminal_database_path_binding(database, connection, handoff.database)?;
-    replace_latch_file_from_pinned(
-        database,
-        &mut pinned_sidecar,
-        OperatorRecoveryLatchRecord::terminal(
+        let sidecar_file = handoff.sidecar_file.as_ref().ok_or_else(|| {
+            invalid_data("session operator recovery terminal sidecar is unavailable")
+        })?;
+        let sidecar_incarnation = handoff.sidecar_incarnation.ok_or_else(|| {
+            invalid_data("session operator recovery terminal sidecar is unavailable")
+        })?;
+        let expected_record = OperatorRecoveryLatchRecord::terminal(
             handoff.latch,
             handoff.database,
-            OperatorRecoveryTerminalPhase::Consumed,
-            None,
-        ),
-    )?;
-    // The sidecar replacement includes a directory fsync.  Recheck after
-    // that irreversible publication boundary as well: a public database
-    // substitution during the sidecar transition must leave the live VFS
-    // connection fenced rather than returning a ready core for an unlinked
-    // old database.
-    revalidate_terminal_database_path_binding(database, connection, handoff.database)?;
-    Ok(())
+            OperatorRecoveryTerminalPhase::PendingHandoff,
+            handoff.snapshot.clone(),
+        );
+        let mut pinned_sidecar = PinnedOperatorRecoveryLatchRecord {
+            record: expected_record,
+            file: sidecar_file.try_clone()?,
+            incarnation: sidecar_incarnation,
+        };
+        terminal_latch_is_coherent_with_connection(
+            connection,
+            database_file,
+            handoff.latch,
+            handoff.database,
+            handoff.snapshot.as_ref(),
+            admitted_snapshot_file,
+        )?;
+        #[cfg(test)]
+        run_latch_consume_before_final_revalidation_hook(&operator_recovery_latch_path(database)?);
+        // The handoff's original sidecar descriptor and the public sidecar name
+        // must still be the one classified above immediately before atomic
+        // replacement.  A byte-identical substitute has a distinct persistent
+        // handle and therefore cannot be consumed as this recovery terminal.
+        revalidate_operator_recovery_latch_record_path(database, &mut pinned_sidecar)?;
+        revalidate_terminal_database_path_binding(database, connection, handoff.database)?;
+        replace_latch_file_from_pinned(
+            database,
+            &mut pinned_sidecar,
+            OperatorRecoveryLatchRecord::terminal(
+                handoff.latch,
+                handoff.database,
+                OperatorRecoveryTerminalPhase::Consumed,
+                None,
+            ),
+        )?;
+        // The sidecar replacement includes a directory fsync.  Recheck after
+        // that irreversible publication boundary as well: a public database
+        // substitution during the sidecar transition must leave the live VFS
+        // connection fenced rather than returning a ready core for an unlinked
+        // old database.
+        revalidate_terminal_database_path_binding(database, connection, handoff.database)?;
+        Ok(())
+    })
+    .map_err(|_| invalid_data("session operator recovery descriptor is unavailable"))?
 }
 
 pub(crate) type ConsensusAppliedMembership = (
@@ -5621,11 +5578,10 @@ fn pin_live_database_file(
     connection: &Connection,
     path: &Path,
 ) -> io::Result<crate::consensus::snapshot::PinnedSqliteFile> {
-    let file = opc_sqlite_file_control_sys::main_file_descriptor(connection)
-        .map_err(|_| invalid_data("SQLite main file descriptor is unavailable"))?;
+    let file = crate::consensus::snapshot::SqliteFilePin::from_connection(connection)?;
     // The canonical path is only the reader's WAL lookup hint. The live
     // descriptor remains authoritative throughout core and reader lifetime.
-    crate::consensus::snapshot::PinnedSqliteFile::from_file(file, std::fs::canonicalize(path)?)
+    crate::consensus::snapshot::PinnedSqliteFile::from_pin(file, std::fs::canonicalize(path)?)
 }
 
 /// Shared persistence resources used by the log store, state machine, and
@@ -35743,12 +35699,8 @@ fn verify_attached_snapshot_descriptor(
     database: &str,
 ) -> io::Result<()> {
     pinned.verify_identity()?;
-    let actual = crate::consensus::snapshot::PinnedSqliteFile::from_file(
-        opc_sqlite_file_control_sys::database_file_descriptor(connection, database)
-            .map_err(|_| invalid_data("SQLite attached snapshot descriptor is unavailable"))?,
-        pinned.path().to_path_buf(),
-    )?;
-    if actual.identity() != pinned.identity() {
+    let actual = crate::consensus::snapshot::FileIdentity::for_database(connection, database)?;
+    if actual != pinned.identity() {
         return Err(invalid_data(
             "SQLite opened a different attached snapshot descriptor",
         ));
