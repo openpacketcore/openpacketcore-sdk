@@ -1,5 +1,14 @@
 mod management_audit_authority;
 
+#[path = "../../opc-session-store/tests/support/formation_clock.rs"]
+mod formation_clock;
+
+#[path = "consensus_openraft/fixture_formation.rs"]
+mod fixture_formation;
+
+#[path = "consensus_openraft/diagnostics.rs"]
+mod diagnostics;
+
 #[path = "consensus_openraft/quorum_admission.rs"]
 mod quorum_admission;
 
@@ -78,6 +87,8 @@ struct LoopbackPeer {
     drop_forward_responses: Arc<AtomicUsize>,
     stall_forward_mutation: Arc<AtomicBool>,
     stall_read_barrier: Arc<AtomicBool>,
+    stall_read_proof: Arc<AtomicBool>,
+    read_barrier_stalled: Arc<tokio::sync::Notify>,
     pause_forward_response: Arc<AtomicBool>,
     forward_response_ready: Arc<tokio::sync::Notify>,
     release_forward_response: Arc<tokio::sync::Notify>,
@@ -99,6 +110,8 @@ impl LoopbackPeer {
             drop_forward_responses: Arc::new(AtomicUsize::new(0)),
             stall_forward_mutation: Arc::new(AtomicBool::new(false)),
             stall_read_barrier: Arc::new(AtomicBool::new(false)),
+            stall_read_proof: Arc::new(AtomicBool::new(false)),
+            read_barrier_stalled: Arc::new(tokio::sync::Notify::new()),
             pause_forward_response: Arc::new(AtomicBool::new(false)),
             forward_response_ready: Arc::new(tokio::sync::Notify::new()),
             release_forward_response: Arc::new(tokio::sync::Notify::new()),
@@ -187,10 +200,17 @@ impl ConsensusPeer for LoopbackPeer {
             ConsensusRpcFamily::ForwardMutation => {
                 self.stall_forward_mutation.load(Ordering::SeqCst)
             }
-            ConsensusRpcFamily::ReadBarrier => self.stall_read_barrier.load(Ordering::SeqCst),
+            ConsensusRpcFamily::ReadBarrier => {
+                self.stall_read_barrier.load(Ordering::SeqCst)
+                    || (self.stall_read_proof.load(Ordering::SeqCst)
+                        && diagnostics::is_read_proof(&request))
+            }
             _ => false,
         };
         if stalled {
+            if request.family == ConsensusRpcFamily::ReadBarrier {
+                self.read_barrier_stalled.notify_one();
+            }
             std::future::pending::<()>().await;
             unreachable!("stalled consensus peer resumed");
         }
@@ -354,11 +374,7 @@ struct ThreeNodeCluster {
 impl ThreeNodeCluster {
     async fn start() -> Self {
         let cluster = Self::build([[0x55; 32]; 3]).await;
-        let (one, two, three) = tokio::join!(
-            cluster.stores[0].initialize_cluster(),
-            cluster.stores[1].initialize_cluster(),
-            cluster.stores[2].initialize_cluster(),
-        );
+        let (one, two, three) = fixture_formation::initialize(cluster.stores.clone()).await;
         one.expect("initialize node one");
         two.expect("initialize node two");
         three.expect("initialize node three");

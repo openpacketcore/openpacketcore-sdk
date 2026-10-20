@@ -400,6 +400,13 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   durable page before emission.
 - `dangerous-test-hooks` exposes fault injection only for explicitly gated
   test profiles. It is not a production feature.
+- `test-control` enables observation-only stderr diagnostics for rejected
+  configuration-cluster initialization and planned-shutdown preparation. Each
+  diagnostic reports its last stage, elapsed protocol and wall time, the actual
+  deadline and metrics snapshot. Shutdown diagnostics also retain the selected
+  successor vote and attempted read proof when preparation times out. These
+  diagnostics are also compiled into unit tests; default production builds
+  perform no diagnostic bookkeeping or output.
 
 ## Relationships
 

@@ -47,6 +47,7 @@ opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 [features]
 default = []
 dangerous-test-hooks = []
+test-control = []
 
 [lints]
 workspace = true

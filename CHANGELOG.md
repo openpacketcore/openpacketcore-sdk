@@ -824,6 +824,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: isolate initial formation in functional consensus fixtures from
+  scheduling pauses using the existing controlled clock, preserving engine
+  runtimes, operation bounds and authority checks. Keep explicit initialization
+  deadline controls on real time. Add opt-in `test-control` diagnostics for
+  initialization rejection and planned-shutdown fallback stages, deadlines,
+  successor votes and read-proof results; production behavior is unchanged.
+
 - `opc-persist`: keep SQLite worker admission, initialization, progress and
   commit checks on the caller's Tokio clock. Paused time no longer spends a
   fresh operation's budget, and advancing time expires the worker's deadline
