@@ -63,6 +63,9 @@ async fn voter_anchor_busy_remains_retryable_through_signer_preflight_and_seed()
     let seed = seed(&signer);
     backend.voter_signer = Some(signer.clone());
     backend.voter_seed = Some(Arc::new(seed.clone()));
+    // Close the idle WAL readers before selecting rollback-journal locking
+    // for this real SQLITE_BUSY read. No consensus service is running here.
+    backend.consensus_acceptance_reader_pool = None;
     {
         let conn = backend.conn.lock().await;
         conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
@@ -74,6 +77,7 @@ async fn voter_anchor_busy_remains_retryable_through_signer_preflight_and_seed()
         .voter_identity_signer(installation(), &member(&signer))
         .await
         .map(|_| ());
+    let binding = backend.voter_identity_binding().await.map(|_| ());
     let preflight = backend.voter_profile_preflight().await.map(|_| ());
     let seed_result = {
         let conn = backend.conn.lock().await;
@@ -81,8 +85,9 @@ async fn voter_anchor_busy_remains_retryable_through_signer_preflight_and_seed()
     };
     blocker.execute_batch("ROLLBACK").unwrap();
     assert_eq!(
-        (reopened, preflight, seed_result),
+        (reopened, binding, preflight, seed_result),
         (
+            Err(ConsensusSessionStoreOpenError::StorageUnavailable),
             Err(ConsensusSessionStoreOpenError::StorageUnavailable),
             Err(SessionConsensusStorageError::BackendUnavailable),
             Err(SessionConsensusStorageError::BackendUnavailable),
@@ -100,6 +105,40 @@ async fn voter_anchor_busy_remains_retryable_through_signer_preflight_and_seed()
     assert!(backend.voter_profile_preflight().await.is_ok());
     let conn = backend.conn.lock().await;
     assert!(require_seed_enrollment(&conn, &seed, false).is_ok());
+}
+
+#[tokio::test]
+async fn voter_public_binding_refuses_missing_or_malformed_anchor_without_key_changes() {
+    for damage in [
+        "DROP TABLE consensus_voter_anchor",
+        "DELETE FROM consensus_voter_anchor",
+        "ALTER TABLE consensus_voter_anchor RENAME COLUMN key_digest TO lost_digest",
+        "PRAGMA ignore_check_constraints = ON; UPDATE consensus_voter_anchor SET format = 2",
+        "PRAGMA ignore_check_constraints = ON; UPDATE consensus_voter_anchor SET incarnation = 0",
+        "PRAGMA ignore_check_constraints = ON; UPDATE consensus_voter_anchor SET key_digest = 'invalid'",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("voter.sqlite");
+        let backend = SqliteSessionBackend::open(&path).unwrap();
+        let signer = backend
+            .enroll_voter_identity(installation(), identity())
+            .await
+            .unwrap();
+        let before = Zeroizing::new(std::fs::read(key_path(&path)).unwrap());
+        backend.conn.lock().await.execute_batch(damage).unwrap();
+        assert_eq!(
+            backend.voter_identity_binding().await,
+            Err(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired),
+            "invalid public anchor: {damage}"
+        );
+        assert!(matches!(
+            backend
+                .voter_identity_signer(installation(), &member(&signer))
+                .await,
+            Err(ConsensusSessionStoreOpenError::VoterIdentityReplacementRequired)
+        ));
+        assert!(std::fs::read(key_path(&path)).unwrap() == *before);
+    }
 }
 
 #[test]
