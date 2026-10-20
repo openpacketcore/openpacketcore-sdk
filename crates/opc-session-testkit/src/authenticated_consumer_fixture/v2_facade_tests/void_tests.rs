@@ -899,14 +899,15 @@ async fn consumer_void_settlement_window_recovers_unknown_then_records_no_effect
             .open_local_aead_v2(CountingProvider::new(), "void-settlement-window")
             .await
             .unwrap();
+        let deadline = soon();
         let mut recovered = recovered_v2(
             reopened
-                .recover_fenced_transition_status(request_id(935), budget(soon()))
+                .recover_fenced_transition_status(request_id(935), budget(deadline))
                 .await
                 .unwrap(),
         );
         assert_eq!(
-            recovered.status_once(soon()).await,
+            recovered.status_once(deadline).await,
             Ok(FencedTransitionV2Status::NotFound)
         );
         assert_eq!(
@@ -914,17 +915,18 @@ async fn consumer_void_settlement_window_recovers_unknown_then_records_no_effect
             Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved)
         );
         assert_eq!(reopened.retained_fenced_transitions().await.unwrap(), 1);
-        let progress = drain_void_rows(&reopened, 8, soon(), |_| {}).await;
+        let progress = drain_void_rows(&reopened, 8, deadline, |_| {}).await;
         assert_eq!(progress.voided(), 1, "{progress:?}");
         assert_eq!(progress.reclaimed(), 1, "{progress:?}");
         assert!(matches!(
-            recovered.status_until_terminal(soon()).await,
+            recovered.status_until_terminal(deadline).await,
             Ok(FencedTransitionV2Status::Recorded(result))
                 if matches!(*result, Err(StoreError::FencedTransitionVoided))
         ));
         recovered.release_resolved().await.unwrap();
         assert_eq!(reopened.retained_fenced_transitions().await.unwrap(), 0);
         assert_eq!(fixture.diagnostics().fenced_transition_v2_calls(), 0);
+        assert!(tokio::time::Instant::now() < deadline);
     })
     .catch_unwind()
     .await;
