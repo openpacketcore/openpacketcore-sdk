@@ -2909,15 +2909,21 @@ mod tests {
             calls: AtomicUsize::new(0),
             dispatched: Notify::new(),
         });
+        let grant = opc_session_store::SessionConsumerAuthorizationGrant::try_new(
+            client_identity,
+            [opc_session_store::SessionConsumerTenantNfScope::new(
+                tenant(),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .expect("tenant/NF grant");
+        let manifest = test_consumer_roster()
+            .authorization_manifest(test_consumer_voter_authority().node_id(), [grant])
+            .expect("consumer manifest");
         let (server, address) = SessionQuorumConsumerServer::new(
             service.clone(),
             material.trusted_server_config(server_identity.as_str()),
-            SessionConsumerAuthorizer::from_authoritative_members(
-                scope,
-                [client_identity],
-                std::iter::empty(),
-            )
-            .expect("authorizer"),
+            SessionConsumerAuthorizer::try_new(manifest).expect("authorizer"),
         )
         .listen("127.0.0.1:0".parse().expect("loopback address"))
         .await
@@ -2971,11 +2977,14 @@ mod tests {
             server.abort_and_wait().await;
             result
         } else {
-            let (result, ()) = tokio::join!(handle.execute_once(), async {
-                service.dispatched.notified().await;
-                server.abort_and_wait().await;
-            });
-            result
+            let execute = handle.execute_once();
+            tokio::pin!(execute);
+            tokio::select! {
+                result = &mut execute => panic!("the transport fixture returned before dispatch: {result:?}"),
+                _ = service.dispatched.notified() => {}
+            }
+            server.abort_and_wait().await;
+            execute.await
         };
         assert_eq!(service.calls.load(Ordering::SeqCst), 1);
         if refuse {
