@@ -94,6 +94,10 @@ cold checkout. The guard compiles offline; its rustix fixture also uses
 lockfile keeps the workspace's rustix version and transitive dependency
 versions and checksums. The guard checks that they still match the workspace,
 so update the fixture lockfile alongside changes to those workspace pins.
+After a Dependabot bump and `cargo fetch --locked`, recreate the guard's temporary
+rustix fixture with its manifest and source, seed it with the workspace
+`Cargo.lock`, run `cargo metadata --offline --format-version 1` there, and copy
+the pruned lockfile back to `ci/fixtures/clippy-fd-guard/Cargo.lock`.
 
 The `nix::unistd::dup` entry intentionally keeps Clippy's unreachable-function
 warning when nix is built without `fs`. That build cannot call `dup`; keeping
