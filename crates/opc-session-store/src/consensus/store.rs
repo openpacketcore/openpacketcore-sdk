@@ -16961,6 +16961,57 @@ mod membership_tests {
         crate::formation_clock::run(async move { store.initialize_cluster().await }).await
     }
 
+    async fn register_fixture_watch(
+        store: &ConsensusSessionStore,
+        start_sequence: u64,
+    ) -> Result<BoxStream<'static, Result<ReplicationEntry, StoreError>>, StoreError> {
+        struct RegistrationClock {
+            _release: std::sync::mpsc::Sender<()>,
+        }
+
+        impl Drop for RegistrationClock {
+            fn drop(&mut self) {
+                tokio::time::resume();
+            }
+        }
+
+        // The logical-read supervisor belongs to the store's runtime, so this
+        // functional setup must freeze that same current-thread runtime. The
+        // public watch still runs once with its original operation timeout.
+        // As in formation_clock, a blocking watchdog inhibits automatic clock
+        // advance and bounds real I/O independently of protocol time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let mut watchdog = tokio::task::spawn_blocking(move || {
+            held.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        });
+        tokio::time::pause();
+        let clock = RegistrationClock { _release: release };
+        let result = tokio::select! {
+            biased;
+            result = store.watch(start_sequence) => Some(result),
+            expired = &mut watchdog => {
+                let _ = expired.expect("watch registration wall-clock watchdog");
+                None
+            }
+        };
+        // Resume the caller's ordinary timing phase without leaving its clock
+        // behind std::Instant, which SQLite also uses for bounded work.
+        tokio::time::advance(
+            std::time::Instant::now()
+                .saturating_duration_since(tokio::time::Instant::now().into_std()),
+        )
+        .await;
+        drop(clock);
+        match result {
+            Some(result) => {
+                let _ = watchdog.await.expect("retire watch registration watchdog");
+                result
+            }
+            None => panic!("watch registration wall-clock watchdog expired"),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn fixture_formation_preserves_the_original_initialization_deadline() {
@@ -26786,7 +26837,9 @@ mod membership_tests {
         initialize_fixture(&store)
             .await
             .expect("initialize V2 reply-loss store");
-        let mut watch = store.watch(1).await.expect("register applied watch");
+        let mut watch = register_fixture_watch(&store, 1)
+            .await
+            .expect("register applied watch");
         let request = v2_create_request_for_supervision().await;
         let altered = v2_request_with_same_id_different_body(&request);
 
@@ -26945,6 +26998,113 @@ mod membership_tests {
             Ok(FencedTransitionV2Status::RequestConflict),
             "the same full V2 ID with a different body is a conflict"
         );
+    }
+
+    #[tokio::test]
+    async fn fixture_watch_registration_waits_for_apply_without_spending_protocol_time() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("watch readiness directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("watch readiness backend");
+        let apply_gate = Arc::clone(&backend.consensus_apply_gate);
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("open watch readiness store");
+        initialize_fixture(&store)
+            .await
+            .expect("form watch readiness store");
+        let held_apply = apply_gate.acquire_owned().await.expect("hold watch apply");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let registering = register_fixture_watch(&store, 1);
+        tokio::pin!(registering);
+        tokio::select! {
+            biased;
+            _ = &mut registering => panic!("watch cannot register before its logical-time apply"),
+            () = wait_for_log_index_after(&store, before, "watch registration proposal") => {}
+        }
+        // Model a scheduling/I/O delay after the real proposal was accepted,
+        // without consuming any of its original 150ms of protocol time.
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(151)))
+            .await
+            .expect("delayed watch apply task");
+        if let Some(result) = registering.as_mut().now_or_never() {
+            assert!(result.is_ok(), "watch setup expired: {:?}", result.err());
+            panic!("watch cannot register while its real apply is held");
+        }
+        assert_eq!(store.inner.operation_timeout, Duration::from_millis(150));
+        drop(held_apply);
+        let mut watch = registering.await.expect("register the real applied watch");
+        assert!(watch.next().now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn fixture_watch_registration_preserves_the_original_deadline() {
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("watch deadline directory");
+        let backend = SqliteSessionBackend::open(directory.path().join("store.sqlite"))
+            .expect("watch deadline backend");
+        let apply_gate = Arc::clone(&backend.consensus_apply_gate);
+        let store = ConsensusSessionStore::open_with_clock(
+            singleton_topology(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Arc::new(SystemClock),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("open watch deadline store");
+        initialize_fixture(&store)
+            .await
+            .expect("form watch deadline store");
+        let held_apply = apply_gate.acquire_owned().await.expect("hold watch apply");
+        let before = store
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .unwrap_or(0);
+        let registering = register_fixture_watch(&store, 1);
+        tokio::pin!(registering);
+        tokio::select! {
+            biased;
+            _ = &mut registering => panic!("watch cannot register before its logical-time apply"),
+            () = wait_for_log_index_after(&store, before, "watch deadline proposal") => {}
+        }
+        let started = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(149)).await;
+        assert!(registering.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(150));
+        // Deliver Tokio's rounded-up timer tick after the unchanged deadline.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(registering.await.err(), Some(consensus_unavailable()));
+        drop(held_apply);
+        let permits = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&store.inner.proposal_admission).acquire_many_owned(
+                u32::try_from(SCOPE_PROPOSAL_ADMISSION_TOTAL_SLOTS)
+                    .expect("proposal slot count fits u32"),
+            ),
+        )
+        .await
+        .expect("watch proposal releases admission after apply")
+        .expect("proposal admission remains open");
+        drop(permits);
     }
 
     #[tokio::test]
