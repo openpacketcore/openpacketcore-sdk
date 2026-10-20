@@ -828,6 +828,22 @@ reply to a transition or batch with the exact correlation, attempt nonce and
 request commitment, proving that the voter refused before dispatch. Void
 operations retain their typed, identity-bearing reply requirement. This
 received refusal does not restart the transport's connection retry loop.
+The V2 prepared handle may advance to the next canonical voter with the
+identical request ID and body, at most once per voter. That exact request is
+idempotent at the quorum and cannot have an additional effect. This differs
+from the V1 prepared handle's terminal refusal rule above.
+
+The server now sends this correlated transition or batch refusal where it
+previously closed the connection because its response validator rejected the
+generic reply. A service may refuse only before submitting its own consensus
+intent; a batch refusal requires that no item was submitted. After a possible
+submission, timeout or other uncertainty must retain the typed unknown result.
+The wire revision and serialized shapes are unchanged. An older client rejects
+this reply as an invalid completion and returns `OutcomeUnknown` (or
+`OutcomeUnknownBatch`); a newer client talking to an older server also returns
+unknown when that server closes the connection. Both combinations retain
+status recovery conservatively.
+
 Partial replies, transport loss,
 uncorrelated replies and results from a voter that may have proposed remain
 unknown for effectful calls. `ReadUnavailable` means a post-write read failed

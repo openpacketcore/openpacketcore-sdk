@@ -329,8 +329,9 @@ struct PreparedFencedTransitionV2Route {
     status_cursor: AtomicUsize,
     attempt_deadline: StdMutex<Option<tokio::time::Instant>>,
     // Set immediately before the adapter enters a physical V2 mutation call
-    // and cleared only by that call's authoritative pre-write
-    // classification. A handle cancelled while this is set may have sent.
+    // and cleared only by that call's authoritative no-dispatch classification,
+    // including a complete, correlated pre-dispatch refusal. A handle cancelled
+    // while this is set may have sent.
     dispatch_admitted: AtomicBool,
 }
 
