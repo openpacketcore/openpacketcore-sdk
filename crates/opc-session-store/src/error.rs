@@ -242,6 +242,15 @@ pub enum StoreError {
     /// business effect. This is nonterminal and uses the same durable binding.
     #[error("fenced transition is deferred by a live lease")]
     FencedTransitionLeaseDeferred,
+    /// The local protected V2 recovery journal could not authenticate or
+    /// access its state. This is distinct from a remote voter refusal and
+    /// from a journal held by another live owner. It does not prove that a
+    /// request was unsent: callers must still inspect the retained identity
+    /// under the journal's ordered admission before retrying preparation.
+    ///
+    /// Append-only to preserve every existing serialized discriminant.
+    #[error("backend unavailable: protected fenced-transition V2 recovery journal unavailable")]
+    FencedTransitionRecoveryJournalUnavailable,
 }
 
 /// Error type for lease operations.
@@ -550,6 +559,7 @@ mod tests {
         for appended in [
             StoreError::FencedTransitionStorageExhausted,
             StoreError::SessionRecordReserved,
+            StoreError::FencedTransitionRecoveryJournalUnavailable,
         ] {
             let encoded = opc_consensus::encode_bounded(&appended)
                 .expect("appended StoreError postcard encoding");
@@ -570,6 +580,27 @@ mod tests {
             "session record is reserved by a protected roster"
         );
         assert_eq!(format!("{error:?}"), "SessionRecordReserved");
+    }
+
+    #[test]
+    fn local_recovery_journal_unavailability_is_typed_and_not_a_wire_authority() {
+        let error = StoreError::FencedTransitionRecoveryJournalUnavailable;
+        assert_eq!(
+            format!("{error:?}"),
+            "FencedTransitionRecoveryJournalUnavailable"
+        );
+        assert_ne!(
+            error,
+            StoreError::BackendUnavailable(
+                "protected fenced-transition V2 recovery journal unavailable".into()
+            ),
+            "the local recovery condition must not match arbitrary remote error text"
+        );
+        assert_eq!(
+            crate::SessionConsumerStoreError::from(error),
+            crate::SessionConsumerStoreError::Unavailable,
+            "the frozen wire error family cannot grant local journal authority"
+        );
     }
 
     #[test]

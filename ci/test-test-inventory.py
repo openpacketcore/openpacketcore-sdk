@@ -1081,6 +1081,33 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
 
 class DeclarationTests(unittest.TestCase):
+    def test_clock_conversion_is_printed_without_waiving_assertion_loss(self):
+        old = rust('assert!(ready()); assert_eq!(value(), 1);')
+        new = declare(rust('controlled_clock(); assert!(ready());'), kind='clock-source-changed')
+        result = report(old, new)
+        self.assertFalse(result.success)
+        self.assertTrue(any(f.kind == 'clock-source-changed' and f.allowed for f in result.findings))
+        self.assertTrue(any(f.kind == 'assertions-decreased' and not f.allowed for f in result.findings))
+
+    def test_clock_conversion_requires_changed_source_and_existing_test(self):
+        self.assertFalse(report(rust(), declare(rust(), kind='clock-source-changed')).success)
+        missing = declare({'Cargo.toml': MANIFEST, 'src/lib.rs': ''}, kind='clock-source-changed')
+        self.assertFalse(report(rust(), missing).success)
+        changed = declare(rust('controlled_clock(); assert_eq!(value(), 1);'), kind='clock-source-changed')
+        self.assertTrue(report(rust(), changed).success)
+        self.assertTrue(report({'Cargo.toml': MANIFEST, 'src/lib.rs': ''}, changed).success)
+
+    def test_clock_conversion_cannot_declare_job_or_reduction_fields(self):
+        for extra in ({'renamed_to': TEST}, {'replacements': [TEST]}, {'behavior_deleted': True, 'deleting_change': 'change'}):
+            with self.subTest(extra=extra), self.assertRaises(GuardError):
+                report(rust(), declare(rust(), kind='clock-source-changed', **extra))
+        head = declare(rust(), kind='clock-source-changed')
+        record = json.loads(head['ci/test-changes.json'])
+        record['changes'][0]['job'] = record['changes'][0].pop('test')
+        head['ci/test-changes.json'] = json.dumps(record)
+        with self.assertRaises(GuardError):
+            report(rust(), head)
+
     def test_declared_removal_is_still_printable(self):
         result = report(rust(), declare({'Cargo.toml': MANIFEST, 'src/lib.rs': ''},
                         behavior_deleted=True, deleting_change='This PR removes the legacy behavior.',

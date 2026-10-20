@@ -370,7 +370,8 @@ impl OwnedSessionMutationError {
         match error {
             StoreError::LeaseExpired | StoreError::TopologyAuthorityRevoked => Self::LeaseLost,
             StoreError::StaleFence => Self::StaleFence,
-            StoreError::BackendUnavailable(_) => Self::BackendUnavailable,
+            StoreError::BackendUnavailable(_)
+            | StoreError::FencedTransitionRecoveryJournalUnavailable => Self::BackendUnavailable,
             StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge { actual, max },
             StoreError::InvalidKey(_) => Self::InvalidRecord("backend rejected record shape"),
             StoreError::InvalidReplicationSequence => Self::StoreRejected {
