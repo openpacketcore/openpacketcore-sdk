@@ -131,6 +131,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-net`: expose
+  `PersistentSessionConsumerClient::lease_mutation_status_with_budget` for
+  ordinary acquire, renew and release receipt recovery within an existing
+  checkpoint deadline. The method preserves exact request identity, ordinary
+  error mapping, pre-write caps and the shared extended-read capacity reserve.
+  It rejects newly observed success at expiry and spends the remaining deadline
+  after possible transmission, without replaying the lease mutation.
+
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
   Live predecessor-lease contention retains one nonterminal binding with a
