@@ -1964,7 +1964,7 @@ fn dedicated_ke_response_build_enforces_group_width() {
 }
 
 #[test]
-fn dedicated_ke_request_decode_enforces_group_width() {
+fn dedicated_ke_request_selection_enforces_group_width() {
     // Received requests defer the width check until the offered group is selected.
     // Retain every malformed width at that boundary rather than rejecting a guess.
     for (group, width) in CREATE_KE_WIDTHS {

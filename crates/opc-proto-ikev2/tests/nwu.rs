@@ -1098,7 +1098,7 @@ fn nwu_ke_request_build_enforces_group_width() {
 }
 
 #[test]
-fn nwu_ke_request_decode_enforces_group_width() {
+fn nwu_ke_request_selection_enforces_group_width() {
     // Compare groups during selection before interpreting the received value.
     for (group, width) in NWU_KE_WIDTHS {
         let (first, bytes) = must(encode_payloads(&must(

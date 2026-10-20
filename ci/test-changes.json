@@ -340,6 +340,20 @@
       "kind": "assertions-decreased",
       "reason": "Remove the redundant admitted assertion after the bounded receipt loop already requires that same captured status to be admitted before it can exit. A missing admission still fails within the original 30-second bound, now naming the last store, receipt and status. Exact receipt-index, leader and readiness assertions remain; no timeout, poll interval or production behavior changes.",
       "issue": 1407
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::test=dedicated_bearer::dedicated_ke_request_decode_enforces_group_width",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::test=dedicated_bearer::dedicated_ke_request_selection_enforces_group_width",
+      "reason": "Rename the request-width test to reflect that Child SA selection enforces the KE group width after decoding. The test body and every assertion are unchanged.",
+      "issue": 476
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::test=nwu::nwu_ke_request_decode_enforces_group_width",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::test=nwu::nwu_ke_request_selection_enforces_group_width",
+      "reason": "Rename the request-width test to reflect that Child SA selection enforces the KE group width after decoding. The test body and every assertion are unchanged.",
+      "issue": 476
     }
   ]
 }
