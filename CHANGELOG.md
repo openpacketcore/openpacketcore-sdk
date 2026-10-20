@@ -820,6 +820,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: retain the whole recovery journal owner in queued
+  operations, keeping its admission lease until all predecessor descriptors
+  retire even when a cancelled worker fails before running its operation.
+
 - `opc-session-net`: preserve valid slow quorum replies until the caller's
   original deadline for protected history, expiry and receipt reads, including
   prepared CAS and lease receipts. Narrow budget-bearing GET, expiry-preflight
@@ -845,6 +849,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-store`: synchronize unit-test snapshot namespace reopen with
   child descriptor retirement, preventing inherited sockets from causing
   spurious `EADDRINUSE` while preserving live-owner exclusion checks.
+
 
 - `opc-session-store`: preserve SQLite's POSIX record locks while checking
   snapshot, checkpoint and recovery file identities, reopening databases,

@@ -233,9 +233,11 @@ impl FencedTransitionV2RecoveryJournal {
             notice: FencedTransitionV2RecoveryNotice(Arc::clone(&state)),
             _owner: Arc::clone(&self.inner),
         };
-        if let Some(ownership) = self.inner.ownership.clone() {
+        if self.inner.ownership.is_some() {
+            let owner = Arc::clone(&self.inner);
             let registered = Arc::clone(&state);
             self.with_connection(false, move |conn, key| {
+                let ownership = owner.ownership.as_ref().ok_or_else(recovery_unavailable)?;
                 let transaction = recovery_read_transaction(conn)?;
                 let (_, members) = verify_recovery_metadata_with_members(&transaction, key, None)?;
                 let live = members
@@ -296,7 +298,7 @@ impl FencedTransitionV2RecoveryJournal {
             notice: FencedTransitionV2RecoveryNotice(Arc::clone(&state)),
             _owner: Arc::clone(&self.inner),
         };
-        let ownership = self.inner.ownership.clone();
+        let owner = Arc::clone(&self.inner);
         self.with_connection(false, move |conn, key| {
             let transaction = recovery_read_transaction(conn)?;
             verify_recovery_metadata(&transaction, key, None)?;
@@ -305,7 +307,7 @@ impl FencedTransitionV2RecoveryJournal {
             }
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
             transaction.commit().map_err(|_| recovery_unavailable())?;
-            if let Some(ownership) = ownership {
+            if let Some(ownership) = owner.ownership.as_ref() {
                 let mut lifetimes = ownership
                     .lifetimes
                     .lock()

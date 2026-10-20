@@ -186,7 +186,9 @@ struct RecoveryJournalInner {
     before_worker_lock: Option<Arc<dyn Fn() + Send + Sync>>,
     // Retire every main-file descriptor before releasing the admission lease:
     // a successor may acquire SQLite locks as soon as path_guard is dropped.
-    ownership: Option<Arc<RecoveryOwnership>>,
+    // Operations retain the whole Arc<RecoveryJournalInner>; no ownership
+    // descriptor can survive this ordered destruction independently.
+    ownership: Option<RecoveryOwnership>,
     #[cfg(unix)]
     path_guard: SecureJournalPathGuard,
 }
@@ -462,10 +464,10 @@ impl FencedTransitionV2RecoveryJournal {
                 .into_iter()
                 .map(|member| member.request_id)
                 .collect();
-                Some(Arc::new(RecoveryOwnership::new(
+                Some(RecoveryOwnership::new(
                     owner_lock.ok_or_else(recovery_unavailable)?,
                     inherited,
-                )))
+                ))
             }
             #[cfg(not(unix))]
             return Err(recovery_unavailable());
@@ -630,7 +632,7 @@ impl FencedTransitionV2RecoveryJournal {
     ) -> Result<(), StoreError> {
         let canonical = canonical_recovery_request(request)?;
         let epoch = recovery_epoch(request.request_id().epoch())?;
-        let ownership = self.inner.ownership.clone();
+        let owner = Arc::clone(&self.inner);
         let physical_id = request.request_id();
         let capacity = self.capacity;
         self.with_connection(true, move |conn, key| {
@@ -678,7 +680,7 @@ impl FencedTransitionV2RecoveryJournal {
             verify_recovery_metadata(&transaction, key, Some(&scope))?;
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
             transaction.commit().map_err(|_| recovery_unavailable())?;
-            if let Some(ownership) = ownership {
+            if let Some(ownership) = owner.ownership.as_ref() {
                 ownership.inserted(request_id, physical_id);
             }
             Ok(())
@@ -739,7 +741,7 @@ impl FencedTransitionV2RecoveryJournal {
     ) -> Result<bool, StoreError> {
         let canonical = canonical_recovery_request(expected)?;
         let epoch = recovery_epoch(expected.request_id().epoch())?;
-        let ownership = self.inner.ownership.clone();
+        let owner = Arc::clone(&self.inner);
         self.with_connection(true, move |conn, key| {
             let transaction = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -785,7 +787,7 @@ impl FencedTransitionV2RecoveryJournal {
             verify_recovery_metadata(&transaction, key, Some(&scope))?;
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
             transaction.commit().map_err(|_| recovery_unavailable())?;
-            if let Some(ownership) = ownership {
+            if let Some(ownership) = owner.ownership.as_ref() {
                 ownership.removed(request_id);
             }
             Ok(true)
@@ -809,7 +811,7 @@ impl FencedTransitionV2RecoveryJournal {
             return Err(recovery_unavailable());
         }
         let floor = recovery_epoch(retired_through)?;
-        let ownership = self.inner.ownership.clone();
+        let owner = Arc::clone(&self.inner);
         self.with_connection(true, move |conn, key| {
             let transaction = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -858,7 +860,7 @@ impl FencedTransitionV2RecoveryJournal {
             verify_recovery_metadata(&transaction, key, Some(&scope))?;
             verify_sqlite_main_file_binding(&transaction).map_err(|_| recovery_unavailable())?;
             transaction.commit().map_err(|_| recovery_unavailable())?;
-            if let Some(ownership) = ownership {
+            if let Some(ownership) = owner.ownership.as_ref() {
                 for member in &retired {
                     ownership.removed(FencedTransitionRequestId::from_bytes(member.request_id));
                 }
