@@ -326,7 +326,9 @@ ICMP signaling in both families. It also runs the 14 eBPF library proofs for
 kernel program identity, historical recovery and retirement races, and the
 three native control-queue and injection contracts. These reuse the library
 binary built for normalization. Their counts, anti-skip checks, success markers
-and native control artifacts remain mandatory.
+and native control artifacts remain mandatory. Workflow regressions pin the
+library's 14-test count, all 14 provenance markers and skip rejection, and verify
+that incomplete evidence fails the gate.
 
 The **Privileged Linux GTP-U datapath** job keeps the host parser tests,
 map-in-map reader-grace proof, Linux GTP-U integration suite and 60 eBPF
@@ -335,14 +337,18 @@ remaining 21 eBPF tests in the `workload_strict_reset_` and
 `workload_exclusive_reset_` families in a fresh network namespace with the same
 kernel prerequisites. Both integration partitions require source-derived counts
 and reject skips; every existing proof assertion and evidence check is retained.
-All 148 native test executions occur exactly once across the three jobs.
+The workflow regressions also pin the 13 strict and 8 exclusive reset tests,
+their combined 21-test count and skip rejection. All 148 native test executions
+occur exactly once across the three jobs.
 
 The existing jobs retain their 30-minute datapath and 20-minute regression
 budgets; the new reset job has a 20-minute budget. The datapath and regression
 jobs each build in `target/gtpu-native`, and the reset job builds in
 `target/gtpu-resets`. Each target is also its job's explicit Rust cache target;
 each hosted job has its own checkout and job-specific cache key. Cache misses
-still compile and execute the complete selection. The required
+still compile and execute the complete selection. All three native jobs save
+caches only on `main`; pull requests still restore them. This limits additional
+PR-scoped archives in the repository's shared cache budget. The required
 **Privileged Linux GTP-U** check requires all three native jobs to succeed. A
 failed, cancelled or skipped native job fails that check. This adds one job per
 CI run. Both workflows run on PRs and main pushes.

@@ -553,6 +553,22 @@ def workflow_jobs(name):
 
 class WorkflowTests(unittest.TestCase):
     NATIVE_GTPU_JOBS = ["privileged-gtpu", "privileged-gtpu-regressions", "privileged-gtpu-resets"]
+    NATIVE_GTPU_PROVENANCE_MARKERS = [
+        "OPC_GTPU_TAG_PROOF_PROVEN",
+        "OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN",
+        "OPC_GTPU_HISTORICAL_25_TAG_PROOF_PROVEN",
+        "OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN",
+        "OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN",
+        "OPC_GTPU_PROGRAM_RETIREMENT_FOREIGN_REFUSAL_PROVEN",
+        "OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=2",
+        "OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=1",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=historical_references",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=generation",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=artifact_owner",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=legacy_record_owner",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=legacy_artifact_owner",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=workload_references",
+    ]
 
     def test_native_gtpu_jobs_build_in_their_cached_target(self):
         jobs = workflow_jobs("gtpu-privileged.yml")
@@ -569,6 +585,11 @@ class WorkflowTests(unittest.TestCase):
                 self.assertNotIn("continue-on-error", job)
                 self.assertNotIn("shared-key:", job)
                 self.assertNotIn("add-job-id-key: false", job)
+                cache = next(step for step in re.split(r"^      - name: ", job, flags=re.M)[1:]
+                             if "uses: Swatinem/rust-cache@v2\n" in step)
+                self.assertEqual([line.strip() for line in cache.splitlines()].count(
+                    "save-if: ${{ github.ref == 'refs/heads/main' }}"), 1)
+                self.assertNotRegex(cache, r"(?m)^        if:", "PRs must still restore the cache")
 
     def test_native_gtpu_proofs_use_three_required_jobs_once(self):
         jobs = workflow_jobs("gtpu-privileged.yml")
@@ -594,6 +615,15 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(sum(job.count(command) for job in native.values()), 1)
                 self.assertIn(command, native[owner])
+        self.assertEqual(len(set(self.NATIVE_GTPU_PROVENANCE_MARKERS)), 14)
+        proof_checks = [f'grep -Fq \'{marker}\' "${{datapath_log}}"'
+                        for marker in self.NATIVE_GTPU_PROVENANCE_MARKERS]
+        proof_checks.append('grep -Fq \'test result: ok. 14 passed; 0 failed;\' "${datapath_log}"')
+        for name, job in native.items():
+            for check in proof_checks:
+                with self.subTest(job=name, proof=check):
+                    self.assertEqual([line.strip() for line in job.splitlines()].count(check),
+                                     1 if name == "privileged-gtpu-regressions" else 0)
         for name, minutes in [("privileged-gtpu", 30), ("privileged-gtpu-regressions", 20),
                               ("privileged-gtpu-resets", 20)]:
             self.assertIn(f"timeout-minutes: {minutes}\n", native[name])
@@ -607,6 +637,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(names), len(re.findall(r"^#\[ignore", source, re.M)))
         reset_names = {name for name in names if name.startswith(("workload_strict_reset_", "workload_exclusive_reset_"))}
         self.assertTrue(reset_names)
+        for family, expected in [("workload_strict_reset_", 13), ("workload_exclusive_reset_", 8)]:
+            self.assertEqual(sum(name.startswith(family) for name in names), expected, family)
+        self.assertEqual(len(reset_names), 21)
         owners = {}
         for job_name in self.NATIVE_GTPU_JOBS:
             self.assertIn(job_name, jobs.keys())
@@ -643,11 +676,47 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn('"OPC_GTPU_RUN_PRIVILEGED=1"', run)
             self.assertIn("unshare -n -- bash -euxo pipefail -c", run)
             self.assertIn("ip link set lo up", run)
-            self.assertIn("skipping:|OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:", run)
-            self.assertIn('grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;"', run)
+            self.assertEqual(run.count("if grep -Eq 'skipping:|OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:'"), 1)
+            self.assertEqual(run.splitlines().count(
+                'grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"'), 1)
         self.assertEqual(owners["privileged-gtpu-resets"], reset_names)
         self.assertEqual(owners["privileged-gtpu"], set(names) - reset_names)
         self.assertCountEqual([name for selected in owners.values() for name in selected], names)
+
+    def test_native_gtpu_proof_checks_reject_incomplete_or_skipped_runs(self):
+        jobs = workflow_jobs("gtpu-privileged.yml")
+        for job, step_name, count, markers in [
+            ("privileged-gtpu-regressions", "Prove eBPF kernel provenance and recovery", 14,
+             self.NATIVE_GTPU_PROVENANCE_MARKERS),
+            ("privileged-gtpu-resets", "Prove workload resets in a fresh netns", 21, []),
+        ]:
+            steps = re.split(r"^      - name: ", jobs[job], flags=re.M)[1:]
+            step = next(step for step in steps if step.startswith(step_name + "\n"))
+            run = textwrap.dedent(step.split("        run: |\n", 1)[1])
+            skip_check = 'if grep -Eq \'skipping:|OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:\' "${datapath_log}"; then'
+            self.assertEqual(run.splitlines().count(skip_check), 1)
+            # Execute only the evidence checks against fixture logs, with no
+            # Cargo, sudo, namespaces or kernel work.
+            checks = run[run.index(skip_check):]
+            summary = f"test result: ok. {count} passed; 0 failed; 0 ignored;\n"
+            success = summary + "".join(marker + "\n" for marker in markers)
+            cases = [("complete", success, True), ("empty", "", False),
+                     ("wrong-count", success.replace(f"{count} passed", f"{count - 1} passed"), False)]
+            cases += [("missing-" + marker, success.replace(marker + "\n", ""), False) for marker in markers]
+            cases += [("skip-" + signal, signal + " fixture skip\n" + success, False)
+                      for signal in ["skipping:", "OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:"]]
+            if job == "privileged-gtpu-resets":
+                cases += [(f"only-{family}", success.replace("21 passed", f"{family_count} passed"), False)
+                          for family, family_count in [("strict", 13), ("exclusive", 8)]]
+            with tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / "proof.log"
+                for case, output, passed in cases:
+                    with self.subTest(job=job, case=case):
+                        log.write_text(output)
+                        env = dict(os.environ, datapath_log=str(log), expected_tests=str(count))
+                        result = subprocess.run(["bash", "-euo", "pipefail", "-c", checks],
+                                                env=env, capture_output=True, check=False)
+                        self.assertEqual(result.returncode == 0, passed, result.stderr)
 
     def test_native_gtpu_aggregate_requires_success_from_all_three_jobs(self):
         aggregate = workflow_jobs("gtpu-privileged.yml")["privileged-gtpu-result"]

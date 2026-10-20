@@ -825,7 +825,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel provenance and control proofs, and move the 21 strict/exclusive reset
   tests into their own 20-minute job. Cache each job's actual build target while
   retaining all 148 test executions, evidence checks and existing 30/20-minute
-  deadlines. The additional job per CI run gives the datapath job more margin.
+  deadlines. Save the three native caches only on main while allowing PRs to
+  restore them. Pin provenance markers and both suites' counts and skip rejection
+  in the workflow regressions. The additional job per CI run gives the datapath
+  job more margin.
 
 - `opc-egress-fence`: keep empty and truncated L3 vectors in the independent
   object oracle executable on kernels that reject short IP test-run transport
