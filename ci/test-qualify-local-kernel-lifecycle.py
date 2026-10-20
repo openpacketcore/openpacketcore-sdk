@@ -670,6 +670,16 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(job=name, proof=check):
                     self.assertEqual([line.strip() for line in job.splitlines()].count(check),
                                      1 if name == "privileged-gtpu-regressions" else 0)
+        datapath_checks = [f'grep -Fq \'{marker}\' "${{datapath_log}}"'
+                           for marker in self.NATIVE_GTPU_DATAPATH_MARKERS]
+        datapath_checks.append(
+            'test "$(grep -Ec "OPC_GTPU_ATTACHMENT_LEAF_PASSED: '
+            'kind=${kind} case=${case} " "${datapath_log}")" = 1')
+        for name, job in native.items():
+            for check in datapath_checks:
+                with self.subTest(job=name, proof=check):
+                    self.assertEqual([line.strip() for line in job.splitlines()].count(check),
+                                     1 if name == "privileged-gtpu" else 0)
         for name, minutes in [("privileged-gtpu", 30), ("privileged-gtpu-regressions", 20),
                               ("privileged-gtpu-resets", 20)]:
             self.assertIn(f"timeout-minutes: {minutes}\n", native[name])
