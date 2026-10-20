@@ -25,7 +25,7 @@ fn sql_scan(
         request,
         now,
         Arc::new(AtomicBool::new(false)),
-        Instant::now() + Duration::from_secs(5),
+        crate::sqlite::SqliteWorkDeadline::RealTime(Instant::now() + Duration::from_secs(5)),
         crate::sqlite::RestoreScanValidationProfile::Consensus,
     )
 }

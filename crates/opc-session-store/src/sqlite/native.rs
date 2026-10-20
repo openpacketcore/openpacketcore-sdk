@@ -198,6 +198,7 @@ impl SqliteSessionBackend {
             + Send
             + 'static,
     {
+        let operation_deadline = SqliteWorkDeadline::tokio(deadline);
         let permit = tokio::time::timeout_at(deadline, workers.acquire_owned())
             .await
             .map_err(|_| unavailable())?
@@ -205,7 +206,6 @@ impl SqliteSessionBackend {
         let wal = self.native_current()?;
         let cancellation = Arc::new(AtomicBool::new(false));
         let task_cancellation = Arc::clone(&cancellation);
-        let operation_deadline = deadline.into_std();
         let queued = Arc::new(StdMutex::new(Some((permit, wal, read))));
         let task_queued = Arc::clone(&queued);
         let task = tokio::task::spawn_blocking(move || {
@@ -214,9 +214,7 @@ impl SqliteSessionBackend {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()?;
             let check = || {
-                if task_cancellation.load(Ordering::Acquire)
-                    || std::time::Instant::now() >= operation_deadline
-                {
+                if task_cancellation.load(Ordering::Acquire) || operation_deadline.is_elapsed() {
                     Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "native read work budget exhausted",

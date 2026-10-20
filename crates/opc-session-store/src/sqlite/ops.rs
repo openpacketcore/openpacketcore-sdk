@@ -26,7 +26,7 @@ use crate::{
     ttl::{checked_session_deadline, validate_stored_record_expiry_at},
 };
 
-use super::RestoreScanValidationProfile;
+use super::{RestoreScanValidationProfile, SqliteWorkDeadline};
 
 const RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL: i32 = 1_000;
 const RESTORE_SCAN_TENANT_MAX_BYTES: usize = 128;
@@ -89,7 +89,7 @@ fn restore_scan_callback_limit_reached(previous_callbacks: usize, max_callbacks:
 fn install_restore_scan_progress_budget(
     conn: &Connection,
     cancellation: Arc<AtomicBool>,
-    operation_deadline: std::time::Instant,
+    operation_deadline: SqliteWorkDeadline,
 ) -> RestoreScanProgressGuard<'_> {
     let callbacks = Arc::new(AtomicUsize::new(0));
     let callback_count = Arc::clone(&callbacks);
@@ -97,11 +97,10 @@ fn install_restore_scan_progress_budget(
     // The configured interval is a small positive compile-time constant.
     let progress_interval = RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL as usize;
     let max_callbacks = (RESTORE_SCAN_MAX_SQLITE_VM_STEPS / progress_interval).max(1);
-    let sqlite_deadline = started
-        .checked_add(Duration::from_millis(RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS))
-        .map_or(operation_deadline, |deadline| {
-            deadline.min(operation_deadline)
-        });
+    // This is an independent wall-clock resource cap on one SQLite query,
+    // not the caller's async budget. Preserve it even with paused Tokio time.
+    let sqlite_deadline =
+        started.checked_add(Duration::from_millis(RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS));
     conn.progress_handler(
         RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL,
         Some(move || {
@@ -110,7 +109,8 @@ fn install_restore_scan_progress_budget(
                     callback_count.fetch_add(1, Ordering::Relaxed),
                     max_callbacks,
                 )
-                || std::time::Instant::now() >= sqlite_deadline
+                || operation_deadline.is_elapsed()
+                || sqlite_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
         }),
     )
     .expect("restore scan owns its SQLite connection");
@@ -1180,12 +1180,15 @@ pub(crate) fn scan_restore_records_sync(
     request: RestoreScanRequest,
     now: Timestamp,
     cancellation: Arc<AtomicBool>,
-    operation_deadline: std::time::Instant,
+    operation_deadline: SqliteWorkDeadline,
     profile: RestoreScanValidationProfile,
 ) -> Result<RestoreScanPage, StoreError> {
     request.validate()?;
-    let _progress_guard =
-        install_restore_scan_progress_budget(conn, Arc::clone(&cancellation), operation_deadline);
+    let _progress_guard = install_restore_scan_progress_budget(
+        conn,
+        Arc::clone(&cancellation),
+        operation_deadline.clone(),
+    );
     if cancellation.load(Ordering::Acquire) {
         return Err(StoreError::RestoreScanWorkBudgetExceeded);
     }
@@ -1231,7 +1234,7 @@ pub(crate) fn scan_restore_records_sync(
 
     let mut records = Vec::with_capacity(selection.candidates.len());
     for candidate in std::mem::take(&mut selection.candidates) {
-        if cancellation.load(Ordering::Acquire) || std::time::Instant::now() >= operation_deadline {
+        if cancellation.load(Ordering::Acquire) || operation_deadline.is_elapsed() {
             return Err(StoreError::RestoreScanWorkBudgetExceeded);
         }
         let record = candidate.load_record(conn)?;
@@ -1773,7 +1776,9 @@ mod tests {
         let guard = install_restore_scan_progress_budget(
             &conn,
             Arc::new(AtomicBool::new(false)),
-            std::time::Instant::now() + Duration::from_secs(5),
+            crate::sqlite::SqliteWorkDeadline::RealTime(
+                std::time::Instant::now() + Duration::from_secs(5),
+            ),
         );
         let error = conn
             .query_row(
@@ -1816,7 +1821,9 @@ mod tests {
         let guard = install_restore_scan_progress_budget(
             &conn,
             cancellation,
-            std::time::Instant::now() + Duration::from_secs(5),
+            crate::sqlite::SqliteWorkDeadline::RealTime(
+                std::time::Instant::now() + Duration::from_secs(5),
+            ),
         );
         let error = conn
             .query_row(
@@ -1845,7 +1852,7 @@ mod tests {
         let guard = install_restore_scan_progress_budget(
             &conn,
             Arc::new(AtomicBool::new(false)),
-            std::time::Instant::now(),
+            SqliteWorkDeadline::RealTime(std::time::Instant::now()),
         );
         let error = conn
             .query_row(
@@ -1861,6 +1868,71 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect_err("expired outer deadline interrupts SQLite work");
+        assert_eq!(
+            restore_scan_sqlite_error(error),
+            StoreError::RestoreScanWorkBudgetExceeded
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn sqlite_clock_restore_progress_follows_the_outer_tokio_deadline() {
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
+        let budget = Duration::from_millis(20);
+        std::thread::sleep(Duration::from_millis(40));
+        let guard = install_restore_scan_progress_budget(
+            &conn,
+            Arc::new(AtomicBool::new(false)),
+            SqliteWorkDeadline::tokio(frozen + budget),
+        );
+        let sql = "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL \
+                   SELECT n + 1 FROM numbers WHERE n < 10000) SELECT SUM(n) FROM numbers";
+        assert_eq!(
+            conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+                .expect("real setup time cannot expire the frozen caller"),
+            50_005_000
+        );
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        tokio::time::advance(budget).await;
+        let error = conn
+            .query_row(sql, [], |row| row.get::<_, i64>(0))
+            .expect_err("the progress hook must observe the advanced caller deadline");
+        assert_eq!(
+            restore_scan_sqlite_error(error),
+            StoreError::RestoreScanWorkBudgetExceeded
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn sqlite_clock_restore_query_keeps_its_independent_wall_time_cap() {
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
+        let deadline = SqliteWorkDeadline::tokio(frozen + Duration::from_secs(5));
+        let guard = install_restore_scan_progress_budget(
+            &conn,
+            Arc::new(AtomicBool::new(false)),
+            deadline.clone(),
+        );
+        std::thread::sleep(Duration::from_millis(
+            RESTORE_SCAN_MAX_SQLITE_WORK_MILLIS + 20,
+        ));
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        assert!(
+            !deadline.is_elapsed(),
+            "the caller's budget is still frozen"
+        );
+        let error = conn
+            .query_row(
+                "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL \
+             SELECT n + 1 FROM numbers WHERE n < 10000) SELECT SUM(n) FROM numbers",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect_err("the independent wall-clock cap still bounds SQLite work");
         assert_eq!(
             restore_scan_sqlite_error(error),
             StoreError::RestoreScanWorkBudgetExceeded

@@ -832,6 +832,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: keep async SQLite worker deadlines on the caller's
+  Tokio clock through SQL progress, acceptance readers, native reads, restore
+  scans and guarded-read completion. Paused-time setup no longer spends a
+  fresh worker's budget, and advancing Tokio time expires worker checks.
+  Independent real-time resource caps and existing timeout values are unchanged.
+
 - `opc-session-testkit`: derive traffic-status backend work from the parent's
   absolute monotonic phase deadline, including the existing reply allowance.
   Expired commands cannot start backend work or publish a late head. Test-control
