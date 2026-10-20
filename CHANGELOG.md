@@ -824,7 +824,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absolute monotonic phase deadline, including the existing reply allowance.
   Expired commands cannot start backend work or publish a late head. Test-control
   fleet failures retain complete child stderr, identify each counted transport
-  failure, and collect voter and client-pool state without changing phase bounds.
+  failure, and collect voter and client-pool state. Phase deadlines and assertions
+  are unchanged, but child backend work stops 1 second before the phase deadline
+  to reserve reply delivery. The effective phase window is 1 second shorter
+  (stricter, never looser); progress first visible in that final second fails as
+  `AvailabilityRecoveryDeadlineExceeded`.
 
 - `opc-session-net`: preserve valid slow quorum replies until the caller's
   original deadline for protected history, expiry and receipt reads, including

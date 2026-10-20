@@ -1735,9 +1735,7 @@ impl QualificationNode {
                 }
             }
             QualificationNodeCommand::ConsensusDiagnostics => {
-                #[cfg(feature = "test-control")]
                 let health = self.store.persistence_health();
-                #[cfg(feature = "test-control")]
                 let status = self.store.status();
                 #[cfg(all(target_os = "linux", feature = "test-control"))]
                 if let Ok(Some(costs)) =
@@ -1768,14 +1766,12 @@ impl QualificationNode {
                         })
                     );
                 }
-                #[cfg(feature = "test-control")]
                 eprintln!(
                     "qualification_consensus_progress term={} leader_known={} local_leader={} last_log_index={:?} applied_index={:?} admitted={} completed_snapshot_count={}",
                     status.term, status.leader_id.is_some(),
                     status.leader_id == Some(status.node_id), status.last_log_index,
                     status.applied_index, status.admitted, status.completed_snapshot_count,
                 );
-                #[cfg(feature = "test-control")]
                 eprintln!(
                     "qualification_persistence_health mode={:?} engine_running={} storage_state={:?} storage_failure={:?}",
                     health.mode, health.engine_running, health.storage_state, health.storage_failure,
@@ -2815,10 +2811,7 @@ impl QualificationNode {
             };
         };
         let replication_head =
-            refresh_traffic_status_for_control(&self.protected, &traffic.observation, || {
-                budget.remaining()
-            })
-            .await;
+            refresh_traffic_status_with_budget(&self.protected, &traffic.observation, budget).await;
         self.traffic_status_with_replication_head(replication_head)
     }
 
@@ -4487,6 +4480,15 @@ async fn wait_for_traffic_recovery_retry(deadline: tokio::time::Instant) -> bool
         .min(deadline.saturating_duration_since(now));
     tokio::time::sleep(delay).await;
     tokio::time::Instant::now() < deadline
+}
+
+/// Connects the received wire budget to the child's backend deadline.
+async fn refresh_traffic_status_with_budget<B: TrafficWatchBackend + ?Sized>(
+    backend: &B,
+    observation: &QualificationTrafficObservation,
+    budget: QualificationTrafficStatusBudget,
+) -> u64 {
+    refresh_traffic_status_for_control(backend, observation, || budget.remaining()).await
 }
 
 /// Refreshes the status head without ever presenting a cached value as a new
@@ -8692,6 +8694,43 @@ mod tests {
             observation.failure().expect("expired control budget").code,
             QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_parent_budget_transmitted_expiry_starts_no_backend_work() {
+        // Reserving the delivery allowance exhausts this real monotonic budget
+        // immediately, independent of host scheduling or the paused Tokio clock.
+        let command = QualificationNodeCommand::TrafficStatus {
+            budget: QualificationTrafficStatusBudget::from_parent_deadline(
+                std::time::Instant::now()
+                    + Duration::from_millis(
+                        opc_session_testkit::qualification::QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS,
+                    ),
+            ),
+        };
+        let wire = serde_json::to_vec(&command).expect("transmit traffic-status command");
+        let QualificationNodeCommand::TrafficStatus { budget } =
+            serde_json::from_slice(&wire).expect("receive traffic-status command")
+        else {
+            panic!("traffic-status command must survive transmission");
+        };
+        let backend = ScriptedTrafficWatchBackend::new([Ok(47)], [], []);
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let started = tokio::time::Instant::now();
+        let head = refresh_traffic_status_with_budget(&backend, &observation, budget).await;
+        assert_eq!(backend.head_requests().await, 0);
+        assert_eq!(
+            head, 41,
+            "an expired wire budget must preserve the proven head"
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        let failure = observation.failure().expect("expired transmitted budget");
+        assert_eq!(
+            failure.code,
+            QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+        );
+        assert_eq!(failure.stage, QualificationTrafficFailureStage::Watch);
+        assert_eq!(failure.recovery_elapsed_millis, Some(0));
     }
 
     #[tokio::test(start_paused = true)]
