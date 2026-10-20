@@ -94,7 +94,10 @@ pub fn close_consensus_application_admission_for_test(store: &ConsensusSessionSt
 ///
 /// The callback must use only nonblocking observations: an operation that waits
 /// for the owner would deadlock. The owner is released when the callback returns
-/// or unwinds. No admission latch, durable record, or deadline is changed.
+/// or unwinds. A panic in the callback poisons the owner lock and fences the
+/// store, so keep assertions outside it. Acquiring the owner waits up to 25 ms
+/// and returns [`std::io::ErrorKind::WouldBlock`] if it remains busy. A callback
+/// that returns normally changes no admission latch, durable record, or deadline.
 #[cfg(target_os = "linux")]
 pub fn with_consensus_native_authority_held_for_test<T>(
     store: &ConsensusSessionStore,
