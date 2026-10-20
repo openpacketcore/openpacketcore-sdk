@@ -599,11 +599,12 @@ fn with_sqlite_file<T>(
             database,
             ffi::SQLITE_FCNTL_FILE_POINTER,
             |descriptor| {
-                // SAFETY: the connection owns the checked descriptor throughout
-                // this synchronous borrow. ManuallyDrop prevents close, including
-                // on callback errors or unwinding. No borrowed reference escapes.
-                let file =
-                    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(descriptor) });
+                let file = std::mem::ManuallyDrop::new(
+                    // SAFETY: the connection owns the checked descriptor
+                    // throughout this synchronous borrow. ManuallyDrop prevents
+                    // close on callback errors or unwinding. No borrow escapes.
+                    unsafe { std::fs::File::from_raw_fd(descriptor) },
+                );
                 if !file.metadata().map_err(|_| FileControlError)?.is_file() {
                     return Err(FileControlError);
                 }
