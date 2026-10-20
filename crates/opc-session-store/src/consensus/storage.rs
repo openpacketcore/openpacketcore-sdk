@@ -11551,6 +11551,11 @@ mod tests {
         let parent_pid = std::env::var(PARENT_PID)
             .map(|value| value.parse::<u32>().unwrap())
             .unwrap_or(fixture_pid);
+        assert_eq!(
+            parent_pid,
+            std::os::unix::process::parent_id(),
+            "the descriptor-retirement parent marker must identify the actual launcher"
+        );
 
         let directory = fs_verity_snapshot_tempdir("child-descriptor-seal-");
         let path = directory.path().join("snapshot");

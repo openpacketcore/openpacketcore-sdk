@@ -816,7 +816,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-store`: isolate the snapshot seal descriptor-retirement fixture
   in a child process so its deliberate write-gate hold cannot stall or poison
-  unrelated seals and store opens. Preserve all assertions and timing bounds.
+  unrelated seals and store opens. Verify its parent marker against the actual
+  parent process. Preserve all assertions and timing bounds.
 
 - `opc-session-store`: register the accepted-proposal fixture's watch on its
   store's controlled clock before the timeout proof, keeping the original
