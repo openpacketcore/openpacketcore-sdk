@@ -16,22 +16,24 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  # Keep the existing required check name and require both independent jobs.
+  # Keep the existing required check name and require all three independent jobs.
   privileged-gtpu-result:
     name: Privileged Linux GTP-U
     if: always()
-    needs: [privileged-gtpu, privileged-gtpu-regressions]
+    needs: [privileged-gtpu, privileged-gtpu-regressions, privileged-gtpu-resets]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
       DATAPATH_RESULT: ${{ needs.privileged-gtpu.result }}
       REGRESSIONS_RESULT: ${{ needs.privileged-gtpu-regressions.result }}
+      RESETS_RESULT: ${{ needs.privileged-gtpu-resets.result }}
     steps:
-      - name: Require both privileged jobs to pass
+      - name: Require all three privileged jobs to pass
         run: |
           set -euo pipefail
           test "$DATAPATH_RESULT" = success
           test "$REGRESSIONS_RESULT" = success
+          test "$RESETS_RESULT" = success
 
   privileged-gtpu-regressions:
     name: Privileged Linux GTP-U and route regressions
@@ -119,8 +121,8 @@ jobs:
           grep -Fq 'OPC_GTPU_EMPTY_LEGACY_NESTED_ROOT_REFUSAL_PROVEN' "${normalization_log}"
 
       # Reuse the library binary already built by normalization. Keeping
-      # these kernel proofs here leaves the full integration suite its
-      # own budget even when compilation starts from an empty target.
+      # these kernel proofs here leaves the integration partitions their
+      # own budgets even when compilation starts from an empty target.
       - name: Prove eBPF kernel provenance and recovery
         run: |
           set -euo pipefail
@@ -234,6 +236,113 @@ jobs:
             ${{ runner.temp }}/route-kernel-build.jsonl
             ${{ runner.temp }}/live_readback_probe.log
             ${{ runner.temp }}/live_locked_route_mtu.log
+          if-no-files-found: warn
+
+  privileged-gtpu-resets:
+    name: Privileged Linux GTP-U workload resets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/gtpu-resets
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target/gtpu-resets
+
+      - name: Install kernel tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ethtool iproute2 iputils-ping kmod nftables procps wireguard-tools
+
+      - name: Check privileged GTP kernel support
+        run: |
+          set -euo pipefail
+          uname -r
+          uname -v
+          if ! sudo modprobe gtp; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe gtp
+          fi
+          lsmod | grep '^gtp'
+          sudo modprobe wireguard
+          # The hand-off test on a VRF slave needs the vrf driver, which
+          # ships in the same optional module package as gtp. Create a VRF
+          # in a throwaway namespace rather than look for a module: that
+          # holds for a built-in driver as well.
+          if ! sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe vrf
+            sudo unshare -n -- ip link add vrf-probe type vrf table 10
+          fi
+          # The test of the attachment's interface enslaves it to a bridge.
+          sudo unshare -n -- ip link add bridge-probe type bridge
+          # The tests of a device stacked on the attachment's interface, and
+          # of the frames of a VLAN above it, need these drivers.
+          sudo unshare -n -- sh -euc '
+            ip link add lower-probe type dummy
+            ip link add link lower-probe name macvlan-probe type macvlan mode passthru
+            ip link del macvlan-probe
+            ip link add link lower-probe name ipvlan-probe type ipvlan mode l2
+            ip link add link lower-probe name vlan-probe type vlan id 100
+            ip link add gre-probe type gre local 192.0.2.1 remote 192.0.2.2 dev lower-probe
+          '
+          sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+          sudo unshare -n -- ip link set lo up
+
+      - name: Build privileged eBPF GTP-U test
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run
+
+      - name: Prove workload resets in a fresh netns
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          # The committed source is the authority on how many reset tests
+          # must run; see the el9 job for why the shipped binary cannot be.
+          datapath_source="crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged.rs"
+          expected_tests="$(grep -Ec '^(async )?fn workload_(strict|exclusive)_reset_' "${datapath_source}")"
+          echo "reset suite expects ${expected_tests} tests from ${datapath_source}"
+          test "${expected_tests}" -gt 0
+          datapath_log="${RUNNER_TEMP}/gtpu-native-resets.log"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" \
+            "OPC_GTPU_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 workload_strict_reset_ workload_exclusive_reset_
+            ' 2>&1 | tee "${datapath_log}"
+
+          # Require the complete selected count and reject the same skip
+          # signals as the datapath partition. The reset tests retain all
+          # their kernel assertions, including the privileged flag check.
+          if grep -Eq 'skipping:|OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:' "${datapath_log}"; then
+            echo "::error::privileged reset tests skipped instead of running"
+            exit 1
+          fi
+          grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
+
+      - name: Upload privileged workload reset logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-privileged-resets
+          path: ${{ runner.temp }}/gtpu-native-resets.log
           if-no-files-found: warn
 
   privileged-gtpu:
@@ -375,7 +484,9 @@ jobs:
           # The committed source is the authority on how many datapath tests
           # must run; see the el9 job for why the shipped binary cannot be.
           datapath_source="crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged.rs"
-          expected_tests="$(grep -c '^#\[ignore' "${datapath_source}")"
+          all_tests="$(grep -c '^#\[ignore' "${datapath_source}")"
+          reset_tests="$(grep -Ec '^(async )?fn workload_(strict|exclusive)_reset_' "${datapath_source}")"
+          expected_tests="$((all_tests - reset_tests))"
           echo "datapath suite expects ${expected_tests} tests from ${datapath_source}"
           test "${expected_tests}" -gt 0
           datapath_log="${RUNNER_TEMP}/gtpu-68-datapath.log"
@@ -388,7 +499,7 @@ jobs:
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
-              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1
+              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 --skip workload_strict_reset_ --skip workload_exclusive_reset_
             ' 2>&1 | tee "${datapath_log}"
 
           # Every one of these tests returns Ok early when
