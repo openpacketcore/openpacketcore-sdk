@@ -7678,6 +7678,130 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn assert_policy_preflight_preserves_store(action: XfrmAction, boundary: &str) {
+        let root = DurableTestRoot::new();
+        let transport = RecordingSuccessTransport::default();
+        let (backend, store) = LinuxXfrmBackend::with_transport(transport.clone())
+            .bind_current_network_namespace_with_object_recovery(
+                root.path().to_path_buf(),
+                XfrmObjectRecoveryProofKey::new([0x74; 32]).unwrap(),
+            )
+            .unwrap();
+        let operation = XfrmObjectInstallOperationId::generate().unwrap();
+        let generation = XfrmObjectInstallOperationGeneration::new(1).unwrap();
+        let valid = durable_object_requests()[0].clone();
+        let authority = backend
+            .prepare_durable_object_install(&store, operation, generation, valid.clone())
+            .await
+            .unwrap();
+        let record = store
+            .restore(
+                operation,
+                generation,
+                valid.object(),
+                store.fingerprints_for_request(&valid).unwrap(),
+            )
+            .unwrap();
+        let before = root.bytes();
+        let parameters = crate::model::malformed_existing_policy_parameters(action);
+        let refused = match boundary {
+            "install" => backend
+                .install_policy(InstallPolicyRequest { parameters })
+                .await
+                .is_err(),
+            "rekey" => backend
+                .rekey_policy(RekeyPolicyRequest { parameters })
+                .await
+                .is_err(),
+            "durable" => backend
+                .prepare_durable_object_install(
+                    &store,
+                    XfrmObjectInstallOperationId::generate().unwrap(),
+                    generation,
+                    XfrmObjectInstallRequest::Policy(InstallPolicyRequest { parameters }),
+                )
+                .await
+                .is_err(),
+            "store" => prepare_object_install(
+                &store,
+                XfrmObjectInstallOperationId::generate().unwrap(),
+                generation,
+                &XfrmObjectInstallRequest::Policy(InstallPolicyRequest { parameters }),
+            )
+            .is_err(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            root.bytes(),
+            before,
+            "invalid policy must not advance epochs or publish a durable record"
+        );
+        assert!(store.record_writer_epoch_is_current(&record).unwrap());
+        assert!(
+            transport.operations().is_empty(),
+            "invalid policy must not reach the kernel"
+        );
+        assert!(refused);
+        assert_eq!(
+            backend
+                .run_durable_object_install(authority)
+                .await
+                .unwrap()
+                .as_str(),
+            "acquired"
+        );
+        assert_eq!(transport.operations(), vec!["query_sa", "install_sa"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_preflight_allow_install_preserves_store_epoch_and_admission() {
+        assert_policy_preflight_preserves_store(XfrmAction::Allow, "install").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_preflight_allow_rekey_preserves_store_epoch_and_admission() {
+        assert_policy_preflight_preserves_store(XfrmAction::Allow, "rekey").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_preflight_allow_durable_preserves_store_epoch_and_admission() {
+        assert_policy_preflight_preserves_store(XfrmAction::Allow, "durable").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_preflight_allow_store_preserves_store_epoch_and_admission() {
+        assert_policy_preflight_preserves_store(XfrmAction::Allow, "store").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_preflight_block_install_preserves_store_epoch_and_admission() {
+        assert_policy_preflight_preserves_store(XfrmAction::Block, "install").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_preflight_block_rekey_preserves_store_epoch_and_admission() {
+        assert_policy_preflight_preserves_store(XfrmAction::Block, "rekey").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_preflight_block_durable_preserves_store_epoch_and_admission() {
+        assert_policy_preflight_preserves_store(XfrmAction::Block, "durable").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_preflight_block_store_preserves_store_epoch_and_admission() {
+        assert_policy_preflight_preserves_store(XfrmAction::Block, "store").await;
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn forward_transit_namespace_refusal_preserves_store_epoch_and_admission() {
         for parameters in crate::model::malformed_forward_transit_parameters() {

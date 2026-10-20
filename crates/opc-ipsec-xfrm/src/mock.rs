@@ -1173,6 +1173,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_preflight_allow_mock_install_and_rekey_have_no_effects() {
+        for rekey in [false, true] {
+            let backend = MockXfrmBackend::new();
+            let parameters = crate::model::malformed_existing_policy_parameters(XfrmAction::Allow);
+            let result = if rekey {
+                backend
+                    .rekey_policy(RekeyPolicyRequest { parameters })
+                    .await
+            } else {
+                backend
+                    .install_policy(InstallPolicyRequest { parameters })
+                    .await
+            };
+            assert!(backend.operations().is_empty());
+            assert!(matches!(
+                result,
+                Err(XfrmError::InvalidConfig {
+                    field: "templates",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_block_mock_install_and_rekey_have_no_effects() {
+        for rekey in [false, true] {
+            let backend = MockXfrmBackend::new();
+            let parameters = crate::model::malformed_existing_policy_parameters(XfrmAction::Block);
+            let result = if rekey {
+                backend
+                    .rekey_policy(RekeyPolicyRequest { parameters })
+                    .await
+            } else {
+                backend
+                    .install_policy(InstallPolicyRequest { parameters })
+                    .await
+            };
+            assert!(backend.operations().is_empty());
+            assert!(matches!(
+                result,
+                Err(XfrmError::InvalidConfig {
+                    field: "templates",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn marked_forward_transit_mock_roundtrip_and_exact_removal() {
         let backend = MockXfrmBackend::new();
         let parameters = PolicyParameters::forward_transit(

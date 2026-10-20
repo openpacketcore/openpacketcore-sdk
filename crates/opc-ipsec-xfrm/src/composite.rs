@@ -842,6 +842,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_preflight_allow_single_has_no_backend_effects() {
+        let backend = FailingCompositeBackend::default();
+        let mut invalid = install_request();
+        invalid.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(XfrmAction::Allow);
+        let result = install_sa_policy_with_rollback(&backend, invalid).await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must precede all SA installs, updates and rollbacks: {:?}",
+            backend.operations()
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_allow_bidirectional_first_has_no_backend_effects() {
+        let backend = FailingCompositeBackend::default();
+        let mut invalid = install_request();
+        invalid.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(XfrmAction::Allow);
+        let result =
+            install_bidirectional_sa_policy_with_rollback(&backend, [invalid, install_request()])
+                .await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must precede all SA installs, updates and rollbacks: {:?}",
+            backend.operations()
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_allow_bidirectional_second_has_no_backend_effects() {
+        let backend = FailingCompositeBackend::default();
+        let mut invalid = install_request();
+        invalid.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(XfrmAction::Allow);
+        let result =
+            install_bidirectional_sa_policy_with_rollback(&backend, [install_request(), invalid])
+                .await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must precede all SA installs, updates and rollbacks: {:?}",
+            backend.operations()
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_allow_rekey_has_no_backend_effects() {
+        let backend = FailingCompositeBackend::default();
+        let mut invalid = install_request();
+        invalid.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(XfrmAction::Allow);
+        let result = rekey_sa_policy(
+            &backend,
+            RekeySaRequest {
+                parameters: invalid.sa.parameters,
+            },
+            RekeyPolicyRequest {
+                parameters: invalid.policy.parameters,
+            },
+        )
+        .await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must precede all SA installs, updates and rollbacks: {:?}",
+            backend.operations()
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_block_single_has_no_backend_effects() {
+        let backend = FailingCompositeBackend::default();
+        let mut invalid = install_request();
+        invalid.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(XfrmAction::Block);
+        let result = install_sa_policy_with_rollback(&backend, invalid).await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must precede all SA installs, updates and rollbacks: {:?}",
+            backend.operations()
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_block_bidirectional_first_has_no_backend_effects() {
+        let backend = FailingCompositeBackend::default();
+        let mut invalid = install_request();
+        invalid.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(XfrmAction::Block);
+        let result =
+            install_bidirectional_sa_policy_with_rollback(&backend, [invalid, install_request()])
+                .await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must precede all SA installs, updates and rollbacks: {:?}",
+            backend.operations()
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_block_bidirectional_second_has_no_backend_effects() {
+        let backend = FailingCompositeBackend::default();
+        let mut invalid = install_request();
+        invalid.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(XfrmAction::Block);
+        let result =
+            install_bidirectional_sa_policy_with_rollback(&backend, [install_request(), invalid])
+                .await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must precede all SA installs, updates and rollbacks: {:?}",
+            backend.operations()
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_block_rekey_has_no_backend_effects() {
+        let backend = FailingCompositeBackend::default();
+        let mut invalid = install_request();
+        invalid.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(XfrmAction::Block);
+        let result = rekey_sa_policy(
+            &backend,
+            RekeySaRequest {
+                parameters: invalid.sa.parameters,
+            },
+            RekeyPolicyRequest {
+                parameters: invalid.policy.parameters,
+            },
+        )
+        .await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must precede all SA installs, updates and rollbacks: {:?}",
+            backend.operations()
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn composite_install_applies_sa_then_policy() {
         let backend = FailingCompositeBackend::default();
 

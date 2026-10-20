@@ -952,6 +952,41 @@ pub(crate) fn malformed_forward_transit_parameters() -> Vec<PolicyParameters> {
     malformed
 }
 
+#[cfg(test)]
+pub(crate) fn malformed_existing_policy_parameters(action: XfrmAction) -> PolicyParameters {
+    let mut parameters = PolicyParameters::forward_transit(
+        XfrmSelector::new(
+            IpAddress::Ipv4([192, 0, 2, 1]),
+            IpAddress::Ipv4([192, 0, 2, 2]),
+            17,
+        ),
+        100,
+        XfrmLookupMark::full(0x4000_0001),
+    )
+    .unwrap();
+    parameters.action = action;
+    match action {
+        XfrmAction::Allow => {} // Ordinary ALLOW requires a transform template.
+        XfrmAction::Block => {
+            parameters.templates = vec![
+                XfrmTemplate {
+                    id: XfrmId {
+                        destination: IpAddress::Ipv4([192, 0, 2, 2]),
+                        spi: 256,
+                        protocol: 50,
+                    },
+                    source_address: IpAddress::Ipv4([192, 0, 2, 1]),
+                    request_id: None,
+                    mode: XfrmMode::Tunnel,
+                };
+                7
+            ]; // All policy kinds have a six-template limit.
+        }
+        XfrmAction::AllowForwardTransit => unreachable!("existing kinds only"),
+    }
+    parameters
+}
+
 /// Template describing an SA that may satisfy a policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct XfrmTemplate {

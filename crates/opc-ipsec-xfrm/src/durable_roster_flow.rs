@@ -3023,6 +3023,32 @@ mod tests {
     }
 
     #[test]
+    fn policy_preflight_allow_roster_refuses_invalid_member() {
+        let request = crate::XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+            parameters: crate::model::malformed_existing_policy_parameters(
+                crate::XfrmAction::Allow,
+            ),
+        });
+        assert!(
+            XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn policy_preflight_block_roster_refuses_invalid_member() {
+        let request = crate::XfrmObjectInstallRequest::Policy(crate::InstallPolicyRequest {
+            parameters: crate::model::malformed_existing_policy_parameters(
+                crate::XfrmAction::Block,
+            ),
+        });
+        assert!(
+            XfrmObjectRosterRequest::new(vec![XfrmObjectRosterMemberRequest::new(request)])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn roster_request_rejects_every_inadmissible_member_set() {
         assert_eq!(
             XfrmObjectRosterRequest::new(Vec::new()).unwrap_err(),

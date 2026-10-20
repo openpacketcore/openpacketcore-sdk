@@ -2142,6 +2142,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_preflight_allow_staged_has_no_journal_or_backend_effects() {
+        let backend = Arc::new(crate::MockXfrmBackend::new());
+        let mut request = install_request();
+        request.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(crate::XfrmAction::Allow);
+        let staged = XfrmStagedInstall::new(request);
+        let journal = staged.journal();
+        let result = staged.run(backend.clone()).await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must not install or roll back any object"
+        );
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_block_staged_has_no_journal_or_backend_effects() {
+        let backend = Arc::new(crate::MockXfrmBackend::new());
+        let mut request = install_request();
+        request.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(crate::XfrmAction::Block);
+        let staged = XfrmStagedInstall::new(request);
+        let journal = staged.journal();
+        let result = staged.run(backend.clone()).await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must not install or roll back any object"
+        );
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn forward_transit_staged_refuses_before_journal_or_sa_effects() {
         for parameters in crate::model::malformed_forward_transit_parameters() {
             let backend = Arc::new(GatedBackend::new());
