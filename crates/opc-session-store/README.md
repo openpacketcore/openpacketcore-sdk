@@ -310,10 +310,16 @@ exports private material. The consumer publishes the complete immutable
 manifest once, outside the voter volumes, and chooses enroll or open from that
 publication record, never from whether a path is empty.
 
+After a restart, `SqliteSessionBackend::voter_identity_binding` reads back the
+completed enrollment's installation, slot, incarnation and public-key digest.
+It reads only public metadata and does not grant admission or prove key
+possession. Use the returned binding with `voter_identity_signer`, and retain
+the same fresh possession-proof requirements when publishing the manifest.
+
 Open only validates retained enrollment. Missing or mismatched enrollment,
-lost consensus bindings after first initialization, and a known retired
-incarnation return `VoterIdentityReplacementRequired` before Raft starts. The
-consumer treats this as storage-loss evidence and automatically allocates a
+lost consensus bindings or native WAL root after first initialization, and a
+known retired incarnation return `VoterIdentityReplacementRequired` before
+Raft starts. The consumer treats this as storage-loss evidence and automatically allocates a
 new volume and incarnation through replacement; it never re-enrolls the lost
 identity. Peers require proof of the selected key before any bootstrap
 Pre-Vote grant or term change. Any enrolled genesis member may initialize the
@@ -322,6 +328,10 @@ majority. After formation, the committed `VoterSlotTable` is the authority.
 Initialization opens admission only after a fresh authenticated Openraft quorum
 barrier and local apply. The readiness probes use that same control route and
 never reuse a pre-restart admission observation or a cached reachability proof.
+
+Operational enrollment-read failures, including file-descriptor exhaustion,
+I/O errors and SQLite contention, return retryable `StorageUnavailable`.
+They do not establish identity loss and must not trigger replacement.
 
 The local enrollment binding is excluded from portable snapshots; installing
 a snapshot preserves the recipient's own binding and key. First initialization

@@ -1589,9 +1589,8 @@ impl SqliteSessionBackend {
                 .database_path
                 .as_ref()
                 .ok_or(crate::consensus::storage::SessionConsensusStorageError::VoterIdentityReplacementRequired)?;
-            let retained = voter_identity::read_anchor(&conn, path).map_err(|_| {
-                crate::consensus::storage::SessionConsensusStorageError::VoterIdentityReplacementRequired
-            })?;
+            let retained =
+                voter_identity::read_anchor(&conn, path).map_err(voter_identity::storage_error)?;
             if retained.cluster_instance() != expected.cluster_instance()
                 || retained.identity() != expected.identity()
                 || retained.key_digest() != expected.key_digest()
@@ -1680,6 +1679,12 @@ impl SqliteSessionBackend {
                     preflight_snapshots(snapshots).await?;
                 }
                 Ok(mode)
+            }
+            Err(error)
+                if self.voter_seed.is_some()
+                    && consensus::wal::owner::is_missing_native_root(&error) =>
+            {
+                Err(SessionConsensusStorageError::VoterIdentityReplacementRequired)
             }
             Err(error)
                 if error.get_ref().is_some_and(|source| {

@@ -6,6 +6,7 @@ async fn voter_opener_reports_lost_native_root_as_identity_replacement() {
     use std::panic::AssertUnwindSafe;
     let mut fleet = Fleet::open().await;
     let outcome = AssertUnwindSafe(async {
+        let storage_identity = fleet.nodes[0].inner.storage_identity;
         while let Some(store) = fleet.nodes.pop() {
             fleet.network.disconnect_and_shutdown(&store).await;
         }
@@ -16,6 +17,13 @@ async fn voter_opener_reports_lost_native_root_as_identity_replacement() {
         let before = zeroize::Zeroizing::new(std::fs::read(&key).unwrap());
         std::fs::rename(&root, directory.join("lost-native-root")).unwrap();
         let backend = SqliteSessionBackend::open(&path).unwrap();
+        assert_eq!(
+            backend
+                .native_persistence_preflight(storage_identity, |_| async { Ok(()) })
+                .await,
+            Err(crate::consensus::storage::SessionConsensusStorageError::CorruptState),
+            "the legacy profile must retain its existing recovery refusal"
+        );
         let result = ConsensusSessionStore::open_with_voter_slots_and_integrity(
             fleet.topology(1),
             fleet.genesis(),

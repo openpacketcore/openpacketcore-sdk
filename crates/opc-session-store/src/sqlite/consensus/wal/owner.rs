@@ -23,6 +23,24 @@ const ROOT_MAGIC: &[u8; 8] = b"OPCNR002";
 const ASYNC_RECOVERY_ROOT_MAGIC: &[u8; 8] = b"OPCNA004";
 const SELECTION_ATTRIBUTE: &str = "user.opc.native-root-v1";
 
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct MissingNativeRoot(io::Error);
+
+#[track_caller]
+fn missing_native_root(message: &'static str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        MissingNativeRoot(invalid_data(message)),
+    )
+}
+
+pub(crate) fn is_missing_native_root(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<MissingNativeRoot>())
+}
+
 #[cfg(any(test, feature = "test-control"))]
 type GenerationHookForTest = Arc<dyn Fn(&'static str) -> io::Result<()> + Send + Sync>;
 
@@ -313,7 +331,7 @@ impl NativeOwner {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if read_selection(&self.database)?.is_some() {
-                    return Err(invalid_data("selected native root is missing"));
+                    return Err(missing_native_root("selected native root is missing"));
                 }
                 Ok(None)
             }
@@ -496,7 +514,7 @@ impl NativeOwner {
             .map_err(io::Error::other)?
         } else {
             if !core.fresh_native_basis || read_selection(&self.database)?.is_some() {
-                return Err(invalid_data(
+                return Err(missing_native_root(
                     "existing fixed storage is missing its native root",
                 ));
             }
