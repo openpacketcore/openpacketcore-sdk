@@ -3129,6 +3129,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_clock_rejected_commit_never_returns_late_success_in_real_time() {
+        let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
+            .await
+            .expect("backend");
+        backend
+            .conn()
+            .lock()
+            .await
+            .execute("CREATE TABLE clock_probe (value INTEGER NOT NULL)", [])
+            .expect("probe table");
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let mut operation = std::pin::pin!(sqlite::run_backend_sqlite_with_timeout(
+            &backend,
+            Duration::from_millis(20),
+            move |conn, _| {
+                let tx = conn.unchecked_transaction().expect("probe transaction");
+                tx.execute("INSERT INTO clock_probe VALUES (1)", [])
+                    .expect("probe insert");
+                std::thread::sleep(Duration::from_millis(40));
+                committed_tx
+                    .send(tx.commit().is_ok())
+                    .expect("commit result");
+                Ok(7)
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Hold the caller until the worker rejects its own expired commit.
+        // This exercises both the deadline and cancellation without a timer
+        // future getting the first chance to cancel the operation.
+        let committed = committed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker finishes");
+        let result = operation.await;
+        let count: i64 = backend
+            .conn()
+            .lock()
+            .await
+            .query_row("SELECT COUNT(*) FROM clock_probe", [], |row| row.get(0))
+            .expect("connection reused");
+        assert!(!committed, "the expired commit is rejected");
+        assert_eq!(count, 0, "rejected work leaves no durable row");
+        assert_eq!(
+            result
+                .expect_err("cancelled work cannot return success")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test]
     async fn pre_core_probe_timeout_never_queues_late_work_and_reuses_backend() {
         let backend = SqliteBackend::open_with_audit_key(":memory:", true, 0, shared_audit_key())
             .await
