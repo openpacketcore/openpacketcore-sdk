@@ -1183,6 +1183,8 @@ impl XfrmStagedInstall {
     where
         B: XfrmBackend + ?Sized + 'static,
     {
+        crate::composite::validate_composite_forward_transit(&self.request)
+            .map_err(XfrmStagedInstallRunError::from)?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedInstallRunError::RuntimeUnavailable)?;
         // Same reason as `install_sa_policy_with_rollback` and
@@ -2137,6 +2139,21 @@ mod tests {
             backend.operations().is_empty(),
             "no request may reach the kernel"
         );
+    }
+
+    #[tokio::test]
+    async fn forward_transit_staged_refuses_before_journal_or_sa_effects() {
+        for parameters in crate::model::malformed_forward_transit_parameters() {
+            let backend = Arc::new(GatedBackend::new());
+            let mut request = install_request();
+            request.policy.parameters = parameters;
+            let staged = XfrmStagedInstall::new(request);
+            let journal = staged.journal();
+            assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+            assert!(staged.run(backend.clone()).await.is_err());
+            assert!(backend.operations().is_empty());
+            assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+        }
     }
 
     #[tokio::test]

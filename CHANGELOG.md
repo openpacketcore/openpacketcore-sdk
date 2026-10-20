@@ -135,6 +135,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an enrolled volume's public installation, slot, incarnation and key digest
   after restart, without exporting private key material or granting admission.
 
+- `opc-ipsec-xfrm`: `PolicyParameters::forward_transit` and the explicit
+  `XfrmAction::AllowForwardTransit` install an unscoped Forward allow with a
+  nonzero full-mask mark and no transform template. Exact readback, removal and
+  durable fingerprints retain the complete identity. Other transit shapes are
+  rejected before writer admission, durable preparation or composite effects;
+  ordinary Allow policies keep their template requirement. The durable-install
+  and roster-request errors add `InvalidForwardTransit` for this refusal.
+
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
   Live predecessor-lease contention retains one nonterminal binding with a

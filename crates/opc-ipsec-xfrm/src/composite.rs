@@ -169,9 +169,9 @@ impl XfrmCompositeOutcome {
 /// Error returned by an SA-plus-policy install composite.
 #[derive(Debug, Clone)]
 pub enum XfrmCompositeInstallError {
-    /// SA install failed before policy install was attempted.
+    /// SA install failed, or policy preflight refused before any mutation.
     InstallSaFailed {
-        /// Backend error from SA install.
+        /// Backend error from SA install or the policy preflight error.
         source: XfrmError,
         /// Composite outcome evidence.
         outcome: XfrmCompositeOutcome,
@@ -237,9 +237,9 @@ impl Error for XfrmCompositeInstallError {
 pub struct XfrmBidirectionalInstallOutcome {
     /// True when both directions fully applied.
     pub applied: bool,
-    /// Outcome for the first direction.
+    /// First-direction outcome, or the preflight refusal of either request.
     pub first: XfrmCompositeOutcome,
-    /// Outcome for the second direction.
+    /// Second-direction outcome; not applied when either preflight refuses.
     pub second: XfrmCompositeOutcome,
     /// True when the first direction was removed after second-direction failure.
     pub cross_rolled_back: bool,
@@ -292,9 +292,13 @@ impl XfrmBidirectionalInstallOutcome {
 /// Error returned by a two-direction SA/policy install.
 #[derive(Debug, Clone)]
 pub enum XfrmBidirectionalInstallError {
-    /// First direction failed before the second direction was attempted.
+    /// First installation failed, or either request was refused in preflight.
+    ///
+    /// A preflight refusal happens before either direction is installed. Its
+    /// source and outcome are carried in this variant even when the refused
+    /// request was the second direction; no direction or rollback was attempted.
     FirstInstallFailed {
-        /// Backend/composite error from the first direction.
+        /// Error from the first install or either request's preflight.
         source: XfrmCompositeInstallError,
         /// Bidirectional outcome evidence.
         outcome: XfrmBidirectionalInstallOutcome,
@@ -355,6 +359,18 @@ impl Error for XfrmBidirectionalInstallError {
     }
 }
 
+/// Preflight the explicit transit action before admitting any composite effect.
+pub(crate) fn validate_composite_forward_transit(
+    request: &XfrmCompositeInstallRequest,
+) -> Result<(), XfrmCompositeInstallError> {
+    crate::model::validate_forward_transit_parameters(&request.policy.parameters).map_err(
+        |source| XfrmCompositeInstallError::InstallSaFailed {
+            source,
+            outcome: XfrmCompositeOutcome::not_applied(XfrmCompositeOperation::InstallSa),
+        },
+    )
+}
+
 /// Install a Security Association and its Security Policy with best-effort rollback.
 ///
 /// Operation order is [`XFRM_COMPOSITE_INSTALL_ORDER`]. If policy install
@@ -372,6 +388,7 @@ pub async fn install_sa_policy_with_rollback<B>(
 where
     B: XfrmBackend + ?Sized,
 {
+    validate_composite_forward_transit(&request)?;
     // Refuse before installing anything. Both rollback paths below delete by
     // re-selecting on these lookup marks, and that selection is never proven
     // unique: a narrower canonical mask can match another stored object, so a
@@ -431,6 +448,9 @@ where
 ///
 /// Returns [`XfrmBidirectionalInstallError`] with outcome evidence preserving
 /// both the failed composite result and any rollback failure.
+/// Both requests are preflighted before installation. Refusal of either request
+/// returns [`XfrmBidirectionalInstallError::FirstInstallFailed`] with neither
+/// direction applied, including when only the second request is invalid.
 // The public error preserves both directional outcomes and rollback evidence;
 // boxing it would change this established API.
 #[allow(clippy::result_large_err)]
@@ -442,6 +462,14 @@ where
     B: XfrmBackend + ?Sized,
 {
     let [first, second] = requests;
+    for request in [&first, &second] {
+        validate_composite_forward_transit(request).map_err(|source| {
+            XfrmBidirectionalInstallError::FirstInstallFailed {
+                outcome: XfrmBidirectionalInstallOutcome::first_failed(source.outcome()),
+                source,
+            }
+        })?;
+    }
 
     let first_outcome = match install_sa_policy_with_rollback(backend, first.clone()).await {
         Ok(outcome) => outcome,
@@ -511,6 +539,7 @@ pub async fn rekey_sa_policy<B>(
 where
     B: XfrmBackend + ?Sized,
 {
+    crate::model::validate_forward_transit_parameters(&policy.parameters)?;
     backend.rekey_sa(sa).await?;
     backend.rekey_policy(policy).await?;
     Ok(XfrmCompositeOutcome::applied())
@@ -740,6 +769,75 @@ mod tests {
             policy: InstallPolicyRequest {
                 parameters: policy_parameters(),
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_transit_composite_refuses_before_any_sa_effect_in_either_direction() {
+        for parameters in crate::model::malformed_forward_transit_parameters() {
+            for invalid_second in [false, true] {
+                let backend = FailingCompositeBackend::default();
+                let mut invalid = install_request();
+                invalid.policy.parameters = parameters.clone();
+                if invalid_second {
+                    let result = install_bidirectional_sa_policy_with_rollback(
+                        &backend,
+                        [install_request(), invalid.clone()],
+                    )
+                    .await;
+                    assert!(result.is_err());
+                    let XfrmBidirectionalInstallError::FirstInstallFailed { source, outcome } =
+                        result.unwrap_err()
+                    else {
+                        panic!("preflight of either direction must use FirstInstallFailed");
+                    };
+                    assert!(matches!(
+                        source,
+                        XfrmCompositeInstallError::InstallSaFailed {
+                            source: XfrmError::InvalidConfig {
+                                field: "forward_transit",
+                                ..
+                            },
+                            ..
+                        }
+                    ));
+                    assert_eq!(
+                        outcome,
+                        XfrmBidirectionalInstallOutcome {
+                            applied: false,
+                            first: XfrmCompositeOutcome::not_applied(
+                                XfrmCompositeOperation::InstallSa
+                            ),
+                            second: XfrmCompositeOutcome::not_applied(
+                                XfrmCompositeOperation::InstallSa
+                            ),
+                            cross_rolled_back: false,
+                            cross_rollback_failed: false,
+                            partial_state_possible: false,
+                        }
+                    );
+                } else {
+                    assert!(install_sa_policy_with_rollback(&backend, invalid.clone())
+                        .await
+                        .is_err());
+                }
+                assert!(
+                    backend.operations().is_empty(),
+                    "preflight must precede the first SA install"
+                );
+                assert!(rekey_sa_policy(
+                    &backend,
+                    RekeySaRequest {
+                        parameters: invalid.sa.parameters
+                    },
+                    RekeyPolicyRequest {
+                        parameters: invalid.policy.parameters
+                    }
+                )
+                .await
+                .is_err());
+                assert!(backend.operations().is_empty());
+            }
         }
     }
 

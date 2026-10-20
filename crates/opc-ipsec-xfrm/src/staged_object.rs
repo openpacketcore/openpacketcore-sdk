@@ -62,6 +62,16 @@ pub enum XfrmObjectInstallRequest {
 }
 
 impl XfrmObjectInstallRequest {
+    /// Validate the explicit transit action without reading or mutating state.
+    pub(crate) fn validate_forward_transit(&self) -> Result<(), XfrmError> {
+        match self {
+            Self::Policy(request) => {
+                crate::model::validate_forward_transit_parameters(&request.parameters)
+            }
+            Self::Sa(_) => Ok(()),
+        }
+    }
+
     /// Object kind installed by this request.
     pub const fn object(&self) -> XfrmInstallObject {
         match self {
@@ -1123,6 +1133,12 @@ impl XfrmStagedObjectInstall {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedObjectInstallRunError::RuntimeUnavailable)?;
         let install_operation = self.journal.inner.install_operation;
+        self.request.validate_forward_transit().map_err(|source| {
+            XfrmStagedObjectInstallRunError::InstallFailed {
+                operation: install_operation,
+                source,
+            }
+        })?;
         // Refuse before installing anything. This journal retains a removal
         // identity so recovery can delete the object it installed, and that
         // delete re-selects by lookup mark without proving the selection is
@@ -1210,6 +1226,30 @@ mod tests {
         RekeyPolicyRequest, RekeySaRequest, SaParameters, SaState, SpiAllocation, XfrmAction,
         XfrmDirection, XfrmId, XfrmLookupMark, XfrmMode, XfrmProbe, XfrmSelector, XfrmTemplate,
     };
+
+    #[tokio::test]
+    async fn forward_transit_staged_object_refuses_before_journal_or_backend_effects() {
+        for parameters in crate::model::malformed_forward_transit_parameters() {
+            let backend = Arc::new(GatedBackend::new());
+            let staged = XfrmStagedObjectInstall::new(XfrmObjectInstallRequest::Policy(
+                InstallPolicyRequest { parameters },
+            ));
+            let journal = staged.journal();
+            assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::NotStarted);
+            assert!(matches!(
+                staged.run(backend.clone()).await,
+                Err(XfrmStagedObjectInstallRunError::InstallFailed {
+                    source: XfrmError::InvalidConfig {
+                        field: "forward_transit",
+                        ..
+                    },
+                    ..
+                })
+            ));
+            assert!(backend.operations().is_empty());
+            assert_eq!(journal.ownership(), XfrmObjectInstallOwnership::NotStarted);
+        }
+    }
 
     #[derive(Debug, Default)]
     struct BackendState {

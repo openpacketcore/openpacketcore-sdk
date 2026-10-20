@@ -990,6 +990,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn install_policy(&self, request: InstallPolicyRequest) -> Result<(), XfrmError> {
+        crate::model::validate_forward_transit_parameters(&request.parameters)?;
         self.admit_mutation()?;
         let mut state = self
             .state
@@ -1014,6 +1015,7 @@ impl XfrmBackend for MockXfrmBackend {
     }
 
     async fn rekey_policy(&self, request: RekeyPolicyRequest) -> Result<(), XfrmError> {
+        crate::model::validate_forward_transit_parameters(&request.parameters)?;
         self.admit_mutation()?;
         let mut state = self
             .state
@@ -1168,6 +1170,82 @@ mod tests {
             mark: None,
             if_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn marked_forward_transit_mock_roundtrip_and_exact_removal() {
+        let backend = MockXfrmBackend::new();
+        let parameters = PolicyParameters::forward_transit(
+            sample_selector(),
+            100,
+            XfrmLookupMark::full(0x4000_0001),
+        )
+        .unwrap();
+        backend
+            .install_policy(InstallPolicyRequest {
+                parameters: parameters.clone(),
+            })
+            .await
+            .unwrap();
+        let query = QueryPolicyRequest::new(parameters.selector.clone(), XfrmDirection::Forward)
+            .with_mark(parameters.mark.unwrap());
+        assert_eq!(
+            backend.query_policy(query.clone()).await.unwrap(),
+            parameters
+        );
+        assert!(matches!(
+            backend
+                .query_policy(
+                    QueryPolicyRequest::new(parameters.selector.clone(), XfrmDirection::Forward)
+                        .with_mark(XfrmLookupMark::full(0x4000_0002))
+                )
+                .await,
+            Err(XfrmError::NotFound)
+        ));
+        backend
+            .remove_policy_exact(ExactRemovePolicyRequest::new(
+                RemovePolicyRequest::new(parameters.selector, XfrmDirection::Forward)
+                    .with_mark(parameters.mark.unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            backend.query_policy(query).await,
+            Err(XfrmError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn marked_forward_transit_mock_refuses_unmarked_shape() {
+        let backend = MockXfrmBackend::new();
+        let mut parameters = PolicyParameters::forward_transit(
+            sample_selector(),
+            100,
+            XfrmLookupMark::full(0x4000_0001),
+        )
+        .unwrap();
+        parameters.mark = None;
+        assert!(matches!(
+            backend
+                .install_policy(InstallPolicyRequest {
+                    parameters: parameters.clone()
+                })
+                .await,
+            Err(XfrmError::InvalidConfig {
+                field: "forward_transit",
+                ..
+            })
+        ));
+        assert!(matches!(
+            backend
+                .rekey_policy(RekeyPolicyRequest { parameters })
+                .await,
+            Err(XfrmError::InvalidConfig {
+                field: "forward_transit",
+                ..
+            })
+        ));
+        assert!(backend.operations().is_empty());
     }
 
     #[tokio::test]

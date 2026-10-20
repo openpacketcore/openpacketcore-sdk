@@ -450,6 +450,11 @@ pub enum XfrmAction {
     Allow,
     /// Block matching packets.
     Block,
+    /// Allow forwarded plaintext with an exact nonzero packet mark and no
+    /// transform template. This explicit opt-in is valid only for an unscoped
+    /// [`XfrmDirection::Forward`] policy. It does not authorize inbound or
+    /// locally generated traffic and does not request IPsec protection.
+    AllowForwardTransit,
 }
 
 /// The exact Linux kernel XFRM name for AES-CBC encryption; do not hand-write
@@ -842,6 +847,109 @@ pub struct PolicyParameters {
     pub mark: Option<XfrmLookupMark>,
     /// Optional XFRM interface identifier.
     pub if_id: Option<u32>,
+}
+
+impl PolicyParameters {
+    /// Build a template-free forward transit allow for one complete mark.
+    ///
+    /// The caller must ensure that only already-authorized packets receive
+    /// this mark and coordinate routing, protective policies and producer
+    /// activation. This policy supplies no tunnel or source authentication.
+    /// Exact readback recognizes the same unscoped Forward/Allow/empty-template
+    /// shape as [`XfrmAction::AllowForwardTransit`]. Existing ordinary `Allow`
+    /// installations still require a transform template.
+    /// Lower numeric priorities win: a transit policy that outranks an
+    /// overlapping Forward policy takes precedence for matching marked packets,
+    /// including over an unmarked policy requiring a tunnel. Linux drops
+    /// matching tunnel-decapsulated traffic that carries the transit mark.
+    /// Mark specificity does not override priority; equal-priority matches
+    /// depend on kernel ordering, so coordinate distinct priorities for overlaps.
+    ///
+    /// # Errors
+    /// Returns [`XfrmError::InvalidConfig`] for a zero or non-full-mask mark.
+    pub fn forward_transit(
+        selector: XfrmSelector,
+        priority: u32,
+        mark: XfrmLookupMark,
+    ) -> Result<Self, XfrmError> {
+        let parameters = Self {
+            selector,
+            direction: XfrmDirection::Forward,
+            action: XfrmAction::AllowForwardTransit,
+            priority,
+            templates: Vec::new(),
+            mark: Some(mark),
+            if_id: None,
+        };
+        validate_forward_transit_parameters(&parameters)?;
+        Ok(parameters)
+    }
+}
+
+pub(crate) fn validate_forward_transit_parameters(
+    parameters: &PolicyParameters,
+) -> Result<(), XfrmError> {
+    if parameters.action == XfrmAction::AllowForwardTransit
+        && (parameters.direction != XfrmDirection::Forward
+            || !parameters.templates.is_empty()
+            || parameters.if_id.is_some()
+            || !parameters
+                .mark
+                .is_some_and(|mark| mark.is_exact_profile() && mark.value() != 0))
+    {
+        return Err(XfrmError::invalid_config(
+            "forward_transit",
+            "transit allow requires Forward, a nonzero full-mask mark, no templates and no interface ID",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn malformed_forward_transit_parameters() -> Vec<PolicyParameters> {
+    let valid = PolicyParameters::forward_transit(
+        XfrmSelector::new(
+            IpAddress::Ipv4([192, 0, 2, 1]),
+            IpAddress::Ipv4([192, 0, 2, 2]),
+            17,
+        ),
+        100,
+        XfrmLookupMark::full(0x4000_0001),
+    )
+    .unwrap();
+    let mut malformed = Vec::new();
+    for direction in [XfrmDirection::In, XfrmDirection::Out] {
+        let mut parameters = valid.clone();
+        parameters.direction = direction;
+        malformed.push(parameters);
+    }
+    for mark in [
+        None,
+        Some(XfrmLookupMark::full(0)),
+        Some(XfrmLookupMark::new(0x10, 0xf0).unwrap()),
+    ] {
+        let mut parameters = valid.clone();
+        parameters.mark = mark;
+        malformed.push(parameters);
+    }
+    for if_id in [0, 42] {
+        let mut parameters = valid.clone();
+        parameters.if_id = Some(if_id);
+        malformed.push(parameters);
+    }
+    let mut parameters = valid;
+    parameters.templates.push(XfrmTemplate {
+        id: XfrmId {
+            destination: IpAddress::Ipv4([192, 0, 2, 2]),
+            spi: 256,
+            protocol: 50,
+        },
+        source_address: IpAddress::Ipv4([192, 0, 2, 1]),
+        request_id: None,
+        mode: XfrmMode::Tunnel,
+    });
+    malformed.push(parameters);
+    malformed
 }
 
 /// Template describing an SA that may satisfy a policy.
