@@ -11528,6 +11528,35 @@ mod tests {
     fn fixed_snapshot_seal_waits_for_test_child_descriptor_retirement() {
         use std::io::Write as _;
 
+        const PARENT_PID: &str = "OPC_SNAPSHOT_SEAL_RETIREMENT_PARENT_PID";
+        const TEST: &str = "consensus::storage::tests::fixed_snapshot_seal_waits_for_test_child_descriptor_retirement";
+        if std::env::var_os(PARENT_PID).is_none() {
+            // Keep the deliberate write hold, and any poisoning on panic,
+            // out of unrelated seals and store opens in the shared process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=4", "--nocapture"])
+                .env(PARENT_PID, std::process::id().to_string())
+                .test_output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                "isolated seal descriptor retirement: {stdout}\n{stderr}"
+            );
+            return;
+        }
+
+        let fixture_pid = std::process::id();
+        let parent_pid = std::env::var(PARENT_PID)
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(fixture_pid);
+        assert_eq!(
+            parent_pid,
+            std::os::unix::process::parent_id(),
+            "the descriptor-retirement parent marker must identify the actual launcher"
+        );
+
         let directory = fs_verity_snapshot_tempdir("child-descriptor-seal-");
         let path = directory.path().join("snapshot");
         let writer = std::fs::OpenOptions::new()
@@ -11548,6 +11577,10 @@ mod tests {
         );
         // Model a child paused before exec with the parent's writable open
         // description still retained. CLOEXEC does not close it until exec.
+        assert_ne!(
+            fixture_pid, parent_pid,
+            "the descriptor-retirement write hold must run outside the shared test process"
+        );
         let launch = crate::test_process::SNAPSHOT_PROCESS_FD_GATE
             .write()
             .unwrap();

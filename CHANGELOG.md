@@ -820,6 +820,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: isolate the snapshot seal descriptor-retirement fixture
+  in a child process so its deliberate write-gate hold cannot stall or poison
+  unrelated seals and store opens. Verify its parent marker against the actual
+  parent process. Preserve all assertions and timing bounds.
 - `opc-egress-fence`: keep empty and truncated L3 vectors in the independent
   object oracle executable on kernels that reject short IP test-run transport
   headers. Preserve the exact packet bytes and every gate assertion.
