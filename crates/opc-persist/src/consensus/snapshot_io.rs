@@ -15,8 +15,44 @@ use super::storage::SnapshotDirectoryOwner;
 // Each blocking closure owns this handle, including while queued. Dropping its
 // async caller or runtime cannot release admission before the physical I/O.
 struct OwnedHandle {
-    file: Mutex<File>,
+    file: Mutex<SnapshotFile>,
     _owner: Option<Arc<SnapshotDirectoryOwner>>,
+}
+
+struct SnapshotFile {
+    file: File,
+    #[cfg(test)]
+    positioning_calls: usize,
+}
+
+impl SnapshotFile {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.file.read(bytes)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.write_all(bytes)
+    }
+
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        #[cfg(test)]
+        {
+            self.positioning_calls += 1;
+        }
+        self.file.seek(position)
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    fn metadata(&self) -> io::Result<Metadata> {
+        self.file.metadata()
+    }
+
+    fn set_permissions(&self, permissions: Permissions) -> io::Result<()> {
+        self.file.set_permissions(permissions)
+    }
 }
 
 enum CompletedIo {
@@ -44,7 +80,11 @@ impl SnapshotIo {
     pub(super) fn new(file: File, owner: Option<Arc<SnapshotDirectoryOwner>>) -> Self {
         Self {
             handle: Arc::new(OwnedHandle {
-                file: Mutex::new(file),
+                file: Mutex::new(SnapshotFile {
+                    file,
+                    #[cfg(test)]
+                    positioning_calls: 0,
+                }),
                 _owner: owner,
             }),
             verification_owner: None,
@@ -66,7 +106,7 @@ impl SnapshotIo {
 
     fn spawn<T: Send + 'static>(
         &self,
-        operation: impl FnOnce(&mut File) -> io::Result<T> + Send + 'static,
+        operation: impl FnOnce(&mut SnapshotFile) -> io::Result<T> + Send + 'static,
     ) -> JoinHandle<io::Result<T>> {
         let handle = self.handle.clone();
         let owner = self.verification_owner.clone();
@@ -85,7 +125,7 @@ impl SnapshotIo {
 
     async fn run<T: Send + 'static>(
         &mut self,
-        operation: impl FnOnce(&mut File) -> io::Result<T> + Send + 'static,
+        operation: impl FnOnce(&mut SnapshotFile) -> io::Result<T> + Send + 'static,
     ) -> io::Result<T> {
         self.flush().await?;
         self.spawn(operation)
@@ -229,6 +269,9 @@ impl AsyncSeek for SnapshotIo {
         Poll::Ready(Ok(self.position))
     }
 }
+
+#[cfg(test)]
+mod operation_tests;
 
 #[cfg(test)]
 mod tests {
