@@ -157,8 +157,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-net`: expose
   `PersistentSessionConsumerClient::lease_mutation_status_with_budget` for
   ordinary acquire, renew and release receipt recovery within an existing
-  checkpoint deadline. The method preserves exact request identity, ordinary
-  error mapping, pre-write caps and the shared extended-read capacity reserve.
+  checkpoint deadline. The method preserves exact request identity, store-error
+  and wire-rejection mapping, pre-write caps and the shared extended-read capacity
+  reserve. Transport authority loss returns terminal `TopologyAuthorityRevoked`
+  instead of the legacy method's `BackendUnavailable`.
   It rejects newly observed success at expiry and spends the remaining deadline
   after possible transmission, without replaying the lease mutation.
 
