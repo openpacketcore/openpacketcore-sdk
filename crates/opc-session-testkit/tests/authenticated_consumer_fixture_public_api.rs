@@ -93,6 +93,13 @@ async fn public_semantic_successor_control(
 
 fn assert_session_store_backend<T: SessionStoreBackend>() {}
 
+#[cfg(feature = "test-control")]
+#[test]
+fn external_consumer_can_subscribe_to_v2_committed_reply_suppression() {
+    let _: fn(&AuthenticatedPreparedFencedTransitionFixture) -> tokio::sync::broadcast::Receiver<()> =
+        AuthenticatedPreparedFencedTransitionFixture::subscribe_fenced_transition_v2_response_suppressed;
+}
+
 #[test]
 fn external_consumer_can_use_only_the_opaque_facade_and_redacted_diagnostics() {
     let _ = public_local_aead_constructor;

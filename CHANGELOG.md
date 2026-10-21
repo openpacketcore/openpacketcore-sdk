@@ -155,6 +155,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trust-domain and workload-path validation. `from_cert_der` continues to use
   the current UTC time.
 
+- `opc-session-testkit`: a `test-control`-gated, payload-free subscription
+  observes real successful V2 commits whose replies the authenticated fixture
+  suppresses. Controlled-clock clients can wait for that boundary before
+  advancing their unchanged attempt deadline and recovering the exact receipt.
+  The subscription and its state are absent without the non-production feature.
+
 - `opc-session-store`: `SqliteSessionBackend::voter_identity_binding` returns
   an enrolled volume's public installation, slot, incarnation and key digest
   after restart, without exporting private key material or granting admission.

@@ -33,6 +33,8 @@ use super::*;
 mod journal_priority_tests;
 mod lease_deferral_tests;
 mod read_deadline_tests;
+#[cfg(feature = "test-control")]
+mod response_loss_observation_tests;
 mod void_tests;
 
 const PAYLOAD: &[u8] = b"fixture-v2-facade-payload";
