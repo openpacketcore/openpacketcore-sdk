@@ -8,8 +8,8 @@ async fn committed_reply_suppressed_event_drives_original_deadline_without_repla
     let fixture = AuthenticatedPreparedFencedTransitionFixture::start([scope()])
         .await
         .expect("start authenticated three-voter fixture");
-    let (fixture, result) = with_fixture_protocol_clock("V2 committed response-loss event", async move {
-        let result = std::panic::AssertUnwindSafe(async {
+    let exercise = async move {
+        let assertions = async {
             let facade = fixture
                 .open_local_aead_v2(CountingProvider::new(), "fixture-v2-loss-event")
                 .await
@@ -25,9 +25,38 @@ async fn committed_reply_suppressed_event_drives_original_deadline_without_repla
                 .expect("prepare ordinary transition");
             let outcome = prepared.execute_once().await.expect("ordinary commit");
             assert!(outcome.matches_request(&ordinary));
-            assert_eq!(events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty));
-            prepared.release_resolved().await.expect("release ordinary receipt");
+            assert_eq!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            );
+            prepared
+                .release_resolved()
+                .await
+                .expect("release ordinary receipt");
             drop(prepared);
+
+            // A conflicting real mutation must return its rejection without
+            // consuming the fault or announcing a successful suppressed reply.
+            let mut rejected = facade
+                .prepare_fenced_transition(
+                    create(request_id(0x6010), 0x6000, PAYLOAD),
+                    budget(soon()),
+                )
+                .await
+                .expect("prepare a conflict against the existing lease and record");
+            fixture.lose_next_fenced_transition_v2_response();
+            assert!(matches!(
+                rejected.execute_once().await,
+                Err(FencedTransitionExecuteError::Rejected(_))
+            ));
+            assert!(fixture
+                .lose_next_fenced_transition_v2_response
+                .load(Ordering::Acquire));
+            assert_eq!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            );
+            drop(rejected);
 
             // Reuse the subscription across two separately armed real commits.
             for ordinal in 1..=2 {
@@ -59,29 +88,76 @@ async fn committed_reply_suppressed_event_drives_original_deadline_without_repla
                         event = events.recv() => event.expect("observe real committed response suppression"),
                     }
                     assert_eq!(tokio::time::Instant::now() - started, Duration::ZERO);
-                    assert_eq!(late_polled.try_recv(), Ok(()), "a subscriber need not be polled before emission");
-                    assert_eq!(events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty));
-                    let mut new_subscriber = fixture.subscribe_fenced_transition_v2_response_suppressed();
-                    assert_eq!(new_subscriber.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty));
+                    assert_eq!(
+                        late_polled.try_recv(),
+                        Ok(()),
+                        "a subscriber need not be polled before emission"
+                    );
+                    assert_eq!(
+                        events.try_recv(),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                    );
+                    let mut new_subscriber =
+                        fixture.subscribe_fenced_transition_v2_response_suppressed();
+                    assert_eq!(
+                        new_subscriber.try_recv(),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                    );
 
-                    let observed = facade.observe_fenced_transition(&session_key(label)).await.expect("authoritative readback at notification");
-                    assert_eq!(observed.record().expect("commit precedes event").payload.as_bytes(), PAYLOAD);
+                    let observed = facade
+                        .observe_fenced_transition(&session_key(label))
+                        .await
+                        .expect("authoritative readback at notification");
+                    assert_eq!(
+                        observed
+                            .record()
+                            .expect("commit precedes event")
+                            .payload
+                            .as_bytes(),
+                        PAYLOAD
+                    );
                     tokio::time::advance(attempt_timeout - FIXTURE_TIMER_TICK).await;
-                    assert!(futures_util::poll!(&mut execution).is_pending(), "the original physical deadline still applies");
+                    assert!(
+                        futures_util::poll!(&mut execution).is_pending(),
+                        "the original physical deadline still applies"
+                    );
                     tokio::time::advance(FIXTURE_TIMER_TICK * 2).await;
-                    assert_eq!(execution.await, Err(FencedTransitionExecuteError::OutcomeUnknown { request_id: id }));
+                    assert_eq!(
+                        execution.await,
+                        Err(FencedTransitionExecuteError::OutcomeUnknown { request_id: id })
+                    );
                 }
-                let status = prepared.status_until_terminal(deadline).await.expect("recover exact receipt");
-                assert!(matches!(status, FencedTransitionV2Status::Recorded(result) if matches!(&*result, Ok(outcome) if outcome.matches_request(&request))));
-                assert_eq!(fixture.diagnostics().fenced_transition_v2_calls(), ordinal as usize + 1, "receipt recovery never replays a mutation");
-                assert_eq!(tokio::time::Instant::now() - started, attempt_timeout + FIXTURE_TIMER_TICK);
-                prepared.release_resolved().await.expect("release recovered receipt");
+                let status = prepared
+                    .status_until_terminal(deadline)
+                    .await
+                    .expect("recover exact receipt");
+                assert!(
+                    matches!(status, FencedTransitionV2Status::Recorded(result) if matches!(&*result, Ok(outcome) if outcome.matches_request(&request)))
+                );
+                assert_eq!(
+                    fixture.diagnostics().fenced_transition_v2_calls(),
+                    ordinal as usize + 2,
+                    "receipt recovery never replays a mutation"
+                );
+                assert_eq!(
+                    tokio::time::Instant::now() - started,
+                    attempt_timeout + FIXTURE_TIMER_TICK
+                );
+                prepared
+                    .release_resolved()
+                    .await
+                    .expect("release recovered receipt");
             }
             assert_eq!(fixture.diagnostics().fenced_transition_calls(), 0);
             assert_eq!(fixture.diagnostics().general_mutation_calls(), 0);
-        }).catch_unwind().await;
+        };
+        let result = std::panic::AssertUnwindSafe(assertions)
+            .catch_unwind()
+            .await;
         (fixture, result)
-    }).await;
+    };
+    let (fixture, result) =
+        with_fixture_protocol_clock("V2 committed response-loss event", exercise).await;
     fixture.shutdown().await.expect("shut down fixture");
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);

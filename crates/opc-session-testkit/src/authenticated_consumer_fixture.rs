@@ -262,6 +262,20 @@ impl fmt::Debug for FixtureGeneralConsumerBackend {
 /// and the facade accepts only an opaque V1-prewarmed roster. The fixture
 /// owns every lower layer and returns only an affine facade or a paired
 /// ordinary backend whose V1 transition methods fail closed.
+#[cfg_attr(
+    not(feature = "test-control"),
+    doc = r#"
+The response-suppression subscription is absent without `test-control`:
+
+```compile_fail
+use opc_session_testkit::authenticated_consumer_fixture::AuthenticatedPreparedFencedTransitionFixture;
+
+fn subscribe(fixture: &AuthenticatedPreparedFencedTransitionFixture) {
+    let _ = fixture.subscribe_fenced_transition_v2_response_suppressed();
+}
+```
+"#
+)]
 pub struct AuthenticatedPreparedFencedTransitionFixture {
     cluster: ConsensusTestCluster,
     roster: SessionConsumerRoster,
@@ -1226,6 +1240,8 @@ impl AuthenticatedPreparedFencedTransitionFixture {
                 Arc::new(cluster.store(store_index).consumer_service()),
                 lose_next_fenced_transition_response.clone(),
                 lose_next_fenced_transition_v2_response.clone(),
+                #[cfg(feature = "test-control")]
+                fenced_transition_v2_response_suppressed.clone(),
                 fenced_transition_status_misses_remaining.clone(),
                 Arc::clone(&ordinary_cas_fault),
                 voters.len(),
@@ -1976,6 +1992,8 @@ struct FixtureConsumer {
     reply_gates: [Mutex<Option<Arc<tokio::sync::Semaphore>>>; 10],
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
+    #[cfg(feature = "test-control")]
+    fenced_transition_v2_response_suppressed: tokio::sync::broadcast::Sender<()>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
     fenced_transition_calls: AtomicUsize,
     fenced_transition_status_calls: AtomicUsize,
@@ -2020,6 +2038,8 @@ impl FixtureConsumer {
         inner: Arc<dyn SessionQuorumConsumer>,
         lose_next_fenced_transition_response: Arc<AtomicBool>,
         lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
+        #[cfg(feature = "test-control")]
+        fenced_transition_v2_response_suppressed: tokio::sync::broadcast::Sender<()>,
         fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
         ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
         voter: usize,
@@ -2038,6 +2058,8 @@ impl FixtureConsumer {
             reply_gates: std::array::from_fn(|_| Mutex::new(None)),
             lose_next_fenced_transition_response,
             lose_next_fenced_transition_v2_response,
+            #[cfg(feature = "test-control")]
+            fenced_transition_v2_response_suppressed,
             fenced_transition_status_misses_remaining,
             fenced_transition_calls: AtomicUsize::new(0),
             fenced_transition_status_calls: AtomicUsize::new(0),
@@ -2370,6 +2392,8 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            #[cfg(feature = "test-control")]
+            let _ = self.fenced_transition_v2_response_suppressed.send(());
             std::future::pending::<SessionConsumerV2Response>().await;
         }
         response
