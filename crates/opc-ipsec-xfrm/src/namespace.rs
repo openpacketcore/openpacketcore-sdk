@@ -7711,22 +7711,26 @@ mod tests {
                 .rekey_policy(RekeyPolicyRequest { parameters })
                 .await
                 .is_err(),
-            "durable" => backend
-                .prepare_durable_object_install(
+            "durable" => matches!(
+                backend
+                    .prepare_durable_object_install(
+                        &store,
+                        XfrmObjectInstallOperationId::generate().unwrap(),
+                        generation,
+                        XfrmObjectInstallRequest::Policy(InstallPolicyRequest { parameters }),
+                    )
+                    .await,
+                Err(XfrmObjectInstallDurableError::InvalidPolicy)
+            ),
+            "store" => matches!(
+                prepare_object_install(
                     &store,
                     XfrmObjectInstallOperationId::generate().unwrap(),
                     generation,
-                    XfrmObjectInstallRequest::Policy(InstallPolicyRequest { parameters }),
-                )
-                .await
-                .is_err(),
-            "store" => prepare_object_install(
-                &store,
-                XfrmObjectInstallOperationId::generate().unwrap(),
-                generation,
-                &XfrmObjectInstallRequest::Policy(InstallPolicyRequest { parameters }),
-            )
-            .is_err(),
+                    &XfrmObjectInstallRequest::Policy(InstallPolicyRequest { parameters }),
+                ),
+                Err(XfrmObjectInstallDurableError::InvalidPolicy)
+            ),
             _ => unreachable!(),
         };
         assert_eq!(

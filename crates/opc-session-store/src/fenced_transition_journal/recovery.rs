@@ -31,9 +31,27 @@ use super::{
 #[cfg(unix)]
 use super::{SecureJournalFileBounds, SecureJournalPathGuard};
 use crate::{
-    FencedTransitionRequestId, FencedTransitionV2HistoryEpoch, FencedTransitionV2Request,
-    StoreError, FENCED_TRANSITION_MAX_PREPARED_BYTES, FENCED_TRANSITION_REQUEST_ID_BYTES,
+    scope_scheduler::ScopeWorkClass, FencedTransitionRequestId, FencedTransitionV2HistoryEpoch,
+    FencedTransitionV2Request, StoreError, FENCED_TRANSITION_MAX_PREPARED_BYTES,
+    FENCED_TRANSITION_REQUEST_ID_BYTES,
 };
+
+/// SDK composition guard retaining priority across consecutive local steps.
+///
+/// Keep this only across local journal awaits. Drop it before provider or
+/// transport I/O, sleeps and idle waits. Cancellation releases its registration;
+/// admitted blocking operations retain their own permits through completion.
+#[doc(hidden)]
+#[must_use]
+pub struct FencedTransitionV2RecoveryPriorityGuard {
+    _registration: operation_gate::RecoveryOperationRegistration,
+}
+
+impl fmt::Debug for FencedTransitionV2RecoveryPriorityGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FencedTransitionV2RecoveryPriorityGuard(<redacted>)")
+    }
+}
 
 /// Width of the independent integrity key protecting one recovery journal.
 pub const FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES: usize = 32;
@@ -58,8 +76,11 @@ const OWNED_RECOVERY_SCHEMA_VERSION: i64 = 2;
 #[cfg(unix)]
 #[path = "recovery/creation.rs"]
 mod creation;
+#[path = "recovery/operation_gate.rs"]
+mod operation_gate;
 #[path = "recovery/ownership.rs"]
 mod ownership;
+use operation_gate::RecoveryOperationGate;
 use ownership::RecoveryOwnership;
 pub use ownership::{
     FencedTransitionV2RecoveryCall, FencedTransitionV2RecoveryNotice,
@@ -208,7 +229,10 @@ struct RecoveryJournalInner {
 pub struct FencedTransitionV2RecoveryJournal {
     inner: Arc<RecoveryJournalInner>,
     capacity: usize,
-    operation_permit: Arc<tokio::sync::Semaphore>,
+    operation_gate: Arc<RecoveryOperationGate>,
+    operation_class: ScopeWorkClass,
+    #[cfg(any(test, feature = "test-control"))]
+    preparation_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     // Caller IDs whose preparation is between its cross-journal absence
     // check and its create-only insert, in this process.
     admissions: Arc<Mutex<BTreeSet<[u8; FENCED_TRANSITION_REQUEST_ID_BYTES]>>>,
@@ -486,10 +510,101 @@ impl FencedTransitionV2RecoveryJournal {
                 ownership,
             }),
             capacity: FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES,
-            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            operation_gate: Arc::new(RecoveryOperationGate::new()),
+            operation_class: ScopeWorkClass::Normal,
+            #[cfg(any(test, feature = "test-control"))]
+            preparation_pause: None,
             admissions: Arc::new(Mutex::new(BTreeSet::new())),
             bound_scope: Arc::new(std::sync::OnceLock::new()),
         })
+    }
+
+    /// Return a view using `class` for its recovery-journal operations.
+    ///
+    /// Views share the same connection, admission state and operation gate.
+    /// Changing one view never changes another caller's class. Newly opened
+    /// journals use [`ScopeWorkClass::Normal`].
+    ///
+    /// Operations follow [`ScopeWorkClass::priority_rank`], with FIFO order
+    /// within each class. Higher-ranked work precedes queued lower-ranked
+    /// work; already admitted blocking operations finish first. Consumer
+    /// calls retain registration across consecutive local journal steps, so
+    /// lower classes cannot interleave within a local sequence. They release
+    /// registration before remote I/O, sealing, backoff and idle waits.
+    ///
+    /// One active higher-ranked local sequence defers lower work until it ends;
+    /// sustained local sequences can starve a lower class. This raw journal
+    /// view supplies no caller deadline; callers must bound their own awaits.
+    /// The consumer facade applies its caller or default operation budget.
+    /// No SQLite progress bound is extended.
+    ///
+    /// Cancelling a waiting future removes its place. Once admitted, blocking
+    /// work retains the operation permit through completion, even if its
+    /// caller stops waiting. This is the same lifetime as ordinary operations.
+    pub fn with_operation_class(&self, class: ScopeWorkClass) -> Self {
+        Self {
+            operation_class: class,
+            ..self.clone()
+        }
+    }
+
+    /// SDK composition only: retain a class across consecutive local steps.
+    /// This registers priority without holding an operation permit. Drop the
+    /// guard before provider or transport I/O, sleeps and idle waits.
+    #[doc(hidden)]
+    pub fn retain_call_priority(&self) -> FencedTransitionV2RecoveryPriorityGuard {
+        FencedTransitionV2RecoveryPriorityGuard {
+            _registration: self.operation_gate.register(self.operation_class),
+        }
+    }
+
+    /// Local scheduling class carried by this journal view.
+    pub const fn operation_class(&self) -> ScopeWorkClass {
+        self.operation_class
+    }
+
+    /// Hold one operation admission until the returned guard is dropped.
+    ///
+    /// Non-production control for deterministic contention tests. This shares
+    /// the real gate and class with journal operations, without touching SQLite.
+    #[cfg(any(test, feature = "test-control"))]
+    #[doc(hidden)]
+    pub async fn hold_operation_for_test(&self) -> Result<impl Send + 'static, StoreError> {
+        self.operation_gate.acquire(self.operation_class).await
+    }
+
+    /// Pause a preparation between caller registration and the absent-row check.
+    /// Non-production control for testing consecutive local journal steps.
+    #[cfg(any(test, feature = "test-control"))]
+    #[doc(hidden)]
+    pub fn with_preparation_pause_for_test(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            preparation_pause: Some((entered, release)),
+            ..self.clone()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-control"))]
+    pub(crate) async fn pause_preparation_for_test(&self) {
+        if let Some((entered, release)) = &self.preparation_pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+    }
+
+    /// Admission count for one class, shared by every view.
+    ///
+    /// Non-production observation for contention tests; contains no request,
+    /// journal or caller identifiers. Holding an admission through the
+    /// test control also increments its class's count.
+    #[cfg(any(test, feature = "test-control"))]
+    #[doc(hidden)]
+    pub fn operation_admissions_for_test(&self, class: ScopeWorkClass) -> usize {
+        self.operation_gate.admissions(class)
     }
 
     /// Admit one caller-stable ID to preparation in this process.
@@ -918,10 +1033,7 @@ impl FencedTransitionV2RecoveryJournal {
             + Send
             + 'static,
     {
-        let permit = Arc::clone(&self.operation_permit)
-            .acquire_owned()
-            .await
-            .map_err(|_| recovery_unavailable())?;
+        let permit = self.operation_gate.acquire(self.operation_class).await?;
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -1906,6 +2018,146 @@ mod tests {
             result,
             Err(StoreError::FencedTransitionRecoveryJournalUnavailable)
         ));
+    }
+
+    fn admissions(journal: &FencedTransitionV2RecoveryJournal) -> [usize; 2] {
+        [ScopeWorkClass::Normal, ScopeWorkClass::Emergency]
+            .map(|class| journal.operation_admissions_for_test(class))
+    }
+
+    async fn marked_operation(
+        journal: FencedTransitionV2RecoveryJournal,
+        marker: u8,
+        order: Arc<Mutex<Vec<u8>>>,
+    ) -> Result<(), StoreError> {
+        journal
+            .with_connection(false, move |conn, _| {
+                assert_eq!(
+                    conn.query_row("SELECT 1", [], |row| row.get::<_, u8>(0))
+                        .expect("real connection operation"),
+                    1,
+                );
+                order.lock().expect("operation order").push(marker);
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_urgent_view_precedes_queued_ordinary_connection_work() {
+        let fixture = RecoveryFixture::new(0x21);
+        let journal = fixture.create();
+        assert_eq!(journal.operation_class, ScopeWorkClass::Normal);
+        let urgent = journal.with_operation_class(ScopeWorkClass::Emergency);
+        let running = journal.hold_operation_for_test().await.expect("hold gate");
+        let before = admissions(&journal);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut first = Box::pin(marked_operation(journal.clone(), 1, Arc::clone(&order)));
+        let mut second = Box::pin(marked_operation(journal.clone(), 2, Arc::clone(&order)));
+        let mut urgent = Box::pin(marked_operation(urgent, 3, Arc::clone(&order)));
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        assert!(futures_util::poll!(&mut urgent).is_pending());
+        drop(running);
+        assert!(futures_util::poll!(&mut first).is_pending());
+        urgent.await.expect("urgent connection operation");
+        assert_eq!(admissions(&journal), [before[0], before[1] + 1]);
+        first.await.expect("first ordinary connection operation");
+        second.await.expect("second ordinary connection operation");
+        assert_eq!(*order.lock().expect("order"), [3, 1, 2]);
+        assert_eq!(admissions(&journal), [before[0] + 2, before[1] + 1]);
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_views_use_every_rank_for_real_connection_operations() {
+        let fixture = RecoveryFixture::new(0x21);
+        let journal = fixture.create();
+        let held = journal.hold_operation_for_test().await.expect("hold gate");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut classes = ScopeWorkClass::ALL;
+        classes.sort_by_key(|class| class.priority_rank());
+        let mut waiting = Vec::new();
+        for class in classes.into_iter().rev() {
+            let mut operation = Box::pin(marked_operation(
+                journal.with_operation_class(class),
+                class.into(),
+                Arc::clone(&order),
+            ));
+            assert!(futures_util::poll!(&mut operation).is_pending());
+            waiting.push(operation);
+        }
+        drop(held);
+        while let Some(next) = waiting.pop() {
+            for operation in &mut waiting {
+                assert!(futures_util::poll!(operation.as_mut()).is_pending());
+            }
+            next.await.expect("next real connection operation by rank");
+        }
+        assert_eq!(*order.lock().expect("order"), classes.map(u8::from));
+        for class in classes {
+            assert_eq!(
+                journal.operation_admissions_for_test(class),
+                1 + usize::from(class == ScopeWorkClass::Normal),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_cancelled_waiters_never_start_connection_work() {
+        for class in ScopeWorkClass::ALL {
+            let fixture = RecoveryFixture::new(0x21);
+            let journal = fixture.create();
+            let running = journal.hold_operation_for_test().await.expect("hold gate");
+            let before = admissions(&journal);
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let mut cancelled = Box::pin(marked_operation(
+                journal.with_operation_class(class),
+                1,
+                Arc::clone(&order),
+            ));
+            let mut survivor = Box::pin(marked_operation(journal.clone(), 2, Arc::clone(&order)));
+            assert!(futures_util::poll!(&mut cancelled).is_pending());
+            assert!(futures_util::poll!(&mut survivor).is_pending());
+            drop(cancelled);
+            drop(running);
+            survivor.await.expect("surviving connection operation");
+            assert_eq!(*order.lock().expect("order"), [2]);
+            assert_eq!(admissions(&journal), [before[0] + 1, before[1]]);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_cancelled_running_caller_retains_the_permit() {
+        let fixture = RecoveryFixture::new(0x21);
+        let journal = fixture.create();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let running_order = Arc::clone(&order);
+        let mut running = Box::pin(journal.with_connection(false, move |_, _| {
+            entered_tx.send(()).expect("report blocking admission");
+            release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release blocking operation");
+            running_order.lock().expect("order").push(1);
+            Ok(())
+        }));
+        assert!(futures_util::poll!(&mut running).is_pending());
+        entered_rx.await.expect("blocking operation entered");
+        drop(running);
+        let mut urgent = Box::pin(marked_operation(
+            journal.with_operation_class(ScopeWorkClass::Emergency),
+            2,
+            Arc::clone(&order),
+        ));
+        assert!(futures_util::poll!(&mut urgent).is_pending());
+        assert_eq!(admissions(&journal), [1, 0]);
+        release_tx.send(()).expect("finish blocking operation");
+        urgent
+            .await
+            .expect("urgent work follows completed blocking work");
+        assert_eq!(*order.lock().expect("order"), [1, 2]);
+        assert_eq!(admissions(&journal), [1, 1]);
     }
 
     #[tokio::test]

@@ -32,13 +32,25 @@ runners, roster admission and the mock backend. Invalid policies leave writer
 epochs, durable records, staged journals and backend state untouched; no SA
 install or compensating rollback starts. Both directions of a bidirectional
 install are checked before the first direction runs.
+The bidirectional helper now returns `FirstInstallFailed` instead of `SecondInstallRolledBack` for an invalid second-request rollback lookup mark, before installing either direction.
 
 Valid requests retain their operation order and encoded/stored bytes. Ordinary
-policy failures return `XfrmError::InvalidConfig`, or `InvalidPolicy` from
+policy validation failures use `XfrmError::InvalidConfig` as their source, or
+return `InvalidPolicy` from
 `XfrmObjectInstallDurableError`/`XfrmObjectRosterRequestError` at those admission
-boundaries. Existing explicit transit-shape failures retain
-`InvalidForwardTransit`. Update exhaustive matches for the new enum variants;
-mock callers must supply policies that satisfy the same shape as Linux.
+boundaries. Both error enums are non-exhaustive; callers classifying specific
+variants should handle `InvalidPolicy`. Single and staged composite helpers
+now report malformed policies as `InstallSaFailed` with
+`not_applied(InstallSa)`, instead of `PolicyInstallRolledBack`. Explicit
+transit-shape failures retain `InvalidForwardTransit` when the selector is
+valid; an invalid selector instead reports `InvalidPolicy` at durable/roster
+boundaries. Mock callers must supply policies that satisfy the same shape as
+Linux.
+
+Before upgrading, recover or finalize unresolved durable install/roster
+operations for malformed Allow/Block policies. The new release refuses their
+recovery with `InvalidPolicy`, leaving the records blocking cooperating writes
+until an exclusive namespace reset.
 
 ## Network-namespace binding
 

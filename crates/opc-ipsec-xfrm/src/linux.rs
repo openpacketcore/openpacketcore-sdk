@@ -8106,6 +8106,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn marked_forward_transit_parser_preserves_templated_allow() {
+        let mut parameters = marked_forward_transit_parameters();
+        parameters.action = XfrmAction::Allow;
+        parameters.templates = policy_parameters().templates;
+        let body = encode_policy_info(&parameters).unwrap();
+        assert_eq!(parse_policy_state(&body).unwrap().parameters, parameters);
+    }
+
     #[tokio::test]
     async fn marked_forward_transit_refuses_every_broader_shape_before_dispatch() {
         let valid = marked_forward_transit_parameters();

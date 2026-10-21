@@ -17,8 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace writer epochs, durable preparation, staged journal claims or
   composite SA effects. Mock policy installs and updates now enforce the same
   shape as Linux. `XfrmObjectInstallDurableError` and
-  `XfrmObjectRosterRequestError` add `InvalidPolicy`; update exhaustive matches.
+  `XfrmObjectRosterRequestError` are non-exhaustive and add `InvalidPolicy`;
+  callers classifying specific variants should handle it. Single and staged
+  composite helpers now report a malformed policy as `InstallSaFailed` instead
+  of `PolicyInstallRolledBack`.
+  The bidirectional helper now returns `FirstInstallFailed` instead of `SecondInstallRolledBack` for an invalid second-request rollback lookup mark, before installing either direction.
   Valid requests and kernel/stored encodings are unchanged.
+  Before upgrading, recover or finalize unresolved durable install/roster
+  operations for malformed Allow/Block policies: the new release returns
+  `InvalidPolicy` for them and leaves their records blocking cooperating writes
+  until an exclusive namespace reset.
 
 - `opc-session-store`: the unadvertised voter-slot profile requires explicit
   volume enrollment before open. The SDK generates incarnation keys and returns
@@ -157,8 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-session-net`: expose
   `PersistentSessionConsumerClient::lease_mutation_status_with_budget` for
   ordinary acquire, renew and release receipt recovery within an existing
-  checkpoint deadline. The method preserves exact request identity, ordinary
-  error mapping, pre-write caps and the shared extended-read capacity reserve.
+  checkpoint deadline. The method preserves exact request identity, store-error
+  and wire-rejection mapping, pre-write caps and the shared extended-read capacity
+  reserve. Transport authority loss returns terminal `TopologyAuthorityRevoked`
+  instead of the legacy method's `BackendUnavailable`.
   It rejects newly observed success at expiry and spends the remaining deadline
   after possible transmission, without replaying the lease mutation.
 
@@ -172,6 +182,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both routing results require E and preserve correlation, Session-Id, ordered
   Proxy-Info, redaction and size limits. Routing policy remains caller-owned,
   and arbitrary numeric result codes are not accepted.
+
+- `opc-session-store` and `opc-session-net`: order V2 recovery-journal work
+  by the existing `ScopeWorkClass` ranks with FIFO operations within each
+  class. Consumer calls retain priority across consecutive local journal
+  steps, releasing it before remote I/O, sealing and backoff. One active
+  higher-ranked local sequence defers lower work until that sequence ends.
+  Prepared, recovered and deferred-resume handles carry the selected class.
+  Inventory reads during preparation or retry, observations and reclamation
+  accept an explicit class instead of falling back to ordinary admission.
+  Default methods inherit the journal view's class, initially `Normal`.
+  Cancelled calls relinquish their registrations while admitted blocking work
+  keeps its progress budget and completion lifetime. Bound pre-dispatch journal
+  authentication and no-effect cleanup by the caller budget, and standalone
+  cleanup/read calls by the existing default operation window. An expired
+  original handle stays resolved and releasable, never dispatchable. Existing
+  scheduled reclamation completes cleanup prevented by the deadline without
+  an operator or a later request; before-expiry settlement is unchanged. Physical
+  mutation lifetime, transmission classification, durability and authority
+  are unchanged.
 
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
@@ -864,8 +893,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-store`: keep async SQLite worker deadlines on the caller's
   Tokio clock through SQL progress, acceptance readers, native reads, restore
-  scans and guarded-read completion. Paused-time setup no longer spends a
-  fresh worker's budget, and advancing Tokio time expires worker checks.
+  scans and the unit-test guarded-read route. Paused-time setup no longer spends
+  a fresh worker's budget, and advancing Tokio time expires worker checks.
   Independent real-time resource caps and existing timeout values are unchanged.
 
 - `opc-session-testkit`: derive traffic-status backend work from the parent's

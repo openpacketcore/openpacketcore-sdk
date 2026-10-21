@@ -2346,6 +2346,77 @@ MUST durably bind caller ID to that complete request in the SDK-owned
 Execution and status MUST dispatch only that authenticated journaled request.
 `recover_fenced_transition_status` MUST NOT require the plaintext body.
 
+Recovery-journal admission uses the existing `ScopeWorkClass`, chosen from
+an authenticated operation and session state. Its explicit rank orders five
+FIFO class heads: `SafetyControl`, `Emergency`, `EmergencyClassification`,
+`Normal`, then `Maintenance`. Unverified emergency classification remains below
+established emergency work. The caller MUST enforce its separate classification
+budget; the journal gate does not grant or enforce that budget. This scheduling
+choice grants no authority and changes no class budget.
+Newly opened journals use `Normal`. Journal views made with
+`with_operation_class` share the gate without changing another view's class.
+The facade's default methods inherit the configured view's class. Callers MAY
+supply a per-call class through `prepare_fenced_transition_with_journal_class`,
+`recover_fenced_transition_status_with_journal_class` and
+`resume_deferred_fenced_transition_with_journal_class`. Observation and
+reclamation MAY use `observe_fenced_transition_with_journal_class` and
+`reclaim_resolved_fenced_transitions_with_journal_class`; routine reclamation
+uses `Maintenance` when the caller selects that class. Inventory reads made
+during preparation or retry MAY use
+`retained_fenced_transitions_with_journal_class` to retain that work's class.
+Its default counterpart keeps the configured view's class, initially `Normal`.
+Returned prepared, recovered and resumed V2 handles retain that class for
+later journal calls.
+The class is local scheduling metadata, not persisted request authority or
+remote-voter priority; a caller recovering or resuming work supplies its current
+authenticated class or configures the appropriate view.
+
+A consumer call MUST retain its class registration across each consecutive
+local journal sequence: scope binding and caller registration through the
+absent-row check, or scope binding through row authentication, lookup, count
+or removal. No lower-class operation may be admitted between these local
+steps. The call MUST release registration before remote capability, history,
+record-expiry or receipt reads, sealing, physical dispatch, sleeps and idle
+waits. Its next local sequence re-enters the gate with the retained class.
+Higher-ranked calls can still proceed and each class's individual journal
+operations remain FIFO. Already admitted blocking work finishes first,
+including lower-ranked work admitted while the higher-ranked call was away
+from the journal. Idle handles retain their class but hold no registration.
+Cancellation MUST release a call's registration and any queued operation's
+place. An admitted blocking operation keeps its permit through completion
+under the existing SQLite progress budget, even if its caller stops waiting.
+Admission capacity, progress limits, durability and transition authority MUST
+remain unchanged. The gate owns only fixed-size state; waiter storage stays
+in caller futures, with no background queue, worker or timer. Legacy V1 journal
+scheduling is unchanged.
+
+One active higher-ranked local sequence defers lower-ranked journal work until
+that sequence ends. Sustained higher-ranked local sequences can starve lower
+ranks; remote I/O and backoff do not contribute to that exclusion. The raw
+journal view has no caller deadline; its caller MUST bound its waits. Consumer
+prepare, recover, resume, status and reclamation use their existing caller
+budgets. Execution bounds repeated journal authentication before dispatch by
+the current physical-attempt deadline, capped by the original deadline. Its
+known no-effect cleanup uses the original deadline; failure or timeout retains
+a releasable row and MUST NOT withhold the known result. Once physical execution
+starts, no enclosing journal timeout may cancel it or change its transmission
+classification. Standalone release, abandon, retained-count and observation
+calls use the existing ten-second default operation window. Cleanup MAY be
+retried with a fresh window after the execution deadline, without restoring
+dispatch authority. No original caller deadline is extended.
+
+An original handle whose preflight fails at or after its caller deadline MUST
+remain resolved and releasable, with dispatch permanently disabled. It MUST
+NOT admit journal cleanup after that deadline. The existing scheduled
+`reclaim_resolved_fenced_transitions` sweep completes cleanup prevented by the
+deadline under its own bounded maintenance budget, independently of a later
+request or an operator. An owned journal with the void profile obtains an
+exact terminal no-effect receipt and removes the row, even while the expired
+handle is alive; ordinary journals retain their existing epoch-reclamation
+rules. Integrations MUST keep this maintenance running without depending on
+new requests. Reclamation MUST NOT restore the original handle's dispatch
+authority. Before-expiry settlement and crash-recovery rules are unchanged.
+
 The recovery journal holds at most 4,096 live rows. That count is an
 authenticated admission fence, not an absorbing lifetime: a row is removed by
 exact compare-and-delete only after an original handle's failed local journal

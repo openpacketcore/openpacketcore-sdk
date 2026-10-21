@@ -88,7 +88,7 @@ jobs:
             cargo fetch --locked --manifest-path "$manifest"
             cargo metadata --locked --offline --format-version 1 \
               --manifest-path "$manifest" > /dev/null
-          done < <(git ls-files -z -- Cargo.lock '**/Cargo.lock')
+          done < <(git ls-files -z -- Cargo.lock '**/Cargo.lock' ':(exclude)ci/fixtures/**')
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -255,6 +255,7 @@ jobs:
 
       - name: Run clippy
         run: |
+          cargo fetch --locked
           python3 ci/test-clippy-fd-guard.py
           cargo clippy --locked -p opc-ipsec-xfrm --lib --no-default-features -- -D warnings
           cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

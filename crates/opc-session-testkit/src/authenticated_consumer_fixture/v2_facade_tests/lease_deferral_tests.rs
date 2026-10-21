@@ -558,3 +558,80 @@ async fn consumer_lease_deferral_rechecks_renewal_and_new_owner_after_resume_aut
         std::panic::resume_unwind(error);
     }
 }
+
+#[tokio::test]
+async fn journal_priority_deferred_resume_retains_the_selected_class() {
+    use opc_session_store::scope_scheduler::ScopeWorkClass::Emergency;
+
+    for explicit in [true, false] {
+        let (fixture, clock) = fixture().await;
+        let journal = fixture.open_recovery_journal().expect("owned journal");
+        let activated =
+            SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster(
+                fixture.persistent_clients().expect("clients"),
+            )
+            .await
+            .expect("activate voters");
+        let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(
+            activated,
+            CountingProvider::new(),
+            "fixture-resume-journal-class",
+            if explicit {
+                Arc::clone(&journal)
+            } else {
+                Arc::new(journal.with_operation_class(Emergency))
+            },
+        )
+        .expect("facade");
+        let prior = predecessor(&facade, 2100).await;
+        let request = successor(&prior, request_id(2101));
+        let deadline = soon();
+        let mut prepared = facade
+            .prepare_fenced_transition_with_journal_class(
+                request.clone(),
+                budget(deadline),
+                Emergency,
+            )
+            .await
+            .expect("prepare emergency transition");
+        let physical_id = deferred(&fixture, &mut prepared, deadline).await;
+        let exact = sealed_request(&fixture, physical_id);
+        drop(prepared);
+        let before = super::journal_priority_tests::admissions(&journal);
+        let deadline = soon();
+        let mut resumed = if explicit {
+            facade
+                .resume_deferred_fenced_transition_with_journal_class(
+                    request.request_id(),
+                    budget(deadline),
+                    Emergency,
+                )
+                .await
+        } else {
+            facade
+                .resume_deferred_fenced_transition(request.request_id(), budget(deadline))
+                .await
+        }
+        .expect("read exact deferral")
+        .expect("resume original sealed request");
+        super::journal_priority_tests::assert_only_class_advanced(
+            before,
+            super::journal_priority_tests::admissions(&journal),
+            Emergency,
+        );
+        clock.advance(31);
+        let before = super::journal_priority_tests::admissions(&journal);
+        committed_v2(&mut resumed, &request, deadline).await;
+        assert_eq!(sealed_request(&fixture, physical_id), exact);
+        resumed.release_resolved().await.expect("release exact row");
+        super::journal_priority_tests::assert_only_class_advanced(
+            before,
+            super::journal_priority_tests::admissions(&journal),
+            Emergency,
+        );
+        drop(resumed);
+        drop(facade);
+        drop(journal);
+        fixture.shutdown().await.expect("shutdown");
+    }
+}

@@ -45,7 +45,8 @@ pub(crate) use recovery::{canonical_recovery_request, RecoveryJournalAdmission};
 pub use recovery::{
     FencedTransitionV2RecoveryCall, FencedTransitionV2RecoveryJournal,
     FencedTransitionV2RecoveryJournalKey, FencedTransitionV2RecoveryNotice,
-    FencedTransitionV2VoidEligibility, FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES,
+    FencedTransitionV2RecoveryPriorityGuard, FencedTransitionV2VoidEligibility,
+    FENCED_TRANSITION_V2_RECOVERY_JOURNAL_KEY_BYTES,
     FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES,
     FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX,
 };

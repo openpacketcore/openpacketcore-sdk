@@ -571,6 +571,128 @@ async fn consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consumer_void_reclaims_expired_preflight_without_a_later_caller() {
+    let fixture = Arc::new(
+        AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable_with_void([scope()])
+            .await
+            .unwrap(),
+    );
+    let client_fixture = Arc::clone(&fixture);
+    let result = std::panic::AssertUnwindSafe(with_fixture_protocol_clock(
+        "expired preflight reclamation",
+        async move {
+            use opc_session_store::scope_scheduler::ScopeWorkClass;
+
+            let journal = client_fixture.open_recovery_journal().unwrap();
+            let activated = SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster(
+                client_fixture.persistent_clients().unwrap(),
+            )
+            .await
+            .unwrap();
+            let facade = Arc::new(
+                SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(
+                    activated,
+                    CountingProvider::new(),
+                    "void-expired-preflight",
+                    Arc::clone(&journal),
+                )
+                .unwrap(),
+            );
+            for (ordinal, class) in [ScopeWorkClass::Normal, ScopeWorkClass::Emergency]
+                .into_iter()
+                .enumerate()
+            {
+                let label = 940 + ordinal as u64;
+                let deadline = soon();
+                let mut original = facade
+                    .prepare_fenced_transition_with_journal_class(
+                        create(request_id(label), label, PAYLOAD),
+                        budget(deadline),
+                        class,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 1);
+                let admissions = journal_priority_tests::admissions(&journal);
+                // Expire only the client authority. Real voters and their
+                // disk work keep running on the fixture's ordinary runtime.
+                tokio::time::advance(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await;
+                assert!(tokio::time::Instant::now() >= deadline);
+                for _ in 0..2 {
+                    let mut execution = Box::pin(original.execute_once());
+                    let result = futures_util::poll!(&mut execution);
+                    drop(execution);
+                    assert_eq!(
+                        result,
+                        std::task::Poll::Ready(Err(FencedTransitionExecuteError::NotTransmitted)),
+                        "the expired original cannot wait for cleanup or dispatch again"
+                    );
+                    assert_eq!(journal_priority_tests::admissions(&journal), admissions);
+                    assert_eq!(client_fixture.diagnostics().fenced_transition_v2_calls(), 0);
+                }
+                assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 1);
+
+                // Maintenance owns its own bounded budget. Keep the original
+                // handle alive and never ask it, or a new request, to delete
+                // the row: the production sweep must create the void receipt
+                // and remove the row through real authenticated voters.
+                let maintenance_facade = Arc::clone(&facade);
+                let maintenance = tokio::spawn(async move {
+                    maintenance_facade
+                        .reclaim_resolved_fenced_transitions_with_journal_class(
+                            8,
+                            budget(soon()),
+                            ScopeWorkClass::Maintenance,
+                        )
+                        .await
+                });
+                let report = maintenance.await.unwrap().unwrap();
+                assert!(!report.interrupted(), "{report:?}");
+                assert_eq!(report.examined(), 1, "{report:?}");
+                assert_eq!(report.voided(), 1, "{report:?}");
+                assert_eq!(report.reclaimed(), 1, "{report:?}");
+                assert_eq!(report.retained(), 0, "{report:?}");
+                assert_eq!(report.waiting_callers(), 0, "{report:?}");
+                assert_eq!(report.unsupported(), 0, "{report:?}");
+                assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
+                assert_eq!(client_fixture.diagnostics().fenced_transition_v2_calls(), 0);
+                assert_eq!(
+                    original.execute_once().await,
+                    Err(FencedTransitionExecuteError::Rejected(StoreError::FencedTransitionVoided)),
+                    "reclamation supplies a terminal receipt, never dispatch authority"
+                );
+                assert!(matches!(
+                    original.status_once(soon()).await,
+                    Ok(FencedTransitionV2Status::Recorded(result))
+                        if matches!(*result, Err(StoreError::FencedTransitionVoided))
+                ));
+                // Release is only an idempotence check after maintenance
+                // already proved the row absent; it did not perform cleanup.
+                original.release_resolved().await.unwrap();
+                assert_eq!(facade.retained_fenced_transitions().await.unwrap(), 0);
+                assert_eq!(client_fixture.diagnostics().fenced_transition_v2_calls(), 0);
+                for store in &client_fixture.cluster.stores {
+                    assert!(store.get(&session_key(label)).await.unwrap().is_none());
+                }
+            }
+        },
+    ))
+    .catch_unwind()
+    .await;
+    Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("the client released the fixture"))
+        .shutdown()
+        .await
+        .unwrap();
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consumer_void_lost_before_bind_drains_the_row_and_resolves_the_live_handle() {
     let fixture =
         AuthenticatedPreparedFencedTransitionFixture::start_fixed_durable_with_void([scope()])

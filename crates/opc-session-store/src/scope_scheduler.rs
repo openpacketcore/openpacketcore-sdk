@@ -61,7 +61,7 @@ impl ScopeWorkClass {
         Self::Maintenance,
     ];
 
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         match self {
             Self::SafetyControl => 0,
             Self::Emergency => 1,
