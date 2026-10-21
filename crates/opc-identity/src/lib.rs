@@ -294,6 +294,26 @@ impl WorkloadIdentity {
         cert_der: &[u8],
         active_bundles: &TrustBundleSet,
     ) -> Result<Self, IdentityReloadError> {
+        Self::from_cert_der_at(cert_der, active_bundles, Timestamp::now_utc())
+    }
+
+    /// Parse a workload identity from an X.509 SVID at the supplied verification time.
+    ///
+    /// The certificate must be valid at `verification_time`: `not_before` is
+    /// inclusive and `not_after` is exclusive. The SPIFFE ID, active trust-domain
+    /// membership and workload path are checked as in [`Self::from_cert_der`].
+    /// Certificate-chain and private-key validation are performed separately by
+    /// [`build_identity_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityReloadError`] for malformed certificate or identity
+    /// data, an expired or not-yet-valid certificate, or an inactive trust domain.
+    pub fn from_cert_der_at(
+        cert_der: &[u8],
+        active_bundles: &TrustBundleSet,
+        verification_time: Timestamp,
+    ) -> Result<Self, IdentityReloadError> {
         let (remaining, x509) = X509Certificate::from_der(cert_der)
             .map_err(|_| IdentityReloadError::MalformedSpiffeId)?;
         if !remaining.is_empty() {
@@ -302,7 +322,7 @@ impl WorkloadIdentity {
 
         let not_before_secs = x509.validity().not_before.timestamp();
         let not_after_secs = x509.validity().not_after.timestamp();
-        let now_secs = Timestamp::now_utc().as_offset_datetime().unix_timestamp();
+        let now_secs = verification_time.as_offset_datetime().unix_timestamp();
 
         if not_after_secs <= now_secs {
             return Err(IdentityReloadError::ExpiredSvid);
