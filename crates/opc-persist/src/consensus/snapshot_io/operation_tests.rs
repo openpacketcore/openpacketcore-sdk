@@ -126,3 +126,45 @@ async fn cancelled_read_only_repositions_when_discarding_unread_bytes() {
     file.read_to_end(&mut all).await.unwrap();
     assert_eq!(all, b"abXYZWghij");
 }
+
+#[tokio::test]
+async fn invalid_relative_seek_preserves_buffered_read_position() {
+    let mut file = SnapshotIo::new(input_file(b"abcdefghij"), None);
+    let handle = file.handle.clone();
+    let mut output = [0; 8];
+    let mut read = Box::pin(file.read(&mut output));
+    std::future::poll_fn(|cx| {
+        let _held = handle.file.lock().unwrap();
+        assert!(read.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(read);
+    let mut prefix = [0; 2];
+    file.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(&prefix, b"ab");
+    assert_eq!(
+        file.seek(SeekFrom::Current(-3)).await.unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let mut rest = [0; 8];
+    file.read_exact(&mut rest).await.unwrap();
+    assert_eq!(&rest, b"cdefghij");
+    assert_eq!(positioning_calls(&file), 0);
+}
+
+#[tokio::test]
+async fn failed_write_returns_initialized_buffer_for_the_next_read() {
+    let source = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), [0x59; 16 * 1024]).unwrap();
+    let mut file = SnapshotIo::new(File::open(source.path()).unwrap(), None);
+    file.write_all(&[0; 8192]).await.unwrap();
+    assert!(file.flush().await.is_err(), "descriptor is read-only");
+    assert!(file.read_buffer.len() >= 8192);
+    let buffer = file.read_buffer.as_ptr();
+    let mut output = [0; 2];
+    file.read_exact(&mut output).await.unwrap();
+    assert_eq!(output, [0x59; 2]);
+    assert_eq!(file.read_buffer.as_ptr(), buffer);
+    assert_eq!(positioning_calls(&file), 1);
+}

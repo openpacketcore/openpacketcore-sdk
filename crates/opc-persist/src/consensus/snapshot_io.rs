@@ -21,17 +21,37 @@ struct OwnedHandle {
 
 struct SnapshotFile {
     file: File,
+    // This cursor belongs to the physical worker. The async caller advances
+    // its logical cursor only as reads are delivered or writes are accepted.
+    position: Option<u64>,
     #[cfg(test)]
     positioning_calls: usize,
 }
 
 impl SnapshotFile {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.file.read(bytes)
+    fn position_at(&mut self, position: u64) -> io::Result<()> {
+        if self.position != Some(position) {
+            self.seek(SeekFrom::Start(position))?;
+        }
+        Ok(())
     }
 
-    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)
+    fn read_at(&mut self, position: u64, bytes: &mut [u8]) -> io::Result<usize> {
+        self.position_at(position)?;
+        // An error may follow partial physical progress. Reconcile before the
+        // next operation instead of assuming the descriptor stayed in place.
+        self.position = None;
+        let read = self.file.read(bytes)?;
+        self.position = position.checked_add(read as u64);
+        Ok(read)
+    }
+
+    fn write_all_at(&mut self, position: u64, bytes: &[u8]) -> io::Result<()> {
+        self.position_at(position)?;
+        self.position = None;
+        self.file.write_all(bytes)?;
+        self.position = position.checked_add(bytes.len() as u64);
+        Ok(())
     }
 
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
@@ -39,7 +59,10 @@ impl SnapshotFile {
         {
             self.positioning_calls += 1;
         }
-        self.file.seek(position)
+        self.position = None;
+        let position = self.file.seek(position)?;
+        self.position = Some(position);
+        Ok(position)
     }
 
     fn sync_all(&self) -> io::Result<()> {
@@ -56,8 +79,14 @@ impl SnapshotFile {
 }
 
 enum CompletedIo {
-    Read(Vec<u8>),
-    Written,
+    Read {
+        buffer: Vec<u8>,
+        result: io::Result<usize>,
+    },
+    Written {
+        buffer: Vec<u8>,
+        result: io::Result<()>,
+    },
     Sought(u64),
 }
 
@@ -68,6 +97,7 @@ pub(super) struct SnapshotIo {
     position: u64,
     seek: Option<SeekFrom>,
     read_buffer: Vec<u8>,
+    read_length: usize,
     read_offset: usize,
     read_ready: bool,
 }
@@ -77,11 +107,14 @@ impl SnapshotIo {
     // memory, and each file has at most one pending data operation.
     const BUFFER_BYTES: usize = 1024 * 1024;
 
+    // Callers provide a newly opened file at offset zero and do not move its
+    // descriptor cursor independently of this adapter.
     pub(super) fn new(file: File, owner: Option<Arc<SnapshotDirectoryOwner>>) -> Self {
         Self {
             handle: Arc::new(OwnedHandle {
                 file: Mutex::new(SnapshotFile {
                     file,
+                    position: Some(0),
                     #[cfg(test)]
                     positioning_calls: 0,
                 }),
@@ -92,6 +125,7 @@ impl SnapshotIo {
             position: 0,
             seek: None,
             read_buffer: Vec::new(),
+            read_length: 0,
             read_offset: 0,
             read_ready: false,
         }
@@ -102,6 +136,11 @@ impl SnapshotIo {
         owner: Option<Arc<SnapshotDirectoryOwner>>,
     ) -> Option<Arc<SnapshotDirectoryOwner>> {
         std::mem::replace(&mut self.verification_owner, owner)
+    }
+
+    #[cfg(test)]
+    pub(super) fn positioning_calls(&self) -> usize {
+        self.handle.file.lock().unwrap().positioning_calls
     }
 
     fn spawn<T: Send + 'static>(
@@ -153,19 +192,25 @@ impl SnapshotIo {
         let result = ready!(Pin::new(pending).poll(cx));
         self.pending = None;
         match result.map_err(|_| io::Error::other("config snapshot file worker failed"))?? {
-            CompletedIo::Read(bytes) => {
-                self.read_buffer = bytes;
+            CompletedIo::Read { buffer, result } => {
+                self.read_buffer = buffer;
+                self.read_length = result?;
                 self.read_offset = 0;
                 self.read_ready = true;
             }
-            CompletedIo::Written => {}
+            CompletedIo::Written { buffer, result } => {
+                self.read_buffer = buffer;
+                result?;
+            }
             CompletedIo::Sought(position) => self.position = position,
         }
         Poll::Ready(Ok(()))
     }
 
     fn discard_read(&mut self) {
-        self.read_buffer.clear();
+        // Retain initialized storage for both reads and writes. Valid unread
+        // bytes are tracked separately so short reads cannot expose old data.
+        self.read_length = 0;
         self.read_offset = 0;
         self.read_ready = false;
     }
@@ -184,22 +229,22 @@ impl AsyncRead for SnapshotIo {
         if !self.read_ready {
             let position = self.position;
             let length = output.remaining().min(Self::BUFFER_BYTES);
+            let mut buffer = std::mem::take(&mut self.read_buffer);
+            if buffer.len() < length {
+                buffer.reserve_exact(length - buffer.len());
+                buffer.resize(length, 0);
+            }
             self.pending = Some(self.spawn(move |file| {
-                file.seek(SeekFrom::Start(position))?;
-                let mut bytes = vec![0; length];
-                let read = file.read(&mut bytes)?;
-                bytes.truncate(read);
-                Ok(CompletedIo::Read(bytes))
+                let result = file.read_at(position, &mut buffer[..length]);
+                Ok(CompletedIo::Read { buffer, result })
             }));
             ready!(self.poll_pending(cx))?;
         }
-        let length = output
-            .remaining()
-            .min(self.read_buffer.len() - self.read_offset);
+        let length = output.remaining().min(self.read_length - self.read_offset);
         output.put_slice(&self.read_buffer[self.read_offset..self.read_offset + length]);
         self.read_offset += length;
         self.position += length as u64;
-        if self.read_offset == self.read_buffer.len() {
+        if self.read_offset == self.read_length {
             self.discard_read();
         }
         Poll::Ready(Ok(()))
@@ -221,12 +266,17 @@ impl AsyncWrite for SnapshotIo {
         let next = position.checked_add(length as u64).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "snapshot offset overflow")
         })?;
-        let bytes = input[..length].to_vec();
+        let mut buffer = std::mem::take(&mut self.read_buffer);
+        let initialized = buffer.len().min(length);
+        buffer[..initialized].copy_from_slice(&input[..initialized]);
+        if initialized < length {
+            buffer.reserve_exact(length - initialized);
+            buffer.extend_from_slice(&input[initialized..length]);
+        }
         self.discard_read();
         self.pending = Some(self.spawn(move |file| {
-            file.seek(SeekFrom::Start(position))?;
-            file.write_all(&bytes)?;
-            Ok(CompletedIo::Written)
+            let result = file.write_all_at(position, &buffer[..length]);
+            Ok(CompletedIo::Written { buffer, result })
         }));
         self.position = next;
         // As with Tokio File, accepted bytes may still be queued. The closure
@@ -256,14 +306,19 @@ impl AsyncSeek for SnapshotIo {
     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         ready!(self.poll_pending(cx))?;
         if let Some(seek) = self.seek.take() {
-            let position = self.position;
+            // Relative seeks start at the delivered cursor, which can lag the
+            // physical cursor after a cancelled read. Resolve that offset here
+            // so an explicit seek still performs just one positioning call.
+            let seek = match seek {
+                SeekFrom::Current(offset) => {
+                    SeekFrom::Start(self.position.checked_add_signed(offset).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "snapshot offset overflow")
+                    })?)
+                }
+                position => position,
+            };
             self.discard_read();
-            self.pending = Some(self.spawn(move |file| {
-                // Reads advance the logical position only when delivered, so a
-                // cancelled read or a smaller replacement buffer cannot skip data.
-                file.seek(SeekFrom::Start(position))?;
-                file.seek(seek).map(CompletedIo::Sought)
-            }));
+            self.pending = Some(self.spawn(move |file| file.seek(seek).map(CompletedIo::Sought)));
             ready!(self.poll_pending(cx))?;
         }
         Poll::Ready(Ok(self.position))

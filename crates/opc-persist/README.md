@@ -344,6 +344,8 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   published reader. That temporary ownership ends when verification and its
   physical work finish. Exported read-only published readers otherwise retain
   only their file descriptor, so dormant readers do not pin directory admission.
+  Sequential snapshot I/O reuses bounded initialized buffers without seeking;
+  explicit seeks and discarded unread data reconcile the logical file position.
   Shutdown fences snapshot reception in both standard and voter profiles, joins
   the engine, and discards unfinished transfers before draining storage. Queued
   staging I/O retains admission until it finishes; old closed store handles

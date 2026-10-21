@@ -35,6 +35,9 @@ const SNAPSHOT_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::fro
 mod snapshot_staging_tests;
 
 #[cfg(test)]
+mod snapshot_io_tests;
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct SnapshotTestHooks {
     before_snapshot_commit: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,

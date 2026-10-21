@@ -716,8 +716,8 @@ fn queued_snapshot_write_retains_owner(runtime_drop: bool, staging: bool) {
         .await
         .unwrap();
     });
-    // Tokio's original queued write also executes after owner release. Wait for
-    // it before the RED assertion so the failed test leaves no blocked worker.
+    // Wait for the queued write before checking ownership so even a failed
+    // ownership assertion leaves no outstanding worker.
     let deadline = std::time::Instant::now() + WATCHDOG;
     while observed.metadata().unwrap().len() == 0 && std::time::Instant::now() < deadline {
         std::thread::yield_now();
