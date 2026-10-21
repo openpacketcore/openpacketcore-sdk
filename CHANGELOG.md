@@ -150,6 +150,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
+  verification time for certificate validity checks while preserving SPIFFE ID,
+  trust-domain and workload-path validation. `from_cert_der` continues to use
+  the current UTC time.
+
+- `opc-session-testkit`: a `test-control`-gated, payload-free subscription
+  observes real successful V2 commits whose replies the authenticated fixture
+  suppresses. Controlled-clock clients can wait for that boundary before
+  advancing their unchanged attempt deadline and recovering the exact receipt.
+  The subscription and its state are absent without the non-production feature.
+
 - `opc-session-store`: `SqliteSessionBackend::voter_identity_binding` returns
   an enrolled volume's public installation, slot, incarnation and key digest
   after restart, without exporting private key material or granting admission.
@@ -891,6 +902,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
+
 - `opc-session-store`: keep async SQLite worker deadlines on the caller's
   Tokio clock through SQL progress, acceptance readers, native reads, restore
   scans and the unit-test guarded-read route. Paused-time setup no longer spends
@@ -923,6 +936,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restore them. Pin provenance markers and both suites' counts and skip rejection
   in the workflow regressions. The additional job per CI run gives the datapath
   job more margin.
+
+- `opc-gtpu-dataplane`: allow fresh control-port queues after transient
+  interface or datapath readback failure when the same live attachment passes
+  all checks again. Old handles and response plans stay invalid, removed or
+  fenced registrations remain closed, and processing counters and rate-limit
+  state survive queue recovery. Apply the same queue withdrawal to open and
+  End Marker readback errors.
 
 - `opc-persist`: isolate initial formation in functional consensus fixtures from
   scheduling pauses using the existing controlled clock, preserving engine
@@ -1094,6 +1114,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing timing bounds. Multi-process scope recovery also crosses genuine
   speculative replies before split votes and expires renewed replication
   leases before its post-restart campaign. (#1333)
+
+- `opc-persist`: retain snapshot staging ownership through file creation and
+  SQLite commit when an async runtime is dropped. Committed build/install
+  artifacts survive teardown, and the next open removes stale artifacts while
+  excluding live owners. Cancelled or timed-out startup filesystem work keeps
+  its directory descriptor and admission until completion, preventing late
+  cleanup from deleting another store's published snapshot through descriptor
+  reuse. Queued snapshot writes, syncs, staging file operations and internal
+  verification reads/seeks retain admission until completion. Sequential snapshot
+  I/O reuses initialized buffers without repositioning the file; explicit seeks
+  and cursor reconciliation preserve cancellation correctness. Published readers
+  release verification admission before returning to transport. Both snapshot
+  receivers reject votes incomparable with the engine's current vote before
+  creating staging. Planned shutdown fences and removes partial transfers in
+  both standard and voter profiles before the storage drain, permitting restart
+  with old closed handles still alive. (#1340)
 
 - `opc-persist`: snapshot reads pin the last durable publication independently
   of building or installing its successor, including a delayed SQLite commit.

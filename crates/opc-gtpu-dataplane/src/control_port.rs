@@ -93,7 +93,11 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     ///
     /// The backend binds the three queues when a port is first opened for
     /// the attachment and keeps them until the attachment is removed or its
-    /// queue is retired. Each hand-off queue is bounded by its own socket
+    /// readback fails. Readback failure invalidates existing handles; a fresh
+    /// [`crate::GtpuDataplaneBackend::open_gtpu_control_port`] can reopen queues
+    /// only after the same live registration passes all attachment checks.
+    /// Removed or fenced registrations remain unavailable. Each hand-off
+    /// queue is bounded by its own socket
     /// receive buffer, so a flood of one class overflows only its own queue;
     /// the kernel counts those drops (see
     /// [`crate::GtpuDownlinkCounters`]). Open the port right after creating

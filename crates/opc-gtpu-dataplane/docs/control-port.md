@@ -68,10 +68,17 @@ the slot before anything is received or sent. External attachment changes
 are refused when observed by the live hook/binding checks. Removal closes the queue and invalidates all old
 ports, including when a replacement has the same name, ifindex and address.
 Ports hold weak references; keeping them alive cannot keep the backend or
-its socket alive. Observed attachment loss retires the queue. Restoring hooks
-alone cannot reopen that retired instance; callers must recreate/adopt the
-attachment under the existing backend lifecycle. Socket bind failure leaves
-no published socket and can be retried. An external listener produces a bind
+its socket alive. A failed interface or datapath readback closes all three
+queues and permanently invalidates their port handles and response plans.
+The caller can retry `open_gtpu_control_port`: fresh exact interface, hook/map
+and IP-receive-interface checks allow new queues for the same live registration.
+Readback failure grants no authority to repair or replace hooks, maps, or
+forwarding state. A removed, replaced, cleanup-only or successor-pending
+registration remains unavailable under the existing backend lifecycle.
+Reopening preserves the registration's processing counters, rate limits and
+fragment Identification sequences. A stale handle cannot invalidate a later
+queue generation. Socket bind failure leaves no published port and can be
+retried. An external listener produces a bind
 error; no reuse-port distribution is enabled.
 
 The port grants no tunnel installation, selector provenance, peer admission,
@@ -757,13 +764,15 @@ this port.
 
 **Binding and integration order.** The backend binds UDP/2152, UDP/2153 and
 UDP/2154 when the control port is first opened for the attachment. It keeps
-them until the attachment is removed or its queue is retired. If any of the
+them until the attachment is removed or readback fails. If any of the
 three cannot be bound, no port is published. Nothing is bound:
 - before that first open;
 - while the process is down across a restart, because tc keeps running from
   the pinned graph;
-- after a retirement, until the attachment is re-created or adopted and the
-  port reopened.
+- after readback loss, until a fresh open validates the same live registration
+  and binds new queues;
+- after registration retirement, until the attachment is re-created or adopted
+  and the port reopened.
 
 In those windows tc drops every hand-off and counts it; see
 [Hand-offs need a bound consumer](#hand-offs-need-a-bound-consumer). The host

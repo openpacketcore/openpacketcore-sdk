@@ -262,6 +262,20 @@ impl fmt::Debug for FixtureGeneralConsumerBackend {
 /// and the facade accepts only an opaque V1-prewarmed roster. The fixture
 /// owns every lower layer and returns only an affine facade or a paired
 /// ordinary backend whose V1 transition methods fail closed.
+#[cfg_attr(
+    not(feature = "test-control"),
+    doc = r#"
+The response-suppression subscription is absent without `test-control`:
+
+```compile_fail
+use opc_session_testkit::authenticated_consumer_fixture::AuthenticatedPreparedFencedTransitionFixture;
+
+fn subscribe(fixture: &AuthenticatedPreparedFencedTransitionFixture) {
+    let _ = fixture.subscribe_fenced_transition_v2_response_suppressed();
+}
+```
+"#
+)]
 pub struct AuthenticatedPreparedFencedTransitionFixture {
     cluster: ConsensusTestCluster,
     roster: SessionConsumerRoster,
@@ -271,6 +285,8 @@ pub struct AuthenticatedPreparedFencedTransitionFixture {
     voters: Vec<FixtureVoter>,
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
+    #[cfg(feature = "test-control")]
+    fenced_transition_v2_response_suppressed: tokio::sync::broadcast::Sender<()>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
     general_consumer_counters: Arc<FixtureGeneralConsumerCounters>,
     ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
@@ -1202,6 +1218,8 @@ impl AuthenticatedPreparedFencedTransitionFixture {
         let client_config = pki.client_config(FIXTURE_CLIENT_SPIFFE);
         let lose_next_fenced_transition_response = Arc::new(AtomicBool::new(false));
         let lose_next_fenced_transition_v2_response = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-control")]
+        let (fenced_transition_v2_response_suppressed, _) = tokio::sync::broadcast::channel(1);
         let fenced_transition_status_misses_remaining = Arc::new(AtomicUsize::new(0));
         let general_consumer_counters = Arc::new(FixtureGeneralConsumerCounters::default());
         let ordinary_cas_fault = Arc::new(FixtureOrdinaryCasFault::default());
@@ -1222,6 +1240,8 @@ impl AuthenticatedPreparedFencedTransitionFixture {
                 Arc::new(cluster.store(store_index).consumer_service()),
                 lose_next_fenced_transition_response.clone(),
                 lose_next_fenced_transition_v2_response.clone(),
+                #[cfg(feature = "test-control")]
+                fenced_transition_v2_response_suppressed.clone(),
                 fenced_transition_status_misses_remaining.clone(),
                 Arc::clone(&ordinary_cas_fault),
                 voters.len(),
@@ -1276,6 +1296,8 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             voters,
             lose_next_fenced_transition_response,
             lose_next_fenced_transition_v2_response,
+            #[cfg(feature = "test-control")]
+            fenced_transition_v2_response_suppressed,
             fenced_transition_status_misses_remaining,
             general_consumer_counters,
             ordinary_cas_fault,
@@ -1663,6 +1685,31 @@ impl AuthenticatedPreparedFencedTransitionFixture {
             .store(true, Ordering::Release);
     }
 
+    /// Subscribe to successful V2 commits whose replies the fixture suppresses.
+    ///
+    /// Subscribe before calling [`Self::lose_next_fenced_transition_v2_response`].
+    /// A unit event means the real service returned a successful V2 transition
+    /// and the armed response-loss control consumed that response. Failed
+    /// transitions and replies delivered normally do not emit events. The event
+    /// contains no request, receipt, payload, endpoint, or voter identity.
+    ///
+    /// Each subscription buffers one event, including before its first poll.
+    /// Slow subscribers receive [`tokio::sync::broadcast::error::RecvError::Lagged`]
+    /// if they miss events; a new subscription does not replay earlier events.
+    /// Coordinate concurrent mutations separately: this is a fixture-wide
+    /// observation, not a request-specific receipt or an authorization to replay.
+    ///
+    /// Controlled-clock tests can await this event before advancing the client's
+    /// unchanged physical-attempt deadline. Keep the voters on real time and
+    /// retain an independent wall-clock watchdog. This non-production hook and
+    /// its notification state are compiled only with `test-control`.
+    #[cfg(feature = "test-control")]
+    pub fn subscribe_fenced_transition_v2_response_suppressed(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<()> {
+        self.fenced_transition_v2_response_suppressed.subscribe()
+    }
+
     /// Withhold the next successful fenced-transition response from whichever
     /// exact voter the opaque facade chooses.
     ///
@@ -1945,6 +1992,8 @@ struct FixtureConsumer {
     reply_gates: [Mutex<Option<Arc<tokio::sync::Semaphore>>>; 10],
     lose_next_fenced_transition_response: Arc<AtomicBool>,
     lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
+    #[cfg(feature = "test-control")]
+    fenced_transition_v2_response_suppressed: tokio::sync::broadcast::Sender<()>,
     fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
     fenced_transition_calls: AtomicUsize,
     fenced_transition_status_calls: AtomicUsize,
@@ -1989,6 +2038,8 @@ impl FixtureConsumer {
         inner: Arc<dyn SessionQuorumConsumer>,
         lose_next_fenced_transition_response: Arc<AtomicBool>,
         lose_next_fenced_transition_v2_response: Arc<AtomicBool>,
+        #[cfg(feature = "test-control")]
+        fenced_transition_v2_response_suppressed: tokio::sync::broadcast::Sender<()>,
         fenced_transition_status_misses_remaining: Arc<AtomicUsize>,
         ordinary_cas_fault: Arc<FixtureOrdinaryCasFault>,
         voter: usize,
@@ -2007,6 +2058,8 @@ impl FixtureConsumer {
             reply_gates: std::array::from_fn(|_| Mutex::new(None)),
             lose_next_fenced_transition_response,
             lose_next_fenced_transition_v2_response,
+            #[cfg(feature = "test-control")]
+            fenced_transition_v2_response_suppressed,
             fenced_transition_status_misses_remaining,
             fenced_transition_calls: AtomicUsize::new(0),
             fenced_transition_status_calls: AtomicUsize::new(0),
@@ -2339,6 +2392,8 @@ impl SessionQuorumConsumer for FixtureConsumer {
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            #[cfg(feature = "test-control")]
+            let _ = self.fenced_transition_v2_response_suppressed.send(());
             std::future::pending::<SessionConsumerV2Response>().await;
         }
         response

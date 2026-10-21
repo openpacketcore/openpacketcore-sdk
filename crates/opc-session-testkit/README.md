@@ -100,6 +100,23 @@ requests nor exposes payloads or voter identities. These round-trip counts are
 separate from client calls, Raft proposals and local WAL operations. Snapshot
 fields are sampled independently.
 
+With `consumer-fixture,test-control`,
+`subscribe_fenced_transition_v2_response_suppressed` returns a payload-free
+subscription for the fixture's V2 response-loss control. Subscribe before
+arming `lose_next_fenced_transition_v2_response`. Each event follows a real
+successful V2 commit whose reply is deliberately withheld; rejected mutations
+and normally delivered replies produce no event. A controlled-clock client can
+then advance its original physical-attempt deadline and recover the exact
+receipt. Keep the voters on real time and retain a separate wall-clock watchdog.
+The event neither supplies a receipt nor authorizes replay.
+
+Each subscription buffers one event, even before its first poll. Falling behind
+reports `Lagged`; a new subscription does not replay earlier events. This is a
+fixture-wide observation, so tests must coordinate concurrent mutations
+themselves. No request, payload, endpoint or voter identity crosses the channel.
+The API, channel state and notification code are absent without `test-control`;
+keep that non-production feature disabled in production builds.
+
 ## Production-mTLS Candidate Harness
 
 The private `opc-session-quorum-node` binary now has a default production-mTLS

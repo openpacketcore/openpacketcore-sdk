@@ -22,6 +22,7 @@ pub use audit_mutation::PreparedAuditedMutation;
 pub(crate) mod history;
 mod raft_adapter;
 mod snapshot_file;
+mod snapshot_io;
 mod sqlite;
 pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;

@@ -328,6 +328,28 @@ impl ConfigVoterProfile {
         replacement: Option<[u8; 32]>,
         deadline: tokio::time::Instant,
     ) -> Result<ConsensusWireResponse, VoterReplacementError> {
+        tokio::select! {
+            biased;
+            () = store.inner.shutdown.wait_started() => Err(VoterReplacementError::Unavailable),
+            result = self.receive_snapshot_chunk(store, source, rpc, replacement, deadline) => result,
+        }
+    }
+
+    pub(super) async fn discard_snapshot_receiver(&self) {
+        // Shutdown has fenced and cancelled chunk reception before this lock.
+        // A partial transfer belongs to the engine drain, not to retained
+        // public store handles or admission readers.
+        drop(self.incoming.lock().await.take());
+    }
+
+    async fn receive_snapshot_chunk(
+        self: &Arc<Self>,
+        store: &ConsensusConfigStore,
+        source: ConsensusNodeId,
+        rpc: InstallSnapshotRequest<ConfigRaftTypeConfig>,
+        replacement: Option<[u8; 32]>,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConsensusWireResponse, VoterReplacementError> {
         let admission_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
         if admission_budget.is_zero() {
             return Err(VoterReplacementError::Deadline);
@@ -339,7 +361,10 @@ impl ConfigVoterProfile {
             .with_raft_state(|state| *state.vote_ref())
             .await
             .map_err(unavailable)?;
-        if rpc.vote < current_vote {
+        if !matches!(
+            rpc.vote.partial_cmp(&current_vote),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ) {
             let result: Result<_, RaftError<ConsensusNodeId, InstallSnapshotError>> =
                 Ok(InstallSnapshotResponse { vote: current_vote });
             return Ok(
@@ -1050,9 +1075,15 @@ impl ConsensusConfigStore {
             .meta
             .last_log_id
             .ok_or(VoterReplacementError::InvalidTransition)?;
-        let (_, digest, _) = storage::verify_open_snapshot_envelope(snapshot.snapshot.as_mut())
-            .await
-            .map_err(|_| VoterReplacementError::Unavailable)?;
+        let owner = self
+            .inner
+            .snapshot_directory_owner
+            .upgrade()
+            .ok_or(VoterReplacementError::Unavailable)?;
+        let (_, digest, _) =
+            storage::verify_open_snapshot_envelope(snapshot.snapshot.as_mut(), owner)
+                .await
+                .map_err(|_| VoterReplacementError::Unavailable)?;
         let evidence = VoterSnapshotEvidence {
             cut: VoterSlotLogId {
                 term: cut.leader_id.term,

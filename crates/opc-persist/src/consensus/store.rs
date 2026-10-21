@@ -323,6 +323,7 @@ struct ConsensusConfigStoreInner {
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
     durable_progress: Arc<storage::ConfigDurableProgress>,
     storage_shutdown: tokio::sync::watch::Receiver<()>,
+    snapshot_directory_owner: std::sync::Weak<storage::SnapshotDirectoryOwner>,
     voter_profile: Option<Arc<voter_slots::ConfigVoterProfile>>,
     shutdown: planned_shutdown::ConfigShutdownCoordinator,
 }
@@ -633,6 +634,14 @@ impl ConsensusConfigStore {
         .await
         .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         let storage_shutdown = log_store.core.storage_shutdown_observer();
+        // Verification outside the storage worker upgrades admission only for
+        // its active I/O. Retained store handles must not own that admission.
+        let snapshot_directory_owner = Arc::downgrade(
+            &log_store
+                .core
+                .snapshot_directory_owner()
+                .map_err(|_| ConfigConsensusOpenError::StorageUnavailable)?,
+        );
         // A repair root has lost the old voter's log and vote. Do not expose
         // that empty state to a live leader or another candidate. A previously
         // restored root retains its ordinary durable restart behavior.
@@ -726,6 +735,7 @@ impl ConsensusConfigStore {
                 metric_leader: std::sync::Mutex::new(None),
                 durable_progress,
                 storage_shutdown,
+                snapshot_directory_owner,
                 voter_profile,
             }),
         };
