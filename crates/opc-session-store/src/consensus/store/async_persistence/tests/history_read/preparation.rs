@@ -34,10 +34,7 @@ async fn delayed_preparation_commit_cannot_consume_the_mutations_sync_hold() {
             );
         }
 
-        let preparing = async {
-            finish_mutation_preparation(&fleet).await;
-            delay.arm()
-        };
+        let preparing = arm_after_preparation(&fleet, &delay);
         tokio::pin!(preparing);
         // Poll the actual fixture boundary once. An unsafe immediate arm will
         // trap the old follower commits when their network hold is released.

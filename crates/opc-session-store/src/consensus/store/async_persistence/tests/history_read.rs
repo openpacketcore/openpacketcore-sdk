@@ -246,6 +246,11 @@ async fn finish_mutation_preparation(fleet: &Fleet) {
     }
 }
 
+async fn arm_after_preparation(fleet: &Fleet, delay: &Arc<NativeSyncDelay>) -> NativeSyncRelease {
+    finish_mutation_preparation(fleet).await;
+    delay.arm()
+}
+
 async fn history_with_delayed_storage(hold_minority: bool) {
     let _timing = crate::acquire_consensus_timing_test_permit().await;
     let mut fleet = Fleet::new(3);
@@ -315,8 +320,7 @@ async fn durable_mutation_waits_for_native_sync_and_completes_after_release() {
         let leader = fleet.leader();
         let store = fleet.store(leader);
         let request = create_request(store, 2, &provider()).await;
-        finish_mutation_preparation(&fleet).await;
-        let storage_release = delay.arm();
+        let storage_release = arm_after_preparation(&fleet, &delay).await;
         let mut mutation = Box::pin(store.fenced_transition_v2(request.clone()));
         tokio::select! {
             result = &mut mutation => panic!("ordinary durable mutation returned before native sync: {result:?}"),
