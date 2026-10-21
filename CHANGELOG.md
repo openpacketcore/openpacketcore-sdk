@@ -732,7 +732,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-egress-fence-common`: remove the unused experimental `scope_time` API
   from the retired timed packet-gate proposal.
 
-- `opc-consensus`: pin Openraft to `6e90e9736cc6` for serialized peer-response
+- `opc-consensus`: pin Openraft to `b3c3995868e7` for serialized peer-response
   fences and exact-vote leader resignation. Align the root, example and fuzz
   locks, publishing guard and qualification assertions with the same revision.
 
@@ -1079,6 +1079,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the admitted fixed topology without changing votes, logs or timers.
   Canonical initialization and quorum-gated application admission are preserved.
 
+- `opc-consensus`: recover the log purge target from the durable snapshot at
+  startup, preserving replication retention guards. Durable and Async native
+  stores reclaim the covered prefix after restart even when shutdown interrupted
+  the snapshot completion callback, without waiting for another snapshot. A
+  restored former leader also retries its deferred purge after step-down drains
+  the replication readers.
+
 - `opc-session-store` and `opc-persist`: add `shutdown_unplanned()` for an
   embedder with a failed replication listener. It fences admission, suppresses
   leadership handoff, and retains clone-wide, cancellation-safe engine and
@@ -1164,7 +1171,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine stops (#1249).
 
 - `opc-consensus`: align every Openraft revision assertion and operator document
-  with `6e90e9736cc6`, including the former-leader purge retry after replication
+  with `b3c3995868e7`, including the former-leader purge retry after replication
   readers retire. The required qualification-profile tests retain exact source
   and feature assertions. (#1249)
 
