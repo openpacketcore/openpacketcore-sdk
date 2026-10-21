@@ -49,6 +49,13 @@ const PROTECTED_V2_RECOVERY_ROW_UNAVAILABLE: &str =
 pub trait ProtectedFencedTransitionV2Backend:
     protected_fenced_transition_backend_seal::Sealed + Send + Sync
 {
+    /// SDK composition only: retain priority across consecutive local journal steps.
+    /// Drop the guard before remote I/O, sealing or sleeps.
+    #[doc(hidden)]
+    fn retain_protected_fenced_transition_v2_priority(
+        &self,
+    ) -> Option<crate::FencedTransitionV2RecoveryPriorityGuard>;
+
     /// Observe one exact key's record head and durable fence floor through
     /// the V2 physical boundary, unprotecting only a present record.
     async fn observe_protected_fenced_transition_v2(
@@ -69,6 +76,22 @@ pub trait ProtectedFencedTransitionV2Backend:
         &self,
         request: FencedTransitionRequest,
     ) -> Result<PreparedFencedTransitionV2, StoreError>;
+
+    /// SDK composition only: register the original caller lifetime and prepare
+    /// under one initial local journal sequence, releasing priority before
+    /// capability reads, epoch selection, record-expiry checks and sealing.
+    #[doc(hidden)]
+    async fn prepare_protected_fenced_transition_v2_with_call(
+        &self,
+        request: FencedTransitionRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        (
+            PreparedFencedTransitionV2,
+            crate::FencedTransitionV2RecoveryCall,
+        ),
+        StoreError,
+    >;
 
     /// Reload the exact retained sealed request for one caller-stable ID.
     async fn recover_protected_fenced_transition_v2(
@@ -107,6 +130,15 @@ pub trait ProtectedFencedTransitionV2Backend:
     async fn protected_fenced_transition_v2_effect(
         &self,
         prepared: &PreparedFencedTransitionV2,
+    ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>>;
+
+    /// Bound only the local authentication and capability preflight before
+    /// dispatch. Once physical execution starts, preserve its full lifetime
+    /// and transmission classification without an enclosing timeout.
+    async fn protected_fenced_transition_v2_effect_with_journal_deadline(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+        deadline: tokio::time::Instant,
     ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>>;
 
     /// Read the exact receipt status of the retained sealed request.
@@ -213,11 +245,19 @@ impl<'a, B> ProtectedV2RecoveryParts<'a, B>
 where
     B: SessionBackend + ?Sized,
 {
-    /// Resolve the journal and bind it to this wrapper's scope. Binding is a
-    /// write only for a never-used journal.
+    /// Resolve the journal and retain priority for the local sequence starting
+    /// with scope binding, which writes only for a never-used journal. Callers
+    /// must drop the returned guard before any provider or transport await.
     async fn bound_journal(
         &self,
-    ) -> Result<(&'a Arc<FencedTransitionV2RecoveryJournal>, [u8; 32]), StoreError> {
+    ) -> Result<
+        (
+            &'a Arc<FencedTransitionV2RecoveryJournal>,
+            [u8; 32],
+            crate::FencedTransitionV2RecoveryPriorityGuard,
+        ),
+        StoreError,
+    > {
         let scope = protected_fenced_transition_v2_recovery_scope(
             self.configured_scope,
             self.backend_namespace,
@@ -226,8 +266,9 @@ where
         let journal = self
             .recovery_journal
             .ok_or_else(unsupported_protected_fenced_transition_v2_recovery)?;
+        let priority = journal.retain_call_priority();
         journal.ensure_scope(scope).await?;
-        Ok((journal, scope))
+        Ok((journal, scope, priority))
     }
 
     async fn require_v2_boundary(&self) -> Result<(), StoreError> {
@@ -243,7 +284,7 @@ where
         U: FnOnce(Option<StoredSessionRecord>) -> UnprotectFuture,
         UnprotectFuture: Future<Output = Result<Option<StoredSessionRecord>, StoreError>>,
     {
-        self.bound_journal().await?;
+        drop(self.bound_journal().await?);
         self.require_v2_boundary().await?;
         let observation = self.inner.observe_fenced_transition(key).await?;
         if observation
@@ -259,8 +300,15 @@ where
     pub(super) async fn prepare<S, SealFuture>(
         &self,
         request: FencedTransitionRequest,
+        call_deadline: Option<tokio::time::Instant>,
         seal: S,
-    ) -> Result<PreparedFencedTransitionV2, StoreError>
+    ) -> Result<
+        (
+            PreparedFencedTransitionV2,
+            Option<crate::FencedTransitionV2RecoveryCall>,
+        ),
+        StoreError,
+    >
     where
         S: Fn(StoredSessionRecord) -> SealFuture,
         SealFuture: Future<Output = Result<StoredSessionRecord, StoreError>>,
@@ -273,9 +321,14 @@ where
         {
             return Err(unsupported_protected_fenced_transition_v2_recovery());
         }
-        let (journal, scope) = self.bound_journal().await?;
-        self.require_v2_boundary().await?;
+        let (journal, scope, priority) = self.bound_journal().await?;
         let request_id = request.request_id();
+        let call = match call_deadline {
+            Some(deadline) => Some(journal.begin_call(request_id, deadline).await?),
+            None => None,
+        };
+        #[cfg(any(test, feature = "test-control"))]
+        journal.pause_preparation_for_test().await;
         // Held from the cross-journal check through this journal's insert, so
         // a concurrent V1 or V2 preparation of the same ID cannot pass its
         // own check in between.
@@ -292,6 +345,8 @@ where
             }
         }
         journal.ensure_absent(scope, request_id).await?;
+        drop(priority);
+        self.require_v2_boundary().await?;
         // The facade chooses the only epoch that may bind a new identity.
         // A full active epoch cannot bind before the operator's maintenance
         // opens its successor, so it is rejected without journal or provider
@@ -334,7 +389,7 @@ where
         )?;
         require_fenced_transition_v2_physical_envelope(&sealed)?;
         journal.insert(scope, request_id, &sealed).await?;
-        Ok(PreparedFencedTransitionV2::new(request_id, sealed))
+        Ok((PreparedFencedTransitionV2::new(request_id, sealed), call))
     }
 
     pub(super) async fn recover(
@@ -357,7 +412,7 @@ where
         StoreError,
     > {
         require_fenced_transition_physical_boundary(self.inner)?;
-        let (journal, scope) = self.bound_journal().await?;
+        let (journal, scope, _priority) = self.bound_journal().await?;
         match journal.lookup_with_notice(scope, request_id).await? {
             Some((request, notice)) => {
                 require_fenced_transition_v2_physical_envelope(&request)?;
@@ -389,7 +444,7 @@ where
         prepared: &PreparedFencedTransitionV2,
     ) -> Result<&'a Arc<FencedTransitionV2RecoveryJournal>, StoreError> {
         require_fenced_transition_physical_boundary(self.inner)?;
-        let (journal, scope) = self.bound_journal().await?;
+        let (journal, scope, _priority) = self.bound_journal().await?;
         let Some(stored) = journal.lookup(scope, prepared.request_id()).await? else {
             return Err(recovery_row_unavailable());
         };
@@ -405,13 +460,45 @@ where
     pub(super) async fn effect(
         &self,
         prepared: &PreparedFencedTransitionV2,
+        journal_deadline: Option<tokio::time::Instant>,
     ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
-        if let Err(error) = self.require_exact(prepared).await {
+        let elapsed = || {
+            StoreError::BackendUnavailable(
+                "protected fenced-transition V2 journal deadline elapsed".into(),
+            )
+        };
+        let authenticate = async {
+            self.require_exact(prepared).await?;
+            self.require_v2_boundary().await
+        };
+        let authenticated = match journal_deadline {
+            Some(deadline) if tokio::time::Instant::now() >= deadline => Err(elapsed()),
+            Some(deadline) => {
+                tokio::pin!(authenticate);
+                // A timer wakeup can be rounded beyond the absolute deadline.
+                // Check authority on every poll before queued authentication
+                // can admit another operation. This never wraps physical I/O.
+                let bounded_authenticate = std::future::poll_fn(|context| {
+                    if tokio::time::Instant::now() >= deadline {
+                        std::task::Poll::Ready(Err(elapsed()))
+                    } else {
+                        std::future::Future::poll(authenticate.as_mut(), context)
+                    }
+                });
+                tokio::time::timeout_at(deadline, bounded_authenticate)
+                    .await
+                    .unwrap_or_else(|_| Err(elapsed()))
+            }
+            None => authenticate.await,
+        };
+        if let Err(error) = authenticated {
             return FencedTransitionV2Effect::NotTransmitted(error);
         }
-        if let Err(error) = self.require_v2_boundary().await {
-            return FencedTransitionV2Effect::NotTransmitted(error);
+        if journal_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return FencedTransitionV2Effect::NotTransmitted(elapsed());
         }
+        // Only the read-only authentication above is cancellable by this
+        // deadline. The physical boundary owns all later classification.
         let physical = prepared.physical_request();
         let unknown = || FencedTransitionV2Effect::OutcomeUnknown {
             request_ids: vec![physical.request_id()],
@@ -520,14 +607,14 @@ where
         &self,
         prepared: &PreparedFencedTransitionV2,
     ) -> Result<bool, StoreError> {
-        let (journal, scope) = self.bound_journal().await?;
+        let (journal, scope, _priority) = self.bound_journal().await?;
         journal
             .remove_if_exact(scope, prepared.request_id(), prepared.physical_request())
             .await
     }
 
     pub(super) async fn history_state(&self) -> Result<FencedTransitionV2HistoryState, StoreError> {
-        self.bound_journal().await?;
+        drop(self.bound_journal().await?);
         self.require_v2_boundary().await?;
         self.inner.fenced_transition_v2_history_state().await
     }
@@ -537,7 +624,7 @@ where
         after: Option<FencedTransitionRequestId>,
         limit: usize,
     ) -> Result<Vec<(FencedTransitionRequestId, FencedTransitionV2HistoryEpoch)>, StoreError> {
-        let (journal, scope) = self.bound_journal().await?;
+        let (journal, scope, _priority) = self.bound_journal().await?;
         Ok(journal
             .page_after(scope, after, limit)
             .await?
@@ -550,7 +637,8 @@ where
         &self,
         limit: usize,
     ) -> Result<(FencedTransitionV2HistoryState, usize), StoreError> {
-        let (journal, scope) = self.bound_journal().await?;
+        let (journal, scope, priority) = self.bound_journal().await?;
+        drop(priority);
         self.require_v2_boundary().await?;
         let history = self.inner.fenced_transition_v2_history_state().await?;
         let removed = match history.retired_through() {
@@ -561,7 +649,7 @@ where
     }
 
     pub(super) async fn retained(&self) -> Result<usize, StoreError> {
-        let (journal, scope) = self.bound_journal().await?;
+        let (journal, scope, _priority) = self.bound_journal().await?;
         journal.live_entries(scope).await
     }
 }
@@ -584,6 +672,7 @@ pub(super) async fn reject_v1_id_retained_by_recovery_journal(
     };
     let scope =
         protected_fenced_transition_v2_recovery_scope(configured_scope, backend_namespace, mode)?;
+    let _priority = journal.retain_call_priority();
     journal.ensure_scope(scope).await?;
     let admission = journal.admit(request_id)?;
     if journal.lookup(scope, request_id).await?.is_some() {
@@ -598,6 +687,14 @@ where
     B: SessionBackend + 'static + ?Sized,
     P: KeyProvider + 'static + ?Sized,
 {
+    fn retain_protected_fenced_transition_v2_priority(
+        &self,
+    ) -> Option<crate::FencedTransitionV2RecoveryPriorityGuard> {
+        self.v2_recovery_parts()
+            .recovery_journal
+            .map(|journal| journal.retain_call_priority())
+    }
+
     async fn observe_protected_fenced_transition_v2(
         &self,
         key: &SessionKey,
@@ -612,8 +709,29 @@ where
         request: FencedTransitionRequest,
     ) -> Result<PreparedFencedTransitionV2, StoreError> {
         self.v2_recovery_parts()
-            .prepare(request, |record| self.encrypt_record(record))
+            .prepare(request, None, |record| self.encrypt_record(record))
             .await
+            .map(|(prepared, _)| prepared)
+    }
+
+    async fn prepare_protected_fenced_transition_v2_with_call(
+        &self,
+        request: FencedTransitionRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        (
+            PreparedFencedTransitionV2,
+            crate::FencedTransitionV2RecoveryCall,
+        ),
+        StoreError,
+    > {
+        let (prepared, call) = self
+            .v2_recovery_parts()
+            .prepare(request, Some(deadline), |record| {
+                self.encrypt_record(record)
+            })
+            .await?;
+        Ok((prepared, call.ok_or_else(recovery_row_unavailable)?))
     }
 
     async fn recover_protected_fenced_transition_v2(
@@ -649,7 +767,17 @@ where
         &self,
         prepared: &PreparedFencedTransitionV2,
     ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
-        self.v2_recovery_parts().effect(prepared).await
+        self.v2_recovery_parts().effect(prepared, None).await
+    }
+
+    async fn protected_fenced_transition_v2_effect_with_journal_deadline(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+        deadline: tokio::time::Instant,
+    ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
+        self.v2_recovery_parts()
+            .effect(prepared, Some(deadline))
+            .await
     }
 
     async fn protected_fenced_transition_v2_status(
@@ -712,6 +840,14 @@ where
     B: SessionBackend + 'static + ?Sized,
     S: RemoteSealProvider + 'static + ?Sized,
 {
+    fn retain_protected_fenced_transition_v2_priority(
+        &self,
+    ) -> Option<crate::FencedTransitionV2RecoveryPriorityGuard> {
+        self.v2_recovery_parts()
+            .recovery_journal
+            .map(|journal| journal.retain_call_priority())
+    }
+
     async fn observe_protected_fenced_transition_v2(
         &self,
         key: &SessionKey,
@@ -726,8 +862,27 @@ where
         request: FencedTransitionRequest,
     ) -> Result<PreparedFencedTransitionV2, StoreError> {
         self.v2_recovery_parts()
-            .prepare(request, |record| self.seal_record(record))
+            .prepare(request, None, |record| self.seal_record(record))
             .await
+            .map(|(prepared, _)| prepared)
+    }
+
+    async fn prepare_protected_fenced_transition_v2_with_call(
+        &self,
+        request: FencedTransitionRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        (
+            PreparedFencedTransitionV2,
+            crate::FencedTransitionV2RecoveryCall,
+        ),
+        StoreError,
+    > {
+        let (prepared, call) = self
+            .v2_recovery_parts()
+            .prepare(request, Some(deadline), |record| self.seal_record(record))
+            .await?;
+        Ok((prepared, call.ok_or_else(recovery_row_unavailable)?))
     }
 
     async fn recover_protected_fenced_transition_v2(
@@ -763,7 +918,17 @@ where
         &self,
         prepared: &PreparedFencedTransitionV2,
     ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
-        self.v2_recovery_parts().effect(prepared).await
+        self.v2_recovery_parts().effect(prepared, None).await
+    }
+
+    async fn protected_fenced_transition_v2_effect_with_journal_deadline(
+        &self,
+        prepared: &PreparedFencedTransitionV2,
+        deadline: tokio::time::Instant,
+    ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
+        self.v2_recovery_parts()
+            .effect(prepared, Some(deadline))
+            .await
     }
 
     async fn protected_fenced_transition_v2_status(

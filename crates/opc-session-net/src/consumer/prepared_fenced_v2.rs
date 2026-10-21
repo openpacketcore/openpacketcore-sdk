@@ -10,6 +10,7 @@
 
 use super::*;
 use opc_session_store::fenced_transition::FencedTransitionV2Effect;
+use opc_session_store::scope_scheduler::ScopeWorkClass;
 use opc_session_store::{
     FencedTransitionV2Capability, FencedTransitionV2HistoryEpoch, FencedTransitionV2HistoryState,
     FencedTransitionV2JournalScope, FencedTransitionV2RecoveryJournal, FencedTransitionV2Request,
@@ -28,6 +29,31 @@ const PREPARED_FENCED_V2_RECLAIM_LIMIT_INVALID: &str =
 
 fn prepared_fenced_v2_deadline() -> StoreError {
     StoreError::BackendUnavailable(PREPARED_FENCED_V2_DEADLINE.into())
+}
+
+fn default_fenced_v2_operation_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        .checked_add(DEFAULT_CONSUMER_OPERATION_TIMEOUT)
+        .unwrap_or_else(tokio::time::Instant::now)
+}
+
+/// Check the absolute authority before polling queued journal work. Tokio's
+/// timer rounds wakeups to a millisecond and polls the inner future first;
+/// neither may admit another journal step when this caller is already expired.
+async fn journal_before_deadline<F: std::future::Future>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Result<F::Output, ()> {
+    let wait = tokio::time::timeout_at(deadline, future);
+    tokio::pin!(wait);
+    std::future::poll_fn(|context| {
+        if tokio::time::Instant::now() >= deadline {
+            std::task::Poll::Ready(Err(()))
+        } else {
+            std::future::Future::poll(wait.as_mut(), context).map(|result| result.map_err(|_| ()))
+        }
+    })
+    .await
 }
 
 fn prepared_fenced_v2_readiness_unavailable() -> StoreError {
@@ -168,6 +194,7 @@ trait PreparedFencedTransitionV2WrapperFactory: Send + Sync {
     fn wrap(
         &self,
         physical: Arc<dyn SessionBackend>,
+        class: ScopeWorkClass,
     ) -> Arc<dyn ProtectedFencedTransitionV2Backend>;
 
     fn with_legacy_journal(
@@ -195,13 +222,16 @@ where
     fn wrap(
         &self,
         physical: Arc<dyn SessionBackend>,
+        class: ScopeWorkClass,
     ) -> Arc<dyn ProtectedFencedTransitionV2Backend> {
         let wrapper = EncryptingSessionBackend::new(
             physical,
             Arc::clone(&self.provider),
             self.backend_namespace.to_string(),
         )
-        .with_fenced_transition_v2_recovery_journal(Arc::clone(&self.journal))
+        .with_fenced_transition_v2_recovery_journal(Arc::new(
+            self.journal.with_operation_class(class),
+        ))
         .with_fenced_transition_v2_journal_scope(self.scope);
         Arc::new(match &self.legacy_journal {
             Some(legacy) => wrapper.with_fenced_transition_journal(Arc::clone(legacy)),
@@ -242,13 +272,16 @@ where
     fn wrap(
         &self,
         physical: Arc<dyn SessionBackend>,
+        class: ScopeWorkClass,
     ) -> Arc<dyn ProtectedFencedTransitionV2Backend> {
         let wrapper = RemoteSealingSessionBackend::new(
             physical,
             Arc::clone(&self.provider),
             self.backend_namespace.to_string(),
         )
-        .with_fenced_transition_v2_recovery_journal(Arc::clone(&self.journal))
+        .with_fenced_transition_v2_recovery_journal(Arc::new(
+            self.journal.with_operation_class(class),
+        ))
         .with_fenced_transition_v2_journal_scope(self.scope);
         Arc::new(match &self.legacy_journal {
             Some(legacy) => wrapper.with_fenced_transition_journal(Arc::clone(legacy)),
@@ -651,7 +684,7 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
                 self.route.mutation_voter(voter_count).wrapping_add(offset),
                 voter_count,
             )];
-            let response = tokio::time::timeout_at(
+            let response = journal_before_deadline(
                 budget.original_deadline(),
                 client.execute_v1_read_with_budget(
                     DeadlineV1Read::PreflightRecordExpiry(preflights.to_vec()),
@@ -1203,14 +1236,15 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         }
     }
 
-    fn backend_for_route(
+    fn backend_for_route_with_journal_class(
         &self,
         route: Arc<PreparedFencedTransitionV2Route>,
         budget: PreparedCheckpointBudget,
         history_read: V2HistoryRead,
+        class: ScopeWorkClass,
     ) -> Arc<dyn ProtectedFencedTransitionV2Backend> {
-        self.wrapper_factory
-            .wrap(Arc::new(ActivatedFencedTransitionV2Backend {
+        self.wrapper_factory.wrap(
+            Arc::new(ActivatedFencedTransitionV2Backend {
                 capability: self.capability,
                 router: Arc::clone(&self.router),
                 route,
@@ -1218,17 +1252,20 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 history_read,
                 deadline: budget.original_deadline(),
                 attempt_timeout: budget.physical_attempt_timeout(),
-            }))
+            }),
+            class,
+        )
     }
 
-    fn local_backend(&self) -> Arc<dyn ProtectedFencedTransitionV2Backend> {
+    fn local_backend_with_journal_class(
+        &self,
+        deadline: tokio::time::Instant,
+        class: ScopeWorkClass,
+    ) -> Arc<dyn ProtectedFencedTransitionV2Backend> {
         // Journal-only and observation work never reaches a V2 mutation, so
         // one bounded default operation window is sufficient here.
-        let deadline = tokio::time::Instant::now()
-            .checked_add(DEFAULT_CONSUMER_OPERATION_TIMEOUT)
-            .unwrap_or_else(tokio::time::Instant::now);
-        self.wrapper_factory
-            .wrap(Arc::new(ActivatedFencedTransitionV2Backend {
+        self.wrapper_factory.wrap(
+            Arc::new(ActivatedFencedTransitionV2Backend {
                 capability: self.capability,
                 router: Arc::clone(&self.router),
                 route: Arc::new(PreparedFencedTransitionV2Route::new(0)),
@@ -1236,21 +1273,45 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 history_read: V2HistoryRead::Cached,
                 deadline,
                 attempt_timeout: DEFAULT_CONSUMER_OPERATION_TIMEOUT,
-            }))
+            }),
+            class,
+        )
     }
 
     /// Read the current record head and durable fence floor for one exact key
     /// and return a present record in caller-visible unprotected form.
     ///
     /// This uses the existing exact-key observation operation and adds no
-    /// raw backend, prepared request, or dispatch authority.
+    /// raw backend, prepared request, or dispatch authority. The full call,
+    /// including its local journal waits, uses the existing ten-second default
+    /// consumer operation window.
     pub async fn observe_fenced_transition(
         &self,
         key: &opc_session_store::SessionKey,
     ) -> Result<FencedTransitionObservation, StoreError> {
-        self.local_backend()
-            .observe_protected_fenced_transition_v2(key)
-            .await
+        self.observe_fenced_transition_with_journal_class(
+            key,
+            self.wrapper_factory.journal().operation_class(),
+        )
+        .await
+    }
+
+    /// Observe with the current operation's authenticated local journal class.
+    /// The class applies to local scope authentication only; remote reads and
+    /// unprotection hold no journal priority. The default window is unchanged.
+    pub async fn observe_fenced_transition_with_journal_class(
+        &self,
+        key: &opc_session_store::SessionKey,
+        class: ScopeWorkClass,
+    ) -> Result<FencedTransitionObservation, StoreError> {
+        let deadline = default_fenced_v2_operation_deadline();
+        journal_before_deadline(
+            deadline,
+            self.local_backend_with_journal_class(deadline, class)
+                .observe_protected_fenced_transition_v2(key),
+        )
+        .await
+        .map_err(|_| prepared_fenced_v2_deadline())?
     }
 
     /// Prepare one protected V2 transition and retain it in a move-only,
@@ -1261,31 +1322,57 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// complete sealed request before this returns. A retained caller ID,
     /// including one retained by a composed legacy V1 journal, is a conflict;
     /// a full recovery journal or full active epoch is
-    /// `FencedTransitionHistoryFull`.
+    /// `FencedTransitionHistoryFull`. The configured journal view supplies
+    /// the default work class; newly opened journals use `Normal`.
     pub async fn prepare_fenced_transition(
         &self,
         request: FencedTransitionRequest,
         budget: PreparedCheckpointBudget,
     ) -> Result<SessionConsumerPreparedFencedTransitionV2, StoreError> {
+        self.prepare_fenced_transition_with_journal_class(
+            request,
+            budget,
+            self.wrapper_factory.journal().operation_class(),
+        )
+        .await
+    }
+
+    /// Prepare with an explicit local recovery-journal scheduling class.
+    ///
+    /// The caller chooses [`ScopeWorkClass`] from authenticated operation and
+    /// session state. Its existing rank orders the local journal's FIFO class
+    /// heads. Each consecutive local journal sequence retains registration,
+    /// preventing lower-class operations from interleaving within it. Remote
+    /// I/O, sealing and backoff hold no journal priority. Higher classes may
+    /// still precede local work; already admitted blocking work finishes.
+    /// The returned handle retains the class for later active calls, without
+    /// holding priority while idle. Class selection changes no authority,
+    /// remote-voter scheduling or class budget; a composed legacy V1 journal
+    /// keeps its existing scheduling.
+    /// Cancelling a call removes its registration. Already admitted blocking
+    /// work finishes under the existing journal progress budget.
+    pub async fn prepare_fenced_transition_with_journal_class(
+        &self,
+        request: FencedTransitionRequest,
+        budget: PreparedCheckpointBudget,
+        class: ScopeWorkClass,
+    ) -> Result<SessionConsumerPreparedFencedTransitionV2, StoreError> {
         let deadline = budget.original_deadline();
         if tokio::time::Instant::now() >= deadline {
             return Err(prepared_fenced_v2_deadline());
         }
-        let call = tokio::time::timeout_at(
-            deadline,
-            self.wrapper_factory
-                .journal()
-                .begin_call(request.request_id(), deadline),
-        )
-        .await
-        .map_err(|_| prepared_fenced_v2_deadline())??;
         let route = Arc::new(PreparedFencedTransitionV2Route::new(
             prepared_fenced_v2_origin(&self.router, request.request_id()),
         ));
-        let backend = self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Cached);
-        let prepared = tokio::time::timeout_at(
+        let backend = self.backend_for_route_with_journal_class(
+            Arc::clone(&route),
+            budget,
+            V2HistoryRead::Cached,
+            class,
+        );
+        let (prepared, call) = journal_before_deadline(
             deadline,
-            backend.prepare_protected_fenced_transition_v2(request),
+            backend.prepare_protected_fenced_transition_v2_with_call(request, deadline),
         )
         .await
         .map_err(|_| prepared_fenced_v2_deadline())??;
@@ -1309,12 +1396,34 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// nor a key provider, and it never restores dispatch authority. `None`
     /// means neither this facade's recovery journal nor a composed legacy V1
     /// journal retains the ID: it was never prepared through them, or its row
-    /// was released or reclaimed after resolution.
+    /// was released or reclaimed after resolution. This uses the configured
+    /// journal view's work class, `Normal` for a newly opened journal.
     pub async fn recover_fenced_transition_status(
         &self,
         request_id: FencedTransitionRequestId,
         budget: PreparedCheckpointBudget,
     ) -> Result<Option<SessionConsumerRecoveredFencedTransition>, StoreError> {
+        self.recover_fenced_transition_status_with_journal_class(
+            request_id,
+            budget,
+            self.wrapper_factory.journal().operation_class(),
+        )
+        .await
+    }
+
+    /// Recover receipt authority with an explicit V2 recovery-journal class.
+    ///
+    /// This has the same scheduling and cancellation contract as
+    /// [`Self::prepare_fenced_transition_with_journal_class`]. The recovered
+    /// V2 handle retains the class, without acquiring dispatch authority.
+    /// A composed legacy V1 journal keeps its existing scheduling behavior.
+    pub async fn recover_fenced_transition_status_with_journal_class(
+        &self,
+        request_id: FencedTransitionRequestId,
+        budget: PreparedCheckpointBudget,
+        class: ScopeWorkClass,
+    ) -> Result<Option<SessionConsumerRecoveredFencedTransition>, StoreError> {
+        let journal = self.wrapper_factory.journal().with_operation_class(class);
         let deadline = budget.original_deadline();
         if tokio::time::Instant::now() >= deadline {
             return Err(prepared_fenced_v2_deadline());
@@ -1322,8 +1431,14 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         let route = Arc::new(PreparedFencedTransitionV2Route::new(
             prepared_fenced_v2_origin(&self.router, request_id),
         ));
-        let backend = self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Cached);
-        tokio::time::timeout_at(deadline, async {
+        let backend = self.backend_for_route_with_journal_class(
+            Arc::clone(&route),
+            budget,
+            V2HistoryRead::Cached,
+            class,
+        );
+        journal_before_deadline(deadline, async {
+            let _priority = journal.retain_call_priority();
             let (retained, notice) = backend
                 .recover_protected_fenced_transition_v2_with_notice(request_id)
                 .await?;
@@ -1383,11 +1498,33 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// An owned journal also requires the previous call to have returned a
     /// known deferral, ended, or reached its deadline; drop an unknown handle
     /// before resuming after a later authoritative deferral observation.
+    /// This uses the configured journal view's work class. Use the explicit
+    /// class variant when resuming work classified per call.
     pub async fn resume_deferred_fenced_transition(
         &self,
         request_id: FencedTransitionRequestId,
         budget: PreparedCheckpointBudget,
     ) -> Result<Option<SessionConsumerPreparedFencedTransitionV2>, StoreError> {
+        self.resume_deferred_fenced_transition_with_journal_class(
+            request_id,
+            budget,
+            self.wrapper_factory.journal().operation_class(),
+        )
+        .await
+    }
+
+    /// Resume a deferred transition with an explicit recovery-journal class.
+    ///
+    /// The caller supplies its current authenticated work class. Every local
+    /// journal step and the resumed handle retain it, including deferred-call
+    /// registration. The class does not change receipt or dispatch authority.
+    pub async fn resume_deferred_fenced_transition_with_journal_class(
+        &self,
+        request_id: FencedTransitionRequestId,
+        budget: PreparedCheckpointBudget,
+        class: ScopeWorkClass,
+    ) -> Result<Option<SessionConsumerPreparedFencedTransitionV2>, StoreError> {
+        let journal = self.wrapper_factory.journal().with_operation_class(class);
         let deadline = budget.original_deadline();
         if tokio::time::Instant::now() >= deadline {
             return Err(prepared_fenced_v2_deadline());
@@ -1395,8 +1532,14 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         let route = Arc::new(PreparedFencedTransitionV2Route::new(
             prepared_fenced_v2_origin(&self.router, request_id),
         ));
-        let backend = self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Fresh);
-        tokio::time::timeout_at(deadline, async {
+        let backend = self.backend_for_route_with_journal_class(
+            Arc::clone(&route),
+            budget,
+            V2HistoryRead::Fresh,
+            class,
+        );
+        journal_before_deadline(deadline, async {
+            let priority = journal.retain_call_priority();
             let prepared = match backend
                 .recover_protected_fenced_transition_v2(request_id)
                 .await?
@@ -1414,12 +1557,13 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                     return Err(StoreError::FencedTransitionRequestConflict);
                 }
             }
+            drop(priority);
             for _ in 0..self.router.clients.len() {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(prepared_fenced_v2_deadline());
                 }
                 route.install_attempt_deadline(deadline);
-                match tokio::time::timeout_at(
+                match journal_before_deadline(
                     deadline,
                     backend.protected_fenced_transition_v2_status(&prepared),
                 )
@@ -1428,11 +1572,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                     Ok(Ok(FencedTransitionV2Status::LeaseDeferred { .. })) => {
                         // The protected wrapper and wire client both compare
                         // the complete ID with the authenticated sealed body.
-                        let call = self
-                            .wrapper_factory
-                            .journal()
-                            .begin_deferred_call(&prepared, deadline)
-                            .await?;
+                        let call = journal.begin_deferred_call(&prepared, deadline).await?;
                         return Ok(Some(SessionConsumerPreparedFencedTransitionV2 {
                             inner: PersistentPreparedFencedTransitionV2Token::new(
                                 Arc::clone(&backend),
@@ -1502,6 +1642,24 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         limit: usize,
         budget: PreparedCheckpointBudget,
     ) -> Result<SessionConsumerFencedTransitionV2ReclaimReport, StoreError> {
+        self.reclaim_resolved_fenced_transitions_with_journal_class(
+            limit,
+            budget,
+            self.wrapper_factory.journal().operation_class(),
+        )
+        .await
+    }
+
+    /// Reclaim with an explicit local journal class, typically `Maintenance`.
+    /// Each consecutive local sequence retains this class; remote history,
+    /// receipt and void requests hold no journal priority. The original sweep
+    /// and physical-attempt budgets remain unchanged.
+    pub async fn reclaim_resolved_fenced_transitions_with_journal_class(
+        &self,
+        limit: usize,
+        budget: PreparedCheckpointBudget,
+        class: ScopeWorkClass,
+    ) -> Result<SessionConsumerFencedTransitionV2ReclaimReport, StoreError> {
         if limit == 0 || limit > FENCED_TRANSITION_V2_RECOVERY_RECLAIM_BATCH_MAX {
             return Err(StoreError::InvalidKey(
                 PREPARED_FENCED_V2_RECLAIM_LIMIT_INVALID.into(),
@@ -1512,11 +1670,15 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             return Err(prepared_fenced_v2_deadline());
         }
         let route = Arc::new(PreparedFencedTransitionV2Route::new(0));
-        let backend =
-            self.backend_for_route(Arc::clone(&route), budget, V2HistoryRead::Maintenance);
+        let backend = self.backend_for_route_with_journal_class(
+            Arc::clone(&route),
+            budget,
+            V2HistoryRead::Maintenance,
+            class,
+        );
         // One linearized history read supplies both the retired floor, which
         // the wrapper applies itself, and the active epoch used below.
-        let (history, retired) = tokio::time::timeout_at(
+        let (history, retired) = journal_before_deadline(
             deadline,
             backend.reclaim_retired_protected_fenced_transitions_v2(limit),
         )
@@ -1534,7 +1696,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             .reclaim_cursor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let page = tokio::time::timeout_at(
+        let page = journal_before_deadline(
             deadline,
             backend.protected_fenced_transition_v2_page(cursor, remaining),
         )
@@ -1550,7 +1712,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                 report.interrupted = true;
                 break;
             };
-            let prepared = match tokio::time::timeout_at(
+            let prepared = match journal_before_deadline(
                 attempt_deadline,
                 backend.recover_protected_fenced_transition_v2(request_id),
             )
@@ -1577,7 +1739,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                     break;
                 };
                 route.install_attempt_deadline(attempt_deadline);
-                match tokio::time::timeout_at(
+                match journal_before_deadline(
                     attempt_deadline,
                     backend.protected_fenced_transition_v2_status(&prepared),
                 )
@@ -1613,7 +1775,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                             break;
                         };
                         route.install_attempt_deadline(attempt_deadline);
-                        match tokio::time::timeout_at(
+                        match journal_before_deadline(
                             attempt_deadline,
                             backend.protected_fenced_transition_v2_void(&prepared),
                         )
@@ -1674,12 +1836,18 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
             };
             report.examined += 1;
             if reclaimable {
-                match backend
-                    .discard_protected_fenced_transition_v2(&prepared)
-                    .await
+                if tokio::time::Instant::now() >= deadline {
+                    report.interrupted = true;
+                    break;
+                }
+                match journal_before_deadline(
+                    deadline,
+                    backend.discard_protected_fenced_transition_v2(&prepared),
+                )
+                .await
                 {
-                    Ok(_) => report.reclaimed += 1,
-                    Err(_) => {
+                    Ok(Ok(_)) => report.reclaimed += 1,
+                    Ok(Err(_)) | Err(_) => {
                         report.interrupted = true;
                         break;
                     }
@@ -1704,11 +1872,37 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// Return the authenticated number of retained recovery-journal rows.
     ///
     /// The value is a fixed count only; it never exceeds
-    /// `FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES`.
+    /// `FENCED_TRANSITION_V2_RECOVERY_JOURNAL_MAX_ENTRIES`. Journal waits use
+    /// the existing ten-second default consumer operation window. This uses
+    /// the configured journal view's class, `Normal` for a newly opened journal.
     pub async fn retained_fenced_transitions(&self) -> Result<usize, StoreError> {
-        self.local_backend()
-            .retained_protected_fenced_transitions_v2()
-            .await
+        self.retained_fenced_transitions_with_journal_class(
+            self.wrapper_factory.journal().operation_class(),
+        )
+        .await
+    }
+
+    /// Return the authenticated retained-row count for a selected journal class.
+    ///
+    /// An inventory read made while preparing or retrying work can use that
+    /// work's authenticated class, so it does not queue behind lower-ranked
+    /// operations. The local scope-binding and count sequence retains its
+    /// registration. Cancelling a queued call releases its place; already
+    /// admitted blocking work retains its progress budget and permit lifetime.
+    /// The read keeps the existing ten-second default operation window and
+    /// grants no mutation, dispatch or recovery authority.
+    pub async fn retained_fenced_transitions_with_journal_class(
+        &self,
+        class: ScopeWorkClass,
+    ) -> Result<usize, StoreError> {
+        let deadline = default_fenced_v2_operation_deadline();
+        journal_before_deadline(
+            deadline,
+            self.local_backend_with_journal_class(deadline, class)
+                .retained_protected_fenced_transitions_v2(),
+        )
+        .await
+        .map_err(|_| prepared_fenced_v2_deadline())?
     }
 }
 
@@ -1782,7 +1976,10 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     /// afterwards. When an original handle fails preflight, every candidate
     /// voter proves a pre-dispatch failure, topology authority is revoked
     /// before any Call byte, or the V2 history definitively rejects the
-    /// request without binding it, this handle removes its own retained row.
+    /// request without binding it, this handle removes its own retained row
+    /// within the original caller deadline. If expiry prevents cleanup, the
+    /// handle remains resolved and cannot dispatch again; the existing
+    /// scheduled reclamation completes cleanup under its maintenance budget.
     /// A resumed deferred request retains its earlier binding and status
     /// recovery when the current attempt fails preflight.
     ///
@@ -1833,7 +2030,9 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     /// no longer retained: recovery returns `None`, and the ID may name a new
     /// transition. An `abandon_unexecuted` call that failed or was cancelled
     /// also permits release. Callers must derive later work from authoritative
-    /// observation. Releasing twice is a no-op.
+    /// observation. Releasing twice is a no-op. Each cleanup call has the
+    /// existing ten-second default operation window, so it can be retried
+    /// after the execution budget expires. Timeout leaves the row releasable.
     pub async fn release_resolved(
         &mut self,
     ) -> Result<(), SessionConsumerFencedTransitionV2ReleaseError> {
@@ -2105,12 +2304,21 @@ impl PersistentPreparedFencedTransitionV2Token {
         if !self.original {
             return;
         }
-        if self
-            .backend
-            .discard_protected_fenced_transition_v2(&self.prepared)
-            .await
-            .is_ok()
-        {
+        #[cfg(test)]
+        tests::pause_execution_journal(tests::ExecutionJournalCut::BeforeDiscard).await;
+        let deadline = self.budget.original_deadline();
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        if matches!(
+            journal_before_deadline(
+                deadline,
+                self.backend
+                    .discard_protected_fenced_transition_v2(&self.prepared),
+            )
+            .await,
+            Ok(Ok(_))
+        ) {
             self.set_resolution(V2Resolution::Released);
         }
     }
@@ -2180,7 +2388,7 @@ impl PersistentPreparedFencedTransitionV2Token {
         // Authenticate the exact retained row before any lane work. The
         // wrapper repeats this immediately before each physical dispatch.
         if !matches!(
-            tokio::time::timeout_at(
+            journal_before_deadline(
                 self.budget.original_deadline(),
                 self.backend
                     .preflight_protected_fenced_transition_v2(&self.prepared),
@@ -2199,6 +2407,8 @@ impl PersistentPreparedFencedTransitionV2Token {
             }
             return Err(FencedTransitionExecuteError::NotTransmitted);
         }
+        #[cfg(test)]
+        tests::pause_execution_journal(tests::ExecutionJournalCut::AfterPreflight).await;
         for _ in 0..self.voter_count {
             let now = tokio::time::Instant::now();
             let Some(attempt_deadline) = now
@@ -2211,11 +2421,15 @@ impl PersistentPreparedFencedTransitionV2Token {
                 break;
             }
             self.route.install_attempt_deadline(attempt_deadline);
-            // The lane actor honors the attempt deadline and classifies the
-            // result itself; this future is never cancelled to bound it.
+            // Bound the wrapper's repeated journal authentication before
+            // physical dispatch. The lane actor owns the later deadline and
+            // transmission classification; never time out the whole mutation.
             match self
                 .backend
-                .protected_fenced_transition_v2_effect(&self.prepared)
+                .protected_fenced_transition_v2_effect_with_journal_deadline(
+                    &self.prepared,
+                    attempt_deadline,
+                )
                 .await
             {
                 FencedTransitionV2Effect::Resolved(Ok(outcome)) => {
@@ -2357,7 +2571,7 @@ impl PersistentPreparedFencedTransitionV2Token {
         }
         // A missing, corrupt, or substituted row is a local fail-closed
         // condition, checked before any receipt lane is used.
-        match tokio::time::timeout_at(
+        match journal_before_deadline(
             deadline,
             self.backend
                 .preflight_protected_fenced_transition_v2(&self.prepared),
@@ -2387,7 +2601,7 @@ impl PersistentPreparedFencedTransitionV2Token {
             return result;
         }
         self.route.install_attempt_deadline(deadline);
-        let result = match tokio::time::timeout_at(
+        let result = match journal_before_deadline(
             deadline,
             self.backend
                 .protected_fenced_transition_v2_status(&self.prepared),
@@ -2467,10 +2681,17 @@ impl PersistentPreparedFencedTransitionV2Token {
                 // The row may already have been reclaimed by a sweep; the
                 // compare-and-delete then removes nothing and release still
                 // completes.
-                self.backend
-                    .discard_protected_fenced_transition_v2(&self.prepared)
-                    .await
-                    .map_err(|_| SessionConsumerFencedTransitionV2ReleaseError::Unavailable)?;
+                // Cleanup has its own existing default operation window.
+                // A later retry remains possible after execution's original
+                // deadline, without restoring any dispatch authority.
+                journal_before_deadline(
+                    default_fenced_v2_operation_deadline(),
+                    self.backend
+                        .discard_protected_fenced_transition_v2(&self.prepared),
+                )
+                .await
+                .map_err(|_| SessionConsumerFencedTransitionV2ReleaseError::Unavailable)?
+                .map_err(|_| SessionConsumerFencedTransitionV2ReleaseError::Unavailable)?;
                 self.set_resolution(V2Resolution::Released);
                 Ok(())
             }
@@ -2519,6 +2740,33 @@ mod tests {
 
     const VOTERS: usize = 3;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ExecutionJournalCut {
+        AfterPreflight,
+        BeforeDiscard,
+    }
+
+    #[derive(Default)]
+    struct ExecutionJournalPause {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    tokio::task_local! {
+        static EXECUTION_JOURNAL_PAUSE: (ExecutionJournalCut, Arc<ExecutionJournalPause>);
+    }
+
+    pub(super) async fn pause_execution_journal(cut: ExecutionJournalCut) {
+        if let Some(pause) = EXECUTION_JOURNAL_PAUSE
+            .try_with(|(selected, pause)| (*selected == cut).then(|| Arc::clone(pause)))
+            .ok()
+            .flatten()
+        {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
     #[derive(Clone)]
     enum Step {
         NotTransmitted,
@@ -2539,6 +2787,9 @@ mod tests {
         voters: StdMutex<Vec<usize>>,
         status: StdMutex<FencedTransitionV2Status>,
         committed: StdMutex<Option<FencedTransitionOutcome>>,
+        status_pause: ExecutionJournalPause,
+        hang_status: std::sync::atomic::AtomicBool,
+        status_reads: std::sync::atomic::AtomicUsize,
     }
 
     impl ScriptedV2Physical {
@@ -2549,6 +2800,9 @@ mod tests {
                 voters: StdMutex::new(Vec::new()),
                 status: StdMutex::new(FencedTransitionV2Status::NotFound),
                 committed: StdMutex::new(None),
+                status_pause: ExecutionJournalPause::default(),
+                hang_status: std::sync::atomic::AtomicBool::new(false),
+                status_reads: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -2690,6 +2944,11 @@ mod tests {
             &self,
             _request: &FencedTransitionV2Request,
         ) -> Result<FencedTransitionV2Status, StoreError> {
+            self.status_reads.fetch_add(1, Ordering::SeqCst);
+            self.status_pause.entered.notify_one();
+            if self.hang_status.load(Ordering::SeqCst) {
+                self.status_pause.release.notified().await;
+            }
             Ok(self.status.lock().expect("status").clone())
         }
 
@@ -2715,6 +2974,7 @@ mod tests {
 
     struct Harness {
         _directory: tempfile::TempDir,
+        journal: Arc<FencedTransitionV2RecoveryJournal>,
         physical: Arc<ScriptedV2Physical>,
         backend: Arc<dyn ProtectedFencedTransitionV2Backend>,
         route: Arc<PreparedFencedTransitionV2Route>,
@@ -2769,6 +3029,10 @@ mod tests {
     }
 
     async fn harness(steps: Vec<Step>) -> Harness {
+        harness_with_class(steps, ScopeWorkClass::Normal).await
+    }
+
+    async fn harness_with_class(steps: Vec<Step>, class: ScopeWorkClass) -> Harness {
         let directory = tempfile::tempdir().expect("journal directory");
         #[cfg(unix)]
         {
@@ -2798,13 +3062,16 @@ mod tests {
         let erased: Arc<dyn SessionBackend> = physical.clone();
         let backend: Arc<dyn ProtectedFencedTransitionV2Backend> = Arc::new(
             EncryptingSessionBackend::new(erased, provider, "prepared-fenced-v2-unit")
-                .with_fenced_transition_v2_recovery_journal(journal)
+                .with_fenced_transition_v2_recovery_journal(Arc::new(
+                    journal.with_operation_class(class),
+                ))
                 .with_fenced_transition_v2_journal_scope(
                     FencedTransitionV2JournalScope::from_bytes([0x73; 32]),
                 ),
         );
         Harness {
             _directory: directory,
+            journal,
             physical,
             backend,
             route,
@@ -3040,6 +3307,152 @@ mod tests {
     #[tokio::test]
     async fn v2_handle_transport_failure_retains_its_recovery_row() {
         assert_v2_network_refusal_settlement(false).await;
+    }
+
+    fn journal_admissions(journal: &FencedTransitionV2RecoveryJournal) -> [usize; 5] {
+        [
+            ScopeWorkClass::SafetyControl,
+            ScopeWorkClass::Emergency,
+            ScopeWorkClass::EmergencyClassification,
+            ScopeWorkClass::Normal,
+            ScopeWorkClass::Maintenance,
+        ]
+        .map(|class| journal.operation_admissions_for_test(class))
+    }
+
+    async fn assert_execution_journal_wait_ends_by_original_deadline(cut: ExecutionJournalCut) {
+        let before_dispatch = cut == ExecutionJournalCut::AfterPreflight;
+        let harness = harness(if before_dispatch {
+            vec![]
+        } else {
+            vec![
+                Step::NotTransmitted,
+                Step::NotTransmitted,
+                Step::NotTransmitted,
+            ]
+        })
+        .await;
+        let token = harness.prepare().await;
+        let deadline = token.budget.original_deadline();
+        let pause = Arc::new(ExecutionJournalPause::default());
+        let mut execution = Box::pin(
+            EXECUTION_JOURNAL_PAUSE.scope((cut, Arc::clone(&pause)), token.execute_once()),
+        );
+        tokio::select! {
+            result = &mut execution => panic!("execution must reach the selected journal cut: {result:?}"),
+            () = pause.entered.notified() => {},
+        }
+        // Contention starts only after the first timed authentication, or
+        // after all physical attempts have definitively proved no effect.
+        let urgent = harness
+            .journal
+            .with_operation_class(ScopeWorkClass::Emergency);
+        let held = urgent
+            .hold_operation_for_test()
+            .await
+            .expect("hold urgent operation");
+        let mut next_urgent = Box::pin(urgent.hold_operation_for_test());
+        assert!(futures_util::poll!(&mut next_urgent).is_pending());
+        let admissions = journal_admissions(&harness.journal);
+        pause.release.notify_one();
+        assert!(futures_util::poll!(&mut execution).is_pending());
+        tokio::time::pause();
+        tokio::time::advance(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
+        let result = futures_util::poll!(&mut execution);
+        assert_eq!(journal_admissions(&harness.journal), admissions);
+        drop(execution);
+        drop(next_urgent);
+        drop(held);
+        tokio::time::resume();
+        assert_eq!(
+            result,
+            std::task::Poll::Ready(Err(FencedTransitionExecuteError::NotTransmitted)),
+            "queued journal work must not withhold a no-effect result past the original deadline"
+        );
+        assert!(!harness.route.may_have_dispatched());
+        assert_eq!(
+            harness.physical.voters(),
+            if before_dispatch {
+                vec![]
+            } else {
+                vec![ORIGIN, (ORIGIN + 1) % VOTERS, (ORIGIN + 2) % VOTERS]
+            }
+        );
+        assert_eq!(harness.retained().await, 1);
+        token
+            .release_resolved()
+            .await
+            .expect("a later cleanup attempt remains available");
+        assert_eq!(harness.retained().await, 0);
+    }
+
+    #[tokio::test]
+    async fn v2_execution_journal_wait_after_timed_preflight_ends_by_original_deadline() {
+        assert_execution_journal_wait_ends_by_original_deadline(
+            ExecutionJournalCut::AfterPreflight,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v2_execution_journal_cleanup_after_no_effect_ends_by_original_deadline() {
+        assert_execution_journal_wait_ends_by_original_deadline(ExecutionJournalCut::BeforeDiscard)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn v2_standalone_journal_cleanup_is_bounded_and_can_retry_after_original_deadline() {
+        for abandon in [false, true] {
+            let harness = harness(if abandon { vec![] } else { vec![Step::Commit] }).await;
+            let token = harness.prepare().await;
+            if !abandon {
+                token
+                    .execute_once()
+                    .await
+                    .expect("resolved physical effect");
+            }
+            let urgent = harness
+                .journal
+                .with_operation_class(ScopeWorkClass::Emergency);
+            let held = urgent
+                .hold_operation_for_test()
+                .await
+                .expect("hold urgent operation");
+            let cleanup = async {
+                if abandon {
+                    token.abandon_unexecuted().await.map_err(|_| ())
+                } else {
+                    token.release_resolved().await.map_err(|_| ())
+                }
+            };
+            let mut cleanup = Box::pin(cleanup);
+            assert!(futures_util::poll!(&mut cleanup).is_pending());
+            tokio::time::pause();
+            tokio::time::advance(DEFAULT_CONSUMER_OPERATION_TIMEOUT).await;
+            let result = futures_util::poll!(&mut cleanup);
+            drop(cleanup);
+            drop(held);
+            tokio::time::resume();
+            assert_eq!(result, std::task::Poll::Ready(Err(())));
+            assert_eq!(harness.retained().await, 1);
+            if abandon {
+                assert_eq!(
+                    token.execute_once().await,
+                    Err(FencedTransitionExecuteError::NotTransmitted)
+                );
+                token
+                    .abandon_unexecuted()
+                    .await
+                    .expect("retry abandoned cleanup");
+            } else {
+                token
+                    .release_resolved()
+                    .await
+                    .expect("retry resolved cleanup");
+            }
+            assert_eq!(harness.retained().await, 0);
+            assert_eq!(harness.physical.voters().len(), usize::from(!abandon));
+        }
     }
 
     #[tokio::test]
@@ -3278,10 +3691,18 @@ mod tests {
         assert!(harness.physical.voters().is_empty());
         assert_eq!(
             harness.retained().await,
-            0,
-            "a failed preflight must settle the original handle's never-dispatched row"
+            1,
+            "expiry prevents deletion but leaves the never-dispatched row releasable"
         );
+        assert!(token.resolution() == V2Resolution::Resolved);
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted),
+            "retaining the expired row cannot restore dispatch authority"
+        );
+        assert!(harness.physical.voters().is_empty());
         assert_eq!(token.release_resolved().await, Ok(()));
+        assert_eq!(harness.retained().await, 0);
         assert_eq!(
             token.execute_once().await,
             Err(FencedTransitionExecuteError::NotTransmitted),
@@ -3439,6 +3860,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_emergency_remote_status_wait_leaves_ordinary_journal_available() {
+        let harness = harness_with_class(vec![Step::Unknown], ScopeWorkClass::Emergency).await;
+        let token = harness.prepare().await;
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown {
+                request_id: harness.request_id,
+            })
+        );
+        harness.physical.hang_status.store(true, Ordering::SeqCst);
+        let mut status = Box::pin(token.status_until_terminal(token.budget.original_deadline()));
+        tokio::select! {
+            result = &mut status => panic!("the voter must remain pending: {result:?}"),
+            () = harness.physical.status_pause.entered.notified() => {},
+        }
+        let mut ordinary = Box::pin(harness.journal.hold_operation_for_test());
+        assert!(
+            matches!(
+                futures_util::poll!(&mut ordinary),
+                std::task::Poll::Ready(Ok(_))
+            ),
+            "idle native journal admission must be immediately available during remote status I/O"
+        );
+        assert!(futures_util::poll!(&mut status).is_pending());
+        drop(status);
+        assert_eq!(
+            harness.physical.voters().len(),
+            1,
+            "receipt polling cannot redispatch"
+        );
+        assert_eq!(harness.retained().await, 1, "unknown rows remain retained");
+    }
+
+    #[tokio::test]
+    async fn v2_emergency_status_backoff_leaves_ordinary_journal_available() {
+        let harness = harness_with_class(vec![Step::Unknown], ScopeWorkClass::Emergency).await;
+        let token = harness.prepare().await;
+        assert!(matches!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+        ));
+        let mut status = Box::pin(token.status_until_terminal(token.budget.original_deadline()));
+        tokio::select! {
+            result = &mut status => panic!("NotFound must stay retryable: {result:?}"),
+            () = async {
+                while harness.physical.status_reads.load(Ordering::SeqCst) < VOTERS {
+                    harness.physical.status_pause.entered.notified().await;
+                }
+            } => {},
+        }
+        // The final synchronous NotFound return reaches the backoff sleep in
+        // the same poll. Freeze that sleep while testing real native admission.
+        tokio::time::pause();
+        let mut ordinary = Box::pin(harness.journal.hold_operation_for_test());
+        assert!(matches!(
+            futures_util::poll!(&mut ordinary),
+            std::task::Poll::Ready(Ok(_))
+        ));
+        assert!(futures_util::poll!(&mut status).is_pending());
+        drop(status);
+        tokio::time::resume();
+        assert_eq!(harness.physical.voters().len(), 1);
+        assert_eq!(harness.retained().await, 1);
+    }
+
+    #[tokio::test]
+    async fn v2_emergency_physical_execution_leaves_ordinary_journal_available() {
+        let harness =
+            harness_with_class(vec![Step::HangAfterAdmission], ScopeWorkClass::Emergency).await;
+        let token = harness.prepare().await;
+        let mut execution = Box::pin(token.execute_once());
+        tokio::select! {
+            result = &mut execution => panic!("the admitted physical operation must remain pending: {result:?}"),
+            () = async {
+                while !harness.route.may_have_dispatched() {
+                    tokio::task::yield_now().await;
+                }
+            } => {},
+        }
+        let mut ordinary = Box::pin(harness.journal.hold_operation_for_test());
+        assert!(matches!(
+            futures_util::poll!(&mut ordinary),
+            std::task::Poll::Ready(Ok(_))
+        ));
+        assert!(futures_util::poll!(&mut execution).is_pending());
+        drop(execution);
+        assert_eq!(harness.physical.voters().len(), 1);
+        assert_eq!(harness.retained().await, 1);
+    }
+
+    #[tokio::test]
     async fn v2_handle_definitive_unbound_rejection_discards_its_row() {
         let harness = harness(vec![Step::Reject(
             StoreError::FencedTransitionHistoryEpochNotActive,
@@ -3474,6 +3986,43 @@ mod tests {
             .execute_once()
             .await
             .expect("a proven pre-dispatch cancellation keeps dispatch authority");
+    }
+
+    #[tokio::test]
+    async fn v2_journal_deadline_never_cancels_an_admitted_physical_mutation() {
+        let harness = harness(vec![Step::HangAfterAdmission]).await;
+        let token = harness.prepare().await;
+        let mut execution = Box::pin(token.execute_once());
+        tokio::select! {
+            result = &mut execution => panic!("the admitted physical operation must remain pending: {result:?}"),
+            () = async {
+                while !harness.route.may_have_dispatched() {
+                    tokio::task::yield_now().await;
+                }
+            } => {},
+        }
+        tokio::time::pause();
+        tokio::time::advance(
+            token
+                .budget
+                .original_deadline()
+                .saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await;
+        assert!(futures_util::poll!(&mut execution).is_pending());
+        drop(execution);
+        tokio::time::resume();
+        assert!(harness.route.may_have_dispatched());
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert_eq!(
+            token.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved)
+        );
+        assert_eq!(harness.physical.voters().len(), 1);
+        assert_eq!(harness.retained().await, 1);
     }
 
     #[tokio::test]
