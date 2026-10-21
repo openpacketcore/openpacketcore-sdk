@@ -181,12 +181,48 @@ fn drain_async_fixture(wal: &Wal, release_prior: Option<mpsc::SyncSender<()>>) {
     });
 }
 
+fn wait_for_prior_capture(wal: &Wal, captured: &mut tokio::sync::watch::Receiver<bool>) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let mut publication = wal.async_persistence_progress();
+    let cut = wal.storage_health().2.unwrap().resident_generation;
+    runtime.block_on(async {
+        tokio::time::timeout(opc_consensus::DURABLE_CONSENSUS_OPERATION_TIMEOUT, async {
+            loop {
+                drop(publication.borrow_and_update());
+                let (state, failure, progress) = wal.storage_health();
+                assert_eq!(state, crate::consensus::SessionStorageState::Running);
+                assert!(failure.is_none());
+                let progress = progress.unwrap();
+                assert!(progress.background_failure.is_none());
+                if *captured.borrow_and_update() {
+                    break;
+                }
+                assert!(
+                    progress.completed_generation < cut,
+                    "primer generation finished without entering its capture hold"
+                );
+                // WriterExit publishes here too. A failed writer must fail
+                // the fixture even while the capture sender remains alive.
+                tokio::select! {
+                    result = captured.changed() => result.unwrap(),
+                    result = publication.changed() => result.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("primer generation must enter its capture hold within the operation budget");
+    });
+}
+
 fn crash(case: Case) -> ! {
     let armed = Arc::new(AtomicBool::new(false));
     let hook_armed = Arc::clone(&armed);
     let hold_prior_capture = Arc::new(AtomicBool::new(false));
     let hook_hold_prior_capture = Arc::clone(&hold_prior_capture);
-    let (captured_tx, captured_rx) = mpsc::sync_channel(1);
+    let (captured_tx, mut captured_rx) = tokio::sync::watch::channel(false);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let release_rx = Mutex::new(release_rx);
     let control = IoControl {
@@ -194,7 +230,7 @@ fn crash(case: Case) -> ! {
             if point == Point::BeforeNativeGenerationAppend
                 && hook_hold_prior_capture.swap(false, Ordering::SeqCst)
             {
-                captured_tx.send(()).map_err(io::Error::other)?;
+                captured_tx.send_replace(true);
                 release_rx
                     .lock()
                     .unwrap()
@@ -211,6 +247,9 @@ fn crash(case: Case) -> ! {
         ..IoControl::default()
     };
     let fixture = Fixture::with_persistence(Limits::default(), control, case.mode);
+    // Drop the release sender before Fixture::drop joins the writer, including
+    // when any setup assertion or report write panics while capture is held.
+    let mut prior_capture = case.hold_prior_capture.then_some(release_tx);
     let request = fenced_transition_v2_request(0xBD, 1, "native-purge-crash");
     let mut entries = vec![formation(), activation(1, request, timestamp(1))];
     entries.extend((2..=6).map(|index| Entry {
@@ -248,9 +287,7 @@ fn crash(case: Case) -> ! {
             .wait()
             .unwrap();
         if case.hold_prior_capture {
-            captured_rx
-                .recv()
-                .expect("the primer barrier generation is captured before arming");
+            wait_for_prior_capture(&fixture.wal, &mut captured_rx);
             assert!(!fixture.wal.checkpoint_pending_for_test().unwrap());
         }
         Some(newer)
@@ -271,7 +308,6 @@ fn crash(case: Case) -> ! {
         serde_json::to_vec(&report).unwrap(),
     )
     .unwrap();
-    let mut prior_capture = case.hold_prior_capture.then_some(release_tx);
     if case.mode == SessionPersistenceMode::Async {
         // An admitted barrier can still have an earlier generation in
         // flight. Drain it before attributing a hook to this operation.

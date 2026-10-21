@@ -227,6 +227,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a fresh install. Native apply and checkpoint replay preserve resolution
   through grouped expiry and retirement, including a reclaimed receipt;
   deletion witnesses remain bound to the immutable profile digest. (#1334)
+- `opc-session-store`: expose `log_pressure_snapshot()`,
+  `ConsensusLogPressureLevel`, `ConsensusLogPressureSnapshot`, and
+  `SESSION_CONSENSUS_LOG_HIGH_WATER_ROWS` for observing current retained-log and
+  snapshot pressure. These gauges clear with progress and impose no lifetime
+  operation budget. (#1249)
 
 - `opc-types`, `opc-proto-ikev2` and `opc-proto-gtpv2c`: add shared checked
   N1-mode wire values, the three TS 24.302 N1 Notify codecs, directional
@@ -727,7 +732,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-egress-fence-common`: remove the unused experimental `scope_time` API
   from the retired timed packet-gate proposal.
 
-- `opc-consensus`: pin Openraft to `0be191c797fd` for serialized peer-response
+- `opc-consensus`: pin Openraft to `6e90e9736cc6` for serialized peer-response
   fences and exact-vote leader resignation. Align the root, example and fuzz
   locks, publishing guard and qualification assertions with the same revision.
 
@@ -903,6 +908,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
+
+- `opc-session-store`: keep dispatched pressure-retry futures on the heap so
+  nested snapshot recovery operations fit the ordinary thread stack without
+  changing operation deadlines or cancellation ownership.
 
 - `opc-session-store`: keep async SQLite worker deadlines on the caller's
   Tokio clock through SQL progress, acceptance readers, native reads, restore
@@ -1096,6 +1105,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Legacy and foreign runtime directories are preserved. CI invokes each
   fs-verity test command through the owner. Refs #1312.
 
+- `opc-session-store`: snapshot file workers, including directory validation and
+  the publication fence, retain their mutation gate, namespace lease and shutdown
+  owner after an attempt expires or its observer is cancelled. Unpublished
+  artifacts remain owned until physical work finishes. Committed cleanup and
+  return-stream preparation retain their completion owner when a caller leaves.
+  A retry waits for physical completion, and shutdown keeps its bounded drain.
+  Fixed verification and publication contention use input-sized allowances. (#1249)
+
 - `opc-proto-gtpu`: encode and decode the PDU Session Container Paging Policy
   Indicator in bits 7..5, as specified by TS 38.415. Correct the independent
   reference corpus, catalog and forwarding fixtures. `opc-gtpu-dataplane`
@@ -1138,6 +1155,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to outlive an RPC budget. Retained repair and voter replacement retry swallowed
   build triggers even when a maintenance build completes at the same cut,
   without polling snapshot contents on unrelated engine updates.
+
+- `opc-session-store`: let progressing consensus snapshots finish across
+  stall intervals, size opaque work budgets to their input, and preserve
+  physical worker ownership on expiry. Keep pressure handoff targets only
+  after engine acceptance, restore lease reuse in a later term, wait for V2
+  status capacity within its deadline, and terminate retries when the local
+  engine stops (#1249).
+
+- `opc-consensus`: align every Openraft revision assertion and operator document
+  with `6e90e9736cc6`, including the former-leader purge retry after replication
+  readers retire. The required qualification-profile tests retain exact source
+  and feature assertions. (#1249)
+
+- `opc-session-store` tests: bound native fixture coordination by the existing
+  consensus operation budget, observe early operation completion and writer
+  failure, and release held writers before fixture shutdown. Check closed
+  namespaces after runtime quiescence. The leader proof's CI budget now follows
+  its exact identity across proof-registry reordering. (#1249)
+
+- `opc-session-store` tests: recover blocked builds through the supported write
+  route after automatic pressure handoff. Require a fresh post-window commit
+  and the original voter's automatic purge within the existing bounds, including
+  a held-builder case that forces leadership transfer before release. Failure
+  diagnostics distinguish setup leadership changes, forwarding ambiguity, and
+  accepted-proposal completion deadlines. Successful transfer and retained-write
+  recovery control protocol time while preserving real retry pacing and the
+  existing physical watchdogs. An explicit 800 ms expiry test observes the
+  unknown outcome and checkpoint resolution without replaying the mutation.
+  (#1249)
+
+- `opc-session-store`: apply retained-log backpressure before ordinary leader
+  proposals. Followers always deliver complete authenticated replicated batches
+  to Raft, preserving heartbeats and trailing control entries. Emergency work
+  and authenticated recovery controls use reserved headroom; demotion wakes
+  queued proposals to reroute within their original deadline. Accepted work
+  retains its accounting and authority through cancellation. Direct writes
+  retain the exact request across pressure-only attempts and recheck authority
+  on retry. Snapshot attempts expire before publication and retry automatically;
+  a leader with a full window and no snapshot or purge progress transfers
+  leadership while retaining actual blocking-worker ownership. (#1249)
 
 - `opc-session-store`: read V2 history through its existing fresh quorum
   read-index barrier without proposing an unused logical-time advance. History

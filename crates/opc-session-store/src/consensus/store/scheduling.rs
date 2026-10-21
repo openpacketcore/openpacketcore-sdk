@@ -1,5 +1,6 @@
 //! Volatile class admission at the durable proposal and outbound boundaries.
 //! Class metadata is authenticated forwarding context, never command bytes.
+use super::super::log_admission::LogAdmissionError;
 use super::*;
 #[cfg(test)]
 use crate::scope_scheduler::ScopeSchedulerBudgets;
@@ -249,11 +250,71 @@ impl ConsensusSessionStore {
     pub(super) async fn start_proposal_before(
         &self,
         reservation: ScopeWorkReservation,
+        intent: &SessionMutationIntent,
         deadline: tokio::time::Instant,
     ) -> Result<ScopeWorkPermit, ForwardMutationReply> {
-        match tokio::time::timeout_at(deadline, reservation.start()).await {
-            Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) | Err(_) => {
+        self.start_proposal_with_headroom_before(reservation, intent, deadline, false, true)
+            .await
+    }
+
+    pub(super) async fn start_proposal_with_headroom_before(
+        &self,
+        reservation: ScopeWorkReservation,
+        intent: &SessionMutationIntent,
+        deadline: tokio::time::Instant,
+        authenticated_cold_barrier: bool,
+        wait_for_log: bool,
+    ) -> Result<ScopeWorkPermit, ForwardMutationReply> {
+        let start = async {
+            let mut reservation = reservation;
+            let reserved_headroom = authenticated_cold_barrier
+                || is_log_progress_control(intent)
+                || reservation.class() == ScopeWorkClass::Emergency;
+            loop {
+                if !reserved_headroom {
+                    if !wait_for_log && !self.inner.raft_handler.log_admission.has_capacity() {
+                        return Err(LogAdmissionError::Pressure);
+                    }
+                    if wait_for_log {
+                        self.inner
+                            .raft_handler
+                            .log_admission
+                            .ready_before(deadline)
+                            .await?;
+                    }
+                }
+                let permit = reservation
+                    .start()
+                    .await
+                    .map_err(|_| LogAdmissionError::Unavailable)?;
+                if reserved_headroom || self.inner.raft_handler.log_admission.has_capacity() {
+                    return Ok::<_, LogAdmissionError>(permit);
+                }
+                // Capacity may change while waiting for a class credit. Keep
+                // the resident reservation, but return the running credit.
+                reservation = permit.finish_unknown();
+                if !wait_for_log {
+                    return Err(LogAdmissionError::Pressure);
+                }
+            }
+        };
+        match tokio::time::timeout_at(
+            deadline,
+            self.inner.raft_handler.log_admission.while_leader(start),
+        )
+        .await
+        {
+            Ok(Ok(Ok(permit))) => Ok(permit),
+            Ok(Err(LogAdmissionError::NotLeader(leader)))
+            | Ok(Ok(Err(LogAdmissionError::NotLeader(leader)))) => {
+                Err(ForwardMutationReply::NotLeader { leader })
+            }
+            Ok(Err(LogAdmissionError::Pressure)) | Ok(Ok(Err(LogAdmissionError::Pressure))) => {
+                Err(ForwardMutationReply::LogPressure)
+            }
+            Ok(Err(LogAdmissionError::Unavailable))
+            | Ok(Ok(Err(LogAdmissionError::Unavailable)))
+            | Err(_) => {
                 self.inner
                     .diagnostics
                     .proposal_permit_deadline
@@ -325,6 +386,12 @@ impl ConsensusSessionStore {
         }
     }
 
+    /// Current retained-log and snapshot-lag gauges, including queued growth.
+    /// Pressure clears automatically as the engine publishes purge progress.
+    pub fn log_pressure_snapshot(&self) -> super::super::ConsensusLogPressureSnapshot {
+        self.inner.raft_handler.log_admission.snapshot()
+    }
+
     /// Observational proposal counts by class. Accepted proposals retain their
     /// running credits until Openraft resolves, even after caller cancellation.
     pub fn scope_proposal_scheduling_snapshot(&self) -> ScopeSchedulerSnapshot {
@@ -388,12 +455,12 @@ impl ConsensusSessionStore {
         intent: SessionMutationIntent,
         required_scope: SessionConsensusIdentity,
         class: ScopeWorkClass,
-    ) -> Result<SessionConsensusResponse, StoreError> {
+    ) -> Result<Option<SessionConsensusResponse>, StoreError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         let unavailable = consensus_outcome_unavailable(&intent);
-        match self
+        let Some(effect) = self
             .submit_request_effect_classified_before(
                 request_id,
                 intent,
@@ -402,10 +469,13 @@ impl ConsensusSessionStore {
                 ForwardWorkClass::Declared(class),
             )
             .await
-        {
+        else {
+            return Ok(None);
+        };
+        match effect {
             ConsensusSubmissionEffect::NotTransmitted(error) => Err(error),
             ConsensusSubmissionEffect::OutcomeUnknown => Err(unavailable),
-            ConsensusSubmissionEffect::Committed(response) => Ok(response),
+            ConsensusSubmissionEffect::Committed(response) => Ok(Some(response)),
             ConsensusSubmissionEffect::Rejected(response) => {
                 response.result?;
                 Err(unavailable)

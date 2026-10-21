@@ -1,8 +1,22 @@
 """Full-size store history and native log proofs run at test O1 with debug checks still enabled.
 
-Keep exact names: neither the million-entry bound nor the default three-cycle
-regressions changes when the expensive proofs run in separate test processes.
+These exact names keep the million-entry bound and live admission window intact.
+The default three-cycle regressions retain their ordinary test profile.
 """
+
+FULL_WINDOW_BUILDS = (
+    "consensus::store::async_persistence::tests::log_admission::"
+    "log_admission_full_window_blocked_build_durable",
+    "consensus::store::async_persistence::tests::log_admission::"
+    "log_admission_full_window_blocked_build_async",
+)
+
+FULL_WINDOW_TRANSFERS = (
+    "consensus::store::async_persistence::tests::log_admission::"
+    "log_admission_full_window_blocked_transfer_durable",
+    "consensus::store::async_persistence::tests::log_admission::"
+    "log_admission_full_window_blocked_transfer_async",
+)
 
 TESTS = (
     "consensus::store::sequential_wal_sdk_tests::native_log_bound::"
@@ -33,6 +47,8 @@ TESTS = (
     "native_catalog_lease_deferral_retirement_separate_checkpoints",
     "consensus::native::generation::catalog::tests::lease_deferral_tests::"
     "native_catalog_lease_deferral_retirement_rejects_false_deletion_witnesses",
+    *FULL_WINDOW_BUILDS,
+    *FULL_WINDOW_TRANSFERS,
 )
 
 # One expensive proof per hosted runner. Keep these separate from the ordinary

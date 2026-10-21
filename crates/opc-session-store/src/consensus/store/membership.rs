@@ -2230,6 +2230,7 @@ impl ConsensusSessionStore {
             fenced_transition_profile_admission: Mutex::new(None),
             proposal_admission: Arc::new(StoreWorkAdmission::new()),
             forward_admission: Arc::new(StoreWorkAdmission::new()),
+            write_retry_admission: Arc::new(StoreWorkAdmission::new()),
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),
@@ -2250,6 +2251,7 @@ impl ConsensusSessionStore {
             Arc::downgrade(&inner),
         );
         let store = Self { inner };
+        log_recovery::start(&store.inner);
         store
             .stage_topology_transition_peers(&request, desired_peers)
             .map_err(|_| ConsensusSessionStoreOpenError::PeerSetMismatch)?;

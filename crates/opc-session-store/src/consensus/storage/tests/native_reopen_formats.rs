@@ -652,53 +652,65 @@ async fn native_future_generation_public_reopen_refuses_before_backend_or_snapsh
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_reopen_fixture_close_waits_for_snapshot_storage_owner() {
+#[test]
+fn native_reopen_fixture_close_waits_for_snapshot_storage_owner() {
     for mode in [
         SessionPersistenceMode::Durable,
         SessionPersistenceMode::Async,
     ] {
         let directory = FixedRawReadStoreFixture::new();
-        let (backend, raft, wal, hook_directory) =
-            native_log_retained_bound::open_engine(&directory, mode).await;
-        select_command_and_snapshot(&raft).await;
-        let gate = Arc::new(SnapshotArtifactGate::new());
-        let _gate = FixedSnapshotReturnGateGuard::install(hook_directory, Arc::clone(&gate));
-        gate.arm();
-        raft.trigger().snapshot().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(300), gate.wait_started())
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let before = runtime.block_on(async {
+            let (backend, raft, wal, hook_directory) =
+                native_log_retained_bound::open_engine(&directory, mode).await;
+            select_command_and_snapshot(&raft).await;
+            let gate = Arc::new(SnapshotArtifactGate::new());
+            let _gate = FixedSnapshotReturnGateGuard::install(hook_directory, Arc::clone(&gate));
+            gate.arm();
+            raft.trigger().snapshot().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(300), gate.wait_started())
+                .await
+                .expect("real snapshot worker reaches its return boundary");
+            let storage_shutdown = raft.shutdown_observer();
+            let waits_for_owner = tokio::time::timeout(Duration::from_secs(300), async {
+                // Join the core first so its shutdown cannot explain a pending
+                // close. Disable cooperative yields during this explicit poll:
+                // only the held storage owner can keep the close future pending.
+                SessionRaft::shutdown(&raft).await.unwrap();
+                let closing = tokio::task::unconstrained(close_engine(backend, raft, wal));
+                tokio::pin!(closing);
+                let polled = poll_fn(|cx| Poll::Ready(closing.as_mut().poll(cx))).await;
+                let waits_for_owner = polled.is_pending();
+                // Release and drain even when the assertion will fail, so the
+                // real worker never outlives the fixture used by the regression.
+                gate.release();
+                drop(match polled {
+                    Poll::Ready(wal) => wal,
+                    Poll::Pending => closing.await,
+                });
+                storage_shutdown.wait().await;
+                waits_for_owner
+            })
             .await
-            .expect("real snapshot worker reaches its return boundary");
-        let storage_shutdown = raft.shutdown_observer();
-        let waits_for_owner = tokio::time::timeout(Duration::from_secs(300), async {
-            // Join the core first so its shutdown cannot explain a pending
-            // close. Disable cooperative yields during this explicit poll:
-            // only the held storage owner can keep the close future pending.
-            SessionRaft::shutdown(&raft).await.unwrap();
-            let closing = tokio::task::unconstrained(close_engine(backend, raft, wal));
-            tokio::pin!(closing);
-            let polled = poll_fn(|cx| Poll::Ready(closing.as_mut().poll(cx))).await;
-            let waits_for_owner = polled.is_pending();
-            // Release and drain even when the assertion will fail, so the
-            // real worker never outlives the fixture used by the regression.
-            gate.release();
-            drop(match polled {
-                Poll::Ready(wal) => wal,
-                Poll::Pending => closing.await,
-            });
-            storage_shutdown.wait().await;
-            waits_for_owner
-        })
-        .await
-        .expect("fixture close completes after the real storage owner exits");
-        assert!(
-            waits_for_owner,
-            "fixture close returned while a snapshot worker still owns SQLite"
-        );
-        let before = (
-            namespace(directory.path()),
-            namespace(directory.snapshot_path()),
-        );
+            .expect("fixture close completes after the real storage owner exits");
+            assert!(
+                waits_for_owner,
+                "fixture close returned while a snapshot worker still owns SQLite"
+            );
+            let before = (
+                namespace(directory.path()),
+                namespace(directory.snapshot_path()),
+            );
+            // Give queued cleanup a turn, then join this fixture's runtime before
+            // comparing namespaces. Late owner cleanup must not escape the check.
+            tokio::task::yield_now().await;
+            before
+        });
+        drop(runtime);
         assert_eq!(
             (
                 namespace(directory.path()),

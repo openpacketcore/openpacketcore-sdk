@@ -123,7 +123,7 @@ impl ConsensusSessionStore {
         &self,
         operation: ScopeBatchCommand,
         class: ScopeWorkClass,
-    ) -> Result<ScopeBatchOutcome, ScopeBatchError> {
+    ) -> Result<Option<ScopeBatchOutcome>, ScopeBatchError> {
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         self.ensure_scope_profile_before(deadline)
             .await
@@ -137,7 +137,7 @@ impl ConsensusSessionStore {
         if current.cluster_id() != operation.request.scope().store() {
             return Err(ScopeAuthorityError::Unauthorized.into());
         }
-        let response = self
+        let Some(response) = self
             .submit_classified_scope_batch(
                 SessionConsensusRequestId::from_bytes(*operation.request.request_id()),
                 SessionMutationIntent::ScopeBatch(Box::new(operation)),
@@ -145,9 +145,12 @@ impl ConsensusSessionStore {
                 class,
             )
             .await
-            .map_err(|_| ScopeBatchError::OutcomeUnknown)?;
+            .map_err(|_| ScopeBatchError::OutcomeUnknown)?
+        else {
+            return Ok(None);
+        };
         match response.result {
-            Ok(SessionMutationOutcome::ScopeBatch(result)) => result,
+            Ok(SessionMutationOutcome::ScopeBatch(result)) => result.map(Some),
             _ => Err(ScopeBatchError::OutcomeUnknown),
         }
     }
@@ -156,7 +159,7 @@ impl ConsensusSessionStore {
         &self,
         operation: ScopeBatchCancelCommand,
         class: ScopeWorkClass,
-    ) -> Result<ScopeBatchReceipt, ScopeBatchError> {
+    ) -> Result<Option<ScopeBatchReceipt>, ScopeBatchError> {
         operation.validate()?;
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         self.ensure_scope_profile_before(deadline)
@@ -171,7 +174,7 @@ impl ConsensusSessionStore {
         if current.cluster_id() != operation.attempt.stamp().scope().store() {
             return Err(ScopeAuthorityError::Unauthorized.into());
         }
-        let response = self
+        let Some(response) = self
             .submit_classified_scope_batch(
                 SessionConsensusRequestId::from_bytes(operation.proposal_id()?),
                 SessionMutationIntent::ScopeBatchCancel(Box::new(operation)),
@@ -179,9 +182,12 @@ impl ConsensusSessionStore {
                 class,
             )
             .await
-            .map_err(|_| ScopeBatchError::OutcomeUnknown)?;
+            .map_err(|_| ScopeBatchError::OutcomeUnknown)?
+        else {
+            return Ok(None);
+        };
         match response.result {
-            Ok(SessionMutationOutcome::ScopeBatchCancel(result)) => result,
+            Ok(SessionMutationOutcome::ScopeBatchCancel(result)) => result.map(Some),
             _ => Err(ScopeBatchError::OutcomeUnknown),
         }
     }

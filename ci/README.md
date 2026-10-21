@@ -36,7 +36,7 @@ duplicate execution. Live inventories reject missing, ignored or ambiguous names
 The tests retain their four Tokio workers, all assertions and ten-second bounds.
 Successful runs print elapsed time and decode/audit counts for hosted validation.
 
-The full-bound native log and receipt-history proofs listed in
+The full-bound native log, receipt-history and full-window admission proofs listed in
 [`native_log_bound.py`](native_log_bound.py) each have a dedicated parallel runner:
 
 | Proof | Core shard | Egress shard |
@@ -55,16 +55,22 @@ The full-bound native log and receipt-history proofs listed in
 | Catalog separate apply, one checkpoint | `native-log-11` | `15` |
 | Catalog separate checkpoints | `native-log-12` | `16` |
 | Catalog rejection of false deletion witnesses | `native-log-13` | `17` |
+| Durable blocked snapshot build | `native-log-14` | `18` |
+| Async blocked snapshot build | `native-log-15` | `19` |
+| Durable blocked snapshot transfer | `native-log-16` | `20` |
+| Async blocked snapshot transfer | `native-log-17` | `21` |
 
 Each runs in its own serial test process at test O1, with debug assertions and
 overflow checks enabled, preserving the original package/feature selection.
 Live prechecks resolve the exact enabled name in that profile. All million-entry
-inputs, persistence operations and assertions remain intact; the default
+and full-window inputs, persistence operations and assertions remain intact; the default
 three-cycle regressions stay in the ordinary library partition.
 
 Core proof runners retain their 90-minute job budget. The egress leader proof
-on shard 4 has 120 minutes; the Durable and Async proofs on shards 5 and 6 retain
-75 minutes. In [egress run 38801737477](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38801737477/job/116652422946),
+has 120 minutes; the remaining full-bound and full-window proofs retain
+75 minutes. The egress matrix selects each proof by its exact name and derives
+its shard from the registry, keeping the budget attached to the leader across
+registry reordering. In [egress run 38801737477](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38801737477/job/116652422946),
 the leader reached 917,504 of 1,056,768 proposals in 3,465.5 seconds before its
 75-minute job budget expired. The slowest measured 65,536-proposal interval took
 298.48 seconds, projecting 80.2 minutes for all proposals. Adding the observed

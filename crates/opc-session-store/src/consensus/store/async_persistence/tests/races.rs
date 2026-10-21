@@ -252,15 +252,20 @@ impl ReplyHold {
 pub(super) fn append_request(
     request: &SessionConsensusWireRequest,
 ) -> Option<AppendEntriesRequest<SessionRaftTypeConfig>> {
+    append_request_in_mode(request, SessionPersistenceMode::Async)
+}
+
+pub(super) fn append_request_in_mode(
+    request: &SessionConsensusWireRequest,
+    mode: SessionPersistenceMode,
+) -> Option<AppendEntriesRequest<SessionRaftTypeConfig>> {
     if !matches!(
         request.family,
         SessionConsensusRpcFamily::AppendEntries | SessionConsensusRpcFamily::AppendEntriesRoster
     ) {
         return None;
     }
-    let payload =
-        persistence_protocol::unwrap_payload(SessionPersistenceMode::Async, &request.payload)
-            .unwrap();
+    let payload = persistence_protocol::unwrap_payload(mode, &request.payload).unwrap();
     Some(
         if request.family == SessionConsensusRpcFamily::AppendEntriesRoster {
             decode_roster_bounded(payload).unwrap()
