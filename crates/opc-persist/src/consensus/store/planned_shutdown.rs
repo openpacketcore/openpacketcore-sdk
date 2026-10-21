@@ -68,6 +68,7 @@ impl ConfigShutdownCoordinator {
         // Config reads never reuse cached leases. Fence every public/forwarded
         // application path before the engine can release a leader vote lease.
         self.started.store(true, Ordering::Release);
+        store.inner.raft_handler.stop_snapshot_reception();
         self.started_notify.notify_waiters();
         let mut unplanned = self.unplanned.subscribe();
         tokio::spawn(async move {
@@ -122,6 +123,10 @@ impl ConfigShutdownCoordinator {
                 .await
                 .map(|()| outcome)
                 .map_err(|_| consensus_unavailable());
+            store.inner.raft_handler.discard_snapshot_receiver().await;
+            if let Some(profile) = store.inner.voter_profile.as_ref() {
+                profile.discard_snapshot_receiver().await;
+            }
             // Raft joins its core and replication tasks, but its state-machine
             // worker and snapshot builders can still own storage afterwards.
             // Keep this drain owned across every caller timeout until all of

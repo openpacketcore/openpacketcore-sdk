@@ -329,10 +329,28 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   Startup verifies the referenced snapshot before a bounded directory cleanup.
   Build and install use one absolute 60-second deadline across file work,
   stepped SQLite backup, validation, and the drained authority transaction;
-  timeout cannot leave a detached worker or report failure after commit.
+  a caller timeout drains the transaction and reports its durable outcome.
   Interrupted receive/build/install/promote artifacts, SQLite sidecars,
   approved-recovery staging, and unreferenced snapshots are removed without
-  following unsafe file types; drop guards clean canceled staging work.
+  following unsafe file types. Creation and commit workers own their cleanup
+  guards even when the async runtime disappears. A committed artifact remains
+  published; the next open verifies it and sweeps recognized stale artifacts.
+  Nonblocking exclusive directory admission prevents a second opener from
+  sweeping a live receiver or worker. Blocking filesystem work retains that
+  admission and the directory descriptor through completion, even after startup
+  cleanup is cancelled or times out; a reused descriptor cannot redirect a late
+  operation into another store. Internal envelope verification retains admission
+  through every queued seek and read, including verification of a borrowed
+  published reader. That temporary ownership ends when verification and its
+  physical work finish. Exported read-only published readers otherwise retain
+  only their file descriptor, so dormant readers do not pin directory admission.
+  Sequential snapshot I/O reuses bounded initialized buffers without seeking;
+  explicit seeks and discarded unread data reconcile the logical file position.
+  Shutdown fences snapshot reception in both standard and voter profiles, joins
+  the engine, and discards unfinished transfers before draining storage. Queued
+  staging I/O retains admission until it finishes; old closed store handles
+  cannot hold the lock after shutdown completes. No manual staging cleanup is
+  required.
 - `probe_durable_readiness` uses Openraft's linearizable path; listener bind or
   a local SQLite read is not readiness evidence.
 - Planned `ConsensusConfigStore::shutdown()` closes application admission and

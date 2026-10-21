@@ -406,6 +406,18 @@ and unreferenced snapshot artifacts. Unsafe recognized file types or an
 oversized directory fail closed. Do not replace this with an unbounded cleanup
 script or delete the referenced snapshot.
 
+For configuration consensus, opening the directory acquires a nonblocking
+exclusive lock before cleanup. A concurrent open returns unavailable while a
+live engine, receiver, or detached creation/commit worker still owns it. Those
+workers retain the admitted directory descriptor through file cleanup, including
+runtime teardown. After the final owner exits, the next open preserves the
+durably published snapshot and sweeps recognized stale artifacts automatically.
+Directory scan I/O uses the existing 60-second stall bound. Planned shutdown
+fences snapshot reception in both standard and voter profiles, joins the engine,
+and discards unfinished transfers before draining storage, including queued file
+I/O. Once shutdown completes, old closed store handles do not retain admission. No manual
+staging cleanup is needed after a crash or restart.
+
 An identity, schema, checksum, or snapshot failure is not a rebootstrap signal.
 Stop the node, preserve the evidence, and use a reviewed restore procedure.
 

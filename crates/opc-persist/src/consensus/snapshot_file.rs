@@ -8,47 +8,91 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 /// Seekable snapshot staging file. Its path is never exposed in diagnostics.
 pub(crate) struct ConfigSnapshotFile {
-    file: tokio::fs::File,
+    file: super::snapshot_io::SnapshotIo,
     path: PathBuf,
     cleanup_on_drop: bool,
 }
 
 impl ConfigSnapshotFile {
+    #[cfg(test)]
     pub(crate) async fn create(path: PathBuf) -> io::Result<Self> {
-        let file = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await?;
-        #[cfg(unix)]
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(Self {
-            file,
-            path,
-            cleanup_on_drop: true,
+        Self::create_with_owner(path, None).await
+    }
+
+    pub(crate) async fn create_owned(
+        path: PathBuf,
+        owner: std::sync::Arc<super::storage::SnapshotDirectoryOwner>,
+    ) -> io::Result<Self> {
+        Self::create_with_owner(path, Some(owner)).await
+    }
+
+    async fn create_with_owner(
+        path: PathBuf,
+        owner: Option<std::sync::Arc<super::storage::SnapshotDirectoryOwner>>,
+    ) -> io::Result<Self> {
+        // Construct the cleanup guard in the blocking task. Cancellation of
+        // its receiver cannot strand a file created after the caller was gone.
+        tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let file = options.open(&path)?;
+            let staged = Self {
+                file: super::snapshot_io::SnapshotIo::new(file, owner),
+                path,
+                cleanup_on_drop: true,
+            };
+            #[cfg(unix)]
+            std::fs::set_permissions(&staged.path, std::fs::Permissions::from_mode(0o600))?;
+            Ok(staged)
         })
+        .await
+        .map_err(|_| io::Error::other("config snapshot receiver creation failed"))?
     }
 
     pub(crate) async fn open(path: PathBuf) -> io::Result<Self> {
+        Self::open_with_owner(path, None)
+    }
+
+    pub(crate) async fn open_owned(
+        path: PathBuf,
+        owner: std::sync::Arc<super::storage::SnapshotDirectoryOwner>,
+    ) -> io::Result<Self> {
+        Self::open_with_owner(path, Some(owner))
+    }
+
+    fn open_with_owner(
+        path: PathBuf,
+        owner: Option<std::sync::Arc<super::storage::SnapshotDirectoryOwner>>,
+    ) -> io::Result<Self> {
         #[cfg(unix)]
-        let file = tokio::fs::File::from_std(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&path)?,
-        );
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
         #[cfg(not(unix))]
-        let file = tokio::fs::OpenOptions::new().read(true).open(&path).await?;
+        let file = std::fs::OpenOptions::new().read(true).open(&path)?;
         Ok(Self {
-            file,
+            file: super::snapshot_io::SnapshotIo::new(file, owner),
             path,
             cleanup_on_drop: false,
         })
+    }
+
+    pub(crate) fn verification_reader(
+        &mut self,
+        owner: std::sync::Arc<super::storage::SnapshotDirectoryOwner>,
+    ) -> VerificationReader<'_> {
+        let previous = self.file.replace_verification_owner(Some(owner));
+        VerificationReader {
+            file: self,
+            previous,
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -61,8 +105,36 @@ impl ConfigSnapshotFile {
     }
 
     pub(crate) async fn sync_all(&mut self) -> io::Result<()> {
-        self.file.flush().await?;
         self.file.sync_all().await
+    }
+}
+
+/// Keep admission only for active verification, including cancellation. Each
+/// physical worker keeps its own clone after this scope releases the reader.
+pub(crate) struct VerificationReader<'a> {
+    file: &'a mut ConfigSnapshotFile,
+    previous: Option<std::sync::Arc<super::storage::SnapshotDirectoryOwner>>,
+}
+
+impl std::ops::Deref for VerificationReader<'_> {
+    type Target = ConfigSnapshotFile;
+
+    fn deref(&self) -> &Self::Target {
+        self.file
+    }
+}
+
+impl std::ops::DerefMut for VerificationReader<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.file
+    }
+}
+
+impl Drop for VerificationReader<'_> {
+    fn drop(&mut self) {
+        self.file
+            .file
+            .replace_verification_owner(self.previous.take());
     }
 }
 
