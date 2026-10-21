@@ -85,6 +85,8 @@ impl SessionConsensusServer {
                 reauthentication: self.reauthentication.clone(),
                 #[cfg(test)]
                 post_accept_setup_hook: self.post_accept_setup_hook.clone(),
+                #[cfg(test)]
+                connection_observer: self.connection_observer.clone(),
             };
             let (handle, address) = endpoint.listen(addresses[index]).await?;
             result.addresses[index] = address;

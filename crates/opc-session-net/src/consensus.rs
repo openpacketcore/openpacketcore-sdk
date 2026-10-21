@@ -3200,6 +3200,8 @@ pub struct SessionConsensusServer {
     reauthentication: SessionReauthenticationControl,
     #[cfg(test)]
     post_accept_setup_hook: Option<Arc<ConsensusAcceptedSetupHook>>,
+    #[cfg(test)]
+    connection_observer: Option<Arc<tests::broken_pipe_recovery::ConnectionObserver>>,
 }
 
 impl fmt::Debug for SessionConsensusServer {
@@ -3292,6 +3294,8 @@ impl SessionConsensusServer {
             reauthentication: SessionReauthenticationControl::new(),
             #[cfg(test)]
             post_accept_setup_hook: None,
+            #[cfg(test)]
+            connection_observer: None,
         }
     }
 
@@ -3410,6 +3414,12 @@ impl SessionConsensusServer {
         }));
         let sem = Arc::new(Semaphore::new(self.max_connections));
         let handler_executions = Arc::new(Semaphore::new(self.max_connections));
+        #[cfg(test)]
+        let connection_observer = self.connection_observer;
+        #[cfg(test)]
+        if let Some(observer) = &connection_observer {
+            observer.observe_permits(&sem, &handler_executions);
+        }
         #[cfg(feature = "test-control")]
         let drain_handler_executions = Arc::clone(&handler_executions);
         #[cfg(feature = "test-control")]
@@ -3436,6 +3446,11 @@ impl SessionConsensusServer {
                 let accepted = listener.accept().await;
                 let Ok((stream, _peer_addr)) = accepted else {
                     continue;
+                };
+                #[cfg(test)]
+                let stream = match &connection_observer {
+                    Some(observer) => observer.observe_accepted(stream),
+                    None => stream,
                 };
                 // One accepted socket gets one non-renewable setup interval.
                 // Capture it before registry contention or child scheduling so
@@ -3477,6 +3492,8 @@ impl SessionConsensusServer {
                     context.peer_addr = stream.peer_addr().ok();
                     context
                 };
+                #[cfg(test)]
+                let connection_observer = connection_observer.clone();
                 let connection = async move {
                     let _permit = permit;
                     #[cfg(test)]
@@ -3503,6 +3520,11 @@ impl SessionConsensusServer {
                     .await;
                     record_consensus_server_connection_outcome(&result);
                     attempt_metrics.finish();
+                    #[cfg(test)]
+                    if let Some(observer) = connection_observer {
+                        drop(_permit);
+                        observer.observe_terminal(result);
+                    }
                 };
                 #[cfg(feature = "test-control")]
                 let connection = crate::qualification_diagnostics::scope(context, connection);
@@ -4592,6 +4614,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    pub(super) mod broken_pipe_recovery;
     mod classified;
     mod negotiated_loss;
     mod transport_diagnostics;

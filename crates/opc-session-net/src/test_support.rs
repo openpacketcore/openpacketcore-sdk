@@ -229,12 +229,25 @@ impl RotatableServerMaterial {
         &self,
         spiffe_id: impl Into<String>,
     ) -> opc_tls::AuthenticatedClientConfig {
+        self.trusted_client_config_with_source(spiffe_id).1
+    }
+
+    /// Keep the publisher alive when a test requires Ready material rather
+    /// than the last-good material retained after source closure.
+    pub(crate) fn trusted_client_config_with_source(
+        &self,
+        spiffe_id: impl Into<String>,
+    ) -> (
+        tokio::sync::watch::Sender<Option<opc_identity::IdentityState>>,
+        opc_tls::AuthenticatedClientConfig,
+    ) {
         let state = identity_state(&self.ca, &spiffe_id.into());
-        let (_source, receiver) = tokio::sync::watch::channel(Some(state));
-        opc_tls::TlsConfigBuilder::new(receiver)
+        let (source, receiver) = tokio::sync::watch::channel(Some(state));
+        let config = opc_tls::TlsConfigBuilder::new(receiver)
             .allow_any_trusted_peer()
             .build_authenticated_client_config()
-            .expect("build client config trusted by test server material")
+            .expect("build client config trusted by test server material");
+        (source, config)
     }
 
     pub(crate) fn rotate(&self) {
