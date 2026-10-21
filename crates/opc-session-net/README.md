@@ -592,7 +592,7 @@ Protected V1/V2 expiry preflights, V2 history reads and prepared CAS/lease
 receipts share this response budget. Prepared checkpoint receipts retain their
 existing separate warmup admission. Mutations keep their existing physical cap.
 Ordinary callers opt in with `get_with_budget`,
-`preflight_record_expiry_with_budget`, or
+`preflight_record_expiry_with_budget`, `lease_mutation_status_with_budget`, or
 `fenced_transition_v2_history_state_with_budget`, passing their existing
 `PreparedCheckpointBudget` and any earlier lease deadline. These narrow methods
 cannot submit a transition, batch or void. Their response wait follows the
@@ -601,9 +601,15 @@ operation ceiling; transport lifecycle retirement still applies. Legacy read
 methods without a caller deadline retain their configured operation timeout.
 Prepared CAS/lease receipts classify observed authority rejection as terminal
 `TopologyAuthorityRevoked` and cache that result. Budget-bearing GET/expiry
-reads preserve their legacy wire-rejection mapping, including `Unauthorized`
-to `BackendUnavailable`. Both split-deadline transports reject operations
-outside their closed set of reads before admission or setup.
+reads and ordinary lease receipts preserve their legacy wire-rejection mapping,
+including `Unauthorized` to `BackendUnavailable`. Both split-deadline transports
+reject operations outside their closed set of reads before admission or setup.
+
+The ordinary lease receipt method keeps the exact retained acquire, renew or
+release request identity and body. It sends one status read and never replays
+the mutation. Success first observed at or after the original deadline is
+unavailable; a possibly transmitted transport failure spends that deadline
+before returning, while authority revocation remains terminal.
 
 When a pool has at least two request lanes, extended reads share at most all
 but one of its existing lanes and total-admission slots across V1 and V2.

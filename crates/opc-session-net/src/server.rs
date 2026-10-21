@@ -253,7 +253,10 @@ fn record_server_connection_failure(error: &ProtocolError) {
             crate::test_support::record_connection_timeout_failure();
             &METRICS.session_net_connection_failure_timeout
         }
-        ProtocolError::Io(_) => &METRICS.session_net_connection_failure_transport,
+        ProtocolError::Io(error) => {
+            crate::lifecycle::record_transport_failure("Io", Some(error.kind()));
+            return;
+        }
         ProtocolError::Authentication => &METRICS.session_net_connection_failure_authentication,
         ProtocolError::BackendUnavailable(_) => &METRICS.session_net_connection_failure_backend,
         _ => &METRICS.session_net_connection_failure_protocol,
@@ -439,6 +442,8 @@ async fn write_post_auth_response_until<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("response-write");
     let result = write_frame_until_server_cancellation(
         writer,
         response,
@@ -514,6 +519,8 @@ async fn write_post_auth_response_with_fallback_until<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("response-write");
     match write_frame_until_server_cancellation(
         writer,
         &response,
@@ -603,6 +610,8 @@ async fn write_watch_response_until<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("response-write");
     match write_frame_until_server_cancellation(
         writer,
         &response,
@@ -1967,7 +1976,18 @@ impl SessionReplicationServer {
                                 if registry.stopping {
                                     break;
                                 }
-                                let conn_handle = tokio::spawn(async move {
+                                #[cfg(feature = "test-control")]
+                                let context = {
+                                    let mut context = crate::qualification_diagnostics::context(
+                                        "direct-inbound", Some(dispatch_config.binding.local_consensus_node_id()), None,
+                                        dispatch_config.reauthentication.generation(),
+                                        tls_config.as_ref().map(|config| config.material_status().epoch()),
+                                    );
+                                    context.local_addr = stream.local_addr().ok();
+                                    context.peer_addr = stream.peer_addr().ok();
+                                    context
+                                };
+                                let connection = async move {
                                     let _permit = permit;
                                     let mut attempt_metrics =
                                         ConnectionAttemptMetricGuard::started();
@@ -1987,7 +2007,10 @@ impl SessionReplicationServer {
                                             "connection handler exited"
                                         );
                                     }
-                                });
+                                };
+                                #[cfg(feature = "test-control")]
+                                let connection = crate::qualification_diagnostics::scope(context, connection);
+                                let conn_handle = tokio::spawn(connection);
                                 registry.handles.push(conn_handle);
                             }
                             Err(_error) => {
@@ -2233,8 +2256,15 @@ async fn handle_connection(
         let handshake = tls_config
             .begin_handshake()
             .map_err(|_| ProtocolError::Authentication)?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::update(|context| {
+            context.generation = Some(generation);
+            context.material_epoch = Some(handshake.epoch().get());
+        });
         let acceptor =
             tokio_rustls::TlsAcceptor::from(session_server_tls_config(handshake.rustls_config()));
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::stage("tls");
         let tls_stream = tokio::time::timeout(idle_timeout, acceptor.accept(stream))
             .await
             .map_err(|_| {
@@ -2357,6 +2387,8 @@ where
         .tls_config
         .as_ref()
         .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("hello-read");
     let hello: BootstrapRequest = {
         let hello_read = read_frame_within(
             reader,
@@ -2611,6 +2643,10 @@ where
     let mut admission_material_rx = lifecycle_tls_config
         .as_ref()
         .map(opc_tls::AuthenticatedServerConfig::subscribe_material_changes);
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::update(|context| {
+        context.remote_node = binding.consensus_node_id(&client_replica_id);
+    });
     let peer_key = directed_connection_key(
         b"direct",
         client_replica_id.as_str(),
@@ -2753,6 +2789,8 @@ where
 
     // Dispatch loop
     loop {
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::stage("rpc-read");
         // Keep one exact request read pinned while soft retirement races
         // admission. If retirement wins, finishing this authenticated frame
         // is only correlation: the request is never validated for dispatch,
@@ -3302,6 +3340,8 @@ where
                             )?
                         } else {
                             let response = Response::ScanRestoreRecords(Ok(page));
+                            #[cfg(feature = "test-control")]
+                            crate::qualification_diagnostics::stage("response-write");
                             match write_frame_until_server_cancellation(
                                 writer,
                                 &response,
@@ -3417,6 +3457,8 @@ where
                 match res {
                     Ok(entries) => {
                         let response = Response::GetReplicationLog(Ok(entries));
+                        #[cfg(feature = "test-control")]
+                        crate::qualification_diagnostics::stage("response-write");
                         match write_frame_until_server_cancellation(
                             writer,
                             &response,
@@ -3795,6 +3837,9 @@ async fn write_bootstrap_ack<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("ack-write");
+
     let deadline = response_write_deadline(timeout)?;
     write_frame_until_server_cancellation(
         writer,
@@ -3827,6 +3872,9 @@ async fn reject_hello<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("bootstrap-rejection-write");
+
     let deadline = response_write_deadline(timeout)?;
     write_frame_until_server_cancellation(
         writer,
@@ -3847,6 +3895,9 @@ async fn retire_bootstrap<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("bootstrap-retirement-write");
+
     tracing::debug!(
         reason = "rotation_bootstrap_retired",
         "retiring authenticated session connection before application admission"

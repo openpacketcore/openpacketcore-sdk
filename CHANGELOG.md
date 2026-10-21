@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-diameter`: `DiameterRequestFailure` adds `RoutePolicy` and
+  `DiameterRequestClassificationError` adds `RoutePolicyRequiresProxiableRequest`;
+  downstream exhaustive matches must handle the new variants.
+
+- `opc-ipsec-xfrm`: invalid ordinary Allow/Block policies are refused before
+  namespace writer epochs, durable preparation, staged journal claims or
+  composite SA effects. Mock policy installs and updates now enforce the same
+  shape as Linux. `XfrmObjectInstallDurableError` and
+  `XfrmObjectRosterRequestError` add `InvalidPolicy`; update exhaustive matches.
+  Valid requests and kernel/stored encodings are unchanged.
+
 - `opc-session-store`: the unadvertised voter-slot profile requires explicit
   volume enrollment before open. The SDK generates incarnation keys and returns
   a signer; missing, mismatched or retired enrollment returns
@@ -142,6 +153,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected before writer admission, durable preparation or composite effects;
   ordinary Allow policies keep their template requirement. The durable-install
   and roster-request errors add `InvalidForwardTransit` for this refusal.
+
+- `opc-session-net`: expose
+  `PersistentSessionConsumerClient::lease_mutation_status_with_budget` for
+  ordinary acquire, renew and release receipt recovery within an existing
+  checkpoint deadline. The method preserves exact request identity, ordinary
+  error mapping, pre-write caps and the shared extended-read capacity reserve.
+  It rejects newly observed success at expiry and spends the remaining deadline
+  after possible transmission, without replaying the lease mutation.
+
+- `opc-proto-diameter`: add `DiameterRoutePolicyRejection` with `UnableToDeliver`
+  (3002) and `RealmNotServed` (3003),
+  `DiameterRequestEnvelope::bind_route_policy_rejection`, and
+  `base::RESULT_CODE_DIAMETER_REALM_NOT_SERVED` for request-bound routing-policy
+  rejections through the existing bounded error-answer builder. Earlier framing
+  and dictionary failures retain precedence; otherwise non-proxiable requests
+  fail with `DiameterRequestClassificationError::RoutePolicyRequiresProxiableRequest`.
+  Both routing results require E and preserve correlation, Session-Id, ordered
+  Proxy-Info, redaction and size limits. Routing policy remains caller-owned,
+  and arbitrary numeric result codes are not accepted.
 
 - `opc-session-store` and `opc-session-net`: add the immutable
   `V2WithLeaseDeferral` store profile and an explicit consumer resume API.
@@ -831,6 +861,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-session-store`: keep async SQLite worker deadlines on the caller's
+  Tokio clock through SQL progress, acceptance readers, native reads, restore
+  scans and guarded-read completion. Paused-time setup no longer spends a
+  fresh worker's budget, and advancing Tokio time expires worker checks.
+  Independent real-time resource caps and existing timeout values are unchanged.
+
+- `opc-session-testkit`: derive traffic-status backend work from the parent's
+  absolute monotonic phase deadline, including the existing reply allowance.
+  Expired commands cannot start backend work or publish a late head. Test-control
+  fleet failures retain complete child stderr, identify each counted transport
+  failure, and collect voter and client-pool state. Phase deadlines and assertions
+  are unchanged, but child backend work stops 1 second before the phase deadline
+  to reserve reply delivery. The effective phase window is 1 second shorter
+  (stricter, never looser); progress first visible in that final second fails as
+  `AvailabilityRecoveryDeadlineExceeded`.
+
+- `opc-session-store`, `opc-sqlite-file-control-sys`: clarify that retained pins
+  hide `File` references but still expose borrowed descriptors, which callers
+  must not duplicate or close. Repository Clippy checks reject
+  `BorrowedFd::try_clone_to_owned`, `rustix::io::dup`,
+  `rustix::io::fcntl_dupfd_cloexec` and `nix::unistd::dup`, with local exceptions
+  for directory, socket, BPF and interpreter handles.
+
+- CI: balance native GTP-U qualification across datapath, regression and a new
+  required workload-reset job. Reuse the regression job's library build for
+  kernel provenance and control proofs, and move the 21 strict/exclusive reset
+  tests into their own 20-minute job. Cache each job's actual build target while
+  retaining all 148 test executions, evidence checks and existing 30/20-minute
+  deadlines. Save the three native caches only on main while allowing PRs to
+  restore them. Pin provenance markers and both suites' counts and skip rejection
+  in the workflow regressions. The additional job per CI run gives the datapath
+  job more margin.
 
 - `opc-persist`: isolate initial formation in functional consensus fixtures from
   scheduling pauses using the existing controlled clock, preserving engine

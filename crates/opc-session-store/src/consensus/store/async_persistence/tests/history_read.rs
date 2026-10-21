@@ -6,6 +6,8 @@ use std::sync::Condvar;
 
 const PHYSICAL_ATTEMPT_CAP: Duration = Duration::from_millis(250);
 
+mod preparation;
+
 /// Delay the ordinary durable data-sync boundary, after warm activation.
 /// The hook is installed before each real native owner is constructed.
 struct NativeSyncDelay {
@@ -81,10 +83,24 @@ impl Drop for NativeSyncRelease {
 pub(super) struct RequestHold {
     released: tokio::sync::watch::Sender<bool>,
     entered: tokio::sync::watch::Sender<bool>,
+    after_commit: Option<u64>,
 }
 
 impl RequestHold {
-    pub(super) async fn wait(&self) {
+    pub(super) async fn wait(&self, request: &SessionConsensusWireRequest) {
+        if let Some(index) = self.after_commit {
+            if request.family != SessionConsensusRpcFamily::AppendEntries {
+                return;
+            }
+            let append: AppendEntriesRequest<SessionRaftTypeConfig> =
+                decode_bounded(&request.payload).expect("ordinary durable AppendEntries");
+            if !append
+                .leader_commit
+                .is_some_and(|log_id| log_id.index > index)
+            {
+                return;
+            }
+        }
         let mut released = self.released.subscribe();
         if !*released.borrow_and_update() {
             self.entered.send_replace(true);
@@ -100,9 +116,14 @@ struct RequestRelease {
 
 impl RequestRelease {
     fn new(peer: &Arc<Peer>) -> Self {
+        Self::after_commit(peer, None)
+    }
+
+    fn after_commit(peer: &Arc<Peer>, after_commit: Option<u64>) -> Self {
         let hold = Arc::new(RequestHold {
             released: tokio::sync::watch::Sender::new(false),
             entered: tokio::sync::watch::Sender::new(false),
+            after_commit,
         });
         assert!(peer
             .held_requests
@@ -199,8 +220,16 @@ async fn activate_and_warm(fleet: &Fleet) -> FencedTransitionV2HistoryState {
             .await
             .unwrap());
     }
+    finish_mutation_preparation(fleet).await;
+    expected.unwrap()
+}
+
+/// Fence every preparation command before any voter is denied durable sync.
+/// Constructing a request observes a fence through a new logical-time command;
+/// its local completion does not wait for the followers' commit persistence.
+async fn finish_mutation_preparation(fleet: &Fleet) {
     let committed = fleet
-        .store(leader)
+        .store(fleet.leader())
         .inner
         .raft
         .metrics()
@@ -215,7 +244,6 @@ async fn activate_and_warm(fleet: &Fleet) -> FencedTransitionV2HistoryState {
             .await
             .unwrap();
     }
-    expected.unwrap()
 }
 
 async fn history_with_delayed_storage(hold_minority: bool) {
@@ -287,6 +315,7 @@ async fn durable_mutation_waits_for_native_sync_and_completes_after_release() {
         let leader = fleet.leader();
         let store = fleet.store(leader);
         let request = create_request(store, 2, &provider()).await;
+        finish_mutation_preparation(&fleet).await;
         let storage_release = delay.arm();
         let mut mutation = Box::pin(store.fenced_transition_v2(request.clone()));
         tokio::select! {

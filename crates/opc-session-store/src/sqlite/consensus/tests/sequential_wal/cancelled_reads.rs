@@ -93,6 +93,76 @@ impl GuardedReadFixture {
 }
 
 #[test]
+fn sqlite_clock_frozen_setup_preserves_retained_read_validation_and_result() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let fixture = GuardedReadFixture::new(&runtime);
+    runtime.block_on(async {
+        tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
+        std::thread::sleep(crate::sqlite::SQLITE_OPERATION_MAX_WORK + Duration::from_millis(20));
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        let value = fixture
+            .backend
+            .run_store_sqlite_task(SqliteStoreWorkKind::Read, |_| Ok(42))
+            .await
+            .expect("frozen retained read must validate and hand back its result");
+        assert_eq!(value, 42);
+        assert_eq!(tokio::time::Instant::now(), frozen);
+        assert!(
+            fixture.wal.vote().is_ok(),
+            "real time cannot fence a live Tokio read"
+        );
+    });
+    fixture.wal.shutdown().unwrap();
+}
+
+#[test]
+fn sqlite_clock_advance_fences_retained_read_without_sql_progress() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let fixture = GuardedReadFixture::new(&runtime);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    runtime.block_on(async {
+        tokio::time::pause();
+        let mut operation = std::pin::pin!(fixture.backend.run_store_sqlite_task(
+            SqliteStoreWorkKind::Read,
+            move |_| {
+                ready_tx.send(()).expect("retained read ready");
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("retained read release");
+                Ok(42)
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("retained read starts");
+        tokio::time::advance(crate::sqlite::SQLITE_OPERATION_MAX_WORK).await;
+        release_tx.send(()).expect("release expired retained read");
+        assert!(operation.await.is_err());
+        // Reacquiring the exact connection proves retained validation ended,
+        // even if the caller's timeout returned before the worker did.
+        let _connection = fixture.backend.conn.lock().await;
+        assert!(
+            fixture.wal.vote().is_err(),
+            "expired validation must fence before releasing ownership"
+        );
+    });
+    assert!(fixture.wal.shutdown().is_err());
+}
+
+#[test]
 fn cancelled_private_cache_read_reconciles_before_releasing_its_owner() {
     for foreign_write in [false, true] {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -277,9 +347,10 @@ fn retained_cache_guard_deadline_fences_before_callback_without_sql_progress() {
             Instant::now() + Duration::from_millis(100)
         };
         let entered = std::cell::Cell::new(false);
-        let result = fixture
-            .wal
-            .with_retained_application_read(&conn, deadline, || {
+        let result = fixture.wal.with_retained_application_read(
+            &conn,
+            &crate::sqlite::SqliteWorkDeadline::RealTime(deadline),
+            || {
                 entered.set(true);
                 fixture.pause.release();
                 // No SQLite VM steps can enforce the deadline in this body.
@@ -288,7 +359,8 @@ fn retained_cache_guard_deadline_fences_before_callback_without_sql_progress() {
                 );
                 assert!(matches!(waiting.try_recv(), Err(mpsc::TryRecvError::Empty)));
                 42
-            });
+            },
+        );
         assert_eq!(entered.get(), !expired_before_entry);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         drop(conn);

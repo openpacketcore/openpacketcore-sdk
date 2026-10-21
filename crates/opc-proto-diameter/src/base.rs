@@ -110,6 +110,8 @@ pub const RESULT_CODE_DIAMETER_SUCCESS: u32 = 2001;
 pub const RESULT_CODE_DIAMETER_COMMAND_UNSUPPORTED: u32 = 3001;
 /// Unable-to-deliver protocol-error result code.
 pub const RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER: u32 = 3002;
+/// Realm-not-served protocol-error result code.
+pub const RESULT_CODE_DIAMETER_REALM_NOT_SERVED: u32 = 3003;
 /// Too-busy protocol-error result code.
 pub const RESULT_CODE_DIAMETER_TOO_BUSY: u32 = 3004;
 /// Application unsupported protocol-error result code.

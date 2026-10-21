@@ -16,27 +16,31 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  # Keep the existing required check name and require both independent jobs.
+  # Keep the existing required check name and require all three independent jobs.
   privileged-gtpu-result:
     name: Privileged Linux GTP-U
     if: always()
-    needs: [privileged-gtpu, privileged-gtpu-regressions]
+    needs: [privileged-gtpu, privileged-gtpu-regressions, privileged-gtpu-resets]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
       DATAPATH_RESULT: ${{ needs.privileged-gtpu.result }}
       REGRESSIONS_RESULT: ${{ needs.privileged-gtpu-regressions.result }}
+      RESETS_RESULT: ${{ needs.privileged-gtpu-resets.result }}
     steps:
-      - name: Require both privileged jobs to pass
+      - name: Require all three privileged jobs to pass
         run: |
           set -euo pipefail
           test "$DATAPATH_RESULT" = success
           test "$REGRESSIONS_RESULT" = success
+          test "$RESETS_RESULT" = success
 
   privileged-gtpu-regressions:
     name: Privileged Linux GTP-U and route regressions
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/gtpu-native
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -46,6 +50,9 @@ jobs:
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target/gtpu-native
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install kernel tooling
         run: |
@@ -91,7 +98,6 @@ jobs:
       - name: Prove empty historical hierarchy normalization and crash recovery
         run: |
           set -euo pipefail
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
           cargo test --locked -p opc-gtpu-dataplane --lib --no-run --message-format=json \
             > "${RUNNER_TEMP}/gtpu-empty-normalization-build.jsonl"
           normalization_binary="$(jq -ers '
@@ -115,10 +121,82 @@ jobs:
           grep -Fq 'OPC_GTPU_EMPTY_LEGACY_NORMALIZATION_CRASH_CUTS_PROVEN' "${normalization_log}"
           grep -Fq 'OPC_GTPU_EMPTY_LEGACY_NESTED_ROOT_REFUSAL_PROVEN' "${normalization_log}"
 
+      # Reuse the library binary already built by normalization. Keeping
+      # these kernel proofs here leaves the integration partitions their
+      # own budgets even when compilation starts from an empty target.
+      - name: Prove eBPF kernel provenance and recovery
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          datapath_log="${RUNNER_TEMP}/gtpu-native-provenance.log"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" \
+            "OPC_GTPU_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              # All filters go after `--`: cargo accepts only one positional
+              # TESTNAME, while libtest itself takes any number.
+              cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation detach_accepts_unrelated_program_retirement_ detach_keeps_foreign_reference_despite_unrelated_program_retirement sibling_scan_
+            ' 2>&1 | tee "${datapath_log}"
+          if grep -Eq 'skipping:|OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:' "${datapath_log}"; then
+            echo "::error::privileged provenance tests skipped instead of running"
+            exit 1
+          fi
+          # These lib proofs return Ok early without printing `skipping:` when
+          # the environment is not privileged, so the skip check above cannot
+          # see them. Require the markers each emits only after real kernel
+          # provenance/recovery work, as the QEMU jobs do.
+          grep -Fq 'test result: ok. 14 passed; 0 failed;' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_HISTORICAL_25_TAG_PROOF_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_FOREIGN_REFUSAL_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=2' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=1' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=historical_references' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=generation' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=artifact_owner' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=legacy_record_owner' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=legacy_artifact_owner' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=workload_references' "${datapath_log}"
+
+      - name: Require native shared GTP-U control queue and both injection contracts
+        run: |
+          set -euo pipefail
+          cargo test --locked -p opc-gtpu-dataplane --lib --no-run --message-format=json \
+            > "${RUNNER_TEMP}/gtpu-control-build.jsonl"
+          gtpu_control_binary="$(python3 - "${RUNNER_TEMP}/gtpu-control-build.jsonl" <<'PY'
+          import json, sys
+          records = [json.loads(line) for line in open(sys.argv[1])]
+          binaries = [r['executable'] for r in records
+                      if r.get('reason') == 'compiler-artifact'
+                      and r.get('executable')
+                      and r['target']['name'] == 'opc_gtpu_dataplane']
+          assert len(binaries) == 1, 'expected exactly one GTP-U test binary'
+          print(binaries[0])
+          PY
+          )"
+          sudo unshare -n -- bash ci/qualify-gtpu-control-native.sh \
+            "$gtpu_control_binary" "${RUNNER_TEMP}/gtpu-control-native" kernel-config
+
+      - name: Upload shared GTP-U control queue qualification logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-control-native
+          path: ${{ runner.temp }}/gtpu-control-native
+          if-no-files-found: warn
+
       - name: Prove route rule families and locked route MTU on the kernel
         run: |
           set -euo pipefail
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
           cargo test --locked -p opc-route-steering \
             --test live_readback_probe --test live_locked_route_mtu \
             --no-run --message-format=json > "${RUNNER_TEMP}/route-kernel-build.jsonl"
@@ -155,15 +233,18 @@ jobs:
           path: |
             ${{ runner.temp }}/gtpu-empty-normalization-build.jsonl
             ${{ runner.temp }}/gtpu-empty-normalization.log
+            ${{ runner.temp }}/gtpu-native-provenance.log
             ${{ runner.temp }}/route-kernel-build.jsonl
             ${{ runner.temp }}/live_readback_probe.log
             ${{ runner.temp }}/live_locked_route_mtu.log
           if-no-files-found: warn
 
-  privileged-gtpu:
-    name: Privileged Linux GTP-U datapath
+  privileged-gtpu-resets:
+    name: Privileged Linux GTP-U workload resets
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/gtpu-resets
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -173,6 +254,117 @@ jobs:
 
       - name: Cache Rust build output
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target/gtpu-resets
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install kernel tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ethtool iproute2 iputils-ping kmod nftables procps wireguard-tools
+
+      - name: Check privileged GTP kernel support
+        run: |
+          set -euo pipefail
+          uname -r
+          uname -v
+          if ! sudo modprobe gtp; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe gtp
+          fi
+          lsmod | grep '^gtp'
+          sudo modprobe wireguard
+          # The hand-off test on a VRF slave needs the vrf driver, which
+          # ships in the same optional module package as gtp. Create a VRF
+          # in a throwaway namespace rather than look for a module: that
+          # holds for a built-in driver as well.
+          if ! sudo unshare -n -- ip link add vrf-probe type vrf table 10; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe vrf
+            sudo unshare -n -- ip link add vrf-probe type vrf table 10
+          fi
+          # The test of the attachment's interface enslaves it to a bridge.
+          sudo unshare -n -- ip link add bridge-probe type bridge
+          # The tests of a device stacked on the attachment's interface, and
+          # of the frames of a VLAN above it, need these drivers.
+          sudo unshare -n -- sh -euc '
+            ip link add lower-probe type dummy
+            ip link add link lower-probe name macvlan-probe type macvlan mode passthru
+            ip link del macvlan-probe
+            ip link add link lower-probe name ipvlan-probe type ipvlan mode l2
+            ip link add link lower-probe name vlan-probe type vlan id 100
+            ip link add gre-probe type gre local 192.0.2.1 remote 192.0.2.2 dev lower-probe
+          '
+          sudo mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+          sudo unshare -n -- ip link set lo up
+
+      - name: Build privileged eBPF GTP-U test
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run
+
+      - name: Prove workload resets in a fresh netns
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          # The committed source is the authority on how many reset tests
+          # must run; see the el9 job for why the shipped binary cannot be.
+          datapath_source="crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged.rs"
+          expected_tests="$(grep -Ec '^(async )?fn workload_(strict|exclusive)_reset_' "${datapath_source}")"
+          echo "reset suite expects ${expected_tests} tests from ${datapath_source}"
+          test "${expected_tests}" -gt 0
+          datapath_log="${RUNNER_TEMP}/gtpu-native-resets.log"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" \
+            "OPC_GTPU_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 workload_strict_reset_ workload_exclusive_reset_
+            ' 2>&1 | tee "${datapath_log}"
+
+          # Require the complete selected count and reject the same skip
+          # signals as the datapath partition. The reset tests retain all
+          # their kernel assertions, including the privileged flag check.
+          if grep -Eq 'skipping:|OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:' "${datapath_log}"; then
+            echo "::error::privileged reset tests skipped instead of running"
+            exit 1
+          fi
+          grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
+
+      - name: Upload privileged workload reset logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtpu-privileged-resets
+          path: ${{ runner.temp }}/gtpu-native-resets.log
+          if-no-files-found: warn
+
+  privileged-gtpu:
+    name: Privileged Linux GTP-U datapath
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/gtpu-native
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target/gtpu-native
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test eBPF parser and observation contracts on the host
         run: cargo test --locked --manifest-path crates/opc-gtpu-dataplane-ebpf/Cargo.toml --target x86_64-unknown-linux-gnu
@@ -221,7 +413,6 @@ jobs:
       - name: Prove map-in-map reader grace
         run: |
           set -euo pipefail
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
           cargo test --locked -p opc-linux-gtpu-sys --lib --no-run --message-format=json \
             > "${RUNNER_TEMP}/gtpu-reader-grace-build.jsonl"
           grace_binary="$(
@@ -244,7 +435,6 @@ jobs:
           set -euo pipefail
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
           cargo test --locked -p opc-gtpu-dataplane --test linux_gtpu_privileged --no-run
 
       - name: Run privileged GTP-U test in a fresh netns
@@ -252,7 +442,6 @@ jobs:
           set -euo pipefail
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
           sudo env \
             "PATH=${PATH}" \
             "CARGO_HOME=${CARGO_HOME}" \
@@ -270,7 +459,6 @@ jobs:
           set -euo pipefail
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
           cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged --no-run
 
       # Proves the committed CO-RE artifact end-to-end on a real kernel:
@@ -296,11 +484,12 @@ jobs:
           set -euo pipefail
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
           # The committed source is the authority on how many datapath tests
           # must run; see the el9 job for why the shipped binary cannot be.
           datapath_source="crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged.rs"
-          expected_tests="$(grep -c '^#\[ignore' "${datapath_source}")"
+          all_tests="$(grep -c '^#\[ignore' "${datapath_source}")"
+          reset_tests="$(grep -Ec '^(async )?fn workload_(strict|exclusive)_reset_' "${datapath_source}")"
+          expected_tests="$((all_tests - reset_tests))"
           echo "datapath suite expects ${expected_tests} tests from ${datapath_source}"
           test "${expected_tests}" -gt 0
           datapath_log="${RUNNER_TEMP}/gtpu-68-datapath.log"
@@ -313,10 +502,7 @@ jobs:
             "OPC_GTPU_RUN_PRIVILEGED=1" \
             unshare -n -- bash -euxo pipefail -c '
               ip link set lo up
-              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1
-              # All filters go after `--`: cargo accepts only one positional
-              # TESTNAME, while libtest itself takes any number.
-              cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 program_tag_candidates_match_the_running_kernel pre_redirect_tag_candidates_match_the_running_kernel historical_25_tag_candidates_match_the_running_kernel historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex historical_25_attached_frozen_graph_is_refused_without_mutation detach_accepts_unrelated_program_retirement_ detach_keeps_foreign_reference_despite_unrelated_program_retirement sibling_scan_
+              cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 --skip workload_strict_reset_ --skip workload_exclusive_reset_
             ' 2>&1 | tee "${datapath_log}"
 
           # Every one of these tests returns Ok early when
@@ -379,54 +565,6 @@ jobs:
           grep -Fq 'OPC_GTPU_ORDINARY_INNER_IPV6_CLEANUP_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_FORWARDS_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_CLEANUP_ACTIVATION_ROLLBACK_PROVEN' "${datapath_log}"
-
-          # These lib proofs return Ok early without printing `skipping:` when
-          # the environment is not privileged, so the skip check above cannot
-          # see them. Require the markers each emits only after real kernel
-          # provenance/recovery work, as the QEMU jobs do.
-          grep -Fq 'test result: ok. 14 passed; 0 failed;' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_TAG_PROOF_PROVEN' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_HISTORICAL_25_TAG_PROOF_PROVEN' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_FOREIGN_REFUSAL_PROVEN' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=2' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=1' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=historical_references' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=generation' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=artifact_owner' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=legacy_record_owner' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=legacy_artifact_owner' "${datapath_log}"
-          grep -Fq 'OPC_GTPU_SIBLING_SCAN_PROVEN site=workload_references' "${datapath_log}"
-
-      - name: Require native shared GTP-U control queue and both injection contracts
-        run: |
-          set -euo pipefail
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/gtpu-target"
-          cargo test --locked -p opc-gtpu-dataplane --lib --no-run --message-format=json \
-            > "${RUNNER_TEMP}/gtpu-control-build.jsonl"
-          gtpu_control_binary="$(python3 - "${RUNNER_TEMP}/gtpu-control-build.jsonl" <<'PY'
-          import json, sys
-          records = [json.loads(line) for line in open(sys.argv[1])]
-          binaries = [r['executable'] for r in records
-                      if r.get('reason') == 'compiler-artifact'
-                      and r.get('executable')
-                      and r['target']['name'] == 'opc_gtpu_dataplane']
-          assert len(binaries) == 1, 'expected exactly one GTP-U test binary'
-          print(binaries[0])
-          PY
-          )"
-          sudo unshare -n -- bash ci/qualify-gtpu-control-native.sh \
-            "$gtpu_control_binary" "${RUNNER_TEMP}/gtpu-control-native" kernel-config
-
-      - name: Upload shared GTP-U control queue qualification logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: gtpu-control-native
-          path: ${{ runner.temp }}/gtpu-control-native
-          if-no-files-found: warn
 
   linux-6-8-classifier-load:
     name: Linux 6.8 committed classifier load

@@ -1,5 +1,8 @@
 //! RFC 6733 request-bound error-answer evidence.
 
+#[path = "error_answers/route_policy.rs"]
+mod route_policy;
+
 use bytes::{BufMut, BytesMut};
 use opc_proto_diameter::apps::swm::{
     parse_swm_diameter_eap_request, parse_swm_diameter_eap_request_with_provenance,

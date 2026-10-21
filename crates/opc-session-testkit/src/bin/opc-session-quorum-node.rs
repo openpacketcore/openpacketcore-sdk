@@ -82,7 +82,8 @@ use opc_session_testkit::qualification::{
     QualificationSecurityMetricsSnapshot, QualificationTlsMaterialStatus,
     QualificationTrafficErrorClass, QualificationTrafficFailureCode,
     QualificationTrafficFailureStage, QualificationTrafficState, QualificationTrafficStatus,
-    QualificationTransportConfig, QUALIFICATION_CONCURRENT_COLLECTOR_MAX_JOURNAL_ENTRIES,
+    QualificationTrafficStatusBudget, QualificationTransportConfig,
+    QUALIFICATION_CONCURRENT_COLLECTOR_MAX_JOURNAL_ENTRIES,
     QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS, QUALIFICATION_CONCURRENT_RESTORE_MAX_PAGES,
     QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX, QUALIFICATION_CONCURRENT_WATCH_MAX_SUBSCRIPTIONS,
     QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
@@ -1270,6 +1271,8 @@ struct QualificationProjectedMtlsRuntime {
 }
 
 struct QualificationDirectedPeer {
+    #[cfg(feature = "test-control")]
+    diagnostic_peer: Arc<RemoteSessionConsensusPeer>,
     peer: QualificationGatedConsensusPeer,
     resolver_evidence: QualificationResolverEvidence,
     required_resolution: Option<QualificationRequiredResolution>,
@@ -1782,6 +1785,24 @@ impl QualificationNode {
                 );
                 QualificationNodeReply::ConsensusDiagnostics {
                     metrics: self.store.diagnostic_snapshot(),
+                    #[cfg(feature = "test-control")]
+                    lifecycle: Box::new(lifecycle_metrics(
+                        self.empty_vote_dispatches.load(Ordering::SeqCst),
+                    )),
+                    #[cfg(feature = "test-control")]
+                    client_connections: match &self.transport {
+                        QualificationTransportRuntime::FoundationPlaintext => BTreeMap::new(),
+                        QualificationTransportRuntime::ProjectedMtls(runtime) => runtime
+                            .directed_peers
+                            .iter()
+                            .map(|(index, peer)| {
+                                (
+                                    *index,
+                                    peer.diagnostic_peer.qualification_connection_snapshot(),
+                                )
+                            })
+                            .collect(),
+                    },
                 }
             }
             QualificationNodeCommand::SetConsensusRpcAvailability { availability } => {
@@ -1891,7 +1912,9 @@ impl QualificationNode {
             QualificationNodeCommand::StartTrafficMutation => self.start_traffic_mutation().await,
             QualificationNodeCommand::StopTrafficMutation => self.stop_traffic_mutation().await,
             QualificationNodeCommand::StopTrafficWatch => self.stop_traffic_watch().await,
-            QualificationNodeCommand::TrafficStatus => self.traffic_status().await,
+            QualificationNodeCommand::TrafficStatus { budget } => {
+                self.traffic_status_with_budget(budget).await
+            }
             QualificationNodeCommand::TrafficStatusSnapshot => self.traffic_status_snapshot(),
             QualificationNodeCommand::StartConcurrentWatch {
                 subscription_id,
@@ -2769,21 +2792,26 @@ impl QualificationNode {
     }
 
     async fn traffic_status(&self) -> QualificationNodeReply {
+        self.traffic_status_with_budget(QualificationTrafficStatusBudget::from_parent_deadline(
+            std::time::Instant::now()
+                + Duration::from_millis(
+                    opc_session_testkit::qualification::QUALIFICATION_CHILD_RESPONSE_TIMEOUT_MILLIS,
+                ),
+        ))
+        .await
+    }
+
+    async fn traffic_status_with_budget(
+        &self,
+        budget: QualificationTrafficStatusBudget,
+    ) -> QualificationNodeReply {
         let Some(traffic) = &self.traffic else {
             return QualificationNodeReply::Error {
                 code: QualificationNodeErrorCode::TrafficUnavailable,
             };
         };
-        let recovery_started_at = tokio::time::Instant::now();
-        let deadline = recovery_started_at
-            + Duration::from_millis(QUALIFICATION_TRAFFIC_WATCH_RECONCILIATION_MILLIS);
-        let replication_head = refresh_traffic_status_authoritative_head(
-            &self.protected,
-            &traffic.observation,
-            recovery_started_at,
-            deadline,
-        )
-        .await;
+        let replication_head =
+            refresh_traffic_status_with_budget(&self.protected, &traffic.observation, budget).await;
         self.traffic_status_with_replication_head(replication_head)
     }
 
@@ -4454,9 +4482,33 @@ async fn wait_for_traffic_recovery_retry(deadline: tokio::time::Instant) -> bool
     tokio::time::Instant::now() < deadline
 }
 
+/// Connects the received wire budget to the child's backend deadline.
+async fn refresh_traffic_status_with_budget<B: TrafficWatchBackend + ?Sized>(
+    backend: &B,
+    observation: &QualificationTrafficObservation,
+    budget: QualificationTrafficStatusBudget,
+) -> u64 {
+    refresh_traffic_status_for_control(backend, observation, || budget.remaining()).await
+}
+
 /// Refreshes the status head without ever presenting a cached value as a new
 /// authoritative observation. Only typed backend unavailability is retried;
 /// every other store error remains terminal for this status response.
+async fn refresh_traffic_status_for_control<B: TrafficWatchBackend + ?Sized>(
+    backend: &B,
+    observation: &QualificationTrafficObservation,
+    remaining: impl FnOnce() -> Duration,
+) -> u64 {
+    let recovery_started_at = tokio::time::Instant::now();
+    // Sample the shared budget after the local instant so sampling cannot
+    // extend the deadline. An injected sample also keeps paused-clock backend
+    // regressions independent of host scheduling; budget arithmetic and wire
+    // delivery boundaries are tested separately in qualification::control_budget.
+    let deadline = recovery_started_at + remaining();
+    refresh_traffic_status_authoritative_head(backend, observation, recovery_started_at, deadline)
+        .await
+}
+
 async fn refresh_traffic_status_authoritative_head<B: TrafficWatchBackend + ?Sized>(
     backend: &B,
     observation: &QualificationTrafficObservation,
@@ -5860,11 +5912,14 @@ async fn prepare_transport(
                 )
                 .with_connection_lifecycle(lifecycle)
                 .with_reauthentication_control(reauthentication.clone());
+                let remote_peer = Arc::new(remote_peer);
                 let peer =
-                    QualificationGatedConsensusPeer::new(Arc::new(remote_peer), rpc_gate.clone());
+                    QualificationGatedConsensusPeer::new(remote_peer.clone(), rpc_gate.clone());
                 directed_peers.insert(
                     member.node_index,
                     QualificationDirectedPeer {
+                        #[cfg(feature = "test-control")]
+                        diagnostic_peer: remote_peer.clone(),
                         peer: peer.clone(),
                         resolver_evidence,
                         required_resolution: None,
@@ -8594,6 +8649,105 @@ mod tests {
         .await
         .expect("traffic watch recovery installs a replacement stream")
         .expect("traffic observation remains live");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_parent_budget_stops_a_delayed_backend_before_reply_time() {
+        let backend = ScriptedTrafficWatchBackend::with_head_delay(
+            [Ok(47)],
+            [],
+            [],
+            Some(Duration::from_secs(2)),
+        );
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let started = tokio::time::Instant::now();
+        let head = refresh_traffic_status_for_control(&backend, &observation, || {
+            Duration::from_millis(100)
+        })
+        .await;
+        assert_eq!(head, 41, "a late head must not become qualified progress");
+        assert!(started.elapsed() <= Duration::from_millis(100));
+        assert_eq!(backend.head_requests().await, 1);
+        let failure = observation.failure().expect("bounded refresh failure");
+        assert_eq!(
+            failure.code,
+            QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+        );
+        assert_eq!(failure.stage, QualificationTrafficFailureStage::Watch);
+        assert!(
+            failure.recovery_elapsed_millis.expect("elapsed diagnostic") <= 100,
+            "the command reports its own exhausted budget, not a new 25-second allowance"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_parent_budget_exhausted_at_delivery_starts_no_backend_work() {
+        let backend = ScriptedTrafficWatchBackend::new([Ok(47)], [], []);
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let started = tokio::time::Instant::now();
+        let head =
+            refresh_traffic_status_for_control(&backend, &observation, || Duration::ZERO).await;
+        assert_eq!(backend.head_requests().await, 0);
+        assert_eq!(head, 41);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(
+            observation.failure().expect("expired control budget").code,
+            QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_parent_budget_transmitted_expiry_starts_no_backend_work() {
+        // Reserving the delivery allowance exhausts this real monotonic budget
+        // immediately, independent of host scheduling or the paused Tokio clock.
+        let command = QualificationNodeCommand::TrafficStatus {
+            budget: QualificationTrafficStatusBudget::from_parent_deadline(
+                std::time::Instant::now()
+                    + Duration::from_millis(
+                        opc_session_testkit::qualification::QUALIFICATION_CONCURRENT_CONTROL_DELIVERY_MILLIS,
+                    ),
+            ),
+        };
+        let wire = serde_json::to_vec(&command).expect("transmit traffic-status command");
+        let QualificationNodeCommand::TrafficStatus { budget } =
+            serde_json::from_slice(&wire).expect("receive traffic-status command")
+        else {
+            panic!("traffic-status command must survive transmission");
+        };
+        let backend = ScriptedTrafficWatchBackend::new([Ok(47)], [], []);
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let started = tokio::time::Instant::now();
+        let head = refresh_traffic_status_with_budget(&backend, &observation, budget).await;
+        assert_eq!(backend.head_requests().await, 0);
+        assert_eq!(
+            head, 41,
+            "an expired wire budget must preserve the proven head"
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        let failure = observation.failure().expect("expired transmitted budget");
+        assert_eq!(
+            failure.code,
+            QualificationTrafficFailureCode::AvailabilityRecoveryDeadlineExceeded
+        );
+        assert_eq!(failure.stage, QualificationTrafficFailureStage::Watch);
+        assert_eq!(failure.recovery_elapsed_millis, Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_status_parent_budget_accepts_a_head_within_the_shared_deadline() {
+        let backend = ScriptedTrafficWatchBackend::with_head_delay(
+            [Ok(47)],
+            [],
+            [],
+            Some(Duration::from_millis(100)),
+        );
+        let observation = QualificationTrafficObservation::new(41, 3);
+        let head =
+            refresh_traffic_status_for_control(&backend, &observation, || Duration::from_secs(1))
+                .await;
+        assert_eq!(head, 47);
+        assert_eq!(backend.head_requests().await, 1);
+        assert!(observation.failure().is_none());
     }
 
     #[tokio::test(start_paused = true)]

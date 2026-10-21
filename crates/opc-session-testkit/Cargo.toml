@@ -10,7 +10,7 @@ default = []
 foundation-insecure = ["opc-session-net/insecure-test"]
 consumer-fixture = ["dep:rcgen", "dep:rustls-pki-types"]
 # Non-production storage fault controls and redacted engine/storage diagnostics.
-test-control = ["opc-session-store/test-control"]
+test-control = ["opc-session-store/test-control", "opc-session-net/test-control"]
 
 [dependencies]
 hex = "0.4.3"
@@ -52,7 +52,7 @@ rcgen = { workspace = true }
 rustls-pki-types = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["event", "fs", "net", "process"] }
+rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rusqlite = { workspace = true, features = ["bundled"] }

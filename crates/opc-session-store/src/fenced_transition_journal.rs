@@ -5403,6 +5403,10 @@ fn sqlite_descriptor_path(
     let anchor = PathBuf::from("/dev/fd").join(parent.as_fd().as_raw_fd().to_string());
 
     let anchor_metadata = std::fs::metadata(&anchor).map_err(|_| journal_unavailable())?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "parent is the admitted directory, not a SQLite main-file descriptor"
+    )]
     let held_parent = std::fs::File::from(
         parent
             .as_fd()

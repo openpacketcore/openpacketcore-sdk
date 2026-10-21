@@ -1183,7 +1183,7 @@ impl XfrmStagedInstall {
     where
         B: XfrmBackend + ?Sized + 'static,
     {
-        crate::composite::validate_composite_forward_transit(&self.request)
+        crate::composite::validate_composite_policy(&self.request)
             .map_err(XfrmStagedInstallRunError::from)?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| XfrmStagedInstallRunError::RuntimeUnavailable)?;
@@ -2139,6 +2139,40 @@ mod tests {
             backend.operations().is_empty(),
             "no request may reach the kernel"
         );
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_allow_staged_has_no_journal_or_backend_effects() {
+        let backend = Arc::new(crate::MockXfrmBackend::new());
+        let mut request = install_request();
+        request.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(crate::XfrmAction::Allow);
+        let staged = XfrmStagedInstall::new(request);
+        let journal = staged.journal();
+        let result = staged.run(backend.clone()).await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must not install or roll back any object"
+        );
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_preflight_block_staged_has_no_journal_or_backend_effects() {
+        let backend = Arc::new(crate::MockXfrmBackend::new());
+        let mut request = install_request();
+        request.policy.parameters =
+            crate::model::malformed_existing_policy_parameters(crate::XfrmAction::Block);
+        let staged = XfrmStagedInstall::new(request);
+        let journal = staged.journal();
+        let result = staged.run(backend.clone()).await;
+        assert!(
+            backend.operations().is_empty(),
+            "invalid policy must not install or roll back any object"
+        );
+        assert_eq!(journal.ownership(), XfrmInstallOwnership::NotStarted);
+        assert!(result.is_err());
     }
 
     #[tokio::test]

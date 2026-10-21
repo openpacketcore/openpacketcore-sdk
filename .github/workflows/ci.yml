@@ -255,6 +255,7 @@ jobs:
 
       - name: Run clippy
         run: |
+          python3 ci/test-clippy-fd-guard.py
           cargo clippy --locked -p opc-ipsec-xfrm --lib --no-default-features -- -D warnings
           cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
@@ -431,11 +432,13 @@ jobs:
           shared-key: opc-rust-libraries
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Check V2 production silence without test-control
+      - name: Check production diagnostic silence without test-control
         if: matrix.shard == 0
         run: |
           cargo test --locked -p opc-session-net --no-default-features --lib \
             consumer::tests::v2_diagnostics_tests:: -- --test-threads=1
+          cargo test --locked -p opc-session-net --no-default-features --lib \
+            consensus::tests::transport_diagnostics:: -- --test-threads=1
 
       - name: Run exact library partition
         shell: bash ci/setup-fsverity-tmp.sh -- bash --noprofile --norc -e -o pipefail {0}

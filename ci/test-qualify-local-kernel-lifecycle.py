@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -551,6 +552,189 @@ def workflow_jobs(name):
 
 
 class WorkflowTests(unittest.TestCase):
+    NATIVE_GTPU_JOBS = ["privileged-gtpu", "privileged-gtpu-regressions", "privileged-gtpu-resets"]
+    NATIVE_GTPU_PROVENANCE_MARKERS = [
+        "OPC_GTPU_TAG_PROOF_PROVEN",
+        "OPC_GTPU_PRE_REDIRECT_TAG_PROOF_PROVEN",
+        "OPC_GTPU_HISTORICAL_25_TAG_PROOF_PROVEN",
+        "OPC_GTPU_HISTORICAL_25_DETACHED_RECOVERY_PROVEN",
+        "OPC_GTPU_HISTORICAL_25_ATTACHED_REFUSAL_PROVEN",
+        "OPC_GTPU_PROGRAM_RETIREMENT_FOREIGN_REFUSAL_PROVEN",
+        "OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=2",
+        "OPC_GTPU_PROGRAM_RETIREMENT_DETACH_PROVEN scan=1",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=historical_references",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=generation",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=artifact_owner",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=legacy_record_owner",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=legacy_artifact_owner",
+        "OPC_GTPU_SIBLING_SCAN_PROVEN site=workload_references",
+    ]
+
+    def test_native_gtpu_jobs_build_in_their_cached_target(self):
+        jobs = workflow_jobs("gtpu-privileged.yml")
+        for name in self.NATIVE_GTPU_JOBS:
+            with self.subTest(job=name):
+                self.assertIn(name, jobs.keys())
+                job = jobs[name]
+                target = re.search(r"^      CARGO_TARGET_DIR: \$\{\{ github.workspace \}\}/([^\n]+)$", job, re.M)
+                self.assertIsNotNone(target, "declare the actual build target before restoring its cache")
+                self.assertEqual(job.count("uses: Swatinem/rust-cache@v2\n"), 1)
+                self.assertIn(f"workspaces: . -> {target[1]}\n", job)
+                self.assertNotRegex(job, r"(?:export |env )CARGO_TARGET_DIR=")
+                self.assertNotIn("CARGO_PROFILE_", job)
+                self.assertNotIn("continue-on-error", job)
+                self.assertNotIn("shared-key:", job)
+                self.assertNotIn("add-job-id-key: false", job)
+                cache = next(step for step in re.split(r"^      - name: ", job, flags=re.M)[1:]
+                             if "uses: Swatinem/rust-cache@v2\n" in step)
+                self.assertEqual([line.strip() for line in cache.splitlines()].count(
+                    "save-if: ${{ github.ref == 'refs/heads/main' }}"), 1)
+                self.assertNotRegex(cache, r"(?m)^        if:", "PRs must still restore the cache")
+
+    def test_native_gtpu_proofs_use_three_required_jobs_once(self):
+        jobs = workflow_jobs("gtpu-privileged.yml")
+        for name in self.NATIVE_GTPU_JOBS:
+            self.assertIn(name, jobs.keys())
+        native = {name: jobs[name] for name in self.NATIVE_GTPU_JOBS}
+        library_filters = (
+            "program_tag_candidates_match_the_running_kernel "
+            "pre_redirect_tag_candidates_match_the_running_kernel "
+            "historical_25_tag_candidates_match_the_running_kernel "
+            "historical_25_detached_frozen_graph_resumes_after_up0_name_reuse_with_new_ifindex "
+            "historical_25_attached_frozen_graph_is_refused_without_mutation "
+            "detach_accepts_unrelated_program_retirement_ "
+            "detach_keeps_foreign_reference_despite_unrelated_program_retirement sibling_scan_"
+        )
+        selections = {
+            "cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 --skip workload_strict_reset_ --skip workload_exclusive_reset_": "privileged-gtpu",
+            "cargo test --locked -p opc-gtpu-dataplane --test ebpf_gtpu_privileged -- --ignored --nocapture --test-threads=1 workload_strict_reset_ workload_exclusive_reset_": "privileged-gtpu-resets",
+            "cargo test --locked -p opc-gtpu-dataplane --lib -- --ignored --nocapture --test-threads=1 " + library_filters: "privileged-gtpu-regressions",
+            'sudo unshare -n -- bash ci/qualify-gtpu-control-native.sh': "privileged-gtpu-regressions",
+        }
+        for command, owner in selections.items():
+            with self.subTest(command=command):
+                self.assertEqual(sum(job.count(command) for job in native.values()), 1)
+                self.assertIn(command, native[owner])
+        self.assertEqual(len(set(self.NATIVE_GTPU_PROVENANCE_MARKERS)), 14)
+        proof_checks = [f'grep -Fq \'{marker}\' "${{datapath_log}}"'
+                        for marker in self.NATIVE_GTPU_PROVENANCE_MARKERS]
+        proof_checks.append('grep -Fq \'test result: ok. 14 passed; 0 failed;\' "${datapath_log}"')
+        for name, job in native.items():
+            for check in proof_checks:
+                with self.subTest(job=name, proof=check):
+                    self.assertEqual([line.strip() for line in job.splitlines()].count(check),
+                                     1 if name == "privileged-gtpu-regressions" else 0)
+        for name, minutes in [("privileged-gtpu", 30), ("privileged-gtpu-regressions", 20),
+                              ("privileged-gtpu-resets", 20)]:
+            self.assertIn(f"timeout-minutes: {minutes}\n", native[name])
+            self.assertIn("runs-on: ubuntu-latest\n", native[name])
+            self.assertNotRegex(native[name], r"(?m)^    (needs|if):")
+
+    def test_native_gtpu_integration_partition_retains_every_ignored_test_once(self):
+        jobs = workflow_jobs("gtpu-privileged.yml")
+        source = (RUNNER.ROOT / "crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged.rs").read_text()
+        names = re.findall(r"^#\[ignore[^\n]*\]\n(?:async )?fn (\w+)\(", source, re.M)
+        self.assertEqual(len(names), len(re.findall(r"^#\[ignore", source, re.M)))
+        reset_names = {name for name in names if name.startswith(("workload_strict_reset_", "workload_exclusive_reset_"))}
+        self.assertTrue(reset_names)
+        for family, expected in [("workload_strict_reset_", 13), ("workload_exclusive_reset_", 8)]:
+            self.assertEqual(sum(name.startswith(family) for name in names), expected, family)
+        self.assertEqual(len(reset_names), 21)
+        owners = {}
+        for job_name in self.NATIVE_GTPU_JOBS:
+            self.assertIn(job_name, jobs.keys())
+            job = jobs[job_name]
+            steps = re.split(r"^      - name: ", job, flags=re.M)[1:]
+            runs = [step.split("        run: |\n", 1)[1] for step in steps
+                    if "--test ebpf_gtpu_privileged -- --ignored" in step]
+            self.assertEqual(len(runs), 0 if job_name == "privileged-gtpu-regressions" else 1)
+            if not runs:
+                continue
+            run = textwrap.dedent(runs[0])
+            command = next(line.strip() for line in run.splitlines()
+                           if line.strip().startswith("cargo test "))
+            args = shlex.split(command.split(" -- ", 1)[1])
+            self.assertEqual(args[:3], ["--ignored", "--nocapture", "--test-threads=1"])
+            filters, skips = [], []
+            args = iter(args[3:])
+            for arg in args:
+                if arg == "--skip":
+                    skips.append(next(args))
+                else:
+                    self.assertFalse(arg.startswith("-"), f"unexpected selection flag: {arg}")
+                    filters.append(arg)
+            selected = {name for name in names
+                        if (not filters or any(value in name for value in filters))
+                        and not any(value in name for value in skips)}
+            owners[job_name] = selected
+            # Execute only the source-count prelude, never a privileged command.
+            prelude = run.split("sudo env", 1)[0]
+            count = subprocess.run(["bash", "-c", prelude + '\nprintf "%s" "$expected_tests"'],
+                                   cwd=RUNNER.ROOT, env=dict(os.environ, RUNNER_TEMP="/tmp"),
+                                   capture_output=True, text=True, check=True)
+            self.assertEqual(int(count.stdout.splitlines()[-1]), len(selected))
+            self.assertIn('"OPC_GTPU_RUN_PRIVILEGED=1"', run)
+            self.assertIn("unshare -n -- bash -euxo pipefail -c", run)
+            self.assertIn("ip link set lo up", run)
+            self.assertEqual(run.count("if grep -Eq 'skipping:|OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:'"), 1)
+            self.assertEqual(run.splitlines().count(
+                'grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"'), 1)
+        self.assertEqual(owners["privileged-gtpu-resets"], reset_names)
+        self.assertEqual(owners["privileged-gtpu"], set(names) - reset_names)
+        self.assertCountEqual([name for selected in owners.values() for name in selected], names)
+
+    def test_native_gtpu_proof_checks_reject_incomplete_or_skipped_runs(self):
+        jobs = workflow_jobs("gtpu-privileged.yml")
+        for job, step_name, count, markers in [
+            ("privileged-gtpu-regressions", "Prove eBPF kernel provenance and recovery", 14,
+             self.NATIVE_GTPU_PROVENANCE_MARKERS),
+            ("privileged-gtpu-resets", "Prove workload resets in a fresh netns", 21, []),
+        ]:
+            steps = re.split(r"^      - name: ", jobs[job], flags=re.M)[1:]
+            step = next(step for step in steps if step.startswith(step_name + "\n"))
+            run = textwrap.dedent(step.split("        run: |\n", 1)[1])
+            skip_check = 'if grep -Eq \'skipping:|OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:\' "${datapath_log}"; then'
+            self.assertEqual(run.splitlines().count(skip_check), 1)
+            # Execute only the evidence checks against fixture logs, with no
+            # Cargo, sudo, namespaces or kernel work.
+            checks = run[run.index(skip_check):]
+            summary = f"test result: ok. {count} passed; 0 failed; 0 ignored;\n"
+            success = summary + "".join(marker + "\n" for marker in markers)
+            cases = [("complete", success, True), ("empty", "", False),
+                     ("wrong-count", success.replace(f"{count} passed", f"{count - 1} passed"), False)]
+            cases += [("missing-" + marker, success.replace(marker + "\n", ""), False) for marker in markers]
+            cases += [("skip-" + signal, signal + " fixture skip\n" + success, False)
+                      for signal in ["skipping:", "OPC_GTPU_ATTACHMENT_LEAF_SKIPPED:"]]
+            if job == "privileged-gtpu-resets":
+                cases += [(f"only-{family}", success.replace("21 passed", f"{family_count} passed"), False)
+                          for family, family_count in [("strict", 13), ("exclusive", 8)]]
+            with tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / "proof.log"
+                for case, output, passed in cases:
+                    with self.subTest(job=job, case=case):
+                        log.write_text(output)
+                        env = dict(os.environ, datapath_log=str(log), expected_tests=str(count))
+                        result = subprocess.run(["bash", "-euo", "pipefail", "-c", checks],
+                                                env=env, capture_output=True, check=False)
+                        self.assertEqual(result.returncode == 0, passed, result.stderr)
+
+    def test_native_gtpu_aggregate_requires_success_from_all_three_jobs(self):
+        aggregate = workflow_jobs("gtpu-privileged.yml")["privileged-gtpu-result"]
+        self.assertIn("if: always()\n", aggregate)
+        self.assertIn("needs: [privileged-gtpu, privileged-gtpu-regressions, privileged-gtpu-resets]\n", aggregate)
+        variables = ["DATAPATH_RESULT", "REGRESSIONS_RESULT", "RESETS_RESULT"]
+        for variable, job in zip(variables, self.NATIVE_GTPU_JOBS):
+            self.assertIn(f"{variable}: ${{{{ needs.{job}.result }}}}", aggregate)
+        command = textwrap.dedent(aggregate.split("        run: |\n", 1)[1])
+        for variable in variables:
+            for status in ["success", "failure", "cancelled", "skipped", ""]:
+                with self.subTest(job=variable, status=status):
+                    env = dict(os.environ, **dict.fromkeys(variables, "success"))
+                    env[variable] = status
+                    result = subprocess.run(["bash", "-e", "-c", command], env=env,
+                                            capture_output=True, check=False)
+                    self.assertEqual(result.returncode == 0, status == "success", result.stderr)
+
     def test_host_qualification_has_one_owner_with_its_own_preflight_and_cleanup(self):
         jobs = workflow_jobs("ci.yml")
         host = jobs["rust-local-kernel-lifecycle"]

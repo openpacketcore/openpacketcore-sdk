@@ -35,6 +35,53 @@ fn call_boundary(
 }
 
 impl PersistentSessionConsumerClient {
+    /// Read the exact ordinary lease receipt within the caller's checkpoint budget.
+    ///
+    /// This retains the request's original identity and complete lease body,
+    /// and submits at most one read; it never replays the mutation. The response
+    /// may use the remaining original deadline, while pool admission, setup and
+    /// Call write keep the physical-attempt cap and any earlier configured
+    /// pre-request limit. It shares the extended-read capacity reservation with
+    /// [`Self::get_with_budget`] and the other budget-bearing reads.
+    ///
+    /// Store errors and wire rejections retain [`Self::lease_mutation_status`]'s
+    /// mapping, including `Unauthorized` to [`StoreError::BackendUnavailable`].
+    /// Transport authority revocation returns [`StoreError::TopologyAuthorityRevoked`]
+    /// immediately. Any other possibly transmitted failure spends the remaining
+    /// original deadline, preventing an overlapping retry. A newly observed
+    /// successful status at or after that deadline is unavailable.
+    pub async fn lease_mutation_status_with_budget(
+        &self,
+        request: &SessionConsumerLeaseMutationRequest,
+        budget: PreparedCheckpointBudget,
+    ) -> Result<SessionConsumerLeaseMutationStatus, StoreError> {
+        match self
+            .execute_v1_read_with_budget(
+                DeadlineV1Read::LeaseMutationStatus(Box::new(request.clone())),
+                budget,
+            )
+            .await
+        {
+            Ok(SessionConsumerResponse::LeaseMutationStatus(Ok(status)))
+                if tokio::time::Instant::now() < budget.original_deadline() =>
+            {
+                Ok(status)
+            }
+            Ok(SessionConsumerResponse::LeaseMutationStatus(Err(error))) => {
+                Err(error.into_store_error())
+            }
+            Ok(SessionConsumerResponse::Rejected(rejection)) => {
+                Err(rejection_into_store_error(rejection))
+            }
+            Err(error) if read_authority_revoked(&error) => {
+                Err(StoreError::TopologyAuthorityRevoked)
+            }
+            Ok(_) | Err(_) => Err(StoreError::BackendUnavailable(
+                "consumer lease receipt status unavailable".into(),
+            )),
+        }
+    }
+
     /// Read authoritative state within the caller's immutable checkpoint budget.
     ///
     /// The response may use the remaining original deadline. Pool admission,

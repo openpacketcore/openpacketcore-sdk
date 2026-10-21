@@ -516,6 +516,37 @@ async fn open_connection(
     operation_deadline: tokio::time::Instant,
     lifecycle: OutboundConnectionLifecycle,
 ) -> Result<Connection, ConnectionOpenError> {
+    #[cfg(feature = "test-control")]
+    let context = crate::qualification_diagnostics::context(
+        "direct-outbound",
+        Some(binding.local_consensus_node_id()),
+        Some(binding.remote_consensus_node_id()),
+        lifecycle.reauthentication.generation(),
+        tls_config
+            .as_ref()
+            .map(|config| config.material_status().epoch()),
+    );
+    let attempt = open_connection_inner(
+        target,
+        tls_config,
+        binding,
+        requested_response_frame_size,
+        operation_deadline,
+        lifecycle,
+    );
+    #[cfg(feature = "test-control")]
+    let attempt = crate::qualification_diagnostics::scope(context, attempt);
+    attempt.await
+}
+
+async fn open_connection_inner(
+    target: RemoteTarget,
+    tls_config: Option<opc_tls::AuthenticatedClientConfig>,
+    binding: RemoteReplicaBinding,
+    requested_response_frame_size: usize,
+    operation_deadline: tokio::time::Instant,
+    lifecycle: OutboundConnectionLifecycle,
+) -> Result<Connection, ConnectionOpenError> {
     // Local configuration rejection is not a connection attempt.
     checked_wire_frame_size(requested_response_frame_size).map_err(ConnectionOpenError::from)?;
     let mut reauthentication_rx = lifecycle.reauthentication.subscribe();
@@ -650,8 +681,10 @@ async fn open_connection(
         {
             Some(&METRICS.session_net_connection_failure_timeout)
         }
-        Err(ConnectionOpenError::Protocol(ProtocolError::Io(_))) => {
-            Some(&METRICS.session_net_connection_failure_transport)
+        Err(ConnectionOpenError::Protocol(ProtocolError::Io(error))) => {
+            crate::lifecycle::record_transport_failure("Io", Some(error.kind()));
+            attempt_metrics.finish();
+            return result;
         }
         Err(ConnectionOpenError::Protocol(ProtocolError::Authentication)) => {
             Some(&METRICS.session_net_connection_failure_authentication)
@@ -689,12 +722,24 @@ async fn open_connection_attempt(
                 let target = target.clone();
                 let binding = binding.clone();
                 async move {
+                    #[cfg(feature = "test-control")]
+                    crate::qualification_diagnostics::begin_resolution(Some(attempt.epoch()));
                     let addr = target.resolve().await.map_err(ProtocolError::Io)?;
+                    #[cfg(feature = "test-control")]
+                    crate::qualification_diagnostics::update(|context| {
+                        context.stage = "connect".to_owned();
+                        context.peer_addr = Some(addr);
+                    });
                     let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
+                    #[cfg(feature = "test-control")]
+                    crate::qualification_diagnostics::socket(&tcp);
+
                     let connector = tokio_rustls::TlsConnector::from(session_client_tls_config(
                         attempt.rustls_config(),
                     ));
                     let server_name = target.tls_server_name(addr)?;
+                    #[cfg(feature = "test-control")]
+                    crate::qualification_diagnostics::stage("tls");
                     let tls_stream = connector
                         .connect(server_name, tcp)
                         .await
@@ -781,8 +826,18 @@ async fn open_connection_attempt(
             lifecycle,
         })
     } else {
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::begin_resolution(None);
         let addr = target.resolve().await.map_err(ProtocolError::Io)?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::update(|context| {
+            context.stage = "connect".to_owned();
+            context.peer_addr = Some(addr);
+        });
         let tcp = TcpStream::connect(addr).await.map_err(ProtocolError::Io)?;
+        #[cfg(feature = "test-control")]
+        crate::qualification_diagnostics::socket(&tcp);
+
         let (mut reader, mut writer) = tokio::io::split(tcp);
         let (contract_profile, frame_limits, cas_idempotency_epoch) = perform_client_handshake(
             &mut reader,
@@ -828,6 +883,8 @@ where
     let handshake_nonce = uuid::Uuid::new_v4();
     let configuration_id = binding.configuration_id().to_hex();
     let requested_response_frame_size = checked_wire_frame_size(requested_response_frame_size)?;
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("hello-write");
     write_frame_bounded_until(
         writer,
         &BootstrapRequest::Hello(BootstrapHello {
@@ -846,6 +903,8 @@ where
     )
     .await?;
 
+    #[cfg(feature = "test-control")]
+    crate::qualification_diagnostics::stage("ack-read");
     let ack: BootstrapResponse = read_frame(reader, MAX_HANDSHAKE_FRAME_SIZE).await?;
     match ack {
         BootstrapResponse::HelloAck(ack) => {

@@ -7,6 +7,7 @@
 //! view by replay and compares every non-log table, not only a high-water mark.
 
 use crate::consensus::{SessionStorageFailure, SessionStorageFailureStage};
+use crate::sqlite::SqliteWorkDeadline;
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -144,8 +145,8 @@ impl AppliedPrefix {
     }
 }
 
-fn check_application_read_deadline(deadline: Option<Instant>) -> io::Result<()> {
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+fn check_application_read_deadline(deadline: Option<&SqliteWorkDeadline>) -> io::Result<()> {
+    if deadline.is_some_and(SqliteWorkDeadline::is_elapsed) {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "private WAL application read deadline exceeded",
@@ -285,7 +286,7 @@ impl Wal {
     pub(crate) fn with_retained_application_read<T>(
         &self,
         conn: &Connection,
-        deadline: Instant,
+        deadline: &SqliteWorkDeadline,
         read: impl FnOnce() -> T,
     ) -> io::Result<T> {
         self.with_application_read_until(conn, Some(deadline), read)
@@ -294,7 +295,7 @@ impl Wal {
     fn with_application_read_until<T>(
         &self,
         conn: &Connection,
-        deadline: Option<Instant>,
+        deadline: Option<&SqliteWorkDeadline>,
         read: impl FnOnce() -> T,
     ) -> io::Result<T> {
         if self.is_native() {
