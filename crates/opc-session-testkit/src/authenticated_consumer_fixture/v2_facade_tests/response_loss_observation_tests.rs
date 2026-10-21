@@ -35,20 +35,32 @@ async fn committed_reply_suppressed_event_drives_original_deadline_without_repla
                 .expect("release ordinary receipt");
             drop(prepared);
 
-            // A conflicting real mutation must return its rejection without
-            // consuming the fault or announcing a successful suppressed reply.
+            // The V2 client resolves a recorded store rejection by exact receipt.
+            // It must not consume the fault or announce a suppressed success.
+            let rejected_id = request_id(0x6010);
+            let rejected_deadline = soon();
             let mut rejected = facade
                 .prepare_fenced_transition(
-                    create(request_id(0x6010), 0x6000, PAYLOAD),
-                    budget(soon()),
+                    create(rejected_id, 0x6000, PAYLOAD),
+                    budget(rejected_deadline),
                 )
                 .await
                 .expect("prepare a conflict against the existing lease and record");
             fixture.lose_next_fenced_transition_v2_response();
-            assert!(matches!(
+            assert_eq!(
                 rejected.execute_once().await,
-                Err(FencedTransitionExecuteError::Rejected(_))
-            ));
+                Err(FencedTransitionExecuteError::OutcomeUnknown {
+                    request_id: rejected_id
+                })
+            );
+            let rejection = rejected
+                .status_until_terminal(rejected_deadline)
+                .await
+                .expect("recover the exact recorded rejection");
+            assert!(
+                matches!(rejection, FencedTransitionV2Status::Recorded(result)
+                if matches!(*result, Err(StoreError::StaleFence)))
+            );
             assert!(fixture
                 .lose_next_fenced_transition_v2_response
                 .load(Ordering::Acquire));
@@ -56,6 +68,10 @@ async fn committed_reply_suppressed_event_drives_original_deadline_without_repla
                 events.try_recv(),
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
             );
+            rejected
+                .release_resolved()
+                .await
+                .expect("release the resolved rejection");
             drop(rejected);
 
             // Reuse the subscription across two separately armed real commits.
