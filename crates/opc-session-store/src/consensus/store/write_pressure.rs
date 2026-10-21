@@ -27,7 +27,10 @@ impl ConsensusSessionStore {
         if self.inner.raft.metrics().borrow().running_state.is_err() {
             return Err(PressureRetryFailure::NotTransmitted);
         }
-        if let Some(result) = attempt(first_deadline).await {
+        // The dispatched operation can contain the complete store/RPC future.
+        // Keep it out of the retry owner's inline state: callers compose this
+        // owner through several public operations before polling it.
+        if let Some(result) = Box::pin(attempt(first_deadline)).await {
             return Ok(result);
         }
         let resident = self
@@ -72,7 +75,7 @@ impl ConsensusSessionStore {
                     return Err(PressureRetryFailure::NotTransmitted);
                 }
                 let deadline = store.operation_deadline_from(tokio::time::Instant::now());
-                if let Some(result) = attempt(deadline).await {
+                if let Some(result) = Box::pin(attempt(deadline)).await {
                     return Ok(result);
                 }
             }

@@ -909,6 +909,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 
+- `opc-session-store`: keep dispatched pressure-retry futures on the heap so
+  nested snapshot recovery operations fit the ordinary thread stack without
+  changing operation deadlines or cancellation ownership.
+
 - `opc-session-store`: keep async SQLite worker deadlines on the caller's
   Tokio clock through SQL progress, acceptance readers, native reads, restore
   scans and the unit-test guarded-read route. Paused-time setup no longer spends
