@@ -6897,10 +6897,11 @@ pub struct GtpuProbe {
     /// their queue and are dropped when it overflows, never forwarded.
     ///
     /// The backend binds those queues when the control port is first opened for
-    /// the attachment and keeps them until the attachment is removed or the
-    /// queue is retired. Nothing is bound before that first open, while the
+    /// the attachment and keeps them until the attachment is removed or its
+    /// readback fails. Nothing is bound before that first open, while the
     /// process is down across a restart (tc keeps running from the pinned
-    /// graph), or after a retirement. In those windows tc drops the steered
+    /// graph), or after queue loss until a fresh open validates a live
+    /// registration and binds new queues. In those windows tc drops the steered
     /// packets and counts them
     /// (`EbpfGtpuDatapathCounters::downlink_missing_consumer`), so the host
     /// answers none of them with an ICMP error toward the peer. Open the

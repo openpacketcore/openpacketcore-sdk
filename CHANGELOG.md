@@ -929,6 +929,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the workflow regressions. The additional job per CI run gives the datapath
   job more margin.
 
+- `opc-gtpu-dataplane`: allow fresh control-port queues after transient
+  interface or datapath readback failure when the same live attachment passes
+  all checks again. Old handles and response plans stay invalid, removed or
+  fenced registrations remain closed, and processing counters and rate-limit
+  state survive queue recovery. Apply the same queue withdrawal to open and
+  End Marker readback errors.
+
 - `opc-persist`: isolate initial formation in functional consensus fixtures from
   scheduling pauses using the existing controlled clock, preserving engine
   runtimes, operation bounds and authority checks. Keep explicit initialization

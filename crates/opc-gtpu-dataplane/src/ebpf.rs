@@ -57202,6 +57202,8 @@ mod load_capability_tests {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod control_port_recovery;
     mod grouped_bearer_transition;
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
@@ -57735,6 +57737,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeState {
+        interface_readback_unavailable: HashSet<String>,
         strict_workload_resets: Vec<(Option<u32>, PathBuf, u16)>,
         strict_workload_reset_report: EbpfStrictWorkloadResetReport,
         /// Interfaces enslaved to a master whose receive handler takes
@@ -60425,6 +60428,9 @@ mod tests {
         }
 
         fn ifindex_by_name(&self, name: &str) -> Result<u32, GtpuError> {
+            if self.state().interface_readback_unavailable.contains(name) {
+                return Err(state_indeterminate("fake_interface_readback"));
+            }
             self.ifindexes.get(name).copied().ok_or(GtpuError::NotFound)
         }
 
