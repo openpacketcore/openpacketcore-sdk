@@ -11,6 +11,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parent.parent
+FIXTURE_LOCK = ROOT / "ci/fixtures/clippy-fd-guard/Cargo.lock"
 PRELUDE = "use std::{fs::File, io, os::fd::{AsFd, BorrowedFd}};\n"
 
 
@@ -28,9 +29,10 @@ class BorrowedDescriptorGuardTests(unittest.TestCase):
             (fixture / "clippy.toml").write_text(
                 (ROOT / "clippy.toml").read_text() if configured else ""
             )
+            if dependencies:
+                (fixture / "Cargo.lock").write_bytes(FIXTURE_LOCK.read_bytes())
             result = subprocess.run(
-                # Dependency fixtures may fetch their locked version on a cold CI host.
-                ["cargo", "clippy", *([] if dependencies else ["--offline"]),
+                ["cargo", "clippy", "--offline", *(["--locked"] if dependencies else []),
                  "--message-format=json", "--", "-D", "warnings"],
                 cwd=fixture, text=True, capture_output=True,
                 env=dict(os.environ, CLIPPY_CONF_DIR=str(fixture),
@@ -82,6 +84,13 @@ pub fn retain_directory(directory: &File) -> io::Result<File> {
 
     def test_rustix_duplication_is_rejected(self):
         packages = tomllib.loads((ROOT / "Cargo.lock").read_text())["package"]
+        identity = lambda package: tuple(package.get(key) for key in
+                                         ("name", "version", "source", "checksum"))
+        workspace_identities = {identity(package) for package in packages}
+        for package in tomllib.loads(FIXTURE_LOCK.read_text())["package"]:
+            if "source" in package:
+                with self.subTest(package=package["name"]):
+                    self.assertIn(identity(package), workspace_identities)
         version = next(package["version"] for package in packages if package["name"] == "rustix")
         dependencies = f'rustix = "={version}"\n'
         source = """

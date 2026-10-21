@@ -98,6 +98,23 @@ target kinds until a shard explicitly covers them; future targets cannot silentl
 fall outside the split. Both ordinary shards and the isolated contracts remain
 required by the same aggregate.
 
+## Borrowed-descriptor Clippy guard
+
+Run `cargo fetch --locked` before `python3 ci/test-clippy-fd-guard.py` on a
+cold checkout. The guard compiles offline; its rustix fixture also uses
+`--locked` and the committed `fixtures/clippy-fd-guard/Cargo.lock`. That
+lockfile keeps the workspace's rustix version and transitive dependency
+versions and checksums. The guard checks that they still match the workspace,
+so update the fixture lockfile alongside changes to those workspace pins.
+After a Dependabot bump and `cargo fetch --locked`, recreate the guard's temporary
+rustix fixture with its manifest and source, seed it with the workspace
+`Cargo.lock`, run `cargo metadata --offline --format-version 1` there, and copy
+the pruned lockfile back to `ci/fixtures/clippy-fd-guard/Cargo.lock`.
+
+The `nix::unistd::dup` entry intentionally keeps Clippy's unreachable-function
+warning when nix is built without `fs`. That build cannot call `dup`; keeping
+the warning also preserves diagnostics for a misspelled path when `fs` is on.
+
 ## Secret scan scope
 
 The [security workflow](../.github/workflows/security.yml) scans a pull request's
