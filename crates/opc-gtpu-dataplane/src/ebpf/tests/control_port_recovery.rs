@@ -108,7 +108,7 @@ impl Fixture {
         state.grouped_map_ready.insert(self.device.ifindex);
     }
 
-    fn assert_oversized_downlink(&self, port: &dyn GtpuControlPort) {
+    fn assert_oversized_downlink(&self, port: &dyn GtpuControlPort) -> u16 {
         // Independent IPv4/UDP fixture: 700 octets, DF set, UE 10.45.0.2.
         let mut inner = vec![
             0x45, 0, 0x02, 0xbc, 0x12, 0x34, 0x40, 0, 64, 17, 0, 0, 8, 8, 8, 8, 10, 45, 0, 2,
@@ -132,6 +132,7 @@ impl Fixture {
         assert_eq!(&packet.fragments()[0][20..], &inner[20..572]);
         assert_eq!(&packet.fragments()[1][20..], &inner[572..]);
         assert!(port.try_receive_downlink(2048).unwrap().is_none());
+        u16::from_be_bytes([packet.fragments()[0][4], packet.fragments()[0][5]])
     }
 }
 
@@ -186,7 +187,7 @@ async fn retired_sdk_control_port_recovers_or_escalates_after_transient_readback
             let old = fixture.open().await;
             let sibling = fixture.open().await;
             fixture.assert_echo(old.as_ref());
-            fixture.assert_oversized_downlink(old.as_ref());
+            let identification = fixture.assert_oversized_downlink(old.as_ref());
             let counters = old.downlink_counters().unwrap();
             let budget = GtpuControlResponseBudget::new(14, 2).unwrap();
             let old_plan = fixture.echo(old.as_ref()).echo_response(budget).unwrap();
@@ -219,8 +220,20 @@ async fn retired_sdk_control_port_recovers_or_escalates_after_transient_readback
                 GtpuControlPortError::SocketMismatch
             );
             assert_eq!(recovered.downlink_counters().unwrap(), counters);
+            // A stale handle's delayed failed readback cannot close the
+            // replacement queues. No additional open is allowed here.
+            fault.set(&fixture, true);
+            assert_eq!(
+                old.try_receive_datagram(2048).unwrap_err(),
+                GtpuControlPortError::Unavailable
+            );
+            fault.set(&fixture, false);
             fixture.assert_echo(recovered.as_ref());
-            fixture.assert_oversized_downlink(recovered.as_ref());
+            assert_eq!(
+                fixture.assert_oversized_downlink(recovered.as_ref()),
+                identification.wrapping_add(1).max(1),
+                "reopening preserves the per-destination Identification sequence"
+            );
         }
     }
 }

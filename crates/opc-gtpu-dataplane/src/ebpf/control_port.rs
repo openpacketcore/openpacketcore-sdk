@@ -130,6 +130,9 @@ pub(super) struct ControlSocketState {
     inner_fragment_socket: Option<crate::GtpuReassemblySocket>,
     /// Service order of the three queues above.
     service_order: DownlinkServiceOrder,
+    /// Revoked whenever readback loss closes the queues. A later open shares
+    /// the registration's budgets, but never revives an old port handle.
+    generation: Arc<()>,
     retired: bool,
     /// Value-free counters of this registration's downlink consumer.
     downlink_counters: crate::GtpuDownlinkCounters,
@@ -161,9 +164,19 @@ impl ControlSocketState {
 
     pub(super) fn retire(&mut self) {
         self.retired = true;
+        self.invalidate_queues();
+    }
+
+    /// Withdraw every queue without retiring the attachment registration.
+    /// Reopening requires fresh exact readback through the backend opener.
+    /// Keep counters, rate limits and fragment Identification sequences: a
+    /// transient read failure must not reset their per-registration scope.
+    fn invalidate_queues(&mut self) {
         self.socket = None;
         self.too_big_socket = None;
         self.inner_fragment_socket = None;
+        self.generation = Arc::new(());
+        self.service_order = DownlinkServiceOrder::default();
     }
 }
 
@@ -172,6 +185,7 @@ type SocketSlot = Mutex<ControlSocketState>;
 struct BackendControlPort {
     backend: Weak<EbpfGtpuDataplaneBackendInner>,
     socket: Weak<SocketSlot>,
+    generation: Arc<()>,
     ifindex: u32,
 }
 
@@ -228,11 +242,20 @@ impl BackendControlPort {
                 .runtime
                 .pdp_readback_datapath_usable(self.ifindex)
         {
-            slot.lock().map_err(|_| unavailable())?.retire();
+            let mut state = slot.lock().map_err(|_| unavailable())?;
+            // A failed readback may finish after another handle already
+            // closed and reopened the queues. It can revoke only its own
+            // generation, never the newly validated one.
+            if Arc::ptr_eq(&self.generation, &state.generation) {
+                state.invalidate_queues();
+            }
             return Err(unavailable());
         }
         let mut state = slot.lock().map_err(|_| unavailable())?;
-        if state.retired || state.socket.is_none() {
+        if state.retired
+            || state.socket.is_none()
+            || !Arc::ptr_eq(&self.generation, &state.generation)
+        {
             return Err(unavailable());
         }
         // Revalidate under the slot: removal retires it while holding it, so
@@ -506,14 +529,15 @@ impl EbpfGtpuDataplaneBackend {
         }
         let slot = Arc::clone(&managed.control_socket);
         drop(devices);
-        if self.inner.runtime.ifindex_by_name(&device.name)? != device.ifindex
+        let current_ifindex = self.inner.runtime.ifindex_by_name(&device.name);
+        if current_ifindex.as_ref().ok() != Some(&device.ifindex)
             || !self
                 .inner
                 .runtime
                 .pdp_readback_datapath_usable(device.ifindex)
         {
-            slot.lock().map_err(|_| unavailable())?.retire();
-            return Err(unavailable());
+            slot.lock().map_err(|_| unavailable())?.invalidate_queues();
+            return Err(current_ifindex.err().unwrap_or_else(unavailable));
         }
         let mut state = slot.lock().map_err(|_| unavailable())?;
         if state.retired {
@@ -573,7 +597,8 @@ impl EbpfGtpuDataplaneBackend {
             })?;
         let slot = Arc::clone(&managed.control_socket);
         drop(devices);
-        if self.inner.runtime.ifindex_by_name(&device.name)? != device.ifindex
+        let current_ifindex = self.inner.runtime.ifindex_by_name(&device.name);
+        if current_ifindex.as_ref().ok() != Some(&device.ifindex)
             || !self
                 .inner
                 .runtime
@@ -581,8 +606,8 @@ impl EbpfGtpuDataplaneBackend {
         {
             slot.lock()
                 .map_err(|_| GtpuError::io("ebpf_control_port_state", poisoned_lock()))?
-                .retire();
-            return Err(unavailable());
+                .invalidate_queues();
+            return Err(current_ifindex.err().unwrap_or_else(unavailable));
         }
         // The port is the consumer of this attachment's hand-offs. tc looks
         // for it on the attachment's interface, so IP input must receive
@@ -628,6 +653,7 @@ impl EbpfGtpuDataplaneBackend {
         Ok(Arc::new(BackendControlPort {
             backend: Arc::downgrade(&self.inner),
             socket: Arc::downgrade(&slot),
+            generation: Arc::clone(&socket.generation),
             ifindex: device.ifindex,
         }))
     }
@@ -865,6 +891,7 @@ mod tests {
         let port = BackendControlPort {
             backend: Arc::downgrade(&backend.inner),
             socket: Weak::new(),
+            generation: Arc::default(),
             ifindex: 731,
         };
         let guard = backend.operation_guard().unwrap();
@@ -891,6 +918,7 @@ mod tests {
         let port = BackendControlPort {
             backend: Arc::downgrade(&backend.inner),
             socket: Weak::new(),
+            generation: Arc::default(),
             ifindex: 731,
         };
         let guard = backend.operation_guard().unwrap();
@@ -920,6 +948,7 @@ mod tests {
         let port = BackendControlPort {
             backend: Arc::downgrade(&backend.inner),
             socket: Weak::new(),
+            generation: Arc::default(),
             ifindex: 731,
         };
         let inner = Arc::clone(&backend.inner);

@@ -106,6 +106,9 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// receive consumer. No raw descriptor or forwarding authority is issued.
     /// A supported backend invalidates outstanding ports on attachment removal,
     /// replacement or backend loss, including already prepared response plans.
+    /// The eBPF backend also invalidates ports on failed attachment readback.
+    /// Retry this open to bind fresh queues once the same live registration
+    /// passes all checks; old handles and response plans remain invalid.
     /// The current eBPF implementation supports concrete IPv4 endpoints only.
     /// Linux kernel, mock and unsupported adapters return the exact unsupported
     /// feature below; they do not bind a competing socket or simulate parity.
