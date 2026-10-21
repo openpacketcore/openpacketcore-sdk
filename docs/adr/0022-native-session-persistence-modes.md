@@ -649,6 +649,104 @@ configuration cannot silently turn a durable-readiness declaration into a
 weaker persistence claim. Products select the storage mode and mode-aware
 traffic gate explicitly; they do not mint SDK authority from counters.
 
+## Live log admission
+
+The SDK holds ordinary new log growth at a live high-water window of 262,144
+rows. The retained gauge is the distance from the engine's published purge
+frontier to its current last log index, including index zero when no frontier
+exists. Queued and accepted growth reserves capacity until actual engine
+completion and a covering observation. A caller timeout or cancellation cannot
+recycle accepted work. A definite non-append rejection releases its reservation.
+Absolute log indices, completed-operation counts and elapsed service lifetime
+are never admission budgets; progress reuses the same window.
+
+A leader checks capacity before taking an execution credit. Its authenticated
+pressure acknowledgement means the request was definitely not proposed. The
+supported write surface retains the immutable request in a bounded SDK owner
+and retries with a fresh per-attempt deadline and fresh authority checks. This
+includes direct ScopeBatch execute/cancel and V2 calls; cancelling an admitted
+pressure retry's result observer does not cancel its work. No running proposal
+or forwarding credit is retained between attempts. Pressure does not convert
+authority failures or possible delivery into a retryable non-proposal result.
+Losing leadership wakes queued proposals with NotLeader so that they can reroute
+within the current attempt's original deadline. Followers
+deliver complete authenticated AppendEntries batches to Raft regardless of
+their retained window. Data appends carry heartbeats, and controls behind data
+must remain reachable. Follower accounting observes pressure and retains
+accepted-work ownership; it never truncates or refuses replicated growth.
+Existing authority and membership-transition validation remain mandatory.
+
+Verified Emergency work and authenticated recovery/membership controls use the
+reserved headroom above the ordinary window. They are counted but are never
+refused by this admission window. EmergencyClassification and ordinary
+SafetyControl application growth remain gated. The single-voter Async
+cold-rejoin barrier receives its exemption only after authentication through
+the private cold-cut path; ordinary AdvanceLogicalTime is still gated.
+
+The engine owns snapshot selection, transfer and purge. SDK snapshot construction
+starts its budget only after acquiring the physical worker gate. Actual native
+export units and hash chunks renew a 60-second stall grace; there is no total
+build-time limit. Opaque whole-image work receives additional time from its size:
+one second per MiB of the actual pinned image and per 1,000 captured native rows.
+Native export includes its compatibility basis, growing output, and immutable
+capture cardinalities; SQLite capture uses its reader's page extent including
+WAL-resident pages. Finalization, sync, sealing and current/predecessor verification
+use the actual descriptor length. Waiting to publish receives the selected
+snapshot's size allowance because a serving reader holds exclusion through a full
+admission scan; without a selected snapshot it receives ordinary stall grace.
+These conservative allowances are progress budgets, not measured throughput
+guarantees or a cap on cumulative business state.
+Expired attempts retry after one second. Cancellation is fenced immediately
+before publication, and an expired native export observes it cooperatively. Blocking I/O retains the actual
+worker gate, descriptors, namespace and shutdown owner until it really exits;
+expiry cannot start a second worker or publish a stale attempt. Once metadata
+publication commits, its owner finishes delivering that exact cut to Raft rather
+than discarding committed progress at the deadline. An independently owned
+completion task retains predecessor cleanup and return-stream preparation even
+when its observer is cancelled. Shutdown also retains this completion owner; its
+existing public deadline bounds the caller while the shared background drain
+joins the actual work. Genuine storage errors are not
+treated as attempt expiry.
+
+An active leader that remains full for five seconds without snapshot or purge
+progress starts an authenticated live leadership transfer. Each transfer attempt
+is bounded. Only an engine-accepted handoff retains its target and transfer
+request; a failed begin is retried only while pressure still requires it. Live
+handoff fences lease reuse for the current term, allowing a fresh proof after
+re-election. The source continues replication, voting and snapshot recovery; it does not retire
+the store or stop emergency sessions. This also bounds leadership held by an
+uncancellable snapshot worker. Heartbeats and new appends cannot reset the
+no-progress timer. No restart or operator action is needed.
+
+If an old stalled build finishes after ordinary commits have stopped at the
+window, the SDK requests a successor while pressure remains and at least one
+snapshot interval has been applied since the selected snapshot. It retries at most once per
+second, because an active build can ignore a request. Quarantined Async voters
+do not start this admission maintenance; activation wakes the observer.
+Releasing a stalled build or transfer clears the affected node's backpressure
+without an operator trigger or a restart.
+
+`ConsensusSessionStore::log_pressure_snapshot()` exposes `retained_rows`,
+`pending_entries`, `entries_since_snapshot` and `high_water_rows`, with independent
+typed retained and snapshot pressure levels. Levels are Normal below half W,
+Elevated at half W, High at three quarters W, and AtWindow at W. Transition
+warnings report these gauges, and a return to Normal clears the warning.
+
+The initial window reserves three quarters of the 1,048,576-row last defence.
+Workload sizing must satisfy W >= K + N + r * (build_time + transfer_time) with
+margin and W <= 786,432, subject to the retained-row memory budget. With the
+fixed K = 1,024 and N = 4,096, 262,144 rows allow approximately 654 seconds at
+393 entries per second after K + N. The idempotent stall regressions establish
+admission and recovery correctness at the full window in both persistence
+modes; they do not measure whole-business-state snapshot cost or process RSS.
+The initial value remains provisional pending those workload measurements.
+The four full-window proofs run serially at test O1 in their named heavy shards,
+with debug assertions, overflow checks, row counts and recovery deadlines intact.
+The three-cycle build and transfer regressions retain the ordinary test profile.
+
+The log window does not change generation-file extent or business-table
+retention. Those resources retain their separate storage contracts.
+
 ## Verification and remaining qualification
 
 The regression matrix includes ordinary public writer delay and ENOSPC,

@@ -329,6 +329,8 @@ pub(crate) enum Point {
     BeforeNativeReceiptRead,
     BeforeNativeLogRead,
     BeforeNativeSnapshotRead,
+    #[cfg(test)]
+    NativeSnapshotExportProgress,
     BeforeNativeSnapshotWriteback,
     BeforeNativePublicRead,
     BeforeNativeGenerationAppend,

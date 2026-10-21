@@ -506,6 +506,34 @@
       "tests": [
         "caller_deadline_accepts_in_time_and_rejects_late_valid_replies"
       ]
+    },
+    {
+      "module": "consensus::store::async_persistence::tests::log_admission",
+      "shard": "native-log-14",
+      "tests": [
+        "log_admission_full_window_blocked_build_durable"
+      ]
+    },
+    {
+      "module": "consensus::store::async_persistence::tests::log_admission",
+      "shard": "native-log-15",
+      "tests": [
+        "log_admission_full_window_blocked_build_async"
+      ]
+    },
+    {
+      "module": "consensus::store::async_persistence::tests::log_admission",
+      "shard": "native-log-16",
+      "tests": [
+        "log_admission_full_window_blocked_transfer_durable"
+      ]
+    },
+    {
+      "module": "consensus::store::async_persistence::tests::log_admission",
+      "shard": "native-log-17",
+      "tests": [
+        "log_admission_full_window_blocked_transfer_async"
+      ]
     }
   ]
 }

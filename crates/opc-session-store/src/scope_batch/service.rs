@@ -1,6 +1,7 @@
 //! Authenticated durable batch service.
 
 use super::*;
+use crate::consensus::store::PressureRetryFailure;
 use crate::scope_authority::{ScopeAuthorityAction, ScopeAuthorityAdmission, ScopeAuthorityRole};
 use crate::scope_scheduler::ScopeWorkClass;
 use crate::{
@@ -290,7 +291,10 @@ impl ScopeBatchStore {
     /// identical to [`Self::execute`]. Transport adapters must authenticate the
     /// header/class and provide per-class ingress/proof capacity before reading
     /// the body. Queue congestion is retried through normal backpressure;
-    /// network/store deadlines still bound each dispatched attempt.
+    /// network/store deadlines still bound each dispatched attempt. Definite
+    /// log pressure retains this exact request in a bounded SDK retry owner;
+    /// authority is checked again on every attempt, and dropping the result
+    /// observer does not cancel an already admitted pressure retry.
     pub async fn execute_classified(
         &self,
         authenticated: &SessionConsumerIdentity,
@@ -298,12 +302,34 @@ impl ScopeBatchStore {
         class: ScopeWorkClass,
     ) -> Result<ScopeBatchOutcome, ScopeBatchError> {
         require_data_lane_class(request.lane(), class)?;
-        tokio::time::timeout(
-            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
-            self.execute_inner(authenticated, request, class),
-        )
-        .await
-        .map_err(|_| ScopeBatchError::OutcomeUnknown)?
+        let service = self.clone();
+        let authenticated = authenticated.clone();
+        let request = request.clone();
+        self.store
+            .own_pressure_retries(
+                ConsensusSessionStore::scope_batch_scheduler_key(self.namespace.scope()),
+                class,
+                tokio::time::Instant::now() + DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                move |_| {
+                    let service = service.clone();
+                    let authenticated = authenticated.clone();
+                    let request = request.clone();
+                    async move {
+                        tokio::time::timeout(
+                            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                            service.execute_inner(&authenticated, &request, class),
+                        )
+                        .await
+                        .unwrap_or(Err(ScopeBatchError::OutcomeUnknown))
+                        .transpose()
+                    }
+                },
+            )
+            .await
+            .map_err(|failure| match failure {
+                PressureRetryFailure::NotTransmitted => ScopeBatchError::Unavailable,
+                PressureRetryFailure::OutcomeUnknown => ScopeBatchError::OutcomeUnknown,
+            })?
     }
 
     /// Race cancellation against apply for this exact immutable attempt. A
@@ -326,37 +352,69 @@ impl ScopeBatchStore {
         class: ScopeWorkClass,
     ) -> Result<ScopeBatchReceipt, ScopeBatchError> {
         require_data_lane_class(attempt.lane(), class)?;
-        tokio::time::timeout(DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT, async {
-            attempt.validate()?;
-            if attempt.stamp().namespace() != &self.namespace
-                || attempt.stamp().execution().identity() != authenticated
-            {
-                return Err(ScopeAuthorityError::Unauthorized.into());
-            }
-            let role = self
-                .admission
-                .authorize(
-                    authenticated,
-                    self.namespace.scope(),
-                    Some(attempt.stamp().execution()),
-                    ScopeAuthorityAction::Mutate,
-                    Some(attempt.cancellation_digest()?),
-                )
-                .await?;
-            if role != ScopeAuthorityRole::Worker {
-                return Err(ScopeAuthorityError::Unauthorized.into());
-            }
-            self.store
-                .commit_scope_batch_cancel(
-                    ScopeBatchCancelCommand {
-                        attempt: attempt.clone(),
-                    },
-                    class,
-                )
-                .await
-        })
-        .await
-        .map_err(|_| ScopeBatchError::OutcomeUnknown)?
+        let service = self.clone();
+        let authenticated = authenticated.clone();
+        let attempt = attempt.clone();
+        self.store
+            .own_pressure_retries(
+                ConsensusSessionStore::scope_batch_scheduler_key(self.namespace.scope()),
+                class,
+                tokio::time::Instant::now() + DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                move |_| {
+                    let service = service.clone();
+                    let authenticated = authenticated.clone();
+                    let attempt = attempt.clone();
+                    async move {
+                        tokio::time::timeout(
+                            DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                            service.cancel_inner(&authenticated, &attempt, class),
+                        )
+                        .await
+                        .unwrap_or(Err(ScopeBatchError::OutcomeUnknown))
+                        .transpose()
+                    }
+                },
+            )
+            .await
+            .map_err(|failure| match failure {
+                PressureRetryFailure::NotTransmitted => ScopeBatchError::Unavailable,
+                PressureRetryFailure::OutcomeUnknown => ScopeBatchError::OutcomeUnknown,
+            })?
+    }
+
+    async fn cancel_inner(
+        &self,
+        authenticated: &SessionConsumerIdentity,
+        attempt: &ScopeBatchAttempt,
+        class: ScopeWorkClass,
+    ) -> Result<Option<ScopeBatchReceipt>, ScopeBatchError> {
+        attempt.validate()?;
+        if attempt.stamp().namespace() != &self.namespace
+            || attempt.stamp().execution().identity() != authenticated
+        {
+            return Err(ScopeAuthorityError::Unauthorized.into());
+        }
+        let role = self
+            .admission
+            .authorize(
+                authenticated,
+                self.namespace.scope(),
+                Some(attempt.stamp().execution()),
+                ScopeAuthorityAction::Mutate,
+                Some(attempt.cancellation_digest()?),
+            )
+            .await?;
+        if role != ScopeAuthorityRole::Worker {
+            return Err(ScopeAuthorityError::Unauthorized.into());
+        }
+        self.store
+            .commit_scope_batch_cancel(
+                ScopeBatchCancelCommand {
+                    attempt: attempt.clone(),
+                },
+                class,
+            )
+            .await
     }
 
     /// Resolve an old boot's uncertain write after a committed succession.
@@ -438,7 +496,7 @@ impl ScopeBatchStore {
         authenticated: &SessionConsumerIdentity,
         request: &ScopeBatchRequest,
         class: ScopeWorkClass,
-    ) -> Result<ScopeBatchOutcome, ScopeBatchError> {
+    ) -> Result<Option<ScopeBatchOutcome>, ScopeBatchError> {
         self.authorize(authenticated, request).await?;
         let current = self
             .store
@@ -448,6 +506,7 @@ impl ScopeBatchStore {
             return current
                 .outcome(request.lane())
                 .cloned()
+                .map(Some)
                 .ok_or(ScopeBatchError::FormatMismatch);
         }
         self.authorize(authenticated, request).await?;
@@ -457,21 +516,32 @@ impl ScopeBatchStore {
         match self.store.commit_scope_batch(command, class).await {
             Ok(outcome) => Ok(outcome),
             Err(
-                ScopeBatchError::OutcomeUnknown
+                _error @ (ScopeBatchError::OutcomeUnknown
                 | ScopeBatchError::Unavailable
                 | ScopeBatchError::Scope(
                     ScopeAuthorityError::Unavailable | ScopeAuthorityError::OutcomeUnknown,
-                ),
+                )),
             ) => {
+                #[cfg(all(test, feature = "test-control"))]
+                if matches!(_error, ScopeBatchError::OutcomeUnknown) {
+                    crate::consensus::store::recovery_test_control::record(
+                        crate::consensus::store::recovery_test_control::Event::ScopeBatchOutcomeUnknown,
+                    );
+                }
                 if let Ok(current) = self
                     .store
                     .scope_batch_checkpoint(self.namespace.scope())
                     .await
                 {
                     if current.replay(request) == Ok(true) {
+                        #[cfg(all(test, feature = "test-control"))]
+                        crate::consensus::store::recovery_test_control::record(
+                            crate::consensus::store::recovery_test_control::Event::CheckpointResolved,
+                        );
                         return current
                             .outcome(request.lane())
                             .cloned()
+                            .map(Some)
                             .ok_or(ScopeBatchError::FormatMismatch);
                     }
                 }

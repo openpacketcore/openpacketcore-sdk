@@ -1672,6 +1672,32 @@ async fn fixed_quorum_public_reopen_reseeds_each_released_cursor_only_unsealed_s
             .await
             .expect("capture sealed fixed selected snapshot");
     }
+    // Triggering only schedules the build; shutdown can cancel an unpublished
+    // snapshot. Require every selected fixture image within one shared budget.
+    let publication_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    for (index, (store, database)) in stores.iter().zip(&database_paths).enumerate() {
+        tokio::time::timeout_at(publication_deadline, async {
+            loop {
+                if fixed_published_snapshot_path(
+                    store,
+                    database,
+                    &snapshot_root.path().join(format!("snapshots-{index}")),
+                )
+                .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "fixed voter store {index} ({}) did not publish its selected snapshot within 5 seconds",
+                database.display()
+            )
+        });
+    }
     shutdown_fixed_cluster_for_reopen(&stores, &paths).await;
     drop(stores);
     drop(paths);
