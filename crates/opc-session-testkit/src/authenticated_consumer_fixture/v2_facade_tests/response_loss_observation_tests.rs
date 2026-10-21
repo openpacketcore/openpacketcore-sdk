@@ -46,7 +46,16 @@ async fn committed_reply_suppressed_event_drives_original_deadline_without_repla
                     let execution = prepared.execute_once();
                     tokio::pin!(execution);
                     tokio::select! {
-                        result = &mut execution => panic!("suppressed reply completed before its deadline: {result:?}"),
+                        result = &mut execution => {
+                            assert!(
+                                !fixture.lose_next_fenced_transition_v2_response.load(Ordering::Acquire),
+                                "the real successful response must consume the armed loss control"
+                            );
+                            let observed = facade.observe_fenced_transition(&session_key(label)).await
+                                .expect("read back the transition when the event is missing");
+                            assert_eq!(observed.record().expect("the suppressed transition committed").payload.as_bytes(), PAYLOAD);
+                            panic!("committed reply was suppressed but no event preceded completion: {result:?}");
+                        },
                         event = events.recv() => event.expect("observe real committed response suppression"),
                     }
                     assert_eq!(tokio::time::Instant::now() - started, Duration::ZERO);
