@@ -131,6 +131,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
+  verification time for certificate validity checks while preserving SPIFFE ID,
+  trust-domain and workload-path validation. `from_cert_der` continues to use
+  the current UTC time.
+
 - `opc-session-store`: `SqliteSessionBackend::voter_identity_binding` returns
   an enrolled volume's public installation, slot, incarnation and key digest
   after restart, without exporting private key material or granting admission.
