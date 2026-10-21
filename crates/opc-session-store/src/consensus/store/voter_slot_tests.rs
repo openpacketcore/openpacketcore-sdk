@@ -4,6 +4,8 @@ use super::*;
 mod identity_tests;
 #[path = "voter_slot_lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[path = "voter_slot_log_admission_tests.rs"]
+mod log_admission_tests;
 #[path = "voter_slot_progress_tests.rs"]
 mod progress_tests;
 #[path = "voter_slot_publication_tests.rs"]

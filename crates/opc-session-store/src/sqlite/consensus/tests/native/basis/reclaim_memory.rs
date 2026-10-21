@@ -570,16 +570,32 @@ fn native_reclaim_memory_shutdown_interrupts_wait_with_writer_already_blocked() 
 }
 
 fn assert_shutdown_interrupts_committed_wait(block_writer_first: bool) {
+    #[derive(Debug, PartialEq, Eq)]
+    enum ApplyEvent {
+        WaitStarted,
+        Finished,
+    }
+    struct ApplyCompletion(mpsc::Sender<ApplyEvent>);
+    impl Drop for ApplyCompletion {
+        fn drop(&mut self) {
+            // A return or panic must also wake the observer: the hook retains
+            // its sender for the whole WAL lifetime.
+            let _ = self.0.send(ApplyEvent::Finished);
+        }
+    }
     let armed = Arc::new(AtomicBool::new(false));
     let gate = Gate::new(Point::BeforeGroup, 1);
-    let (wait_started_tx, wait_started_rx) = mpsc::sync_channel(1);
+    let (apply_tx, apply_rx) = mpsc::channel();
     let (fixture, entry) = waiting_fixture_with(IoControl {
         hook: Arc::new({
             let armed = Arc::clone(&armed);
             let gate = Arc::clone(&gate);
+            let apply_tx = apply_tx.clone();
             move |point| {
                 if point == Point::NativeRetirementWaitStarted {
-                    wait_started_tx.send(()).map_err(io::Error::other)?;
+                    apply_tx
+                        .send(ApplyEvent::WaitStarted)
+                        .map_err(io::Error::other)?;
                 }
                 if armed.load(Ordering::Acquire) {
                     gate.hook(point)
@@ -593,10 +609,21 @@ fn assert_shutdown_interrupts_committed_wait(block_writer_first: bool) {
     let pressure =
         crate::consensus::verified_snapshot::VerificationMemory::reserve(80 * 1024 * 1024).unwrap();
     std::thread::scope(|scope| {
-        let apply = scope.spawn(|| fixture.wal.native_apply_committed(&[entry]));
-        wait_started_rx
-            .recv()
-            .expect("committed apply entered the retirement wait");
+        let apply = scope.spawn(|| {
+            let _completion = ApplyCompletion(apply_tx);
+            fixture.wal.native_apply_committed(&[entry])
+        });
+        // The same operation budget bounds retirement admission in the WAL.
+        // Expiry is a failure, never evidence that the wait was entered.
+        let event = apply_rx.recv_timeout(opc_consensus::DURABLE_CONSENSUS_OPERATION_TIMEOUT);
+        if event != Ok(ApplyEvent::WaitStarted) {
+            fixture.wal.stop_retirement_waits();
+        }
+        assert_eq!(
+            event,
+            Ok(ApplyEvent::WaitStarted),
+            "committed apply must enter retirement wait before finishing"
+        );
         let (waits, operations, _) = fixture.wal.retirement_wait_state_for_test().unwrap();
         assert!(waits > 0);
         assert_eq!(

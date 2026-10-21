@@ -134,7 +134,7 @@ removed. Each domain retains its own state machine and production evidence
 gates.
 
 The current exact pin is the immutable `openpacketcore/openraft` revision
-`2e1fb7455752455a3505b354d003d6effa55985d` (0.9.25 plus fork fixes). Both domains
+`b3c3995868e736364b0898dce5d293fa61f528f6` (0.9.25 plus fork fixes). Both domains
 consume one fixed runtime profile from `opc-consensus`, including fresh
 per-campaign `[5,000 ms, 8,000 ms)` election-timeout sampling, a 2,000 ms
 heartbeat/AppendEntries ceiling, and the shared 10,000 ms operation default.

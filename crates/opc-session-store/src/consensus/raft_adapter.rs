@@ -177,9 +177,65 @@ pub(crate) struct SessionRaftPeerDirectory {
     membership_apply_fence: Arc<tokio::sync::RwLock<()>>,
     #[cfg(test)]
     membership_apply_queued: tokio::sync::watch::Sender<()>,
+    #[cfg(all(test, target_os = "linux", feature = "test-control"))]
+    snapshot_transfer_hold: Arc<std::sync::Mutex<Option<Arc<SnapshotTransferHoldForTest>>>>,
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-control"))]
+struct SnapshotTransferHoldForTest {
+    target: SessionConsensusNodeId,
+    gate: Arc<super::snapshot::SnapshotArtifactGate>,
+    cut: std::sync::Mutex<Option<u64>>,
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-control"))]
+pub(crate) struct SnapshotTransferHoldGuardForTest {
+    directory: SessionRaftPeerDirectory,
+    hold: Arc<SnapshotTransferHoldForTest>,
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-control"))]
+impl SnapshotTransferHoldGuardForTest {
+    pub(crate) fn cut(&self) -> u64 {
+        self.hold.cut.lock().unwrap().expect("held snapshot cut")
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "test-control"))]
+impl Drop for SnapshotTransferHoldGuardForTest {
+    fn drop(&mut self) {
+        self.hold.gate.release();
+        let mut current = self.directory.snapshot_transfer_hold.lock().unwrap();
+        if current
+            .as_ref()
+            .is_some_and(|hold| Arc::ptr_eq(hold, &self.hold))
+        {
+            *current = None;
+        }
+    }
 }
 
 impl SessionRaftPeerDirectory {
+    #[cfg(all(test, target_os = "linux", feature = "test-control"))]
+    pub(crate) fn pause_snapshot_transfer_for_test(
+        &self,
+        target: SessionConsensusNodeId,
+        gate: Arc<super::snapshot::SnapshotArtifactGate>,
+    ) -> SnapshotTransferHoldGuardForTest {
+        let hold = Arc::new(SnapshotTransferHoldForTest {
+            target,
+            gate,
+            cut: std::sync::Mutex::new(None),
+        });
+        let mut current = self.snapshot_transfer_hold.lock().unwrap();
+        assert!(current.is_none(), "one live transfer hold per source");
+        *current = Some(hold.clone());
+        SnapshotTransferHoldGuardForTest {
+            directory: self.clone(),
+            hold,
+        }
+    }
+
     fn try_new(
         identity: SessionConsensusIdentity,
         local_node_id: SessionConsensusNodeId,
@@ -207,6 +263,8 @@ impl SessionRaftPeerDirectory {
             membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             membership_apply_queued: tokio::sync::watch::Sender::default(),
+            #[cfg(all(test, target_os = "linux", feature = "test-control"))]
+            snapshot_transfer_hold: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -233,6 +291,8 @@ impl SessionRaftPeerDirectory {
             membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             membership_apply_queued: tokio::sync::watch::Sender::default(),
+            #[cfg(all(test, target_os = "linux", feature = "test-control"))]
+            snapshot_transfer_hold: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -912,6 +972,8 @@ impl SessionRaftNetworkFactory {
                 membership_apply_fence: Arc::new(tokio::sync::RwLock::new(())),
                 #[cfg(test)]
                 membership_apply_queued: tokio::sync::watch::Sender::default(),
+                #[cfg(all(test, target_os = "linux", feature = "test-control"))]
+                snapshot_transfer_hold: Arc::new(std::sync::Mutex::new(None)),
             },
         })
     }
@@ -1225,6 +1287,45 @@ fn append_entries_split_hint(entry_count: usize) -> Option<u64> {
 }
 
 impl RaftNetwork<SessionRaftTypeConfig> for SessionRaftNetwork {
+    // Hold the actual engine-owned transfer before chunking, so a chunk RPC's
+    // timeout cannot silently replace the pinned snapshot used by a stall test.
+    // With no hold, this is exactly the trait's default chunked transport.
+    #[cfg(all(test, target_os = "linux", feature = "test-control"))]
+    async fn full_snapshot(
+        &mut self,
+        vote: Vote<SessionConsensusNodeId>,
+        snapshot: opc_consensus::engine::Snapshot<SessionRaftTypeConfig>,
+        cancel: impl std::future::Future<Output = opc_consensus::engine::error::ReplicationClosed>
+            + opc_consensus::engine::OptionalSend
+            + 'static,
+        option: RPCOption,
+    ) -> Result<
+        opc_consensus::engine::raft::SnapshotResponse<SessionConsensusNodeId>,
+        opc_consensus::engine::error::StreamingError<
+            SessionRaftTypeConfig,
+            opc_consensus::engine::error::Fatal<SessionConsensusNodeId>,
+        >,
+    > {
+        use opc_consensus::engine::network::snapshot_transport::{Chunked, SnapshotTransport};
+        let hold = self
+            .peer_directory
+            .snapshot_transfer_hold
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|hold| hold.target == self.target)
+            .cloned();
+        let mut cancel = Box::pin(cancel);
+        if let Some(hold) = hold {
+            *hold.cut.lock().unwrap() = snapshot.meta.last_log_id.map(|id| id.index);
+            tokio::select! {
+                () = hold.gate.block_if_armed() => {},
+                closed = &mut cancel => return Err(closed.into()),
+            }
+        }
+        Chunked::send_snapshot(self, vote, snapshot, cancel, option).await
+    }
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<SessionRaftTypeConfig>,
@@ -1314,6 +1415,7 @@ pub(crate) struct SessionRaftRpcHandler {
     local_node_id: SessionConsensusNodeId,
     fixed_quorum_admission: Option<FixedQuorumEngineAdmission>,
     persistence: PersistenceProtocol,
+    pub(super) log_admission: Arc<super::log_admission::LogAdmission>,
 }
 
 impl SessionRaftRpcHandler {
@@ -1322,12 +1424,17 @@ impl SessionRaftRpcHandler {
         peer_directory: SessionRaftPeerDirectory,
         local_node_id: SessionConsensusNodeId,
     ) -> Self {
+        let persistence = PersistenceProtocol::default();
         Self {
+            log_admission: super::log_admission::LogAdmission::for_raft(
+                raft.clone(),
+                persistence.clone(),
+            ),
             raft,
             peer_directory,
             local_node_id,
             fixed_quorum_admission: None,
-            persistence: PersistenceProtocol::default(),
+            persistence,
         }
     }
 
@@ -1336,19 +1443,24 @@ impl SessionRaftRpcHandler {
         peer_directory: SessionRaftPeerDirectory,
         local_node_id: SessionConsensusNodeId,
         fixed_quorum_admission: FixedQuorumEngineAdmission,
+        persistence: PersistenceProtocol,
     ) -> Self {
         Self {
+            log_admission: super::log_admission::LogAdmission::for_raft(
+                raft.clone(),
+                persistence.clone(),
+            ),
             raft,
             peer_directory,
             local_node_id,
             fixed_quorum_admission: Some(fixed_quorum_admission),
-            persistence: PersistenceProtocol::default(),
+            persistence,
         }
     }
 
-    pub(crate) fn with_persistence(mut self, persistence: PersistenceProtocol) -> Self {
-        self.persistence = persistence;
-        self
+    #[cfg(test)]
+    pub(crate) fn set_log_admission_window_for_test(&self, window: u64) {
+        self.log_admission.set_window_for_test(window);
     }
 
     /// Answer only after the caller has checked durable authority, voting
@@ -1469,6 +1581,64 @@ impl SessionRaftRpcHandler {
         persistence_protocol::wrap_response(self.persistence.mode(), response)
     }
 
+    async fn append_admitted_before(
+        &self,
+        rpc: AppendEntriesRequest<SessionRaftTypeConfig>,
+        persistence: persistence_protocol::EngineAdmission,
+        engine_rpc: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        deadline: tokio::time::Instant,
+    ) -> SessionConsensusWireResponse {
+        let growth = self.log_admission.track_append(&rpc);
+        let matched = rpc
+            .entries
+            .last()
+            .map(|entry| entry.log_id)
+            .or(rpc.prev_log_id);
+        let supervise = growth.is_some();
+        let raft = self.raft.clone();
+        let work = async move {
+            let result = raft.append_entries(rpc).await;
+            if let Some(growth) = growth {
+                match &result {
+                    Ok(AppendEntriesResponse::Success) => {
+                        growth.complete(matched.expect("growth append has a last entry").index)
+                    }
+                    Ok(AppendEntriesResponse::PartialSuccess(Some(last))) => {
+                        growth.complete(last.index)
+                    }
+                    _ => drop(growth),
+                }
+            }
+            if matches!(result, Ok(AppendEntriesResponse::Conflict))
+                && persistence.request_cold_repair()
+            {
+                return rejected_response(SessionConsensusPeerError::Rejected);
+            }
+            if matches!(result, Ok(AppendEntriesResponse::Success)) {
+                persistence.confirm_append(matched);
+            }
+            let result = encode_engine_result(&result);
+            drop(engine_rpc);
+            drop(persistence);
+            result.map_or_else(rejected_response, |payload| SessionConsensusWireResponse {
+                result: Ok(payload),
+            })
+        };
+        if !supervise {
+            return work.await;
+        }
+        let (send, receive) = tokio::sync::oneshot::channel();
+        // Each owned task has a live growth reservation. A transport deadline
+        // cannot recycle it, or release authority guards, before engine completion.
+        tokio::spawn(async move {
+            let _ = send.send(work.await);
+        });
+        match tokio::time::timeout_at(deadline, receive).await {
+            Ok(Ok(response)) => response,
+            _ => rejected_response(SessionConsensusPeerError::Timeout),
+        }
+    }
+
     async fn handle_payload_before(
         &self,
         authenticated_sender: SessionConsensusNodeId,
@@ -1556,21 +1726,9 @@ impl SessionRaftRpcHandler {
                 if !persistence.permits_append(&rpc) {
                     return rejected_response(SessionConsensusPeerError::Rejected);
                 }
-                let matched = rpc
-                    .entries
-                    .last()
-                    .map(|entry| entry.log_id)
-                    .or(rpc.prev_log_id);
-                let result = self.raft.append_entries(rpc).await;
-                if matches!(result, Ok(AppendEntriesResponse::Conflict))
-                    && persistence.request_cold_repair()
-                {
-                    return rejected_response(SessionConsensusPeerError::Rejected);
-                }
-                if matches!(result, Ok(AppendEntriesResponse::Success)) {
-                    persistence.confirm_append(matched);
-                }
-                encode_engine_result(&result)
+                return self
+                    .append_admitted_before(rpc, persistence, engine_rpc.take(), deadline)
+                    .await;
             }
             SessionConsensusRpcFamily::AppendEntriesRoster => {
                 let rpc = match decode_roster_and_bind_sender::<
@@ -1584,21 +1742,9 @@ impl SessionRaftRpcHandler {
                 if !persistence.permits_append(&rpc) {
                     return rejected_response(SessionConsensusPeerError::Rejected);
                 }
-                let matched = rpc
-                    .entries
-                    .last()
-                    .map(|entry| entry.log_id)
-                    .or(rpc.prev_log_id);
-                let result = self.raft.append_entries(rpc).await;
-                if matches!(result, Ok(AppendEntriesResponse::Conflict))
-                    && persistence.request_cold_repair()
-                {
-                    return rejected_response(SessionConsensusPeerError::Rejected);
-                }
-                if matches!(result, Ok(AppendEntriesResponse::Success)) {
-                    persistence.confirm_append(matched);
-                }
-                encode_engine_result(&result)
+                return self
+                    .append_admitted_before(rpc, persistence, engine_rpc.take(), deadline)
+                    .await;
             }
             SessionConsensusRpcFamily::Vote => {
                 let rpc = match decode_and_bind_sender::<VoteRequest<SessionConsensusNodeId>>(
@@ -2860,6 +3006,7 @@ mod tests {
             directory,
             local,
             fixed_admission,
+            PersistenceProtocol::default(),
         );
         FixedFollowerFixture {
             _temp: temp,
@@ -5605,5 +5752,123 @@ mod tests {
             crate::StableId::new(Bytes::from(vec![0xa5; crate::STABLE_ID_MAX_BYTES + 1])),
             Err(crate::StableIdError::InvalidWidth)
         );
+    }
+
+    #[tokio::test]
+    async fn log_admission_follower_applies_growth_and_keeps_heartbeat_and_repair() {
+        let fixture =
+            fixed_follower_fixture(Duration::from_secs(5), true, FixedAuthorityBackend::Sqlite)
+                .await;
+        fixture.raft.runtime_config().elect(false);
+        fixture.handler.set_log_admission_window_for_test(4);
+        let log_id = |term, index| LogId::new(CommittedLeaderId::new(term, fixture.leader), index);
+        let seeded = fixture
+            .raft
+            .append_entries(AppendEntriesRequest {
+                vote: Vote::new_committed(1, fixture.leader),
+                prev_log_id: Some(log_id(1, 0)),
+                leader_commit: Some(log_id(1, 0)),
+                entries: (1..4)
+                    .map(|index| Entry {
+                        log_id: log_id(1, index),
+                        payload: EntryPayload::Blank,
+                    })
+                    .collect(),
+            })
+            .await
+            .expect("seed retained follower log");
+        assert_eq!(seeded, AppendEntriesResponse::Success);
+        let mut metrics = fixture.raft.metrics();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.borrow_and_update().last_log_index != Some(3) {
+                metrics
+                    .changed()
+                    .await
+                    .expect("follower metrics remain live");
+            }
+        })
+        .await
+        .expect("observe the full live log window");
+        let send = |rpc: AppendEntriesRequest<SessionRaftTypeConfig>| {
+            let request = SessionConsensusWireRequest::try_new(
+                fixture.scope,
+                fixture.leader,
+                SessionConsensusRpcFamily::AppendEntries,
+                encode_bounded(&rpc).expect("bounded log admission request"),
+            )
+            .expect("valid log admission envelope");
+            fixture.handler.handle(fixture.leader, request)
+        };
+        assert_append_success(
+            send(AppendEntriesRequest {
+                vote: Vote::new_committed(1, fixture.leader),
+                prev_log_id: Some(log_id(1, 3)),
+                leader_commit: Some(log_id(1, 0)),
+                entries: vec![],
+            })
+            .await,
+        );
+        assert_append_success(
+            send(AppendEntriesRequest {
+                vote: Vote::new_committed(2, fixture.leader),
+                prev_log_id: Some(log_id(1, 1)),
+                leader_commit: Some(log_id(1, 0)),
+                entries: (2..4)
+                    .map(|index| Entry {
+                        log_id: log_id(2, index),
+                        payload: EntryPayload::Blank,
+                    })
+                    .collect(),
+            })
+            .await,
+        );
+        let mut entry = transition_command_entry(
+            fixture.leader,
+            4,
+            fixture.scope,
+            0xB1,
+            SessionMutationIntent::AdvanceLogicalTime,
+        );
+        entry.log_id = log_id(2, 4);
+        let response = send(AppendEntriesRequest {
+            vote: Vote::new_committed(2, fixture.leader),
+            prev_log_id: Some(log_id(2, 3)),
+            leader_commit: Some(log_id(1, 0)),
+            entries: vec![entry],
+        })
+        .await;
+        assert_append_success(response);
+        assert_eq!(fixture.raft.metrics().borrow().last_log_index, Some(4));
+        let response = send(AppendEntriesRequest {
+            vote: Vote::new_committed(3, fixture.leader),
+            prev_log_id: Some(log_id(1, 1)),
+            leader_commit: Some(log_id(1, 0)),
+            entries: (2..6)
+                .map(|index| {
+                    let mut entry = transition_command_entry(
+                        fixture.leader,
+                        index,
+                        fixture.scope,
+                        0xB2,
+                        SessionMutationIntent::AdvanceLogicalTime,
+                    );
+                    entry.log_id = log_id(3, index);
+                    entry
+                })
+                .collect(),
+        })
+        .await;
+        let result: Result<
+            AppendEntriesResponse<SessionConsensusNodeId>,
+            RaftError<SessionConsensusNodeId>,
+        > = decode_bounded(&response.result.unwrap()).unwrap();
+        assert_eq!(
+            result,
+            Ok(AppendEntriesResponse::Success),
+            "a mixed request repairs its complete prefix and appends all growth"
+        );
+        assert_eq!(fixture.raft.metrics().borrow().last_log_index, Some(5));
+        assert!(fixture.raft.metrics().borrow().running_state.is_ok());
+        fixture.raft.shutdown().await.expect("follower shutdown");
     }
 }

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Partition the egress host tests by exact libtest name, without narrowing features.
 
-Every ordinary shard retains the old six-package/all-features selection. Cargo still
-launches every harness with its original working directory and environment.
-Only exact test-name exclusions differ. Existing isolated proofs retain their
-package selection, single-test processes and (where prescribed) O1 profile.
+Every ordinary shard retains the six-package/all-features selection and uses
+exact test-name exclusions. Dedicated shards each compile the same six-package
+--lib selection at O1 and run one full-bound reclamation or full-window admission
+proof. Cargo retains its working-directory setup. Other isolated proofs retain
+their package selection, single-test processes and prescribed profiles.
 """
 
 from __future__ import annotations
@@ -283,7 +284,9 @@ def require_jobs(needs: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shard", type=int, choices=SHARDS)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--shard", type=int, choices=SHARDS)
+    selection.add_argument("--native-log-proof", choices=native_log_bound.TESTS)
     parser.add_argument("--inventory-only", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--check-jobs", action="store_true")
@@ -292,8 +295,10 @@ def main() -> int:
         require_jobs(json.loads(os.environ["EGRESS_JOB_RESULTS"]))
         print("Every required egress-fence job has the expected result.")
         return 0
+    if args.native_log_proof is not None:
+        args.shard = owner(args.native_log_proof)
     if args.output is None or (not args.inventory_only and args.shard is None):
-        parser.error("--output and either --shard or --inventory-only are required")
+        parser.error("--output and either --shard, --native-log-proof or --inventory-only are required")
     if not args.inventory_only and args.shard in native_log_bound.EGRESS_SHARDS:
         # These runners need only O1. The ordinary runners still inventory all
         # names and verify their ownership, while this live O1 precheck rejects

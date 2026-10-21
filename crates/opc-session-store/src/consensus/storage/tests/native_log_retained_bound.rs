@@ -333,6 +333,149 @@ async fn native_log_three_cycles_reclaim_and_reopen_async() {
     bounded_cycles(SessionPersistenceMode::Async, 3).await;
 }
 
+// A published snapshot must permit automatic purge after restart even when
+// shutdown prevented the previous engine from receiving its build completion.
+async fn reopen_purges_published_snapshot(mode: SessionPersistenceMode) {
+    let directory = FixedRawReadStoreFixture::new();
+    let profile = DURABLE_OPENRAFT_PROFILE;
+    let (backend, raft, wal, hook_directory) = open_engine(&directory, mode).await;
+    let gate = Arc::new(SnapshotArtifactGate::new());
+    let return_gate = FixedSnapshotReturnGateGuard::install(hook_directory, Arc::clone(&gate));
+    let total = 2 * profile.logs_per_snapshot;
+
+    for start in (0..total).step_by(profile.max_payload_entries as usize) {
+        if start == profile.logs_per_snapshot {
+            raft.wait(Some(WAIT))
+                .metrics(
+                    |m| {
+                        m.snapshot == Some(log_id(start - 1))
+                            && m.purged == Some(log_id(start - profile.retained_logs - 1))
+                    },
+                    "first automatic snapshot and purge settle",
+                )
+                .await
+                .expect("first cycle settles before arming the publication gate");
+            gate.arm();
+        }
+        let end = start + profile.max_payload_entries;
+        assert_eq!(
+            tokio::time::timeout(WAIT, raft.append_entries(append_request(start, end)))
+                .await
+                .expect("append returns")
+                .expect("append succeeds"),
+            AppendEntriesResponse::Success
+        );
+        raft.wait(Some(WAIT))
+            .applied_index_at_least(Some(end - 1), "committed entries apply")
+            .await
+            .expect("apply finishes");
+    }
+    tokio::time::timeout(WAIT, gate.wait_started())
+        .await
+        .expect("second automatic snapshot reaches its post-publication return boundary");
+    let before = raft.metrics().borrow().clone();
+    eprintln!(
+        "NATIVE_LOG_REOPEN mode={mode:?} phase=published_before_callback snapshot={:?} purged={:?} inventory={:?}",
+        before.snapshot,
+        before.purged,
+        wal.native_log_inventory_for_test().unwrap()
+    );
+    assert_eq!(before.snapshot, Some(log_id(profile.logs_per_snapshot - 1)));
+    assert_eq!(
+        before.purged,
+        Some(log_id(
+            profile.logs_per_snapshot - profile.retained_logs - 1
+        ))
+    );
+    // Match the store's shutdown ordering, pausing only the builder's return.
+    tokio::time::timeout(WAIT, raft.raft.shutdown())
+        .await
+        .expect("core shutdown does not wait for the detached snapshot builder")
+        .unwrap();
+    gate.release();
+    raft.storage_shutdown.stop_native_snapshot_exports();
+    tokio::time::timeout(WAIT, raft.storage_shutdown.wait())
+        .await
+        .expect("storage workers drain");
+    drop(return_gate);
+    drop(raft);
+    wal.shutdown_after_consensus().unwrap();
+    drop(wal);
+    drop(backend);
+
+    let (backend, raft, wal, _) = open_engine(&directory, mode).await;
+    raft.wait(Some(WAIT))
+        .metrics(
+            |m| m.snapshot == Some(log_id(total - 1)),
+            "startup publishes the recovered snapshot metrics",
+        )
+        .await
+        .expect("reopened engine publishes its recovered state");
+    let reopened = raft.metrics().borrow().clone();
+    let expected = Some(log_id(total - profile.retained_logs - 1));
+    eprintln!(
+        "NATIVE_LOG_REOPEN mode={mode:?} phase=reopened snapshot={:?} purged={:?} expected={expected:?} inventory={:?}",
+        reopened.snapshot,
+        reopened.purged,
+        wal.native_log_inventory_for_test().unwrap()
+    );
+    assert_eq!(reopened.snapshot, Some(log_id(total - 1)));
+    assert_eq!(
+        raft.append_entries(append_request(total, total + 1))
+            .await
+            .unwrap(),
+        AppendEntriesResponse::Success
+    );
+    raft.wait(Some(WAIT))
+        .applied_index_at_least(Some(total), "one post-reopen entry applies")
+        .await
+        .unwrap();
+    let settled = raft
+        .wait(Some(WAIT))
+        .metrics(
+            |m| m.purged == expected,
+            "recovered snapshot permits policy purge",
+        )
+        .await;
+    let after = raft.metrics().borrow().clone();
+    let inventory = wal.native_log_inventory_for_test().unwrap();
+    let log_state = wal.native_log_state().unwrap();
+    eprintln!(
+        "NATIVE_LOG_REOPEN mode={mode:?} phase=after_wait result={settled:?} snapshot={:?} purged={:?} expected={expected:?} inventory={inventory:?}",
+        after.snapshot,
+        after.purged,
+    );
+    raft.shutdown().await.unwrap();
+    drop(raft);
+    wal.shutdown_after_consensus().unwrap();
+    drop(wal);
+    drop(backend);
+    assert!(
+        settled.is_ok(),
+        "recovered snapshot purge never settled: {settled:?}"
+    );
+    assert_eq!(
+        after.snapshot,
+        Some(log_id(total - 1)),
+        "no fresh snapshot is needed"
+    );
+    assert_eq!(log_state.last_purged_log_id, expected);
+    assert_eq!(log_state.last_log_id, Some(log_id(total)));
+    assert_eq!(inventory.0 as u64, profile.retained_logs + 1);
+    assert_eq!(inventory.1, Some(total - profile.retained_logs));
+    assert_eq!(inventory.2, expected.map(|cut| cut.index));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_log_reopen_purges_snapshot_published_before_shutdown_durable() {
+    reopen_purges_published_snapshot(SessionPersistenceMode::Durable).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_log_reopen_purges_snapshot_published_before_shutdown_async() {
+    reopen_purges_published_snapshot(SessionPersistenceMode::Async).await;
+}
+
 // Required native-log proofs: deliberately not ignored. Each exact name runs
 // on its own dedicated shard, outside the ordinary library partitions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

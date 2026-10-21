@@ -18,7 +18,15 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    run_before(Instant::now() + Duration::from_secs(30), operation).await
+}
+
+/// Use an existing physical deadline for both the operation and its task drain.
+pub(crate) async fn run_before<F>(deadline: Instant, operation: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     let (lifetime, cancelled) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
