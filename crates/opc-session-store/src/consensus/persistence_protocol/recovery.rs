@@ -139,7 +139,7 @@ impl PersistenceProtocol {
                     .operation_stamp()
                     .checked_add(1)
                     .ok_or(SessionConsensusPeerError::Rejected)?;
-                self.active.store(false, Ordering::Release);
+                self.set_active(false);
                 self.generation.store(generation, Ordering::Release);
                 self.recovery_limit.store(0, Ordering::Release);
                 *state = Admission::Preparing { plan, era };
@@ -211,7 +211,7 @@ impl PersistenceProtocol {
             return Ok(false);
         }
         *state = Admission::Active;
-        self.active.store(true, Ordering::Release);
+        self.set_active(true);
         self.progress.notify_waiters();
         Ok(true)
     }
