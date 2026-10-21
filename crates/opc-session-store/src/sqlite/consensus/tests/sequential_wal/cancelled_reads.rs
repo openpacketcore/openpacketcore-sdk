@@ -130,29 +130,36 @@ fn sqlite_clock_advance_fences_retained_read_without_sql_progress() {
     let (release_tx, release_rx) = mpsc::channel();
     runtime.block_on(async {
         tokio::time::pause();
-        let mut operation = std::pin::pin!(fixture.backend.run_store_sqlite_task(
-            SqliteStoreWorkKind::Read,
-            move |_| {
+        let deadline = crate::sqlite::SqliteWorkDeadline::tokio(
+            tokio::time::Instant::now() + crate::sqlite::SQLITE_OPERATION_MAX_WORK,
+        );
+        let conn = Arc::clone(&fixture.backend.conn);
+        let wal = Arc::clone(&fixture.wal);
+        let operation = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // Only the retained-read guard can enforce this deadline, including
+            // during the SQL validation after the read body returns.
+            conn.progress_handler(0, None::<fn() -> bool>)
+                .expect("clear retained-read progress handler");
+            wal.with_retained_application_read(&conn, &deadline, || {
                 ready_tx.send(()).expect("retained read ready");
                 release_rx
                     .recv_timeout(Duration::from_secs(5))
                     .expect("retained read release");
-                Ok(42)
-            },
-        ));
-        std::future::poll_fn(|cx| {
-            assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
+                42
+            })
+        });
         ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("retained read starts");
+        assert!(!operation.is_finished(), "retained read is still held");
         tokio::time::advance(crate::sqlite::SQLITE_OPERATION_MAX_WORK).await;
         release_tx.send(()).expect("release expired retained read");
-        assert!(operation.await.is_err());
-        // Reacquiring the exact connection proves retained validation ended,
-        // even if the caller's timeout returned before the worker did.
+        assert_eq!(
+            operation.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut,
+        );
+        // The guard has finished and released the exact connection.
         let _connection = fixture.backend.conn.lock().await;
         assert!(
             fixture.wal.vote().is_err(),
