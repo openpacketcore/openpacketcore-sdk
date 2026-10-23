@@ -1018,6 +1018,13 @@ using owned journals and the void profile can reclaim it after a terminal
 no-effect receipt; other journals follow the existing epoch lifecycle. A resumed
 deferred request retains its earlier binding when a later preflight fails.
 
+A local journal failure during V2 receipt lookup returns `Unavailable`
+immediately without resolving the handle. A later `status_once` or
+`status_until_terminal` call authenticates the complete original binding again
+and can recover its committed receipt. Missing, corrupt, or substituted rows
+remain unavailable without network dispatch; a matching caller ID alone never
+authorizes adoption of another request or restores mutation authority.
+
 The revision-2 persistent-consumer transport qualification contract remains
 recorded in the v7 profile and the published v6 profile remains the unchanged
 revision-1 contract. Revision 5 retains every bounded persistent-transport

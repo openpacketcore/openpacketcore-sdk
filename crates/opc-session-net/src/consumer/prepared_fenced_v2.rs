@@ -2011,9 +2011,10 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     /// nonterminal, and keeps the row for explicit deferral resumption.
     ///
     /// A retained row that is missing or fails authentication is a local
-    /// fail-closed condition: `Unavailable` is then returned at once and is
-    /// final for this handle. `recover_fenced_transition_status` reports
-    /// whether the caller ID is still retained.
+    /// fail-closed condition: `Unavailable` is returned at once. A later status
+    /// call re-authenticates the exact original binding, allowing recovery
+    /// after a temporary local failure without accepting a substituted row
+    /// or restoring mutation authority.
     pub async fn status_until_terminal(
         &mut self,
         deadline: tokio::time::Instant,
@@ -2086,8 +2087,8 @@ impl SessionConsumerRecoveredFencedTransitionV2Status {
 
     /// Rotate read-only receipt lookups until a terminal status is found or
     /// the caller's absolute deadline is reached. As for a live handle, a
-    /// local row failure returns `Unavailable` at once and is final for this
-    /// handle.
+    /// local row failure returns `Unavailable` at once. A later status call
+    /// re-authenticates the same binding; it never adopts a replacement row.
     /// `LeaseDeferred` returns immediately without making the row releasable;
     /// only the facade's explicit deferral resume method can restore dispatch.
     pub async fn status_until_terminal(
@@ -2559,15 +2560,34 @@ impl PersistentPreparedFencedTransitionV2Token {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<FencedTransitionV2Status, SessionConsumerPreparedFencedTransitionStatusError> {
+        self.status_attempt(deadline).await.0
+    }
+
+    // The flag distinguishes local authentication failures from retryable
+    // remote unavailability. End this polling call immediately on a local
+    // failure, but retain the original binding for a later explicit retry.
+    async fn status_attempt(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> (
+        Result<FencedTransitionV2Status, SessionConsumerPreparedFencedTransitionStatusError>,
+        bool,
+    ) {
         if let Some(result) = self.cached_terminal_receipt() {
-            return result;
+            return (result, false);
         }
         if !self.state.status_allowed() {
-            return Err(SessionConsumerPreparedFencedTransitionStatusError::NotExecuted);
+            return (
+                Err(SessionConsumerPreparedFencedTransitionStatusError::NotExecuted),
+                false,
+            );
         }
         let now = tokio::time::Instant::now();
         if deadline <= now || deadline > self.budget.original_deadline() {
-            return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+            return (
+                Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+                false,
+            );
         }
         // A missing, corrupt, or substituted row is a local fail-closed
         // condition, checked before any receipt lane is used.
@@ -2581,24 +2601,35 @@ impl PersistentPreparedFencedTransitionV2Token {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 if let Some(result) = self.cached_terminal_receipt() {
-                    return result;
+                    return (result, false);
                 }
-                return self.terminal_receipt(Err(
-                    SessionConsumerPreparedFencedTransitionStatusError::Unavailable,
-                ));
+                return (
+                    Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
+                    true,
+                );
             }
-            Err(_) => return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+            Err(_) => {
+                return (
+                    Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+                    false,
+                )
+            }
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
+            return (
+                Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
+                false,
+            );
         }
-        let _attempt = self
-            .state
-            .begin_status()
-            .map_err(|_| SessionConsumerPreparedFencedTransitionStatusError::Unavailable)?;
+        let Ok(_attempt) = self.state.begin_status() else {
+            return (
+                Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
+                false,
+            );
+        };
         if let Some(result) = self.cached_terminal_receipt() {
-            return result;
+            return (result, false);
         }
         self.route.install_attempt_deadline(deadline);
         let result = match journal_before_deadline(
@@ -2618,7 +2649,7 @@ impl PersistentPreparedFencedTransitionV2Token {
             Ok(Err(_)) => Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
             Err(_) => Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
         };
-        match result {
+        let result = match result {
             // NotFound is non-exclusionary while the request's epoch is
             // active; unavailable and per-attempt deadlines stay retryable.
             Ok(FencedTransitionV2Status::NotFound)
@@ -2629,7 +2660,8 @@ impl PersistentPreparedFencedTransitionV2Token {
                 self.terminal_receipt(result)
             }
             Err(_) => result,
-        }
+        };
+        (result, false)
     }
 
     async fn status_until_terminal(
@@ -2645,12 +2677,14 @@ impl PersistentPreparedFencedTransitionV2Token {
         }
         loop {
             for _ in 0..self.voter_count {
-                let result = self.status_once(deadline).await;
-                // A cached terminal receipt, including a local fail-closed
-                // row failure, never changes; retrying it only spends the
-                // caller's deadline. A concurrent call may have cached it.
+                let (result, local_failure) = self.status_attempt(deadline).await;
+                // A cached terminal receipt never changes. A concurrent call
+                // or reclamation may have observed it during this attempt.
                 if let Some(cached) = self.cached_terminal_receipt() {
                     return cached;
+                }
+                if local_failure {
+                    return result;
                 }
                 if !prepared_fenced_v2_status_retryable_before(&result, deadline)? {
                     return result;
@@ -4238,7 +4272,10 @@ mod tests {
             Err(FencedTransitionExecuteError::NotTransmitted)
         );
         assert_eq!(harness.physical.voters().len(), 1);
-        token.release_resolved().await.expect("release exact receipt");
+        token
+            .release_resolved()
+            .await
+            .expect("release exact receipt");
         assert_eq!(harness.retained().await, 0);
     }
 

@@ -1550,6 +1550,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtimes, and verify the exact acquire deadline and rejection of expired
   queued reads. (#1308, #1211)
 
+- `opc-session-net`: prepared V2 receipt handles can recover after a transient
+  local journal preflight failure by checking the exact original binding on
+  the next status call. Local failures still return immediately, and retries
+  cannot adopt a substituted row or restore mutation authority. (#1378)
+
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 
 - `opc-session-store`: keep async SQLite worker deadlines on the caller's
