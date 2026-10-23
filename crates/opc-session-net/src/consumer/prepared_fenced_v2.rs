@@ -83,6 +83,55 @@ impl fmt::Debug for ActivatedSessionConsumerFencedTransitionV2Voters {
     }
 }
 
+/// Closed, value-free phase of a prepared V2 execution failure.
+///
+/// This describes local progress only. It grants no retry or release authority
+/// and never proves whether the remote operation committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionConsumerFencedTransitionV2FailureStage {
+    /// Local preparation, admission, or cold connection setup did not complete.
+    Setup,
+    /// The authenticated lane was preparing or writing the application Call.
+    Send,
+    /// The Call was written and its reply was pending or reported a rejection.
+    AwaitingReply,
+    /// A written Call lost its connection or received an unusable reply.
+    ReplyLost,
+}
+
+impl SessionConsumerFencedTransitionV2FailureStage {
+    /// Stable value-free label for logs and metrics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Send => "send",
+            Self::AwaitingReply => "awaiting_reply",
+            Self::ReplyLost => "reply_lost",
+        }
+    }
+}
+
+/// Value-free diagnostic snapshot taken when a prepared V2 execution fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionConsumerFencedTransitionV2FailureDiagnostics {
+    stage: SessionConsumerFencedTransitionV2FailureStage,
+    remaining_budget_ms: u64,
+}
+
+impl SessionConsumerFencedTransitionV2FailureDiagnostics {
+    /// Last physical attempt's observed phase, or local setup before an attempt.
+    pub const fn stage(self) -> SessionConsumerFencedTransitionV2FailureStage {
+        self.stage
+    }
+
+    /// Remaining original caller budget at failure, rounded down to milliseconds.
+    ///
+    /// This is a snapshot, not a renewed deadline or a retry allowance.
+    pub const fn remaining_budget_ms(self) -> u64 {
+        self.remaining_budget_ms
+    }
+}
+
 /// Redaction-safe failure to release a retained protected V2 transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -1994,6 +2043,15 @@ impl SessionConsumerPreparedFencedTransitionV2 {
         &mut self,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
         self.inner.execute_once().await
+    }
+
+    /// Diagnostic snapshot for the latest failed execution, for logs and metrics only.
+    ///
+    /// This never changes the execution outcome or its retry and release rules.
+    pub fn execution_failure_diagnostics(
+        &self,
+    ) -> Option<SessionConsumerFencedTransitionV2FailureDiagnostics> {
+        None
     }
 
     /// Try one read-only receipt lookup on the next deterministic voter.
@@ -4346,5 +4404,300 @@ mod tests {
             tokio::time::Instant::now() < deadline,
             "a cached terminal receipt ends the loop at once"
         );
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DiagnosticFailure {
+        Setup,
+        Send,
+        HeldRefusal,
+        ReplyLost,
+        Rejected,
+    }
+
+    struct DiagnosticConsumer {
+        failure: DiagnosticFailure,
+        entered: Notify,
+        release: Notify,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionQuorumConsumer for DiagnosticConsumer {
+        async fn execute(
+            &self,
+            _authorization: &SessionConsumerAuthorization,
+            _request: SessionConsumerRequest,
+        ) -> SessionConsumerResponse {
+            SessionConsumerResponse::Rejected(SessionConsumerRejection::Unavailable)
+        }
+
+        async fn execute_v2(
+            &self,
+            _authorization: &SessionConsumerAuthorization,
+            request: SessionConsumerV2Request,
+        ) -> SessionConsumerV2Response {
+            match request.operation() {
+                SessionConsumerV2Operation::FencedTransitionV2Capability => {
+                    SessionConsumerV2Response::FencedTransitionV2Capability(Ok(
+                        FencedTransitionV2Capability::V2,
+                    ))
+                }
+                SessionConsumerV2Operation::FencedTransitionV2HistoryState => {
+                    SessionConsumerV2Response::FencedTransitionV2HistoryState(Ok(history_state(
+                        1, 1, 0,
+                    )))
+                }
+                SessionConsumerV2Operation::FencedTransitionV2 { .. } => {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.entered.notify_one();
+                    if self.failure == DiagnosticFailure::Rejected {
+                        return SessionConsumerV2Response::FencedTransitionV2(Err(
+                            opc_session_store::SessionConsumerV2FencedTransitionError::HistoryFull,
+                        ));
+                    }
+                    self.release.notified().await;
+                    SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable)
+                }
+                _ => SessionConsumerV2Response::Rejected(SessionConsumerRejection::Unavailable),
+            }
+        }
+
+        async fn watch(
+            &self,
+            _authorization: &SessionConsumerAuthorization,
+            _scope: SessionConsumerScope,
+            _start_sequence: u64,
+        ) -> Result<
+            BoxStream<'static, Result<SessionConsumerChange, SessionConsumerStoreError>>,
+            SessionConsumerRejection,
+        > {
+            Err(SessionConsumerRejection::Unavailable)
+        }
+    }
+
+    async fn assert_failure_diagnostics(failure: DiagnosticFailure) {
+        let _metrics_guard = crate::test_support::SESSION_CONNECTION_METRICS_TEST_LOCK
+            .lock()
+            .await;
+        let client_identity = opc_types::SpiffeId::new("spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/diagnostic-client").unwrap();
+        let server_identity = opc_types::SpiffeId::new("spiffe://test-domain/tenant/test/ns/default/sa/session/nf/consumer/instance/diagnostic-server").unwrap();
+        let material = crate::test_support::RotatableClientMaterial::new(client_identity.as_str());
+        let scope = test_consumer_voter_authority().scope();
+        let service = Arc::new(DiagnosticConsumer {
+            failure,
+            entered: Notify::new(),
+            release: Notify::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let grant = opc_session_store::SessionConsumerAuthorizationGrant::try_new(
+            client_identity,
+            [opc_session_store::SessionConsumerTenantNfScope::new(
+                tenant(),
+                NetworkFunctionKind::smf(),
+            )],
+        )
+        .unwrap();
+        let manifest = test_consumer_roster()
+            .authorization_manifest(test_consumer_voter_authority().node_id(), [grant])
+            .unwrap();
+        let (server, address) = SessionQuorumConsumerServer::new(
+            service.clone(),
+            material.trusted_server_config(server_identity.as_str()),
+            SessionConsumerAuthorizer::try_new(manifest).unwrap(),
+        )
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+        let mut server = Some(server);
+        let block_setup = Arc::new(AtomicBool::new(false));
+        let setup_entered = Arc::new(Notify::new());
+        let resolver: RemoteAddrResolver = Arc::new({
+            let block_setup = Arc::clone(&block_setup);
+            let setup_entered = Arc::clone(&setup_entered);
+            move || {
+                let block_setup = Arc::clone(&block_setup);
+                let setup_entered = Arc::clone(&setup_entered);
+                Box::pin(async move {
+                    if block_setup.load(Ordering::Acquire) {
+                        setup_entered.notify_one();
+                        std::future::pending().await
+                    } else {
+                        Ok(address)
+                    }
+                })
+            }
+        });
+        let client = PersistentSessionConsumerClient::from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver_unattested_for_test(
+                resolver,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                server_identity,
+                scope,
+                material.config(),
+            ),
+        )
+        .unwrap();
+        let voters = SessionConsumerPreparedFencedTransitionV2Backend::persistent_exact_voter_prewarm_roster([client.clone()]).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let journal = Arc::new(
+            FencedTransitionV2RecoveryJournal::create_new(
+                directory.path().join("recovery.sqlite3"),
+                FencedTransitionV2RecoveryJournalKey::from_bytes([0x71; 32]),
+            )
+            .unwrap(),
+        );
+        let facade = SessionConsumerPreparedFencedTransitionV2Backend::persistent_encrypting(
+            voters,
+            Arc::new(MemoryKeyProvider::new()),
+            "prepared-v2-diagnostics",
+            journal,
+        )
+        .unwrap();
+        let request_id = FencedTransitionRequestId::from_bytes([0x74; 16]);
+        let budget = budget();
+        let mut handle = facade
+            .prepare_fenced_transition(delete_request(request_id), budget)
+            .await
+            .unwrap();
+        assert_eq!(handle.execution_failure_diagnostics(), None);
+        let hook = Arc::new(PersistentV2PreCallTestHook::new());
+        if failure == DiagnosticFailure::Send {
+            *client.v2_pool.pre_call_test_hook.lock().unwrap() = Some(Arc::clone(&hook));
+            client.request_reauthentication().unwrap();
+        } else if failure == DiagnosticFailure::Setup {
+            block_setup.store(true, Ordering::Release);
+            client.request_reauthentication().unwrap();
+        }
+        let result = {
+            let execute = handle.execute_once();
+            tokio::pin!(execute);
+            if failure != DiagnosticFailure::Rejected {
+                let entered = async {
+                    match failure {
+                        DiagnosticFailure::Setup => setup_entered.notified().await,
+                        DiagnosticFailure::Send => hook.entered.notified().await,
+                        _ => service.entered.notified().await,
+                    }
+                };
+                tokio::select! {
+                    result = &mut execute => panic!("attempt returned before the selected mechanism: {result:?}"),
+                    _ = entered => {}
+                }
+                if failure == DiagnosticFailure::ReplyLost {
+                    server.take().unwrap().abort_and_wait().await;
+                } else {
+                    tokio::task::yield_now().await;
+                    tokio::time::pause();
+                    tokio::time::advance(
+                        budget.physical_attempt_timeout() + Duration::from_millis(1),
+                    )
+                    .await;
+                    hook.release.notify_one();
+                    tokio::time::resume();
+                }
+            }
+            execute.await
+        };
+        let no_dispatch = matches!(failure, DiagnosticFailure::Setup | DiagnosticFailure::Send);
+        let unknown = matches!(
+            failure,
+            DiagnosticFailure::HeldRefusal | DiagnosticFailure::ReplyLost
+        );
+        assert_eq!(
+            result,
+            Err(if no_dispatch {
+                FencedTransitionExecuteError::NotTransmitted
+            } else if unknown {
+                FencedTransitionExecuteError::OutcomeUnknown { request_id }
+            } else {
+                FencedTransitionExecuteError::Rejected(StoreError::FencedTransitionHistoryFull)
+            })
+        );
+        assert_eq!(
+            service.calls.load(Ordering::SeqCst),
+            usize::from(!no_dispatch)
+        );
+        assert_eq!(
+            facade.retained_fenced_transitions().await.unwrap(),
+            usize::from(unknown)
+        );
+        assert_eq!(
+            handle.release_resolved().await,
+            if unknown {
+                Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved)
+            } else {
+                Ok(())
+            }
+        );
+        // Failure diagnostics must not include any request, peer, journal or
+        // store-error value, and must preserve the caller's original budget.
+        let diagnostics = handle
+            .execution_failure_diagnostics()
+            .expect("failure stage and remaining original budget must be reported");
+        let expected = match failure {
+            DiagnosticFailure::Setup => "setup",
+            DiagnosticFailure::Send => "send",
+            DiagnosticFailure::HeldRefusal | DiagnosticFailure::Rejected => "awaiting_reply",
+            DiagnosticFailure::ReplyLost => "reply_lost",
+        };
+        assert_eq!(diagnostics.stage().as_str(), expected);
+        assert!(diagnostics.remaining_budget_ms() > 0);
+        assert!(diagnostics.remaining_budget_ms() <= 5_000);
+        let snapshot = diagnostics;
+        tokio::task::yield_now().await;
+        assert_eq!(handle.execution_failure_diagnostics(), Some(snapshot));
+        let debug = format!("{diagnostics:?}");
+        for secret in [
+            "prepared-v2-diagnostics",
+            "diagnostic-server",
+            "recovery.sqlite3",
+            "7474747474747474",
+        ] {
+            assert!(!debug.contains(secret), "diagnostics disclosed a value");
+        }
+        assert_eq!(
+            handle.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert_eq!(
+            service.calls.load(Ordering::SeqCst),
+            usize::from(!no_dispatch)
+        );
+        service.release.notify_one();
+        if let Some(server) = server {
+            server.abort_and_wait().await;
+        }
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v2_failure_diagnostics_cold_setup_expiry_preserves_original_budget() {
+        assert_failure_diagnostics(DiagnosticFailure::Setup).await;
+    }
+
+    #[tokio::test]
+    async fn v2_failure_diagnostics_send_boundary_expiry_preserves_nontransmission() {
+        assert_failure_diagnostics(DiagnosticFailure::Send).await;
+    }
+
+    #[tokio::test]
+    async fn v2_failure_diagnostics_held_refusal_preserves_receipt_only_ownership() {
+        assert_failure_diagnostics(DiagnosticFailure::HeldRefusal).await;
+    }
+
+    #[tokio::test]
+    async fn v2_failure_diagnostics_reply_loss_preserves_receipt_only_ownership() {
+        assert_failure_diagnostics(DiagnosticFailure::ReplyLost).await;
+    }
+
+    #[tokio::test]
+    async fn v2_failure_diagnostics_confirmed_rejection_preserves_release() {
+        assert_failure_diagnostics(DiagnosticFailure::Rejected).await;
     }
 }
