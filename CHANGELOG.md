@@ -787,6 +787,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   total starts from the new outcome slots; earlier raw-slot history cannot be
   attributed to either outcome. (#1184)
 
+- `opc-session-net`: prepared V2 handles expose value-free failure diagnostics:
+  a closed setup/send/reply stage and the remaining original caller budget.
+  Execution outcomes, receipt ownership and release rules are unchanged.
+
 - `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
   verification time for certificate validity checks while preserving SPIFFE ID,
   trust-domain and workload-path validation. `from_cert_der` continues to use

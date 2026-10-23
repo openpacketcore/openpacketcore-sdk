@@ -132,6 +132,78 @@ impl SessionConsumerFencedTransitionV2FailureDiagnostics {
     }
 }
 
+// An observation belongs to one public execution. A cancelled lane actor may
+// retain its Arc, but it cannot write a later execution's diagnostic snapshot.
+// No dispatch, receipt or release decision reads this state.
+pub(super) struct PreparedV2AttemptProgress {
+    stage: AtomicU8,
+    finished_at: StdMutex<Option<tokio::time::Instant>>,
+}
+
+impl PreparedV2AttemptProgress {
+    fn new() -> Self {
+        Self {
+            stage: AtomicU8::new(SessionConsumerFencedTransitionV2FailureStage::Setup as u8),
+            finished_at: StdMutex::new(None),
+        }
+    }
+
+    pub(super) fn start_attempt(&self) {
+        self.observe(SessionConsumerFencedTransitionV2FailureStage::Setup);
+        *self
+            .finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub(super) fn observe(&self, stage: SessionConsumerFencedTransitionV2FailureStage) {
+        self.stage.store(stage as u8, Ordering::Release);
+    }
+
+    pub(super) fn reply_lost(&self) {
+        let _ = self.stage.compare_exchange(
+            SessionConsumerFencedTransitionV2FailureStage::AwaitingReply as u8,
+            SessionConsumerFencedTransitionV2FailureStage::ReplyLost as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn finish(&self) {
+        let mut finished_at = self
+            .finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if finished_at.is_none() {
+            *finished_at = Some(tokio::time::Instant::now());
+        }
+    }
+
+    fn snapshot(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> SessionConsumerFencedTransitionV2FailureDiagnostics {
+        let finished_at = self
+            .finished_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let stage = match self.stage.load(Ordering::Acquire) {
+            1 => SessionConsumerFencedTransitionV2FailureStage::Send,
+            2 => SessionConsumerFencedTransitionV2FailureStage::AwaitingReply,
+            3 => SessionConsumerFencedTransitionV2FailureStage::ReplyLost,
+            _ => SessionConsumerFencedTransitionV2FailureStage::Setup,
+        };
+        SessionConsumerFencedTransitionV2FailureDiagnostics {
+            stage,
+            remaining_budget_ms: deadline
+                .saturating_duration_since(finished_at)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        }
+    }
+}
+
 /// Redaction-safe failure to release a retained protected V2 transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -415,6 +487,7 @@ struct PreparedFencedTransitionV2Route {
     // including a complete, correlated pre-dispatch refusal. A handle cancelled
     // while this is set may have sent.
     dispatch_admitted: AtomicBool,
+    execution_progress: StdMutex<Option<Arc<PreparedV2AttemptProgress>>>,
 }
 
 impl PreparedFencedTransitionV2Route {
@@ -424,6 +497,7 @@ impl PreparedFencedTransitionV2Route {
             status_cursor: AtomicUsize::new(origin.wrapping_add(1)),
             attempt_deadline: StdMutex::new(None),
             dispatch_admitted: AtomicBool::new(false),
+            execution_progress: StdMutex::new(None),
         }
     }
 
@@ -474,6 +548,20 @@ impl PreparedFencedTransitionV2Route {
 
     fn may_have_dispatched(&self) -> bool {
         self.dispatch_admitted.load(Ordering::Acquire)
+    }
+
+    fn observe_execution(&self, progress: Arc<PreparedV2AttemptProgress>) {
+        *self
+            .execution_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(progress);
+    }
+
+    fn execution_progress(&self) -> Option<Arc<PreparedV2AttemptProgress>> {
+        self.execution_progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -855,7 +943,15 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
         // From here on a cancellation may leave the lane actor writing, so
         // the owning handle must treat it as a possible send.
         self.route.admit_dispatch();
-        let response = client.execute_v2_before(&wire, deadline).await;
+        let progress = self.route.execution_progress();
+        let response = client
+            .execute_v2_before_observed(&wire, deadline, progress.as_ref())
+            .await;
+        if let Some(progress) = progress {
+            // Preserve the budget at transport completion, before a proven
+            // no-effect result may await local journal cleanup.
+            progress.finish();
+        }
         match response {
             Ok(SessionConsumerV2Response::FencedTransitionV2Deferred { request_id })
                 if request_id == request.request_id() =>
@@ -1426,6 +1522,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
         .await
         .map_err(|_| prepared_fenced_v2_deadline())??;
         Ok(SessionConsumerPreparedFencedTransitionV2 {
+            failure_diagnostics: None,
             inner: PersistentPreparedFencedTransitionV2Token::new(
                 backend,
                 prepared,
@@ -1623,6 +1720,7 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
                         // the complete ID with the authenticated sealed body.
                         let call = journal.begin_deferred_call(&prepared, deadline).await?;
                         return Ok(Some(SessionConsumerPreparedFencedTransitionV2 {
+                            failure_diagnostics: None,
                             inner: PersistentPreparedFencedTransitionV2Token::new(
                                 Arc::clone(&backend),
                                 prepared,
@@ -1989,6 +2087,7 @@ enum V2Resolution {
 /// ```
 pub struct SessionConsumerPreparedFencedTransitionV2 {
     inner: PersistentPreparedFencedTransitionV2Token,
+    failure_diagnostics: Option<SessionConsumerFencedTransitionV2FailureDiagnostics>,
 }
 
 impl fmt::Debug for SessionConsumerPreparedFencedTransitionV2 {
@@ -2042,16 +2141,26 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     pub async fn execute_once(
         &mut self,
     ) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
-        self.inner.execute_once().await
+        let progress = Arc::new(PreparedV2AttemptProgress::new());
+        self.inner.route.observe_execution(Arc::clone(&progress));
+        self.failure_diagnostics = None;
+        let result = self.inner.execute_once().await;
+        if result.is_err() {
+            self.failure_diagnostics =
+                Some(progress.snapshot(self.inner.budget.original_deadline()));
+        }
+        result
     }
 
     /// Diagnostic snapshot for the latest failed execution, for logs and metrics only.
     ///
     /// This never changes the execution outcome or its retry and release rules.
+    /// A new execution clears the previous snapshot; success or cancellation
+    /// leaves no failure snapshot. Status and release calls preserve it.
     pub fn execution_failure_diagnostics(
         &self,
     ) -> Option<SessionConsumerFencedTransitionV2FailureDiagnostics> {
-        None
+        self.failure_diagnostics
     }
 
     /// Try one read-only receipt lookup on the next deterministic voter.
@@ -2455,6 +2564,9 @@ impl PersistentPreparedFencedTransitionV2Token {
             .await,
             Ok(Ok(()))
         ) {
+            if let Some(progress) = self.route.execution_progress() {
+                progress.finish();
+            }
             // Only an original handle proves that no earlier execution
             // could bind this row. A resumed deferral still needs its receipt.
             if self.original {
@@ -2480,17 +2592,24 @@ impl PersistentPreparedFencedTransitionV2Token {
                 break;
             }
             self.route.install_attempt_deadline(attempt_deadline);
+            let progress = self.route.execution_progress();
+            if let Some(progress) = &progress {
+                progress.start_attempt();
+            }
             // Bound the wrapper's repeated journal authentication before
             // physical dispatch. The lane actor owns the later deadline and
             // transmission classification; never time out the whole mutation.
-            match self
+            let effect = self
                 .backend
                 .protected_fenced_transition_v2_effect_with_journal_deadline(
                     &self.prepared,
                     attempt_deadline,
                 )
-                .await
-            {
+                .await;
+            if let Some(progress) = progress {
+                progress.finish();
+            }
+            match effect {
                 FencedTransitionV2Effect::Resolved(Ok(outcome)) => {
                     preparation.terminal();
                     self.set_resolution(V2Resolution::Resolved);
@@ -3562,6 +3681,7 @@ mod tests {
         let harness = harness(vec![]).await;
         let mut handle = SessionConsumerPreparedFencedTransitionV2 {
             inner: harness.prepare().await,
+            failure_diagnostics: None,
         };
         assert_eq!(harness.retained().await, 1);
         assert_eq!(
@@ -3595,6 +3715,7 @@ mod tests {
         let harness = harness(vec![]).await;
         let mut original = SessionConsumerPreparedFencedTransitionV2 {
             inner: harness.prepare().await,
+            failure_diagnostics: None,
         };
         let PreparedFencedTransitionV2Lookup::Found(prepared) = harness
             .backend
@@ -3641,6 +3762,7 @@ mod tests {
             .await;
             let mut handle = SessionConsumerPreparedFencedTransitionV2 {
                 inner: harness.prepare().await,
+                failure_diagnostics: None,
             };
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), handle.execute_once())
@@ -3679,6 +3801,7 @@ mod tests {
         let harness = harness(vec![]).await;
         let mut handle = SessionConsumerPreparedFencedTransitionV2 {
             inner: harness.prepare().await,
+            failure_diagnostics: None,
         };
         let journal = harness._directory.path().join("recovery.sqlite3");
         std::fs::rename(&journal, journal.with_extension("moved")).unwrap();
@@ -3711,6 +3834,7 @@ mod tests {
             let harness = harness(vec![]).await;
             let mut handle = SessionConsumerPreparedFencedTransitionV2 {
                 inner: harness.prepare().await,
+                failure_diagnostics: None,
             };
             let (entered, blocked) = tokio::sync::oneshot::channel();
             let (release, released) = std::sync::mpsc::channel();

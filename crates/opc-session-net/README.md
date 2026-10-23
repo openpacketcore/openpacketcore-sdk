@@ -1018,6 +1018,17 @@ using owned journals and the void profile can reclaim it after a terminal
 no-effect receipt; other journals follow the existing epoch lifecycle. A resumed
 deferred request retains its earlier binding when a later preflight fails.
 
+After a failed `execute_once`, `execution_failure_diagnostics()` reports a
+closed stage (`setup`, `send`, `awaiting_reply`, or `reply_lost`) and the
+remaining original caller budget in milliseconds. The snapshot describes
+local progress: `send` includes preparing the Call on an authenticated lane;
+`reply_lost` means a written Call lost its connection or received an unusable
+reply. Neither stage proves a remote commit. The snapshot contains no request,
+peer, journal or store-error values and grants no retry or release authority.
+Transport completion fixes the budget snapshot before local journal cleanup;
+it never creates a fresh deadline. A new execution clears the old snapshot,
+while status and release calls preserve it.
+
 A local journal failure during V2 receipt lookup returns `Unavailable`
 immediately without resolving the handle. A later `status_once` or
 `status_until_terminal` call authenticates the complete original binding again
