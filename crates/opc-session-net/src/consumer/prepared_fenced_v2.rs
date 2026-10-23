@@ -2771,6 +2771,7 @@ mod tests {
     enum Step {
         NotTransmitted,
         Commit,
+        CommitReplyLost,
         Unknown,
         Reject(StoreError),
         HangBeforeAdmission,
@@ -2921,6 +2922,15 @@ mod tests {
                     let outcome = outcome_for(&request);
                     *self.committed.lock().expect("committed") = Some(outcome.clone());
                     FencedTransitionV2Effect::Resolved(Ok(outcome))
+                }
+                Step::CommitReplyLost => {
+                    self.route.admit_dispatch();
+                    let outcome = outcome_for(&request);
+                    *self.committed.lock().expect("committed") = Some(outcome.clone());
+                    self.set_status(FencedTransitionV2Status::Recorded(Box::new(Ok(outcome))));
+                    FencedTransitionV2Effect::OutcomeUnknown {
+                        request_ids: vec![request.request_id()],
+                    }
                 }
                 Step::Unknown => {
                     self.route.admit_dispatch();
@@ -4189,6 +4199,88 @@ mod tests {
             .await
             .expect("a proven-unsent row is released once the journal is back");
         assert_eq!(harness.retained().await, 0);
+    }
+
+    #[tokio::test]
+    async fn v2_status_preflight_retry_recovers_the_original_committed_receipt() {
+        let harness = harness(vec![Step::CommitReplyLost]).await;
+        let token = harness.prepare().await;
+        assert!(matches!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+        ));
+        let expected = FencedTransitionV2Status::Recorded(Box::new(Ok(harness
+            .physical
+            .committed
+            .lock()
+            .expect("committed")
+            .clone()
+            .expect("lost reply committed"))));
+        let journal = harness._directory.path().join("recovery.sqlite3");
+        std::fs::rename(&journal, journal.with_extension("moved")).expect("move journal");
+        let deadline = token.budget.original_deadline();
+        assert_eq!(
+            token.status_until_terminal(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
+        );
+        assert!(tokio::time::Instant::now() < deadline);
+        assert_eq!(harness.physical.status_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            token.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved)
+        );
+        std::fs::rename(journal.with_extension("moved"), &journal).expect("restore journal");
+        assert_eq!(token.status_once(deadline).await, Ok(expected.clone()));
+        assert_eq!(token.status_until_terminal(deadline).await, Ok(expected));
+        assert_eq!(harness.physical.status_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert_eq!(harness.physical.voters().len(), 1);
+        token.release_resolved().await.expect("release exact receipt");
+        assert_eq!(harness.retained().await, 0);
+    }
+
+    #[tokio::test]
+    async fn v2_status_preflight_retry_never_accepts_a_substituted_binding() {
+        let harness = harness(vec![Step::CommitReplyLost]).await;
+        let token = harness.prepare().await;
+        assert!(matches!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+        ));
+        assert!(harness
+            .backend
+            .discard_protected_fenced_transition_v2(&token.prepared)
+            .await
+            .expect("remove original binding"));
+        let deadline = token.budget.original_deadline();
+        assert_eq!(
+            token.status_once(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
+        );
+        let substituted = harness
+            .backend
+            .prepare_protected_fenced_transition_v2(delete_request(harness.request_id))
+            .await
+            .expect("retain another binding for the same caller ID");
+        assert_ne!(substituted, token.prepared);
+        assert_eq!(
+            token.status_once(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
+        );
+        assert_eq!(harness.physical.status_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            token.release_resolved().await,
+            Err(SessionConsumerFencedTransitionV2ReleaseError::NotResolved)
+        );
+        assert_eq!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::NotTransmitted)
+        );
+        assert_eq!(harness.physical.voters().len(), 1);
+        assert_eq!(harness.retained().await, 1);
     }
 
     #[tokio::test]
