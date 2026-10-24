@@ -29,6 +29,9 @@ use tokio::sync::Barrier;
 #[path = "encryption/strict_reads.rs"]
 mod strict_reads;
 
+#[path = "encryption/provider_availability.rs"]
+mod provider_availability;
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1028,7 +1031,10 @@ async fn late_local_provider_failure_never_delegates_nested_replication() {
         .replicate_entry(nested_replication_entry(1, "local-late-secret-canary"))
         .await
         .expect_err("third nested CAS must fail");
-    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(
+        error,
+        StoreError::BackendUnavailable("session key provider unavailable".into())
+    );
     assert_eq!(provider.calls(), 3);
     assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 0);
     assert!(inner.entries().is_empty());
@@ -1049,7 +1055,10 @@ async fn late_local_provider_failure_never_delegates_nested_replication() {
         ])
         .await
         .expect_err("final nested CAS must fail rebuild staging");
-    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(
+        error,
+        StoreError::BackendUnavailable("session key provider unavailable".into())
+    );
     assert_eq!(provider.calls(), 4);
     assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 0);
     assert!(inner.entries().is_empty());
@@ -1073,7 +1082,10 @@ async fn late_remote_provider_failure_never_delegates_nested_replication() {
         .replicate_entry(nested_replication_entry(1, "remote-late-secret-canary"))
         .await
         .expect_err("third nested CAS must fail");
-    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(
+        error,
+        StoreError::BackendUnavailable("session key provider unavailable".into())
+    );
     assert_eq!(provider.calls(), 3);
     assert_eq!(inner.replicate_calls.load(Ordering::SeqCst), 0);
     assert!(inner.entries().is_empty());
@@ -1097,7 +1109,10 @@ async fn late_remote_provider_failure_never_delegates_nested_replication() {
         ])
         .await
         .expect_err("final nested CAS must fail rebuild staging");
-    assert!(matches!(error, StoreError::Crypto(_)));
+    assert_eq!(
+        error,
+        StoreError::BackendUnavailable("session key provider unavailable".into())
+    );
     assert_eq!(provider.calls(), 4);
     assert_eq!(inner.rebuild_calls.load(Ordering::SeqCst), 0);
     assert!(inner.entries().is_empty());
