@@ -290,8 +290,42 @@ async fn direct_memory_remote_seal_provider_remains_compatible_and_unadmitted() 
         provider
             .unseal(&sealed_key_id, &wrong_aad, &sealed.ciphertext_and_tag)
             .await
-            .expect_err("wrong aad must fail"),
-        KeyError::Unavailable
+            .expect_err("wrong aad must fail")
+            .to_string(),
+        "key provider operation failed"
+    );
+}
+
+#[tokio::test]
+async fn memory_remote_authentication_failure_is_not_unavailability() {
+    let provider = MemoryRemoteSealProvider::new(
+        KeyId::new("remote-authentication-key").expect("key id"),
+        KeyPurpose::Session,
+        tenant(),
+        Zeroizing::new([0x42; AES_256_GCM_SIV_KEY_LEN]),
+    );
+    let aad = session_aad();
+    let plaintext = b"remote-authentication-plaintext-canary";
+    let sealed = provider.seal(&aad, plaintext).await.expect("seal");
+    let key_id = key_id_from_bound_aad(&sealed.aad).expect("key id");
+    for index in 0..sealed.ciphertext_and_tag.len() {
+        let mut corrupted = sealed.ciphertext_and_tag.clone();
+        corrupted[index] ^= 1;
+        let error = provider
+            .unseal(&key_id, &aad, &corrupted)
+            .await
+            .expect_err("every modified byte must fail authentication");
+        assert_ne!(error, KeyError::Unavailable);
+        assert_eq!(error.to_string(), "key provider operation failed");
+        assert_eq!(format!("{error:?}"), "OperationFailed");
+    }
+    assert_eq!(
+        provider
+            .unseal(&key_id, &aad, &sealed.ciphertext_and_tag)
+            .await
+            .expect("authentication failures do not make the provider unavailable")
+            .as_slice(),
+        plaintext
     );
 }
 

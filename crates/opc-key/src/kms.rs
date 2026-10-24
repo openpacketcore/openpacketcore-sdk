@@ -827,6 +827,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kms_completed_failure_is_not_unavailability() {
+        let key_id = KeyId::new("kms-denial-sensitive-key").expect("key id");
+        for reason in ["authentication failed", "access denied", "key revoked"] {
+            for operation in ["get_active_key", "get_key_by_id", "seal", "unseal"] {
+                let response = serde_json::json!({
+                    "status": "error",
+                    "error_message": format!("{reason}: key={} payload=secret-canary", key_id.as_str()),
+                })
+                .to_string()
+                .into_bytes();
+                let mock = mock_kms(MockResponse::Bytes(response)).await;
+                let local =
+                    KmsKeyProvider::new(mock.endpoint.clone(), None, Duration::from_secs(1));
+                let remote = KmsRemoteSealProvider::new(
+                    mock.endpoint.clone(),
+                    None,
+                    Duration::from_secs(1),
+                    key_id.clone(),
+                );
+                let error = match operation {
+                    "get_active_key" => local
+                        .get_active_key(KeyPurpose::Session, &tenant())
+                        .await
+                        .expect_err("explicit denial fails active lookup"),
+                    "get_key_by_id" => local
+                        .get_key_by_id(&key_id)
+                        .await
+                        .expect_err("explicit denial fails historical lookup"),
+                    "seal" => remote
+                        .seal(&session_aad(), b"plaintext-canary")
+                        .await
+                        .expect_err("explicit denial fails seal"),
+                    "unseal" => remote
+                        .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                        .await
+                        .expect_err("explicit denial fails unseal"),
+                    _ => unreachable!("fixed operation fixture"),
+                };
+                assert_ne!(error, KeyError::Unavailable, "{operation}: {reason}");
+                assert_eq!(error.to_string(), "key provider operation failed");
+                assert_eq!(format!("{error:?}"), "OperationFailed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kms_remote_timeout_remains_unavailability() {
+        let key_id = KeyId::new("remote-timeout-key").expect("key id");
+        for unseal in [false, true] {
+            let mock = mock_kms(MockResponse::Hang(Duration::from_secs(5))).await;
+            let provider = KmsRemoteSealProvider::new(
+                mock.endpoint.clone(),
+                None,
+                Duration::from_millis(25),
+                key_id.clone(),
+            );
+            let error = if unseal {
+                provider
+                    .unseal(&key_id, &session_aad(), b"ciphertext-canary")
+                    .await
+                    .expect_err("unseal times out")
+            } else {
+                provider
+                    .seal(&session_aad(), b"plaintext-canary")
+                    .await
+                    .expect_err("seal times out")
+            };
+            assert_eq!(error, KeyError::Unavailable);
+        }
+    }
+
+    #[tokio::test]
     async fn kms_remote_seal_provider_maps_seal_to_encrypt_request() {
         let key_id = KeyId::new("session-remote-2026-01").expect("key id");
         let ciphertext = b"kms-ciphertext-and-auth-tag";
@@ -977,7 +1049,7 @@ mod tests {
             .unseal(&key_id, &session_aad(), b"ciphertext-canary")
             .await
             .expect_err("revoked historical key must fail closed");
-        assert_eq!(error, KeyError::Unavailable);
+        assert_eq!(error.to_string(), "key provider operation failed");
         let rendered = format!("{error} {error:?}");
         assert!(!rendered.contains(key_id.as_str()));
         assert!(!rendered.contains("tenant-a"));
