@@ -159,8 +159,17 @@ impl NativeState {
         let empty_request = original.is_empty();
         let floor = self.frontiers.async_fence_floor();
         original.ensure_not_compacted(floor)?;
-        let first = (original.first_sequence() - floor)
-            .checked_add(self.frontiers.async_watch_before())
+        // A zero-length request is an empty page, never a compacted-cursor
+        // error and never an unchecked outward subtraction below the
+        // asynchronous floor. Return before any position arithmetic can
+        // underflow.
+        if empty_request {
+            return Ok(Vec::new());
+        }
+        let first = original
+            .first_sequence()
+            .checked_sub(floor)
+            .and_then(|start| start.checked_add(self.frontiers.async_watch_before()))
             .ok_or_else(unavailable)?;
         // Bounded rolling retention: a cursor below the derived floor has no
         // authoritative replay. Answer with the existing typed stale-cursor

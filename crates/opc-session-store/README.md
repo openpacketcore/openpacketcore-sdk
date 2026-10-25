@@ -1970,7 +1970,8 @@ Slow consumers are evicted when the live channel fills, and closed or
 cancelled registrations are pruned without unbounded accumulation.
 
 Native state additionally keeps a bounded rolling notification backlog: the
-newest 65,536 notifications are resident, and a watcher whose inclusive cursor
+newest 65,536 notification rows are resident (a row-count bound, not a byte
+budget), and a watcher whose inclusive cursor
 is at or below the derived retention floor receives the existing
 `ReplicationLogCursorCompacted { resume_from }` answer with the lowest
 replayable sequence described above. The floor is derived only from the

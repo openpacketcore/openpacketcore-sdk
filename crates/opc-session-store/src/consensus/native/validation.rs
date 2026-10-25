@@ -295,6 +295,10 @@ pub(super) fn validate_frontiers(
     if let Some(boundary) = &frontiers.async_recovery {
         boundary.validate_protected_scope(identity, members, root)?;
     }
+    // Notifications are capped by their own rolling retention window, which is
+    // strictly smaller than MAX_ITEMS, so the legacy MAX_ITEMS notification
+    // equality can no longer be reached; MAX_ITEMS remains the last defense for
+    // every other table and for legacy un-retired states.
     if u64::try_from(notifications).ok() != Some(frontiers.retained_notification_count()) {
         return Err(invalid("native image watch count differs"));
     }

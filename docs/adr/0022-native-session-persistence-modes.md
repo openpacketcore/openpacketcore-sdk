@@ -265,7 +265,8 @@ indeterminate publication state or a store with no published snapshot at all
 stops the engine. The bounded attempt/backoff, value-free failure classification
 and duplicate-build degradation are documented in the `opc-session-store`
 README. Separate key and ordinary-receipt caps are unchanged. Notification
-rows use a bounded rolling window of the newest 65,536 entries: the retention
+rows use a bounded rolling row-count window of the newest 65,536 entries (a
+row-count bound, not a byte budget): the retention
 floor is derived only from the committed `watch_sequence`, so every voter
 derives the same floor at the same log index and the already-persisted watch
 sequence carries it across snapshots and restart without a new format field or

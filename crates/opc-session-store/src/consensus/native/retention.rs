@@ -30,12 +30,14 @@ use std::io;
 
 /// Production notification backlog retained for watch replay.
 ///
-/// This is a bounded backlog, not delivery tracking: a watcher below the
-/// derived floor receives `StoreError::ReplicationLogCursorCompacted` and
-/// resynchronises from the returned sequence. The value is deliberately much
-/// smaller than the hard `MAX_ITEMS` admission cap so notification retirement
-/// bounds resident memory and snapshot work instead of only removing the
-/// lifetime stop.
+/// This is a row-count bound, not a byte budget: each retained notification
+/// row keeps its bounded payload and metadata, so the resident notification
+/// footprint is at most this many rows. It is a bounded replay backlog, not
+/// delivery tracking: a watcher below the derived floor receives
+/// `StoreError::ReplicationLogCursorCompacted` and resynchronises from the
+/// returned sequence. The value is deliberately much smaller than the hard
+/// `MAX_ITEMS` admission cap so notification retirement bounds resident rows
+/// and snapshot work instead of only removing the lifetime stop.
 pub(crate) const RETAINED_NOTIFICATIONS: u64 = 65_536;
 
 /// One append-only sequence family's bounded retention window.

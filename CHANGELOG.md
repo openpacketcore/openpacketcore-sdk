@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old receive capabilities and plans. Refs #1084.
 - `opc-session-store`: native notification rows now use bounded rolling
   retention instead of accumulating for the life of the store. The newest
-  65,536 notifications remain resident; the retention floor is derived only
+  65,536 notifications remain resident; that 65,536 is a row-count bound, not a
+  byte budget, and the retention floor is derived only
   from the committed `watch_sequence`, so every voter derives the same floor at
   the same log index and the already-persisted snapshot/frontier state carries
   it across restart with no new persisted-format field or
