@@ -243,8 +243,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retirement as one `after=None` change with the predecessor content stamp and
   table-summary conservation, published through the existing row machinery.
   Removals are deduplicated and staged at most once; a candidate key created or
-  updated in the same delta is collapsed (transient create-and-retire) and a key
-  with no committed predecessor is rejected. No production sweep produces
+  updated in the same delta is collapsed *before* the resident expiry index is
+  rebuilt and the removed key's resident expiry entry is removed with it (so the
+  next prune cannot observe a stale record/lease/released/scope entry).
+  Create-and-retire of a never-committed key is a transient with no journal row,
+  and a key with no committed predecessor is rejected. No production sweep produces
   removals yet, there is no generation-base+delta/relocation/cold/replay/export
   or SQLite prepared-base/full-image carry, and floor=0 behavior is unchanged.
   PR2b (exact persisted-format carry and round-trip/relocation/parity tests),

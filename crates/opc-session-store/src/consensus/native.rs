@@ -1399,6 +1399,19 @@ impl NativeState {
         delta.key_removals.push(key);
         changes::Publication::prepare(delta)?.publish(self)
     }
+
+    /// Test-only same-delta retirement journal: apply `entries` and retire
+    /// `removals` in the same business change.
+    #[cfg(test)]
+    pub(crate) fn apply_key_retirements_in_batch(
+        &mut self,
+        entries: &[Entry<SessionRaftTypeConfig>],
+        removals: Vec<SessionKey>,
+    ) -> io::Result<NativeApplied> {
+        let mut delta = self.prepare(entries)?;
+        delta.key_removals.extend(removals);
+        changes::Publication::prepare(delta)?.publish(self)
+    }
 }
 
 impl NativeDelta<'_> {
