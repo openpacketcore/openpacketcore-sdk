@@ -26,13 +26,11 @@ impl<'state, I: Iterator<Item = &'state SessionKey>> RestoreScanSource for Rows<
 
     fn next_row(&mut self) -> Result<Option<Self::Row<'_>>, StoreError> {
         loop {
-            (self.check)().map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    StoreError::RestoreScanWorkBudgetExceeded
-                } else {
-                    unavailable()
-                }
-            })?;
+            // A deadline check is slow progress (retryable availability), not
+            // fixed work-budget exhaustion. The caller keeps its single
+            // absolute deadline; genuine scan work limits below still return
+            // `RestoreScanWorkBudgetExceeded`.
+            (self.check)().map_err(|_| unavailable())?;
             let Some(key) = self.keys.next() else {
                 return Ok(None);
             };
