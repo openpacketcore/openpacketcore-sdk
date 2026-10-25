@@ -232,7 +232,7 @@ pub(in crate::sqlite::consensus) struct Opening {
     limits: Limits,
     control: IoControl,
     conn: Connection,
-    lock: File,
+    lock: RootLock,
     native: NativeStorage,
     selected: Option<native_basis::Selected>,
     audit: Option<RecoveryAudit>,
@@ -323,8 +323,7 @@ impl Opening {
         let directory_pin = owner::pin_directory(directory)?;
         let pinned_path = owner::directory_path(&directory_pin);
         let directory = pinned_path.as_path();
-        let lock = file_read(&directory.join("LOCK"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        let lock = RootLock::acquire_existing(&directory.join("LOCK"))?;
         let conn = cold_basis(directory, binding)?;
         check()?;
         let authority = Authority::load(&conn, binding.identity)?;
