@@ -270,3 +270,55 @@ fn failover_cooldown_returns_the_exact_bounded_edge_without_taking_the_serial_pr
         );
     });
 }
+
+#[test]
+fn failover_cooldown_cannot_bypass_an_already_elapsed_caller_deadline() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("deadline runtime");
+    let policy = ConnectionLifecyclePolicy::try_new(
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+        Duration::from_millis(80),
+        Duration::ZERO,
+    )
+    .expect("bounded lifecycle");
+    let gate = ReconnectGate::new(policy);
+    runtime.block_on(async {
+        let now = tokio::time::Instant::now();
+        gate.acquire(now + Duration::from_secs(1), 0, None)
+            .await
+            .expect("first attempt")
+            .failed();
+        // The caller budget elapsed before this admission attempt. Fail-over
+        // must preserve the terminal Deadline classification even though a
+        // cooldown is also active; it must not return a "try another peer"
+        // signal past the caller's own budget.
+        let admission = gate
+            .acquire_classified_with_jitter_and_cooldown(
+                now,
+                0,
+                None,
+                Duration::ZERO,
+                ReconnectCooldownPolicy::FailOver,
+            )
+            .await;
+        assert!(
+            matches!(admission, ReconnectAdmission::Deadline),
+            "an elapsed caller deadline stays terminal under fail-over"
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            now,
+            "the refusal itself does not advance the controlled clock"
+        );
+        assert_eq!(
+            gate.serial.available_permits(),
+            1,
+            "the deadline refusal never takes the serial probe admission"
+        );
+    });
+}

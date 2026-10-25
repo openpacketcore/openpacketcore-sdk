@@ -1010,8 +1010,12 @@ pub enum SessionConsumerClientError {
     #[error("session consumer peer is in reconnect cooldown")]
     Cooldown {
         /// Bounded remaining shared cooldown when the admission was refused.
+        ///
+        /// Rounded up to whole milliseconds, so an active cooldown never
+        /// reports `0`; the shared edge itself is tracked as a `Duration`.
         remaining_cooldown_millis: u32,
-        /// Bounded time spent awaiting the shared reconnect gate.
+        /// Bounded time spent awaiting the shared reconnect gate, rounded up
+        /// to whole milliseconds (`0` means no measurable gate wait).
         gate_wait_millis: u32,
     },
     /// The quorum endpoint was unavailable.
@@ -12966,7 +12970,10 @@ fn counter_max(counter: &AtomicU64, value: u64) {
 }
 
 fn bounded_millis(duration: Duration) -> u32 {
-    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+    // Round an active edge up so a positive sub-millisecond cooldown is never
+    // reported as zero (which would be indistinguishable from "no cooldown").
+    let rounded = duration.as_nanos().div_ceil(1_000_000);
+    u32::try_from(rounded).unwrap_or(u32::MAX)
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -38316,5 +38323,23 @@ mod tests {
         cooling.shutdown().await;
         healthy.shutdown().await;
         server.abort_and_wait().await;
+    }
+
+    #[test]
+    fn bounded_millis_rounds_an_active_sub_millisecond_cooldown_up() {
+        assert_eq!(super::bounded_millis(Duration::ZERO), 0);
+        assert_eq!(
+            super::bounded_millis(Duration::from_nanos(1)),
+            1,
+            "a positive sub-millisecond edge is never reported as zero"
+        );
+        assert_eq!(super::bounded_millis(Duration::from_micros(999)), 1);
+        assert_eq!(super::bounded_millis(Duration::from_millis(1)), 1);
+        assert_eq!(super::bounded_millis(Duration::from_micros(1_500)), 2);
+        assert_eq!(
+            super::bounded_millis(Duration::from_secs(u64::MAX)),
+            u32::MAX,
+            "the public bound saturates instead of truncating"
+        );
     }
 }

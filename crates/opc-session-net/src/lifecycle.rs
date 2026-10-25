@@ -387,6 +387,13 @@ impl ReconnectGate {
         };
         self.observe_epoch(generation, material);
         if cooldown_policy == ReconnectCooldownPolicy::FailOver {
+            // The caller's own deadline stays the terminal boundary: an
+            // already-elapsed caller gets the original Deadline classification
+            // even when a cooldown is also active, so fail-over cannot extend
+            // a budget that has already expired.
+            if tokio::time::Instant::now() >= deadline {
+                return ReconnectAdmission::Deadline;
+            }
             // Fast fail-over path: never queue behind the serial admission (or
             // an in-flight probe) when the shared cooldown is already visible.
             // The routing caller receives the bounded remaining cooldown now
@@ -445,6 +452,11 @@ impl ReconnectGate {
                 break;
             };
             if wait_until >= deadline || cooldown_policy == ReconnectCooldownPolicy::FailOver {
+                if cooldown_policy == ReconnectCooldownPolicy::FailOver
+                    && tokio::time::Instant::now() >= deadline
+                {
+                    return ReconnectAdmission::Deadline;
+                }
                 return ReconnectAdmission::Cooldown {
                     remaining: wait_until.saturating_duration_since(tokio::time::Instant::now()),
                 };
