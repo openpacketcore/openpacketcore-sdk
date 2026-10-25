@@ -7060,9 +7060,21 @@ mod tests {
             write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
                 .await
                 .expect("write terminal-watch entry");
-            match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
-                Ok(Ok((_retry, _))) => 2,
-                _ => 1,
+            // Event-driven quiescence: the client ends its watch task after the
+            // terminal entry, which closes this stream. A reconnect attempt would
+            // arrive as a second accept. Wait for whichever happens, with the
+            // accept checked first so a simultaneous reconnect is never missed;
+            // no wall-clock window decides the count.
+            let mut probe = [0_u8; 1];
+            loop {
+                tokio::select! {
+                    biased;
+                    accepted = listener.accept() => {
+                        let _ = accepted;
+                        break 2;
+                    }
+                    _ = stream.read(&mut probe) => break 1,
+                }
             }
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
@@ -7077,7 +7089,14 @@ mod tests {
             u64::MAX
         );
         assert!(watch.next().await.is_none());
-        assert_eq!(server.await.expect("terminal-watch server"), 1);
+        // The stream closes only when the watch handle is dropped; the server
+        // then observes that event instead of waiting out a wall-clock window.
+        drop(watch);
+        let count = tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("terminal-watch server must terminate")
+            .expect("terminal-watch server");
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
