@@ -129,13 +129,24 @@ push, and commits already on a base branch other than `main` that has no pull
 request of its own. The push to `main` scans all of them; the daily scan covers
 branches.
 
-Every scan passes `--diff-merges=first-parent` to gitleaks' `git log -p` walk.
-Merge commits are scanned as ordinary patches against their first parent,
-including text introduced only by conflict resolution. This changes the diff
-format, not history traversal: commits on every merged side branch are still
-scanned, including changes removed before the merge and nested merge resolutions
-that a later merge removes. Ordinary and merge findings share the same report,
-finding count, and scanner diagnostics.
+The ordinary `git log -p` walk scans every reachable parent in the event's scope,
+including side-branch changes removed before a merge. A separate full traversal
+examines every merge, including nested merges that a later merge removes. For
+two-parent merges, `git merge-tree --write-tree --allow-unrelated-histories`
+recreates the automatic merge without changing the worktree or index. A
+conflict-free result whose tree is identical to the recorded merge needs no
+second scan: its parent additions were already scanned with their original
+commit-scoped ignore fingerprints. This avoids re-reporting approved false
+positives merely because a clean merge copied them.
+
+Conflicted merges, merges with edits beyond the automatic result, and all
+octopus merges are scanned against their first parent with
+`--diff-merges=first-parent --no-walk`. They are batched only to bound argument
+size; every selected merge is scanned. Unexpected merge-tree failures or missing
+tree output fail the gate. All scanner passes retain their diagnostics and error
+checks, and merge scanning continues after ordinary findings. Completed passes
+contribute to one report and total finding count. An incomplete scan fails
+without publishing a partial count. No pass containing findings is a success.
 
 Scheduled runs (daily at 08:17 UTC) fetch and scan all branch and tag refs with
 the `.gitleaksignore` on `main`, including branches without pull requests.
@@ -155,6 +166,11 @@ finding that it adds. Review every change to `.gitleaksignore`, and any new
 by commit, file, rule and line and says why the value is not a secret. Do not
 add path or rule allowlists. The scan emits a warning when either file changes;
 the warning does not fail the scan.
+
+A conflicted, manually edited, or octopus merge can repeat an approved false
+positive in its first-parent patch. Such a finding still needs an explicit
+fingerprint for that merge, with the same review as an ordinary finding; the
+scanner never broadens an exception from one commit to other commits.
 
 ## Test inventory guard
 

@@ -114,6 +114,10 @@ changes, and `tests/dtls12/rfc6083.rs` adds the profile integration proof:
 - `tests/ossl/io_buf.rs` uses `Vec::clear` for compatibility with the current
   all-target Clippy gate.
 
+`tests/dtls13/edge.rs` replaces the signature-algorithms test's raw byte search
+with a bounded ClientHello walk (RFC 9147 sections 4, 5.2 and 5.3), preserving its
+advertised-scheme assertions and adding framing and decoy regressions (Refs #1311).
+
 Inspect those adapters after extracting the archive:
 
 ```sh
@@ -127,7 +131,7 @@ The expected changed paths are `tests/auto/main.rs`, `tests/dtls12/common.rs`,
 `tests/dtls12/fragmentation.rs`, `tests/dtls12/handshake.rs`,
 `tests/dtls12/main.rs`, `tests/dtls12/ossl.rs`, `tests/dtls12/psk.rs`,
 `tests/dtls12/retransmit.rs`, `tests/dtls12/rfc6083.rs`, and
-`tests/dtls13/main.rs`, plus `tests/ossl/io_buf.rs`.
+`tests/dtls13/main.rs`, `tests/dtls13/edge.rs`, plus `tests/ossl/io_buf.rs`.
 
 The additional `tests/dtls12/rfc6083_record_reference.py` and `.tsv` contain
 six synthetic record-layer vectors reproduced with Python `cryptography`

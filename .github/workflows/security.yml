@@ -83,29 +83,113 @@ jobs:
               exit 1
               ;;
           esac
-          # Scan merge resolutions against the first parent, while still walking every parent.
-          log_opts="--diff-merges=first-parent $log_opts"
           report="${RUNNER_TEMP}/gitleaks-report.json"
           log="${RUNNER_TEMP}/gitleaks.log"
-          status=0
-          # Exit 2 means findings. Any other non-zero status means the scan did not complete.
-          # gitleaks colours its log lines unless NO_COLOR is set, also when stderr is a file.
-          NO_COLOR=1 gitleaks detect --source . --redact --no-banner --exit-code 2 \
-            --report-format json --report-path "$report" --log-opts "$log_opts" 2> "$log" || status=$?
-          cat "$log" >&2
-          # gitleaks 8.30.1 exits 0 when its git log fails; it only logs the failure.
-          # A clean result has the scanner's "no leaks found" line and no error line.
-          if [[ "$status" -eq 0 ]]; then
-            if grep -q -E '^[^ ]+ (ERR|FTL) ' "$log"; then
-              echo "::error::The scanner logged an error; this is not a clean result."
-              status=1
-            elif ! grep -q -E '^[^ ]+ INF no leaks found$' "$log"; then
-              echo "::error::The scanner did not log \"no leaks found\"; this is not a clean result."
-              status=1
+          finding_reports=()
+          scan_pass() {
+            local pass_opts="$1" pass_report="$2" pass_log="$3" pass_status=0
+            rm -f -- "$pass_report" || return $?
+            # Exit 2 means findings. Any other non-zero status is an incomplete scan.
+            NO_COLOR=1 gitleaks detect --source . --redact --no-banner --exit-code 2 \
+              --report-format json --report-path "$pass_report" --log-opts "$pass_opts" \
+              2> "$pass_log" || pass_status=$?
+            cat "$pass_log" >&2 || return $?
+            # 8.30.1 can exit 0 after git log fails. Require its clean-result line.
+            if [[ "$pass_status" -eq 0 ]]; then
+              if grep -q -E '^[^ ]+ (ERR|FTL) ' "$pass_log"; then
+                echo "::error::The scanner logged an error; this is not a clean result."
+                pass_status=1
+              elif ! grep -q -E '^[^ ]+ INF no leaks found$' "$pass_log"; then
+                echo "::error::The scanner did not log \"no leaks found\"; this is not a clean result."
+                pass_status=1
+              fi
             fi
+            if [[ "$pass_status" -eq 2 ]]; then
+              finding_reports+=("$pass_report")
+            fi
+            return "$pass_status"
+          }
+
+          # Keep the ordinary walk and its original-commit ignore fingerprints.
+          status=0
+          scan_pass "$log_opts" "$report" "$log" || status=$?
+          if [[ "$status" -ne 0 && "$status" -ne 2 ]]; then
+            exit "$status"
           fi
+
+          # A clean automatic merge contains no resolution edits. Its parent
+          # additions were already scanned, so do not give them new fingerprints.
+          # Walk every merge, including nested merges on side branches.
+          git rev-list --merges $log_opts > "${RUNNER_TEMP}/gitleaks-merges.txt"
+          selected_merges=()
+          while read -r merge; do
+            merge_metadata="$(git show --no-patch --format='%T %P' "$merge")"
+            read -r -a metadata <<< "$merge_metadata"
+            if [[ "${#metadata[@]}" -eq 3 ]]; then
+              merge_status=0
+              git merge-tree --write-tree --allow-unrelated-histories \
+                "${metadata[1]}" "${metadata[2]}" \
+                > "${RUNNER_TEMP}/gitleaks-auto-merge.txt" \
+                2> "${RUNNER_TEMP}/gitleaks-auto-merge.log" || merge_status=$?
+              cat "${RUNNER_TEMP}/gitleaks-auto-merge.log" >&2
+              if [[ "$merge_status" -ne 0 && "$merge_status" -ne 1 ]]; then
+                echo "::error::Cannot classify merge ${merge}: git merge-tree exited ${merge_status}."
+                exit 1
+              fi
+              IFS= read -r automatic_tree < "${RUNNER_TEMP}/gitleaks-auto-merge.txt" || {
+                echo "::error::Cannot classify merge ${merge}: missing automatic tree."
+                exit 1
+              }
+              if [[ ! "$automatic_tree" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+                echo "::error::Cannot classify merge ${merge}: invalid automatic tree."
+                exit 1
+              fi
+              if [[ "$merge_status" -eq 0 && "$automatic_tree" == "${metadata[0]}" ]]; then
+                continue
+              fi
+            elif [[ "${#metadata[@]}" -lt 4 ]]; then
+              echo "::error::Cannot classify merge ${merge}: missing parents."
+              exit 1
+            fi
+            # Always scan conflicts, edited automatic merges, and octopus merges.
+            selected_merges+=("$merge")
+          done < "${RUNNER_TEMP}/gitleaks-merges.txt"
+
+          # Bound argv size without dropping a commit. Each selected merge is
+          # scanned once; --no-walk prevents rescanning its ordinary ancestors.
+          for ((offset=0; offset<${#selected_merges[@]}; offset+=512)); do
+            batch=("${selected_merges[@]:offset:512}")
+            merge_scan_status=0
+            echo "Secret scan merge-resolution batch $((offset / 512 + 1))" >&2
+            scan_pass "--diff-merges=first-parent --no-walk ${batch[*]}" \
+              "${RUNNER_TEMP}/gitleaks-merge-${offset}.json" \
+              "${RUNNER_TEMP}/gitleaks-merge-${offset}.log" || merge_scan_status=$?
+            if [[ "$merge_scan_status" -ne 0 && "$merge_scan_status" -ne 2 ]]; then
+              exit "$merge_scan_status"
+            elif [[ "$merge_scan_status" -eq 2 ]]; then
+              status=2
+            fi
+          done
+
+          # Keep one complete report/count, including when ordinary commits leak.
+          # An incomplete pass above never publishes a misleading partial count.
           if [[ "$status" -eq 2 ]]; then
-            count="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$report")"
+            count="$(python3 - "$report" "${finding_reports[@]}" <<'PY'
+          import json
+          import sys
+
+          findings = []
+          for path in sys.argv[2:]:
+              with open(path) as source:
+                  report = json.load(source)
+              if not isinstance(report, list):
+                  raise ValueError('scanner report is not a JSON array')
+              findings.extend(report)
+          with open(sys.argv[1], 'w') as output:
+              json.dump(findings, output)
+          print(len(findings))
+          PY
+            )"
             echo "findings=${count}" >> "$GITHUB_OUTPUT"
           fi
           exit "$status"
