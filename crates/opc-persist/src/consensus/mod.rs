@@ -40,7 +40,7 @@ pub use history::{ConfigHistoryLimits, ConfigHistoryRetention};
 
 pub use store::{
     ConfigConsensusOpenError, ConfigConsensusStatus, ConfigLocalAuthorityOutcome,
-    ConsensusConfigStore, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    ConfigQuorumLeaseState, ConsensusConfigStore, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use types::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusClusterId,

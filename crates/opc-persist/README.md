@@ -175,6 +175,56 @@ state without a leader/read-index round. Failed admission needs no store
 replacement, volume cleanup or coordinated restart; the caller retries the
 same store as connectivity returns.
 
+### Leader quorum-lease authority (check-quorum)
+
+An engine leader may accept new proposals, prove local writer authority and
+answer forwarded mutations/read barriers only while the pinned Openraft engine
+reports a quorum acknowledgement younger than the fixed quorum-authority ceiling
+`DURABLE_CONSENSUS_LEADER_QUORUM_LEASE` = `election_timeout_max` (8 s). This is
+the point by which every follower's election timer has expired, so the leader can
+conclude it no longer holds a majority for new authority. The pinned engine
+exposes only the acknowledgement age (`RaftMetrics::millis_since_quorum_ack`)
+and defines no application leader lease of its own; the constant is unrelated to
+the SDK's separate 2 s `DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE` read-lease
+reuse. No timing budget changes. Once the ceiling is exceeded the store performs
+an SDK **authority step-down**: local proposals fail with a typed retryable
+`PersistErrorKind::Unavailable` before any proposal is attempted,
+`ensure_local_authority[_at_config_head]` returns
+`ConfigLocalAuthorityOutcome::Retry { leader_hint: None }` (no leader), and
+forwarded mutations/read barriers receive the additive `NoQuorum` reply, which
+the forwarding replica converts to the same retryable unavailability instead of
+holding the caller to its operation deadline. A withheld call proposes,
+applies and commits nothing, and callers retry the same request identity, so
+exactly-once behavior is unchanged.
+
+The transition is observable through
+`ConsensusConfigStore::quorum_lease_state()` (`Available` /
+`NoQuorum { millis_since_quorum_ack }`), the
+`opc_persist_quorum_lease_lost_total` / `opc_persist_quorum_lease_restored_total`
+counters, and one warning/info log per transition. Authority returns
+automatically after two consecutive healthy observations (a one-flush debounce
+against marginal acknowledgements); no restart, vote fabrication or manual step
+is required. A healthy leader whose quorum keeps acknowledging is never fenced.
+A leader that has not yet obtained any quorum acknowledgement is bounded from the
+observed start of its leader term, with up to one heartbeat of observation grace.
+The engine's durable role may still read `Leader` while authority is withheld;
+that is deliberate: the SDK does not fabricate votes or mutate Openraft election
+state, and the majority side independently elects a successor through the
+ordinary election path.
+
+Two tradeoffs are explicit. First, the ceiling is the *latest safe* point: it
+waits until every follower's 5–8 s election timer has expired, so a leader that
+loses its majority can still accept (uncommittable) proposals for up to about
+8 s of the 10 s operation budget before clients receive the typed retryable
+rejection. Fencing earlier (for example at `election_timeout_min`) could reject a
+leader whose quorum is merely slow and would violate the no-false-step-down
+requirement, so the write and read fences intentionally share the same safe
+ceiling; the residual client wait remains bounded and typed, never a full-budget
+hold. Second, a leader that has not yet received *any* acknowledgement is
+observed only by the quorum-lease watchdog (one poll/half-heartbeat cadence), so
+its bound can be up to one heartbeat late across a same-node term change; that
+grace is bounded and never grants authority to a proven-stale leader.
+
 The HA composition is:
 
 ```text
