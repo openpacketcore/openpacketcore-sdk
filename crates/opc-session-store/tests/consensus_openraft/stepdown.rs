@@ -228,12 +228,19 @@ async fn receive_response<F: Future>(
 struct PublicationEvents(Arc<StdMutex<Option<Arc<PublicationHold>>>>);
 
 struct PublicationDispatch {
+    _unobserved: tracing::Dispatch,
     observer: tracing::Dispatch,
 }
 
 impl PublicationDispatch {
     fn new(publication: Arc<StdMutex<Option<Arc<PublicationHold>>>>) -> Self {
+        // tracing-core 0.1.36's single-dispatch fast path takes callsite
+        // interest from the thread that first emits it. Another test runtime
+        // has no subscriber and can cache Interest::never for our event.
+        // Retain both dispatchers so registration considers both interests,
+        // without installing a subscriber on any other runtime's threads.
         Self {
+            _unobserved: tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
             observer: tracing::Dispatch::new(PublicationEvents(publication)),
         }
     }
