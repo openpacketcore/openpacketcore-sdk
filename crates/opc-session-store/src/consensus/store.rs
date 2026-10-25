@@ -4277,7 +4277,10 @@ impl ConsensusSessionStore {
     /// stopped engine. Stop external consumers first and keep the authenticated
     /// replication handler installed until this method finishes. Shutdown
     /// automatically attempts one bounded leadership handoff, then proceeds
-    /// with ordinary drain even on failure. [`Self::shutdown_with_report`]
+    /// with ordinary drain even on failure. For an unplanned loss (for example
+    /// a failed replication listener), call [`Self::shutdown_unplanned`]
+    /// instead; it suppresses new handoff preparation and cancels and joins an
+    /// outstanding preparation before the same drain. [`Self::shutdown_with_report`]
     /// returns the typed handoff result; fallback is also logged. The bounded maintenance
     /// lanes are stopped and joined first, so a Raft shutdown that cannot
     /// complete cannot retain their workers or checkpoint connections. This

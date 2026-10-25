@@ -47,9 +47,12 @@ impl ConfigShutdownCoordinator {
     }
 
     fn prevent_handoff(&self) {
+        // Publish the unplanned choice before started/notify so a concurrent
+        // planned preparation that observes started also observes the flag and
+        // reports Unplanned rather than a spurious handoff fallback.
+        self.unplanned.send_replace(true);
         self.started.store(true, Ordering::Release);
         self.started_notify.notify_waiters();
-        self.unplanned.send_replace(true);
     }
 
     fn start_or_subscribe(&self, store: ConsensusConfigStore) -> watch::Receiver<Completion> {
@@ -98,6 +101,10 @@ impl ConfigShutdownCoordinator {
                     result.unwrap_or(Err(timeout_reason))
                 },
             };
+            // Unplanned wins whenever its flag is set, including when it lands
+            // after the select resolved: a concurrent unplanned drain must not
+            // be reported as a handoff failure.
+            let preparation = prefer_unplanned(preparation, &unplanned);
             // Keep the trace outside the timed future so cancellation retains
             // the last attempted read proof and the observed successor vote.
             #[cfg(any(test, feature = "test-control"))]
@@ -137,6 +144,18 @@ impl ConfigShutdownCoordinator {
             sender.send_replace(Some(result));
         });
         receiver
+    }
+}
+
+/// Prefer the unplanned fallback whenever the coordinator flag is set.
+fn prefer_unplanned(
+    preparation: Result<PlannedShutdownOutcome, PlannedShutdownFallback>,
+    unplanned: &watch::Receiver<bool>,
+) -> Result<PlannedShutdownOutcome, PlannedShutdownFallback> {
+    if *unplanned.borrow() {
+        Err(PlannedShutdownFallback::Unplanned)
+    } else {
+        preparation
     }
 }
 

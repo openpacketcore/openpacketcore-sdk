@@ -34,8 +34,11 @@ impl ConsensusRetirementCoordinator {
         // Fence admission synchronously, before the caller can be cancelled.
         store.inner.raw_v2_read_barrier.disable_lease_reuse();
         store.inner.read_barrier.disable_lease_reuse();
-        self.started.store(true, Ordering::Release);
+        // Publish the unplanned choice before marking preparation started, so a
+        // concurrent planned preparation that observes `started` also observes
+        // the flag and reports Unplanned rather than a spurious NotAdmitted.
         self.unplanned.send_replace(true);
+        self.started.store(true, Ordering::Release);
     }
 
     fn start_or_subscribe(
@@ -69,6 +72,10 @@ impl ConsensusRetirementCoordinator {
                     store.prepare_shutdown_before(deadline, &mut timeout_reason),
                 ) => result.unwrap_or(Err(timeout_reason)),
             };
+            // The unplanned flag wins whenever it is set, including when it
+            // lands after the select resolved: a concurrent unplanned drain
+            // must never be reported as a handoff failure.
+            let result = prefer_unplanned(result, &unplanned);
             sender.send_replace(Some(result));
         });
         receiver
@@ -380,5 +387,51 @@ async fn await_preparation(
             .changed()
             .await
             .map_err(|_| PlannedShutdownFallback::EngineUnavailable)?;
+    }
+}
+
+/// Prefer the unplanned fallback whenever the coordinator flag is set.
+///
+/// The flag is published before `started`, and this second check closes the
+/// remaining window where a planned preparation resolves at the same instant
+/// the flag is set: the caller-visible report must say Unplanned, not a
+/// not-admitted or other handoff failure.
+fn prefer_unplanned(
+    result: RetirementResult,
+    unplanned: &tokio::sync::watch::Receiver<bool>,
+) -> RetirementResult {
+    if *unplanned.borrow() {
+        Err(PlannedShutdownFallback::Unplanned)
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unplanned_flag_wins_over_other_fallbacks() {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            prefer_unplanned(Err(PlannedShutdownFallback::NotAdmitted), &receiver),
+            Err(PlannedShutdownFallback::NotAdmitted)
+        );
+        sender.send_replace(true);
+        assert_eq!(
+            prefer_unplanned(Err(PlannedShutdownFallback::NotAdmitted), &receiver),
+            Err(PlannedShutdownFallback::Unplanned)
+        );
+        assert_eq!(
+            prefer_unplanned(Err(PlannedShutdownFallback::DeadlineElapsed), &receiver),
+            Err(PlannedShutdownFallback::Unplanned)
+        );
+        // A flag that lands after a completed transfer still yields the weaker
+        // Unplanned report; it never claims successor authority.
+        assert_eq!(
+            prefer_unplanned(Ok(PlannedShutdownOutcome::FollowerRetired), &receiver),
+            Err(PlannedShutdownFallback::Unplanned)
+        );
     }
 }
