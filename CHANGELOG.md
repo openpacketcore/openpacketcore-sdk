@@ -175,9 +175,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version-5 TFT graph (including its three-slot counter map) is refused and
   needs a fresh attachment, exactly like every earlier pinned-ABI generation;
   no in-place migration or packet continuity is provided. Downstream code that
-  enumerated `TftFragmentDisposition` or `TftUplinkDropReason` exhaustively
-  must handle the new capacity outcomes (both are now `#[non_exhaustive]`).
-  Refs #1087.
+  enumerated `TftFragmentDisposition` exhaustively must handle the new capacity
+  outcome: `TftFragmentDisposition` is now `#[non_exhaustive]`, while the
+  already-`#[non_exhaustive]` `TftUplinkDropReason` gains the additive
+  `CapacityExhausted` variant. Refs #1087.
 
 - `opc-gtpu-dataplane`: `GtpPdpContext.peer_teid` is now `PeerTeid`, a new
   public peer/outgoing-TEID type that admits the TS 29.281 section 5.1 all-zero
