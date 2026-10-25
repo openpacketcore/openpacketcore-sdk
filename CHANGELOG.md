@@ -238,6 +238,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: native key-removal business-change journal (partial
+  #1252, PR2a). `BusinessChanges` can now stage an exact-predecessor key
+  retirement as one `after=None` change with the predecessor content stamp and
+  table-summary conservation, published through the existing row machinery.
+  Removals are deduplicated and staged at most once; a candidate key created or
+  updated in the same delta is collapsed (transient create-and-retire) and a key
+  with no committed predecessor is rejected. No production sweep produces
+  removals yet, there is no generation-base+delta/relocation/cold/replay/export
+  or SQLite prepared-base/full-image carry, and floor=0 behavior is unchanged.
+  PR2b (exact persisted-format carry and round-trip/relocation/parity tests),
+  PR2c/PR3 (capacity-triggered deterministic sweep, exact-bound and
+  stale-credential order matrix, >1,048,576 distinct-key/voter/snapshot
+  qualification) remain open; #1252 stays partial and must not be closed by
+  this change. Refs #1252.
+
 - `opc-session-store`: native touched-key retention foundation (partial #1252).
   A committed-state-only fence floor `next_fence - RETAINED_KEY_FENCES` now
   identifies protected credentials issued before a provably non-authoritative

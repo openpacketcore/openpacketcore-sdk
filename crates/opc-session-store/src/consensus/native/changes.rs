@@ -993,6 +993,7 @@ impl Publication {
             roster,
             roster_changes,
             keys,
+            key_removals,
             receipts,
             receipt_removals,
             reclaim_memory,
@@ -1264,7 +1265,43 @@ impl Publication {
             )?;
         }
         expiry.validate_requests(&frontiers)?;
-        let keys = staged(0, keys, &base.keys, tracking, &mut tables[0])?;
+        // Exact-predecessor key retirement journal rows. A candidate key
+        // created or updated earlier in this delta is dropped from the staged
+        // changes; a key that never existed in the predecessor is a transient
+        // create-and-retire with no endpoint and no journal row, exactly like a
+        // transient receipt. Everything else stages one `after=None` change with
+        // the predecessor content stamp and table-summary conservation.
+        let mut key_candidates = keys;
+        let mut key_removal_rows: Vec<StagedRow<SessionKey, NativeKeyState>> =
+            Vec::with_capacity(key_removals.len());
+        let mut retired = std::collections::HashSet::with_capacity(key_removals.len());
+        for key in key_removals {
+            if !retired.insert(key.clone()) {
+                continue;
+            }
+            let created_in_delta = key_candidates.remove(&key);
+            let Some(before) = base.keys.get(&key).cloned() else {
+                if created_in_delta.is_some() {
+                    continue;
+                }
+                return Err(invalid("native key removal has no exact predecessor"));
+            };
+            let before_hash = stamp(0, &key, &before)?;
+            tables[0].replace(Some(before_hash), None)?;
+            let journal_key = tracking.then_some(key.clone());
+            key_removal_rows.push(StagedRow {
+                key,
+                journal_key,
+                change: RowChange {
+                    before: Some(Box::new(before)),
+                    after: None,
+                    before_hash: Some(before_hash),
+                    after_hash: None,
+                },
+            });
+        }
+        let mut keys = staged(0, key_candidates, &base.keys, tracking, &mut tables[0])?;
+        keys.extend(key_removal_rows);
         let receipts = staged(1, receipts, &base.receipts, tracking, &mut tables[1])?;
         let deletions = DeletedRows::prepare(
             receipt_removals,

@@ -683,6 +683,10 @@ struct NativeDelta<'a> {
     roster: roster::Ledger,
     roster_changes: roster::changes::Journal,
     keys: HashMap<SessionKey, NativeKeyState>,
+    /// Exact predecessor keys retired by this delta's committed business
+    /// change. Publication stages them as `after=None` journal rows; no sweep
+    /// produces them yet (PR2a journal plumbing only).
+    key_removals: Vec<SessionKey>,
     expiry: expiry::ExpiryIndex,
     receipts: HashMap<FencedTransitionV2RequestId, NativeReceipt>,
     receipt_removals: changes::Removals,
@@ -1352,6 +1356,7 @@ impl NativeState {
             resolved,
             frontiers: self.frontiers.clone(),
             keys: HashMap::new(),
+            key_removals: Vec::new(),
             roster: self.roster.clone(),
             roster_changes: roster::changes::Journal::empty(&self.roster)?,
             expiry: self.require_business_proof()?.expiry.clone(),
@@ -1382,6 +1387,16 @@ impl NativeState {
         entries: &[Entry<SessionRaftTypeConfig>],
     ) -> io::Result<NativeApplied> {
         let delta = self.prepare(entries)?;
+        changes::Publication::prepare(delta)?.publish(self)
+    }
+
+    /// Test-only journal application: retire exactly one committed predecessor
+    /// key through the ordinary business publication path. No production sweep
+    /// calls this yet.
+    #[cfg(test)]
+    pub(crate) fn apply_key_retirement(&mut self, key: SessionKey) -> io::Result<NativeApplied> {
+        let mut delta = self.prepare(&[])?;
+        delta.key_removals.push(key);
         changes::Publication::prepare(delta)?.publish(self)
     }
 }
