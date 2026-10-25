@@ -1403,14 +1403,27 @@ Three limits remain.
   not closable by tightening the check; every discriminator available inside
   the program is in-band and so forgeable by a local sender.
 
-`uplink_far_misses` no longer counts the datapath's own re-emitted outer
-frames. Their source is the local S2b-U address rather than a UE PAA, so before
-the redirect outcome was recognized this counter rose once per *successfully
-delivered* uplink IPv4 packet and made a healthy uplink read as session-state
-corruption. It remains a miss counter for every other mark-zero IPv4 frame
-leaving the attachment whose source is not a provisioned UE PAA -- locally
-originated traffic from the host included -- so read a nonzero value as a
-prompt to investigate rather than as proof of session-state corruption.
+`uplink_far_misses_passed` counts IPv4 FAR misses passed unencapsulated
+because the full packet mark is zero, regardless of the packet's origin.
+Locally sent Echo and Error Indication datagrams can raise it in a healthy
+system. `uplink_far_misses_dropped` counts missing nonzero-mark FARs and
+missing marked owners, which drop the packet. `uplink_far_misses` remains
+their saturating sum for compatibility. All three exclude the datapath's own
+re-emitted outer frames. The two new counters use reserved slots without
+changing the pinned counter map's width or any forwarding decision.
+
+A zero `uplink_far_misses_dropped` is not proof of no uplink loss. Grouped
+selector/graph failures, malformed packets, reserved schema sources, invalid
+FAR/DSCP/commit/PDR/binding state, mismatched or inactive marked owners, MTU
+rejection, and encapsulation/redirect failures drop without counting here.
+The MTU counters report their respective drops separately. Counter snapshots
+are observational reads, not atomic snapshots across CPUs; the public total
+is computed from the two outcome values read in that snapshot.
+
+When a same-width counter pin from a pre-split build is retained, the new
+outcome slots start at zero. The public compatibility total therefore counts
+only misses observed by the split build. Raw slot 1 retains its earlier
+aggregate history, which cannot be attributed to either outcome.
 
 `downlink_missing_consumer` counts the hand-offs that tc gave to no UDP
 socket, because none was bound to receive them or they arrived in a VLAN above
@@ -1891,7 +1904,7 @@ a build is refused before anything is read through a typed binding or
 changed: with `DatapathGenerationMismatch` while its hooks are still
 attached, and with `ebpf_pin_map_abi` when only its pins remain. Drain it,
 remove the retained graph with the build that created it (or remove its pins
-once nothing references them), and provision again. Eight of the sixteen
+once nothing references them), and provision again. Six of the sixteen
 slots are reserved, so that the next counter does not change the width
 again. Any retained PDR/FAR without an exact binding
 is indeterminate and fails before either hook changes. The SDK never invents
@@ -2784,7 +2797,7 @@ The frozen v1 and pre-redirect artifacts both carry six-slot counter maps, so
 their authentic retained graphs require drained reprovisioning rather than
 automatic migration. The map has grown once more since, from seven to sixteen
 slots for the missing-consumer counter, and a graph retained with the
-seven-slot map is refused in the same way. Eight of the sixteen slots are
+seven-slot map is refused in the same way. Six of the sixteen slots are
 reserved, so that the next counter leaves the width as it is.
 
 **Program generation and graph identity.** Replacing a hook in place requires

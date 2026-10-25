@@ -64,6 +64,8 @@ mod backend_packet_too_big;
 mod backend_packet_too_big_ipv6;
 #[path = "ebpf_gtpu_privileged/backend_reassembly.rs"]
 mod backend_reassembly;
+#[path = "ebpf_gtpu_privileged/measured_diagnostics.rs"]
+mod measured_diagnostics;
 #[path = "ebpf_gtpu_privileged/n3_end_marker.rs"]
 mod n3_end_marker;
 #[path = "ebpf_gtpu_privileged/n3_fixed_flow.rs"]
@@ -334,10 +336,10 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_MISSING_CONSUMER,
     COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP,
-    COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
-    COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
-    DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN,
-    GTPU_MANDATORY_HDR_LEN, GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN,
+    COUNTER_UL_FAR_MISS, COUNTER_UL_FAR_MISS_DROPPED, COUNTER_UL_FAR_MISS_PASSED,
+    COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED,
+    DOWNLINK_BINDING_COUNTER_SLOTS, DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN,
+    ETH_HDR_LEN, GTPU_MANDATORY_HDR_LEN, GTPU_SESSION_CONFIG_KEY, GTPU_SESSION_CONFIG_VALUE_LEN,
     GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN, GTPU_SESSION_GROUP_REF_LEN,
     GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_IPV4_SLOT, GTPU_SESSION_IPV6_SLOT,
     GTPU_SESSION_SCHEMA_MARKER_LEN, GTPU_SESSION_SCHEMA_MARKER_VALUE,
@@ -685,144 +687,6 @@ fn command_stdout(program: &str, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
-}
-
-/// One measured expectation and the value observed when its bound expired.
-pub(crate) struct MeasuredObservation {
-    label: &'static str,
-    expected: u64,
-    observed: u64,
-}
-
-/// Value-free, bounded diagnostics for a measured privileged datapath timeout.
-///
-/// Every field is a counter, index, closed label or truncated kernel state
-/// record from the test's own topology (documentation-range addresses only);
-/// no packet payload, credential or peer identity is included, and each kernel
-/// reader is bounded and rendered as `unavailable(...)` on failure so a
-/// timeout path cannot block on diagnostics generation.
-pub(crate) struct DatapathTimeoutDiagnostics<'a> {
-    context: &'a str,
-    redirect_delta: Option<i128>,
-    shared_peer_iteration: Option<usize>,
-    observations: Vec<MeasuredObservation>,
-}
-
-impl<'a> DatapathTimeoutDiagnostics<'a> {
-    pub(crate) fn new(context: &'a str) -> Self {
-        Self {
-            context,
-            redirect_delta: None,
-            shared_peer_iteration: None,
-            observations: Vec::new(),
-        }
-    }
-
-    pub(crate) fn redirect_delta(mut self, delta: i128) -> Self {
-        self.redirect_delta = Some(delta);
-        self
-    }
-
-    pub(crate) fn shared_peer_iteration(mut self, iteration: usize) -> Self {
-        self.shared_peer_iteration = Some(iteration);
-        self
-    }
-
-    pub(crate) fn observe(mut self, label: &'static str, expected: u64, observed: u64) -> Self {
-        self.observations.push(MeasuredObservation {
-            label,
-            expected,
-            observed,
-        });
-        self
-    }
-
-    /// Render one deterministic, value-free line for the failing assertion.
-    pub(crate) fn render(&self) -> String {
-        let redirect_delta = self.redirect_delta.map_or_else(
-            || "not-measured-at-this-stage".to_owned(),
-            |delta| delta.to_string(),
-        );
-        let shared_peer_iteration = self.shared_peer_iteration.map_or_else(
-            || "not-applicable".to_owned(),
-            |iteration| iteration.to_string(),
-        );
-        let observations = if self.observations.is_empty() {
-            "none-at-this-stage".to_owned()
-        } else {
-            self.observations
-                .iter()
-                .map(|observation| {
-                    format!(
-                        "{}=expected:{} observed:{}",
-                        observation.label, observation.expected, observation.observed
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        format!(
-            "{}: measured datapath state: redirect_delta={redirect_delta}; shared_peer_iteration={shared_peer_iteration}; counters=[{observations}]; tentative_addresses=[{}]; neighbours=[{}]; routes4=[{}]; routes6=[{}]",
-            self.context,
-            bounded_kernel_state("ip", &["-6", "addr", "show", "tentative"]),
-            bounded_kernel_state("ip", &["neigh", "show"]),
-            bounded_kernel_state("ip", &["route", "show"]),
-            bounded_kernel_state("ip", &["-6", "route", "show"]),
-        )
-    }
-}
-
-/// Read kernel datapath state for diagnostics only: bounded output, no panic,
-/// and failures collapse to a closed `unavailable` marker.
-fn bounded_kernel_state(program: &str, args: &[&str]) -> String {
-    const MAX_DIAGNOSTIC_STATE_CHARS: usize = 1024;
-    let output = match Command::new(program).args(args).output() {
-        Ok(output) => output,
-        Err(error) => return format!("unavailable({:?})", error.kind()),
-    };
-    let mut text = String::from_utf8_lossy(&output.stdout).replace('\n', "; ");
-    if !output.status.success() {
-        text.push_str(&format!(" status={}", output.status));
-    }
-    if text.chars().count() > MAX_DIAGNOSTIC_STATE_CHARS {
-        text = text.chars().take(MAX_DIAGNOSTIC_STATE_CHARS).collect();
-        text.push_str("...");
-    }
-    text
-}
-
-/// Deterministic forced-timeout regression for the shared diagnostic renderer.
-/// Runs in the privileged datapath lane (`--ignored`), needs no privilege: it
-/// asserts a synthetic timed-out measurement renders every required field.
-#[test]
-#[ignore = "privileged datapath lane runs this diagnostics regression"]
-fn forced_timeout_reports_datapath_state_fields() {
-    let rendered = DatapathTimeoutDiagnostics::new("forced timeout")
-        .redirect_delta(-6)
-        .shared_peer_iteration(1)
-        .observe("missing-consumer drops", 6, 5)
-        .observe("reassembled", 6, 4)
-        .render();
-    for field in [
-        "forced timeout",
-        "redirect_delta=-6",
-        "shared_peer_iteration=1",
-        "missing-consumer drops=expected:6 observed:5",
-        "reassembled=expected:6 observed:4",
-        "tentative_addresses=[",
-        "neighbours=[",
-        "routes4=[",
-        "routes6=[",
-    ] {
-        assert!(
-            rendered.contains(field),
-            "timed-out measured assertion must report {field}: {rendered}"
-        );
-    }
-    assert!(
-        !rendered.contains("INVITE") && !rendered.contains("password"),
-        "diagnostics must stay value-free: {rendered}"
-    );
 }
 
 /// Run `f` on a thread joined to the named netns; sockets it creates keep
@@ -6874,6 +6738,30 @@ fn pinned_default_commit(pin_dir: &std::path::Path) -> Option<[u8; UPLINK_SOURCE
     commits.get(&UE_PAA.octets(), 0).ok()
 }
 
+fn assert_far_miss_delta(
+    before: opc_gtpu_dataplane::EbpfGtpuDatapathCounters,
+    after: opc_gtpu_dataplane::EbpfGtpuDatapathCounters,
+    passed: u64,
+    dropped: u64,
+) {
+    assert_eq!(
+        after.uplink_far_misses_passed,
+        before.uplink_far_misses_passed + passed
+    );
+    assert_eq!(
+        after.uplink_far_misses_dropped,
+        before.uplink_far_misses_dropped + dropped
+    );
+    assert_eq!(
+        after.uplink_far_misses,
+        before.uplink_far_misses + passed + dropped
+    );
+    assert_eq!(
+        after.uplink_far_misses,
+        after.uplink_far_misses_passed + after.uplink_far_misses_dropped
+    );
+}
+
 fn pinned_far_miss_counters(pin_dir: &Path) -> [u64; 3] {
     // Read the raw ABI slots so this packet regression also compiles against
     // the unsplit datapath. Slots 8 and 9 already exist in its 16-slot map.
@@ -7393,6 +7281,14 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
             COUNTER_UL_FAR_MISS,
         ),
         (
+            initial_snapshot.counters.uplink_far_misses_passed,
+            COUNTER_UL_FAR_MISS_PASSED,
+        ),
+        (
+            initial_snapshot.counters.uplink_far_misses_dropped,
+            COUNTER_UL_FAR_MISS_DROPPED,
+        ),
+        (
             initial_snapshot.counters.downlink_decapsulated,
             COUNTER_DL_DECAP,
         ),
@@ -7792,6 +7688,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     drain_datagrams(&pgw_socket);
     drain_datagrams(&pgw_plaintext_socket);
     let raw_far_miss_before = pinned_far_miss_counters(&marked_pin_dir);
+    let far_miss_before = backend.datapath_snapshot(&device).await?.counters;
     for _ in 0..3 {
         ue_unknown_mark_socket.send_to(b"must-not-leak", (REMOTE_HOST, 53))?;
     }
@@ -7803,6 +7700,8 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         0,
         3,
     );
+    let far_miss_after = backend.datapath_snapshot(&device).await?.counters;
+    assert_far_miss_delta(far_miss_before, far_miss_after, 0, 3);
 
     // A missing marked owner drops even when the complete FAR is present.
     let owner_map = Map::from_map_data(MapData::from_pin(
@@ -7820,11 +7719,13 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     let owner = owners.get(&owner_key, 0)?;
     owners.remove(&owner_key)?;
     let raw_owner_miss_before = pinned_far_miss_counters(&marked_pin_dir);
+    let owner_miss_before = backend.datapath_snapshot(&device).await?.counters;
     for _ in 0..3 {
         ue_mark_a_socket.send_to(b"missing-owner-must-not-leak", (REMOTE_HOST, 53))?;
     }
     expect_no_datagram(&pgw_socket);
     expect_no_datagram(&pgw_plaintext_socket);
+    let owner_miss_after = backend.datapath_snapshot(&device).await?.counters;
     owners.insert(owner_key, owner, 0)?;
     assert_pinned_far_miss_delta(
         raw_owner_miss_before,
@@ -7832,9 +7733,11 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         0,
         3,
     );
+    assert_far_miss_delta(owner_miss_before, owner_miss_after, 0, 3);
 
     // Control datagrams sent with mark zero pass unchanged without a FAR.
     let raw_passed_before = pinned_far_miss_counters(&marked_pin_dir);
+    let passed_before = backend.datapath_snapshot(&device).await?.counters;
     pgw_socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     for message_type in [1, 2] {
         let control = [0x32, message_type, 0, 4, 0, 0, 0, 0, 0, 42, 0, 0];
@@ -7849,6 +7752,8 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         2,
         0,
     );
+    let passed_after = backend.datapath_snapshot(&device).await?.counters;
+    assert_far_miss_delta(passed_before, passed_after, 2, 0);
 
     // A non-G-PDU retains the priority-10 injected outer sentinel and passes
     // to the local control plane. This exact-mark INPUT gate proves the
@@ -12940,7 +12845,14 @@ async fn ebpf_gtpu_uplink_redirect_counter_tracks_delivery_not_submission(
         .expect("set PGW read timeout");
     for index in 0..REDIRECT_PROBE_PACKETS {
         let (len, from) = pgw_socket.recv_from(&mut buffer).unwrap_or_else(|error| {
-            panic!("healthy uplink G-PDU {index} must reach the PGW: {error}")
+            panic!(
+                "healthy uplink G-PDU {index} must reach the PGW: {error}\n{}",
+                measured_diagnostics::DatapathDiagnostics {
+                    pin_dir: &pin_dir,
+                    redirects_before: reachable_before.uplink_redirects_resolved,
+                    iteration: &format!("reachable packet={index}"),
+                }
+            )
         });
         assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
         assert!(buffer[..len].ends_with(format!("opc-redirect-healthy-{index}").as_bytes()));
@@ -13073,7 +12985,14 @@ async fn ebpf_gtpu_uplink_redirect_counter_tracks_delivery_not_submission(
     }
     for index in 0..REDIRECT_PROBE_PACKETS {
         let (len, _) = pgw_socket.recv_from(&mut buffer).unwrap_or_else(|error| {
-            panic!("recovered uplink G-PDU {index} must reach the PGW: {error}")
+            panic!(
+                "recovered uplink G-PDU {index} must reach the PGW: {error}\n{}",
+                measured_diagnostics::DatapathDiagnostics {
+                    pin_dir: &pin_dir,
+                    redirects_before: recovered_before.uplink_redirects_resolved,
+                    iteration: &format!("recovered packet={index}"),
+                }
+            )
         });
         assert!(buffer[..len].ends_with(format!("opc-redirect-recovered-{index}").as_bytes()));
     }

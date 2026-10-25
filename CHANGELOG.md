@@ -838,6 +838,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Unavailable` and never becomes readable again. Ports without backend-owned
   sockets keep the default `Unsupported` result. Refs #1021.
 
+- `opc-gtpu-dataplane`: expose IPv4 uplink FAR misses by passed and dropped
+  outcome, retaining `uplink_far_misses` as their sum. Reserved counter slots
+  preserve the map layout; forwarding behavior is unchanged. The public
+  `EbpfGtpuDatapathCounters` remains exhaustive: out-of-crate struct literals
+  and exhaustive destructurings must add `uplink_far_misses_passed` and
+  `uplink_far_misses_dropped`. When adopting a pre-split counter pin, the public
+  total starts from the new outcome slots; earlier raw-slot history cannot be
+  attributed to either outcome. (#1184)
+
 - `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
   verification time for certificate validity checks while preserving SPIFFE ID,
   trust-domain and workload-path validation. `from_cert_der` continues to use
@@ -1589,6 +1598,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-gtpu-dataplane`: measured End Marker and redirect-delivery timeouts now
+  report redirect deltas, iteration, counters, tentative IPv6 addresses, and
+  neighbour/route state, including failed diagnostic reads. Packet counts and
+  measurement deadlines are unchanged. (#1188)
 
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 
