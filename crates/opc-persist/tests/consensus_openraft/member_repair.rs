@@ -572,6 +572,10 @@ async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
 }
 
 fn large_attested(tx: TxId) -> AttestedConfigCommit {
+    large_attested_with_plaintext(tx, 256 * 1024)
+}
+
+fn large_attested_with_plaintext(tx: TxId, plaintext_bytes: usize) -> AttestedConfigCommit {
     let mut record = commit(tx, None, 1, 0x41);
     let aad = EnvelopeAad::config(
         opc_types::TenantId::from_static("tenant-a"),
@@ -592,7 +596,7 @@ fn large_attested(tx: TxId) -> AttestedConfigCommit {
         opc_types::TenantId::from_static("tenant-a"),
         Zeroizing::new([0x41; AES_256_GCM_SIV_KEY_LEN]),
     );
-    let plaintext = vec![0x41; 256 * 1024];
+    let plaintext = vec![0x41; plaintext_bytes];
     let envelope = encrypt_attested_envelope_with_handle_and_nonce(
         &handle,
         &aad,
@@ -789,6 +793,106 @@ async fn cancelled_repair_requires_fresh_quorum_then_reopens_with_a_majority() {
             .record
             .tx_id,
         second
+    );
+    cluster.shutdown().await;
+}
+
+// Linux-only lane: needs CI/qualification run (real-time multi-chunk repair
+// fixture; the macOS analysis host cannot open the fixed-quorum fixture).
+#[cfg(all(target_os = "linux", feature = "dangerous-test-hooks"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repair_transfer_verifies_once_and_derives_one_size_following_attempt_budget() {
+    let mut cluster = ThreeNodeCluster::start().await;
+    let tx = TxId::new();
+    let payload_bytes = 2 * 1024 * 1024;
+    cluster.stores[cluster.leader()]
+        .append_commit_idempotent(
+            ConfigConsensusRequestId::from_bytes([0x51; 16]),
+            large_attested_with_plaintext(tx, payload_bytes),
+        )
+        .await
+        .unwrap();
+    cluster.stores[0].shutdown().await.unwrap();
+    let leader = cluster.leader();
+    assert_ne!(leader, 0);
+    cluster.stores[leader]
+        .probe_durable_readiness()
+        .await
+        .unwrap();
+    cluster.stores[leader].trigger_snapshot().await.unwrap();
+
+    let nodes = [1, 2, 3].map(|id| ConfigConsensusNodeId::new(id).unwrap());
+    let topology =
+        ConfigConsensusTopology::try_new(cluster.identity, nodes[0], nodes.into_iter().collect())
+            .unwrap();
+    let options = retained_options(
+        &cluster._directory.path().join("scaled-repair.sqlite"),
+        topology.clone(),
+        12,
+    );
+    let backend = SqliteBackend::provision_config_member_repair(options, audit_key())
+        .await
+        .unwrap();
+    let control = Arc::new(RepairControl::default());
+    let peers = (1..3)
+        .map(|target| {
+            (
+                nodes[target],
+                Arc::new(RepairPeer {
+                    peer: cluster.paths[&(0, target)].clone(),
+                    control: control.clone(),
+                }) as Arc<dyn ConsensusPeer>,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let snapshots = cluster._directory.path().join("scaled-repair-snapshots");
+    cluster.stores[0] = ConsensusConfigStore::open_with_operation_timeout(
+        topology,
+        backend,
+        &snapshots,
+        peers,
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    for ((_, target), peer) in &cluster.paths {
+        if *target == 0 {
+            peer.install(cluster.stores[0].rpc_handler()).await;
+        }
+    }
+    // Each whole-file verification costs a quarter second. Per-chunk
+    // re-verification of this multi-chunk snapshot exceeds the 3 s operation
+    // deadline; one verification plus cheap chunk reads fits the size-derived
+    // transfer attempt.
+    cluster.stores[leader].set_snapshot_verification_delay_for_test(Duration::from_millis(250));
+    let verifications_before = cluster.stores[leader].snapshot_envelope_verifications_for_test();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        cluster.stores[0].initialize_cluster(),
+    )
+    .await
+    .expect("one bounded size-derived repair attempt")
+    .expect("single attempt repairs the large snapshot");
+    let verifications =
+        cluster.stores[leader].snapshot_envelope_verifications_for_test() - verifications_before;
+    assert_eq!(
+        verifications, 1,
+        "the snapshot is verified once per transfer, not once per cursor chunk"
+    );
+    assert!(
+        control.chunks.load(Ordering::SeqCst) > 4,
+        "the regression snapshot is multi-chunk: {}",
+        control.chunks.load(Ordering::SeqCst)
+    );
+    assert_eq!(
+        cluster.stores[0]
+            .load_latest()
+            .await
+            .unwrap()
+            .unwrap()
+            .record
+            .tx_id,
+        tx
     );
     cluster.shutdown().await;
 }

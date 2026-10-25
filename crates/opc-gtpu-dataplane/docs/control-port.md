@@ -52,9 +52,33 @@ only by explicit processing getters.
 existing eBPF attachment with a concrete IPv4 endpoint. Repeated opens share
 one backend-owned socket. This includes a grouped attachment with IPv4;
 an IPv6-only attachment returns `UnsupportedFeature { feature:
-"gtpu_control_port_ipv6" }`. Linux kernel-GTP, mock and unsupported backends
-return `UnsupportedFeature { feature: "gtpu_control_port" }`. They do not
-open another listener or expose their private file descriptors.
+"gtpu_control_port_ipv6" }`. Mock and unsupported backends return
+`UnsupportedFeature { feature: "gtpu_control_port" }`. They do not open
+another listener or expose their private file descriptors.
+
+For `LinuxGtpuDataplaneBackend`, an ordinary (non-recoverable) creation keeps
+a userspace UDP socket and passes its descriptor to the kernel GTP driver.
+The driver passes every non-G-PDU and every G-PDU whose TEID matches no PDP
+context back to that socket's ordinary queue: the TS 29.281 7.3.1
+unknown-tunnel trigger. `open_gtpu_control_port` exposes exactly that queue
+and never binds, duplicates or reopens a socket; a recoverable kernel-owned
+attachment has no userspace descriptor and returns `UnsupportedFeature {
+feature: "gtpu_control_port_kernel_owned" }`. The port accepts only a
+concrete IPv4 bind on UDP/2152 (else `gtpu_control_port_ipv6` or
+`gtpu_control_port_port`). `try_receive_downlink` returns a G-PDU as
+`UnknownTunnel` (an observation, never tunnel or peer authority), controls,
+unmodelled messages and unsupported required-extension events as `Control`
+(so `extension_notification` still applies), and malformed framing as a
+`Malformed` drop. Receive and response return the typed `Busy` result instead
+of waiting behind an attachment mutation, and every response pins its
+transmitted IP source with an `IP_PKTINFO` cmsg to the original local
+destination, so a wildcard bind on a multi-homed endpoint keeps the ingress
+address. A
+`GtpuControlDatagram::unknown_tunnel_error` plan is bound to the exact
+receiving generation; removal, replacement, adoption or a socket/descriptor
+generation change retires the old port and every outstanding plan, so an old
+receive capability can never send through a replacement generation. The
+retained descriptor remains the only socket owner.
 
 The backend checks its exact current tc hooks/maps and serializes each socket
 operation per attachment, through that registration's socket slot. PDP
@@ -261,7 +285,7 @@ the datagram.
 | --- | --- |
 | `Decapsulated` | The inner packet, its family and bearer mark (default bearer is `None`). An IPv4 packet has a validated header and ends at its total length. The caller injects it toward XFRM with that mark. The packet can be an inner IPv4 fragment; see [Inner fragments](#inner-fragments). |
 | `Control` | Non-G-PDU message; use the response planners above. |
-| `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. |
+| `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. On Linux kernel-GTP it is the datagram the kernel passed up from the retained userspace socket; the caller decides whether an Error Indication is due. |
 | `Dropped` | Value-free `GtpuDownlinkDrop`: malformed (including an inner IPv4 header that fails the checks above), binding mismatch, destination mismatch, state unavailable, or an over-MTU packet refused by the inner fragmenter (rate limited, or carrying IPv4 options). |
 | `Fragmented` | An over-MTU DF IPv4 packet split into RFC 791 inner fragments under the default policy below, with the bearer mark. The caller injects every fragment, in order, toward XFRM with that mark. |
 | `PacketTooBig` | An over-MTU DF IPv4 packet, or an over-MTU inner IPv6 packet, under the explicit in-tunnel Packet Too Big opt-in below; never forwarded. |

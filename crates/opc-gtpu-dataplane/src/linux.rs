@@ -5,7 +5,7 @@ use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -78,6 +78,26 @@ impl Default for LinuxGtpuDataplaneBackendConfig {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod control_port;
+
+/// One exact attachment-generation binding for the retained control socket.
+///
+/// The token is shared only with the retained socket generation; a replacement
+/// device, socket or namespace retires the slot, and every operation compares
+/// the slot before touching the descriptor.
+struct ControlSlot {
+    ifindex: u32,
+    name: String,
+    namespace: Option<PdpLiveWriterNamespaceIdentity>,
+    bind_address: IpAddr,
+    bind_port: u16,
+    /// `SO_COOKIE` of the exact retained descriptor, when it is a real socket.
+    socket_cookie: Option<u64>,
+    identity: Arc<()>,
+    active: AtomicBool,
+}
+
 /// Production Linux kernel GTP-U dataplane backend.
 ///
 /// This backend opens raw route/generic netlink sockets through
@@ -102,6 +122,11 @@ struct LinuxGtpuDataplaneBackendInner {
     /// Serializes PDP read/compare/mutate transactions across backend clones.
     pdp_operation_lock: Mutex<()>,
     device_sockets: Mutex<OwnedDeviceSockets>,
+    /// Active attachment-bound control-port slots, one per retained
+    /// userspace socket generation. Retired on removal, replacement or
+    /// adoption; operations revalidate the slot and descriptor under
+    /// `device_sockets`.
+    control_ports: Mutex<HashMap<u32, Arc<ControlSlot>>>,
     config: LinuxGtpuDataplaneBackendConfig,
     /// Durable directory anchoring cross-process PDP restart-recovery leases.
     ///
@@ -140,6 +165,7 @@ impl LinuxGtpuDataplaneBackend {
                 next_sequence: AtomicU32::new(1),
                 pdp_operation_lock: Mutex::new(()),
                 device_sockets: Mutex::new(OwnedDeviceSockets::default()),
+                control_ports: Mutex::new(HashMap::new()),
                 config,
                 pdp_recovery_root: OnceLock::new(),
             }),
@@ -238,6 +264,7 @@ impl LinuxGtpuDataplaneBackend {
                 next_sequence: AtomicU32::new(1),
                 pdp_operation_lock: Mutex::new(()),
                 device_sockets: Mutex::new(OwnedDeviceSockets::default()),
+                control_ports: Mutex::new(HashMap::new()),
                 config: LinuxGtpuDataplaneBackendConfig {
                     receive_attempts: 1,
                     receive_buffer_len: 4096,
@@ -644,6 +671,7 @@ impl LinuxGtpuDataplaneBackend {
             .device_sockets
             .lock()
             .map_err(|_| GtpuError::io("device_socket_retain", poisoned_lock()))?;
+        self.retire_control_port_locked(device.ifindex);
         match &socket.socket {
             OwnedGtpuSocket::Userspace(_) => {
                 sockets.userspace.insert(device.ifindex, socket);
@@ -691,7 +719,18 @@ impl LinuxGtpuDataplaneBackend {
         sockets.kernel.retain(|(owned_ifindex, owned)| {
             *owned_ifindex != ifindex || owned.namespace != Some(namespace)
         });
+        self.retire_control_port_locked(ifindex);
         Ok(())
+    }
+
+    /// Retire the attachment's control-port generation. The caller holds
+    /// `device_sockets`, preserving the backend lock order.
+    fn retire_control_port_locked(&self, ifindex: u32) {
+        if let Ok(mut ports) = self.inner.control_ports.lock() {
+            if let Some(slot) = ports.remove(&ifindex) {
+                slot.active.store(false, Ordering::SeqCst);
+            }
+        }
     }
 
     fn probe_sync(&self) -> GtpuProbe {
@@ -1627,6 +1666,18 @@ fn acquire_pdp_topology_lease(_root: &Path) -> Result<PdpRecoveryLease, GtpuErro
 
 #[async_trait]
 impl GtpuDataplaneBackend for LinuxGtpuDataplaneBackend {
+    #[cfg(target_os = "linux")]
+    async fn open_gtpu_control_port(
+        &self,
+        device: &GtpDevice,
+    ) -> Result<std::sync::Arc<dyn crate::control_port::GtpuControlPort>, GtpuError> {
+        let device = device.clone();
+        self.run_blocking("open_gtpu_control_port", move |backend| {
+            control_port::open(&backend, device)
+        })
+        .await
+    }
+
     async fn create_device(&self, request: CreateGtpDeviceRequest) -> Result<GtpDevice, GtpuError> {
         self.run_blocking("create_device", move |backend| {
             backend.create_device_sync(request)
@@ -1808,6 +1859,15 @@ impl GtpuSocketHandle {
 
     fn raw_fd(&self) -> i32 {
         self.raw_fd
+    }
+
+    fn is_real(&self) -> bool {
+        self._socket.is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_as_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self._socket.as_ref().map(GtpuUdpSocket::as_fd)
     }
 }
 
@@ -3321,6 +3381,7 @@ mod tests {
 
     use super::*;
     use crate::model::{PdpLiveWriterNamespaceIdentity, Teid, DEFAULT_PDP_HASHSIZE};
+    use crate::DownlinkOuterProvenance;
     use crate::{
         PdpContextMismatchField, PdpContextSelectorOccupancy, PdpLiveWriterProof,
         PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof, RetainedDeviceConflictReason,
@@ -8620,6 +8681,153 @@ mod tests {
         let mut remove = RemovePdpContextRequest::from_context(&pdp_context());
         remove.link_ifindex = 0;
         assert!(validate_remove_pdp_context_request(&remove).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn control_transport() -> CapturingTransport {
+        let transport = CapturingTransport::new();
+        *transport.namespace_identity.lock().unwrap() = Some((1, 2));
+        transport
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_userspace_socket(_ifindex: u32, name: &str, raw_fd: i32) -> OwnedDeviceSocket {
+        OwnedDeviceSocket {
+            name: name.to_string(),
+            namespace: Some(PdpLiveWriterNamespaceIdentity::from_dev_ino(1, 2)),
+            bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            bind_port: GTPU_PORT,
+            socket: OwnedGtpuSocket::Userspace(GtpuSocketHandle::fake(raw_fd)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unknown_tunnel_datagram() -> crate::control_port::GtpuControlDatagram {
+        crate::control_port::GtpuControlDatagram::received(
+            bytes::Bytes::copy_from_slice(&[0x30, 255, 0, 1, 1, 2, 3, 4, 0x45]),
+            DownlinkOuterProvenance::new(
+                Ipv4Addr::new(127, 0, 0, 3),
+                Ipv4Addr::new(127, 0, 0, 2),
+                1,
+                49152,
+            )
+            .unwrap(),
+            Arc::new(()),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_control_port_requires_a_retained_userspace_socket() {
+        let transport = control_transport();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport);
+        backend.inner.device_sockets.lock().unwrap().kernel.push((
+            42,
+            OwnedDeviceSocket {
+                name: "gtp0".to_string(),
+                namespace: Some(PdpLiveWriterNamespaceIdentity::from_dev_ino(1, 2)),
+                bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                bind_port: GTPU_PORT,
+                socket: OwnedGtpuSocket::KernelOwned(test_device_incarnation()),
+            },
+        ));
+        let device = GtpDevice {
+            name: "gtp0".to_string(),
+            ifindex: 42,
+        };
+        assert!(matches!(
+            backend.open_gtpu_control_port(&device).await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_control_port_kernel_owned"
+            })
+        ));
+        // No slot was published for a queue this backend cannot reach.
+        assert!(backend.inner.control_ports.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_control_port_refuses_nonstandard_port_and_ipv6_bind() {
+        let transport = control_transport();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport);
+        let mut request = CreateGtpDeviceRequest::new("gtp-port");
+        request.bind_port = 32_151;
+        let device = backend.create_device(request).await.unwrap();
+        assert!(matches!(
+            backend.open_gtpu_control_port(&device).await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_control_port_port"
+            })
+        ));
+        let mut request = CreateGtpDeviceRequest::new("gtp-v6");
+        request.bind_address = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let device = backend.create_device(request).await.unwrap();
+        assert!(matches!(
+            backend.open_gtpu_control_port(&device).await,
+            Err(GtpuError::UnsupportedFeature {
+                feature: "gtpu_control_port_ipv6"
+            })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_control_port_lifetime_tracks_the_retained_socket_generation() {
+        let transport = control_transport();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport);
+        let device = backend
+            .create_device(CreateGtpDeviceRequest::new("gtp0"))
+            .await
+            .unwrap();
+        let port = backend.open_gtpu_control_port(&device).await.unwrap();
+        // Fake descriptors cannot receive; the binding is still published.
+        assert!(port.try_receive_datagram(64).is_err());
+        // A replacement retained socket retires the old generation.
+        backend
+            .retain_device_socket(
+                &device,
+                retained_userspace_socket(device.ifindex, "gtp0", 99),
+            )
+            .unwrap();
+        assert_eq!(
+            port.try_receive_datagram(64).unwrap_err(),
+            crate::control_port::GtpuControlPortError::Unavailable
+        );
+        // The same live attachment can be reopened on its new generation.
+        let fresh = backend.open_gtpu_control_port(&device).await.unwrap();
+        assert!(fresh.try_receive_datagram(64).is_err());
+        // Removing the device retires the replacement generation too.
+        backend.remove_device(&device).await.unwrap();
+        assert_eq!(
+            fresh.try_receive_datagram(64).unwrap_err(),
+            crate::control_port::GtpuControlPortError::Unavailable
+        );
+        assert!(backend.inner.control_ports.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_control_port_rejects_plans_from_another_generation() {
+        let transport = control_transport();
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport);
+        let device = backend
+            .create_device(CreateGtpDeviceRequest::new("gtp0"))
+            .await
+            .unwrap();
+        let port = backend.open_gtpu_control_port(&device).await.unwrap();
+        let budget = crate::control_port::GtpuControlResponseBudget::new(28, 4).unwrap();
+        let plan = unknown_tunnel_datagram()
+            .unknown_tunnel_error(budget)
+            .unwrap();
+        assert_eq!(
+            port.send_control_response(plan).unwrap_err(),
+            crate::control_port::GtpuControlPortError::SocketMismatch
+        );
+        // Receive limits are validated before touching the retained socket.
+        assert_eq!(
+            port.try_receive_datagram(7).unwrap_err(),
+            crate::control_port::GtpuControlPortError::InvalidLimits
+        );
     }
 
     #[test]

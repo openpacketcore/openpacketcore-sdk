@@ -225,6 +225,40 @@ observed only by the quorum-lease watchdog (one poll/half-heartbeat cadence), so
 its bound can be up to one heartbeat late across a same-node term change; that
 grace is bounded and never grants authority to a proven-stale leader.
 
+### Snapshot work budgets follow size
+
+Snapshot build, install and repair deadlines scale with the bytes they move
+(#1339). Each stage derives its own bound as the preserved stage floor plus one
+second per complete 8 MiB of that stage's input, capped by an 8 h ceiling:
+build/install stages keep the previous 60 s floor for ordinary snapshots, and a
+repair attempt keeps the previous 10 s floor. No stage shares another stage's
+deadline, so a slow-but-healthy large snapshot cannot consume the budget of a
+later stage, and every timeout at a derived bound is still typed.
+
+- Build derives its SQLite backup stage from the database size, then derives the
+  envelope copy/hash stage from the captured artifact size; directory sync,
+  staging removal, final open and metadata publication keep the 60 s stage floor.
+- Install starts its size-derived work budget only after acquiring the snapshot
+  build gate (the gate wait keeps its own preserved bound), then derives
+  sync/verify, extraction, promotion and SQLite installation budgets from the
+  received envelope/payload sizes.
+- Repair first asks the authenticated leader for the exact published envelope
+  length (a cheap durable-row probe that verifies nothing) and uses it to derive
+  one size-following attempt deadline. A peer that cannot answer keeps the
+  previous fixed attempt deadline, so mixed-version repair remains conservative.
+  The verified snapshot descriptor is then cached per transfer, so the snapshot
+  is hashed once instead of once per 128 KiB cursor chunk.
+- A resent final snapshot chunk is idempotent: while the final artifact is
+  installing or after it installed, a duplicate final chunk receives the
+  ordinary success reply instead of forcing a whole new transfer. A failed
+  installation clears the marker so the engine can restart the transfer.
+- Replacement snapshot reads reuse the digest produced by the engine snapshot
+  read's single whole-file verification instead of hashing the file again.
+
+These bounds are progress/size based, never unbounded: the largest admissible
+artifact at the documented minimum throughput stays below the ceiling, and an
+operation that reaches its derived bound fails typed instead of extending.
+
 The HA composition is:
 
 ```text

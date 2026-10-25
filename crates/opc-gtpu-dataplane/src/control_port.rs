@@ -594,6 +594,29 @@ impl GtpuControlDatagram {
     }
 }
 
+/// Map one received datagram to the backend-neutral downlink outcome.
+///
+/// This is the shared classification used by backend control ports whose
+/// receive queue carries both controls and unknown-tunnel G-PDUs. Only
+/// malformed framing is a drop: a bound control, an unmodelled message and a
+/// required-extension event all stay available to the existing control
+/// planners (in particular `extension_notification`), while a structurally
+/// complete G-PDU is returned as an untouched unknown-tunnel observation.
+#[must_use]
+pub(crate) fn downlink_event(datagram: GtpuControlDatagram) -> crate::GtpuDownlinkEvent {
+    match datagram.kind() {
+        GtpuControlDatagramKind::Gpdu => crate::GtpuDownlinkEvent::UnknownTunnel(datagram),
+        GtpuControlDatagramKind::Control
+        | GtpuControlDatagramKind::Unmodelled
+        | GtpuControlDatagramKind::UnsupportedRequiredExtension => {
+            crate::GtpuDownlinkEvent::Control(datagram)
+        }
+        GtpuControlDatagramKind::Malformed => {
+            crate::GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::Malformed)
+        }
+    }
+}
+
 /// Affine response plan bound to one exact receiving socket.
 ///
 /// Sending consumes the plan even if I/O fails; retries require a new received
@@ -724,6 +747,123 @@ mod tests {
                 .unwrap_err(),
             GtpuControlPortError::WrongProcedure
         );
+    }
+
+    #[test]
+    fn unknown_tunnel_error_refuses_every_non_gpdu_and_zero_teid() {
+        // A control message, an unsupported required extension and malformed
+        // framing are observations that never authorize an Error Indication.
+        let required = [0x34, 255, 0, 9, 1, 2, 3, 4, 0, 0, 0, 0x80, 1, 0, 0, 0, 0x45];
+        for event in [
+            receive(ECHO, 49152),
+            receive(&required, 49152),
+            receive(&[0x30, 255, 0], 49152),
+        ] {
+            assert_eq!(
+                event.unknown_tunnel_error(budget()).unwrap_err(),
+                GtpuControlPortError::WrongProcedure
+            );
+        }
+        let mut zero = GPDU.to_vec();
+        zero[4..8].fill(0);
+        assert_eq!(
+            receive(&zero, 49152)
+                .unknown_tunnel_error(budget())
+                .unwrap_err(),
+            GtpuControlPortError::WrongProcedure
+        );
+        // Any nonzero unknown TEID is a candidate; tunnel authority is the
+        // caller's lookup, never this receive event.
+        for teid in [1_u32, 0x0102_0304, u32::MAX] {
+            let mut packet = GPDU.to_vec();
+            packet[4..8].copy_from_slice(&teid.to_be_bytes());
+            let plan = receive(&packet, 49152)
+                .unknown_tunnel_error(budget())
+                .unwrap();
+            assert_eq!(
+                plan.source(),
+                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2152)
+            );
+            assert_eq!(
+                plan.destination(),
+                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), 2152)
+            );
+            assert_eq!(plan.received_length(), packet.len());
+            assert_eq!(plan.response_length(), 28);
+        }
+    }
+
+    #[test]
+    fn unknown_tunnel_error_refuses_invalid_response_tuples() {
+        let packet = GPDU;
+        for (peer, local) in [
+            (Ipv4Addr::new(127, 0, 0, 3), Ipv4Addr::new(224, 0, 0, 2)),
+            (Ipv4Addr::new(224, 0, 0, 1), Ipv4Addr::new(127, 0, 0, 2)),
+        ] {
+            let event = GtpuControlDatagram::received(
+                Bytes::copy_from_slice(packet),
+                DownlinkOuterProvenance::new(peer, local, 1, 49152).unwrap(),
+                Arc::new(()),
+            );
+            assert_eq!(
+                event.unknown_tunnel_error(budget()).unwrap_err(),
+                GtpuControlPortError::InvalidTuple
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_tunnel_error_enforces_byte_and_amplification_budgets() {
+        // 9 received octets, a 28-octet Error Indication.
+        let tight = GtpuControlResponseBudget::new(28, 4).unwrap();
+        assert_eq!(
+            receive(GPDU, 49152)
+                .unknown_tunnel_error(tight)
+                .unwrap()
+                .response_length(),
+            28
+        );
+        for budget in [
+            GtpuControlResponseBudget::new(27, 4).unwrap(),
+            GtpuControlResponseBudget::new(28, 3).unwrap(),
+            GtpuControlResponseBudget::new(1024, 1).unwrap(),
+        ] {
+            assert_eq!(
+                receive(GPDU, 49152)
+                    .unknown_tunnel_error(budget)
+                    .unwrap_err(),
+                GtpuControlPortError::ResponseBudgetExceeded
+            );
+        }
+    }
+
+    #[test]
+    fn downlink_outcome_matches_the_ebpf_verdict() {
+        use crate::GtpuDownlinkEvent;
+        // A complete G-PDU is an untouched unknown-tunnel observation.
+        assert!(matches!(
+            downlink_event(receive(GPDU, 49152)),
+            GtpuDownlinkEvent::UnknownTunnel(event)
+                if event.kind() == GtpuControlDatagramKind::Gpdu
+        ));
+        // Bound controls and required-extension events stay available to the
+        // control planners and are never converted into a malformed drop.
+        assert!(matches!(
+            downlink_event(receive(ECHO, 49152)),
+            GtpuDownlinkEvent::Control(event)
+                if event.kind() == GtpuControlDatagramKind::Control
+        ));
+        let required = [0x34, 255, 0, 9, 1, 2, 3, 4, 0, 0, 0, 0x80, 1, 0, 0, 0, 0x45];
+        assert!(matches!(
+            downlink_event(receive(&required, 49152)),
+            GtpuDownlinkEvent::Control(event)
+                if event.kind() == GtpuControlDatagramKind::UnsupportedRequiredExtension
+        ));
+        // Malformed framing is the only drop.
+        assert!(matches!(
+            downlink_event(receive(&[0x30, 255, 0], 49152)),
+            GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::Malformed)
+        ));
     }
 
     #[test]

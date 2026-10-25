@@ -26,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AES-CCM_8 and Ed25519/Ed448 remain deliberately excluded pending dependency
   and security-owner approval (see the #1352 follow-up scope); they are not
   advertised. Refs #1352.
+- `opc-gtpu-dataplane`: `LinuxGtpuDataplaneBackend` now opens an
+  attachment-bound control port over the userspace UDP/2152 socket retained by
+  an ordinary creation. The Linux `gtp` driver passes non-G-PDUs and G-PDUs
+  whose TEID matches no PDP context back to that socket (the TS 29.281 7.3.1
+  unknown-tunnel trigger), so `try_receive_downlink` reports them as
+  value-free `UnknownTunnel`/`Control` observations and one consuming
+  `unknown_tunnel_error` plan sends an Error Indication through the same
+  retained socket with the Peer Address, TEID Data I and triggering UDP
+  source-port fields. Receipt grants no tunnel or peer authority; the caller
+  keeps tunnel lookup, peer admission, budgets and answer policy. A
+  kernel-owned recoverable attachment returns
+  `gtpu_control_port_kernel_owned`, no second socket is ever bound, and
+  removal, replacement, adoption or a descriptor generation change retires
+  old receive capabilities and plans. Refs #1084.
+
 - `opc-session-net`: `PersistentSessionConsumerConfig::with_cooldown_admission`
   selects the explicit reconnect-cooldown admission policy for a persistent
   consumer client. The default `ReconnectCooldownPolicy::Wait` preserves the
@@ -129,6 +144,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the configuration/encoding acceptance is met). Refs #1344.
 
 ### Fixed
+
+- `opc-persist`: configuration snapshot build, install and repair deadlines now
+  derive from the bytes each stage moves instead of one fixed wall-clock budget
+  (#1339). Build derives its SQLite backup stage from the database size and its
+  envelope stage from the captured artifact size; install starts its size-derived
+  work budget after gate acquisition and derives sync/verify, extraction,
+  promotion and SQLite installation budgets from the received sizes; repair
+  derives one attempt deadline from the authenticated leader's published
+  envelope length (falling back to the previous fixed deadline when that probe
+  is unavailable) and caches the verified descriptor once per transfer instead
+  of re-hashing the whole snapshot per 128 KiB cursor chunk. A resent final
+  snapshot chunk is now idempotent while the artifact installs or after it
+  installed, and replacement snapshot reads reuse the digest from the engine
+  read's single whole-file verification instead of hashing twice. Ordinary
+  snapshots keep the previous 60 s build/install and 10 s repair floors; derived
+  budgets add one second per complete 8 MiB with an 8 h ceiling, and every
+  timeout at a derived bound remains typed. Refs #1339.
+
+- `opc-session-store`: a store that receives only protected-roster commands now
+  reclaims retained roster history through a bounded leader-owned maintenance
+  lane. The lane observes the published authenticated retention occupancy
+  (retained terminal and tombstone reservations), re-checks local leadership
+  and the operation deadline, and proposes the existing ordinary
+  `AdvanceLogicalTime` intent so the existing deterministic reclaim/retire turn
+  runs on native and SQLite state machines. It keeps at most one proposal in
+  flight and backs off exponentially to a fixed 60 s ceiling while a turn makes
+  no retention progress (neither reclaims a retained row nor retires a
+  tombstone), so it cannot busy-loop; a reclaim that keeps the retained-plus-
+  tombstone total flat still counts as progress. Every transient submission
+  outcome (leadership loss, no-quorum/authority refusal, deadline expiry,
+  outcome-unknown or any other store error) is a bounded skip that keeps the
+  lane alive, and only dropping the store stops it. The 24 h `TERMINAL_RETENTION`
+  boundary, the fixed caps, the frozen Q1/Q2 protected-roster mutation width,
+  fencing, stale-guard and exactly-once semantics are unchanged: a roster-only
+  store no longer waits for unrelated ordinary traffic before reclaiming
+  capacity that is already eligible. Sustaining more than the fixed retained
+  cap within one 24 h window still yields the typed capacity refusal and remains
+  gated on the #1298 recovery-retirement API decision and #1306 automatic
+  discharge (caller-deadline capacity backpressure is a documented follow-up);
+  this change does not claim those acceptance items. Refs #1307.
 
 - `opc-persist`: a configuration-consensus leader that cannot obtain a quorum
   acknowledgement within the fixed quorum-authority ceiling

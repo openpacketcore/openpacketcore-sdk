@@ -114,6 +114,17 @@ fn q2(signed: &RosterV2PersistenceFixture, index: u64) -> Entry<SessionRaftTypeC
 }
 
 fn maintenance(signed: &RosterV2PersistenceFixture, index: u64) -> Entry<SessionRaftTypeConfig> {
+    advance_logical_time(signed, index, 1 + 24 * 60 * 60)
+}
+
+/// One ordinary logical-time command at an exact offset from the fixture
+/// acquisition time. The roster-maintenance lane proposes exactly this intent;
+/// this helper lets tests step to the retention boundary and one tick before it.
+fn advance_logical_time(
+    signed: &RosterV2PersistenceFixture,
+    index: u64,
+    offset_seconds: i64,
+) -> Entry<SessionRaftTypeConfig> {
     let mut value = entry(
         signed,
         index,
@@ -126,9 +137,74 @@ fn maintenance(signed: &RosterV2PersistenceFixture, index: u64) -> Entry<Session
     command.logical_time = signed
         .authority
         .acquired_at()
-        .add_seconds(1 + 24 * 60 * 60)
+        .add_seconds(offset_seconds)
         .unwrap();
     value
+}
+
+fn roster_retained_bindings(storage: &NativeStorage) -> usize {
+    storage
+        .business
+        .roster
+        .witness
+        .expect("signed roster cycle witness")
+        .roster
+        .retained_and_live_bindings()
+}
+
+fn roster_durable_bindings(storage: &NativeStorage) -> usize {
+    storage
+        .business
+        .roster
+        .witness
+        .expect("signed roster cycle witness")
+        .roster
+        .durable_epoch_bindings()
+}
+
+#[test]
+fn roster_only_advance_logical_time_reclaims_retention_before_the_next_admission() {
+    // The roster-maintenance lane exists because Q1/Q2 commands must never fold
+    // retention work into their frozen mutation width. This is the exact
+    // ordinary command that lane proposes; a roster-only store therefore frees
+    // eligible retained capacity before it has to evaluate another admission.
+    let signed = crate::consensus::types::roster_v2_persistence_fixture();
+    let mut storage = configured(&signed);
+    apply(&mut storage, &[q1(&signed, 1)]);
+    apply(&mut storage, &[q2(&signed, 2)]);
+    assert_eq!(roster_retained_bindings(&storage), 1);
+    assert_eq!(roster_durable_bindings(&storage), 1);
+    assert_eq!(storage.business.roster.rows.len(), 1);
+
+    // One tick before the exact retention boundary a deterministic maintenance
+    // turn must not reclaim the young retained row.
+    apply(
+        &mut storage,
+        &[advance_logical_time(&signed, 3, 24 * 60 * 60)],
+    );
+    assert_eq!(
+        roster_retained_bindings(&storage),
+        1,
+        "the lane must never reclaim before the exact 24 h boundary"
+    );
+    assert_eq!(storage.business.roster.rows.len(), 1);
+
+    // At the boundary the same ordinary command reclaims the retained
+    // reservation (releasing live-plus-retained capacity), then retires the
+    // compact tombstone on the following turn (releasing durable capacity).
+    apply(&mut storage, &[maintenance(&signed, 4)]);
+    assert_eq!(
+        roster_retained_bindings(&storage),
+        0,
+        "retained admission capacity is reclaimed before the next admission"
+    );
+    assert_eq!(roster_durable_bindings(&storage), 1);
+    apply(&mut storage, &[maintenance(&signed, 5)]);
+    assert!(
+        storage.business.roster.rows.is_empty(),
+        "the compact tombstone is retired so durable capacity is also reclaimed"
+    );
+    assert_eq!(roster_durable_bindings(&storage), 0);
 }
 
 fn exact_rosters(restored: &NativeStorage, expected: &NativeStorage) {
