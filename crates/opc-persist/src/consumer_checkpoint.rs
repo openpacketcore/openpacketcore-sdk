@@ -284,6 +284,20 @@ impl Work {
     }
 }
 
+/// Failure-only test diagnostic: name the stage that produced an ambiguous
+/// durable outcome so a regression can identify whether settlement, decryption,
+/// verification or the storage operation itself returned Indeterminate.
+/// Production builds return the typed error with no side effect.
+fn indeterminate(path: &Path, stage: &'static str) -> ConsumerCheckpointError {
+    #[cfg(all(test, unix))]
+    tests::record_indeterminate_stage(path, stage);
+    #[cfg(not(all(test, unix)))]
+    let _ = (path, stage);
+    #[cfg(all(test, unix))]
+    let _ = stage;
+    ConsumerCheckpointError::Indeterminate
+}
+
 struct CancelOnDrop(Arc<Work>);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -425,9 +439,12 @@ impl ConsumerCheckpointStore {
         let stored = self
             .decrypt(&row)
             .await
-            .map_err(|_| ConsumerCheckpointError::Indeterminate)?;
+            .map_err(|_| indeterminate(&self.options.path, "compare-and-set-decrypt"))?;
         if row.generation != generation || *stored != *payload {
-            return Err(ConsumerCheckpointError::Indeterminate);
+            return Err(indeterminate(
+                &self.options.path,
+                "compare-and-set-verification",
+            ));
         }
         self.verified = Some((row.generation, Sha256::digest(&row.envelope).into()));
         self.uncertain = false;
@@ -510,6 +527,12 @@ impl ConsumerCheckpointStore {
                 conn.progress_handler(1000, Some(move || progress.check().is_err()))
                     .map_err(|_| ConsumerCheckpointError::Unavailable)?;
                 check_storage_size(&options)?;
+                // Set once a replacement transaction has durably committed.
+                // Deadline cancellation stops applying at that boundary: the
+                // write outcome is known and post-commit settlement (checkpoint
+                // and verification readback) may be slow without making the
+                // committed result ambiguous.
+                let mut committed = false;
                 if let Some((expected, verified_digest, row)) = update {
                     let current = read_row(conn, &options)?;
                     if current.generation != expected
@@ -540,12 +563,25 @@ impl ConsumerCheckpointStore {
                     }
                     tx.execute("INSERT INTO consumer_checkpoint (singleton, generation, envelope) VALUES (1, ?1, ?2)", rusqlite::params![row.generation as i64, row.envelope])
                         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
+                    // Deterministic pre-commit storage-fault regression hook.
+                    #[cfg(all(test, unix))]
+                    tests::storage_failure(&options.path, "before-commit")?;
                     #[cfg(test)]
                     tests::crash_at("before-commit");
                     tx.commit()
                         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
+                    committed = true;
                     #[cfg(test)]
                     tests::crash_at("after-commit");
+                    // The replacement is durably committed. Clear the deadline
+                    // progress handler so a slow post-commit checkpoint or
+                    // verification readback cannot abort a known outcome.
+                    conn.progress_handler(0, None::<fn() -> bool>)
+                        .map_err(|_| ConsumerCheckpointError::Unavailable)?;
+                    // Injected post-commit latency: a slow but successfully
+                    // committed write must still report success.
+                    #[cfg(all(test, unix))]
+                    tests::storage_latency(&options.path, "after-commit");
                     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
                         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
                     #[cfg(test)]
@@ -553,10 +589,20 @@ impl ConsumerCheckpointStore {
                 }
                 let row = read_row(conn, &options)?;
                 check_storage_size(&options)?;
-                task_work.check()?;
+                if !committed {
+                    // Read-only settlement retains its caller budget check.
+                    task_work.check()?;
+                }
                 Ok(row)
             })();
-            result.map_err(|e| task_work.error(e))
+            result.map_err(|error| {
+                let error = task_work.error(error);
+                #[cfg(all(test, unix))]
+                if error == ConsumerCheckpointError::Indeterminate {
+                    tests::record_indeterminate_stage(&options.path, "storage-operation");
+                }
+                error
+            })
         });
         self.pending = Some(PendingIo { task, work });
         Ok(())
@@ -570,10 +616,15 @@ impl ConsumerCheckpointStore {
             .as_mut()
             .ok_or(ConsumerCheckpointError::Conflict)?;
         let _cancel = CancelOnDrop(Arc::clone(&pending.work));
-        let result = tokio::time::timeout(self.options.timeout, &mut pending.task)
+        // The caller's operation budget is enforced inside the owned blocking
+        // operation (Work deadline plus SQLite progress handler). Settlement
+        // itself is observed to completion so a slow but durably committed
+        // write reports the outcome that is already known instead of losing it
+        // to an outer timeout. The task is self-bounded and already owns the
+        // storage lock; dropping that task here could not have released it.
+        let result = (&mut pending.task)
             .await
-            .map_err(|_| ConsumerCheckpointError::Indeterminate)?
-            .map_err(|_| ConsumerCheckpointError::Indeterminate)?;
+            .map_err(|_| indeterminate(&self.options.path, "settle-task-join"))?;
         self.pending = None;
         Ok(result)
     }
