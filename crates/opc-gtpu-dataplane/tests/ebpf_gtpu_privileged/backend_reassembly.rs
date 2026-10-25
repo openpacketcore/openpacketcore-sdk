@@ -29,7 +29,11 @@ fn receive_event(port: &dyn GtpuControlPort) -> GtpuDownlinkEvent {
         }
         assert!(
             Instant::now() < deadline,
-            "reassembled G-PDU must reach the backend consumer"
+            "{}",
+            super::DatapathTimeoutDiagnostics::new(
+                "reassembled G-PDU must reach the backend consumer"
+            )
+            .render()
         );
         std::thread::sleep(Duration::from_millis(1));
     }

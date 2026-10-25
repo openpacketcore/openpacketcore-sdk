@@ -352,6 +352,18 @@
       "kind": "assertions-decreased",
       "reason": "Issue #1208 replaces the two immediate status reads (higher term, non-leader) with one bounded wait_for_status_for_test predicate that checks the same two conditions; the static helper resolver attributes one fewer assertion to the test. Openraft publishes the successor term and non-leader state from its own engine task, so a single immediate read could observe the pre-stepdown snapshot. Every original property and the existing RECOVERY_TIMEOUT bound are preserved; no timeout was raised and no assertion was weakened.",
       "issue": 1208
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::forced_timeout_reports_datapath_state_fields",
+      "kind": "disabled",
+      "reason": "Forced-timeout diagnostics regression is marked #[ignore] because this target executes with the privileged GTP-U datapath lane (`--ignored --nocapture`), the only lane that runs it; the regression itself needs no privilege. It asserts the shared datapath timeout diagnostics render every required field (redirect delta, shared-peer iteration, measured counter/drop expected and observed values, tentative addresses, neighbour and route state) and only adds coverage.",
+      "issue": 1188
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_n3_end_marker_retirement_ordering",
+      "kind": "assertions-decreased",
+      "reason": "Replace the ad-hoc redirect-IT timeout eprintln block (which called `ip -6 addr/neigh show` with an expect) with the shared DatapathTimeoutDiagnostics formatter. The timeout assertion and every behavioral assertion are unchanged; the removed diagnostic `expect` is now a failure-safe bounded renderer, so the static helper resolver attributes fewer assertions while failures report strictly more datapath state (redirect delta, shared-peer iteration, counter values, tentative addresses, neighbours, routes).",
+      "issue": 1188
     }
   ]
 }

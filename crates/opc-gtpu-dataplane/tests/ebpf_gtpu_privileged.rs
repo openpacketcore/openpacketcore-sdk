@@ -687,6 +687,144 @@ fn command_stdout(program: &str, args: &[&str]) -> String {
     )
 }
 
+/// One measured expectation and the value observed when its bound expired.
+pub(crate) struct MeasuredObservation {
+    label: &'static str,
+    expected: u64,
+    observed: u64,
+}
+
+/// Value-free, bounded diagnostics for a measured privileged datapath timeout.
+///
+/// Every field is a counter, index, closed label or truncated kernel state
+/// record from the test's own topology (documentation-range addresses only);
+/// no packet payload, credential or peer identity is included, and each kernel
+/// reader is bounded and rendered as `unavailable(...)` on failure so a
+/// timeout path cannot block on diagnostics generation.
+pub(crate) struct DatapathTimeoutDiagnostics<'a> {
+    context: &'a str,
+    redirect_delta: Option<i128>,
+    shared_peer_iteration: Option<usize>,
+    observations: Vec<MeasuredObservation>,
+}
+
+impl<'a> DatapathTimeoutDiagnostics<'a> {
+    pub(crate) fn new(context: &'a str) -> Self {
+        Self {
+            context,
+            redirect_delta: None,
+            shared_peer_iteration: None,
+            observations: Vec::new(),
+        }
+    }
+
+    pub(crate) fn redirect_delta(mut self, delta: i128) -> Self {
+        self.redirect_delta = Some(delta);
+        self
+    }
+
+    pub(crate) fn shared_peer_iteration(mut self, iteration: usize) -> Self {
+        self.shared_peer_iteration = Some(iteration);
+        self
+    }
+
+    pub(crate) fn observe(mut self, label: &'static str, expected: u64, observed: u64) -> Self {
+        self.observations.push(MeasuredObservation {
+            label,
+            expected,
+            observed,
+        });
+        self
+    }
+
+    /// Render one deterministic, value-free line for the failing assertion.
+    pub(crate) fn render(&self) -> String {
+        let redirect_delta = self.redirect_delta.map_or_else(
+            || "not-measured-at-this-stage".to_owned(),
+            |delta| delta.to_string(),
+        );
+        let shared_peer_iteration = self.shared_peer_iteration.map_or_else(
+            || "not-applicable".to_owned(),
+            |iteration| iteration.to_string(),
+        );
+        let observations = if self.observations.is_empty() {
+            "none-at-this-stage".to_owned()
+        } else {
+            self.observations
+                .iter()
+                .map(|observation| {
+                    format!(
+                        "{}=expected:{} observed:{}",
+                        observation.label, observation.expected, observation.observed
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "{}: measured datapath state: redirect_delta={redirect_delta}; shared_peer_iteration={shared_peer_iteration}; counters=[{observations}]; tentative_addresses=[{}]; neighbours=[{}]; routes4=[{}]; routes6=[{}]",
+            self.context,
+            bounded_kernel_state("ip", &["-6", "addr", "show", "tentative"]),
+            bounded_kernel_state("ip", &["neigh", "show"]),
+            bounded_kernel_state("ip", &["route", "show"]),
+            bounded_kernel_state("ip", &["-6", "route", "show"]),
+        )
+    }
+}
+
+/// Read kernel datapath state for diagnostics only: bounded output, no panic,
+/// and failures collapse to a closed `unavailable` marker.
+fn bounded_kernel_state(program: &str, args: &[&str]) -> String {
+    const MAX_DIAGNOSTIC_STATE_CHARS: usize = 1024;
+    let output = match Command::new(program).args(args).output() {
+        Ok(output) => output,
+        Err(error) => return format!("unavailable({:?})", error.kind()),
+    };
+    let mut text = String::from_utf8_lossy(&output.stdout).replace('\n', "; ");
+    if !output.status.success() {
+        text.push_str(&format!(" status={}", output.status));
+    }
+    if text.chars().count() > MAX_DIAGNOSTIC_STATE_CHARS {
+        text = text.chars().take(MAX_DIAGNOSTIC_STATE_CHARS).collect();
+        text.push_str("...");
+    }
+    text
+}
+
+/// Deterministic forced-timeout regression for the shared diagnostic renderer.
+/// Runs in the privileged datapath lane (`--ignored`), needs no privilege: it
+/// asserts a synthetic timed-out measurement renders every required field.
+#[test]
+#[ignore = "privileged datapath lane runs this diagnostics regression"]
+fn forced_timeout_reports_datapath_state_fields() {
+    let rendered = DatapathTimeoutDiagnostics::new("forced timeout")
+        .redirect_delta(-6)
+        .shared_peer_iteration(1)
+        .observe("missing-consumer drops", 6, 5)
+        .observe("reassembled", 6, 4)
+        .render();
+    for field in [
+        "forced timeout",
+        "redirect_delta=-6",
+        "shared_peer_iteration=1",
+        "missing-consumer drops=expected:6 observed:5",
+        "reassembled=expected:6 observed:4",
+        "tentative_addresses=[",
+        "neighbours=[",
+        "routes4=[",
+        "routes6=[",
+    ] {
+        assert!(
+            rendered.contains(field),
+            "timed-out measured assertion must report {field}: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("INVITE") && !rendered.contains("password"),
+        "diagnostics must stay value-free: {rendered}"
+    );
+}
+
 /// Run `f` on a thread joined to the named netns; sockets it creates keep
 /// that namespace for their lifetime.
 fn in_netns<T: Send + 'static>(namespace: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
