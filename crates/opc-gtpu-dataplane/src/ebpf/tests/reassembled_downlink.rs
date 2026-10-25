@@ -52,6 +52,21 @@ fn inner_ipv6(destination: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
+fn inner_ipv6_from(
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    next_header: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = vec![0x60, 0, 0, 0];
+    packet.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+    packet.extend_from_slice(&[next_header, 64]);
+    packet.extend_from_slice(&source.octets());
+    packet.extend_from_slice(&destination.octets());
+    packet.extend_from_slice(payload);
+    packet
+}
+
 fn gpdu(teid: u32, inner: &[u8]) -> Vec<u8> {
     let mut message = vec![0x30, 0xff];
     message.extend_from_slice(&u16::try_from(inner.len()).unwrap().to_be_bytes());
@@ -1217,28 +1232,178 @@ async fn ordinary_inner_ipv6_context_decapsulates_through_its_family_authority()
     assert_eq!(counters.decapsulated, 2);
 }
 
-/// The family-tagged entry that carries an ordinary inner-IPv6 context has
-/// no downlink inner MTU field, so an opted-in IPv6 context must be refused
-/// explicitly rather than installed without enforcement.
+fn ipv6_signal_context(mtu: u16) -> GtpPdpContext {
+    let mut context = ordinary_ipv6_context();
+    context.downlink_inner_mtu =
+        Some(crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu).unwrap());
+    context
+}
+
+fn ipv6_packet_too_big_plan(
+    runtime: &FakeRuntime,
+    packet: &[u8],
+) -> crate::ebpf::reassembled_downlink::PacketTooBigPlan {
+    let mut counters = GtpuDownlinkCounters::default();
+    plan(process_downlink_datagram(
+        runtime,
+        ordinary_scope(),
+        datagram_from(gpdu(LOCAL_TEID, packet), PEER, 2152),
+        &mut counters,
+    ))
+}
+
+/// An ordinary inner-IPv6 context that opts into in-tunnel Packet Too Big
+/// reports a plan whose G-PDU carries one well-formed RFC 4443 error quoting
+/// as much of the invoking packet as fits in the minimum IPv6 MTU.
 #[tokio::test]
-async fn ordinary_inner_ipv6_context_refuses_the_in_tunnel_packet_too_big_opt_in() {
+async fn ordinary_inner_ipv6_over_mtu_signals_one_in_tunnel_icmpv6_ptb() {
     let (backend, runtime) = ordinary_fixture(context()).await;
-    // IPv6 has no in-network fragmentation (RFC 8200 section 4.5), and the
-    // family-tagged entry has no MTU field: both policies are refused.
-    for mtu in [
-        crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(1_300),
-        crate::GtpuDownlinkInnerMtu::new(1_300),
+    let desired = ipv6_signal_context(1_300);
+    backend.install_pdp_context(desired.clone()).await.unwrap();
+    assert_eq!(
+        backend
+            .read_pdp_context(crate::PdpContextSelector::LocalTeid(
+                crate::PdpContextLocalTeidSelector::from_context(&desired).unwrap(),
+            ))
+            .await
+            .unwrap(),
+        crate::PdpContextReadback::Present(desired)
+    );
+    let mut counters = GtpuDownlinkCounters::default();
+    // Exactly the MTU fits and decapsulates; there is no IPv6 fragmentation
+    // policy, so only the explicit opt-in is installable.
+    let destination: Ipv6Addr = "2001:db8:45:1::abcd".parse().unwrap();
+    let originator: Ipv6Addr = "2001:db8:ffff::8".parse().unwrap();
+    let exact = inner_ipv6(destination, &vec![0x11; 1_300 - 40]);
+    assert!(matches!(
+        process(
+            &runtime,
+            ordinary_scope(),
+            gpdu(LOCAL_TEID, &exact),
+            &mut counters
+        ),
+        GtpuDownlinkEvent::Decapsulated(_)
+    ));
+    let oversized = inner_ipv6(destination, &vec![0x11; 1_301 - 40]);
+    let plan = plan(process_downlink_datagram(
+        runtime.as_ref(),
+        ordinary_scope(),
+        datagram_from(gpdu(LOCAL_TEID, &oversized), PEER, 2152),
+        &mut counters,
+    ));
+    assert_eq!(plan.family(), crate::GtpAddressFamily::Ipv6);
+    assert_eq!(plan.mtu(), 1_300);
+    assert_eq!(plan.session(), LOCAL_TEID.to_be_bytes());
+    assert_eq!(counters.packet_too_big, 1);
+    assert_eq!(counters.decapsulated, 1);
+
+    let (gpdu_bytes, local, peer) = plan.build_uplink_gpdu().unwrap();
+    assert_eq!((local, peer), (LOCAL, PEER));
+    // GTP-U header: v1/PT, T-PDU length, the default bearer's peer TEID.
+    assert_eq!(&gpdu_bytes[..2], &[0x30, 0xff]);
+    assert_eq!(
+        u16::from_be_bytes([gpdu_bytes[2], gpdu_bytes[3]]),
+        u16::try_from(gpdu_bytes.len() - 8).unwrap()
+    );
+    assert_eq!(&gpdu_bytes[4..8], &0x2000_0001_u32.to_be_bytes());
+    let outer = &gpdu_bytes[8..];
+    // Outer IPv6 header: ICMPv6 next header, payload length 8 + quote.
+    let quote_len = oversized.len().min(1_280 - 40 - 8);
+    assert_eq!(outer.len(), 40 + 8 + quote_len);
+    assert_eq!(outer[0], 0x60);
+    assert_eq!(
+        u16::from_be_bytes([outer[4], outer[5]]),
+        u16::try_from(8 + quote_len).unwrap()
+    );
+    assert_eq!(outer[6], 58);
+    assert_eq!(&outer[8..24], &destination.octets());
+    assert_eq!(&outer[24..40], &originator.octets());
+    // RFC 4443: type Packet Too Big, code 0, MTU field 1300, then the quote.
+    let icmp = &outer[40..];
+    assert_eq!(icmp[0], 2);
+    assert_eq!(icmp[1], 0);
+    assert_eq!(&icmp[4..8], &1_300_u32.to_be_bytes());
+    assert_eq!(&icmp[8..], &oversized[..quote_len]);
+    // The ICMPv6 checksum covers the pseudo-header of the outer IPv6 packet.
+    let mut checksum_input = Vec::new();
+    checksum_input.extend_from_slice(&destination.octets());
+    checksum_input.extend_from_slice(&originator.octets());
+    checksum_input
+        .extend_from_slice(&u32::from(u16::try_from(8 + quote_len).unwrap()).to_be_bytes());
+    checksum_input.extend_from_slice(&[0, 0, 0, 58]);
+    checksum_input.extend_from_slice(icmp);
+    assert_eq!(
+        opc_gtpu_ebpf_common::internet_checksum(&checksum_input),
+        0,
+        "one well-formed RFC 4443 error"
+    );
+}
+
+/// RFC 4443 section 2.4 never-answer rules for the in-tunnel error.
+#[tokio::test]
+async fn ordinary_inner_ipv6_ptb_applies_the_rfc_4443_never_answer_rules() {
+    let (backend, runtime) = ordinary_fixture(context()).await;
+    backend
+        .install_pdp_context(ipv6_signal_context(1_300))
+        .await
+        .unwrap();
+    let destination: Ipv6Addr = "2001:db8:45:1::abcd".parse().unwrap();
+    let originator: Ipv6Addr = "2001:db8:ffff::8".parse().unwrap();
+    let payload = vec![0x11; 1_301 - 40];
+    // Unspecified and multicast sources do not identify one host.
+    for source in [
+        Ipv6Addr::UNSPECIFIED,
+        "ff02::1".parse().unwrap(),
+        "ff0e::1".parse().unwrap(),
     ] {
-        let mut ipv6 = ordinary_ipv6_context();
-        ipv6.downlink_inner_mtu = mtu;
-        assert!(matches!(
-            backend.install_pdp_context(ipv6).await,
-            Err(GtpuError::UnsupportedFeature {
-                feature: "downlink_inner_mtu_inner_ipv6"
-            })
-        ));
+        let packet = inner_ipv6_from(source, destination, 17, &payload);
+        assert!(
+            ipv6_packet_too_big_plan(&runtime, &packet)
+                .build_uplink_gpdu()
+                .is_none(),
+            "source {source} must not be answered"
+        );
     }
-    assert!(runtime.state().session_downlink_index.is_empty());
+    // An ICMPv6 error is never answered; an informational message is.
+    for (icmp_type, answered) in [
+        (1_u8, false),
+        (2, false),
+        (3, false),
+        (4, false),
+        (128, true),
+        (129, true),
+    ] {
+        let mut icmp = payload.clone();
+        icmp[0] = icmp_type;
+        let packet = inner_ipv6_from(originator, destination, 58, &icmp);
+        assert_eq!(
+            ipv6_packet_too_big_plan(&runtime, &packet)
+                .build_uplink_gpdu()
+                .is_some(),
+            answered,
+            "ICMPv6 type {icmp_type}"
+        );
+    }
+    // Never answer a non-initial fragment; a first fragment is answerable.
+    for (fragment_word, answered) in [(0_u16, true), (8, false), (0xfff8, false)] {
+        let mut fragment = payload.clone();
+        fragment[0] = 17;
+        fragment[1] = 0;
+        fragment[2..4].copy_from_slice(&fragment_word.to_be_bytes());
+        let packet = inner_ipv6_from(originator, destination, 44, &fragment);
+        assert_eq!(
+            ipv6_packet_too_big_plan(&runtime, &packet)
+                .build_uplink_gpdu()
+                .is_some(),
+            answered,
+            "fragment word {fragment_word:#06x}"
+        );
+    }
+    // An ordinary oversized unicast datagram is answered.
+    let ordinary = inner_ipv6_from(originator, destination, 17, &payload);
+    assert!(ipv6_packet_too_big_plan(&runtime, &ordinary)
+        .build_uplink_gpdu()
+        .is_some());
 }
 
 #[tokio::test]

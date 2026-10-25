@@ -162,8 +162,14 @@ applies the context's RFC 4459 policy:
   address the PGW's anti-spoofing admits; this departs from RFC 1812 4.3.2.4,
   and the originator attributes the error to the subscriber.
 
-Inner IPv6 contexts refuse both policies: IPv6 has no in-network
-fragmentation (RFC 8200).
+An ordinary inner-IPv6 context accepts only the opt-in: IPv6 has no
+in-network fragmentation (RFC 8200), so the fragment-inner default is refused
+with `downlink_inner_mtu_inner_ipv6_fragmentation`. Its family-tagged entry
+carries the opt-in MTU in a versioned profile (2 bytes at 73..74; byte 75 is
+reserved; schema marker
+`OPC-GROUP-IP-v7`), tc steers an over-MTU packet to the same packet-too-big
+queue, and the consumer sends one in-tunnel RFC 4443 Packet Too Big quoting up
+to 1,232 octets. The MTU must be at least the IPv6 minimum 1,280.
 
 Under either policy, tc also steers every other inner IPv4 fragment of such
 a context (More Fragments set, or a non-zero fragment offset) to a second

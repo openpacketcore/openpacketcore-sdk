@@ -76,7 +76,8 @@ use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
     classify_udp_checksum, consumer_is_bound_to_attachment, control_block_flags_word,
     decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_hand_off_port,
-    downlink_parse_ipv4_total_length, downlink_parse_payload_offset, downlink_parse_teid,
+    downlink_ipv6_exceeds_inner_mtu, downlink_parse_ipv4_total_length,
+    downlink_parse_payload_offset, downlink_parse_teid,
     gtpu_session_config_wire_owns_local_ipv4, gtpu_session_config_wire_owns_local_ipv6,
     hand_off_assignment_keeps_datagram, internet_checksum_sum_is_valid,
     marked_owner_wire_authorizes_downlink, marked_owner_wire_authorizes_uplink,
@@ -94,7 +95,8 @@ use opc_gtpu_ebpf_common::{
     TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta, TftFragmentBucket,
     TftFragmentDisposition, TftFragmentKey, TftIpv4Fragment, UdpChecksumDisposition,
     UdpChecksumEvidence, UdpEnvelopeBounds, UplinkFar, UplinkFarKey, UplinkMtuMapState,
-    UplinkPmtuDecision, COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
+    UplinkPmtuDecision, GTPU_PACKET_TOO_BIG_QUEUE_PORT,
+    COUNTER_DL_BINDING_FAMILY_MISMATCH, COUNTER_DL_BINDING_INGRESS_MISMATCH,
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_MISSING_CONSUMER,
@@ -3008,6 +3010,7 @@ fn grouped_inner_payload_is_exact(
 fn decap_grouped_downlink(
     ctx: &TcContext,
     outer_family: GtpuSessionIpFamily,
+    l4_offset: usize,
     payload_offset: usize,
     entry: GtpuSessionEntryWireView<'_>,
 ) -> i32 {
@@ -3015,6 +3018,33 @@ fn decap_grouped_downlink(
     if !grouped_inner_payload_is_exact(ctx, payload_offset, inner_family) {
         count(COUNTER_DL_MALFORMED);
         return TC_ACT_SHOT;
+    }
+    // An ordinary inner-IPv6 session that opted into in-tunnel Packet Too Big
+    // hands an over-MTU packet to the backend-owned queue instead of
+    // decapsulating it. IPv6 has no in-network fragmentation (RFC 8200
+    // section 4.5); the consumer builds one RFC 4443 error under the existing
+    // opt-in, per-session rate limit and never-answer rules. Only an IPv4
+    // outer endpoint can be steered with the IPv4 consumer lookup, and only a
+    // canonical opt-in profile is ever enforced.
+    if outer_family == GtpuSessionIpFamily::Ipv4 && inner_family == GtpuSessionIpFamily::Ipv6 {
+        if let Some(mtu) = entry.downlink_inner_mtu() {
+            if mtu.is_packet_too_big() {
+                let Ok(payload_length) = ctx.load::<u16>(payload_offset + 4) else {
+                    count(COUNTER_DL_MALFORMED);
+                    return TC_ACT_SHOT;
+                };
+                if downlink_ipv6_exceeds_inner_mtu(
+                    mtu.mtu(),
+                    u16::from_be(payload_length),
+                ) {
+                    return hand_off_to_backend_queue(
+                        ctx,
+                        l4_offset,
+                        GTPU_PACKET_TOO_BIG_QUEUE_PORT,
+                    );
+                }
+            }
+        }
     }
     let Some(strip) = payload_offset.checked_sub(ETH_HDR_LEN) else {
         count(COUNTER_DL_MALFORMED);
@@ -3739,8 +3769,13 @@ fn handle_downlink_ipv6(ctx: &mut TcContext) -> i32 {
             let observation_publication_id =
                 current_observation_redirect_identity(observation_authority)
                     .map(|(_, publication_id)| publication_id);
-            let action =
-                decap_grouped_downlink(ctx, GtpuSessionIpFamily::Ipv6, payload_offset, entry);
+            let action = decap_grouped_downlink(
+                ctx,
+                GtpuSessionIpFamily::Ipv6,
+                udp_offset,
+                payload_offset,
+                entry,
+            );
             if action == TC_ACT_OK {
                 if let Some(publication_id) = observation_publication_id {
                     emit_grouped_observation(
@@ -3798,8 +3833,13 @@ fn handle_grouped_downlink_ipv4(
             let observation_publication_id =
                 current_observation_redirect_identity(observation_authority)
                     .map(|(_, publication_id)| publication_id);
-            let action =
-                decap_grouped_downlink(ctx, GtpuSessionIpFamily::Ipv4, payload_offset, entry);
+            let action = decap_grouped_downlink(
+                ctx,
+                GtpuSessionIpFamily::Ipv4,
+                l4_offset,
+                payload_offset,
+                entry,
+            );
             if action == TC_ACT_OK {
                 if let Some(publication_id) = observation_publication_id {
                     emit_grouped_observation(
@@ -4968,7 +5008,7 @@ fn downlink_inner_hand_off_port(
 /// backend binds its queues when the control port is first opened, and they
 /// close with the process, while tc keeps steering from the pinned graph.
 #[inline(never)]
-fn hand_off_to_backend_queue(ctx: &mut TcContext, l4_offset: usize, port: u16) -> i32 {
+fn hand_off_to_backend_queue(ctx: &TcContext, l4_offset: usize, port: u16) -> i32 {
     let from = u16::from_ne_bytes(GTPU_UDP_PORT.to_be_bytes());
     let to = u16::from_ne_bytes(port.to_be_bytes());
     if ctx

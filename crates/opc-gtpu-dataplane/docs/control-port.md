@@ -264,7 +264,7 @@ the datagram.
 | `UnknownTunnel` | Untouched G-PDU whose TEID selects no tunnel. An observation, not an absence receipt. |
 | `Dropped` | Value-free `GtpuDownlinkDrop`: malformed (including an inner IPv4 header that fails the checks above), binding mismatch, destination mismatch, state unavailable, or an over-MTU packet refused by the inner fragmenter (rate limited, or carrying IPv4 options). |
 | `Fragmented` | An over-MTU DF IPv4 packet split into RFC 791 inner fragments under the default policy below, with the bearer mark. The caller injects every fragment, in order, toward XFRM with that mark. |
-| `PacketTooBig` | An over-MTU DF IPv4 packet under the explicit in-tunnel Packet Too Big opt-in below; never forwarded. |
+| `PacketTooBig` | An over-MTU DF IPv4 packet, or an over-MTU inner IPv6 packet, under the explicit in-tunnel Packet Too Big opt-in below; never forwarded. |
 
 `downlink_counters` returns bounded, value-free counters for the current
 attachment registration. The ordinary legacy socket port keeps the default
@@ -294,7 +294,7 @@ decapsulating them:
 
 | Hand-off | Queue |
 | --- | --- |
-| An authorized over-MTU Don't Fragment packet of a context with a downlink inner MTU | UDP/2153 |
+| An authorized over-MTU Don't Fragment packet of an IPv4 context, or any over-MTU packet of an inner-IPv6 context, with a downlink inner MTU | UDP/2153 |
 | Every other authorized inner fragment of such a context | UDP/2154 |
 | A G-PDU for one of the attachment's endpoints whose TEID selects no tunnel | UDP/2152 |
 | A G-PDU for one of the attachment's endpoints with a required unknown extension | UDP/2152 |
@@ -782,29 +782,45 @@ set that exceeds the MTU:
 - `GtpuDownlinkInnerMtu::new(mtu)` selects the **default**, inner
   fragmentation before encapsulation (RFC 4459 section 3.4);
 - `GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(mtu)` is the **explicit
-  opt-in** alternative, one in-tunnel RFC 1191 error.
+  opt-in** alternative, one in-tunnel RFC 1191 error for IPv4 or RFC 4443
+  Packet Too Big for IPv6.
 
-Under either policy, tc also hands every inner IPv4 fragment of the context
-to this consumer; see [Inner fragments](#inner-fragments).
+Under either IPv4 policy, tc also hands every inner IPv4 fragment of the
+context to this consumer; see [Inner fragments](#inner-fragments). An
+ordinary inner-IPv6 context accepts only the opt-in: IPv6 has no in-network
+fragmentation (RFC 8200 section 4.5), so the fragment-inner default is
+refused with `downlink_inner_mtu_inner_ipv6_fragmentation`, and its MTU must
+be at least the IPv6 minimum 1,280.
 
 `None` keeps today's behaviour: tc decapsulates every packet, fragment or
 not, and the host drops an over-MTU Don't Fragment packet with its own
 Fragmentation Needed toward the core.
 
-**Storage.** The field lives in the previously reserved bytes 66..68 of the
-Active `PdpContextCommit`, so it is published, replaced and read back
-atomically with the rest of the graph. The MTU is in the low 15 bits; bit 15
-is set only for the in-tunnel Packet Too Big opt-in. A record without an MTU
-is byte-identical to the original layout, so retained graphs are unchanged.
-An older SDK does not tolerate a record carrying an MTU: its retained-graph
-recovery rejects the non-canonical commit and refuses the whole attachment
-as indeterminate, not just that context. Before downgrading, drain every
-MTU-bearing context (reinstall it with `None`, or remove it).
+**Storage.** For an IPv4 context the field lives in the previously reserved
+bytes 66..68 of the Active `PdpContextCommit`, so it is published, replaced
+and read back atomically with the rest of the graph. The MTU is in the low 15
+bits; bit 15 is set only for the in-tunnel Packet Too Big opt-in. A record
+without an MTU is byte-identical to the original layout, so retained IPv4
+graphs are unchanged. An older SDK does not tolerate a record carrying an
+MTU: its retained-graph recovery rejects the non-canonical commit and refuses
+the whole attachment as indeterminate, not just that context. Before
+downgrading, drain every MTU-bearing context (reinstall it with `None`, or
+remove it).
 
-**Refusals and capability.** The in-tunnel Packet Too Big opt-in requires
-the legacy service-port uplink policy; the default fragmentation sends
-nothing uplink and accepts either. Grouped entries and ordinary inner-IPv6
-contexts refuse both policies. The eBPF probe reports
+For an ordinary inner-IPv6 context the opt-in MTU lives in a versioned
+profile of the family-tagged entry (the 2-byte field at bytes 73..74; byte 75
+is reserved). That entry is shared with
+grouped records and the protected selector ledger, so the grouped schema
+marker advances to `OPC-GROUP-IP-v7`; a retained version-6 graph is refused
+and needs a fresh attachment before it can carry the field. Entries without
+the field keep their byte-exact older profiles and read back with `None`.
+
+**Refusals and capability.** The IPv4 in-tunnel Packet Too Big opt-in
+requires the legacy service-port uplink policy; the default fragmentation
+sends nothing uplink and accepts either. Grouped entries refuse both policies.
+An ordinary inner-IPv6 context accepts only the opt-in, with an MTU of at
+least 1,280, and refuses the fragment-inner default with
+`downlink_inner_mtu_inner_ipv6_fragmentation`. The eBPF probe reports
 `downlink_inner_mtu_enforcement`. `Available` covers the datapath only:
 fragments are produced, and errors sent, only while the application drains
 this port.
@@ -1163,14 +1179,41 @@ visible yet.
 **IPv6.** IPv6 has no in-network fragmentation: only the source fragments
 (RFC 8200 sections 4.5 and 5), and a router answers an oversized packet with
 Packet Too Big (RFC 4443 section 3.2). Ordinary inner-IPv6 contexts (#998) are
-stored as family-tagged entries, and those entries have no MTU field, so an
-inner-IPv6 context with a downlink inner MTU is refused with
-`downlink_inner_mtu_inner_ipv6` under either policy rather than installed
-without enforcement. Inner IPv6 Packet Too Big (#1007) needs three pieces:
-- an MTU in the family-tagged entry wire, which is shared with grouped
-  records and the protected selector ledger;
-- the same steering in tc's family-tagged decapsulation;
-- the existing ICMPv6 builder, quoting up to 1,232 octets.
+stored as family-tagged entries; their versioned entry profile carries the
+opt-in downlink inner MTU (the 2-byte field at bytes 73..74; byte 75 is
+reserved). tc's family-tagged decapsulation
+steers an over-MTU inner IPv6 packet to the same packet-too-big queue, and
+the consumer sends exactly one in-tunnel RFC 4443 Packet Too Big:
+
+- **Addresses.** The source is the invoking packet's own destination (the
+  subscriber address inside its `/64`, the only inner source the PGW's
+  anti-spoofing admits); the destination is the originator. Nothing is sent
+  unencapsulated.
+- **Quote.** As much of the invoking packet as fits in the minimum IPv6 MTU:
+  1,232 octets after the outer IPv6 and ICMPv6 headers.
+- **Never answered** (RFC 4443 section 2.4), checked before any rate-limit
+  token is taken: an unspecified or multicast source; a multicast
+  destination; an ICMPv6 error (type below 128); a non-initial fragment.
+  Informational ICMPv6 messages, such as Echo, are answered.
+- **Header validation.** A truncated or inconsistent invoking IPv6 packet is
+  silently discarded and counted as unsendable.
+- **Bearer and rate limit.** The error rides the subscriber's default-bearer
+  uplink tunnel as the IPv4 opt-in does, with the same per-session token
+  bucket, 255-second eviction grace and never-answer-before-token order. If
+  the entry is a dedicated bearer, its own PAA's default-bearer entry is used;
+  without one nothing is sent.
+
+The MTU profile is shared with grouped records and the protected selector
+ledger, so the grouped schema marker advances to `OPC-GROUP-IP-v7`. A
+retained version-6 graph is refused and needs a fresh attachment; downgrading
+to an older SDK likewise refuses the newer marker, so drain or re-create the
+attachment in either direction.
+
+The native lane `ebpf_gtpu_downlink_ipv6_packet_too_big_is_signalled_in_tunnel`
+gives one well-formed RFC 4443 error with the exact quote and checksum, no
+host-generated ICMPv6, a forwarded fitting packet, the never-answer rule
+consuming no token, and the per-session rate limit. It runs in the same
+privileged lanes as the IPv4 opt-in and requires those lanes' kernels.
 
 **Native evidence.** The committed classifier is exercised with:
 
