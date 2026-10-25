@@ -89,8 +89,72 @@ pub const FENCED_TRANSITION_V2_MAX_RETAINED_HISTORY_ENTRIES: usize =
 /// it may need to reclaim a retired epoch.
 pub const FENCED_TRANSITION_V2_REQUIRED_OPERATIONAL_TARGET: usize = 100_000;
 
+/// Number of binding slots kept free before the active V2 epoch is rotated
+/// proactively.
+///
+/// Rotation at the fully bound epoch (`current_bound_count ==
+/// MAX_HISTORY_ENTRIES`) refuses every concurrent binding until the maintenance
+/// turn is proposed and applied (#1112). Keeping a bounded headroom lets the
+/// leader-owned history-maintenance lane open the successor before the next
+/// burst of bindings reaches the epoch ceiling, without retiring any unexpired
+/// receipt: the closed epoch remains exactly replayable until its own retention
+/// window ends.
+pub const FENCED_TRANSITION_V2_PREEMPTIVE_ROTATION_HEADROOM: usize = 8_192;
+
 /// Number of obsolete V2 history entries reclaimed in one bounded batch.
 pub const FENCED_TRANSITION_V2_RECLAIM_BATCH: usize = 1_024;
+
+/// Active-epoch binding count at which maintenance may preemptively rotate.
+///
+/// The production value is `MAX_HISTORY_ENTRIES - PREEMPTIVE_ROTATION_HEADROOM`.
+/// A thread-local test override exercises the same applied rotation/reclaim
+/// path with a reduced window instead of publishing 130,000 bindings.
+pub(crate) fn fenced_transition_v2_rotation_high_water() -> usize {
+    #[cfg(test)]
+    if let Some(high) = tests_support::rotation_high_water() {
+        return high;
+    }
+    FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES
+        .saturating_sub(FENCED_TRANSITION_V2_PREEMPTIVE_ROTATION_HEADROOM)
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ROTATION_HIGH_WATER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct RotationHighWaterOverride {
+        previous: Option<usize>,
+    }
+
+    impl Drop for RotationHighWaterOverride {
+        fn drop(&mut self) {
+            ROTATION_HIGH_WATER.with(|high| high.set(self.previous));
+        }
+    }
+
+    /// Run the V2 preemptive-rotation window at `high` bindings on this thread.
+    pub(crate) fn override_rotation_high_water_for_test(high: usize) -> RotationHighWaterOverride {
+        assert!(high > 0, "a test rotation window must be positive");
+        let previous = ROTATION_HIGH_WATER.with(|current| current.replace(Some(high)));
+        RotationHighWaterOverride { previous }
+    }
+
+    pub(super) fn rotation_high_water() -> Option<usize> {
+        ROTATION_HIGH_WATER.with(Cell::get)
+    }
+}
+
+/// Whether a bound-entry count is at the preemptive rotation high-water mark.
+///
+/// Both the applied maintenance path and follower projection call this exact
+/// predicate, so they can never disagree about when a successor is opened.
+pub(crate) fn fenced_transition_v2_preemptive_rotation_due(bound_entries: usize) -> bool {
+    bound_entries >= fenced_transition_v2_rotation_high_water()
+}
 
 /// Fixed width of a complete V2 request identity.
 pub const FENCED_TRANSITION_V2_REQUEST_ID_BYTES: usize = 8 + 16 + 32;

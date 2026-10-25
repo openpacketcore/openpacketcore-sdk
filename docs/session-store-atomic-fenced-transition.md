@@ -1121,3 +1121,22 @@ The receipt itself binds the complete canonical body. The current exact scope
 is enforced under the activation lifecycle above, so an authorized successor
 can recover across rollover while a revoked predecessor cannot observe the
 receipt. No separate `BindConsumerRequest` or log entry exists.
+
+
+## Preemptive V2 history rotation
+
+A leader-owned maintenance lane now schedules the existing replicated V2
+history-maintenance command at a 250 ms observation tick, with one proposal in
+flight and exponential back-off to two seconds while a turn makes no lifecycle
+progress. When a writable epoch reaches
+`FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES -
+FENCED_TRANSITION_V2_PREEMPTIVE_ROTATION_HEADROOM` bound entries, the applied
+maintenance turn opens the successor before the epoch is physically full, so a
+continuous healthy bind stream is not refused only because an external
+maintainer has not run. The closed epoch remains exactly replayable until its
+own retention window expires; reclamation still advances only in the existing
+bounded batches after that exact boundary. When every retained epoch is still
+inside its replay window, the turn is a typed no-op and new bindings retain the
+existing typed `FencedTransitionHistoryFull` fail-closed outcome. The durable
+schema, profile, epoch count, per-epoch capacity and 24-hour replay window are
+unchanged.
