@@ -5,7 +5,11 @@ mod audit_continuity;
 mod compatibility;
 #[cfg(any(test, feature = "test-control"))]
 mod diagnostics;
+mod failover;
 mod member_repair;
+pub use failover::{
+    ConfigFailoverState, ConfigFailoverStatus, CONFIG_CONSENSUS_UNPLANNED_FAILOVER_DETECTION_BOUND,
+};
 mod planned_shutdown;
 pub(crate) mod voter_slots;
 
@@ -391,6 +395,12 @@ struct ConsensusConfigStoreInner {
     /// Number of healthy observations consumed by the last recovery. Test-only
     /// diagnostics prove the debounce actually engaged.
     quorum_lease_last_recovery_observations: AtomicU8,
+    /// Whether the engine's automatic-election path is enabled for this store.
+    /// Mirrored in the SDK because the pinned fork has no public getter; the
+    /// failover accelerator must never request a campaign while it is disabled.
+    automatic_elections_enabled: AtomicBool,
+    /// Bounded unplanned-leader-loss failover observation and acceleration.
+    failover: failover::ConfigFailoverAccelerator,
     repair_pending: AtomicBool,
     repair_progress: tokio::sync::Mutex<Option<member_repair::RepairDownload>>,
     /// One verified snapshot descriptor reused by every repair chunk request of
@@ -438,6 +448,17 @@ impl ConsensusConfigStore {
             .is_ok_and(|append| append.entries.is_empty())
     }
 
+    /// Observe the current leader-silence interval without changing it. The
+    /// regression anchors its exact derived bound to the last known contact.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn leader_silence_millis_for_test(&self) -> Option<u64> {
+        let contact = self.inner.failover.contact_locked();
+        contact
+            .as_ref()
+            .map(|contact| u64::try_from(contact.at.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
     /// Observe the actual vote-update instant, without changing the lease.
     #[cfg(feature = "dangerous-test-hooks")]
     #[doc(hidden)]
@@ -453,9 +474,12 @@ impl ConsensusConfigStore {
 
     /// Disable automatic campaigns for a deterministic concurrent fixture.
     /// Explicit test campaigns still use the engine's normal voting path.
-    #[cfg(feature = "dangerous-test-hooks")]
+    #[cfg(any(test, feature = "dangerous-test-hooks"))]
     #[doc(hidden)]
     pub fn disable_automatic_elections_for_test(&self) {
+        self.inner
+            .automatic_elections_enabled
+            .store(false, Ordering::Release);
         self.inner.raft.runtime_config().elect(false);
     }
 
@@ -765,6 +789,7 @@ impl ConsensusConfigStore {
             config.enable_elect = false;
             config.enable_heartbeat = false;
         }
+        let automatic_elections_enabled = config.enable_elect;
         let raft = ConfigRaft::new(
             local_node_id,
             Arc::new(config),
@@ -808,6 +833,8 @@ impl ConsensusConfigStore {
                 quorum_lease_recovery_observations: AtomicU8::new(0),
                 quorum_lease_last_millis: AtomicU64::new(0),
                 quorum_lease_last_recovery_observations: AtomicU8::new(0),
+                automatic_elections_enabled: AtomicBool::new(automatic_elections_enabled),
+                failover: failover::ConfigFailoverAccelerator::default(),
                 repair_pending: AtomicBool::new(repair_pending),
                 repair_progress: tokio::sync::Mutex::new(None),
                 repair_snapshot_cache: Arc::new(member_repair::RepairSnapshotCache::default()),
@@ -826,6 +853,7 @@ impl ConsensusConfigStore {
         };
         voter_slots::start_coordinator(&store);
         start_quorum_lease_watchdog(&store);
+        failover::start_failover_watchdog(&store);
         Ok(store)
     }
 
@@ -2684,6 +2712,12 @@ impl ConfigConsensusService {
                     .await
                 {
                     return ConsensusWireResponse { result: Err(error) };
+                }
+                if matches!(
+                    request.family,
+                    ConsensusRpcFamily::AppendEntries | ConsensusRpcFamily::InstallSnapshot
+                ) {
+                    self.store.record_leader_contact(authenticated_sender);
                 }
                 self.store
                     .inner
