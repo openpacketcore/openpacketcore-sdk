@@ -2262,14 +2262,14 @@ async fn partial_initial_watch_open_response_releases_the_isolated_admission() {
             .await
             .expect("partial WatchOpened response obeys the authenticated idle bound");
         assert!(matches!(result, Err(SessionConsumerClientError::Deadline)));
-        tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, async {
-            while client.diagnostics().await.watch_active != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("initial watch-open failure releases its isolated physical admission");
+        // The failed initial setup owns no caller-visible stream: its watch
+        // runtime (and therefore the isolated admission permit) is dropped
+        // before open_watch returns, so this state is already published here.
         let diagnostics = client.diagnostics().await;
+        assert_eq!(
+            diagnostics.watch_active, 0,
+            "initial watch-open failure releases its isolated physical admission"
+        );
         assert_eq!(diagnostics.setup_failures, 1);
         assert_eq!(diagnostics.failures, 1);
         assert_eq!(diagnostics.deadline, 1);
@@ -2398,13 +2398,21 @@ async fn partial_active_watch_frames_expire_and_release_the_isolated_slot() {
             .expect("a partial active frame obeys the configured idle bound")
             .expect("reader reports the authenticated transport failure");
         assert!(item.is_err(), "partial frame never becomes a watch entry");
-        tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, async {
-            while client.diagnostics().await.watch_active != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("timed-out reader releases its isolated watch slot");
+        // The reader task owns the watch admission and releases it as it ends;
+        // stream end is its published completion event, so wait on that event
+        // instead of polling the counter it updated first.
+        assert!(
+            tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, watch.next())
+                .await
+                .expect("timed-out reader publishes its stream end")
+                .is_none(),
+            "the timed-out reader emits one terminal result and then ends"
+        );
+        assert_eq!(
+            client.diagnostics().await.watch_active,
+            0,
+            "timed-out reader releases its isolated watch slot"
+        );
         drop(watch);
         client.shutdown().await;
         server.await.expect("malicious server");
@@ -2626,13 +2634,20 @@ async fn quiet_authenticated_watch_remains_admitted_until_the_peer_closes() {
         matches!(terminal, None | Some(Err(_))),
         "peer close never manufactures a watch entry"
     );
-    tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, async {
-        while client.diagnostics().await.watch_active != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("peer close releases the isolated quiet-watch admission");
+    // The reader task that owns the quiet-watch admission ends on peer close;
+    // await its stream-end publication, then assert the admission it released.
+    assert!(
+        tokio::time::timeout(SHORT_ACTIVE_FRAME_WAIT, watch.next())
+            .await
+            .expect("peer close publishes the watch stream end")
+            .is_none(),
+        "peer close emits one terminal result and then ends the watch"
+    );
+    assert_eq!(
+        client.diagnostics().await.watch_active,
+        0,
+        "peer close releases the isolated quiet-watch admission"
+    );
     drop(watch);
     client.shutdown().await;
     server.await.expect("malicious server");
