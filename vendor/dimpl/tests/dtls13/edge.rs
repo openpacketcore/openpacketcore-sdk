@@ -1010,6 +1010,80 @@ fn dtls13_alert_bad_certificate() {
 /// Previously, Ed25519 (0x0807) and RSA_PSS_RSAE_SHA256 (0x0804) were advertised
 /// in the ClientHello signature_algorithms extension but could not be verified,
 /// causing handshake failures when a peer selected them.
+/// Walk the plaintext DTLS record and ClientHello structure and return the
+/// body of one extension.
+///
+/// The ClientHello is parsed structurally rather than searched for a byte
+/// pattern: the client random, legacy session ID and key shares can legitimately
+/// contain any 2-byte pair, so a scan can find a false extension type and then
+/// read a bogus length past the end of the packet.
+fn client_hello_extension(packet: &[u8], extension_type: u16) -> Option<&[u8]> {
+    // DTLSPlaintext header: content_type(1) + version(2) + epoch(2) + seq(6)
+    // + length(2).
+    let record_header_len = 13usize;
+    // Handshake header: msg_type(1) + length(3) + message_seq(2)
+    // + frag_offset(3) + frag_length(3).
+    let handshake_header_len = 12usize;
+    let body_start = record_header_len.checked_add(handshake_header_len)?;
+    if packet.len() < body_start {
+        return None;
+    }
+    let fragment_len = u32::from_be_bytes([
+        0,
+        *packet.get(record_header_len + 9)?,
+        *packet.get(record_header_len + 10)?,
+        *packet.get(record_header_len + 11)?,
+    ]) as usize;
+    let body_end = body_start.checked_add(fragment_len)?;
+    if body_end > packet.len() {
+        return None;
+    }
+
+    // ClientHello body: version(2) + random(32) + session_id_len(1)
+    // + session_id + cookie_len(1) + cookie + cipher_suites_len(2)
+    // + cipher_suites + comp_methods_len(1) + comp_methods
+    // + extensions_len(2) + extensions.
+    let mut pos = body_start.checked_add(2 + 32)?;
+    let session_id_len = usize::from(*packet.get(pos)?);
+    pos = pos.checked_add(1 + session_id_len)?;
+    let cookie_len = usize::from(*packet.get(pos)?);
+    pos = pos.checked_add(1 + cookie_len)?;
+    let cipher_suites_len = usize::from(u16::from_be_bytes([
+        *packet.get(pos)?,
+        *packet.get(pos + 1)?,
+    ]));
+    pos = pos.checked_add(2 + cipher_suites_len)?;
+    let comp_methods_len = usize::from(*packet.get(pos)?);
+    pos = pos.checked_add(1 + comp_methods_len)?;
+    let extensions_len = usize::from(u16::from_be_bytes([
+        *packet.get(pos)?,
+        *packet.get(pos + 1)?,
+    ]));
+    pos = pos.checked_add(2)?;
+    let extensions_end = pos.checked_add(extensions_len)?;
+    if extensions_end > body_end {
+        return None;
+    }
+
+    while pos + 4 <= extensions_end {
+        let current_type = u16::from_be_bytes([*packet.get(pos)?, *packet.get(pos + 1)?]);
+        let current_len = usize::from(u16::from_be_bytes([
+            *packet.get(pos + 2)?,
+            *packet.get(pos + 3)?,
+        ]));
+        let data_start = pos + 4;
+        let data_end = data_start.checked_add(current_len)?;
+        if data_end > extensions_end {
+            return None;
+        }
+        if current_type == extension_type {
+            return packet.get(data_start..data_end);
+        }
+        pos = data_end;
+    }
+    None
+}
+
 #[test]
 #[cfg(feature = "rcgen")]
 fn dtls13_only_functional_signature_schemes_advertised() {
@@ -1037,29 +1111,35 @@ fn dtls13_only_functional_signature_schemes_advertised() {
     //                   + extensions_len(2) + extensions...
     let ch_packet = &out.packets[0];
 
-    // Find signature_algorithms extension (type 0x000D) in the packet.
-    // Scan for the 2-byte extension type.
-    let sig_alg_type: [u8; 2] = [0x00, 0x0D];
-    let pos = ch_packet
-        .windows(2)
-        .position(|w| w == sig_alg_type)
+    // Find signature_algorithms extension (type 0x000D) by walking the
+    // ClientHello structure, not by scanning for its type bytes: random fields
+    // can contain the pair `00 0D` and a scan then indexes out of bounds.
+    let sig_alg_data = client_hello_extension(ch_packet, 0x000D)
         .expect("signature_algorithms extension should be present in ClientHello");
+    assert!(
+        sig_alg_data.len() >= 2,
+        "signature_algorithms extension has no list length"
+    );
 
-    // Extension format: type(2) + ext_len(2) + list_len(2) + schemes(2 each)
-    let ext_len_offset = pos + 2;
-    let list_len_offset = ext_len_offset + 2;
-    let list_len =
-        u16::from_be_bytes([ch_packet[list_len_offset], ch_packet[list_len_offset + 1]]) as usize;
-    let schemes_start = list_len_offset + 2;
+    // Extension data format: list_len(2) + schemes(2 each)
+    let list_len = u16::from_be_bytes([sig_alg_data[0], sig_alg_data[1]]) as usize;
+    assert_eq!(
+        list_len + 2,
+        sig_alg_data.len(),
+        "signature_algorithms list length must match the extension body"
+    );
+    let schemes = &sig_alg_data[2..];
+    assert_eq!(
+        schemes.len() % 2,
+        0,
+        "signature_algorithms schemes must be 2 bytes each"
+    );
 
     // Extract all advertised scheme codes
-    let mut advertised: Vec<u16> = Vec::new();
-    let mut i = schemes_start;
-    while i < schemes_start + list_len {
-        let scheme = u16::from_be_bytes([ch_packet[i], ch_packet[i + 1]]);
-        advertised.push(scheme);
-        i += 2;
-    }
+    let advertised: Vec<u16> = schemes
+        .chunks_exact(2)
+        .map(|scheme| u16::from_be_bytes([scheme[0], scheme[1]]))
+        .collect();
 
     // Only ECDSA P-256 (0x0403) and P-384 (0x0503) should be advertised.
     let non_functional: Vec<u16> = advertised
@@ -1081,6 +1161,53 @@ fn dtls13_only_functional_signature_schemes_advertised() {
         vec![0x0403, 0x0503],
         "Expected exactly ECDSA P-256 and P-384"
     );
+}
+
+/// Regression for the raw-byte-scan bug: a `00 0D` pair inside the client
+/// random must not be mistaken for the signature_algorithms extension.
+#[test]
+fn structural_extension_walk_ignores_random_byte_pairs() {
+    let extensions: &[u8] = &[
+        // signature_algorithms (0x000D), body length 4.
+        0x00, 0x0d, 0x00, 0x04, // list length 2, one scheme: ECDSA_SECP256R1_SHA256.
+        0x00, 0x02, 0x04, 0x03,
+    ];
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0xfe, 0xfd]); // legacy_version
+    body.extend_from_slice(&[0x00, 0x0d]); // random begins with a false 00 0D
+    body.extend_from_slice(&[0u8; 30]);
+    body.push(0); // empty legacy_session_id
+    body.push(0); // empty cookie
+    body.extend_from_slice(&2u16.to_be_bytes()); // one cipher suite
+    body.extend_from_slice(&0x1301u16.to_be_bytes());
+    body.push(1); // one compression method
+    body.push(0);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+
+    let body_len = body.len() as u32;
+    let mut handshake = Vec::new();
+    handshake.push(1); // ClientHello
+    handshake.extend_from_slice(&body_len.to_be_bytes()[1..]);
+    handshake.extend_from_slice(&0u16.to_be_bytes()); // message_seq
+    handshake.extend_from_slice(&[0, 0, 0]); // fragment_offset
+    handshake.extend_from_slice(&body_len.to_be_bytes()[1..]); // fragment_length
+
+    let mut packet = Vec::new();
+    packet.push(22); // handshake content type
+    packet.extend_from_slice(&[0xfe, 0xfd]); // DTLS 1.2 record version
+    packet.extend_from_slice(&0u16.to_be_bytes()); // epoch
+    packet.extend_from_slice(&[0u8; 6]); // record sequence number
+    let record_len = (handshake.len() + body.len()) as u16;
+    packet.extend_from_slice(&record_len.to_be_bytes());
+    packet.extend_from_slice(&handshake);
+    packet.extend_from_slice(&body);
+
+    let extension = client_hello_extension(&packet, 0x000d)
+        .expect("structural walk must find the real extension");
+    assert_eq!(extension, &[0x00, 0x02, 0x04, 0x03]);
+    // The false pair is present in the random, at the start of the body.
+    assert_eq!(packet[27..29], [0x00, 0x0d]);
 }
 
 /// Regression test for bug #2: a bad record in a multi-record datagram must not
