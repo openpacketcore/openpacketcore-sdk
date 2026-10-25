@@ -1635,8 +1635,11 @@ impl SessionConsumerPreparedFencedTransitionV2Backend {
     /// nor a key provider, and it never restores dispatch authority. `None`
     /// means neither this facade's recovery journal nor a composed legacy V1
     /// journal retains the ID: it was never prepared through them, or its row
-    /// was released or reclaimed after resolution. This uses the configured
-    /// journal view's work class, `Normal` for a newly opened journal.
+    /// was released or reclaimed after resolution. A transient local journal
+    /// or backing failure is an error, not `None`: the ID is not proven
+    /// released or reclaimed, and recovery may be retried. This uses the
+    /// configured journal view's work class, `Normal` for a newly opened
+    /// journal.
     pub async fn recover_fenced_transition_status(
         &self,
         request_id: FencedTransitionRequestId,
@@ -2273,6 +2276,12 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     }
 
     /// Try one read-only receipt lookup on the next deterministic voter.
+    ///
+    /// A definitive local row failure (the exact retained row is missing or
+    /// names a different canonical request) is returned as `Unavailable` and
+    /// cached as final for this handle. A transient local journal, backing or
+    /// key-provider failure is also returned as `Unavailable`, but it is not
+    /// cached: the same exact binding can be re-checked by a later call.
     pub async fn status_once(
         &mut self,
         deadline: tokio::time::Instant,
@@ -2286,10 +2295,13 @@ impl SessionConsumerPreparedFencedTransitionV2 {
     /// A correlated `LeaseDeferred` also returns immediately, remains
     /// nonterminal, and keeps the row for explicit deferral resumption.
     ///
-    /// A retained row that is missing or fails authentication is a local
-    /// fail-closed condition: `Unavailable` is then returned at once and is
-    /// final for this handle. `recover_fenced_transition_status` reports
-    /// whether the caller ID is still retained.
+    /// A retained row that is definitively missing or no longer matches the
+    /// prepared binding is a local fail-closed condition: `Unavailable` is
+    /// returned at once and is final for this handle. A transient local
+    /// journal, backing or key-provider failure also returns `Unavailable`,
+    /// but it stays retryable until the caller's deadline, so the same exact
+    /// binding can be re-checked later. `recover_fenced_transition_status`
+    /// reports whether the caller ID is still retained.
     pub async fn status_until_terminal(
         &mut self,
         deadline: tokio::time::Instant,
@@ -2353,6 +2365,10 @@ impl SessionConsumerRecoveredFencedTransitionV2Status {
     }
 
     /// Try one read-only receipt lookup on the next deterministic voter.
+    ///
+    /// As for a live handle, a definitive local row failure is cached as
+    /// final `Unavailable`, while a transient local failure stays
+    /// re-checkable on this exact binding.
     pub async fn status_once(
         &mut self,
         deadline: tokio::time::Instant,
@@ -2362,8 +2378,8 @@ impl SessionConsumerRecoveredFencedTransitionV2Status {
 
     /// Rotate read-only receipt lookups until a terminal status is found or
     /// the caller's absolute deadline is reached. As for a live handle, a
-    /// local row failure returns `Unavailable` at once and is final for this
-    /// handle.
+    /// definitive local row failure returns `Unavailable` at once and is
+    /// final; a transient local failure is retried until the deadline.
     /// `LeaseDeferred` returns immediately without making the row releasable;
     /// only the facade's explicit deferral resume method can restore dispatch.
     pub async fn status_until_terminal(
@@ -2490,6 +2506,26 @@ fn v2_rejection_never_binds(error: &StoreError) -> bool {
             | StoreError::FencedTransitionHistoryFull
             | StoreError::FencedTransitionRetentionExhausted
     )
+}
+
+/// Return whether a local protected-V2 recovery preflight failure is
+/// definitive for the exact prepared binding.
+///
+/// A definitive failure can never become observable by waiting: the exact
+/// retained row is missing, the caller ID names a different canonical
+/// request, or the row/backend contract cannot be authenticated at all. A
+/// transient journal, backing, key-provider or operation-outcome failure is
+/// reported through separate classes and must stay re-checkable without
+/// restoring dispatch authority.
+fn prepared_fenced_v2_preflight_failure_is_definitive(error: &StoreError) -> bool {
+    error.is_protected_fenced_transition_v2_recovery_row_unavailable()
+        || matches!(
+            error,
+            StoreError::FencedTransitionRequestConflict
+                | StoreError::Crypto(_)
+                | StoreError::Serialization(_)
+                | StoreError::CapabilityNotSupported(_)
+        )
 }
 
 /// Routing context one handle shares with its physical adapter: the
@@ -2909,8 +2945,10 @@ impl PersistentPreparedFencedTransitionV2Token {
         if deadline <= now || deadline > self.budget.original_deadline() {
             return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline);
         }
-        // A missing, corrupt, or substituted row is a local fail-closed
-        // condition, checked before any receipt lane is used.
+        // A missing, replaced or unauthenticatable row is a definitive local
+        // fail-closed condition. Transient local journal/backing failures are
+        // also checked here, but they must not become this handle's final
+        // receipt: the exact retained row may still be re-checked later.
         match journal_before_deadline(
             deadline,
             self.backend
@@ -2919,13 +2957,16 @@ impl PersistentPreparedFencedTransitionV2Token {
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => {
+            Ok(Err(error)) => {
                 if let Some(result) = self.cached_terminal_receipt() {
                     return result;
                 }
-                return self.terminal_receipt(Err(
-                    SessionConsumerPreparedFencedTransitionStatusError::Unavailable,
-                ));
+                if prepared_fenced_v2_preflight_failure_is_definitive(&error) {
+                    return self.terminal_receipt(Err(
+                        SessionConsumerPreparedFencedTransitionStatusError::Unavailable,
+                    ));
+                }
+                return Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable);
             }
             Err(_) => return Err(SessionConsumerPreparedFencedTransitionStatusError::Deadline),
         }
@@ -3131,6 +3172,9 @@ mod tests {
         voters: StdMutex<Vec<usize>>,
         status: StdMutex<FencedTransitionV2Status>,
         committed: StdMutex<Option<FencedTransitionOutcome>>,
+        // The exact sealed request the scripted boundary was last asked to
+        // dispatch, so tests can derive the receipt they expect.
+        dispatched: StdMutex<Option<FencedTransitionV2Request>>,
         status_pause: ExecutionJournalPause,
         hang_status: std::sync::atomic::AtomicBool,
         status_reads: std::sync::atomic::AtomicUsize,
@@ -3144,6 +3188,7 @@ mod tests {
                 voters: StdMutex::new(Vec::new()),
                 status: StdMutex::new(FencedTransitionV2Status::NotFound),
                 committed: StdMutex::new(None),
+                dispatched: StdMutex::new(None),
                 status_pause: ExecutionJournalPause::default(),
                 hang_status: std::sync::atomic::AtomicBool::new(false),
                 status_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -3160,6 +3205,10 @@ mod tests {
 
         fn set_status(&self, status: FencedTransitionV2Status) {
             *self.status.lock().expect("status") = status;
+        }
+
+        fn dispatched_request(&self) -> Option<FencedTransitionV2Request> {
+            self.dispatched.lock().expect("dispatched").clone()
         }
     }
 
@@ -3240,6 +3289,7 @@ mod tests {
             &self,
             request: FencedTransitionV2Request,
         ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
+            *self.dispatched.lock().expect("dispatched") = Some(request.clone());
             self.voters
                 .lock()
                 .expect("voters")
@@ -3376,6 +3426,15 @@ mod tests {
     }
 
     fn delete_request(request_id: FencedTransitionRequestId) -> FencedTransitionRequest {
+        delete_request_with_ttl(request_id, Duration::from_secs(60))
+    }
+
+    /// Build the same logical delete with a deliberately different canonical
+    /// body, used to substitute the retained row under one caller ID.
+    fn delete_request_with_ttl(
+        request_id: FencedTransitionRequestId,
+        ttl: Duration,
+    ) -> FencedTransitionRequest {
         let key = opc_session_store::SessionKey {
             tenant: tenant(),
             nf_kind: NetworkFunctionKind::smf(),
@@ -3388,11 +3447,11 @@ mod tests {
         let guard = lease_guard(
             key,
             acquired_at,
-            checked_session_deadline(acquired_at, Duration::from_secs(60)).expect("expiry"),
+            checked_session_deadline(acquired_at, ttl).expect("expiry"),
         );
         FencedTransitionRequest::new(
             request_id,
-            FencedTransitionLease::renew(guard, Duration::from_secs(60)).expect("renewal"),
+            FencedTransitionLease::renew(guard, ttl).expect("renewal"),
             FencedTransitionMutation::delete(Generation::new(1)),
         )
         .expect("delete request")
@@ -4901,5 +4960,150 @@ mod tests {
         ] {
             assert!(!display.contains(forbidden), "display leaked {forbidden:?}");
         }
+    }
+
+    #[test]
+    fn v2_preflight_failure_classification_separates_final_from_transient() {
+        for definitive in [
+            StoreError::FencedTransitionRequestConflict,
+            StoreError::Crypto("content-dependent failure".into()),
+            StoreError::Serialization("undecodable row".into()),
+            StoreError::CapabilityNotSupported("no protected V2 boundary".into()),
+        ] {
+            assert!(
+                prepared_fenced_v2_preflight_failure_is_definitive(&definitive),
+                "{definitive:?} must stay final"
+            );
+        }
+        for transient in [
+            StoreError::FencedTransitionRecoveryJournalUnavailable,
+            StoreError::BackendUnavailable("journal locked by a live owner".into()),
+            StoreError::KeyProviderUnavailable("kms unavailable".into()),
+            StoreError::BackendOperationOutcomeUnavailable,
+        ] {
+            assert!(
+                !prepared_fenced_v2_preflight_failure_is_definitive(&transient),
+                "{transient:?} must stay re-checkable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_status_transient_preflight_failure_stays_recheckable_and_recovers_the_receipt() {
+        let harness = harness(vec![Step::Unknown]).await;
+        let token = harness.prepare().await;
+        assert!(matches!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+        ));
+        // The read-only observation the caller later makes is a committed
+        // receipt for the exact prepared request.
+        let expected = outcome_for(
+            &harness
+                .physical
+                .dispatched_request()
+                .expect("the scripted boundary dispatched the request"),
+        );
+        harness
+            .physical
+            .set_status(FencedTransitionV2Status::Recorded(Box::new(Ok(
+                expected.clone()
+            ))));
+        let journal = harness._directory.path().join("recovery.sqlite3");
+        std::fs::rename(&journal, journal.with_extension("moved")).expect("move journal");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            token.status_once(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
+            "a transient local preflight failure is reported as unavailable"
+        );
+        assert!(
+            token.cached_terminal_receipt().is_none(),
+            "a transient local preflight failure must not be cached as final"
+        );
+        std::fs::rename(journal.with_extension("moved"), &journal).expect("restore journal");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            token.status_once(deadline).await,
+            Ok(FencedTransitionV2Status::Recorded(Box::new(Ok(expected)))),
+            "the exact binding can be re-checked and returns its committed receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_status_missing_exact_row_stays_final() {
+        let harness = harness(vec![Step::Unknown]).await;
+        let token = harness.prepare().await;
+        assert!(matches!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+        ));
+        // Another handle or a sweep removed the exact retained row after this
+        // handle became receipt-only.
+        assert!(harness
+            .backend
+            .discard_protected_fenced_transition_v2(&token.prepared)
+            .await
+            .expect("remove the row out from under the handle"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            token.status_once(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
+        );
+        assert!(
+            token.cached_terminal_receipt().is_some(),
+            "a missing exact row is a definitive local failure"
+        );
+        let reads_before = harness
+            .physical
+            .status_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            token.status_once(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable),
+            "the cached final failure is returned on the next call"
+        );
+        assert_eq!(
+            harness
+                .physical
+                .status_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            reads_before,
+            "a definitive local failure ends status lookups at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_status_substituted_binding_stays_final() {
+        let harness = harness(vec![Step::Unknown]).await;
+        let token = harness.prepare().await;
+        assert!(matches!(
+            token.execute_once().await,
+            Err(FencedTransitionExecuteError::OutcomeUnknown { .. })
+        ));
+        assert!(harness
+            .backend
+            .discard_protected_fenced_transition_v2(&token.prepared)
+            .await
+            .expect("remove the original row"));
+        // Reuse the caller ID for a different canonical request, as a
+        // substituted retained row would.
+        harness
+            .backend
+            .prepare_protected_fenced_transition_v2(delete_request_with_ttl(
+                harness.request_id,
+                Duration::from_secs(61),
+            ))
+            .await
+            .expect("substitute the retained binding");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            token.status_once(deadline).await,
+            Err(SessionConsumerPreparedFencedTransitionStatusError::Unavailable)
+        );
+        assert!(
+            token.cached_terminal_receipt().is_some(),
+            "a replaced exact binding is a definitive local failure"
+        );
     }
 }

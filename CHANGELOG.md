@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation are unchanged, and Create Bearer behaviour is unchanged.
   Refs #1441.
 
+- `opc-session-net`: prepared protected V2 transition status no longer caches
+  a transient local recovery-preflight failure as the handle's final
+  `Unavailable`. A transient journal, backing, key-provider or
+  operation-outcome failure leaves the exact retained binding re-checkable
+  until the caller's deadline (or a later status call). A definitive local
+  failure (missing retained row, replaced canonical request, or
+  content-authentication failure) remains final, and the public error stays
+  `Unavailable`. No failure class restores dispatch authority. Refs #1378.
+
 ### Breaking
 
 - `opc-ipsec-xfrm`: `SaParameters` and `SaState` add a public

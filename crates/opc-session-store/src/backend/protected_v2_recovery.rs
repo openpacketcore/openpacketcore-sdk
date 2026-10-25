@@ -209,6 +209,24 @@ fn recovery_row_unavailable() -> StoreError {
     StoreError::BackendUnavailable(PROTECTED_V2_RECOVERY_ROW_UNAVAILABLE.into())
 }
 
+impl StoreError {
+    /// Return whether this failure reports that the exact protected
+    /// fenced-transition V2 recovery row is absent locally.
+    ///
+    /// The row-absence case shares the transient [`Self::BackendUnavailable`]
+    /// class with backing faults. This predicate is the stable SDK way to
+    /// distinguish a definitive local absence from a failure that may clear;
+    /// it exposes no backend text. It does not prove that the request never
+    /// executed: callers still classify the retained identity under the
+    /// journal's ordered admission before retrying preparation.
+    pub fn is_protected_fenced_transition_v2_recovery_row_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::BackendUnavailable(reason) if reason == PROTECTED_V2_RECOVERY_ROW_UNAVAILABLE
+        )
+    }
+}
+
 /// Bind one recovery journal to its exact wrapper authority.
 ///
 /// The commitment covers the protection mode, the explicitly configured
