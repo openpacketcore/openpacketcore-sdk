@@ -166,6 +166,8 @@ mod async_persistence;
 mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
+#[cfg(any(test, not(feature = "test-control")))]
+mod roster_maintenance;
 mod scheduling;
 mod scope_authority;
 mod transport_class;
@@ -4057,6 +4059,8 @@ impl ConsensusSessionStore {
             Arc::downgrade(&inner),
         );
         let store = Self { inner };
+        #[cfg(not(any(test, feature = "test-control")))]
+        roster_maintenance::start(Arc::downgrade(&store.inner));
         voter_slots::start_coordinator(&store);
         Ok(store)
     }
