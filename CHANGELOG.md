@@ -54,8 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so it resynchronises from the lowest replayable sequence; retention is a
   bounded replay backlog, not delivery tracking. The 1,048,576-row
   `MAX_ITEMS` cap remains a last defense instead of a lifetime stop. Durable
-  generation/image/export carry for the derived floor is the staged follow-up
-  (#1250) and adds no format boundary in this change. Refs #1250.
+  carry for the derived floor is included: generation base and delta catalogs,
+  full images, the portable SQLite snapshot projection and the prepared SQL
+  base preserve the sparse raw sequences and re-derive the identical floor on
+  replay, so close/reopen and snapshot install continue the same bounded
+  window. Million-mutation qualification and leader-to-snapshot-install parity
+  remain the final follow-up (#1250), with no new format boundary. Refs #1250.
 
 - `opc-session-net`: `PersistentSessionConsumerConfig::with_cooldown_admission`
   selects the explicit reconnect-cooldown admission policy for a persistent

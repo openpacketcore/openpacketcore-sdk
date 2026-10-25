@@ -847,3 +847,162 @@ fn native_v1_current_delta_over_original_generic_base_preserves_cold_commitments
     );
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
+
+/// Generation base and delta replay preserve the bounded rolling notification
+/// window: the derived floor is not written, so the reader retires the same
+/// prefix from the committed watch sequences and keeps exact raw ordering.
+#[test]
+fn native_notification_retention_survives_generation_base_delta_and_reopen() {
+    let _retention =
+        crate::consensus::native::retention::tests_support::override_retained_for_test(4);
+    let (mut storage, _request, mut outcome) = fixture();
+    for index in 2..=10_u64 {
+        let next = request(index, Some(&outcome));
+        let applied = apply(
+            &mut storage,
+            &[command(index, &next, time(index as u8), false)],
+        );
+        let Ok(SessionMutationOutcome::FencedTransition(next_outcome)) =
+            &applied.responses[0].result
+        else {
+            panic!("native retention fixture transition failed")
+        };
+        outcome = next_outcome.clone();
+    }
+    let watch = storage.business.frontiers.watch_sequence;
+    let floor = storage.business.frontiers.notification_floor();
+    assert!(watch > 4);
+    let maximum = crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("retained-generation.opc");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let base = PreparedBase::prepare(
+        &storage,
+        crate::consensus::native::generation::BaseParameters {
+            binding: ROOT,
+            file_epoch: 4,
+            checkpoint_epoch: 11,
+            operation_sequence: 18,
+            cut_binding: [0xE0; 32],
+            block_bytes: BLOCK,
+            maximum,
+        },
+        &|| Ok(()),
+    )
+    .unwrap();
+    let identity = base.write_to(&mut output, &|| Ok(())).unwrap();
+    output.sync_all().unwrap();
+    drop(output);
+    drop(base);
+    let (mut owner, catalog) = Catalog::open(
+        &path,
+        identity,
+        maximum,
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
+        [0xE0; 32],
+        &|| Ok(()),
+    )
+    .unwrap();
+    let restored = catalog.into_storage(&|| Ok(())).unwrap();
+    assert_eq!(restored.business.frontiers.watch_sequence, watch);
+    assert_eq!(restored.business.frontiers.notification_floor(), floor);
+    assert_eq!(restored.business.notifications.len() as u64, 4);
+    assert_eq!(
+        restored.business.notifications.front().unwrap().sequence(),
+        floor + 1
+    );
+    assert_eq!(
+        Version::capture(&restored)
+            .unwrap()
+            .context_digest()
+            .unwrap(),
+        Version::capture(&storage)
+            .unwrap()
+            .context_digest()
+            .unwrap()
+    );
+    assert!(matches!(
+        restored.business.replication_log(0, 8, &|| Ok(())),
+        Err(StoreError::ReplicationLogCursorCompacted { resume_from }) if resume_from == floor + 1
+    ));
+
+    // A delta that appends two notifications retires two predecessor rows on
+    // replay while the header carries only the retained target count.
+    let version = Version::capture(&storage).unwrap();
+    storage.begin_changes().unwrap();
+    for index in 11..=12_u64 {
+        let next = request(index, Some(&outcome));
+        let applied = apply(
+            &mut storage,
+            &[command(index, &next, time(index as u8), false)],
+        );
+        let Ok(SessionMutationOutcome::FencedTransition(next_outcome)) =
+            &applied.responses[0].result
+        else {
+            panic!("native retention delta transition failed")
+        };
+        outcome = next_outcome.clone();
+    }
+    let delta = PreparedDelta::prepare(
+        owner.current(),
+        &version,
+        12,
+        21,
+        [0xE1; 32],
+        storage.take_changes().unwrap(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(delta.header.changed[3], 2);
+    delta.append(&mut owner, &|| Ok(())).unwrap();
+    let selected = owner.current().identity();
+    let (_, catalog) = Catalog::open(
+        &path,
+        selected,
+        maximum,
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
+        [0xE1; 32],
+        &|| Ok(()),
+    )
+    .unwrap();
+    let restored = catalog.into_storage(&|| Ok(())).unwrap();
+    assert_eq!(
+        Version::capture(&restored)
+            .unwrap()
+            .context_digest()
+            .unwrap(),
+        Version::capture(&storage)
+            .unwrap()
+            .context_digest()
+            .unwrap()
+    );
+    let watch = storage.business.frontiers.watch_sequence;
+    let floor = storage.business.frontiers.notification_floor();
+    assert_eq!(restored.business.frontiers.watch_sequence, watch);
+    assert_eq!(restored.business.frontiers.notification_floor(), floor);
+    assert_eq!(restored.business.notifications.len() as u64, 4);
+    assert!(matches!(
+        restored.business.replication_log(0, 8, &|| Ok(())),
+        Err(StoreError::ReplicationLogCursorCompacted { resume_from }) if resume_from == floor + 1
+    ));
+    let page = restored
+        .business
+        .replication_log(floor + 1, 8, &|| Ok(()))
+        .unwrap();
+    assert_eq!(page.len() as u64, 4);
+    for (offset, entry) in page.iter().enumerate() {
+        assert_eq!(entry.sequence, floor + 1 + offset as u64);
+    }
+}

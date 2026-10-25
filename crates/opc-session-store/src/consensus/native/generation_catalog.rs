@@ -1167,6 +1167,22 @@ impl Rows {
         ordinals.validate(frontiers.history)?;
         self.read_catalog_table(reader, after, section, batch::Table::Generic, check)?;
         self.read_catalog_table(reader, after, section, batch::Table::Notification, check)?;
+        // Bounded rolling retention: the generation stores appended rows only.
+        // Drop the prefix outside the derived window (already validated by the
+        // header frontier transition) and remove its exact content stamps, so
+        // the recomputed table summary equals the after-image commitment.
+        let target_notifications = after.business.counts[3];
+        if self.notifications.len() != target_notifications {
+            let excess = self
+                .notifications
+                .len()
+                .checked_sub(target_notifications)
+                .ok_or_else(|| invalid("native catalog notification retention differs"))?;
+            let retired: Vec<_> = self.notifications.drain(..excess).collect();
+            for row in &retired {
+                self.summary[3].replace(Some(row.row.content), None)?;
+            }
+        }
         let mut changed = ChangedLogs::new(if base { 0 } else { counts[4] })?;
         for _ in 0..counts[4] {
             check()?;

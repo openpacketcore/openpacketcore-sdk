@@ -194,6 +194,7 @@ impl RelocationBuilder {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare(
         self,
         source: Arc<VerifiedPrefix>,
@@ -201,6 +202,7 @@ impl RelocationBuilder {
         applied: Option<LogId<SessionConsensusNodeId>>,
         members: &BTreeSet<SessionConsensusNodeId>,
         root: Option<Arc<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>>,
+        notification_floor: u64,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Relocations> {
         let Self {
@@ -252,10 +254,17 @@ impl RelocationBuilder {
                     length,
                 } => {
                     let sequence = row.sequence();
-                    let index = usize::try_from(sequence.checked_sub(1).ok_or_else(|| {
-                        invalid("native relocation notification sequence is zero")
-                    })?)
-                    .map_err(|_| invalid("native relocation notification index overflow"))?;
+                    // The replacement lands at its ordinal in the retained
+                    // window, not at raw sequence - 1: retired rows are gone.
+                    let index = sequence
+                        .checked_sub(notification_floor)
+                        .and_then(|position| position.checked_sub(1))
+                        .ok_or_else(|| invalid("native relocation notification sequence is zero"))
+                        .and_then(|index| {
+                            usize::try_from(index).map_err(|_| {
+                                invalid("native relocation notification index overflow")
+                            })
+                        })?;
                     let facts = facts::Row {
                         content: row.row_fingerprint(3, &sequence)?,
                         facts: facts::Notification {

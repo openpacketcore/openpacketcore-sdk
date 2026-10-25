@@ -274,9 +274,13 @@ acknowledgement/delivery state. The 1,048,576-row cap remains a last defense,
 front rows are retired as the window advances, and a watcher whose inclusive
 cursor is at or below the floor receives the existing
 `ReplicationLogCursorCompacted { resume_from }` answer instructing it to
-resynchronise. Durable generation/image/export carry for the derived floor is
-the staged notification-retention follow-up; this change adds no persisted
-format boundary.
+resynchronise. Durable carry for the derived floor is part of the same change:
+generation base and delta catalogs, full images, the portable SQLite snapshot
+projection and the prepared SQL base all preserve the sparse raw sequences and
+re-derive the identical floor on replay, so a reopened store or an installed
+snapshot continues the same bounded window. The million-mutation qualification
+job and a leader-to-snapshot-install parity qualification remain the final
+follow-up; no persisted format boundary is added.
 
 ## Async writer and local observations
 

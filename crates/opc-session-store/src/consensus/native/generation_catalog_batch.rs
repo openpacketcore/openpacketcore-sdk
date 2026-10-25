@@ -94,19 +94,14 @@ impl ReservedFrame<'_, '_> {
 fn frame<'a, 'r>(
     reader: &'a mut Cursor<'r>,
     table: Table,
-    notifications: usize,
+    notification_sequence: u64,
     check: &impl Fn() -> io::Result<()>,
 ) -> io::Result<(Header, Frame<'a, 'r>)> {
     check()?;
     expect(reader, &[table.index() as u8])?;
     let header = match table {
         Table::Generic => Header::Generic(reader.before()?),
-        Table::Notification => {
-            if notifications >= validation::MAX_ITEMS {
-                return Err(invalid("native catalog watch count exceeds original bound"));
-            }
-            Header::Notification(notifications as u64 + 1)
-        }
+        Table::Notification => Header::Notification(notification_sequence),
     };
     let offset = reader
         .position
@@ -327,24 +322,42 @@ impl Rows {
         resources: &Resources<'_>,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
+        if table.index() == 3
+            && self
+                .notifications
+                .len()
+                .checked_add(section.counts[3])
+                .is_none_or(|count| count > validation::MAX_ITEMS)
+        {
+            return Err(invalid("native catalog watch count exceeds original bound"));
+        }
         let mut batch = if section.counts[table.index()] < PARALLEL_MIN || resources.available <= 1
         {
             None
         } else {
             Batch::new(resources).ok()
         };
-        for _ in 0..section.counts[table.index()] {
-            let pending = batch.as_ref().map_or(0, |batch| batch.rows.len());
-            let (header, mut frame) =
-                match frame(reader, table, self.notifications.len() + pending, check) {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        if let Some(batch) = &mut batch {
-                            batch.finish(self, after, section, resources, check)?;
-                        }
-                        return Err(error);
+        for row_index in 0..section.counts[table.index()] {
+            // Every notification appended by this generation has a committed
+            // raw sequence continuing from its predecessor watch sequence.
+            // Retirement removes a prefix but never renumbers a survivor.
+            let notification_sequence = after
+                .business
+                .frontiers
+                .watch_sequence
+                .checked_sub(section.counts[3] as u64)
+                .and_then(|first| first.checked_add(row_index as u64))
+                .and_then(|position| position.checked_add(1))
+                .ok_or_else(|| invalid("native catalog notification sequence overflow"))?;
+            let (header, mut frame) = match frame(reader, table, notification_sequence, check) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    if let Some(batch) = &mut batch {
+                        batch.finish(self, after, section, resources, check)?;
                     }
-                };
+                    return Err(error);
+                }
+            };
             if frame.range.length as usize > INPUT {
                 if let Some(batch) = &mut batch {
                     batch.finish(self, after, section, resources, check)?;
@@ -485,8 +498,11 @@ impl Rows {
                 )?;
             }
             (Header::Notification(sequence), CatalogRow::Notification(row)) => {
-                if sequence != self.notifications.len() as u64 + 1 || row.facts.sequence != sequence
-                {
+                let ordered = self
+                    .notifications
+                    .last()
+                    .is_none_or(|last| last.row.facts.sequence.checked_add(1) == Some(sequence));
+                if !ordered || row.facts.sequence != sequence {
                     return Err(invalid(
                         "native catalog inspected notification order differs",
                     ));
