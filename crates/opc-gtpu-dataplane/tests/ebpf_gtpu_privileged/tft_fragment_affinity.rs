@@ -1,6 +1,7 @@
 //! Real tc uplink fragment-affinity proofs using synthetic IPv4 ESP packets.
 
 use super::*;
+use opc_gtpu_dataplane::PeerTeid;
 use opc_gtpu_ebpf_common::{
     TftClassifierKey, TftClassifierMeta, TftClassifierOwnerId, TftFragmentKey,
     COUNTER_TFT_CLASSIFIER_INVALID_STATE, COUNTER_TFT_CLASSIFIER_MALFORMED, TFT_FRAGMENT_BUCKETS,
