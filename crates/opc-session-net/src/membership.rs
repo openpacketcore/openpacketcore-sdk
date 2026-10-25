@@ -1021,6 +1021,7 @@ mod tests {
         Arc::new(
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new(cluster).expect("test cluster"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("legacy-test").expect("test generation"),
                 SessionConfigurationEpoch::new(epoch).expect("test epoch"),
                 descriptors,
@@ -1796,6 +1797,7 @@ mod tests {
         let duplicate = descriptor(1);
         let result = SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new("membership-test").expect("test cluster"),
+            [0x5a; 32],
             SessionConfigurationGeneration::new("legacy-test").expect("test generation"),
             SessionConfigurationEpoch::new(2).expect("test epoch"),
             vec![duplicate.clone(), duplicate],

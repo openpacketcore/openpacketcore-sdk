@@ -281,6 +281,7 @@ fn manifest_for_replicas(
     Arc::new(
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new(cluster).expect("cluster ID"),
+            [0x5a; 32],
             SessionConfigurationGeneration::new("legacy-v4").expect("legacy generation"),
             SessionConfigurationEpoch::new(epoch).expect("configuration epoch"),
             replicas

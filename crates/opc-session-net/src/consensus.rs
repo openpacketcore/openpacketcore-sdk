@@ -4855,6 +4855,7 @@ mod tests {
         let manifest = Arc::new(
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("consensus-raw-rejection").expect("cluster"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("legacy").expect("legacy generation"),
                 SessionConfigurationEpoch::new(1).expect("epoch"),
                 vec![descriptor(1), descriptor(2)],
@@ -5027,6 +5028,7 @@ mod tests {
         Arc::new(
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("consensus-membership-transition").expect("cluster"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("legacy").expect("legacy generation"),
                 SessionConfigurationEpoch::new(epoch).expect("epoch"),
                 members.iter().copied().map(descriptor).collect(),
@@ -9293,6 +9295,7 @@ mod tests {
         let strict = Arc::new(
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("fixed-policy-handshake").expect("cluster"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("fixed").expect("generation"),
                 SessionConfigurationEpoch::new(1).expect("epoch"),
                 descriptors.clone(),
@@ -9302,6 +9305,7 @@ mod tests {
         let reduced = Arc::new(
             SessionReplicationManifest::try_new_with_epoch_and_placement_policy(
                 SessionClusterId::new("fixed-policy-handshake").expect("cluster"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("fixed").expect("generation"),
                 SessionConfigurationEpoch::new(1).expect("epoch"),
                 descriptors,

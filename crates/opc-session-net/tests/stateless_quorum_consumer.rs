@@ -963,6 +963,7 @@ impl ThreeVoterConsumerFleet {
             SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
                 SessionClusterId::new("consumer-three-voter-transition")
                     .expect("three-voter cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("consumer-three-voter-v1")
                     .expect("three-voter configuration generation"),
                 ConsensusConfigurationEpoch::new(1).expect("three-voter epoch"),

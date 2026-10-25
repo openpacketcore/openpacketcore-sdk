@@ -1404,6 +1404,10 @@ impl QualificationNode {
         let manifest = Arc::new(
             SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
                 SessionClusterId::new(config.cluster_id.clone()).map_err(|_| NodeFailure)?,
+                // Qualification campaigns model one fresh installation each;
+                // real consumers generate and persist their own non-zero
+                // installation nonce with the immutable manifest (#1187).
+                [0x5a; 32],
                 SessionConfigurationGeneration::new(config.configuration_generation.clone())
                     .map_err(|_| NodeFailure)?,
                 SessionConfigurationEpoch::new(config.configuration_epoch)

@@ -514,6 +514,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-session-net` (fresh-install boundary): session cluster identity, consensus
+  node IDs and the configuration digest are installation-qualified. Every
+  `SessionReplicationManifest` constructor now requires the persisted non-zero
+  32-byte installation nonce; the consensus cluster ID derives through
+  `ConsensusClusterId::for_installation`, node IDs derive from that qualified
+  identity, and the configuration digest advances to
+  `opc-session-net/configuration/v2` with the nonce committed. The same
+  human-readable cluster name under a fresh nonce is a distinct authority
+  domain: retained session/consensus stores, scope identities and voter-slot
+  tables from an earlier installation are refused with typed
+  identity/replacement errors instead of joining the new installation. No
+  migration is provided; consumers must generate and persist the nonce with the
+  immutable manifest at first install, and changing it on existing storage is a
+  fresh installation. Refs #1187.
+
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned
   opt-in downlink inner MTU profiles (versions 3 and 4, the 2-byte field at

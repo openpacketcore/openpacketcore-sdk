@@ -4380,6 +4380,7 @@ fn fixed_voter_topology_for_configuration_with_root(
     let manifest = SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
         SessionClusterId::new(format!("qualification-mtls-{}-cluster", members.len()))
             .expect("qualification consumer cluster ID"),
+        [0x5a; 32],
         SessionConfigurationGeneration::new(configuration_generation)
             .expect("qualification consumer configuration generation"),
         SessionConfigurationEpoch::new(configuration_epoch)
@@ -8248,6 +8249,7 @@ impl Fleet {
                     self.member_count()
                 ))
                 .expect("qualification cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("v1")
                     .expect("qualification configuration generation"),
                 SessionConfigurationEpoch::new(1).expect("qualification configuration epoch"),
@@ -8406,6 +8408,7 @@ impl Fleet {
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("qualification-mtls-3-cluster")
                     .expect("qualification cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("v1")
                     .expect("qualification configuration generation"),
                 SessionConfigurationEpoch::new(1).expect("qualification configuration epoch"),

@@ -592,9 +592,13 @@ the limit; a caller may retry the same cursor with a smaller record limit.
 
 Every production participant is created with an opaque authenticated TLS
 config and a binding derived from one immutable `SessionReplicationManifest`.
-The manifest's configuration ID is an order-independent SHA-256 digest of the
-cluster ID, operator-controlled generation, and every field of every replica
-descriptor. During the v5 handshake, each side extracts the canonical SPIFFE
+The manifest's configuration ID is an order-independent SHA-256 digest (v2)
+of the cluster ID, the persisted installation nonce, operator-controlled
+generation, and every field of every replica descriptor. Cluster identity, node
+IDs and the configuration digest are installation-qualified: the same cluster
+name under a fresh installation nonce is a distinct authority domain and its
+retained stores are refused with the typed identity mismatch, while reusing the
+persisted nonce continues the installation. During the v5 handshake, each side extracts the canonical SPIFFE
 URI from the live certificate and requires it to match the claimed stable
 `ReplicaId`, expected opposite member, cluster, and configuration ID before
 dispatch. The client verifies its fresh challenge is echoed by the server.
