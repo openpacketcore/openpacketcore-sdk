@@ -9469,17 +9469,32 @@ fn terminate_candidate_git_process_group(
     // Do not key the KILL decision on the leader: a leader may already have
     // exited while a descendant still owns either pipe.
     signal_owned_candidate_git_process_group(process_group, rustix::process::Signal::KILL)?;
+    // The leader is a direct child and is reaped by `try_wait`. Descendants the
+    // leader spawned are not our children, so they cannot be reaped here; a
+    // container whose PID 1 does not reap orphans may instead retain an exited
+    // descendant as a zombie forever. That zombie has already exited: it cannot
+    // run or hold the pipe, and `kill(pid, 0)` still succeeds for it. Cleanup
+    // therefore reports completion only once every process in the owned group
+    // has exited, so the caller's exact-PID observation cannot race a
+    // still-running descendant.
     let reap_deadline = Instant::now() + CANDIDATE_GIT_TERMINATE_GRACE;
-    while Instant::now() < reap_deadline {
-        if child.try_wait()?.is_some() {
+    loop {
+        let leader_reaped = child.try_wait()?.is_some();
+        let live_group_member = candidate_git_owned_process_group_has_live_member(process_group)?;
+        if leader_reaped && !live_group_member {
             break;
         }
+        if Instant::now() >= reap_deadline {
+            if !leader_reaped {
+                return Err(io::Error::other(
+                    "candidate Git leader did not reap after owned-group SIGKILL",
+                ));
+            }
+            return Err(io::Error::other(
+                "candidate Git owned process group retained a live member after SIGKILL",
+            ));
+        }
         thread::sleep(CANDIDATE_GIT_PIPE_POLL);
-    }
-    if child.try_wait()?.is_none() {
-        return Err(io::Error::other(
-            "candidate Git leader did not reap after owned-group SIGKILL",
-        ));
     }
     stop_readers.store(true, Ordering::Release);
     let readers_deadline = Instant::now() + CANDIDATE_GIT_TERMINATE_GRACE;
@@ -12722,18 +12737,93 @@ fn write_candidate_git_helper_script(path: &Path, body: &[u8]) {
         .expect("make candidate Git helper script executable");
 }
 
-fn candidate_git_process_is_gone(process_id: u32) -> bool {
-    let Some(process_id) = i32::try_from(process_id)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-    else {
-        return false;
+/// Terminal state of one observed candidate-Git process.
+///
+/// A zombie has already exited: it cannot run, hold the pipe, or execute the
+/// trusted Git operation. A container whose PID 1 does not reap orphans keeps
+/// such a process visible to `kill(pid, 0)` forever, so termination is decided
+/// from the kernel's process state instead of from that probe alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateGitProcessState {
+    /// The process no longer exists (its parent reaped it).
+    Gone,
+    /// The process has exited and only its exit status is retained.
+    Zombie,
+    /// The process still exists and can run.
+    Live,
+}
+
+/// Exact exit state for one observed candidate-Git process.
+fn candidate_git_process_state(process_id: u32) -> io::Result<CandidateGitProcessState> {
+    let stat = match fs::read_to_string(format!("/proc/{process_id}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(CandidateGitProcessState::Gone);
+        }
+        Err(error) => return Err(error),
     };
-    match rustix::process::test_kill_process(process_id) {
-        Ok(()) => false,
-        Err(error) if error.raw_os_error() == 3 => true, // ESRCH
-        Err(_) => false,
+    // `comm` is parenthesized and may itself contain spaces or `)`, so the
+    // state is the first field after the final `)`. The raw helper output is
+    // never scanned for a byte that random contents can contain.
+    let (_, fields) = stat
+        .split_once(')')
+        .ok_or_else(|| io::Error::other("candidate Git process stat is malformed"))?;
+    let state = fields
+        .split_ascii_whitespace()
+        .next()
+        .ok_or_else(|| io::Error::other("candidate Git process stat has no state"))?;
+    Ok(match state {
+        "Z" | "X" | "x" => CandidateGitProcessState::Zombie,
+        _ => CandidateGitProcessState::Live,
+    })
+}
+
+/// True once the exact process has exited, whether or not its parent reaped it.
+fn candidate_git_process_terminated(process_id: u32) -> bool {
+    matches!(
+        candidate_git_process_state(process_id),
+        Ok(CandidateGitProcessState::Gone | CandidateGitProcessState::Zombie)
+    )
+}
+
+/// True while at least one still-live process belongs to the owned candidate-Git
+/// process group. Exited zombies are not live members: they cannot hold the pipe,
+/// and a non-reaping container PID 1 may keep their PID visible forever.
+fn candidate_git_owned_process_group_has_live_member(
+    process_group: rustix::process::Pid,
+) -> io::Result<bool> {
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(process_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // A process can exit between read_dir and read; absence is not live.
+        let Ok(stat) = fs::read_to_string(format!("/proc/{process_id}/stat")) else {
+            continue;
+        };
+        let Some((_, fields)) = stat.split_once(')') else {
+            continue;
+        };
+        let mut fields = fields.split_ascii_whitespace();
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        let _parent_process_id = fields.next();
+        let Some(Ok(group_id)) = fields.next().map(str::parse::<i32>) else {
+            continue;
+        };
+        if rustix::process::Pid::from_raw(group_id) != Some(process_group) {
+            continue;
+        }
+        if !matches!(state, "Z" | "X" | "x") {
+            return Ok(true);
+        }
     }
+    Ok(false)
 }
 
 #[test]
@@ -12889,13 +12979,29 @@ fn bounded_candidate_git_runner_kills_pipe_holding_term_resistant_descendant() {
         "the parent-recorded $! must name a distinct background descendant"
     );
     let gone_deadline = Instant::now() + CANDIDATE_GIT_TERMINATE_GRACE;
-    while !candidate_git_process_is_gone(observed_descendant_pid) && Instant::now() < gone_deadline
+    while !candidate_git_process_terminated(observed_descendant_pid)
+        && Instant::now() < gone_deadline
     {
         thread::sleep(CANDIDATE_GIT_PIPE_POLL);
     }
     assert!(
-        candidate_git_process_is_gone(observed_descendant_pid),
-        "owned process-group SIGKILL leaves the exact parent-recorded descendant PID gone after its leader exits"
+        candidate_git_process_terminated(observed_descendant_pid),
+        "owned process-group SIGKILL leaves the exact parent-recorded descendant PID terminated (exited or reaped) after its leader exits"
+    );
+    // The helper leader is the process-group leader (`process_group(0)`), so
+    // its recorded PID is also the owned group identifier. Cleanup must not
+    // report completion while a member of that group can still run. A zombie
+    // has exited and is therefore not a live member even when the container
+    // never reaps it.
+    assert!(
+        !candidate_git_owned_process_group_has_live_member(
+            rustix::process::Pid::from_raw(
+                i32::try_from(observed_leader_pid).expect("leader pid fits i32")
+            )
+            .expect("positive leader pid")
+        )
+        .expect("observe owned candidate-Git process group"),
+        "cleanup must not report completion while an owned candidate-Git group member is live"
     );
 
     // Check observations only after the original deadline and owned-process
@@ -12916,6 +13022,108 @@ fn bounded_candidate_git_runner_kills_pipe_holding_term_resistant_descendant() {
     // The existing cleanup may report a cancelled pipe reader while SIGKILL
     // is still closing the descendant's descriptors. Preserve that result;
     // the exact descendant PID and original cleanup bound are asserted above.
+}
+
+#[test]
+fn candidate_git_process_state_distinguishes_zombie_from_live_process() {
+    let workspace = tempfile::tempdir().expect("create zombie observation workspace");
+    let child_pid = workspace.path().join("child.pid");
+    // The keeper survives its background child and never calls `wait`, so the
+    // child stays an unreaped zombie regardless of whether the container's
+    // PID 1 reaps unrelated orphans. This reproduces the observed CI shape in
+    // which `kill(pid, 0)` still succeeds after the process-group SIGKILL.
+    let mut keeper = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("sleep 0.05 & printf '%s' \"$!\" > \"$1\"; exec sleep 30")
+        .arg("candidate-git-zombie-keeper")
+        .arg(&child_pid)
+        .spawn()
+        .expect("spawn non-reaping candidate-Git keeper");
+    let keeper_pid = keeper.id();
+    let pid_deadline = Instant::now() + Duration::from_secs(5);
+    let observed_child_pid = loop {
+        if let Ok(contents) = fs::read_to_string(&child_pid) {
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                break pid;
+            }
+        }
+        assert!(
+            Instant::now() < pid_deadline,
+            "keeper reported its background child PID"
+        );
+        thread::sleep(CANDIDATE_GIT_PIPE_POLL);
+    };
+    assert!(
+        !candidate_git_process_terminated(keeper_pid),
+        "a running keeper must not be reported terminated"
+    );
+    let zombie_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match candidate_git_process_state(observed_child_pid)
+            .expect("observe the background child state")
+        {
+            CandidateGitProcessState::Zombie => break,
+            CandidateGitProcessState::Live => {
+                assert!(
+                    Instant::now() < zombie_deadline,
+                    "the background child must exit within the observation bound"
+                );
+                thread::sleep(CANDIDATE_GIT_PIPE_POLL);
+            }
+            CandidateGitProcessState::Gone => {
+                panic!("the live non-reaping keeper must retain the exited child as a zombie")
+            }
+        }
+    }
+    assert!(
+        candidate_git_process_terminated(observed_child_pid),
+        "an exited zombie must be reported terminated, not alive"
+    );
+    let zombie = rustix::process::Pid::from_raw(
+        i32::try_from(observed_child_pid).expect("background child PID fits i32"),
+    )
+    .expect("positive background child PID");
+    assert!(
+        rustix::process::test_kill_process(zombie).is_ok(),
+        "regression evidence: an unreaped zombie still answers kill(pid, 0), which is why the previous gone-check observed it as alive"
+    );
+    keeper.kill().expect("kill the non-reaping keeper");
+    keeper.wait().expect("reap the non-reaping keeper");
+    assert!(
+        candidate_git_process_terminated(keeper_pid),
+        "the killed keeper must be reported terminated after it is reaped"
+    );
+    // The keeper's zombie child is reparented to the container's reaper when
+    // the keeper exits; this fixture never leaves a live process behind.
+}
+
+#[test]
+fn candidate_git_owned_process_group_live_member_tracks_termination() {
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("trap '' TERM; while :; do sleep 1; done")
+        .process_group(0);
+    let mut child = command.spawn().expect("spawn owned-group fixture");
+    let process_group = rustix::process::Pid::from_child(&child);
+    assert!(
+        candidate_git_owned_process_group_has_live_member(process_group)
+            .expect("observe the owned-group fixture"),
+        "a live owned-group member must be observed before termination"
+    );
+    signal_owned_candidate_git_process_group(process_group, rustix::process::Signal::KILL)
+        .expect("signal the owned-group fixture");
+    let terminate_deadline = Instant::now() + CANDIDATE_GIT_TERMINATE_GRACE;
+    while candidate_git_owned_process_group_has_live_member(process_group)
+        .expect("observe the owned-group fixture after SIGKILL")
+    {
+        assert!(
+            Instant::now() < terminate_deadline,
+            "the owned-group fixture must terminate after the owned-group SIGKILL"
+        );
+        thread::sleep(CANDIDATE_GIT_PIPE_POLL);
+    }
+    child.wait().expect("reap the owned-group leader");
 }
 
 #[test]
@@ -12944,7 +13152,7 @@ fn bounded_candidate_git_runner_identifies_live_leader_after_both_pipes_close() 
         .parse::<u32>()
         .expect("leader pid is numeric");
     assert!(
-        candidate_git_process_is_gone(observed_leader_pid),
+        candidate_git_process_terminated(observed_leader_pid),
         "owned live leader was killed and reaped despite both pipes already closing"
     );
 
