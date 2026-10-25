@@ -2277,8 +2277,9 @@ impl SessionConsumerPreparedFencedTransitionV2 {
 
     /// Try one read-only receipt lookup on the next deterministic voter.
     ///
-    /// A definitive local row failure (the exact retained row is missing or
-    /// names a different canonical request) is returned as `Unavailable` and
+    /// A definitive local row failure (the exact retained row is missing,
+    /// names a different canonical request, or the required protected-V2
+    /// backend contract is unsupported) is returned as `Unavailable` and
     /// cached as final for this handle. A transient local journal, backing or
     /// key-provider failure is also returned as `Unavailable`, but it is not
     /// cached: the same exact binding can be re-checked by a later call.
@@ -2513,18 +2514,28 @@ fn v2_rejection_never_binds(error: &StoreError) -> bool {
 ///
 /// A definitive failure can never become observable by waiting: the exact
 /// retained row is missing, the caller ID names a different canonical
-/// request, or the row/backend contract cannot be authenticated at all. A
-/// transient journal, backing, key-provider or operation-outcome failure is
-/// reported through separate classes and must stay re-checkable without
-/// restoring dispatch authority.
+/// request, or the required protected-V2 backend contract is missing or
+/// unsupported. A transient journal, backing, key-provider or
+/// operation-outcome failure is reported through separate classes and must
+/// stay re-checkable without restoring dispatch authority. Corrupt or
+/// unauthenticatable local journal state is currently reported as retryable
+/// journal unavailability, not as a raw content-authentication error, so it
+/// is retried fail-closed (and never grants authority) rather than treated as
+/// a final result.
 fn prepared_fenced_v2_preflight_failure_is_definitive(error: &StoreError) -> bool {
     error.is_protected_fenced_transition_v2_recovery_row_unavailable()
         || matches!(
             error,
             StoreError::FencedTransitionRequestConflict
+                | StoreError::CapabilityNotSupported(_)
+                // Defensive, unreachable from `require_exact_journal` today:
+                // the recovery journal collapses corrupt/undecodable rows into
+                // `FencedTransitionRecoveryJournalUnavailable`. Keep the raw
+                // content-authentication classes definitive so a preflight
+                // that ever surfaces them directly cannot cache a retry as a
+                // final receipt.
                 | StoreError::Crypto(_)
                 | StoreError::Serialization(_)
-                | StoreError::CapabilityNotSupported(_)
         )
 }
 
@@ -4966,9 +4977,18 @@ mod tests {
     fn v2_preflight_failure_classification_separates_final_from_transient() {
         for definitive in [
             StoreError::FencedTransitionRequestConflict,
+            // The store's fixed row-absence reason. `require_exact_journal`
+            // reports a cleanly absent exact row this way; the matching
+            // predicate is also covered end to end by
+            // `v2_status_missing_exact_row_stays_final`.
+            StoreError::BackendUnavailable(
+                "protected fenced-transition V2 recovery row unavailable".into(),
+            ),
+            StoreError::CapabilityNotSupported("no protected V2 boundary".into()),
+            // Defensive arms only: require_exact_journal currently collapses
+            // corrupt/undecodable rows into journal unavailability.
             StoreError::Crypto("content-dependent failure".into()),
             StoreError::Serialization("undecodable row".into()),
-            StoreError::CapabilityNotSupported("no protected V2 boundary".into()),
         ] {
             assert!(
                 prepared_fenced_v2_preflight_failure_is_definitive(&definitive),

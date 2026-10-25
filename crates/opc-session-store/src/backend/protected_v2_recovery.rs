@@ -206,6 +206,11 @@ pub(super) fn unsupported_protected_fenced_transition_v2_recovery() -> StoreErro
 }
 
 fn recovery_row_unavailable() -> StoreError {
+    // This fixed reason doubles as the row-absence discriminator checked by
+    // `is_protected_fenced_transition_v2_recovery_row_unavailable`. The same
+    // constructor is also used for unrelated "waiting caller"/"no call
+    // registered" conditions, so callers must apply that predicate only to
+    // the exact-row preflight path and must not reuse it for other meanings.
     StoreError::BackendUnavailable(PROTECTED_V2_RECOVERY_ROW_UNAVAILABLE.into())
 }
 
@@ -216,9 +221,12 @@ impl StoreError {
     /// The row-absence case shares the transient [`Self::BackendUnavailable`]
     /// class with backing faults. This predicate is the stable SDK way to
     /// distinguish a definitive local absence from a failure that may clear;
-    /// it exposes no backend text. It does not prove that the request never
-    /// executed: callers still classify the retained identity under the
-    /// journal's ordered admission before retrying preparation.
+    /// it exposes no backend text. It is meaningful only for an error from the
+    /// exact-row preflight (`require_exact`): the same fixed reason is reused
+    /// for unrelated void/prepare conditions, which are not row absence. It
+    /// does not prove that the request never executed: callers still classify
+    /// the retained identity under the journal's ordered admission before
+    /// retrying preparation.
     pub fn is_protected_fenced_transition_v2_recovery_row_unavailable(&self) -> bool {
         matches!(
             self,

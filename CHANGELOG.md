@@ -41,10 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a transient local recovery-preflight failure as the handle's final
   `Unavailable`. A transient journal, backing, key-provider or
   operation-outcome failure leaves the exact retained binding re-checkable
-  until the caller's deadline (or a later status call). A definitive local
-  failure (missing retained row, replaced canonical request, or
-  content-authentication failure) remains final, and the public error stays
-  `Unavailable`. No failure class restores dispatch authority. Refs #1378.
+  until the caller's deadline (or a later status call). The cached definitive
+  cases are an exactly missing retained row, a caller ID now naming a
+  different canonical request (`FencedTransitionRequestConflict`), and a
+  missing or unsupported protected-V2 backend contract
+  (`CapabilityNotSupported`). Corrupt or unreadable local journal state is
+  reported by the store as retryable journal unavailability, so it is retried
+  fail-closed and never granted authority rather than being claimed final.
+  The public error stays `Unavailable`, and no failure class restores dispatch
+  authority. Refs #1378.
 
 ### Breaking
 
