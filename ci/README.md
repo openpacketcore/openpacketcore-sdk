@@ -144,9 +144,11 @@ octopus merges are scanned against their first parent with
 `--diff-merges=first-parent --no-walk`. They are batched only to bound argument
 size; every selected merge is scanned. Unexpected merge-tree failures or missing
 tree output fail the gate. All scanner passes retain their diagnostics and error
-checks, and merge scanning continues after ordinary findings. Completed passes
-contribute to one report and total finding count. An incomplete scan fails
-without publishing a partial count. No pass containing findings is a success.
+checks, and merge scanning continues after ordinary findings. Finding reports
+contribute to one report and total finding count. Classification failures,
+non-finding scanner failures and malformed reports fail without publishing a
+combined count. As before, a scanner exit 2 retains its findings even if its log
+also contains an error; that run fails. No pass containing findings is a success.
 
 Scheduled runs (daily at 08:17 UTC) fetch and scan all branch and tag refs with
 the `.gitleaksignore` on `main`, including branches without pull requests.

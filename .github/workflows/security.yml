@@ -172,7 +172,7 @@ jobs:
           done
 
           # Keep one complete report/count, including when ordinary commits leak.
-          # An incomplete pass above never publishes a misleading partial count.
+          # A pass rejected above never publishes a misleading partial count.
           if [[ "$status" -eq 2 ]]; then
             count="$(python3 - "$report" "${finding_reports[@]}" <<'PY'
           import json
