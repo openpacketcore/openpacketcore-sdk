@@ -727,6 +727,7 @@ pub(crate) fn tests_sa_request_for_repair() -> XfrmObjectInstallRequest {
             output_mark: None,
             if_id: None,
             egress_dscp: None,
+            tfc_pad: None,
         },
     })
 }
@@ -836,6 +837,7 @@ mod tests {
                 output_mark: None,
                 if_id: None,
                 egress_dscp: None,
+                tfc_pad: None,
             },
         })
     }

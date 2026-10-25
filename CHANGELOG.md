@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `opc-ipsec-xfrm`: SAs can request Linux Traffic Flow Confidentiality (TFC)
+  padding through the new `SaParameters::tfc_pad: Option<u32>`. A `Some(n)`
+  value serializes the `XFRMA_TFCPAD` attribute (UAPI attribute 22, `__u32`) on
+  install and rekey; Linux ESP output then pads the protected packet to at
+  least `n` bytes when shorter, capped at the path MTU. Validation rejects a
+  zero length, non-ESP SAs, and non-tunnel modes before any netlink mutation,
+  matching the kernel's `verify_newsa_info`. `SaState::tfc_pad` reports the
+  value from exact `GETSA` readback. `None` emits no attribute and keeps the
+  pre-TFC bytes exactly unchanged. The versioned durable install-request and
+  outbound-binding fingerprints do not cover `tfc_pad` in this revision
+  (in-memory request comparisons do); widening them needs its own
+  auth-domain-v2 and migration follow-up. Dummy-packet generation with Next
+  Header 59 (RFC 4303 §2.5/§2.7) is not part of this netlink model and remains
+  a tracked follow-up, so #1344 is only partially addressed by this change
+  (the configuration/encoding acceptance is met). Refs #1344.
+
 ### Fixed
 
 - `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
@@ -40,6 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PeerTeid::new`, `PeerTeid::ZERO`, or `PeerTeid::from(teid)`; `Teid` remains
   for `local_teid` and every selector/map key. Downstream code that assigned a
   `Teid` to `peer_teid` must convert or construct a `PeerTeid`. Refs #1346.
+- `opc-ipsec-xfrm`: `SaParameters` and `SaState` add a public
+  `tfc_pad: Option<u32>` field for Linux Traffic Flow Confidentiality padding.
+  Callers constructing either struct with a literal must add `tfc_pad: None`;
+  SAs that do not configure TFC emit byte-identical netlink and report `None`
+  on readback, so no installed-state behaviour changes. Downstream exhaustive
+  struct literals must be updated. Refs #1344.
 
 - `opc-session-net`: `StartupError` adds `PlatformInvalid`,
   `PlatformChanged`, and `PrerequisiteRefused`. Issuer probe and retained-session
@@ -203,6 +227,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error for Configuration Update Command/Complete bodies.
 
 ### Added
+
+- `opc-session-net`: prepared V2 fenced-transition handles expose
+  `execute_once_with_failure_diagnostic`, an additive diagnostic wrapper around
+  the unchanged `execute_once` effect classification. A `NotTransmitted` or
+  `OutcomeUnknown` failure now carries a value-free
+  `SessionConsumerPreparedFencedTransitionV2FailureDiagnostic` with a closed
+  `setup`/`send`/`awaiting_reply`/`reply_lost` stage and the remaining original
+  caller budget in milliseconds, so a cold setup expiry, a held refusal and
+  reply loss can be told apart in logs and metrics. Dispatch authority,
+  ownership, effect classification, request identity and wire format are
+  unchanged; `into_error` recovers exactly the previous error. Resolved
+  rejections and lease deferrals carry no diagnostic. Refs #1129.
 
 - `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
   verification time for certificate validity checks while preserving SPIFFE ID,

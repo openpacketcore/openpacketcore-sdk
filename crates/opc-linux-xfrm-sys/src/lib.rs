@@ -304,6 +304,14 @@ pub const XFRMA_ALG_AEAD: u16 = 18;
 pub const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 /// XFRM optional packet mark attribute.
 pub const XFRMA_MARK: u16 = 21;
+/// XFRM Traffic Flow Confidentiality padding attribute (`__u32`).
+///
+/// Defined by `enum xfrm_attr_type_t` (`XFRMA_TFCPAD`) in
+/// `include/uapi/linux/xfrm.h`. The kernel stores it as the SA's target
+/// padding length, parses it with `NLA_U32`, emits it from `GETSA` only when
+/// the stored length is nonzero, and accepts it only for ESP SAs in tunnel
+/// mode (`verify_newsa_info` in `net/xfrm/xfrm_user.c`).
+pub const XFRMA_TFCPAD: u16 = 22;
 /// XFRM ESN replay sequence/bitmap attribute.
 pub const XFRMA_REPLAY_ESN_VAL: u16 = 23;
 /// Empty netlink alignment attribute.
