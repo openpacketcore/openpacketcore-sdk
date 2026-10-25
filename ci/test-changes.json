@@ -346,6 +346,12 @@
       "kind": "assertions-decreased",
       "reason": "The four PCO rejection assertions moved to positive retention/ignore coverage for issue #1441 in new tests (issue payloads, request/response retention, nonzero instances, builder round-trip, framing). The negative test keeps its AMBR, bearer-context, instance-shape and malformed-cause assertions; only the PCO-specific local-helper assertions were removed because that behaviour intentionally stopped being a rejection.",
       "issue": 1441
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=consensus_openraft::stepdown::superseded_leader_stops_replication_before_truncating_its_uncommitted_suffix",
+      "kind": "assertions-decreased",
+      "reason": "Issue #1208 replaces the two immediate status reads (higher term, non-leader) with one bounded wait_for_status_for_test predicate that checks the same two conditions; the static helper resolver attributes one fewer assertion to the test. Openraft publishes the successor term and non-leader state from its own engine task, so a single immediate read could observe the pre-stepdown snapshot. Every original property and the existing RECOVERY_TIMEOUT bound are preserved; no timeout was raised and no assertion was weakened.",
+      "issue": 1208
     }
   ]
 }
