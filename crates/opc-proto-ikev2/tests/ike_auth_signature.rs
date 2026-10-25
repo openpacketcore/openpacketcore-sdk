@@ -8,17 +8,21 @@ use opc_proto_ikev2::{
     Ikev2SignaturePublicKey, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
     IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, IKEV2_AUTH_METHOD_SHARED_KEY_MIC,
     RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384,
-    RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
+    RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256, RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
 };
 
 mod support;
 
 const RSA_SPKI_DER: &[u8] = include_bytes!("data/rsa2048_spki.der");
+#[cfg(feature = "rsa-signing")]
+const RSA_PKCS8_DER: &[u8] = include_bytes!("data/rsa2048_pkcs8.der");
 const P256_PKCS8_DER: &[u8] = include_bytes!("data/p256_pkcs8.der");
 const P256_SPKI_DER: &[u8] = include_bytes!("data/p256_spki.der");
 const P256_CERT_DER: &[u8] = include_bytes!("data/p256_cert.der");
 const P384_PKCS8_DER: &[u8] = include_bytes!("data/p384_pkcs8.der");
 const P384_SPKI_DER: &[u8] = include_bytes!("data/p384_spki.der");
+const P521_PKCS8_DER: &[u8] = include_bytes!("data/p521_pkcs8.der");
+const P521_SPKI_DER: &[u8] = include_bytes!("data/p521_spki.der");
 
 fn profile() -> Ikev2SaInitCryptoProfile {
     Ikev2SaInitCryptoProfile::new_aead(
@@ -149,6 +153,188 @@ fn ecdsa_p384_method_14_signature_round_trips() {
         Some(authority.verification_authorization()),
     )
     .expect("method 14 ECDSA P-384 verifies");
+}
+
+#[test]
+fn ecdsa_p256_method_9_signature_round_trips_as_fixed_width_rs() {
+    let identity = identity_payload_body();
+    let octets = signed_octets(&[0x91; 64], PEER_NONCE, &identity);
+    let key =
+        Ikev2SignatureAuthKey::ecdsa_p256_sha256_pkcs8_der(P256_PKCS8_DER).expect("P-256 key");
+    assert_eq!(key.method().as_u8(), 9);
+
+    let auth_data =
+        compute_ike_auth_signature(profile(), &key_material(), octets, &key, None).expect("sign");
+    // RFC 4754 sections 3/7 method 9 carries fixed-width r || s
+    // (2 x 32 octets), with no DER SEQUENCE/INTEGER framing and no RFC 7427
+    // AlgorithmIdentifier.
+    assert_eq!(auth_data.len(), 64);
+    assert!(!(auth_data[0] == 0x30 && auth_data[1] == 0x2d || auth_data[1] == 0x2b));
+    let r = &auth_data[..32];
+    let s = &auth_data[32..];
+    assert!(r.iter().any(|byte| *byte != 0) && s.iter().any(|byte| *byte != 0));
+    let public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 SPKI");
+    // A DER-encoded value must not be accepted as method 9 AUTH data.
+    let mut der = vec![0x30, 0x00];
+    der.extend_from_slice(&auth_data);
+    der[1] = u8::try_from(der.len() - 2).unwrap();
+    assert_eq!(
+        verify_ike_auth_signature(
+            profile(),
+            &key_material(),
+            octets,
+            &public,
+            &auth_payload(9, &der),
+            None,
+        ),
+        Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
+    );
+
+    verify_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &public,
+        &auth_payload(9, &auth_data),
+        None,
+    )
+    .expect("method 9 ECDSA P-256 verifies");
+
+    // A method/curve substitution must fail closed.
+    assert_eq!(
+        verify_ike_auth_signature(
+            profile(),
+            &key_material(),
+            octets,
+            &public,
+            &auth_payload(10, &auth_data),
+            None,
+        ),
+        Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch)
+    );
+}
+
+#[test]
+fn ecdsa_p384_method_10_signature_round_trips_as_fixed_width_rs() {
+    let identity = identity_payload_body();
+    let octets = signed_octets(&[0x92; 64], PEER_NONCE, &identity);
+    let key =
+        Ikev2SignatureAuthKey::ecdsa_p384_sha384_pkcs8_der(P384_PKCS8_DER).expect("P-384 key");
+    assert_eq!(key.method().as_u8(), 10);
+
+    let auth_data =
+        compute_ike_auth_signature(profile(), &key_material(), octets, &key, None).expect("sign");
+    // RFC 4754 method 10: fixed-width r || s, 2 x 48 octets.
+    assert_eq!(auth_data.len(), 96);
+
+    let public = Ikev2SignaturePublicKey::from_spki_der(P384_SPKI_DER).expect("P-384 SPKI");
+    verify_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &public,
+        &auth_payload(10, &auth_data),
+        None,
+    )
+    .expect("method 10 ECDSA P-384 verifies");
+}
+
+#[test]
+fn ecdsa_p521_method_11_signature_round_trips_as_fixed_width_rs() {
+    let identity = identity_payload_body();
+    let octets = signed_octets(&[0x93; 64], PEER_NONCE, &identity);
+    let key =
+        Ikev2SignatureAuthKey::ecdsa_p521_sha512_pkcs8_der(P521_PKCS8_DER).expect("P-521 key");
+    assert_eq!(key.method().as_u8(), 11);
+
+    let auth_data =
+        compute_ike_auth_signature(profile(), &key_material(), octets, &key, None).expect("sign");
+    // RFC 4754 method 11: fixed-width r || s, 2 x 66 octets.
+    assert_eq!(auth_data.len(), 132);
+
+    let public = Ikev2SignaturePublicKey::from_spki_der(P521_SPKI_DER).expect("P-521 SPKI");
+    verify_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &public,
+        &auth_payload(11, &auth_data),
+        None,
+    )
+    .expect("method 11 ECDSA P-521 verifies");
+
+    // Same key material under the wrong method id must be rejected.
+    assert_eq!(
+        verify_ike_auth_signature(
+            profile(),
+            &key_material(),
+            octets,
+            &public,
+            &auth_payload(9, &auth_data),
+            None,
+        ),
+        Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch)
+    );
+}
+
+#[test]
+fn rsa_pss_method14_identifier_is_parsed_then_rejected_on_signature() {
+    let identity = identity_payload_body();
+    let authority =
+        support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_256);
+    let octets = signed_octets(&authority.sa_init_response, PEER_NONCE, &identity);
+    let mut auth_data = vec![RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256.len() as u8];
+    auth_data.extend_from_slice(&RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256);
+    auth_data.extend_from_slice(&[0_u8; 256]);
+    let public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
+    assert_eq!(
+        verify_ike_auth_signature(
+            profile(),
+            &key_material(),
+            octets,
+            &public,
+            &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
+            Some(authority.verification_authorization()),
+        ),
+        Err(Ikev2IkeAuthVerificationError::SignatureVerificationFailed)
+    );
+}
+
+#[cfg(feature = "rsa-signing")]
+#[test]
+fn rsa_pss_method14_signature_round_trips() {
+    let identity = identity_payload_body();
+    let authority =
+        support::responder_signature_hash_context(Ikev2SignatureHashAlgorithm::Sha2_256);
+    let octets = signed_octets(&authority.sa_init_response, PEER_NONCE, &identity);
+    let key = Ikev2SignatureAuthKey::rsa_pss_sha256_pkcs8_der(RSA_PKCS8_DER).expect("RSA-PSS key");
+    let auth_data = compute_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &key,
+        Some(authority.signing_authorization()),
+    )
+    .expect("PSS sign");
+    assert_eq!(
+        usize::from(auth_data[0]),
+        RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256.len()
+    );
+    assert_eq!(
+        &auth_data[1..1 + RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256.len()],
+        RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256
+    );
+
+    let public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
+    verify_ike_auth_signature(
+        profile(),
+        &key_material(),
+        octets,
+        &public,
+        &auth_payload(IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE, &auth_data),
+        Some(authority.verification_authorization()),
+    )
+    .expect("method 14 RSA-PSS verifies");
 }
 
 #[test]
@@ -297,7 +483,7 @@ fn non_signature_auth_methods_are_rejected() {
     let octets = signed_octets(SA_INIT_RESPONSE, PEER_NONCE, &identity);
     let public = Ikev2SignaturePublicKey::from_spki_der(RSA_SPKI_DER).expect("RSA SPKI");
 
-    for method in [IKEV2_AUTH_METHOD_SHARED_KEY_MIC, 9, 255] {
+    for method in [IKEV2_AUTH_METHOD_SHARED_KEY_MIC, 12, 255] {
         assert_eq!(
             verify_ike_auth_signature(
                 profile(),

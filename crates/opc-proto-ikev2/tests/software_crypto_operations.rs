@@ -959,6 +959,59 @@ fn software_signature_verification_fails_closed_with_stable_codes() {
     assert_eq!(bad_key.code(), CryptoOperationErrorCode::InvalidSigningKey);
 }
 
+#[test]
+fn software_rsa_pss_signature_verification_matches_an_independent_signer() {
+    // Verification is always available; sign the fixed message independently
+    // with the `rsa` crate's RSASSA-PSS implementation (MGF1, salt = digest
+    // length) rather than the crate's own signing path.
+    use rsa::pkcs8::DecodePrivateKey as _;
+    use rsa::signature::Signer as _;
+
+    const RSA_SPKI: &[u8] = include_bytes!("data/rsa2048_spki.der");
+    const RSA_PKCS8: &[u8] = include_bytes!("data/rsa2048_pkcs8.der");
+    let message = b"ikev2-rsa-pss-verification-kat";
+    let private = rsa::RsaPrivateKey::from_pkcs8_der(RSA_PKCS8).expect("RSA private key");
+    let signing_key = rsa::pss::SigningKey::<rsa::sha2::Sha256>::new(private);
+    let signature: rsa::pss::Signature = signing_key.try_sign(message).expect("PSS signature");
+    let signature_bytes: Box<[u8]> = signature.into();
+
+    OPERATIONS
+        .verify_signature(
+            IkeSignatureAlgorithm::RsaPssSha2_256,
+            RSA_SPKI,
+            message,
+            &signature_bytes,
+        )
+        .expect("independent PSS/SHA-256 signature verifies");
+
+    let tampered = b"ikev2-rsa-pss-verification-kat!";
+    let error = OPERATIONS
+        .verify_signature(
+            IkeSignatureAlgorithm::RsaPssSha2_256,
+            RSA_SPKI,
+            tampered,
+            &signature_bytes,
+        )
+        .expect_err("tampered PSS message must fail closed");
+    assert_eq!(
+        error.code(),
+        CryptoOperationErrorCode::SignatureVerificationFailed
+    );
+
+    let error = OPERATIONS
+        .verify_signature(
+            IkeSignatureAlgorithm::RsaPssSha2_384,
+            RSA_SPKI,
+            message,
+            &signature_bytes,
+        )
+        .expect_err("wrong PSS hash must fail closed");
+    assert_eq!(
+        error.code(),
+        CryptoOperationErrorCode::SignatureVerificationFailed
+    );
+}
+
 #[cfg(not(feature = "rsa-signing"))]
 #[test]
 fn software_rsa_signing_is_unavailable_without_the_rsa_signing_feature() {
@@ -999,6 +1052,20 @@ mod rsa_signing {
         assert_eq!(auth_data.len(), 256);
 
         let signed = responder_signed_octets(&material, SA_INIT_RESPONSE, &identity);
+        let pss_key = OPERATIONS
+            .load_signing_key(IkeSignatureAlgorithm::RsaPssSha2_256, RSA_PKCS8_DER)
+            .expect("software RSA-PSS key loads");
+        assert_eq!(pss_key.rsa_modulus_len(), Some(256));
+        let pss_signature = pss_key.sign(b"pss-provider-message").expect("PSS signs");
+        OPERATIONS
+            .verify_signature(
+                IkeSignatureAlgorithm::RsaPssSha2_256,
+                RSA_SPKI_DER,
+                b"pss-provider-message",
+                &pss_signature,
+            )
+            .expect("provider PSS verify succeeds");
+
         let signing_key = OPERATIONS
             .load_signing_key(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256, RSA_PKCS8_DER)
             .expect("software RSA key loads");

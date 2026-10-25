@@ -122,6 +122,7 @@ pub mod software_crypto;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod validation;
+mod xcbc;
 
 pub use certreq::{
     ikev2_certreq_authority_key_hash, Ikev2CertReqAuthorityHash, Ikev2CertReqSubjectPublicKeyInfo,
@@ -240,7 +241,9 @@ pub use ike_auth_signature::{
     Ikev2LocalAuthSelfVerificationAuthorization, Ikev2SignatureAuthKey, Ikev2SignatureAuthMethod,
     Ikev2SignatureKeyError, Ikev2SignaturePublicKey, IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE,
     IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE, RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256,
-    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
+    RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256,
+    RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384, RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512,
+    RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
 };
 pub use ike_sa_rekey::{
     build_ike_sa_rekey_request, build_ike_sa_rekey_response, decode_ike_sa_rekey_request,

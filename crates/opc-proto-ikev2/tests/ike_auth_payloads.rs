@@ -1681,7 +1681,7 @@ fn received_ke_selection_order_keeps_legacy_group_one_over_unimplemented_groups(
     ke_wire.extend_from_slice(&[2; 96]);
     let ke = opc_proto_ikev2::Ikev2KeyExchangePayload::decode_body(&ke_wire).unwrap();
     for separate in [false, true] {
-        for unsupported in [5, 15, 31] {
+        for unsupported in [5, 22, 31] {
             for groups in [vec![1, unsupported], vec![unsupported, 1]] {
                 let wire =
                     build_ike_auth_sa_payload(&generic_child_offer_for_groups(&groups, separate))

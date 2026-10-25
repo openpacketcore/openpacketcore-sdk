@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: the executable IKE_SA_INIT/IKE_AUTH transform surface now
+  covers RFC 3526 MODP groups 15-18 (Transform IDs 15/16/17/18, 3072/4096/6144/
+  8192-bit) with exact 384/512/768/1024-octet public-value and shared-secret
+  widths; RFC 4754 ECDSA AUTH methods 9/10/11 (P-256/SHA-256, P-384/SHA-384,
+  P-521/SHA-512) including RFC 4754 fixed-width r || s AUTH framing and P-521 signing/
+  verification; RFC 7427 method-14 RSASSA-PSS signature identifiers
+  (SHA-256/384/512, MGF1 with the same hash, salt = digest length) with
+  verification always available and PSS signing compiled only behind the
+  existing `rsa-signing` feature; and RFC 4434 PRF_AES128_XCBC (Transform ID
+  4) with RFC 3566/4434 known-answer vectors. Existing transform ordering,
+  selection and validation for pre-existing values are unchanged; new groups
+  and PRF remain caller-selected proposal alternatives. All new algorithms are
+  wired through the #334 admitted-module capability advertisement/preflight and
+  fail closed when a configured module cannot execute them. ChaCha20-Poly1305,
+  AES-CCM_8 and Ed25519/Ed448 remain deliberately excluded pending dependency
+  and security-owner approval (see the #1352 follow-up scope); they are not
+  advertised. Refs #1352.
 - `opc-gtpu-dataplane`: `LinuxGtpuDataplaneBackend` now opens an
   attachment-bound control port over the userspace UDP/2152 socket retained by
   an ordinary creation. The Linux `gtp` driver passes non-G-PDUs and G-PDUs
