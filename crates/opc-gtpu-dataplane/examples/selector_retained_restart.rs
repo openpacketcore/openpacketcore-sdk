@@ -11,7 +11,7 @@ mod linux {
         EbpfGtpuDataplaneBackendConfig, GtpDevice, GtpPdpContext, GtpVersion, GtpuDataplaneBackend,
         GtpuLocalEndpointSet, GtpuSessionDeviceId, GtpuSessionEntry, GtpuSessionGroup,
         GtpuSessionGroupId, GtpuSessionSelectorNamespaceAuthority, GtpuSourcePortPolicy,
-        GtpuUplinkSourcePortPolicy, Teid,
+        GtpuUplinkSourcePortPolicy, PeerTeid, Teid,
     };
     use opc_key::{KeyId, KeyPurpose, MemoryKeyProvider, Zeroizing};
     use opc_session_store::{
@@ -115,8 +115,7 @@ mod linux {
                 GtpPdpContext {
                     local_teid: Teid::new(0x4100 + u32::from(ordinal))
                         .ok_or("synthetic local tunnel")?,
-                    peer_teid: Teid::new(0x5100 + u32::from(ordinal))
-                        .ok_or("synthetic peer tunnel")?,
+                    peer_teid: PeerTeid::new(0x5100 + u32::from(ordinal)),
                     ms_address: IpAddr::from([192, 0, 2, ordinal]),
                     peer_address: "198.51.100.10".parse()?,
                     link_ifindex: attachment.ifindex,

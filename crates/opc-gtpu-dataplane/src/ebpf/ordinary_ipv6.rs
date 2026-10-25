@@ -179,7 +179,7 @@ fn context_from_entry(entry: EbpfSessionEntry, ifindex: u32) -> Option<GtpPdpCon
     let mark = u32::from_be_bytes(entry.bearer_mark());
     Some(GtpPdpContext {
         local_teid: Teid::new(u32::from_be_bytes(entry.local_teid()))?,
-        peer_teid: Teid::new(u32::from_be_bytes(entry.peer_teid()))?,
+        peer_teid: crate::PeerTeid::new(u32::from_be_bytes(entry.peer_teid())),
         ms_address: ip_address(entry.inner_paa().canonical_address()),
         peer_address: ip_address(entry.peer_outer_address()),
         link_ifindex: ifindex,
@@ -344,7 +344,9 @@ impl EbpfGtpuDataplaneBackend {
         {
             return Err(indeterminate());
         }
-        context_from_entry(entry, ifindex).ok_or_else(indeterminate)
+        let context = context_from_entry(entry, ifindex).ok_or_else(indeterminate)?;
+        crate::model::reject_unsupported_zero_peer_teid(context.peer_teid)?;
+        Ok(context)
     }
 
     /// Inspect the inner-IPv6 local-TEID selector of an ordinary attachment.

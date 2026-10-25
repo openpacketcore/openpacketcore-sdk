@@ -139,7 +139,7 @@ async fn seed_pair<B>(
     let children: [GtpuSessionGroup; 2] = std::array::from_fn(|index| {
         let mut context = parents[index].entries()[0].context().clone();
         context.local_teid = Teid::new(0x2000 + u32::from(cycle) * 2 + index as u32).unwrap();
-        context.peer_teid = Teid::new(0x4000 + u32::from(cycle) * 2 + index as u32).unwrap();
+        context.peer_teid = PeerTeid::new(0x4000 + u32::from(cycle) * 2 + index as u32);
         context.bearer_mark = Some(crate::GtpBearerMark::new(6).unwrap());
         GtpuSessionGroup::new(
             GtpuSessionGroupId::new([3 + cycle * 2 + index as u8; 16]).unwrap(),

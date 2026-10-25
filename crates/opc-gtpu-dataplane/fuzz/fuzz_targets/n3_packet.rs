@@ -6,7 +6,7 @@ use opc_gtpu_dataplane::{
     n3::{
         N3Direction, N3PacketError, N3PacketView, N3Qfi, N3UplinkEncapsulation, ReceivedN3UplinkTnl,
     },
-    Teid,
+    PeerTeid,
 };
 use opc_protocol::DecodeContext;
 
@@ -49,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
         let qfi = N3Qfi::new(qfi_byte & 63).unwrap();
         let tunnel = ReceivedN3UplinkTnl::new(
             "192.0.2.1".parse().unwrap(),
-            Teid::new(0x1122_3344).unwrap(),
+            PeerTeid::new(0x1122_3344),
         )
         .unwrap();
         let insertion = N3UplinkEncapsulation::new(tunnel, qfi);

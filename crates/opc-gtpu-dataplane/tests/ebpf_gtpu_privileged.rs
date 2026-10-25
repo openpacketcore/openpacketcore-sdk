@@ -2958,7 +2958,7 @@ impl Drop for TestNet {
 fn session_context(link_ifindex: u32) -> GtpPdpContext {
     GtpPdpContext {
         local_teid: Teid::new(LOCAL_TEID).expect("nonzero"),
-        peer_teid: Teid::new(PEER_TEID).expect("nonzero"),
+        peer_teid: PeerTeid::new(PEER_TEID),
         ms_address: IpAddr::V4(UE_PAA),
         peer_address: IpAddr::V4(PGW_IP),
         link_ifindex,
@@ -3019,7 +3019,7 @@ fn grouped_entry(
     GtpuSessionEntry::new(
         GtpPdpContext {
             local_teid: Teid::new(local_teid).expect("nonzero grouped local TEID"),
-            peer_teid: Teid::new(peer_teid).expect("nonzero grouped peer TEID"),
+            peer_teid: PeerTeid::new(peer_teid),
             ms_address: inner,
             peer_address: peer_outer,
             link_ifindex,
@@ -3136,7 +3136,7 @@ fn dedicated_session_context(
 ) -> GtpPdpContext {
     let mut context = session_context(link_ifindex);
     context.local_teid = Teid::new(local_teid).expect("nonzero local TEID");
-    context.peer_teid = Teid::new(peer_teid).expect("nonzero peer TEID");
+    context.peer_teid = PeerTeid::new(peer_teid);
     context.bearer_mark = Some(GtpBearerMark::new(mark).expect("nonzero bearer mark"));
     context
 }
@@ -7380,7 +7380,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     // DSCP state still removes cleanly after its FAR delete.
     let mut no_dscp_removal = session_context(device.ifindex);
     no_dscp_removal.local_teid = Teid::new(0x1000_0010).expect("nonzero local TEID");
-    no_dscp_removal.peer_teid = Teid::new(0x2000_0010).expect("nonzero peer TEID");
+    no_dscp_removal.peer_teid = PeerTeid::new(0x2000_0010);
     no_dscp_removal.ms_address = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 3));
     backend.install_pdp_context(no_dscp_removal.clone()).await?;
     let no_dscp_remove = RemovePdpContextRequest::from_context(&no_dscp_removal);
@@ -7959,8 +7959,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         let mut uplink_collision = expected.clone();
         uplink_collision.local_teid =
             Teid::new(expected.local_teid.get() + 0x100).ok_or("conflict TEID must be nonzero")?;
-        uplink_collision.peer_teid =
-            Teid::new(expected.peer_teid.get() + 0x100).ok_or("conflict TEID must be nonzero")?;
+        uplink_collision.peer_teid = PeerTeid::new(expected.peer_teid.get() + 0x100);
         assert!(matches!(
             restored
                 .install_pdp_context_classified(uplink_collision)
