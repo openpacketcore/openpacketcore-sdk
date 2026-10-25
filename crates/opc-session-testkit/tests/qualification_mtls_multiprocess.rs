@@ -13113,7 +13113,11 @@ fn candidate_git_owned_process_group_live_member_tracks_termination() {
     );
     signal_owned_candidate_git_process_group(process_group, rustix::process::Signal::KILL)
         .expect("signal the owned-group fixture");
-    let terminate_deadline = Instant::now() + CANDIDATE_GIT_TERMINATE_GRACE;
+    // A test-only hang guard, not the observation under test: the product
+    // cleanup path keeps its own unchanged grace, while this fixture must
+    // tolerate scheduling delay under a loaded parallel shard without turning
+    // into a new flake.
+    let terminate_deadline = Instant::now() + Duration::from_secs(5);
     while candidate_git_owned_process_group_has_live_member(process_group)
         .expect("observe the owned-group fixture after SIGKILL")
     {
