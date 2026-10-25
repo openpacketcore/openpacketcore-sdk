@@ -1691,4 +1691,43 @@ mod tests {
         assert_send_sync::<TrafficContinuityEvaluator>();
         assert_send_sync::<TrafficContinuityAssessment>();
     }
+
+    // Host-portable #720 scale evidence: the retained-event bound is a hard
+    // fail-closed limit below the required 40,000-event burst. This test
+    // characterizes the current bound; it is not a claim that 40,000 events
+    // can be retained and it does not change production behavior.
+    #[test]
+    fn retained_event_capacity_is_below_required_burst_and_refuses_excess() {
+        const REQUIRED_BURST_EVENTS: usize = 40_000;
+        assert_eq!(MAX_RETAINED_EVENTS, 4096);
+        let retained_bound = MAX_RETAINED_EVENTS;
+        assert!(retained_bound < REQUIRED_BURST_EVENTS);
+        let accepted = TrafficContinuityPolicy::new(
+            2,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(20),
+            Duration::from_secs(3),
+            MAX_RETAINED_EVENTS,
+        )
+        .expect("the exact retained-event bound is a valid policy");
+        assert_eq!(accepted.maximum_retained_events(), MAX_RETAINED_EVENTS);
+        let refused = TrafficContinuityPolicy::new(
+            2,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            Duration::from_secs(20),
+            Duration::from_secs(3),
+            MAX_RETAINED_EVENTS + 1,
+        )
+        .expect_err("a policy above the hard retained-event bound must fail closed");
+        assert_eq!(
+            refused,
+            TrafficContinuityError::InvalidPolicy {
+                code: "maximum_retained_events_exceeds_bound"
+            }
+        );
+        let over_bound = MAX_RETAINED_EVENTS + 1;
+        assert!(over_bound < REQUIRED_BURST_EVENTS);
+    }
 }
