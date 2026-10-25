@@ -841,6 +841,14 @@ pub struct SaParameters {
     /// unchanged. Because the kernel omits the attribute for an unset length,
     /// an absent attribute and a zero value are the same kernel state and must
     /// not become two spellings of one identity; use `None` for no padding.
+    ///
+    /// The versioned durable install-request fingerprints
+    /// (`opc-xfrm-object-install-request-v1`,
+    /// `opc-xfrm-roster-install-request-v1`) and the outbound binding
+    /// fingerprint do not cover this field in this revision, so a recovery
+    /// request that differs only in `tfc_pad` is not distinguished. See the
+    /// crate README for the recommended auth-domain-v2 and migration
+    /// follow-up.
     pub tfc_pad: Option<u32>,
 }
 

@@ -8161,6 +8161,32 @@ mod tests {
     }
 
     #[test]
+    fn tfc_padding_parser_rejects_duplicate_and_malformed_attributes() {
+        let mut duplicate = encode_sa_info(&sa_parameters()).unwrap();
+        append_attr(&mut duplicate, XFRMA_TFCPAD, &256_u32.to_ne_bytes()).unwrap();
+        append_attr(&mut duplicate, XFRMA_TFCPAD, &512_u32.to_ne_bytes()).unwrap();
+        assert!(matches!(
+            parse_sa_state(&duplicate, None),
+            Err(XfrmError::Io {
+                operation: "query_sa",
+                kind: std::io::ErrorKind::InvalidData,
+                ..
+            })
+        ));
+
+        let mut malformed = encode_sa_info(&sa_parameters()).unwrap();
+        append_attr(&mut malformed, XFRMA_TFCPAD, &[0x01]).unwrap();
+        assert!(matches!(
+            parse_sa_state(&malformed, None),
+            Err(XfrmError::Io {
+                operation: "query_sa",
+                kind: std::io::ErrorKind::InvalidData,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn encodes_policy_with_mark_and_if_id_attrs() {
         let mut params = policy_parameters();
         params.mark = Some(XfrmLookupMark::full(0x0000_0042));

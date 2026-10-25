@@ -17,8 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero length, non-ESP SAs, and non-tunnel modes before any netlink mutation,
   matching the kernel's `verify_newsa_info`. `SaState::tfc_pad` reports the
   value from exact `GETSA` readback. `None` emits no attribute and keeps the
-  pre-TFC bytes exactly unchanged. Dummy-packet generation with Next Header 59
-  is not part of this netlink model. Refs #1344.
+  pre-TFC bytes exactly unchanged. The versioned durable install-request and
+  outbound-binding fingerprints do not cover `tfc_pad` in this revision
+  (in-memory request comparisons do); widening them needs its own
+  auth-domain-v2 and migration follow-up. Dummy-packet generation with Next
+  Header 59 (RFC 4303 §2.5/§2.7) is not part of this netlink model and remains
+  a tracked follow-up, so #1344 is only partially addressed by this change
+  (the configuration/encoding acceptance is met). Refs #1344.
 
 ### Fixed
 
