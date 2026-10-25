@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-persist`: retained-authority provisioning is now crash-resumable. A
+  fixed-size authenticated provisioning intent (`<database>.opc-retained.intent`).
+  It binds the exact topology, backing identity, key scope, audit-key
+  epoch/fingerprint and operation class (new authority or member repair), carries
+  fresh per-publication entropy, and is synced with its parent directory before
+  the first artifact mutation. Request identity for resume/conflict decisions is
+  that authenticated binding digest plus the operation class; the API carries no
+  caller request id, so two publications with the same binding/audit key/class
+  are the same request. A retry
+  of the same interrupted request either reconciles a committed admission
+  exactly once (returning the validated backend even when the original caller
+  never observed success) or removes its authenticated partial prefix under
+  the exclusive lifetime lock and runs one fresh attempt, so no caller marker
+  deletion, guessed cleanup or manual backing replacement is needed for an
+  interruption caused by that transaction. Conflicting requests, foreign data,
+  unverifiable records beside artifacts and established stores are never
+  adopted, overwritten or deleted; committed-store validation failure stays
+  `RecoveryRequired`/`Rejected`. Established database and admission-record
+  formats are unchanged, and cancellation/deadline outcomes remain
+  `AdmissionBound`/`Indeterminate` with same-request resumability, distinct
+  from `RetainedConfigOpenRetirement`. The deterministic crash matrix now
+  covers intent publication, lock/database/schema/binding/sync/record/intent
+  boundaries plus injected I/O faults, same-request resume,
+  conflicting-request refusal, lock-leak, partial-authority and
+  established-store-loss assertions. Refs #1114.
+
 - `opc-gtpu-dataplane`: publish the RFC 016 external selector-adapter codec
   module `selector_adapter_codec`: versioned canonical namespace binding
   (145 bytes), operation stamp (208 bytes) and opaque terminal capsule

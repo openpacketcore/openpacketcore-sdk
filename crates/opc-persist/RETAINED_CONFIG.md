@@ -83,6 +83,21 @@ and the new-authority/member-repair disposition. Its matching database row is
 part of admission validation. Neither marker presence nor database absence is
 permission to initialize authority.
 
+While a provisioning operation is in flight, the SDK also publishes one
+fixed-size authenticated provisioning intent beside those files
+(`<database>.opc-retained.intent`). It binds the same topology/backing/key-scope
+digest and audit key epoch/fingerprint as admission plus the operation class
+(new authority or member repair), carries fresh random entropy unique to that
+publication, and its file and parent directory are synced before the first
+artifact mutation. Consent is per publication, but request identity for
+resume/conflict decisions is the authenticated binding digest (topology,
+backing identity, key scope, audit-key epoch/fingerprint) plus the operation
+class: the caller API carries no request id, so two publications with the same
+binding, audit key and operation class are the same request even though their
+entropy differs. The intent is SDK-owned recovery metadata only: it is never
+admission authority, a capability, or permission to create or adopt a store,
+and the established database and admission-record formats are unchanged.
+
 The profile requires private regular files without hard-link aliases or
 symlink path components on a supported Unix filesystem. Atomic `create_new`
 reserves new files; SQLite read-write opening omits `CREATE` and uses
@@ -112,16 +127,54 @@ admitted binding, rather than transferring a sender's local storage identity.
 
 ## Provisioning interruption and reopening
 
-| Last completed boundary | Ordinary reopen |
-| --- | --- |
-| Nothing created | Reject missing storage without creating files. |
-| Admission file or database exclusively reserved | Reject incomplete state; preserve artifacts. |
-| Base or consensus schema initialized | Reject incomplete admission; do not initialize missing metadata. |
-| Matching database binding stored and database synchronized | Reject while the admission record remains incomplete. |
-| Complete authenticated admission record present | Validate the exact binding, schema and sealed history; reconcile a completed operation even if its original caller received no result. |
+A provisioning operation publishes its authenticated intent before touching the
+backing, so a later retry of the *same* request can decide from evidence whether
+to finish or abort the interrupted prefix. It never guesses from marker presence
+alone.
 
-Provisioning never overwrites partial artifacts. An operator must explicitly
-recover or replace the backing resource before another provisioning operation.
+| Last completed boundary | Ordinary reopen | Same-request provisioning retry |
+| --- | --- | --- |
+| Intent published, nothing else | Reject missing storage without creating files. | Authenticated intent matches and no artifact exists: continue the same request. |
+| Admission file and/or database reserved, base/consensus schema, local binding, database sync | Reject incomplete state; preserve artifacts. | Authenticated intent matches: remove that partial prefix while holding the exclusive lock, then run one fresh admitted attempt. |
+| Complete authenticated admission record present | Validate the exact binding, schema and sealed history; reconcile a completed operation even if its original caller received no result. | Reconcile this committed request exactly once, retire the intent and return the validated backend. |
+| Intent missing but provisioning artifacts exist | Reject; never adopt or overwrite. | Refuse `AlreadyExists`; explicit recovery/replacement is still required for foreign or legacy partial state. |
+| Intent authentic but for a different authenticated binding or operation class, or unverifiable beside artifacts | Reject; never adopt, overwrite or delete. | Refuse without mutation; the conflicting request must be resolved explicitly. |
+
+An interruption caused by this transaction therefore needs no caller-owned
+marker deletion, guessed cleanup or manual backing replacement: retrying the
+same request either completes it exactly once or removes its authenticated
+partial prefix and retries from clean state. A different authenticated binding
+or operation class, foreign data or an unverifiable record beside artifacts is
+never adopted or overwritten.
+Operator recovery remains required for foreign/legacy partial state and for a
+committed store whose authenticated content fails validation; established-store
+loss is never accepted as a provisioning side effect. Coherent whole-store
+rollback still needs the external authority check below.
+
+Recovery outcomes stay value-free and stable:
+- pre-effect rejection (`InvalidRequest`, `AlreadyExists`, `InUse`, or
+  `AdmissionBound` before intent publication) creates nothing and is retryable;
+- success returns one validated backend, including exactly-once reconciliation
+  of a request that committed before its caller observed the result;
+- a retry after an interrupted prefix returns success only after the
+  authenticated abort and the fresh admitted attempt, never a partially usable
+  authority;
+- `RecoveryRequired`/`Rejected` mean conflicting, foreign or unverifiable state
+  that the SDK must not touch.
+Cancellation or a deadline after a possible effect returns `AdmissionBound` or
+`Indeterminate` without a capability; the same request resumes on retry. This is
+distinct from `RetainedConfigOpenRetirement`, which reports opener/join
+retirement and is never rollback or authoritative readback.
+
+The deterministic lane injects process loss at intent publication, lock
+creation, database creation, base and consensus schema initialization, binding
+write, database and parent sync, admission-record write and sync, and intent
+retirement, plus injected I/O failure at each of those persistent steps. It
+proves same-request resume, conflicting-request refusal, no second writer, no
+leaked admission lock, no partially usable authority and no loss of an
+established store. It is process-restart evidence, not a power-loss
+qualification claim.
+
 Reopening never initializes or migrates retained storage or invokes legacy
 recovery. It compares the complete base schema with an SDK-owned in-memory
 reference, including the exact unique replay index. A digest stored in the
