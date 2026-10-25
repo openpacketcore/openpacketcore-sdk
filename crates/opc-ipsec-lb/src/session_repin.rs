@@ -4029,6 +4029,7 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         ),
         StoreError::CapabilityNotSupported(_) => IpsecLbError::Unsupported,
         StoreError::BackendUnavailable(_)
+        | StoreError::KeyProviderUnavailable(_)
         | StoreError::ReplicationWatchCatchUpRequired
         | StoreError::FencedTransitionRecoveryJournalUnavailable => IpsecLbError::io(
             "session_repin_journal",

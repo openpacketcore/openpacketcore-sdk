@@ -1178,6 +1178,7 @@ async fn qualification_activation_attempt(
 fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficErrorClass {
     match error {
         StoreError::BackendUnavailable(_)
+        | StoreError::KeyProviderUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable => {
             QualificationTrafficErrorClass::BackendUnavailable
         }
@@ -6064,6 +6065,7 @@ fn map_lease_error(error: &LeaseError) -> QualificationNodeErrorCode {
 fn map_store_error(error: &StoreError) -> QualificationNodeErrorCode {
     match error {
         StoreError::BackendUnavailable(_)
+        | StoreError::KeyProviderUnavailable(_)
         | StoreError::BackendOperationOutcomeUnavailable
         | StoreError::CasIdempotencyOutcomeUnavailable
         | StoreError::Crypto(_)

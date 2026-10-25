@@ -30954,6 +30954,7 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::FencedTransitionRetentionExhausted
         | StoreError::BackendOperationOutcomeUnavailable
         | StoreError::BackendUnavailable(_)
+        | StoreError::KeyProviderUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable
         | StoreError::InvalidReplicationSequence
         | StoreError::InvalidReplicationLogRange

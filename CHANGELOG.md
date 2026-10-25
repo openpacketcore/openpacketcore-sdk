@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-session-store`: `StoreError` adds `KeyProviderUnavailable`. Key-provider
+  outages from record sealing/unsealing (KMS restart, TLS failure, refused
+  connection, timeout) are now reported as this retryable variant, classified
+  like `BackendUnavailable`, instead of the coarse `Crypto` error; callers can
+  retry within their request budget. Every content-dependent key failure
+  (invalid envelope, unknown key id, authentication failure) remains collapsed
+  into `Crypto` to preserve the encryption-oracle resistance property. The wire
+  error representation maps the new variant onto its retryable
+  `BackendUnavailable` class, so no wire format changed. Downstream exhaustive
+  matches must handle the new variant. Refs #1197.
+
 - `opc-proto-diameter`: `DiameterRequestFailure` adds `RoutePolicy` and
   `DiameterRequestClassificationError` adds `RoutePolicyRequiresProxiableRequest`;
   downstream exhaustive matches must handle the new variants.
