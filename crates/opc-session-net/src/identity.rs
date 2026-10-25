@@ -219,6 +219,11 @@ impl SessionReplicationManifest {
 
     /// Validate a complete descriptor set and derive its consensus identity.
     ///
+    /// `installation_nonce` must be freshly generated from a CSPRNG with at
+    /// least 256 bits of entropy at first install and persisted immutably;
+    /// only the all-zero value is rejected, and a constant or reused nonce
+    /// would collapse separate installations into one authority domain.
+    ///
     /// Node IDs are stable installation-scoped hashes of logical
     /// [`ReplicaId`] and therefore do not change when another member is added
     /// or removed.
@@ -372,7 +377,12 @@ impl SessionReplicationManifest {
 
         let consensus_cluster_id =
             SessionConsensusClusterId::for_installation(cluster_id.as_str(), installation_nonce)
-                .map_err(|_| SessionManifestError::InvalidClusterId)?;
+                .map_err(|error| match error {
+                    opc_consensus::ConsensusIdentityError::InvalidInstallationNonce => {
+                        SessionManifestError::InvalidInstallationNonce
+                    }
+                    _ => SessionManifestError::InvalidClusterId,
+                })?;
         let consensus_epoch = configuration_epoch;
         let component_fingerprints = members
             .values()
@@ -434,10 +444,15 @@ impl SessionReplicationManifest {
 
     /// Installation nonce committed by this manifest.
     ///
-    /// Consumers generate one random non-zero nonce at first install and
-    /// retain it with the immutable manifest; reusing it with the same
-    /// human-readable cluster name reuses the installation, while a fresh
-    /// non-zero value is a different authority domain (fresh-install boundary).
+    /// Consumers generate one non-zero nonce from a CSPRNG with at least 256
+    /// bits of entropy at first install and retain it immutably with the
+    /// manifest; reusing it with the same human-readable cluster name reuses
+    /// the installation, while a fresh non-zero value is a different authority
+    /// domain (fresh-install boundary). Only the all-zero value is rejected: a
+    /// constant, reused or low-entropy nonce is accepted and collides
+    /// installations into one authority domain. Never derive the nonce from
+    /// configuration text, share it across deployments, or regenerate it on an
+    /// existing installation.
     pub const fn installation_nonce(&self) -> [u8; 32] {
         self.installation_nonce
     }

@@ -226,8 +226,14 @@ Openraft node ID is derived from cluster identity plus that logical
 `ReplicaId`, never from DNS ordering or endpoint spelling.
 
 Cluster identity is installation-qualified: at first install, generate one
-random non-zero 32-byte installation nonce, persist it with the immutable
-manifest, and pass it to every `SessionReplicationManifest` constructor. A
+non-zero 32-byte installation nonce from a cryptographically secure random
+source with at least 256 bits of entropy, persist it immutably with the
+manifest, and pass it to every `SessionReplicationManifest` constructor. The
+SDK can reject only the all-zero value; a constant, reused or low-entropy nonce
+is accepted and silently collapses installations that share the cluster name
+into one authority domain, so never derive it from configuration text, never
+share it between deployments, and never regenerate it on an existing
+installation. A
 retained volume from an earlier installation (same cluster name, different
 nonce) is refused with the store's typed identity mismatch instead of joining;
 reusing the persisted nonce is what continues the installation. Changing the

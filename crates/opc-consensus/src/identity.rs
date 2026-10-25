@@ -29,6 +29,9 @@ pub enum ConsensusIdentityError {
     /// Cluster name is empty, oversized, or non-canonical.
     #[error("invalid consensus cluster identity")]
     InvalidClusterId,
+    /// Installation nonce is all zero (never a permitted installation).
+    #[error("invalid consensus installation nonce")]
+    InvalidInstallationNonce,
     /// Configuration epochs are strictly positive.
     #[error("invalid consensus configuration epoch")]
     InvalidConfigurationEpoch,
@@ -53,7 +56,7 @@ impl ConsensusClusterId {
     ) -> Result<Self, ConsensusIdentityError> {
         let named = Self::new(name)?;
         if nonce == [0; 32] {
-            return Err(ConsensusIdentityError::InvalidClusterId);
+            return Err(ConsensusIdentityError::InvalidInstallationNonce);
         }
         let mut hasher = Sha256::new();
         hasher.update(INSTALLATION_ID_DOMAIN);
