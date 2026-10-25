@@ -30,6 +30,7 @@ GRPC_ALLOWED_ROOTS = {"opc-gnmi-server"}
 UNSAFE_ALLOWED_ROOTS = {
     "opc-fs-verity-sys",
     "opc-libsctp-sys",
+    "opc-linux-clock-sys",
     "opc-linux-gtpu-sys",
     "opc-linux-route-sys",
     "opc-linux-xfrm-sys",

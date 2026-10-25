@@ -7,6 +7,7 @@ mod boot;
 pub(crate) mod child_read_wire;
 mod clock;
 mod notice;
+mod platform_clock;
 mod policy;
 mod pool;
 mod proof;
@@ -20,6 +21,9 @@ pub use boot::{BootError, BootIdentity};
 pub use clock::{
     AuthenticationClock, AuthenticationTimeError, AuthenticationTimeSource, IntervalClock,
     RealtimeReading,
+};
+pub use platform_clock::{
+    PlatformAuthenticationTimeSource, PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY,
 };
 pub use policy::{PolicyError, PrincipalGrant, ScopePolicy, ScopeRole};
 pub use pool::{ProofBudgets, ProofPoolError};

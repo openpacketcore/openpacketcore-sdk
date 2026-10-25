@@ -242,6 +242,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported
+  production `AuthenticationTimeSource` for RFC 026 authentication freshness.
+  It reads the Linux kernel clock-adjustment state (one read-only
+  `clock_adjtime(CLOCK_REALTIME)` query, no privilege or clock change) and
+  reports the kernel maximum realtime error as the symmetric uncertainty of one
+  fresh observation. Unsynchronized, unavailable, zero, negative or over-bound
+  kernel state returns the typed retryable `AuthenticationTimeError`; there is
+  no wall-clock fallback. The synchronization generation starts at 1 on the
+  first accepted synchronized observation and increments after synchronization
+  is re-established, while wall steps keep `IntervalClock`'s existing fixed-
+  budget recovery policy. The default maximum accepted uncertainty is 1 s
+  (`PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY`) and can be fixed with
+  `with_maximum_uncertainty` at startup. A fixed, value-free `tracing` warning
+  carries the closed refusal reason. Refs #1244.
+
+- `opc-linux-clock-sys`: narrow unsafe Linux clock-adjustment UAPI boundary
+  used only by `opc-session-net`. `read_kernel_clock_adjustment()` performs one
+  read-only `clock_adjtime(CLOCK_REALTIME)` query and returns the kernel
+  synchronization state plus maximum/estimated error; unsupported platforms
+  compile to a stub that fails explicitly. ADR 0017's mechanical unsafe
+  boundary allow-list and `scripts/check-management-plane-policy.py` are
+  amended for this narrowly scoped read-only crate. Refs #1244.
+
 - `opc-session-net`: prepared V2 fenced-transition handles expose
   `execute_once_with_failure_diagnostic`, an additive diagnostic wrapper around
   the unchanged `execute_once` effect classification. A `NotTransmitted` or
