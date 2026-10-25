@@ -199,6 +199,75 @@ impl IssuerStartupSession {
     }
 }
 
+impl IssuerStartupSession {
+    /// Deliver one authenticated, typed refusal to the exact proved candidate
+    /// boot instead of a ticket notice.
+    ///
+    /// Use this when the issuer's own trusted reads definitively refuse this
+    /// boot: a definitively invalid or changed installed observation, or a
+    /// definitively refused discovery/key-set prerequisite. The motivating
+    /// **observation-sandwich limit** is that two consistent reads of the
+    /// platform workload record around the bootstrap proof do not establish
+    /// that the platform has already published the current container restart:
+    /// a new process can prove possession while both reads still describe the
+    /// preceding container. When the record later catches up, issuing another
+    /// generation for the retained immutable ticket would conflict, so the
+    /// issuer must refuse the key before staging anything and this call tells
+    /// the worker to finish shutdown and start a fresh boot key.
+    ///
+    /// The call performs no platform read of its own (the caller owns the
+    /// refusal decision and may already have observed the changed facts); it
+    /// revalidates bootstrap credential freshness and the live authenticated
+    /// connection, then writes one bounded revision-two frame on the retained
+    /// startup connection. The frame is bound to the exact candidate attempt
+    /// and proved boot and carries only a closed reason code: it conveys no
+    /// committed authority, no closure evidence, no credential, identity,
+    /// endpoint or key material, and no right to bypass an admitted worker's
+    /// normal drain/close obligations. It is terminal for this candidate
+    /// attempt; the next boot must connect with a fresh process nonce and boot
+    /// key. Liveness sessions are refused locally before any bytes are written.
+    ///
+    /// A lost or truncated frame stays a retryable startup failure on the
+    /// worker ([`StartupError::Unavailable`]) and is never treated as a
+    /// refusal.
+    pub async fn deliver_boot_refusal(
+        mut self,
+        reason: super::refusal::BootRefusalReason,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), StartupError> {
+        use super::refusal;
+        use tokio::io::AsyncWriteExt;
+        if !self.proof.is_candidate() {
+            return Err(StartupError::Invalid);
+        }
+        let body = refusal::encode_payload(
+            &self.nonce,
+            self.proof.process_nonce(),
+            &self.proof.boot_key_digest(),
+            reason,
+        );
+        tokio::time::timeout_at(deadline, async {
+            self.revalidate_authentication()?;
+            let header = refusal::refusal_header(&self.header, body.len())?;
+            self.connection
+                .write_all(&header.encode().map_err(|_| StartupError::Invalid)?)
+                .await
+                .map_err(|_| StartupError::Unavailable)?;
+            self.connection
+                .write_all(&body)
+                .await
+                .map_err(|_| StartupError::Unavailable)?;
+            self.connection
+                .flush()
+                .await
+                .map_err(|_| StartupError::Unavailable)?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| StartupError::Unavailable)?
+    }
+}
+
 macro_rules! redacted_debug {
     ($($ty:ty),+ $(,)?) => { $(impl std::fmt::Debug for $ty {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(concat!(stringify!($ty), "([redacted])")) }

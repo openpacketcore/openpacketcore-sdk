@@ -36,6 +36,13 @@ pub enum StartupError {
     /// prerequisite after activation. This is not transient.
     #[error("scope startup prerequisite refused")]
     PrerequisiteRefused,
+    /// The authenticated issuer definitively refused this exact candidate
+    /// boot attempt with a closed, value-free reason. The refusal grants no
+    /// authority and never bypasses the worker's normal drain/close
+    /// obligations; the process should finish shutdown and start a fresh boot
+    /// with a new key. A lost or truncated refusal is not this variant.
+    #[error("scope startup boot refused: {0}")]
+    BootRefused(super::refusal::BootRefusalReason),
     /// A bounded I/O attempt or trusted source is temporarily unavailable.
     #[error("scope startup unavailable")]
     Unavailable,
@@ -539,6 +546,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> StartupSession<S> {
     /// commitment is checked. Stage hints until this call succeeds; discard a
     /// partial or invalid set. A fresh startup exchange can replace the hints for
     /// the same issuance with a later complete snapshot, without a new generation.
+    ///
+    /// The configured issuer may instead deliver one authenticated
+    /// [`super::BootRefusalReason`] bound to this exact candidate attempt and
+    /// proved boot. That returns the terminal typed
+    /// [`StartupError::BootRefused`]; it grants no ticket, boot or scope
+    /// authority, and a missing, lost or truncated refusal remains
+    /// [`StartupError::Unavailable`]/[`StartupError::Invalid`] rather than a
+    /// refusal. Liveness sessions and already admitted workers never receive a
+    /// refusal on this path.
     pub async fn receive_ticket_notice<F>(
         mut self,
         deadline: tokio::time::Instant,
@@ -588,8 +604,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin> StartupSession<S> {
                     )
                     .map_err(|_| StartupError::AuthTimeUnavailable)?;
                 let header = revision::startup_header(&fixed, &authentication, RESPONDER_CALL)?;
-                if header.kind != FrameKind::TicketNotice || !header.matches_attempt(&self.header) {
+                if !header.matches_attempt(&self.header) {
                     return Err(StartupError::Invalid);
+                }
+                match header.kind {
+                    FrameKind::TicketNotice => {}
+                    FrameKind::BootRefusal => {
+                        // One exact bounded refusal body, authenticated and
+                        // revalidated before it can end the boot attempt.
+                        let mut body = vec![0; header.payload_len];
+                        self.connection
+                            .read_exact(&mut body)
+                            .await
+                            .map_err(|_| StartupError::Unavailable)?;
+                        self.route
+                            .revalidate()
+                            .map_err(|_| StartupError::Unauthorized)?;
+                        self.connection
+                            .channel_binding(
+                                opc_tls::ChannelBindingPurpose::BootCandidate,
+                                self.clock
+                                    .interval()
+                                    .map_err(|_| StartupError::AuthTimeUnavailable)?,
+                            )
+                            .map_err(|_| StartupError::AuthTimeUnavailable)?;
+                        let reason = super::refusal::decode_payload(
+                            &body,
+                            &self.nonce,
+                            self.process.boot().process_nonce(),
+                            &self.process.boot().key_digest(),
+                        )?;
+                        return Err(StartupError::BootRefused(reason));
+                    }
+                    _ => return Err(StartupError::Invalid),
                 }
                 let mut body = vec![0; header.payload_len];
                 self.connection

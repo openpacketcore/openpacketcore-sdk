@@ -11,6 +11,7 @@ mod platform_clock;
 mod policy;
 mod pool;
 mod proof;
+mod refusal;
 mod revision;
 #[cfg(test)]
 mod revision_tests;
@@ -27,6 +28,7 @@ pub use platform_clock::{
 };
 pub use policy::{PolicyError, PrincipalGrant, ScopePolicy, ScopeRole};
 pub use pool::{ProofBudgets, ProofPoolError};
+pub use refusal::BootRefusalReason;
 pub use revision::{
     scope_transport_revision_diagnostics, ScopeTransportDirection, ScopeTransportPurpose,
     ScopeTransportRevisionDiagnostic, ScopeTransportRole,
