@@ -129,8 +129,16 @@ push, and commits already on a base branch other than `main` that has no pull
 request of its own. The push to `main` scans all of them; the daily scan covers
 branches.
 
-gitleaks reads `git log -p`, which prints no diff for a merge commit, so text that
-exists only in a merge commit's conflict resolution is not scanned by any run.
+Each run makes two passes with the same pinned scanner. The primary pass reads
+`git log -p` over the pull request's exact range, the pushed commit's full
+reachable history, or all fetched refs; it covers ordinary commits and side
+branches. A second merge-only pass (`--merges -m --first-parent`) diffs merge
+commits against their first parent, so text that exists only in a merge
+commit's conflict resolution is scanned even though `git log -p` prints no diff
+for a merge commit. Both passes must complete cleanly, or report a findings
+count, for the scan to pass; a scan that did not complete is never clean. The
+merge-only pass adds coverage after a clean primary pass, and its report is
+`gitleaks-merge-report.json` in the runner temp directory.
 
 Scheduled runs (daily at 08:17 UTC) fetch and scan all branch and tag refs with
 the `.gitleaksignore` on `main`, including branches without pull requests.
@@ -142,7 +150,8 @@ scan step also fails when the scanner logs an error or does not log `no leaks fo
 That issue does not impose a merge hold on unrelated pull requests. Manual runs
 scan all refs like the scheduled run, with the dispatched commit's
 `.gitleaksignore`, and do not open an issue. Required workflow regressions in
-`ci/test-test-inventory.py` pin these scopes and scheduled issue reporting.
+`ci/test-test-inventory.py` pin these scopes, the merge-commit diff pass, the
+merge-only-text fixture, and scheduled issue reporting.
 
 A pull request is scanned with its own `.gitleaksignore`, so it can silence a
 finding that it adds. Review every change to `.gitleaksignore`, and any new
