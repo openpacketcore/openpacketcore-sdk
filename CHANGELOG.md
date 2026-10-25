@@ -261,7 +261,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used only by `opc-session-net`. `read_kernel_clock_adjustment()` performs one
   read-only `clock_adjtime(CLOCK_REALTIME)` query and returns the kernel
   synchronization state plus maximum/estimated error; unsupported platforms
-  compile to a stub that fails explicitly. Refs #1244.
+  compile to a stub that fails explicitly. ADR 0017's mechanical unsafe
+  boundary allow-list and `scripts/check-management-plane-policy.py` are
+  amended for this narrowly scoped read-only crate. Refs #1244.
 
 - `opc-session-net`: prepared V2 fenced-transition handles expose
   `execute_once_with_failure_diagnostic`, an additive diagnostic wrapper around

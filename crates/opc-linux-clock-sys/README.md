@@ -43,7 +43,10 @@ budget on retry.
 ## Status And Limits
 
 - Unpublished workspace crate (`publish = false`).
-- Contains the syscall `unsafe` allowed by its lint configuration.
+- Contains the syscall `unsafe` allowed only here by its local lint
+  configuration; ADR 0017's mechanical boundary gate
+  (`scripts/check-management-plane-policy.py`) allow-lists this crate and
+  requires an adjacent `SAFETY:` comment on every `unsafe` token.
 - Non-Linux or `opc_linux_clock_sys_force_unsupported` builds compile to
   unsupported stubs.
 - Does not detect a synchronization daemon that has exited without updating
