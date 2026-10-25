@@ -737,9 +737,8 @@ if history.returncode or patches.returncode or patches.stderr:
     sys.stderr.write(line(level, '[git] ' + error.splitlines()[0]) + line(level, 'error="stderr is not empty"')
                      + line('INF', 'no leaks found'))
     sys.exit(0)
-merge_pass = '--merges' in ' '.join(args)
-count = 0 if merge_pass else int(os.environ.get('FAKE_FINDINGS', '3'))
-exit_code = 0 if merge_pass else int(os.environ.get('SCAN_EXIT', '0'))
+count = int(os.environ.get('FAKE_FINDINGS', '3'))
+exit_code = int(os.environ.get('SCAN_EXIT', '0'))
 marker_lines = [line for line in patches.stdout.splitlines()
                 if line.startswith('+') and 'SCOPE_FIXTURE_' + 'A' * 12 in line]
 if marker_lines:
@@ -793,9 +792,7 @@ sys.exit(int(os.environ.get('GH_EXIT', '0')))
                                 cwd=self.repo, env={**self.env, **env}, capture_output=True, text=True, check=False)
         all_records = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
         self.last_records = all_records
-        records = [record for record in all_records
-                   if 'detect' not in record['args'] or '--merges' not in ' '.join(record['args'])]
-        return result, records
+        return result, all_records
 
     def scan_event(self, event, **env):
         return self.run_step(self.scan, **{'GITHUB_EVENT_NAME': event, 'GITHUB_SHA': self.base,
@@ -864,33 +861,34 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
         self.assertEqual(scan['args'], ['detect', '--source', '.', '--redact', '--no-banner',
                                         '--exit-code', '2', '--report-format', 'json',
                                         '--report-path', str(self.scan_report),
-                                        '--log-opts', f'{self.base}..{self.head}'])
+                                        '--log-opts', f'--diff-merges=first-parent {self.base}..{self.head}'])
         self.assertEqual(scan['commits'], [self.head])
         self.assertEqual(scan['ignore'], 'PR head fingerprint\n')
 
     def test_each_event_runs_a_merge_commit_diff_pass(self):
         cases = (
-            ('pull_request', f'{self.base}..{self.head} --merges --diff-merges=first-parent'),
-            ('push', f'--full-history {self.base} --merges --diff-merges=first-parent'),
-            ('schedule', '--full-history --all --merges --diff-merges=first-parent'),
-            ('workflow_dispatch', '--full-history --all --merges --diff-merges=first-parent'),
+            ('pull_request', f'--diff-merges=first-parent {self.base}..{self.head}'),
+            ('push', f'--diff-merges=first-parent --full-history {self.base}'),
+            ('schedule', '--diff-merges=first-parent --full-history --all'),
+            ('workflow_dispatch', '--diff-merges=first-parent --full-history --all'),
         )
         for event, expected in cases:
             with self.subTest(event=event):
-                result, primary = self.scan_event(event)
+                result, records = self.scan_event(event)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(len(primary), 1)
-                self.assertEqual(len(self.last_records), 2)
-                merge = [record for record in self.last_records
-                         if '--merges' in ' '.join(record['args'])]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(len(self.last_records), 1)
+                merge = [record for record in records
+                         if '--diff-merges=first-parent' in record['args'][-1].split()]
                 self.assertEqual(len(merge), 1)
                 self.assertEqual(merge[0]['args'][-2:], ['--log-opts', expected])
-                self.assertIn(str(self.root / 'gitleaks-merge-report.json'), merge[0]['args'])
+                self.assertIn(str(self.scan_report), merge[0]['args'])
+                self.assertNotIn('--first-parent', merge[0]['args'][-1].split())
+                self.assertNotIn('--merges', merge[0]['args'][-1].split())
 
     def test_merge_resolution_text_is_scanned(self):
-        # Text that exists only in a merge commit's resolution: the primary
-        # pass (ordinary git log patches) cannot see it; the merge-diff pass
-        # must. Before the second pass existed this scan exited 0.
+        # Text that exists only in a merge commit's resolution must be seen
+        # alongside ordinary patches in the same scan and report.
         self.git('checkout', '-qb', 'merge-side', 'main', repo=self.origin)
         side = self.commit('merge-side', 'clean side change')
         self.git('checkout', '-q', 'main', repo=self.origin)
@@ -908,12 +906,13 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
         self.assertEqual(self.output.read_text(), 'findings=1\n')
         self.assertEqual(len(primary), 1)
         self.assertEqual(set(primary[0]['commits']), {main_edit, side, merge_head})
-        self.assertFalse(primary[0]['scan_marker'],
+        patches = self.git('log', '-p', '-U0', f'{self.base}..{merge_head}')
+        self.assertFalse(('SCOPE_FIXTURE_' + 'A' * 12) in patches,
                          "ordinary git log patches must not see merge-only text")
         merge = [record for record in self.last_records
-                 if '--merges' in ' '.join(record['args'])]
+                 if '--diff-merges=first-parent' in record['args'][-1].split()]
         self.assertEqual(len(merge), 1)
-        self.assertEqual(merge[0]['commits'], [merge_head])
+        self.assertEqual(set(merge[0]['commits']), {main_edit, side, merge_head})
         self.assertTrue(merge[0]['scan_marker'],
                         "the merge-diff pass must see the resolution text")
         self.assertEqual(primary[0]['ignore'], 'base fingerprint\n')
@@ -926,7 +925,7 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
         self.assertEqual(scan['args'], ['detect', '--source', '.', '--redact', '--no-banner',
                                         '--exit-code', '2', '--report-format', 'json',
                                         '--report-path', str(self.scan_report),
-                                        '--log-opts', f'--full-history {self.base}'])
+                                        '--log-opts', f'--diff-merges=first-parent --full-history {self.base}'])
         self.assertEqual(set(scan['commits']), {self.first, self.base})
 
     def test_nested_merge_resolution_only_findings_fail_every_scan(self):
@@ -962,7 +961,8 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                 result, primary = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
                 self.assertEqual(len(primary), 1)
                 self.assertIn(inner_merge, primary[0]['commits'])
-                self.assertFalse(primary[0]['scan_marker'])
+                patches = self.git('log', '-p', '-U0', f'{self.base}..{head}')
+                self.assertFalse(marker in patches)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertEqual(self.output.read_text(), 'findings=1\n')
 
@@ -986,7 +986,7 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                 self.assertEqual(scan['args'], ['detect', '--source', '.', '--redact', '--no-banner',
                                                 '--exit-code', '2', '--report-format', 'json',
                                                 '--report-path', str(self.scan_report),
-                                                '--log-opts', '--full-history --all'])
+                                                '--log-opts', '--diff-merges=first-parent --full-history --all'])
                 self.assertEqual(set(scan['commits']), before | {without_pr, tag_only})
                 self.assertEqual(self.git('for-each-ref', '--format=%(objectname)',
                                           f'refs/secret-scan/heads/without-pr-{event}'), without_pr)
