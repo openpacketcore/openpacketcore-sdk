@@ -811,7 +811,9 @@ Both modes physically remove log rows through the selected purge frontier,
 covered by the selected snapshot and applied cut. Snapshots, installs and
 restarts preserve only the retained suffix. Reclamation removes the accumulated
 log-row lifetime limit; generation files still grow toward their existing
-32 GiB Durable and 8 GiB Async ceilings until file rollover is implemented.
+32 GiB Durable and 8 GiB Async ceilings until file rollover is implemented. The
+rollover design, crash/qualification plan and pending owner decisions are
+recorded in [ADR 0022 § Generation-file rollover design](../../docs/adr/0022-native-session-persistence-modes.md).
 See [ADR 0022](../../docs/adr/0022-native-session-persistence-modes.md).
 
 Automatic unanimous recovery requires retained reservations and an applied

@@ -4,6 +4,9 @@
 
 Accepted feature contract. Correctness, performance, and consumer qualification
 are separate executed evidence; this decision does not declare their completion.
+Generation-file rollover (SDK #1253) is a separately reviewed design stage
+recorded below; it is not implemented or authorized until its owner decision
+requests are approved.
 This supersedes ADR 0021's private-only activation, SQLite application
 composition, and proposed migration scope. Its durable WAL implementation and
 regressions remain part of the SDK.
@@ -295,6 +298,199 @@ re-derive the identical floor on replay, so a reopened store or an installed
 snapshot continues the same bounded window. The million-mutation qualification
 job and a leader-to-snapshot-install parity qualification remain the final
 follow-up; no persisted format boundary is added.
+
+
+## Generation-file rollover design (SDK #1253, design pending owner approval)
+
+**Status: design stage only.** No rollover, compaction or durable-format change is
+implemented by this section. The generation file remains append-only and the
+declared ceilings remain in force: `MIN_BLOCK` 64 KiB with `MAX_BLOCKS`
+524,288 in `consensus/native/prefix.rs` (32 GiB Durable) and
+`MAX_GENERATION_BYTES` 8 GiB in `wal/async_persistence.rs`. At a ceiling the
+store currently stops, or, in Async, a latched failed writer makes the next
+snapshot publication fail and stops the engine. Removing the ceilings requires
+the decisions and staged implementation below; implementation is not authorized
+until the owner approves the decision requests.
+
+This is its own stage of the #1249 work: #1250/#1251/#1307/#1377 bound and
+reclaim resident native state, but no row retirement shrinks an append-only
+generation extent, so the lifetime stop remains.
+
+### Rollover and selection contract (owner decision 1, recommended)
+
+Recommended: **write a new compact base generation file and switch selection
+with one atomic selector replacement** (not rewrite-in-place). A compact base is
+materialised from the committed cut only, in a new file epoch carrying the same
+binding context; the previous file stays readable until no reader is pinned.
+Rewrite-in-place is not recommended: it cannot preserve a pinned reader, a
+crash-safe verification boundary and table-agnostic reclamation with one
+mechanism.
+
+- Reuse the existing generation magic, vocabulary and selector/epoch machinery.
+  The current vocabulary is `0x06` (fixed). If the rollover candidate reuses it,
+  the persisted profile digest is unchanged and **no fresh-install boundary is
+  introduced**; this is the recommended option and the only one that keeps a
+  rolling upgrade and existing image roots valid.
+- If implementation later needs wider counters, new index pages or a different
+  layout, a new vocabulary/root discriminator is a **durable-format decision**
+  (the existing `OPCNR002`/`OPCNA004` boundary rule applies): old roots refuse
+  the new discriminator and the store reports `FreshInstallationRequired`.
+  That decision must be explicit in the implementation review, not assumed.
+- Selection is the existing durable selector/epoch: readers resolve one selected
+  generation under the existing generation/selection invariants. The namespace
+  already reserves the rollover handoff (one unselected next file and up to two
+  previous native generation files); rollover uses that reserved capacity and
+  must not require increasing it silently.
+- The compact base must preserve the full committed contract: rows, clean/
+  dirty state, purge frontier and semantic row catalogs, membership/roster
+  contexts, snapshot selection and all carry state the base format already
+  requires. Row selection is table-agnostic: a row is omitted only when the
+  committed state and existing retention rules say it is no longer required
+  (including the #1250/#1251/#1307 retired prefixes); anything else is copied
+  exactly. #1249's physical row-reclamation contract is unchanged.
+
+### Crash-safe rollover and restart selection (owner decision 2, recommended)
+
+Recommended staged state machine (all steps bounded work, one rollover in flight
+per voter):
+
+1. Capture the committed application cut, selected snapshot cut and exact
+   context under the existing apply/admission ordering.
+2. Write the compact base into a **new, not yet selected** generation epoch:
+   stream rows under the existing bounded read/write path, write/verify the
+   root, prefix, block index and row catalogs, and fsync file data.
+3. Verify the candidate against the captured cut/context before selection:
+   prefix/root magic+vocabulary+profile, block ownership, digest, row coverage
+   and required catalogs. A failed verification keeps the current selected
+   generation and reports a typed retryable rollover failure; it never changes
+   selection.
+4. Atomically replace the durable selector/epoch to the verified candidate and
+   sync the containing directory.
+5. Keep the old generation file as a **pinned previous file** while any reader
+   captured before the selector switch is still using it; retire the old file
+   only after the last pinned reader releases it (or its existing reader
+   deadline/typed retry path resolves). Retirement is ordinary file removal by
+   the owner/garbage-collection path, not a side effect of a read.
+
+Restart selection rule (recommended): the last durably selected, verified
+generation wins; an incomplete/unselected candidate is ignored and removed by
+the existing recovery sweep; a selected candidate that fails verification is a
+typed corruption/fresh-installation outcome, never a silent fallback to a
+possibly newer unselected file. A crash before selector replacement must reopen
+to the previous generation with correct committed state; a crash after selector
+replacement must reopen to the candidate with correct committed state and treat
+the previous file as pinned/retirable.
+
+Per-step crash matrix (both modes must be tested at every cut):
+
+| Crash cut | Durable reopen expectation | Async reopen expectation |
+|:---|:---|:---|
+| Before candidate file creation | Previous selected generation, full state | Previous selected generation/resident recovery |
+| Mid candidate write/append, before root/index complete | Previous generation selected; partial candidate swept | Previous generation selected; partial candidate swept |
+| Candidate complete, not yet verified | Previous generation selected; unverified candidate swept | Previous generation selected; unverified candidate swept |
+| Verified, selector not yet replaced | Previous generation selected; candidate retried or swept | Previous generation selected; candidate retried or swept |
+| Selector replaced, old file still needed by reader | Candidate selected; old file retained until reader finishes | Candidate selected; resident/read recovery uses candidate; old file retained |
+| Selector replaced and old file retired | Candidate selected; previous epoch absent; reopen correct | Candidate selected; reopen correct |
+
+Async writer-latch recovery: a failed background rollover writer must not latch
+the engine into a permanent stop and must not make the next snapshot publication
+fail merely because compaction failed. The writer retries the rollover under a
+fixed bounded attempt/backoff budget (same recoverable failure contract as the
+bounded local snapshot-build retry, SDK #1254), keeps serving from the current
+selected generation and keeps admission backpressured/typed-retryable while
+space is exhausted. Only the pre-existing engine-stopping cases remain: an
+indeterminate publication state or a store with no published snapshot at all.
+Rollover is not a publication; its failure is a typed storage-health/retryable
+signal.
+
+### Pinned-reader contract (owner decision 3, recommended)
+
+Recommended: a reader that resolved the previous generation before selection may
+complete against that pinned file until its existing operation deadline; a
+reader that arrives after selection uses the candidate. A reader whose pinned
+file was retired/withdrawn before it acquired a bounded slice receives the
+existing typed compacted/retryable answer (the same family as
+`ReplicationLogCursorCompacted`/cursor-compacted behavior) and resynchronises;
+it must never fence a healthy store, never observe a torn generation and never
+be silently served from a different cut. At most one previous generation may be
+pinned plus the reserved namespace capacity; pinned retention is bounded by the
+existing reader deadline/timeout and is visible in persistence diagnostics. A
+rollover waits for pinned readers only through their bounded deadline; it never
+blocks admission indefinitely.
+
+### Size trigger, bounds, warning and fail-closed rule (technical plan)
+
+- Trigger is **file extent/size**, not store age or time: roll over when the
+  selected file's extent reaches the compact-base target plus a bounded headroom
+  large enough for one capture/verification segment (exact constants selected in
+  implementation, subject to review; the trigger must fire well before the
+  hard `MAX_BLOCKS`/`MAX_GENERATION_BYTES` ceiling).
+- Post-rollover bound: selected compact base + one live append segment + one
+  retained previous generation (pinned) stays within a stated multiple of the
+  compact base; the regression asserts the size bound rather than quoting a
+  fixed GiB figure derived from block size.
+- Warning threshold well before the ceiling (typed persistence-health/diagnostic
+  evidence and operator warning), e.g. at a documented fraction of the hard
+  ceiling, so operators see it before any stop.
+- When rollover cannot progress (verification failures, pinned reader holding
+  the only retirement slot, insufficient disk/IO error, bounded retry budget
+  exhausted): admission stays typed-retryable/backpressured (no silent data
+  loss, no silent fence); the old selected generation remains the authority and
+  the store reports the typed compaction/fail-closed outcome. A hard ceiling
+  reached while rollover cannot progress is only the last-resort failure, after
+  warnings; it is never reached silently and never resolved by truncating live
+  state.
+
+### Test-profile and qualification plan
+
+- Reduced-ceiling deterministic regressions (Linux-only, needs-CI): a test-only
+  profile/override that shrinks the Durable and Async ceilings/blocks
+  deterministically **without changing the persisted vocabulary/profile digest**
+  (recommended: `test-control`-gated runtime ceiling override where the prefix
+  validation permits it; otherwise a test-only profile with the unchanged
+  vocabulary, decided in the implementation PR). Tests: run past the reduced
+  ceiling in each mode and keep serving; assert file size stays within the stated
+  post-rollover bound; crash at every row of the matrix above then reopen and
+  compare exact committed state; pinned reader completes or receives the typed
+  retry; restart selects correctly; voter parity (every voter produces the same
+  committed state after rollover); table-agnostic reclaim combined with
+  #1250/#1251/#1307 row retirement frees bytes through the same mechanism.
+- Linux large-file/disk qualification (needs CI/qualification): an actual
+  process/VM run on Linux test storage including clean restart, not just process
+  restart; process restart alone is not power-loss evidence. Disk-full, ENOSPC,
+  directory-sync and slow-file qualification remain required before claiming the
+  lifetime stop removed.
+- The existing #1249/retention regressions and snapshot/restart/voter-parity
+  suites remain unchanged.
+
+### Implementation split (after owner approval)
+
+- **This PR:** docs-only design/ADR + operator documentation pointer. No code,
+  no durable-format/profile change; #1253 is design-pending/owner-decision.
+- **Follow-up PR 1 (Durable):** rollover writing/verification/selection,
+  pinned-reader contract, reduced-ceiling passthrough/crash/restart/parity tests.
+- **Follow-up PR 2 (Async + qualification):** Async writer latch recovery,
+  reduced-ceiling Async tests, warning/diagnostics, large-file/disk Linux
+  qualification. The split may be adjusted by the owner; the two implementation
+  PRs must not land before decision requests 1–3 are approved.
+
+### Explicit decision requests for the owner
+
+1. Accept or reject the recommended new-compact-base + atomic-selector rollover
+   contract, and confirm that reusing the existing generation vocabulary/profile
+   digest (no fresh-install boundary) is required unless a new root/vocabulary is
+   explicitly approved as a durable-format decision.
+2. Accept or reject the recommended staged crash-safe state machine and restart
+   selection rule (last durably selected, verified generation wins; unverified/
+   incomplete candidates are swept, never selected).
+3. Accept or reject the recommended pinned-reader policy (complete within the
+   bounded timeout or receive the typed retry/compacted outcome; never fence a
+   healthy store; at most one pinned previous generation plus reserved namespace
+   capacity).
+
+Until these three are approved and this design is updated, no implementation
+work on generation rollover may change the current ceilings or the persisted
+format.
 
 ## Async writer and local observations
 
