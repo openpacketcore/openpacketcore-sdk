@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `opc-proto-gtpv2c`: an S2b Update Bearer request or response carrying a
+  Protocol Configuration Options (PCO) IE no longer rejects the rest of the
+  procedure. PCO is not S2b-applicable (`CONFORMANCE.md`; TS 29.274 Tables
+  7.2.15/7.2.16), so it is handled as an unexpected IE under clause 7.7.9: the
+  procedure continues, the IE is retained byte-for-byte in the projection's
+  additional IEs, and the SDK never interprets it (a caller that re-encodes the
+  projected message will carry it). Malformed PCO and mandatory-field
+  validation are unchanged, and Create Bearer behaviour is unchanged.
+  Refs #1441.
+
 ### Breaking
 
 - `opc-proto-diameter`: `DiameterRequestFailure` adds `RoutePolicy` and

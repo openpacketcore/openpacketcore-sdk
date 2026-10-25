@@ -19,7 +19,7 @@ use crate::ie::{
     FullyQualifiedTeid, TypedIe, TypedIeValue, IE_TYPE_AMBR, IE_TYPE_APCO, IE_TYPE_BEARER_CONTEXT,
     IE_TYPE_BEARER_QOS, IE_TYPE_BEARER_TFT, IE_TYPE_CAUSE, IE_TYPE_CHARGING_ID, IE_TYPE_EBI,
     IE_TYPE_F_TEID, IE_TYPE_LOAD_CONTROL_INFORMATION, IE_TYPE_OVERLOAD_CONTROL_INFORMATION,
-    IE_TYPE_PCO, IE_TYPE_PGW_CHANGE_INFO,
+    IE_TYPE_PGW_CHANGE_INFO,
 };
 use crate::s2b::{
     build_s2b_profile_message, cause, typed_ie, MessageDirection, Procedure, S2bProcedureMessage,
@@ -1617,10 +1617,15 @@ fn project_update_bearer_request<'a>(
             ));
         }
     };
+    // TS 29.274 clause 7.7.9: an unexpected PCO is ignored rather than used to
+    // reject the rest of the procedure. It stays visible through
+    // `additional_ies` so callers can audit it without interpreting or relaying
+    // its contents (issue #1441). Other misplaced dedicated-bearer IEs remain
+    // rejected below.
     if view.ies.iter().any(|ie| {
         matches!(
             ie.ie_type(),
-            IE_TYPE_EBI | IE_TYPE_BEARER_TFT | IE_TYPE_BEARER_QOS | IE_TYPE_PCO | IE_TYPE_APCO
+            IE_TYPE_EBI | IE_TYPE_BEARER_TFT | IE_TYPE_BEARER_QOS | IE_TYPE_APCO
         )
     }) {
         return Err(DedicatedBearerError::message(
@@ -1637,7 +1642,7 @@ fn project_update_bearer_request<'a>(
         if context.members.iter().any(|ie| {
             matches!(
                 ie.ie_type(),
-                IE_TYPE_AMBR | IE_TYPE_BEARER_CONTEXT | IE_TYPE_CAUSE | IE_TYPE_PCO
+                IE_TYPE_AMBR | IE_TYPE_BEARER_CONTEXT | IE_TYPE_CAUSE
             )
         }) {
             return Err(DedicatedBearerError::bearer(
@@ -1736,15 +1741,12 @@ fn project_update_bearer_response<'a>(
             DedicatedBearerErrorKind::ZeroAcceptedResponseTeid,
         ));
     }
+    // TS 29.274 clause 7.7.9: tolerate an unexpected PCO here as well; it is
+    // retained in `additional_ies`, not interpreted (issue #1441).
     if view.ies.iter().any(|ie| {
         matches!(
             ie.ie_type(),
-            IE_TYPE_AMBR
-                | IE_TYPE_APCO
-                | IE_TYPE_BEARER_QOS
-                | IE_TYPE_BEARER_TFT
-                | IE_TYPE_EBI
-                | IE_TYPE_PCO
+            IE_TYPE_AMBR | IE_TYPE_APCO | IE_TYPE_BEARER_QOS | IE_TYPE_BEARER_TFT | IE_TYPE_EBI
         )
     }) {
         return Err(DedicatedBearerError::message(
@@ -1765,7 +1767,6 @@ fn project_update_bearer_response<'a>(
                     | IE_TYPE_BEARER_CONTEXT
                     | IE_TYPE_BEARER_QOS
                     | IE_TYPE_BEARER_TFT
-                    | IE_TYPE_PCO
             )
         }) {
             return Err(DedicatedBearerError::bearer(
