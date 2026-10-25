@@ -1147,6 +1147,7 @@ fn require_verification_hash_authority(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod rfc4754_encoding_tests {
     use super::*;
 

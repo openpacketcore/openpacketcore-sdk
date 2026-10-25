@@ -84,6 +84,7 @@ pub(crate) fn aes_xcbc_prf_128(key: &[u8], data: &[u8]) -> [u8; 16] {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
