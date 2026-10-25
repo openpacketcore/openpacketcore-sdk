@@ -42,7 +42,7 @@ impl VoterSlotStateReader for DeadlineReader {
             }
             *remaining -= 1;
         }
-        if let Some(error) = self.failure.lock().unwrap().clone() {
+        if let Some(error) = *self.failure.lock().unwrap() {
             return Err(error);
         }
         self.read_voter_slot_state().await
