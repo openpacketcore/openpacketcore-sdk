@@ -3858,6 +3858,25 @@ const MAX_TRAFFIC_PROOF_ATTEMPTS: usize = 256;
 const MAX_TRAFFIC_PROOF_DRAIN_BATCH: usize = MAX_RETAINED_EVENTS;
 const TRAFFIC_OBSERVATION_SEQUENCE_WINDOW: u64 = MAX_RETAINED_EVENTS as u64;
 
+/// Bounded live-attempt admission predicate.
+///
+/// Kept as one explicitly testable expression so the host-portable scale
+/// evidence can exercise the exact failure boundary without constructing a
+/// full backend. It is the same predicate the renewal/admission paths already
+/// enforce and has no behavior of its own.
+const fn traffic_attempt_capacity_available(current: usize) -> bool {
+    current < MAX_TRAFFIC_PROOF_ATTEMPTS
+}
+
+/// Bounded observation-drain batch predicate.
+///
+/// The drain never appends a record once the batch is full; it marks the drain
+/// overflowed so the consumer fails closed instead of silently truncating.
+/// Kept as one explicitly testable expression for the same evidence reason.
+const fn traffic_observation_batch_full(record_count: usize, budget: usize) -> bool {
+    record_count >= budget
+}
+
 /// Bounded, attachment-wide replay detector for one production observation
 /// source incarnation.
 ///
@@ -13527,7 +13546,7 @@ impl EbpfGtpuDataplaneBackend {
                     operation: "ebpf_traffic_renewal_predecessor",
                 });
             }
-            if attempts.len() >= MAX_TRAFFIC_PROOF_ATTEMPTS {
+            if !traffic_attempt_capacity_available(attempts.len()) {
                 return Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_traffic_capacity",
                 });
@@ -13634,7 +13653,8 @@ impl EbpfGtpuDataplaneBackend {
             });
         }
         let mut attempts = self.traffic_attempts()?;
-        if attempts.len() == MAX_TRAFFIC_PROOF_ATTEMPTS || attempts.contains_key(&attempt_id) {
+        if !traffic_attempt_capacity_available(attempts.len()) || attempts.contains_key(&attempt_id)
+        {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_traffic_capacity",
             });
@@ -49215,7 +49235,9 @@ mod aya_runtime {
                 let mut records = Vec::with_capacity(budget);
                 let mut overflowed = false;
                 while let Some(item) = ring.next() {
-                    if item.len() != GTPU_TRAFFIC_OBSERVATION_EVENT_LEN || records.len() == budget {
+                    if item.len() != GTPU_TRAFFIC_OBSERVATION_EVENT_LEN
+                        || super::traffic_observation_batch_full(records.len(), budget)
+                    {
                         overflowed = true;
                     } else {
                         let mut record = [0_u8; GTPU_TRAFFIC_OBSERVATION_EVENT_LEN];
@@ -57218,6 +57240,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod reassembled_downlink;
     mod retained_namespace_boundary;
+    mod scale_evidence;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
     #[cfg(target_os = "linux")]
