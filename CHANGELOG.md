@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: the recovery profile can send the RFC 7296 §2.4 empty
+  `INFORMATIONAL` liveness probe that it could previously only answer. New
+  `Ikev2CommittedWindow` APIs (`send_empty_request`,
+  `retransmit_empty_request`, `complete_empty_request`,
+  `abandon_empty_request`, plus the `pending_empty_request_message_id` and
+  `next_send_message_id` query accessors) seal one empty request at the volatile
+  next send ID without a store command, retransmit its exact bytes with the same
+  Message ID and IV, correlate a matching authenticated empty response, and
+  refuse ordinary preparation or sync initiation while it is outstanding. The
+  caller owns the complete liveness decision, including authenticated ESP
+  traffic under the IKE SA (NAT keepalives never count), and the retransmission
+  budget. The probe's send-ID advance is volatile: the next committed operation
+  persists it, and a crash before that commit loses it as a bounded lead
+  (RFC 6311 §5.1) that the consumer must synchronize before relying on the
+  peer's receive expectation. GCM sealing requires an allocation from an
+  already committed reservation block; CBC uses its admitted random IV.
+  Refs #1241.
+
 - `opc-ipsec-xfrm`: SAs can request Linux Traffic Flow Confidentiality (TFC)
   padding through the new `SaParameters::tfc_pad: Option<u32>`. A `Some(n)`
   value serializes the `XFRMA_TFCPAD` attribute (UAPI attribute 22, `__u32`) on
@@ -40,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   length/structure-only. A dedicated test-only allocator probe
   (`opc-key-hygiene-probe`) proves the dropped buffers are cleared, with
   positive controls for `Vec` and `bytes::Bytes` deallocation. Refs #1262.
+- `opc-persist`: a configuration-consensus leader-routed call is now bounded by
+  this replica's own leader view. Once the engine has observed a successor for
+  a lost leader, an unanswered forwarded mutation or linearizable read barrier
+  is abandoned after `DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (200 ms) and
+  re-offered through that successor, instead of occupying the complete
+  operation deadline. A route with no observed successor keeps the existing
+  operation deadline and its typed ambiguous outcome; an abandoned forwarded
+  mutation is classified as possibly transmitted and retries on the same
+  request identity, so the configuration store still applies it exactly once.
+  Election, heartbeat and forwarded-mutation timing budgets are unchanged.
+  Refs #1049.
 
 - `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
   TS 29.281 section 5.1 all-zero value is now representable and installable on
@@ -61,6 +90,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   projected message will carry it). Malformed PCO and mandatory-field
   validation are unchanged, and Create Bearer behaviour is unchanged.
   Refs #1441.
+
+- `opc-session-store`: a cancelled Dynamic-authority current-snapshot
+  admission no longer releases publication exclusion, its namespace lease or
+  its shutdown evidence while the detached descriptor scan still reads the
+  selected snapshot. Dynamic admission now runs the bounded envelope scan on a
+  blocking worker that retains the serving gate and the admitted
+  snapshot-directory lease (the existing Fixed-admission retention) and
+  additionally takes a shutdown child, so shutdown tracks the detached scan
+  through its last read. Fixed admission, snapshot bytes, admission deadlines
+  and published artifacts are unchanged. Refs #1371.
 
 - `opc-session-net`: prepared protected V2 transition status no longer caches
   a transient local recovery-preflight failure as the handle's final
@@ -274,6 +313,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error for Configuration Update Command/Complete bodies.
 
 ### Added
+
+- `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported
+  production `AuthenticationTimeSource` for RFC 026 authentication freshness.
+  It reads the Linux kernel clock-adjustment state (one read-only
+  `clock_adjtime(CLOCK_REALTIME)` query, no privilege or clock change) and
+  reports the kernel maximum realtime error as the symmetric uncertainty of one
+  fresh observation. Unsynchronized, unavailable, zero, negative or over-bound
+  kernel state returns the typed retryable `AuthenticationTimeError`; there is
+  no wall-clock fallback. The synchronization generation starts at 1 on the
+  first accepted synchronized observation and increments after synchronization
+  is re-established, while wall steps keep `IntervalClock`'s existing fixed-
+  budget recovery policy. The default maximum accepted uncertainty is 1 s
+  (`PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY`) and can be fixed with
+  `with_maximum_uncertainty` at startup. A fixed, value-free `tracing` warning
+  carries the closed refusal reason. Refs #1244.
+
+- `opc-linux-clock-sys`: narrow unsafe Linux clock-adjustment UAPI boundary
+  used only by `opc-session-net`. `read_kernel_clock_adjustment()` performs one
+  read-only `clock_adjtime(CLOCK_REALTIME)` query and returns the kernel
+  synchronization state plus maximum/estimated error; unsupported platforms
+  compile to a stub that fails explicitly. ADR 0017's mechanical unsafe
+  boundary allow-list and `scripts/check-management-plane-policy.py` are
+  amended for this narrowly scoped read-only crate. Refs #1244.
 
 - `opc-session-net`: prepared V2 fenced-transition handles expose
   `execute_once_with_failure_diagnostic`, an additive diagnostic wrapper around

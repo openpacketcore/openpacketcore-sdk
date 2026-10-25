@@ -5833,16 +5833,30 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                         error,
                     )
                 })?;
-                let mut snapshot = SessionSnapshotFile::from_std(file, path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                let (_, checksum, length) = verify_snapshot_envelope_reader(&mut snapshot)
+                // Dynamic authority streams the portable envelope, so its
+                // admission scan runs on a blocking worker that owns the
+                // serving/shutdown evidence itself. A dropped admission caller
+                // can then no longer release publication exclusion, the
+                // namespace lease or the shutdown barrier while the detached
+                // scan still reads the selected inode.
+                let work = DynamicSnapshotAdmissionWork {
+                    _gate: SnapshotIntegrityGate::Serving {
+                        _guard: Arc::clone(&serving_guard),
+                    },
+                    _lease: Arc::clone(&self._snapshot_directory_lease),
+                    _shutdown: self.shutdown_guard.child(),
+                };
+                let (file, checksum, length) =
+                    verify_dynamic_admitted_snapshot(file, path.clone(), work)
+                        .await
+                        .map_err(|error| {
+                            storage_error(
+                                ErrorSubject::Snapshot(Some(meta.signature())),
+                                ErrorVerb::Read,
+                                error,
+                            )
+                        })?;
+                let snapshot = SessionSnapshotFile::from_std(file, path.clone())
                     .await
                     .map_err(|error| {
                         storage_error(
@@ -8064,6 +8078,117 @@ pub(crate) async fn inspect_voter_snapshot(
             _lease: lease,
         })
     }
+}
+
+/// Retention ownership for one Dynamic-authority current-snapshot admission.
+///
+/// Fixed authority pins the selected descriptor and moves its
+/// [`SnapshotIntegrityWork`] bundle into the blocking verifier. Dynamic
+/// authority serves the portable envelope as a streaming file, so its bounded
+/// admission scan runs on a blocking worker that owns the same evidence:
+/// publication exclusion (the serving gate), the admitted namespace lease and
+/// a shutdown child. A cancelled admission caller therefore cannot release any
+/// of them while the detached scan still reads the selected inode.
+struct DynamicSnapshotAdmissionWork {
+    _gate: SnapshotIntegrityGate,
+    _lease: Arc<SnapshotDirectoryLease>,
+    _shutdown: ConsensusStorageShutdownGuard,
+}
+
+/// Run the Dynamic current-snapshot admission scan on a blocking worker while
+/// that worker owns `work`, then hand the rewound descriptor back for
+/// streaming. Server-side caller cancellation drops only the join handle; the
+/// worker and its retention bundle survive through the last read.
+async fn verify_dynamic_admitted_snapshot(
+    file: std::fs::File,
+    path: PathBuf,
+    work: DynamicSnapshotAdmissionWork,
+) -> io::Result<(std::fs::File, [u8; 32], u64)> {
+    tokio::task::spawn_blocking(move || {
+        let _work = work;
+        let mut file = file;
+        let (checksum, length) = scan_dynamic_snapshot_envelope(&mut file, &path)?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+        Ok((file, checksum, length))
+    })
+    .await
+    .map_err(|_| io::Error::other("snapshot integrity worker unavailable"))?
+}
+
+/// Bounded synchronous counterpart of [`verify_snapshot_envelope_reader`] for
+/// Dynamic current-snapshot admission.
+///
+/// The scan must not be driven by cancellable Tokio file reads: owning the
+/// whole read inside one blocking closure is what lets the caller release its
+/// future without releasing the worker's retention evidence.
+// The path is only read by test-only admission-scan hooks; production builds
+// use the descriptor alone.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn scan_dynamic_snapshot_envelope(
+    file: &mut std::fs::File,
+    path: &Path,
+) -> io::Result<([u8; 32], u64)> {
+    use std::io::{Read as _, Seek as _};
+
+    let total_length = file.seek(io::SeekFrom::End(0))?;
+    if total_length <= SNAPSHOT_FOOTER_BYTES || total_length > SNAPSHOT_ENVELOPE_MAX_BYTES {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot size is invalid",
+        ));
+    }
+    file.seek(io::SeekFrom::End(
+        -i64::try_from(SNAPSHOT_FOOTER_BYTES).map_err(|_| {
+            consensus::invalid_data("session consensus snapshot footer size is invalid")
+        })?,
+    ))?;
+    let mut magic = [0_u8; 8];
+    let mut encoded_length = [0_u8; 8];
+    let mut expected_checksum = [0_u8; 32];
+    file.read_exact(&mut magic)?;
+    file.read_exact(&mut encoded_length)?;
+    file.read_exact(&mut expected_checksum)?;
+    if &magic != SNAPSHOT_FOOTER_MAGIC {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot magic is invalid",
+        ));
+    }
+    let payload_length = u64::from_be_bytes(encoded_length);
+    if payload_length == 0
+        || payload_length > SNAPSHOT_MAX_BYTES
+        || payload_length.checked_add(SNAPSHOT_FOOTER_BYTES) != Some(total_length)
+    {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot length is invalid",
+        ));
+    }
+    file.seek(io::SeekFrom::Start(0))?;
+    #[cfg(test)]
+    super::snapshot::block_fixed_prepublication_scan(path);
+    let mut limited = file.by_ref().take(payload_length);
+    let mut hasher = Sha256::new();
+    let mut observed = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = limited.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(u64::try_from(read).map_err(|_| {
+                consensus::invalid_data("session consensus snapshot length overflow")
+            })?)
+            .ok_or_else(|| consensus::invalid_data("session consensus snapshot length overflow"))?;
+        hasher.update(&buffer[..read]);
+    }
+    let actual_checksum: [u8; 32] = hasher.finalize().into();
+    #[cfg(test)]
+    super::snapshot::record_fixed_prepublication_scan(path, observed);
+    if observed != payload_length || actual_checksum != expected_checksum {
+        return Err(consensus::invalid_data(
+            "session consensus snapshot checksum mismatch",
+        ));
+    }
+    Ok((actual_checksum, total_length))
 }
 
 pub(crate) async fn verify_snapshot_envelope_reader(
@@ -17498,6 +17623,94 @@ mod tests {
                 .meta,
             original.meta
         );
+    }
+
+    /// Dynamic authority streams the selected portable envelope, so its
+    /// admission scan must keep serving/shutdown evidence inside the detached
+    /// blocking worker. Dropping the caller mid-read may not release the
+    /// publication exclusion, the namespace lease or the shutdown child while
+    /// that scan still reads the selected inode.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_dynamic_current_snapshot_scan_retains_worker_ownership() {
+        let directory = FixedRawReadStoreFixture::new();
+        let database = directory.path().join("dynamic-current-snapshot.sqlite");
+        let backend = SqliteSessionBackend::open(&database).expect("dynamic backend");
+        let (log, mut machine) = open(
+            &backend,
+            directory.snapshot_path(),
+            identity(1),
+            expected_members(),
+        )
+        .await
+        .expect("open dynamic authority store");
+        machine
+            .apply([initial_membership_entry()])
+            .await
+            .expect("apply membership before current snapshot");
+        let original = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .expect("publish dynamic current snapshot before cancellation");
+        let original_meta = original.meta.clone();
+        drop(original);
+        let observer = machine
+            .shutdown_observer()
+            .expect("dynamic store has a tracked shutdown guard");
+        let gate = Arc::new(SnapshotArtifactGate::new());
+        gate.arm();
+        let hook_directory =
+            snapshot_namespace_test_hook_directory(&machine._snapshot_directory_lease);
+        let _gate_guard =
+            FixedPrepublicationScanGateGuard::install(hook_directory, Arc::clone(&gate));
+        let mut serving = Box::pin(machine.get_current_snapshot());
+        tokio::select! {
+            _ = gate.wait_started() => {}
+            result = &mut serving => {
+                let _ = result;
+                panic!("dynamic admission completed before its descriptor-scan gate");
+            }
+        }
+        drop(serving);
+        assert_eq!(
+            observer.0.active_owners.load(Ordering::Acquire),
+            3,
+            "the detached dynamic admission worker retains its shutdown child"
+        );
+        let worker_owns_publication = Arc::clone(&machine.core.snapshot_serving_gate)
+            .try_lock_owned()
+            .is_err();
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observer.0.active_owners.load(Ordering::Acquire) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached dynamic scan releases its shutdown child after completion");
+        let released = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&machine.core.snapshot_serving_gate).lock_owned(),
+        )
+        .await
+        .expect("detached dynamic scan releases publication exclusion after completion");
+        drop(released);
+        assert!(
+            worker_owns_publication,
+            "cancelled dynamic admission must exclude publication until its worker stops"
+        );
+        assert_eq!(
+            machine
+                .get_current_snapshot()
+                .await
+                .expect("read original snapshot after cancelled dynamic scan")
+                .expect("original snapshot remains selected")
+                .meta,
+            original_meta
+        );
+        drop(log);
     }
 
     #[cfg(target_os = "linux")]

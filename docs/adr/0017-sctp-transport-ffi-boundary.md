@@ -66,10 +66,14 @@ an SCTP-terminating CNF is in scope:
 1. **`opc-libsctp-sys`** provides thin FFI over Linux SCTP socket UAPI and
    minimal `libsctp` helpers where required. It is the **only SCTP workspace
    crate** permitted to contain `unsafe`; follow-on Linux kernel UAPI exceptions
-   such as `opc-linux-xfrm-sys`, `opc-linux-gtpu-sys`, and
-   `opc-fs-verity-sys`, and narrow reviewed FFI boundaries such as
+   such as `opc-linux-clock-sys`, `opc-linux-xfrm-sys`, `opc-linux-gtpu-sys`,
+   and `opc-fs-verity-sys`, and narrow reviewed FFI boundaries such as
    `opc-sqlite-file-control-sys`, must be separately and explicitly allowlisted
-   by the same mechanical gate. The fs-verity boundary is limited to enabling
+   by the same mechanical gate. The clock boundary is limited to one read-only,
+   unprivileged `clock_adjtime(CLOCK_REALTIME)` query (`modes == 0`, the clock
+   is never changed) that returns the kernel synchronization state and the
+   kernel maximum and estimated error; it accepts no paths, credentials, or
+   configuration and has no mutation surface. The fs-verity boundary is limited to enabling
    and measuring the fixed version-1, SHA-256, 4096-byte-block profile through
    already-open file descriptors; it accepts no paths or file contents. The SQLite production
    boundary is limited to `SQLITE_FCNTL_HAS_MOVED`, `SQLITE_FCNTL_VFSNAME`,
@@ -97,8 +101,9 @@ an SCTP-terminating CNF is in scope:
    `scripts/check-management-plane-policy.py --check` token-scans OpenPacketCore
    workspace crate sources and asserts `unsafe` appears only in explicitly
    allowlisted sys crates (`opc-libsctp-sys` and later, reviewed kernel-UAPI
-   boundaries such as `opc-linux-xfrm-sys`, `opc-linux-gtpu-sys`, and the
-   fixed-profile descriptor-only `opc-fs-verity-sys`, plus the pinned
+   boundaries such as `opc-linux-clock-sys`, `opc-linux-xfrm-sys`,
+   `opc-linux-gtpu-sys`, and the fixed-profile descriptor-only
+   `opc-fs-verity-sys`, plus the pinned
    file-control, test-only VFS, and ADR 0020 read-only snapshot VFS boundary in
    `opc-sqlite-file-control-sys`); the same gate also rejects each allowed sys
    crate if it

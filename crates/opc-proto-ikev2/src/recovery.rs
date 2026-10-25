@@ -13,6 +13,12 @@
 //! write. Trusted restart reconstruction repairs a lost stateless prefix; the
 //! first nonempty result commits the repaired floor and ends reconstruction.
 //! Replay probes are old bytes, not fresh liveness or new outcome evidence.
+//!
+//! An opt-in volatile empty-INFORMATIONAL probe sends a liveness request without
+//! a durable write: its Message-ID advance is folded into the next committed
+//! record and is lost on a crash as a bounded lead (RFC 6311 §5.1). The caller
+//! owns the idleness decision, including authenticated ESP traffic, and the
+//! retransmission budget; retransmitting a probe replays its exact sealed bytes.
 
 use std::{cell::Cell, error::Error as StdError, fmt, sync::Arc};
 
@@ -27,6 +33,7 @@ mod cbc_epoch;
 pub(crate) mod cbc_test_fixtures;
 mod empty;
 mod packet;
+mod probe;
 pub(crate) mod profile;
 use profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
 mod reconcile;
@@ -41,6 +48,7 @@ mod sync_responder;
 pub use cbc_epoch::{Ikev2CbcEpochInputs, Ikev2CbcEpochRecord};
 pub use empty::{Ikev2EmptyReply, Ikev2EmptyReplyObservation};
 pub use packet::Ikev2AuthenticatedOrdinary;
+pub use probe::{Ikev2EmptyRequest, Ikev2EmptyRequestCompletion};
 pub use profile::{Ikev2CbcRecoveryProfile, Ikev2GcmRecoveryProfile};
 pub use record::{
     Ikev2CommittedExchangeRecord, Ikev2CommittedWindowDomain, Ikev2CommittedWindowRecord,
@@ -90,7 +98,7 @@ pub enum Ikev2WindowError {
     CommitMismatch,
     /// Message-ID or commit-generation space is exhausted; never wrap.
     Exhausted,
-    /// Stateless empty request cannot create durable work or a fresh probe.
+    /// Stateless empty request is not durable work; use the opt-in probe API.
     NoDurableWork,
     /// Enable the qualified canonical handler before admitting empty-request traffic.
     EmptyRepliesDisabled,
@@ -244,6 +252,7 @@ pub struct Ikev2CommittedWindow<P: RecoveryProfile = Gcm> {
     reconcile_terminal: bool,
     observed_peer_request: Cell<Option<u32>>,
     receive: empty::ReceiveState<P>,
+    probe: probe::ProbeState,
     sync_live: bool,
     sync_closed: bool,
     sync_last_observed_unix_ms: Option<u64>,
@@ -305,6 +314,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             reconcile_terminal: false,
             observed_peer_request: Cell::new(None),
             receive: empty::ReceiveState::new(record.next_receive),
+            probe: probe::ProbeState::default(),
             sync_live: false,
             sync_closed: false,
             sync_last_observed_unix_ms: record
@@ -460,7 +470,22 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             .generation
             .checked_add(1)
             .ok_or(Ikev2WindowError::Exhausted)?;
+        // Fold a volatile empty-probe send-ID advance into the next durable
+        // record. IDs consumed by probes are never reused inside this runtime,
+        // even across a crash that loses the uncommitted high-water mark only
+        // after this record commits.
+        if let (Some(durable), Some(volatile)) = (record.next_send, self.probe.next_send) {
+            record.next_send = Some(durable.max(volatile));
+        }
         Ok(record)
+    }
+
+    /// Next local request Message ID including volatile empty-probe advances.
+    pub(crate) fn effective_next_send(&self) -> Option<u32> {
+        match (self.record.next_send, self.probe.next_send) {
+            (Some(durable), Some(volatile)) => Some(durable.max(volatile)),
+            (next, _) => next,
+        }
     }
     fn prepared(
         &mut self,
@@ -497,6 +522,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             .outbound
             .as_ref()
             .is_some_and(|request| request.response.is_none())
+            || self.probe.pending.is_some()
         {
             return Err(Ikev2WindowError::RequestOutstanding);
         }
@@ -646,7 +672,8 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     /// Replay the committed pending local request without new state.
     ///
     /// No request or a settled exchange yields `None`. A peer may forget its
-    /// settled response, so replay is never a local liveness probe.
+    /// settled response, so replay is never a local liveness probe. A fresh
+    /// liveness exchange uses [`Self::send_empty_request`] instead.
     /// # Errors
     /// Quiescent runtimes must resolve readback first.
     pub fn replay_request(&self) -> Result<Option<Ikev2ExactReplay<'_>>, Ikev2WindowError> {
@@ -832,12 +859,16 @@ profile_lifetime_redacted_debug!(
 impl Ikev2CommittedWindow<Gcm> {
     /// Seal and prepare a single new ordinary request without send permission.
     ///
-    /// The caller reserves IVs only for genuine state-changing work, never liveness.
-    /// A failed call burns its supplied allocation but changes no Message-ID state.
+    /// The caller reserves IVs only for genuine state-changing work or for an
+    /// already committed probe block, never for a per-probe liveness write.
+    /// Empty liveness probes use [`Self::send_empty_request`] instead: their
+    /// retained bytes are volatile and issue no store command. A failed call
+    /// burns its supplied allocation but changes no Message-ID state.
     /// The last representable ID should be reserved for rekey/closure by policy.
     /// # Errors
-    /// Rejects pending work, unresolved commits, exhaustion, invalid payloads and
-    /// empty INFORMATIONAL probes. IKE_SA_INIT and sync are outside this path.
+    /// Rejects pending ordinary work, a pending empty probe, unresolved commits,
+    /// exhaustion, invalid payloads and empty INFORMATIONAL probes. IKE_SA_INIT
+    /// and sync are outside this path.
     pub fn prepare_request(
         &mut self,
         profile: Ikev2SaInitCryptoProfile,
@@ -871,7 +902,8 @@ impl Ikev2CommittedWindow<Gcm> {
 
 impl Ikev2CommittedWindow<Ikev2CbcRecoveryProfile> {
     /// Seal with one fresh admitted random CBC IV; no reservation is used.
-    /// Persist the exact candidate before transmission. Empty probes are refused.
+    /// Persist the exact candidate before transmission. Empty liveness probes
+    /// use [`Self::send_empty_request`] and are never admitted here.
     /// # Errors
     /// Refuses unresolved/pending work, exhausted IDs, invalid payloads or sealing failure.
     pub fn prepare_request(

@@ -51,8 +51,9 @@ pub use profile::{
     DurableConsensusTimingProfile, DurableConsensusTimingProfileError, DurableOpenraftDomain,
     DurableOpenraftProfile, DurableOpenraftProfileError, DurableOpenraftRuntime,
     DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
-    DURABLE_CONSENSUS_TIMING_PROFILE, DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES,
-    DURABLE_OPENRAFT_PROFILE, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE, DURABLE_CONSENSUS_TIMING_PROFILE,
+    DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES, DURABLE_OPENRAFT_PROFILE,
+    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 pub use shutdown::{planned_shutdown_timeout, PlannedShutdownFallback, PlannedShutdownOutcome};
 pub use transport::{

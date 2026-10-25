@@ -87,6 +87,19 @@ mutation/consumer ReadBarrier and operation default 10,000 ms, and listener
 idle/handler ceilings 30,000 ms. The 1,500 ms DNS/TCP/mTLS/bootstrap cold cap is
 contained inside the selected family deadline, never added to it.
 
+`DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (200 ms) bounds an outstanding
+leader-routed configuration-consensus call after this replica's own engine has
+named a successor for the attempted leader. The unanswered call is abandoned and
+re-offered through the observed successor, so a black-holed former leader cannot
+hold a client write for the complete operation deadline. This is a
+route-retirement bound, not an election, heartbeat or forwarded-mutation budget
+change: without an observed successor the existing complete-operation deadline
+and its typed ambiguous outcome still apply. A forwarded mutation that was
+transmitted and then abandoned is classified as possibly transmitted; retries
+reuse the same request identity so the state machine idempotency contract keeps
+the operation exactly-once. A route this replica has already superseded is not
+transmitted.
+
 `DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS` fixes the ordinary proposal baseline
 at eight concurrent paths. The scope-aware session adapter adds five independent
 class-reserved credits above that pool, for thirteen concurrent proposals in

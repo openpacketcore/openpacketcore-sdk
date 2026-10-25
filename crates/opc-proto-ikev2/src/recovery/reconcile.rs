@@ -55,7 +55,8 @@ impl<P: RecoveryProfile> Window<P> {
     /// or completion token is created. Restore durable outcomes idempotently.
     ///
     /// Every attempt fences all old completion tokens and any live local sync
-    /// proposal, even at the same generation. A pending proposal therefore needs
+    /// proposal, even at the same generation; it likewise fences a pending
+    /// volatile empty-INFORMATIONAL probe. A pending proposal therefore needs
     /// its existing bounded higher-proposal retry, spending another attempt.
     /// Clock and latched-close knowledge survive. Valid lifecycle states succeed;
     /// [`Self::ready`] reports pending sync, uncertain outcome or closure afterward.
@@ -139,6 +140,10 @@ impl<P: RecoveryProfile> Window<P> {
         // No fallible operation may follow retirement and precede publication.
         // Retain the applicable last reply for unchanged/outbound readback.
         self.receive.retire_readback(next, boundary)?;
+        // Fence a volatile empty probe for the same reason as any other send
+        // claim: its response is stale after readback. The consumed send ID
+        // stays burned in this runtime and the next committed record persists it.
+        self.probe.pending = None;
         self.record = record.clone();
         self.canonical_binding = epoch.clone();
         if boundary {

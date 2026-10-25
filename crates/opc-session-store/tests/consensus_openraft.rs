@@ -78,6 +78,15 @@ const CLUSTER_START_TIMEOUT: Duration = RECOVERY_TIMEOUT;
 const SNAPSHOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const SNAPSHOT_COMMAND_BATCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SNAPSHOT_CATCH_UP_COMMANDS: usize = 4_300;
+// A preparation batch has no total-runtime bound: every command is already
+// bounded by the store's own operation deadline, and completion is observed
+// through the store's published snapshot/purge progress afterwards. This is
+// only a hang guard for a batch that stops publishing store progress; two
+// complete operation deadlines is longer than any single bounded command can
+// legitimately leave the store unpublished, and far shorter than a job timeout.
+const SNAPSHOT_PREPARATION_STALL_TIMEOUT: Duration =
+    DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT.saturating_mul(2);
+const SNAPSHOT_PREPARATION_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 // `timeout_at` bounds which protocol event wins, but a host runtime can only
 // observe its timer once it is scheduled. Keep this below half the deliberate
@@ -867,6 +876,223 @@ async fn commit_snapshot_triggering_commands(store: &ConsensusSessionStore) {
             .await
             .expect("advance committed logical time toward snapshot compaction");
     }
+}
+
+/// One store-published status observation used only as preparation progress.
+///
+/// These are the store's own published indices and counters (no file or path
+/// data), so a stalled preparation is diagnosable without reading storage. A
+/// change in any one of them is progress: applying a command and completing a
+/// snapshot are both store publication events the preparation depends on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotPreparationPublication {
+    applied_index: Option<u64>,
+    last_log_index: Option<u64>,
+    completed_snapshot_count: u64,
+}
+
+fn snapshot_preparation_publication(
+    store: &ConsensusSessionStore,
+) -> SnapshotPreparationPublication {
+    let status = store.status();
+    SnapshotPreparationPublication {
+        applied_index: status.applied_index,
+        last_log_index: status.last_log_index,
+        completed_snapshot_count: status.completed_snapshot_count,
+    }
+}
+
+/// Event-driven preparation progress: total elapsed time never fails a batch,
+/// only the absence of a published store change for the hang-guard window.
+struct SnapshotPreparationProgress {
+    publication: SnapshotPreparationPublication,
+    last_change_at: Instant,
+}
+
+impl SnapshotPreparationProgress {
+    fn new(publication: SnapshotPreparationPublication, sampled_at: Instant) -> Self {
+        Self {
+            publication,
+            last_change_at: sampled_at,
+        }
+    }
+
+    /// Track one store-published sample and return the no-progress window when
+    /// it reaches the hang-guard threshold. The total elapsed preparation time
+    /// is intentionally not a failure condition.
+    fn observe(
+        &mut self,
+        sampled_at: Instant,
+        publication: SnapshotPreparationPublication,
+        stall_timeout: Duration,
+    ) -> Option<Duration> {
+        if publication != self.publication {
+            self.publication = publication;
+            self.last_change_at = sampled_at;
+            return None;
+        }
+        let stalled_for = sampled_at.saturating_duration_since(self.last_change_at);
+        (stalled_for >= stall_timeout).then_some(stalled_for)
+    }
+}
+
+/// Bounded, value-free description of a preparation that stopped publishing
+/// store progress. `phase` is a closed label owned by the qualification test.
+fn snapshot_preparation_stall_diagnostic(
+    phase: &str,
+    outstanding_command: usize,
+    stalled_for: Duration,
+    publication: SnapshotPreparationPublication,
+) -> String {
+    format!(
+        "{phase} snapshot preparation published no store progress for {} ms while \
+         command {outstanding_command}/{SNAPSHOT_CATCH_UP_COMMANDS} was outstanding: \
+         applied_index={:?} last_log_index={:?} completed_snapshot_count={}",
+        stalled_for.as_millis(),
+        publication.applied_index,
+        publication.last_log_index,
+        publication.completed_snapshot_count,
+    )
+}
+
+/// Commit the snapshot-triggering command batch without a fixed aggregate
+/// wall-clock bound.
+///
+/// The store's own operation deadline bounds every command, so a slow host that
+/// keeps publishing progress cannot fail the preparation merely by taking
+/// longer than a fixed total. The only additional guard is a hang guard derived
+/// from that same operation deadline: if the store stops publishing progress
+/// for `SNAPSHOT_PREPARATION_STALL_TIMEOUT` while a command is outstanding, fail
+/// with the phase, command ordinal and last published indices/counters. The
+/// caller attaches the post-failure storage diagnostics, so the command loop is
+/// not perturbed by storage observation.
+async fn commit_snapshot_triggering_commands_observed(
+    store: &ConsensusSessionStore,
+    phase: &'static str,
+) -> Result<(), String> {
+    let initial_publication = snapshot_preparation_publication(store);
+    let monitor_store = store.clone();
+    let outstanding_command = Arc::new(AtomicUsize::new(1));
+    let monitor_outstanding = Arc::clone(&outstanding_command);
+    let (stall_sender, mut stall_receiver) = tokio::sync::oneshot::channel::<String>();
+    let monitor = tokio::spawn(async move {
+        let mut progress = SnapshotPreparationProgress::new(initial_publication, Instant::now());
+        loop {
+            tokio::time::sleep(SNAPSHOT_PREPARATION_PROGRESS_INTERVAL).await;
+            let sampled_at = Instant::now();
+            let publication = snapshot_preparation_publication(&monitor_store);
+            if let Some(stalled_for) =
+                progress.observe(sampled_at, publication, SNAPSHOT_PREPARATION_STALL_TIMEOUT)
+            {
+                let _ = stall_sender.send(snapshot_preparation_stall_diagnostic(
+                    phase,
+                    monitor_outstanding.load(Ordering::Relaxed),
+                    stalled_for,
+                    progress.publication,
+                ));
+                return;
+            }
+        }
+    });
+    for ordinal in 1..=SNAPSHOT_CATCH_UP_COMMANDS {
+        outstanding_command.store(ordinal, Ordering::Relaxed);
+        tokio::select! {
+            result = store.max_replication_sequence() => {
+                if let Err(error) = result {
+                    monitor.abort();
+                    return Err(format!(
+                        "{phase} snapshot preparation command {ordinal}/{SNAPSHOT_CATCH_UP_COMMANDS} \
+                         exceeded the store's own operation deadline ({} ms): {error:?}",
+                        DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT.as_millis(),
+                    ));
+                }
+            }
+            stalled = &mut stall_receiver => {
+                monitor.abort();
+                return Err(stalled.unwrap_or_else(|_| {
+                    format!("{phase} snapshot preparation progress monitor stopped")
+                }));
+            }
+        }
+    }
+    // The batch completed, so a concurrently detected terminal stall is no
+    // longer a failure: the required publication is asserted by the caller.
+    monitor.abort();
+    let _ = monitor.await;
+    // A completed preparation must have issued every unchanged command and
+    // advanced the store's own published state; otherwise the batch was a
+    // silent no-op that would make the later snapshot waits meaningless.
+    assert_eq!(
+        outstanding_command.load(Ordering::Relaxed),
+        SNAPSHOT_CATCH_UP_COMMANDS,
+        "the {phase} preparation batch issues every unchanged snapshot command"
+    );
+    assert!(
+        snapshot_preparation_publication(store) != initial_publication,
+        "the {phase} preparation batch advances the store's published state"
+    );
+    Ok(())
+}
+
+#[test]
+fn snapshot_preparation_progress_is_event_driven_not_total_runtime_bounded() {
+    let started_at = Instant::now();
+    let mut publication = SnapshotPreparationPublication {
+        applied_index: Some(1),
+        last_log_index: Some(1),
+        completed_snapshot_count: 0,
+    };
+    let mut progress = SnapshotPreparationProgress::new(publication, started_at);
+    let mut sampled_at = started_at;
+    // A slow batch: 180 commands at 5 s each publish store progress well inside
+    // the hang-guard window, for 900 s total. That is far longer than the
+    // removed 300 s aggregate bound, and total duration is never the failure
+    // condition.
+    for applied in 2..=181_u64 {
+        sampled_at += Duration::from_secs(5);
+        publication.applied_index = Some(applied);
+        publication.last_log_index = Some(applied);
+        assert_eq!(
+            None,
+            progress.observe(sampled_at, publication, SNAPSHOT_PREPARATION_STALL_TIMEOUT),
+            "a slow preparation that keeps publishing store progress must not fail on elapsed time"
+        );
+    }
+    assert!(
+        sampled_at.saturating_duration_since(started_at) > SNAPSHOT_COMMAND_BATCH_TIMEOUT,
+        "the regression covers a preparation longer than the removed aggregate bound"
+    );
+    // A completed snapshot is store publication progress even when the apply
+    // head does not move.
+    sampled_at += Duration::from_secs(5);
+    publication.completed_snapshot_count = 1;
+    assert_eq!(
+        None,
+        progress.observe(sampled_at, publication, SNAPSHOT_PREPARATION_STALL_TIMEOUT),
+        "snapshot publication alone counts as store progress"
+    );
+    // No published store change for the full hang-guard window is the only
+    // failure condition.
+    sampled_at += SNAPSHOT_PREPARATION_STALL_TIMEOUT;
+    let stalled_for = progress
+        .observe(sampled_at, publication, SNAPSHOT_PREPARATION_STALL_TIMEOUT)
+        .expect("a stalled preparation is reported");
+    assert_eq!(stalled_for, SNAPSHOT_PREPARATION_STALL_TIMEOUT);
+    let diagnostic = snapshot_preparation_stall_diagnostic(
+        "predecessor",
+        SNAPSHOT_CATCH_UP_COMMANDS,
+        stalled_for,
+        progress.publication,
+    );
+    assert!(
+        diagnostic.contains("predecessor snapshot preparation published no store progress"),
+        "the diagnostic names the closed preparation phase: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("applied_index=Some(181)")
+            && diagnostic.contains("completed_snapshot_count=1"),
+        "the diagnostic retains the last published store indices/counters: {diagnostic}"
+    );
 }
 
 impl TestCluster {
@@ -6402,19 +6628,14 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
     // First make every voter compact, publish, and purge its predecessor
     // phase. The later isolated voter keeps its selected predecessor P, but
     // has no retained P+1..S log interval from which it can catch up.
-    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
-        commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
-    })
-    .await
-    .unwrap_or_else(|error| {
-        // Observe only after failure: sampling inside the command loop can
-        // change the storage/snapshot interleaving we need to diagnose.
-        panic!(
-            "predecessor snapshot command batch exceeded its unchanged {}s aggregate bound: {error:?}; {}",
-            SNAPSHOT_COMMAND_BATCH_TIMEOUT.as_secs(),
-            snapshot_catch_up_failure_diagnostic(&cluster, lagging)
-        );
-    });
+    commit_snapshot_triggering_commands_observed(&cluster.stores[initial_leader], "predecessor")
+        .await
+        .unwrap_or_else(|failure| {
+            panic!(
+                "{failure}; {}",
+                snapshot_catch_up_failure_diagnostic(&cluster, lagging)
+            );
+        });
     let predecessor = tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
         loop {
             let progress = futures_util::future::join_all(
@@ -6467,17 +6688,14 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
     .await
     .expect("surviving majority remains ready while predecessor voter is isolated");
 
-    tokio::time::timeout(SNAPSHOT_COMMAND_BATCH_TIMEOUT, async {
-        commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
-    })
-    .await
-    .unwrap_or_else(|error| {
-        panic!(
-            "successor snapshot command batch exceeded its unchanged {}s aggregate bound: {error:?}; {}",
-            SNAPSHOT_COMMAND_BATCH_TIMEOUT.as_secs(),
-            snapshot_catch_up_failure_diagnostic(&cluster, lagging)
-        );
-    });
+    commit_snapshot_triggering_commands_observed(&cluster.stores[initial_leader], "successor")
+        .await
+        .unwrap_or_else(|failure| {
+            panic!(
+                "{failure}; {}",
+                snapshot_catch_up_failure_diagnostic(&cluster, lagging)
+            );
+        });
     tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
         loop {
             let progress = futures_util::future::join_all(

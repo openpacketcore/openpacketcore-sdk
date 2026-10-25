@@ -43,7 +43,9 @@ impl<P: RecoveryProfile> Window<P> {
     fn sync_counters(&self) -> Result<Counters, Error> {
         let state = self.record.sync_state().ok_or(Error::Drop)?;
         let mut counters = Counters::new(
-            self.record.next_send.ok_or(Error::SyncClosed)?,
+            // Advertise the volatile empty-probe advance too. The peer takes the
+            // maximum of these values, so a burned probe ID is never skipped.
+            self.effective_next_send().ok_or(Error::SyncClosed)?,
             self.next_receive().ok_or(Error::SyncClosed)?,
         );
         counters.highest_local_request = state.highest_local_request();
@@ -115,6 +117,7 @@ impl<P: RecoveryProfile> Window<P> {
         self.sync_open()?;
         if pending_inbound.is_some()
             || self.receive.pending.borrow().is_some()
+            || self.probe.pending.is_some()
             || self
                 .record
                 .outbound
