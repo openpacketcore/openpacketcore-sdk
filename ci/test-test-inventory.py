@@ -927,6 +927,43 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                                         '--log-opts', f'--full-history {self.base}'])
         self.assertEqual(set(scan['commits']), {self.first, self.base})
 
+    def test_nested_merge_resolution_only_findings_fail_every_scan(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'nested-side', self.base, repo=self.origin)
+        side = self.commit('base', 'side of inner conflict')
+        self.git('checkout', '-qb', 'nested-leaf', self.base, repo=self.origin)
+        leaf = self.commit('base', 'other side of inner conflict')
+        self.git('checkout', '-q', 'nested-side', repo=self.origin)
+        conflict = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', leaf],
+                                  cwd=self.origin, env=self.env, capture_output=True, text=True)
+        self.assertEqual(conflict.returncode, 1, conflict.stderr)
+        self.assertIn('CONFLICT (content)', conflict.stdout)
+        inner_merge = self.commit('base', marker)
+        for parent in (side, leaf):
+            self.assertNotIn(marker, self.git('show', f'{parent}:base', repo=self.origin))
+
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('base', 'main side of outer conflict')
+        conflict = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', inner_merge],
+                                  cwd=self.origin, env=self.env, capture_output=True, text=True)
+        self.assertEqual(conflict.returncode, 1, conflict.stderr)
+        self.assertIn('CONFLICT (content)', conflict.stdout)
+        head = self.commit('base', 'clean outer resolution')
+        self.assertNotIn(marker, self.git('show', f'{head}:base', repo=self.origin))
+        # Only main reaches the inner merge; no side ref can rescue --first-parent.
+        self.git('branch', '-D', 'nested-side', 'nested-leaf', repo=self.origin)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, primary = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(len(primary), 1)
+                self.assertIn(inner_merge, primary[0]['commits'])
+                self.assertFalse(primary[0]['scan_marker'])
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
+
     def test_schedule_fetches_and_scans_all_refs_including_unopened_branches_and_tags(self):
         for event in ('schedule', 'workflow_dispatch'):
             with self.subTest(event=event):
@@ -966,6 +1003,54 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                     self.assertEqual(len(records), 1)
                     self.assertEqual(self.output.read_text(), 'findings=3\n' if exit_code == 2 else '')
                     self.assertIn(harmless_log, result.stderr)
+
+    def test_merge_resolution_only_findings_fail_every_scan(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'merge-side', self.base, repo=self.origin)
+        side = self.commit('base', 'side of conflict')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        first_parent = self.commit('base', 'main side of conflict')
+        merge = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', side],
+                               cwd=self.origin, env=self.env, capture_output=True, text=True)
+        self.assertEqual(merge.returncode, 1, merge.stderr)
+        self.assertIn('CONFLICT (content)', merge.stdout)
+        head = self.commit('base', marker)
+        self.assertEqual(self.git('show', '-s', '--format=%P', head, repo=self.origin),
+                         f'{first_parent} {side}')
+        for parent in (first_parent, side):
+            self.assertNotIn(marker, self.git('show', f'{parent}:base', repo=self.origin))
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn(head, records[0]['commits'])
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
+
+    def test_merged_side_branch_history_is_still_scanned(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'merge-side', self.base, repo=self.origin)
+        leaked = self.commit('side-file', marker)
+        side = self.commit('side-file', 'removed before merge')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('main-file', 'main change')
+        self.git('-c', 'commit.gpgsign=false', 'merge', '--no-ff', '-qm', 'merge side', side,
+                 repo=self.origin)
+        head = self.git('rev-parse', 'HEAD', repo=self.origin)
+        self.assertNotIn(marker, self.git('show', f'{head}:side-file', repo=self.origin))
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn(leaked, records[0]['commits'])
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
 
     def test_git_failure_inside_the_scanner_is_never_a_clean_result(self):
         absent = '0' * 39 + '1'
