@@ -922,7 +922,7 @@ mod tests {
     fn context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: teid(1),
-            peer_teid: teid(2),
+            peer_teid: teid(2).into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
@@ -1111,7 +1111,7 @@ mod tests {
         default.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
         let mut marked = context();
         marked.local_teid = teid(3);
-        marked.peer_teid = teid(4);
+        marked.peer_teid = teid(4).into();
         marked.bearer_mark = crate::GtpBearerMark::new(0x1001);
         marked.egress_dscp = Some(crate::DscpCodepoint::new(34).unwrap());
 
@@ -1175,7 +1175,7 @@ mod tests {
 
         let mut same_uplink = installed.clone();
         same_uplink.local_teid = teid(11);
-        same_uplink.peer_teid = teid(12);
+        same_uplink.peer_teid = teid(12).into();
         let outcome = backend
             .install_pdp_context_classified(same_uplink.clone())
             .await

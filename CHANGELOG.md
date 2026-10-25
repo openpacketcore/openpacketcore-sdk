@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
+  TS 29.281 section 5.1 all-zero value is now representable and installable on
+  the model and mock-software paths, and the N3 software G-PDU encoder emits
+  the TEID field as zero for it. Locally allocated/received/map-key TEIDs
+  remain strictly nonzero (`Teid::new(0)` still returns `None`), with Debug
+  redaction unchanged. The Linux kernel-GTP netlink path cannot install
+  `GTPA_O_TEI = 0` in this release and returns the stable typed
+  `GtpuError::UnsupportedFeature { feature: "peer_teid_zero" }` on install and
+  readback; the eBPF userspace adapter returns the same typed refusal until its
+  committed datapath object is rebuilt with zero-peer-TEID support. Refs #1346.
+
 - `opc-proto-gtpv2c`: an S2b Update Bearer request or response carrying a
   Protocol Configuration Options (PCO) IE no longer rejects the rest of the
   procedure. PCO is not S2b-applicable (`CONFORMANCE.md`; TS 29.274 Tables
@@ -20,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refs #1441.
 
 ### Breaking
+
+- `opc-gtpu-dataplane`: `GtpPdpContext.peer_teid` is now `PeerTeid`, a new
+  public peer/outgoing-TEID type that admits the TS 29.281 section 5.1 all-zero
+  value; `Teid` remains the strictly nonzero local/received TEID type and its
+  `new(0) -> None` contract is unchanged. `ReceivedN3UplinkTnl::new` and
+  `ReceivedN3UplinkTnl::teid` now use `PeerTeid`. Construct peer values with
+  `PeerTeid::new`, `PeerTeid::ZERO`, or `PeerTeid::from(teid)`; `Teid` remains
+  for `local_teid` and every selector/map key. Downstream code that assigned a
+  `Teid` to `peer_teid` must convert or construct a `PeerTeid`. Refs #1346.
 
 - `opc-session-net`: `StartupError` adds `PlatformInvalid`,
   `PlatformChanged`, and `PrerequisiteRefused`. Issuer probe and retained-session

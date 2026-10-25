@@ -11020,11 +11020,11 @@ fn decode_canonical_desired(bytes: &[u8]) -> Option<GtpuSessionGroup> {
             &mut cursor,
             4,
         )?)?))?;
-        let peer_teid = crate::Teid::new(u32::from_be_bytes(take_array(take(
+        let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(take_array(take(
             bytes,
             &mut cursor,
             4,
-        )?)?))?;
+        )?)?));
         let link_ifindex = u32::from_be_bytes(take_array(take(bytes, &mut cursor, 4)?)?);
         let gtp_version = match *take(bytes, &mut cursor, 1)?.first()? {
             1 => crate::GtpVersion::V1,
@@ -11187,7 +11187,7 @@ mod tests {
     ) -> GtpuSessionGroup {
         let context = GtpPdpContext {
             local_teid: Teid::new(teid).unwrap(),
-            peer_teid: Teid::new(teid + 1).unwrap(),
+            peer_teid: crate::PeerTeid::new(teid + 1),
             ms_address: paa,
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
@@ -12647,7 +12647,7 @@ mod tests {
         let mut changed_canonical = state.clone();
         let original = group(1, 1, 0x1000_0001, None);
         let mut context = original.entries()[0].context().clone();
-        context.peer_teid = Teid::new(0x2000_0001).unwrap();
+        context.peer_teid = crate::PeerTeid::new(0x2000_0001);
         let changed_group = GtpuSessionGroup::new(
             original.id(),
             original.device_id(),
@@ -14115,7 +14115,7 @@ mod tests {
     fn stable_group_key_is_distinct_from_complete_forwarding_commitment() {
         let original = group(1, 1, 0x1000_0001, None);
         let mut changed_context = original.entries()[0].context().clone();
-        changed_context.peer_teid = Teid::new(0x2000_0001).unwrap();
+        changed_context.peer_teid = crate::PeerTeid::new(0x2000_0001);
         let changed = GtpuSessionGroup::new(
             original.id(),
             original.device_id(),
@@ -15510,7 +15510,7 @@ mod tests {
         let mut entries = template.entries().to_vec();
         let mut second_context = template.entries()[0].context().clone();
         second_context.local_teid = Teid::new(0x1000_0002).unwrap();
-        second_context.peer_teid = Teid::new(0x1000_0003).unwrap();
+        second_context.peer_teid = crate::PeerTeid::new(0x1000_0003);
         second_context.ms_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 1));
         entries.push(
             GtpuSessionEntry::new(second_context, template.entries()[0].local_outer_address())

@@ -8,7 +8,7 @@ use opc_gtpu_dataplane::{
     GtpuDataplaneBackend, LinuxGtpuDataplaneBackend, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkSelector, PdpDeviceIncarnation,
-    PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof, PdpRestartRecoveryRequest,
+    PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof, PdpRestartRecoveryRequest, PeerTeid,
     RemovePdpContextRequest, RetainedDeviceConflictReason, RetainedDeviceIdentityOutcome,
     RetainedDeviceIdentityRequest, Teid, GTPU_PORT,
 };
@@ -215,7 +215,7 @@ async fn create_install_remove_destroy_gtpu_device_in_current_netns(
     let device = backend.create_device(create).await?;
 
     let local_teid = Teid::new(0x1000_0001).ok_or("local TEID must be nonzero")?;
-    let peer_teid = Teid::new(0x2000_0001).ok_or("peer TEID must be nonzero")?;
+    let peer_teid = PeerTeid::new(0x2000_0001);
     let context = GtpPdpContext {
         local_teid,
         peer_teid,
@@ -265,8 +265,7 @@ async fn create_install_remove_destroy_gtpu_device_in_current_netns(
         let mut stale_selector = context.clone();
         stale_selector.local_teid =
             Teid::new(0x1000_0002).ok_or("stale local TEID must be nonzero")?;
-        stale_selector.peer_teid =
-            Teid::new(0x2000_0002).ok_or("stale peer TEID must be nonzero")?;
+        stale_selector.peer_teid = PeerTeid::new(0x2000_0002);
         assert!(matches!(
             backend
                 .install_pdp_context_classified(stale_selector)
@@ -337,7 +336,7 @@ async fn mixed_inner_outer_families_read_back_and_reconcile_in_current_netns(
         let device = backend.create_device(create).await?;
         let context = GtpPdpContext {
             local_teid: Teid::new(local_teid).ok_or("local TEID must be nonzero")?,
-            peer_teid: Teid::new(peer_teid).ok_or("peer TEID must be nonzero")?,
+            peer_teid: PeerTeid::new(peer_teid),
             ms_address,
             peer_address,
             link_ifindex: device.ifindex,
@@ -398,7 +397,7 @@ fn privileged_recovery_root() -> PathBuf {
 fn privileged_recovery_context(device: &GtpDevice) -> Result<GtpPdpContext, &'static str> {
     Ok(GtpPdpContext {
         local_teid: Teid::new(0x1400_0001).ok_or("local TEID must be nonzero")?,
-        peer_teid: Teid::new(0x2400_0001).ok_or("peer TEID must be nonzero")?,
+        peer_teid: PeerTeid::new(0x2400_0001),
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 9)),
         peer_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         link_ifindex: device.ifindex,
@@ -539,7 +538,7 @@ async fn restart_recovery_removes_exact_pdp_and_is_idempotent_in_current_netns(
         // A same-selector but different-identity resident is never touched.
         backend.install_pdp_context(context.clone()).await?;
         let mut foreign = context.clone();
-        foreign.peer_teid = Teid::new(0x2400_0999).ok_or("foreign TEID must be nonzero")?;
+        foreign.peer_teid = PeerTeid::new(0x2400_0999);
         let conflict = backend
             .recover_pdp_context_exact(privileged_recovery_request(&device, incarnation, foreign))
             .await?;
@@ -950,7 +949,7 @@ async fn live_writer_removal_removes_exact_pdp_under_live_authority_in_current_n
         // A same-selector but different-identity resident is never touched.
         backend.install_pdp_context(context.clone()).await?;
         let mut foreign = context.clone();
-        foreign.peer_teid = Teid::new(0x2400_0999).ok_or("foreign TEID must be nonzero")?;
+        foreign.peer_teid = PeerTeid::new(0x2400_0999);
         match backend
             .remove_pdp_context_exact_live_writer(
                 privileged_live_writer_request(&backend, &device, incarnation, foreign).await,

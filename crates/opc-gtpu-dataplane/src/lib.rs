@@ -174,7 +174,7 @@ pub use model::{
     PdpContextRemovalOutcome, PdpContextRepairReason, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkIdentity, PdpContextUplinkSelector,
     PdpDeviceIncarnation, PdpLiveWriterProof, PdpLiveWriterRemovalRequest, PdpRestartRecoveryProof,
-    PdpRestartRecoveryRequest, RemovePdpContextRequest, RetainedDeviceConflictReason,
+    PdpRestartRecoveryRequest, PeerTeid, RemovePdpContextRequest, RetainedDeviceConflictReason,
     RetainedDeviceIdentityAcquisition, RetainedDeviceIdentityOutcome,
     RetainedDeviceIdentityRequest, RetainedDeviceIndeterminateReason, RetainedDeviceRepairReason,
     RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
@@ -269,7 +269,7 @@ mod integration_tests {
     fn context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: teid(0x1000_0001),
-            peer_teid: teid(0x2000_0001),
+            peer_teid: teid(0x2000_0001).into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,

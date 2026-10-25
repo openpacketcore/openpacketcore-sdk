@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, GtpDevice, GtpPdpContext, GtpVersion, GtpuDataplaneBackend, GtpuError,
     GtpuProbe, GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, MockOperation, PdpContextConflict,
-    PdpContextInstallOutcome, PdpContextSelectorOccupancy, RemovePdpContextRequest, Teid,
+    PdpContextInstallOutcome, PdpContextSelectorOccupancy, PeerTeid, RemovePdpContextRequest, Teid,
 };
 
 fn established_mock_operation_kind(operation: &MockOperation) -> &'static str {
@@ -51,8 +51,7 @@ impl GtpuDataplaneBackend for ExternalBackend {
         desired: GtpPdpContext,
     ) -> Result<PdpContextInstallOutcome, GtpuError> {
         let mut existing = desired.clone();
-        existing.peer_teid = Teid::new(3)
-            .ok_or_else(|| GtpuError::invalid_config("test.peer_teid", "TEID must be nonzero"))?;
+        existing.peer_teid = PeerTeid::new(3);
         let conflict =
             PdpContextConflict::between(PdpContextSelectorOccupancy::Both, &existing, &desired)
                 .ok_or_else(|| {
@@ -69,7 +68,7 @@ impl GtpuDataplaneBackend for ExternalBackend {
 fn context() -> GtpPdpContext {
     GtpPdpContext {
         local_teid: Teid::new(1).unwrap(),
-        peer_teid: Teid::new(2).unwrap(),
+        peer_teid: PeerTeid::new(2),
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
         peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         link_ifindex: 7,
