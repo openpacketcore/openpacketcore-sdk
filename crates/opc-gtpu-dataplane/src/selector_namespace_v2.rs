@@ -29,6 +29,11 @@ const SUBSET_DOMAIN_V1: &[u8] = b"opc/gtpu-selector/subset/v1\0";
 const SELECTOR_SET_DOMAIN_V1: &[u8] = b"opc/gtpu-selector/set/v1\0";
 const PROVENANCE_SOURCE_DOMAIN_V1: &[u8] = b"opc/gtpu-selector/provenance-source/v1\0";
 const PROVENANCE_PARTITION_DOMAIN_V1: &[u8] = b"opc/gtpu-selector/provenance-partition/v1\0";
+const ATOM_DOMAIN_V1: &[u8] = b"opc/gtpu-selector/atom/v1\0";
+const DRAIN_QUALIFICATION_DOMAIN_V1: &[u8] = b"opc/gtpu-selector/drain-qualification/v1\0";
+const TRANSFER_EDGE_DOMAIN_V1: &[u8] = b"opc/gtpu-selector/transfer-edge/v1\0";
+const DRAIN_QUALIFICATION_V1_LEN: usize = 305;
+const TRANSFER_EDGE_V1_LEN: usize = 289;
 const MAX_PROVENANCE_ATOMS: usize = 256;
 const MAX_PROVENANCE_SOURCES: usize = 32;
 const MAX_ATOM_BYTES: usize = 13;
@@ -434,6 +439,7 @@ fn canonical_atom_length(encoded: &[u8]) -> Result<usize, SelectorNamespaceCodec
     dead_code,
     reason = "RFC 017 provenance is staged behind the coordinator."
 )]
+#[derive(Clone)]
 struct AtomSubsetCodecV1 {
     atoms: Vec<Vec<u8>>,
 }
@@ -521,6 +527,7 @@ impl AtomSubsetCodecV1 {
     dead_code,
     reason = "RFC 017 provenance is staged behind the coordinator."
 )]
+#[derive(Clone)]
 struct ProvenanceSourceCodecV1 {
     namespace_binding: [u8; 32],
     candidate_group: [u8; 32],
@@ -534,6 +541,7 @@ struct ProvenanceSourceCodecV1 {
     dead_code,
     reason = "RFC 017 provenance is staged behind the coordinator."
 )]
+#[derive(Clone)]
 enum ProvenanceSourceKindV1 {
     NeverPublished,
     RetiredSubset {
@@ -952,6 +960,446 @@ impl ProvenancePartitionCodecV1 {
     ) -> Result<SelectorNamespaceCommitmentV2, SelectorNamespaceCodecError> {
         key.commit(PROVENANCE_PARTITION_DOMAIN_V1, &self.encode())
     }
+
+    fn sources(&self) -> &[ProvenanceSourceCodecV1] {
+        &self.sources
+    }
+}
+
+/// Canonical immutable drain qualification for one fully retired predecessor.
+///
+/// See RFC 017 section 4.2. The value is constructed only by the coordinator;
+/// this staged slice validates and encodes it so mixed-provenance admission can
+/// bind a retired subset to its exact qualification commitment without
+/// trusting a caller's assertion. Persistence and receipt consumption remain
+/// coordinator work.
+///
+/// The preflight enforces the authority-generation ordering
+/// `terminal_generation < qualification_generation <
+/// precommitted_qualification_generation`, matching the coordinator's
+/// single-CAS qualification schedule. The `removed_dataplane_generation` field
+/// lives in the dataplane generation space, not the authority generation
+/// space, so it is not numerically ordered against those three here; the
+/// coordinator must bind it to the exact trusted removed-dataplane readback
+/// before consuming this qualification.
+#[allow(
+    dead_code,
+    reason = "The RFC 017 coordinator durable admission/restore wiring remains; this codec is tested."
+)]
+#[derive(Clone, PartialEq, Eq)]
+struct DrainQualificationCodecV1 {
+    namespace_binding: [u8; 32],
+    predecessor_group: [u8; 32],
+    predecessor_set: [u8; 32],
+    predecessor_desired: [u8; 32],
+    terminal_generation: NonZeroU64,
+    removed_dataplane_generation: NonZeroU64,
+    qualification_generation: NonZeroU64,
+    qualification_nonce: [u8; 16],
+    precommitted_qualification_generation: NonZeroU64,
+    precommitted_qualification_nonce: [u8; 16],
+    backend_epoch: [u8; 16],
+    terminal_stamp_commitment: [u8; 32],
+    absence_commitment: [u8; 32],
+    backend_drain_receipt_commitment: [u8; 32],
+}
+
+#[allow(
+    dead_code,
+    reason = "The RFC 017 coordinator durable admission/restore wiring remains; this codec is tested."
+)]
+impl DrainQualificationCodecV1 {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        namespace_binding: [u8; 32],
+        predecessor_group: [u8; 32],
+        predecessor_set: [u8; 32],
+        predecessor_desired: [u8; 32],
+        terminal_generation: NonZeroU64,
+        removed_dataplane_generation: NonZeroU64,
+        qualification_generation: NonZeroU64,
+        qualification_nonce: [u8; 16],
+        precommitted_qualification_generation: NonZeroU64,
+        precommitted_qualification_nonce: [u8; 16],
+        backend_epoch: [u8; 16],
+        terminal_stamp_commitment: [u8; 32],
+        absence_commitment: [u8; 32],
+        backend_drain_receipt_commitment: [u8; 32],
+    ) -> Result<Self, SelectorNamespaceCodecError> {
+        for value in [
+            &namespace_binding,
+            &predecessor_group,
+            &predecessor_set,
+            &predecessor_desired,
+            &terminal_stamp_commitment,
+            &absence_commitment,
+            &backend_drain_receipt_commitment,
+        ] {
+            nonzero_commitment(value)?;
+        }
+        if qualification_nonce == [0; 16] || precommitted_qualification_nonce == [0; 16] {
+            return Err(SelectorNamespaceCodecError::invalid());
+        }
+        if backend_epoch == [0; 16] {
+            return Err(SelectorNamespaceCodecError::invalid());
+        }
+        if qualification_generation <= terminal_generation
+            || precommitted_qualification_generation <= qualification_generation
+        {
+            return Err(SelectorNamespaceCodecError::invalid());
+        }
+        Ok(Self {
+            namespace_binding,
+            predecessor_group,
+            predecessor_set,
+            predecessor_desired,
+            terminal_generation,
+            removed_dataplane_generation,
+            qualification_generation,
+            qualification_nonce,
+            precommitted_qualification_generation,
+            precommitted_qualification_nonce,
+            backend_epoch,
+            terminal_stamp_commitment,
+            absence_commitment,
+            backend_drain_receipt_commitment,
+        })
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, SelectorNamespaceCodecError> {
+        if encoded.len() != DRAIN_QUALIFICATION_V1_LEN || encoded[0] != 1 {
+            return Err(SelectorNamespaceCodecError::invalid());
+        }
+        let fixed = |start: usize| -> Result<[u8; 32], SelectorNamespaceCodecError> {
+            encoded[start..start + 32]
+                .try_into()
+                .map_err(|_| SelectorNamespaceCodecError::invalid())
+        };
+        let nonce = |start: usize| -> Result<[u8; 16], SelectorNamespaceCodecError> {
+            encoded[start..start + 16]
+                .try_into()
+                .map_err(|_| SelectorNamespaceCodecError::invalid())
+        };
+        let generation = |start: usize| -> Result<NonZeroU64, SelectorNamespaceCodecError> {
+            NonZeroU64::new(u64::from_be_bytes(
+                encoded[start..start + 8]
+                    .try_into()
+                    .map_err(|_| SelectorNamespaceCodecError::invalid())?,
+            ))
+            .ok_or_else(SelectorNamespaceCodecError::invalid)
+        };
+        Self::new(
+            fixed(1)?,
+            fixed(33)?,
+            fixed(65)?,
+            fixed(97)?,
+            generation(129)?,
+            generation(137)?,
+            generation(145)?,
+            nonce(153)?,
+            generation(169)?,
+            nonce(177)?,
+            nonce(193)?,
+            fixed(209)?,
+            fixed(241)?,
+            fixed(273)?,
+        )
+    }
+
+    fn encode(&self) -> [u8; DRAIN_QUALIFICATION_V1_LEN] {
+        let mut encoded = [0_u8; DRAIN_QUALIFICATION_V1_LEN];
+        encoded[0] = 1;
+        encoded[1..33].copy_from_slice(&self.namespace_binding);
+        encoded[33..65].copy_from_slice(&self.predecessor_group);
+        encoded[65..97].copy_from_slice(&self.predecessor_set);
+        encoded[97..129].copy_from_slice(&self.predecessor_desired);
+        encoded[129..137].copy_from_slice(&self.terminal_generation.get().to_be_bytes());
+        encoded[137..145].copy_from_slice(&self.removed_dataplane_generation.get().to_be_bytes());
+        encoded[145..153].copy_from_slice(&self.qualification_generation.get().to_be_bytes());
+        encoded[153..169].copy_from_slice(&self.qualification_nonce);
+        encoded[169..177].copy_from_slice(
+            &self
+                .precommitted_qualification_generation
+                .get()
+                .to_be_bytes(),
+        );
+        encoded[177..193].copy_from_slice(&self.precommitted_qualification_nonce);
+        encoded[193..209].copy_from_slice(&self.backend_epoch);
+        encoded[209..241].copy_from_slice(&self.terminal_stamp_commitment);
+        encoded[241..273].copy_from_slice(&self.absence_commitment);
+        encoded[273..305].copy_from_slice(&self.backend_drain_receipt_commitment);
+        encoded
+    }
+
+    fn commitment(
+        &self,
+        key: &SelectorNamespaceCommitmentKeyV2,
+    ) -> Result<SelectorNamespaceCommitmentV2, SelectorNamespaceCodecError> {
+        key.commit(DRAIN_QUALIFICATION_DOMAIN_V1, &self.encode())
+    }
+}
+
+/// Canonical immutable transfer edge for one atom moved out of one retired
+/// predecessor (RFC 017 section 4.2).
+///
+/// Every retired source contributes exactly one edge per transferred atom in
+/// the mixed admission preflight; the durable append-only ledger remains
+/// coordinator work.
+#[allow(
+    dead_code,
+    reason = "The RFC 017 coordinator durable admission/restore wiring remains; this codec is tested."
+)]
+#[derive(Clone, PartialEq, Eq)]
+struct TransferEdgeCodecV1 {
+    namespace_binding: [u8; 32],
+    atom_commitment: [u8; 32],
+    predecessor_group: [u8; 32],
+    predecessor_terminal_generation: NonZeroU64,
+    successor_group: [u8; 32],
+    successor_set: [u8; 32],
+    successor_desired: [u8; 32],
+    successor_installing_generation: NonZeroU64,
+    successor_operation_nonce: [u8; 16],
+    source_subset_commitment: [u8; 32],
+    drain_qualification_commitment: [u8; 32],
+}
+
+#[allow(
+    dead_code,
+    reason = "The RFC 017 coordinator durable admission/restore wiring remains; this codec is tested."
+)]
+impl TransferEdgeCodecV1 {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        namespace_binding: [u8; 32],
+        atom_commitment: [u8; 32],
+        predecessor_group: [u8; 32],
+        predecessor_terminal_generation: NonZeroU64,
+        successor_group: [u8; 32],
+        successor_set: [u8; 32],
+        successor_desired: [u8; 32],
+        successor_installing_generation: NonZeroU64,
+        successor_operation_nonce: [u8; 16],
+        source_subset_commitment: [u8; 32],
+        drain_qualification_commitment: [u8; 32],
+    ) -> Result<Self, SelectorNamespaceCodecError> {
+        for value in [
+            &namespace_binding,
+            &atom_commitment,
+            &predecessor_group,
+            &successor_group,
+            &successor_set,
+            &successor_desired,
+            &source_subset_commitment,
+            &drain_qualification_commitment,
+        ] {
+            nonzero_commitment(value)?;
+        }
+        if successor_operation_nonce == [0; 16] {
+            return Err(SelectorNamespaceCodecError::invalid());
+        }
+        Ok(Self {
+            namespace_binding,
+            atom_commitment,
+            predecessor_group,
+            predecessor_terminal_generation,
+            successor_group,
+            successor_set,
+            successor_desired,
+            successor_installing_generation,
+            successor_operation_nonce,
+            source_subset_commitment,
+            drain_qualification_commitment,
+        })
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, SelectorNamespaceCodecError> {
+        if encoded.len() != TRANSFER_EDGE_V1_LEN || encoded[0] != 1 {
+            return Err(SelectorNamespaceCodecError::invalid());
+        }
+        let fixed = |start: usize| -> Result<[u8; 32], SelectorNamespaceCodecError> {
+            encoded[start..start + 32]
+                .try_into()
+                .map_err(|_| SelectorNamespaceCodecError::invalid())
+        };
+        let nonce = |start: usize| -> Result<[u8; 16], SelectorNamespaceCodecError> {
+            encoded[start..start + 16]
+                .try_into()
+                .map_err(|_| SelectorNamespaceCodecError::invalid())
+        };
+        let generation = |start: usize| -> Result<NonZeroU64, SelectorNamespaceCodecError> {
+            NonZeroU64::new(u64::from_be_bytes(
+                encoded[start..start + 8]
+                    .try_into()
+                    .map_err(|_| SelectorNamespaceCodecError::invalid())?,
+            ))
+            .ok_or_else(SelectorNamespaceCodecError::invalid)
+        };
+        Self::new(
+            fixed(1)?,
+            fixed(33)?,
+            fixed(65)?,
+            generation(97)?,
+            fixed(105)?,
+            fixed(137)?,
+            fixed(169)?,
+            generation(201)?,
+            nonce(209)?,
+            fixed(225)?,
+            fixed(257)?,
+        )
+    }
+
+    fn encode(&self) -> [u8; TRANSFER_EDGE_V1_LEN] {
+        let mut encoded = [0_u8; TRANSFER_EDGE_V1_LEN];
+        encoded[0] = 1;
+        encoded[1..33].copy_from_slice(&self.namespace_binding);
+        encoded[33..65].copy_from_slice(&self.atom_commitment);
+        encoded[65..97].copy_from_slice(&self.predecessor_group);
+        encoded[97..105].copy_from_slice(&self.predecessor_terminal_generation.get().to_be_bytes());
+        encoded[105..137].copy_from_slice(&self.successor_group);
+        encoded[137..169].copy_from_slice(&self.successor_set);
+        encoded[169..201].copy_from_slice(&self.successor_desired);
+        encoded[201..209]
+            .copy_from_slice(&self.successor_installing_generation.get().to_be_bytes());
+        encoded[209..225].copy_from_slice(&self.successor_operation_nonce);
+        encoded[225..257].copy_from_slice(&self.source_subset_commitment);
+        encoded[257..289].copy_from_slice(&self.drain_qualification_commitment);
+        encoded
+    }
+
+    fn commitment(
+        &self,
+        key: &SelectorNamespaceCommitmentKeyV2,
+    ) -> Result<SelectorNamespaceCommitmentV2, SelectorNamespaceCodecError> {
+        key.commit(TRANSFER_EDGE_DOMAIN_V1, &self.encode())
+    }
+}
+
+/// Canonical mixed-provenance admission preflight for one complete candidate.
+///
+/// This is the deterministic value-level half of RFC 017 section 6.1: it builds
+/// the exact provenance partition and one transfer edge per retired atom, with
+/// every classification and commitment checked before any durable CAS. The
+/// coordinator's resolved atom/group rows, one-CAS state change, transfer-gate
+/// transitions, and loss-qualified same-group restore remain unwired.
+#[allow(
+    dead_code,
+    reason = "The RFC 017 coordinator durable admission/restore wiring remains; this preflight is tested."
+)]
+struct MixedProvenanceCompositionV2 {
+    partition: ProvenancePartitionCodecV1,
+    transfer_edges: Vec<TransferEdgeCodecV1>,
+}
+
+#[allow(
+    dead_code,
+    reason = "The RFC 017 coordinator durable admission/restore wiring remains; this preflight is tested."
+)]
+impl MixedProvenanceCompositionV2 {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        namespace_binding: [u8; 32],
+        candidate_group: [u8; 32],
+        candidate_desired: [u8; 32],
+        candidate: &AtomSubsetCodecV1,
+        commitment_key: &SelectorNamespaceCommitmentKeyV2,
+        sources: Vec<ProvenanceSourceCodecV1>,
+        qualifications: &[DrainQualificationCodecV1],
+        successor_installing_generation: NonZeroU64,
+        successor_operation_nonce: [u8; 16],
+    ) -> Result<Self, SelectorNamespaceCodecError> {
+        // The successor coordinate is reserved for the candidate even when a
+        // pure-fresh partition emits no transfer edges, so a zero nonce is
+        // refused here rather than being silently dropped by the empty edge
+        // set. (The installing generation is already nonzero by type.)
+        if bool::from(successor_operation_nonce.ct_eq(&[0; 16])) {
+            return Err(SelectorNamespaceCodecError::invalid());
+        }
+        let partition = ProvenancePartitionCodecV1::new(
+            namespace_binding,
+            candidate_group,
+            candidate_desired,
+            candidate,
+            commitment_key,
+            sources,
+        )?;
+        let mut transfer_edges = Vec::new();
+        let mut edge_atoms = std::collections::BTreeSet::new();
+        for source in partition.sources() {
+            let ProvenanceSourceKindV1::RetiredSubset {
+                predecessor_group,
+                predecessor_set,
+                terminal_generation,
+                qualification,
+            } = &source.kind
+            else {
+                continue;
+            };
+            if *predecessor_group == candidate_group {
+                // Same-group republish is a loss-qualified restore operation,
+                // never a provenance transfer; refusing here prevents a source
+                // from citing its own success as a predecessor.
+                return Err(SelectorNamespaceCodecError::invalid());
+            }
+            let selected = qualifications
+                .iter()
+                .filter(|candidate| {
+                    candidate.namespace_binding == namespace_binding
+                        && candidate.predecessor_group == *predecessor_group
+                        && candidate.predecessor_set == *predecessor_set
+                        && candidate.terminal_generation == *terminal_generation
+                })
+                .filter(|candidate| {
+                    candidate
+                        .commitment(commitment_key)
+                        .is_ok_and(|commitment| commitment.matches(qualification))
+                })
+                .collect::<Vec<_>>();
+            if selected.len() != 1 {
+                // Missing, foreign, stale or ambiguous qualification.
+                return Err(SelectorNamespaceCodecError::invalid());
+            }
+            let qualification = selected[0];
+            let source_subset_commitment = source.subset.commitment(commitment_key)?.0;
+            let drain_qualification_commitment = qualification.commitment(commitment_key)?.0;
+            for atom in source.subset.atoms() {
+                let atom_commitment = commitment_key.commit(ATOM_DOMAIN_V1, atom)?.0;
+                if !edge_atoms.insert(atom_commitment) {
+                    return Err(SelectorNamespaceCodecError::invalid());
+                }
+                transfer_edges.push(TransferEdgeCodecV1::new(
+                    namespace_binding,
+                    atom_commitment,
+                    *predecessor_group,
+                    *terminal_generation,
+                    candidate_group,
+                    partition.candidate_set,
+                    candidate_desired,
+                    successor_installing_generation,
+                    successor_operation_nonce,
+                    source_subset_commitment,
+                    drain_qualification_commitment,
+                )?);
+            }
+        }
+        if transfer_edges.len() > MAX_PROVENANCE_ATOMS {
+            return Err(SelectorNamespaceCodecError::invalid());
+        }
+        transfer_edges.sort_by_key(TransferEdgeCodecV1::encode);
+        Ok(Self {
+            partition,
+            transfer_edges,
+        })
+    }
+
+    fn partition(&self) -> &ProvenancePartitionCodecV1 {
+        &self.partition
+    }
+
+    fn transfer_edges(&self) -> &[TransferEdgeCodecV1] {
+        &self.transfer_edges
+    }
 }
 
 /// Opaque RFC 017 operation class carried by one SDK-minted backend request.
@@ -1163,10 +1611,11 @@ mod tests {
 
     use super::{
         AtomSubsetCodecV1, BackendFenceCoordinateCodecV2, BackendFenceOutcomeV2,
-        BackendFencePhaseV2, NextLossEntryScheduleCodecV2, ProvenancePartitionCodecV1,
-        ProvenanceSourceCodecV1, SelectorNamespaceCommitmentKeyV2, SelectorNamespaceCommitmentV2,
+        BackendFencePhaseV2, DrainQualificationCodecV1, MixedProvenanceCompositionV2,
+        NextLossEntryScheduleCodecV2, ProvenancePartitionCodecV1, ProvenanceSourceCodecV1,
+        SelectorNamespaceCommitmentKeyV2, SelectorNamespaceCommitmentV2, TransferEdgeCodecV1,
         BACKEND_FENCE_COORDINATE_V2_LEN, MAX_ATOM_BYTES, MAX_PROVENANCE_ATOMS,
-        NEXT_LOSS_ENTRY_SCHEDULE_V2_LEN, SELECTOR_SET_DOMAIN_V1,
+        NEXT_LOSS_ENTRY_SCHEDULE_V2_LEN, SELECTOR_SET_DOMAIN_V1, TRANSFER_EDGE_V1_LEN,
     };
 
     const NAMESPACE_BINDING: [u8; 32] = [0x11; 32];
@@ -2219,6 +2668,432 @@ mod tests {
             [0; 16],
             generation(42),
             nonce(0x66),
+        )
+        .is_err());
+    }
+    fn drain_qualification(
+        predecessor_group: u8,
+        predecessor_set: u8,
+        terminal_generation: u64,
+    ) -> DrainQualificationCodecV1 {
+        DrainQualificationCodecV1::new(
+            NAMESPACE_BINDING,
+            commitment_bytes(predecessor_group),
+            commitment_bytes(predecessor_set),
+            commitment_bytes(predecessor_set.wrapping_add(1)),
+            generation(terminal_generation),
+            generation(terminal_generation + 1),
+            generation(terminal_generation + 2),
+            nonce(0x44),
+            generation(terminal_generation + 3),
+            nonce(0x55),
+            [0x66; 16],
+            commitment_bytes(0x77),
+            commitment_bytes(0x88),
+            commitment_bytes(0x99),
+        )
+        .expect("the test drain qualification is canonical")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retired_source(
+        candidate_group: [u8; 32],
+        candidate_set: [u8; 32],
+        candidate_desired: [u8; 32],
+        atoms: Vec<Vec<u8>>,
+        predecessor_group: u8,
+        predecessor_set: u8,
+        terminal_generation: u64,
+        qualification: &DrainQualificationCodecV1,
+        key: &SelectorNamespaceCommitmentKeyV2,
+    ) -> ProvenanceSourceCodecV1 {
+        ProvenanceSourceCodecV1::retired_subset(
+            NAMESPACE_BINDING,
+            candidate_group,
+            candidate_set,
+            candidate_desired,
+            AtomSubsetCodecV1::new(atoms).expect("the test subset is canonical"),
+            commitment_bytes(predecessor_group),
+            commitment_bytes(predecessor_set),
+            generation(terminal_generation),
+            qualification.commitment(key).expect("commitment").0,
+        )
+        .expect("the test retired source is canonical")
+    }
+
+    fn fresh_source(
+        candidate_group: [u8; 32],
+        candidate_set: [u8; 32],
+        candidate_desired: [u8; 32],
+        atoms: Vec<Vec<u8>>,
+    ) -> ProvenanceSourceCodecV1 {
+        ProvenanceSourceCodecV1::never_published(
+            NAMESPACE_BINDING,
+            candidate_group,
+            candidate_set,
+            candidate_desired,
+            AtomSubsetCodecV1::new(atoms).expect("the test fresh subset is canonical"),
+        )
+        .expect("the test fresh source is canonical")
+    }
+
+    #[test]
+    fn drain_qualification_and_transfer_edge_codecs_round_trip_canonically() {
+        let qualification = drain_qualification(0x55, 0x56, 77);
+        let encoded = qualification.encode();
+        assert_eq!(encoded.len(), 305);
+        assert_eq!(
+            DrainQualificationCodecV1::decode(&encoded)
+                .expect("the canonical qualification decodes")
+                .encode(),
+            encoded
+        );
+        assert!(DrainQualificationCodecV1::decode(&encoded[..304]).is_err());
+        let mut wrong_version = encoded;
+        wrong_version[0] = 2;
+        assert!(DrainQualificationCodecV1::decode(&wrong_version).is_err());
+        let mut zero_generation = encoded;
+        zero_generation[129..137].fill(0);
+        assert!(DrainQualificationCodecV1::decode(&zero_generation).is_err());
+        let mut zero_nonce = encoded;
+        zero_nonce[153..169].fill(0);
+        assert!(DrainQualificationCodecV1::decode(&zero_nonce).is_err());
+        for range in [1..33, 33..65, 65..97, 97..129, 209..241, 241..273, 273..305] {
+            let mut zero_field = encoded;
+            zero_field[range].fill(0);
+            assert!(DrainQualificationCodecV1::decode(&zero_field).is_err());
+        }
+        // The authority-generation schedule is monotonic: qualification comes
+        // after the terminal coordinate and the precommitted qualified
+        // coordinate comes after qualification.
+        let mut reversed_terminal = qualification.clone();
+        reversed_terminal.terminal_generation = generation(80);
+        assert!(DrainQualificationCodecV1::new(
+            reversed_terminal.namespace_binding,
+            reversed_terminal.predecessor_group,
+            reversed_terminal.predecessor_set,
+            reversed_terminal.predecessor_desired,
+            reversed_terminal.terminal_generation,
+            reversed_terminal.removed_dataplane_generation,
+            reversed_terminal.qualification_generation,
+            reversed_terminal.qualification_nonce,
+            reversed_terminal.precommitted_qualification_generation,
+            reversed_terminal.precommitted_qualification_nonce,
+            reversed_terminal.backend_epoch,
+            reversed_terminal.terminal_stamp_commitment,
+            reversed_terminal.absence_commitment,
+            reversed_terminal.backend_drain_receipt_commitment,
+        )
+        .is_err());
+        let mut reversed_precommit = qualification;
+        reversed_precommit.precommitted_qualification_generation = generation(79);
+        assert!(DrainQualificationCodecV1::new(
+            reversed_precommit.namespace_binding,
+            reversed_precommit.predecessor_group,
+            reversed_precommit.predecessor_set,
+            reversed_precommit.predecessor_desired,
+            reversed_precommit.terminal_generation,
+            reversed_precommit.removed_dataplane_generation,
+            reversed_precommit.qualification_generation,
+            reversed_precommit.qualification_nonce,
+            reversed_precommit.precommitted_qualification_generation,
+            reversed_precommit.precommitted_qualification_nonce,
+            reversed_precommit.backend_epoch,
+            reversed_precommit.terminal_stamp_commitment,
+            reversed_precommit.absence_commitment,
+            reversed_precommit.backend_drain_receipt_commitment,
+        )
+        .is_err());
+
+        let edge = TransferEdgeCodecV1::new(
+            NAMESPACE_BINDING,
+            commitment_bytes(0x11),
+            commitment_bytes(0x55),
+            generation(77),
+            commitment_bytes(0x21),
+            commitment_bytes(0x22),
+            commitment_bytes(0x23),
+            generation(88),
+            nonce(0x33),
+            commitment_bytes(0x44),
+            commitment_bytes(0x55),
+        )
+        .expect("the test transfer edge is canonical");
+        let encoded = edge.encode();
+        assert_eq!(encoded.len(), TRANSFER_EDGE_V1_LEN);
+        assert_eq!(
+            TransferEdgeCodecV1::decode(&encoded)
+                .expect("the canonical edge decodes")
+                .encode(),
+            encoded
+        );
+        assert!(TransferEdgeCodecV1::decode(&encoded[..288]).is_err());
+        let mut wrong_version = encoded;
+        wrong_version[0] = 2;
+        assert!(TransferEdgeCodecV1::decode(&wrong_version).is_err());
+        let mut zero_atom = encoded;
+        zero_atom[33..65].fill(0);
+        assert!(TransferEdgeCodecV1::decode(&zero_atom).is_err());
+        let mut zero_nonce = encoded;
+        zero_nonce[209..225].fill(0);
+        assert!(TransferEdgeCodecV1::decode(&zero_nonce).is_err());
+        for range in [
+            1..33,
+            65..97,
+            105..137,
+            137..169,
+            169..201,
+            225..257,
+            257..289,
+        ] {
+            let mut zero_field = encoded;
+            zero_field[range].fill(0);
+            assert!(TransferEdgeCodecV1::decode(&zero_field).is_err());
+        }
+    }
+
+    #[test]
+    fn mixed_provenance_composition_selects_one_edge_per_retired_atom() {
+        let key = commitment_key();
+        let candidate = AtomSubsetCodecV1::new(vec![
+            mark_atom(7),
+            ipv4_paa_atom([10, 23, 0, 9]),
+            downlink_atom(0x1000_0002),
+            downlink_atom(0x1000_0003),
+        ])
+        .expect("the mixed candidate set is canonical");
+        let candidate_group = commitment_bytes(0x21);
+        let candidate_desired = commitment_bytes(0x22);
+        let candidate_set = selector_set_commitment(&candidate, &key);
+        let qualification_a = drain_qualification(0x55, 0x56, 77);
+        let qualification_b = drain_qualification(0x57, 0x58, 87);
+        let fresh = fresh_source(
+            candidate_group,
+            candidate_set,
+            candidate_desired,
+            vec![downlink_atom(0x1000_0003)],
+        );
+        let retired_a = retired_source(
+            candidate_group,
+            candidate_set,
+            candidate_desired,
+            vec![mark_atom(7), ipv4_paa_atom([10, 23, 0, 9])],
+            0x55,
+            0x56,
+            77,
+            &qualification_a,
+            &key,
+        );
+        let retired_b = retired_source(
+            candidate_group,
+            candidate_set,
+            candidate_desired,
+            vec![downlink_atom(0x1000_0002)],
+            0x57,
+            0x58,
+            87,
+            &qualification_b,
+            &key,
+        );
+        let composition = MixedProvenanceCompositionV2::new(
+            NAMESPACE_BINDING,
+            candidate_group,
+            candidate_desired,
+            &candidate,
+            &key,
+            vec![fresh, retired_a, retired_b],
+            &[qualification_a, qualification_b],
+            generation(88),
+            nonce(0x33),
+        )
+        .expect("the mixed partition composes exactly");
+        assert_eq!(composition.partition().sources().len(), 3);
+        assert_eq!(composition.transfer_edges().len(), 3);
+        let mut atom_commitments = std::collections::BTreeSet::new();
+        for edge in composition.transfer_edges() {
+            assert!(atom_commitments.insert(edge.atom_commitment));
+            assert_eq!(edge.successor_group, candidate_group);
+            assert_eq!(edge.successor_set, candidate_set);
+            assert_eq!(edge.successor_desired, candidate_desired);
+            assert_eq!(edge.successor_installing_generation, generation(88));
+            assert_eq!(edge.successor_operation_nonce, nonce(0x33));
+            assert_eq!(
+                TransferEdgeCodecV1::decode(&edge.encode())
+                    .expect("every selected edge is canonical")
+                    .encode(),
+                edge.encode()
+            );
+        }
+        for atom in [
+            mark_atom(7),
+            ipv4_paa_atom([10, 23, 0, 9]),
+            downlink_atom(0x1000_0002),
+        ] {
+            let expected = key.commit(super::ATOM_DOMAIN_V1, &atom).expect("atom").0;
+            assert!(atom_commitments.contains(&expected));
+        }
+        // The fresh atom has no transfer edge: never-published atoms are not
+        // amplified into predecessor lineage.
+        let fresh_commitment = key
+            .commit(super::ATOM_DOMAIN_V1, &downlink_atom(0x1000_0003))
+            .expect("atom")
+            .0;
+        assert!(!atom_commitments.contains(&fresh_commitment));
+    }
+
+    #[test]
+    fn mixed_provenance_refuses_missing_stale_foreign_or_duplicate_qualifications() {
+        let key = commitment_key();
+        let candidate = AtomSubsetCodecV1::new(vec![
+            mark_atom(7),
+            ipv4_paa_atom([10, 23, 0, 9]),
+            downlink_atom(0x1000_0003),
+        ])
+        .expect("the candidate set is canonical");
+        let candidate_group = commitment_bytes(0x21);
+        let candidate_desired = commitment_bytes(0x22);
+        let candidate_set = selector_set_commitment(&candidate, &key);
+        let qualification = drain_qualification(0x55, 0x56, 77);
+        let build_sources = |qualification_commitment: [u8; 32]| {
+            let fresh = fresh_source(
+                candidate_group,
+                candidate_set,
+                candidate_desired,
+                vec![downlink_atom(0x1000_0003)],
+            );
+            let retired = ProvenanceSourceCodecV1::retired_subset(
+                NAMESPACE_BINDING,
+                candidate_group,
+                candidate_set,
+                candidate_desired,
+                AtomSubsetCodecV1::new(vec![mark_atom(7), ipv4_paa_atom([10, 23, 0, 9])])
+                    .expect("the retired subset is canonical"),
+                commitment_bytes(0x55),
+                commitment_bytes(0x56),
+                generation(77),
+                qualification_commitment,
+            )
+            .expect("the retired source is canonical");
+            vec![fresh, retired]
+        };
+        let qualification_commitment = qualification.commitment(&key).expect("commitment").0;
+        let compose = |failure: &[DrainQualificationCodecV1]| {
+            MixedProvenanceCompositionV2::new(
+                NAMESPACE_BINDING,
+                candidate_group,
+                candidate_desired,
+                &candidate,
+                &key,
+                build_sources(qualification_commitment),
+                failure,
+                generation(88),
+                nonce(0x33),
+            )
+        };
+        assert!(compose(&[]).is_err(), "missing qualification");
+        assert!(
+            compose(&[qualification.clone(), qualification.clone()]).is_err(),
+            "duplicate qualification"
+        );
+        let mut stale = qualification.clone();
+        stale.terminal_generation = generation(78);
+        assert!(compose(&[stale]).is_err(), "stale terminal generation");
+        let mut foreign = qualification.clone();
+        foreign.namespace_binding = commitment_bytes(0xee);
+        assert!(
+            compose(&[foreign]).is_err(),
+            "cross-namespace qualification"
+        );
+        let mut wrong_set = qualification.clone();
+        wrong_set.predecessor_set = commitment_bytes(0xef);
+        assert!(compose(&[wrong_set]).is_err(), "changed predecessor set");
+        assert!(compose(&[qualification]).is_ok());
+    }
+
+    #[test]
+    fn mixed_pure_fresh_candidate_rejects_zero_successor_nonce() {
+        let key = commitment_key();
+        let candidate = AtomSubsetCodecV1::new(vec![downlink_atom(0x1000_0003)])
+            .expect("the fresh candidate is canonical");
+        let candidate_group = commitment_bytes(0x21);
+        let candidate_desired = commitment_bytes(0x22);
+        let candidate_set = selector_set_commitment(&candidate, &key);
+        let fresh = fresh_source(
+            candidate_group,
+            candidate_set,
+            candidate_desired,
+            vec![downlink_atom(0x1000_0003)],
+        );
+        assert!(MixedProvenanceCompositionV2::new(
+            NAMESPACE_BINDING,
+            candidate_group,
+            candidate_desired,
+            &candidate,
+            &key,
+            vec![fresh.clone()],
+            &[],
+            generation(88),
+            [0; 16],
+        )
+        .is_err());
+        let composition = MixedProvenanceCompositionV2::new(
+            NAMESPACE_BINDING,
+            candidate_group,
+            candidate_desired,
+            &candidate,
+            &key,
+            vec![fresh],
+            &[],
+            generation(88),
+            nonce(0x33),
+        )
+        .expect("a nonzero successor coordinate is valid for a pure-fresh candidate");
+        assert!(composition.transfer_edges().is_empty());
+        assert_eq!(composition.partition().sources().len(), 1);
+    }
+
+    #[test]
+    fn mixed_provenance_never_accepts_same_group_as_transfer_source() {
+        let key = commitment_key();
+        let candidate = AtomSubsetCodecV1::new(vec![
+            mark_atom(7),
+            ipv4_paa_atom([10, 23, 0, 9]),
+            downlink_atom(0x1000_0003),
+        ])
+        .expect("the candidate set is canonical");
+        let candidate_group = commitment_bytes(0x21);
+        let candidate_desired = commitment_bytes(0x22);
+        let candidate_set = selector_set_commitment(&candidate, &key);
+        let qualification = drain_qualification(0x21, 0x56, 77);
+        let fresh = fresh_source(
+            candidate_group,
+            candidate_set,
+            candidate_desired,
+            vec![downlink_atom(0x1000_0003)],
+        );
+        let same_group = ProvenanceSourceCodecV1::retired_subset(
+            NAMESPACE_BINDING,
+            candidate_group,
+            candidate_set,
+            candidate_desired,
+            AtomSubsetCodecV1::new(vec![mark_atom(7), ipv4_paa_atom([10, 23, 0, 9])])
+                .expect("the retired subset is canonical"),
+            candidate_group,
+            commitment_bytes(0x56),
+            generation(77),
+            qualification.commitment(&key).expect("commitment").0,
+        )
+        .expect("the same-group source is structurally canonical");
+        assert!(MixedProvenanceCompositionV2::new(
+            NAMESPACE_BINDING,
+            candidate_group,
+            candidate_desired,
+            &candidate,
+            &key,
+            vec![fresh, same_group],
+            &[qualification],
+            generation(88),
+            nonce(0x33),
         )
         .is_err());
     }
