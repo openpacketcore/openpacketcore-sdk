@@ -34,7 +34,7 @@ GTP-U encapsulation/classification helpers.
   extension rule between both tc parsers and the host reassembly parser. The
   complete chain must validate before a control-plane handoff.
 - `ipv4_header_checksum` computes an option-free IPv4 header checksum.
-- The TFT v5 ABI defines classifier metadata and precedence-ranked filters for
+- The TFT v6 ABI defines classifier metadata and precedence-ranked filters for
   the IPv4 uplink path. `TftClassifierIpv4Packet::parse` remains a strict
   packet-only parser that rejects fragments. `parse_first_fragment` accepts a
   fully visible fragment-zero header solely for stateful affinity; ESP exposes
@@ -147,14 +147,19 @@ authority-store lease API from `opc-gtpu-dataplane`.
   and 64 range checks, without helpers or allocations.
 - Each fragment slot is 392 bytes; a bucket is 1,568 bytes, or 1,572 bytes with
   the tc BTF spin lock. The kernel ARRAY uses a 1,576-byte aligned stride,
-  totaling 24.625 MiB of value storage per attachment before map metadata. These
-  limits are shared by all datagrams on an attachment, with no per-PAA capacity
-  guarantee. Classifier replacement invalidates identities; it does not
-  delete live slots or extend their deadlines.
+  totaling 24.625 MiB of value storage per attachment before map metadata. The
+  classifier identity (attachment and subscriber PAA) selects one of 256 owner
+  groups of 64 buckets, so one subscriber is bounded to 256 concurrent
+  fragmented datagrams and cannot consume another owner group's capacity.
+  Colliding PAAs share one group's bound; the partition costs no memory.
+  Classifier replacement invalidates identities; it does not delete live slots
+  or extend their deadlines.
 - The additional pinned map advances the current graph to 35 maps and TFT
-  marker to `OPC-TFT-IPv4-v5`. The loader refuses retained TFT v4 or incomplete
-  TFT graphs before attachment mutation; current recovery proof/WAL formats
-  also advance. Upgrade and rollback require a drain, compatible-version exact
+  marker to `OPC-TFT-IPv4-v6`. Version 6 adds the fourth pinned TFT drop-counter
+  slot (fragment-affinity capacity refusal), so its counter-map definition
+  differs from version 5 even though the pin count is unchanged. The loader
+  refuses retained TFT v5, TFT v4, or incomplete TFT graphs before attachment
+  mutation; current recovery proof/WAL formats also advance. Upgrade and rollback require a drain, compatible-version exact
   cleanup, and fresh attachment. Incompatible retained proofs, WALs, or
   finalized receipts continue to fence the namespace after graph cleanup. No
   record conversion is implemented: preserve them and use a separate, freshly
@@ -163,7 +168,7 @@ authority-store lease API from `opc-gtpu-dataplane`.
   The separate frozen shipped-25 ABI retains its literal TFT v4 recognition.
 - The grouped-session ABI is used by the current loader and tc programs without
   changing legacy key bytes. The independent `GTPU_SCHEMA6` marker prevents a
-  v5 graph from being mistaken for the grouped schema. Each attachment owns
+  v6 graph from being mistaken for the grouped schema. Each attachment owns
   exact configuration, authority, transaction-journal, uplink-index, and
   downlink-index maps; tc retains one selected index and validates it against
   the matching whole-value authority before that packet is authorized.

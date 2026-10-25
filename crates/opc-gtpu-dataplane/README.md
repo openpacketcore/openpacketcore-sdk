@@ -1236,12 +1236,17 @@ most 64 fragment ranges, including the first, and expires exactly two seconds
 after admission in boot-time nanoseconds. No live entry is evicted, including
 poisoned or completed entries. Expired slots are reused in place; neither a
 successful later fragment nor a duplicate first fragment extends the deadline.
-This is a concurrent-datagram budget shared by the attachment, not a reserved
-slot per subscriber; hash collisions can exhaust a bucket before the global
-limit is reached. There is no per-subscriber admission bound: one subscriber
-can keep all slots occupied and deny new fragmented datagrams to every other
-classified subscriber on the attachment. The host `TftUplinkFragmentTable`
-allocates approximately 24.5 MiB per attachment.
+
+Bucket selection is owner-partitioned. The attachment interface index and the
+subscriber PAA in the key's first eight bytes select one of 256 owner groups of
+64 buckets; the remaining key bytes select a bucket inside that group. One
+subscriber can therefore occupy at most 256 concurrent fragmented datagrams
+(64 buckets times four slots) and cannot deny or reset another owner group's
+capacity. Two PAAs that hash to the same group share that group's bound, so the
+blast radius of a hash collision is one group rather than the whole table.
+The host `TftUplinkFragmentTable` allocates approximately 24.5 MiB per
+attachment; the partition adds no memory and only two masks to the existing
+single hash pass.
 
 A duplicate first fragment is accepted only when its parsed classifier fields,
 selected mark, header length, and first range agree. A conflicting first
@@ -1254,12 +1259,12 @@ host and tc and leaves affinity untouched.
 Later fragments received before their first fragment, or after its expiry,
 drop while a classifier owns the PAA. Valid non-overlapping later fragments
 may arrive in either order after admission. IPv4 ID reuse requires expiry;
-replacement does not clear the old key early. Rejections use the existing
-aggregate TFT malformed, no-match, and invalid-state counters without packet
-values or per-datagram labels. Invalid-state includes ordinary fragment events
-such as orphan, expiry, capacity refusal and overlap, as well as inconsistent
-classifier state; capacity refusal has no distinct slot in the pinned counter
-map.
+replacement does not clear the old key early. Rejections use value-free TFT
+malformed, no-match, invalid-state, and capacity counters without packet
+values or per-datagram labels. Invalid-state covers orphan, expiry and overlap
+events as well as inconsistent classifier state. A new fragmented datagram
+that finds its subscriber's owner group full has its own capacity counter; a
+retained entry is never evicted to admit it.
 
 `GTPU_TFT_FRAG` is a pinned BTF ARRAY with one spin lock per bucket. Each slot
 is 392 bytes; four slots occupy 1,568 bytes, and the lock makes the BTF value
@@ -1767,9 +1772,12 @@ are unchanged.
 #### TFT fragment-affinity upgrade and rollback
 
 The current attachment requires all 35 named maps, including the pinned
-`GTPU_TFT_FRAG` BTF ARRAY, and TFT marker `OPC-TFT-IPv4-v5`. An old 34-map graph
-without this map, a retained v4 TFT marker, or any partial TFT graph is refused
-before attachment mutation. The loader does not fill in the new map beside an
+`GTPU_TFT_FRAG` BTF ARRAY, and TFT marker `OPC-TFT-IPv4-v6`. The version-6 marker
+widens the pinned TFT drop-counter map from three to four slots (the new
+capacity counter); its map definition therefore differs from version 5 even
+though the pin count stays 35. An old 34-map graph without the fragment map, a
+retained v5 or v4 TFT marker, a retained three-slot TFT counter map, or any
+partial TFT graph is refused before attachment mutation. The loader does not fill in the new map beside an
 old classifier. Fresh creation initializes the map to zero. Promotion of an
 all-zero TFT marker requires a complete current TFT graph with empty metadata,
 filters, and affinity state, checked before hook mutation and again before
@@ -2367,7 +2375,7 @@ recovery:
 Before granting authority the backend proves the expected name/ifindex pair,
 then performs a complete read-only inventory and ABI/capacity validation of all
 35 current map pins before binding CONFIG or any other typed map. Only the exact
-current PMTU-v5 and TFT-v5 graph is accepted: cleanup acquisition never creates
+current PMTU-v5 and TFT-v6 graph is accepted: cleanup acquisition never creates
 a missing pin, migrates an older schema, or advances a schema marker. A
 canonical nonzero endpoint is then compared with the caller's configured local
 S2b-U address. The independent grouped authority must still be uninitialized:

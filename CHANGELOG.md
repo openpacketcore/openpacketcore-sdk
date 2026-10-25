@@ -28,6 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workload-record reads around the proof do not establish that the platform has
   published the current container restart) is documented on the delivery API
   and in the crate README. Refs #1245.
+- `opc-gtpu-dataplane`: the native TFT fragment-affinity table now partitions
+  its 16,384 buckets into 256 owner groups of 64 buckets selected by the
+  attachment and subscriber PAA, so one classified subscriber can occupy at
+  most 256 concurrent fragmented datagrams and cannot deny or reset another
+  owner group's entries. `TFT_FRAGMENT_OWNER_BUCKETS`,
+  `TFT_FRAGMENT_OWNER_GROUPS`, and `TFT_FRAGMENT_OWNER_MAX_DATAGRAMS` document
+  the bound. A saturated owner group now reports
+  `TftFragmentDisposition::Capacity` and the value-free
+  `COUNTER_TFT_CLASSIFIER_CAPACITY` (a new fourth pinned TFT drop-counter slot)
+  through the host model and tc; the host reason
+  `TftUplinkDropReason::CapacityExhausted` is additive in its non-exhaustive
+  enum. Colliding PAAs share one group's bound. Refs #1087.
 
 - `opc-proto-ikev2`: the recovery profile can send the RFC 7296 §2.4 empty
   `INFORMATIONAL` liveness probe that it could previously only answer. New
@@ -90,6 +102,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Zeroizing<Vec<u8>>`. Allocation-counter integration tests prove the decode,
   error and drop paths retain no allocation, with positive controls for `Vec`
   and `bytes::Bytes` retention. Refs #1262.
+- `opc-gtpu-dataplane`: one subscriber can no longer monopolize the shared
+  inner-uplink IPv4 fragment-affinity table. Bucket selection is partitioned by
+  the attachment interface index and the subscriber PAA, so a subscriber is
+  bounded to 256 concurrent fragmented datagrams and only its own owner group
+  can be exhausted. A saturated owner group's packet is dropped fail closed
+  with a distinct capacity disposition/counter instead of being counted as
+  stale/invalid classifier state, and another subscriber's owner group keeps
+  admitting. Refs #1087.
+
 - `opc-persist`: a configuration-consensus leader-routed call is now bounded by
   this replica's own leader view. Once the engine has observed a successor for
   a lost leader, an unanswered forwarded mutation or linearizable read barrier
@@ -183,6 +204,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distinct from retryable `Unavailable`/`AuthTimeUnavailable` results and grants
   no authority; downstream exhaustive matches must handle the new variant.
   Refs #1245.
+- `opc-gtpu-dataplane`: the pinned TFT schema advances to
+  `OPC-TFT-IPv4-v6`. The `GTPU_TFT_DROP` per-CPU counter map widens from three
+  to four slots for the new fragment-affinity capacity counter, so its pinned
+  map definition changes even though the graph still has 35 maps. A retained
+  version-5 TFT graph (including its three-slot counter map) is refused and
+  needs a fresh attachment, exactly like every earlier pinned-ABI generation;
+  no in-place migration or packet continuity is provided. Downstream code that
+  enumerated `TftFragmentDisposition` exhaustively must handle the new capacity
+  outcome: `TftFragmentDisposition` is now `#[non_exhaustive]`, while the
+  already-`#[non_exhaustive]` `TftUplinkDropReason` gains the additive
+  `CapacityExhausted` variant. Refs #1087.
 
 - `opc-gtpu-dataplane`: `GtpPdpContext.peer_teid` is now `PeerTeid`, a new
   public peer/outgoing-TEID type that admits the TS 29.281 section 5.1 all-zero
