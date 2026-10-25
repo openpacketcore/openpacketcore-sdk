@@ -44,6 +44,102 @@ fn keys(seed: u8) -> Arc<MemoryKeyProvider> {
     provider
 }
 
+/// Test-only checkpoint storage faults, scoped to one store path so parallel
+/// unit tests cannot perturb each other through the blocking storage thread.
+enum StorageFault {
+    Latency(Duration),
+    Failure(ConsumerCheckpointError),
+}
+
+static STORAGE_FAULTS: Mutex<Vec<(PathBuf, &'static str, StorageFault)>> = Mutex::new(Vec::new());
+static INDETERMINATE_STAGES: Mutex<Vec<(PathBuf, &'static str)>> = Mutex::new(Vec::new());
+
+pub(super) fn set_storage_latency(path: &Path, stage: &'static str, delay: Duration) {
+    STORAGE_FAULTS
+        .lock()
+        .expect("checkpoint storage fault registry")
+        .push((path.to_path_buf(), stage, StorageFault::Latency(delay)));
+}
+
+pub(super) fn inject_storage_failure(path: &Path, stage: &'static str) {
+    STORAGE_FAULTS
+        .lock()
+        .expect("checkpoint storage fault registry")
+        .push((
+            path.to_path_buf(),
+            stage,
+            StorageFault::Failure(ConsumerCheckpointError::Unavailable),
+        ));
+}
+
+pub(super) fn clear_storage_faults(path: &Path) {
+    STORAGE_FAULTS
+        .lock()
+        .expect("checkpoint storage fault registry")
+        .retain(|(registered, _, _)| registered != path);
+}
+
+/// Sleep for a configured injected latency when the exact store and stage run.
+pub(super) fn storage_latency(path: &Path, stage: &str) {
+    let delay = {
+        let faults = STORAGE_FAULTS
+            .lock()
+            .expect("checkpoint storage fault registry");
+        faults
+            .iter()
+            .find_map(|(registered, registered_stage, fault)| match fault {
+                StorageFault::Latency(delay)
+                    if registered == path && *registered_stage == stage =>
+                {
+                    Some(*delay)
+                }
+                _ => None,
+            })
+    };
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
+    }
+}
+
+/// Return one configured injected storage failure exactly once.
+pub(super) fn storage_failure(path: &Path, stage: &str) -> Result<(), ConsumerCheckpointError> {
+    let mut faults = STORAGE_FAULTS
+        .lock()
+        .expect("checkpoint storage fault registry");
+    let Some(index) = faults
+        .iter()
+        .position(|(registered, registered_stage, fault)| {
+            registered == path
+                && *registered_stage == stage
+                && matches!(fault, StorageFault::Failure(_))
+        })
+    else {
+        return Ok(());
+    };
+    match faults.remove(index).2 {
+        StorageFault::Failure(error) => Err(error),
+        StorageFault::Latency(_) => Ok(()),
+    }
+}
+
+/// Failure-only diagnostic: retain which stage produced an Indeterminate.
+pub(super) fn record_indeterminate_stage(path: &Path, stage: &'static str) {
+    INDETERMINATE_STAGES
+        .lock()
+        .expect("checkpoint indeterminate stage registry")
+        .push((path.to_path_buf(), stage));
+}
+
+pub(super) fn take_indeterminate_stage(path: &Path) -> Option<&'static str> {
+    let mut stages = INDETERMINATE_STAGES
+        .lock()
+        .expect("checkpoint indeterminate stage registry");
+    let index = stages
+        .iter()
+        .position(|(registered, _)| registered == path)?;
+    Some(stages.remove(index).1)
+}
+
 fn files(path: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
     std::fs::read_dir(path)
         .unwrap()
@@ -553,6 +649,77 @@ async fn maximum_payload_fits_the_minimum_accepted_storage_budget() {
     assert_eq!(generation, 4);
     assert_eq!(&**payload, vec![3; maximum_payload]);
     reopened.shutdown().await.unwrap();
+}
+
+/// A replacement that durably commits before the injected post-commit latency
+/// must report its known success, not an ambiguous outcome, even though the
+/// slow post-commit settlement exceeds the store's operation budget.
+#[tokio::test]
+async fn slow_post_commit_checkpoint_settlement_reports_known_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint.sqlite");
+    let template = options(&path);
+    let operation_budget = Duration::from_millis(200);
+    let options = ConsumerCheckpointOptions::new(
+        &path,
+        template.binding.clone(),
+        template.durability,
+        template.max_payload_bytes,
+        template.max_storage_bytes,
+        operation_budget,
+    )
+    .unwrap();
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x61))
+        .await
+        .unwrap();
+    store.read_back().await.unwrap();
+    let payload = Zeroizing::new(vec![0x61; 64 * 1024]);
+    set_storage_latency(&path, "after-commit", operation_budget * 2);
+    let result = store.compare_and_set(1, payload.clone()).await;
+    clear_storage_faults(&path);
+    let read = result.expect("a slow but durably committed write reports known success");
+    assert_eq!(*read.into_parts().1, *payload);
+    assert_eq!(take_indeterminate_stage(&path), None);
+    assert_eq!(
+        store.read_back().await.unwrap().into_parts().0,
+        2,
+        "the committed replacement remains the verified generation"
+    );
+    store.shutdown().await.unwrap();
+}
+
+/// A failure after durable replacement work started but before commit keeps the
+/// conservative indeterminate outcome, and the failure-only diagnostic names the
+/// exact stage rather than a generic settle/decrypt/verification guess.
+#[tokio::test]
+async fn pre_commit_storage_failure_stays_indeterminate_with_its_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checkpoint.sqlite");
+    let options = options(&path);
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x62))
+        .await
+        .unwrap();
+    store.read_back().await.unwrap();
+    inject_storage_failure(&path, "before-commit");
+    let result = store
+        .compare_and_set(1, Zeroizing::new(vec![0x62; 4096]))
+        .await;
+    clear_storage_faults(&path);
+    assert_eq!(
+        result.unwrap_err(),
+        ConsumerCheckpointError::Indeterminate,
+        "a failure after mutation started but before commit remains indeterminate"
+    );
+    assert_eq!(
+        take_indeterminate_stage(&path),
+        Some("storage-operation"),
+        "failure-only diagnostics identify the storage-operation stage"
+    );
+    // Actual storage resolves the abandoned attempt: no replacement committed.
+    let (generation, payload) = store.read_back().await.unwrap().into_parts();
+    assert_eq!(generation, 1);
+    assert!(payload.is_empty());
+    store.shutdown().await.unwrap();
 }
 
 #[tokio::test]
