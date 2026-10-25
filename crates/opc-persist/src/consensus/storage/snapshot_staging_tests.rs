@@ -1142,3 +1142,68 @@ fn queued_borrowed_snapshot_verification_read_retains_owner_after_task_abort() {
 fn queued_borrowed_snapshot_verification_read_retains_owner_after_runtime_drop() {
     queued_snapshot_verification_retains_owner(true, true, true);
 }
+
+#[tokio::test]
+async fn snapshot_read_verifies_once_and_publishes_reusable_digest_evidence() {
+    let temp = tempfile::tempdir().expect("snapshot fixture");
+    let config_backend = backend(&temp.path().join("evidence.sqlite")).await;
+    let snapshots = temp.path().join("evidence-snapshots");
+    let (_, mut machine, _) = open(&config_backend, &snapshots, identity(), members())
+        .await
+        .expect("evidence snapshot owner");
+    machine
+        .apply([membership(), blank()])
+        .await
+        .expect("published state");
+    let built = machine
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .expect("built snapshot");
+    let snapshot_id = built.meta.snapshot_id.clone();
+    let expected_length = std::fs::metadata(built.snapshot.path())
+        .expect("fixture metadata")
+        .len();
+    drop(built);
+
+    let before = machine.core.snapshot_work_hooks.envelope_verifications();
+    let read = machine
+        .get_current_snapshot()
+        .await
+        .expect("verified read")
+        .expect("published snapshot");
+    assert_eq!(
+        before + 1,
+        machine.core.snapshot_work_hooks.envelope_verifications(),
+        "one read verifies the whole file exactly once"
+    );
+    let evidence = machine
+        .core
+        .snapshot_read_verification(&snapshot_id)
+        .expect("read publishes its verification evidence");
+    assert_eq!(evidence.snapshot_id, snapshot_id);
+    assert_eq!(evidence.length, expected_length);
+    assert_eq!(read.meta.snapshot_id, snapshot_id);
+    assert_ne!(evidence.checksum, [0; 32]);
+
+    // A second read verifies once again (never reuses another read's open
+    // descriptor), then republishes the same single evidence slot.
+    machine
+        .get_current_snapshot()
+        .await
+        .expect("second verified read")
+        .expect("published snapshot");
+    assert_eq!(
+        before + 2,
+        machine.core.snapshot_work_hooks.envelope_verifications(),
+        "each read performs exactly one whole-file verification"
+    );
+    assert_eq!(
+        evidence,
+        machine
+            .core
+            .snapshot_read_verification(&snapshot_id)
+            .expect("evidence stays bound to the verified snapshot")
+    );
+}

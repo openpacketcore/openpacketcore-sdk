@@ -1,6 +1,7 @@
 //! Fixed incarnation profile; every consensus effect remains owned by Openraft.
 
 use super::super::raft_adapter::{decode_and_bind_sender, encode_engine_result};
+use super::super::snapshot_timing::snapshot_work_budget;
 use super::*;
 use opc_consensus::engine::{
     error::{InstallSnapshotError, RaftError},
@@ -30,6 +31,27 @@ pub(super) struct ConfigVoterProfile {
     pub(super) transport: Arc<ConfigVoterTransport>,
     core: super::super::sqlite::ConfigConsensusCore,
     incoming: tokio::sync::Mutex<Option<IncomingSnapshot>>,
+    /// Completed or in-flight final-chunk installation, used to answer a
+    /// resent final chunk idempotently instead of restarting the transfer.
+    finalized: tokio::sync::Mutex<Option<FinalizedState>>,
+}
+
+#[derive(Clone)]
+struct FinalizedSnapshot {
+    source: ConsensusNodeId,
+    vote: Vote<ConsensusNodeId>,
+    meta: SnapshotMeta<ConsensusNodeId, EmptyNode>,
+    replacement: Option<[u8; 32]>,
+    offset: u64,
+}
+
+enum FinalizedState {
+    Installing {
+        marker: FinalizedSnapshot,
+        succeeded: Arc<std::sync::atomic::AtomicU8>,
+        changed: Arc<tokio::sync::Notify>,
+    },
+    Installed(FinalizedSnapshot),
 }
 
 // One coordinator owns accepted work through completion. This cache is keyed
@@ -72,6 +94,8 @@ struct SnapshotDelivery {
     artifact: Snapshot<ConfigRaftTypeConfig>,
     evidence: VoterSnapshotEvidence,
     offset: u64,
+    /// Exact validated envelope length; final-chunk deadlines derive from it.
+    length: u64,
     finishing: bool,
 }
 
@@ -251,6 +275,7 @@ impl ConfigVoterProfile {
             transport,
             core,
             incoming: tokio::sync::Mutex::new(None),
+            finalized: tokio::sync::Mutex::new(None),
         }))
     }
 
@@ -375,6 +400,17 @@ impl ConfigVoterProfile {
                 }),
             );
         }
+        // A resent final chunk is idempotent: the receiver either completed or
+        // is still installing exactly this artifact. Answer the duplicate
+        // without restarting a full re-transfer (#1339).
+        if rpc.done && rpc.offset > 0 {
+            if let Some(reply) = self
+                .duplicate_final_chunk_reply(source, &rpc, replacement, deadline)
+                .await?
+            {
+                return Ok(reply);
+            }
+        }
         let mut incoming = self.incoming.lock().await;
         if rpc.offset == 0
             && incoming.as_ref().is_none_or(|assembly| {
@@ -386,6 +422,7 @@ impl ConfigVoterProfile {
         {
             // A new authenticated transfer owns a new file; stale chunks cannot
             // finish a predecessor leader's transfer.
+            *self.finalized.lock().await = None;
             *incoming = Some(IncomingSnapshot {
                 source,
                 vote: rpc.vote,
@@ -455,60 +492,173 @@ impl ConfigVoterProfile {
             );
         }
         let mut assembly = incoming.take().ok_or(VoterReplacementError::Unavailable)?;
-        drop(incoming);
-        let table = storage::inspect_voter_snapshot(
-            &self.core,
-            &mut assembly.data,
-            &assembly.meta,
-            deadline,
+        // The final chunk owns inspection and installation of the whole
+        // artifact: derive their bound from the exact received envelope size.
+        let total_bytes = assembly.offset;
+        let size_deadline = super::super::snapshot_timing::derived_deadline(
+            tokio::time::Instant::now(),
+            snapshot_work_budget(total_bytes),
         )
-        .await
-        .map_err(|_| VoterReplacementError::InvalidTransition)?;
-        if table.is_retired(source)
-            || table
-                .replacement
-                .as_ref()
-                .map(|operation| operation.attestation.request_digest)
-                != replacement
-        {
-            return Err(VoterReplacementError::UnauthorizedReplacement);
+        .map_err(|_| VoterReplacementError::Unavailable)?;
+        let marker = FinalizedSnapshot {
+            source,
+            vote: assembly.vote,
+            meta: assembly.meta.clone(),
+            replacement,
+            offset: total_bytes,
+        };
+        let succeeded = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let changed = Arc::new(tokio::sync::Notify::new());
+        *self.finalized.lock().await = Some(FinalizedState::Installing {
+            marker: marker.clone(),
+            succeeded: Arc::clone(&succeeded),
+            changed: Arc::clone(&changed),
+        });
+        let outcome = async {
+            let table = storage::inspect_voter_snapshot(
+                &self.core,
+                &mut assembly.data,
+                &assembly.meta,
+                size_deadline,
+            )
+            .await
+            .map_err(|_| VoterReplacementError::InvalidTransition)?;
+            if table.is_retired(source)
+                || table
+                    .replacement
+                    .as_ref()
+                    .map(|operation| operation.attestation.request_digest)
+                    != replacement
+            {
+                return Err(VoterReplacementError::UnauthorizedReplacement);
+            }
+            let members = assembly
+                .meta
+                .last_membership
+                .nodes()
+                .map(|(node, _)| *node)
+                .collect();
+            let raft = store.inner.raft.clone();
+            // Inspection and accepted installation remain owned if the chunk's
+            // caller times out. Give the verified artifact its own size-derived
+            // admission budget (never shorter than the caller's remaining).
+            let deadline = size_deadline.max(tokio::time::Instant::now() + admission_budget);
+            let response = self
+                .admission
+                .run_snapshot(table, members, deadline, move || async move {
+                    Ok(raft
+                        .install_full_snapshot(
+                            assembly.vote,
+                            Snapshot {
+                                meta: assembly.meta,
+                                snapshot: assembly.data,
+                            },
+                        )
+                        .await)
+                })
+                .await?;
+            let result: Result<
+                InstallSnapshotResponse<ConsensusNodeId>,
+                RaftError<ConsensusNodeId, InstallSnapshotError>,
+            > = response.map(Into::into).map_err(RaftError::Fatal);
+            self.wait_candidate_ack(&store.inner.raft, store.inner.local_node_id, deadline)
+                .await?;
+            Ok(
+                encode_engine_result(&result).map_or_else(rejected, |payload| {
+                    ConsensusWireResponse {
+                        result: Ok(payload),
+                    }
+                }),
+            )
         }
-        let members = assembly
-            .meta
-            .last_membership
-            .nodes()
-            .map(|(node, _)| *node)
-            .collect();
-        let raft = store.inner.raft.clone();
-        // Inspection and accepted installation remain owned if the chunk's
-        // caller times out. Give the verified artifact its own admission budget.
-        let deadline = tokio::time::Instant::now() + admission_budget;
-        let response = self
-            .admission
-            .run_snapshot(table, members, deadline, move || async move {
-                Ok(raft
-                    .install_full_snapshot(
-                        assembly.vote,
-                        Snapshot {
-                            meta: assembly.meta,
-                            snapshot: assembly.data,
-                        },
-                    )
-                    .await)
-            })
-            .await?;
-        let result: Result<
-            InstallSnapshotResponse<ConsensusNodeId>,
-            RaftError<ConsensusNodeId, InstallSnapshotError>,
-        > = response.map(Into::into).map_err(RaftError::Fatal);
-        self.wait_candidate_ack(&store.inner.raft, store.inner.local_node_id, deadline)
-            .await?;
-        Ok(
-            encode_engine_result(&result).map_or_else(rejected, |payload| ConsensusWireResponse {
-                result: Ok(payload),
-            }),
-        )
+        .await;
+        match &outcome {
+            Ok(_) => {
+                succeeded.store(1, Ordering::Release);
+                *self.finalized.lock().await = Some(FinalizedState::Installed(marker));
+            }
+            Err(_) => {
+                succeeded.store(2, Ordering::Release);
+                *self.finalized.lock().await = None;
+            }
+        }
+        changed.notify_waiters();
+        outcome
     }
+
+    /// Answer a resent final chunk from the completed or in-flight install of
+    /// the same artifact. `None` means no matching final install exists and the
+    /// ordinary assembly/error path must decide.
+    async fn duplicate_final_chunk_reply(
+        &self,
+        source: ConsensusNodeId,
+        rpc: &InstallSnapshotRequest<ConfigRaftTypeConfig>,
+        replacement: Option<[u8; 32]>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<ConsensusWireResponse>, VoterReplacementError> {
+        let (installed, installing) = {
+            let finalized = self.finalized.lock().await;
+            match finalized.as_ref() {
+                Some(FinalizedState::Installed(marker))
+                    if finalized_matches(marker, source, rpc, replacement) =>
+                {
+                    (true, None)
+                }
+                Some(FinalizedState::Installing {
+                    marker,
+                    succeeded,
+                    changed,
+                }) if finalized_matches(marker, source, rpc, replacement) => (
+                    succeeded.load(Ordering::Acquire) == 1,
+                    Some((Arc::clone(succeeded), Arc::clone(changed))),
+                ),
+                _ => (false, None),
+            }
+        };
+        if installed {
+            return Ok(Some(install_snapshot_success(rpc.vote)));
+        }
+        let Some((succeeded, changed)) = installing else {
+            return Ok(None);
+        };
+        if succeeded.load(Ordering::Acquire) == 0 {
+            tokio::time::timeout_at(deadline, changed.notified())
+                .await
+                .map_err(|_| VoterReplacementError::Deadline)?;
+        }
+        match succeeded.load(Ordering::Acquire) {
+            1 => Ok(Some(install_snapshot_success(rpc.vote))),
+            // The main install task owns clearing the marker on failure. A
+            // stale waiter must not wipe a newer install's marker that may
+            // already have replaced this generation.
+            2 => Ok(None),
+            _ => Err(VoterReplacementError::Unavailable),
+        }
+    }
+}
+
+fn finalized_matches(
+    marker: &FinalizedSnapshot,
+    source: ConsensusNodeId,
+    rpc: &InstallSnapshotRequest<ConfigRaftTypeConfig>,
+    replacement: Option<[u8; 32]>,
+) -> bool {
+    marker.source == source
+        && marker.vote == rpc.vote
+        && marker.meta == rpc.meta
+        && marker.replacement == replacement
+        && marker.offset == rpc.offset
+        && rpc.done
+}
+
+fn install_snapshot_success(vote: Vote<ConsensusNodeId>) -> ConsensusWireResponse {
+    let result: Result<
+        InstallSnapshotResponse<ConsensusNodeId>,
+        RaftError<ConsensusNodeId, InstallSnapshotError>,
+    > = Ok(InstallSnapshotResponse { vote });
+    encode_engine_result(&result).map_or_else(rejected, |payload| ConsensusWireResponse {
+        result: Ok(payload),
+    })
 }
 
 impl ConsensusConfigStore {
@@ -1042,7 +1192,7 @@ impl ConsensusConfigStore {
         &self,
         required: u64,
         vote: Vote<ConsensusNodeId>,
-    ) -> Result<(Snapshot<ConfigRaftTypeConfig>, VoterSnapshotEvidence), VoterReplacementError>
+    ) -> Result<(Snapshot<ConfigRaftTypeConfig>, VoterSnapshotEvidence, u64), VoterReplacementError>
     {
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         self.wait_for_snapshot_cut(Some(required), vote, deadline)
@@ -1075,15 +1225,44 @@ impl ConsensusConfigStore {
             .meta
             .last_log_id
             .ok_or(VoterReplacementError::InvalidTransition)?;
-        let owner = self
-            .inner
-            .snapshot_directory_owner
-            .upgrade()
-            .ok_or(VoterReplacementError::Unavailable)?;
-        let (_, digest, _) =
-            storage::verify_open_snapshot_envelope(snapshot.snapshot.as_mut(), owner)
+        // `get_snapshot` verified the whole file exactly once on this read and
+        // published the digest; reuse it instead of hashing the file again
+        // (#1339). A missing evidence entry falls back to one explicit
+        // verification so the authority binding never weakens.
+        let length =
+            tokio::io::AsyncSeekExt::seek(&mut snapshot.snapshot, std::io::SeekFrom::End(0))
                 .await
                 .map_err(|_| VoterReplacementError::Unavailable)?;
+        tokio::io::AsyncSeekExt::seek(&mut snapshot.snapshot, std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|_| VoterReplacementError::Unavailable)?;
+        let core = self
+            .inner
+            .voter_profile
+            .as_ref()
+            .ok_or(VoterReplacementError::IncompatibleProfile)?
+            .core
+            .clone();
+        // Reuse the engine read's single verification only when the cached
+        // evidence still matches this exact descriptor length; otherwise one
+        // explicit verification keeps the authority binding intact.
+        let digest = match core.snapshot_read_verification(&snapshot.meta.snapshot_id) {
+            Some(verification) if verification.length == length => verification.checksum,
+            _ => {
+                core.snapshot_work_hooks
+                    .before_envelope_verification()
+                    .await;
+                let owner = self
+                    .inner
+                    .snapshot_directory_owner
+                    .upgrade()
+                    .ok_or(VoterReplacementError::Unavailable)?;
+                storage::verify_open_snapshot_envelope(snapshot.snapshot.as_mut(), owner)
+                    .await
+                    .map_err(|_| VoterReplacementError::Unavailable)?
+                    .1
+            }
+        };
         let evidence = VoterSnapshotEvidence {
             cut: VoterSlotLogId {
                 term: cut.leader_id.term,
@@ -1092,7 +1271,7 @@ impl ConsensusConfigStore {
             snapshot_id: snapshot.meta.snapshot_id.clone(),
             digest,
         };
-        Ok((snapshot, evidence))
+        Ok((snapshot, evidence, length))
     }
 
     async fn deliver_initial_snapshot(
@@ -1103,13 +1282,14 @@ impl ConsensusConfigStore {
         progress: &mut ReplacementProgress,
     ) -> Result<VoterSnapshotEvidence, VoterReplacementError> {
         if progress.snapshot.is_none() {
-            let (snapshot, evidence) = self
+            let (snapshot, evidence, length) = self
                 .read_replacement_snapshot(operation.evidence.prepare.index, vote)
                 .await?;
             progress.snapshot = Some(SnapshotDelivery {
                 artifact: snapshot,
                 evidence,
                 offset: 0,
+                length,
                 finishing: false,
             });
         }
@@ -1126,7 +1306,7 @@ impl ConsensusConfigStore {
         // A lost final reply may still have installed the artifact. Confirm it
         // before resending anything, using the same retained ID and digest.
         if delivery.finishing {
-            let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
+            let deadline = tokio::time::Instant::now() + snapshot_work_budget(delivery.length);
             if matches!(self.slot_control_call(target, &ControlRequest::SnapshotInstalled {
                 request_digest: operation.attestation.request_digest,
                 evidence: delivery.evidence.clone(),
@@ -1155,7 +1335,18 @@ impl ConsensusConfigStore {
             {
                 return Err(VoterReplacementError::NoSurvivingQuorum);
             }
-            let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
+            // The final (done) chunk owns whole-artifact inspection and
+            // installation, so its deadline follows the artifact size;
+            // ordinary data chunks keep the existing per-chunk budget.
+            // Match the receiver's install budget exactly: a final chunk that
+            // carries 10-60 s of legitimate installation work must not time out
+            // against a shorter sender floor and churn retries.
+            let chunk_budget = if delivery.offset == delivery.length {
+                snapshot_work_budget(delivery.length)
+            } else {
+                self.inner.operation_timeout
+            };
+            let deadline = tokio::time::Instant::now() + chunk_budget;
             tokio::io::AsyncSeekExt::seek(
                 &mut delivery.artifact.snapshot,
                 std::io::SeekFrom::Start(delivery.offset),
@@ -1221,7 +1412,7 @@ impl ConsensusConfigStore {
                 break;
             }
         }
-        let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
+        let deadline = tokio::time::Instant::now() + snapshot_work_budget(delivery.length);
         match self
             .slot_control_call(
                 target,

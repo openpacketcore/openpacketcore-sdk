@@ -113,6 +113,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: configuration snapshot build, install and repair deadlines now
+  derive from the bytes each stage moves instead of one fixed wall-clock budget
+  (#1339). Build derives its SQLite backup stage from the database size and its
+  envelope stage from the captured artifact size; install starts its size-derived
+  work budget after gate acquisition and derives sync/verify, extraction,
+  promotion and SQLite installation budgets from the received sizes; repair
+  derives one attempt deadline from the authenticated leader's published
+  envelope length (falling back to the previous fixed deadline when that probe
+  is unavailable) and caches the verified descriptor once per transfer instead
+  of re-hashing the whole snapshot per 128 KiB cursor chunk. A resent final
+  snapshot chunk is now idempotent while the artifact installs or after it
+  installed, and replacement snapshot reads reuse the digest from the engine
+  read's single whole-file verification instead of hashing twice. Ordinary
+  snapshots keep the previous 60 s build/install and 10 s repair floors; derived
+  budgets add one second per complete 8 MiB with an 8 h ceiling, and every
+  timeout at a derived bound remains typed. Refs #1339.
+
 - `opc-persist`: a configuration-consensus leader that cannot obtain a quorum
   acknowledgement within the fixed quorum-authority ceiling
   (`election_timeout_max` = 8 s; the engine exposes only the

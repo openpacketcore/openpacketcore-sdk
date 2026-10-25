@@ -194,6 +194,9 @@ pub struct SqliteBackend {
     pub(crate) consensus_apply_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     pub(crate) consensus_snapshot_test_hooks: Arc<crate::consensus::SnapshotTestHooks>,
+    /// Always-compiled snapshot work accounting. Production only counts
+    /// envelope verifications; test features may inject latency.
+    pub(crate) consensus_snapshot_work_hooks: Arc<crate::consensus::SnapshotWorkHooks>,
     /// Audit HMAC key used to seal and verify local audit-trail rows.
     audit_key: Arc<AuditKey>,
     management_audit_keys:
@@ -317,6 +320,10 @@ impl SqliteBackend {
         self.conn.clone()
     }
 
+    pub(crate) fn snapshot_work_hooks(&self) -> Arc<crate::consensus::SnapshotWorkHooks> {
+        Arc::clone(&self.consensus_snapshot_work_hooks)
+    }
+
     pub(crate) fn config_consensus_worker_gate(&self) -> Arc<tokio::sync::Semaphore> {
         self.config_consensus_worker_gate.clone()
     }
@@ -398,6 +405,7 @@ impl SqliteBackend {
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_snapshot_test_hooks: Arc::new(crate::consensus::SnapshotTestHooks::default()),
+            consensus_snapshot_work_hooks: Arc::new(crate::consensus::SnapshotWorkHooks::default()),
             audit_key: Arc::new(audit_key),
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),
@@ -440,6 +448,7 @@ impl SqliteBackend {
             consensus_apply_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             consensus_snapshot_test_hooks: Arc::new(crate::consensus::SnapshotTestHooks::default()),
+            consensus_snapshot_work_hooks: Arc::new(crate::consensus::SnapshotWorkHooks::default()),
             audit_key: Arc::new(audit_key),
             management_audit_keys: Arc::new(std::sync::OnceLock::new()),
             management_audit_data_version: Arc::new(AtomicU64::new(0)),

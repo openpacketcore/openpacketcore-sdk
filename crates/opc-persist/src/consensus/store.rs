@@ -393,6 +393,9 @@ struct ConsensusConfigStoreInner {
     quorum_lease_last_recovery_observations: AtomicU8,
     repair_pending: AtomicBool,
     repair_progress: tokio::sync::Mutex<Option<member_repair::RepairDownload>>,
+    /// One verified snapshot descriptor reused by every repair chunk request of
+    /// the same transfer (#1339).
+    repair_snapshot_cache: Arc<member_repair::RepairSnapshotCache>,
     audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
@@ -807,6 +810,7 @@ impl ConsensusConfigStore {
                 quorum_lease_last_recovery_observations: AtomicU8::new(0),
                 repair_pending: AtomicBool::new(repair_pending),
                 repair_progress: tokio::sync::Mutex::new(None),
+                repair_snapshot_cache: Arc::new(member_repair::RepairSnapshotCache::default()),
                 shutdown: planned_shutdown::ConfigShutdownCoordinator::new(),
                 audit_continuity,
                 linearizability,
@@ -858,7 +862,7 @@ impl ConsensusConfigStore {
             diagnostics::DeadlineDiagnostic::new("config_consensus_initialization", "deadline");
         let result = async {
             self.inner.admitted.store(false, Ordering::Release);
-            let deadline = tokio::time::Instant::now()
+            let mut deadline = tokio::time::Instant::now()
                 .checked_add(self.inner.operation_timeout)
                 .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
             #[cfg(any(test, feature = "test-control"))]
@@ -889,7 +893,17 @@ impl ConsensusConfigStore {
                 {
                     diagnostic.stage = "repair";
                 }
-                self.recover_member_before_participation(deadline).await?;
+                // Repairing a large healthy snapshot needs a deadline derived
+                // from its actual size; ordinary snapshots keep the existing
+                // operation deadline because the derived floor is the same.
+                let repair_deadline = self.repair_attempt_deadline(deadline).await;
+                self.recover_member_before_participation(repair_deadline)
+                    .await?;
+                // Post-repair admission work keeps its ordinary budget even if
+                // the size-derived repair attempt consumed the original one.
+                deadline = tokio::time::Instant::now()
+                    .checked_add(self.inner.operation_timeout)
+                    .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
             }
             if !initialized
                 && canonical_bootstrap == Some(self.inner.local_node_id)
@@ -947,6 +961,28 @@ impl ConsensusConfigStore {
             ));
         }
         result
+    }
+
+    /// Inject a controlled whole-file envelope-verification latency. Test-only;
+    /// grants no authority and changes no sizing decision.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn set_snapshot_verification_delay_for_test(&self, delay: std::time::Duration) {
+        let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.inner
+            .backend
+            .snapshot_work_hooks()
+            .set_verification_delay_millis(millis);
+    }
+
+    /// Count whole-file snapshot envelope verifications served by this store.
+    #[cfg(feature = "dangerous-test-hooks")]
+    #[doc(hidden)]
+    pub fn snapshot_envelope_verifications_for_test(&self) -> u64 {
+        self.inner
+            .backend
+            .snapshot_work_hooks()
+            .envelope_verifications()
     }
 
     /// Fresh status sourced from Openraft metrics, never from a second state machine.

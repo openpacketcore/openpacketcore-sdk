@@ -180,6 +180,7 @@ async fn replacement_awaits_one_snapshot_read_beyond_its_rpc_budget() {
             ConfigConsensusTopology::try_new(identity, node, BTreeSet::from([node])).unwrap();
         let backend = SqliteBackend::in_memory_for_test().await.unwrap();
         let hooks = backend.consensus_snapshot_test_hooks.clone();
+        let work_hooks = backend.consensus_snapshot_work_hooks.clone();
         let store = ConsensusConfigStore::open_with_operation_timeout(
             topology,
             backend,
@@ -206,6 +207,7 @@ async fn replacement_awaits_one_snapshot_read_beyond_its_rpc_budget() {
             .await
             .unwrap();
         let reads_before = hooks.reads_started.load(Ordering::Acquire);
+        let verifications_before = work_hooks.envelope_verifications();
         hooks.pause_open_read.store(true, Ordering::Release);
         let source = store.clone();
         let read =
@@ -226,10 +228,16 @@ async fn replacement_awaits_one_snapshot_read_beyond_its_rpc_budget() {
         );
         hooks.pause_open_read.store(false, Ordering::Release);
         hooks.resume_read.notify_one();
-        let (snapshot, evidence) = read
+        let (snapshot, evidence, length) = read
             .await
             .unwrap()
             .expect("accepted snapshot read completes");
+        assert!(length > 0);
+        assert_eq!(
+            verifications_before + 1,
+            work_hooks.envelope_verifications(),
+            "the replacement read verifies the whole file exactly once and reuses that digest"
+        );
         assert!(snapshot.meta.last_log_id.unwrap().index >= required);
         assert_eq!(evidence.snapshot_id, snapshot.meta.snapshot_id);
         assert_eq!(evidence.cut.index, snapshot.meta.last_log_id.unwrap().index);
@@ -249,4 +257,70 @@ async fn replacement_awaits_one_snapshot_read_beyond_its_rpc_budget() {
         watchdog.await.unwrap(),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
     ));
+}
+
+#[test]
+fn resent_final_chunk_matches_only_the_identical_finalized_artifact() {
+    use opc_consensus::engine::{
+        CommittedLeaderId, LogId, Membership, SnapshotMeta, StoredMembership,
+    };
+
+    let node = member(1, 1).identity.node_id();
+    let peer = member(2, 1).identity.node_id();
+    let vote = Vote::new_committed(5, node);
+    let meta = SnapshotMeta {
+        last_log_id: Some(LogId::new(CommittedLeaderId::new(5, node), 9)),
+        last_membership: StoredMembership::new(
+            None,
+            Membership::new(
+                vec![BTreeSet::from([node, peer])],
+                BTreeSet::from([node, peer]),
+            ),
+        ),
+        snapshot_id: "finalized-snapshot".to_owned(),
+    };
+    let marker = FinalizedSnapshot {
+        source: node,
+        vote,
+        meta: meta.clone(),
+        replacement: Some([0x11; 32]),
+        offset: 4096,
+    };
+    let rpc = InstallSnapshotRequest {
+        vote,
+        meta: meta.clone(),
+        offset: 4096,
+        data: Vec::new(),
+        done: true,
+    };
+    assert!(finalized_matches(&marker, node, &rpc, Some([0x11; 32])));
+
+    // A different artifact, replacement, offset, source or non-final transfer
+    // must never receive the idempotent success.
+    let mut changed = rpc.clone();
+    changed.meta.snapshot_id = "other-snapshot".to_owned();
+    assert!(!finalized_matches(
+        &marker,
+        node,
+        &changed,
+        Some([0x11; 32])
+    ));
+    let mut changed = rpc.clone();
+    changed.offset = 4095;
+    assert!(!finalized_matches(
+        &marker,
+        node,
+        &changed,
+        Some([0x11; 32])
+    ));
+    let mut changed = rpc.clone();
+    changed.done = false;
+    assert!(!finalized_matches(
+        &marker,
+        node,
+        &changed,
+        Some([0x11; 32])
+    ));
+    assert!(!finalized_matches(&marker, peer, &rpc, Some([0x11; 32])));
+    assert!(!finalized_matches(&marker, node, &rpc, None));
 }
