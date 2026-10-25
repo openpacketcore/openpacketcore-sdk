@@ -4,9 +4,9 @@ use super::*;
 use opc_gtpu_dataplane::PeerTeid;
 use opc_gtpu_ebpf_common::{
     TftClassifierKey, TftClassifierMeta, TftClassifierOwnerId, TftFragmentKey,
-    COUNTER_TFT_CLASSIFIER_INVALID_STATE, COUNTER_TFT_CLASSIFIER_MALFORMED, TFT_FRAGMENT_BUCKETS,
-    TFT_FRAGMENT_BUCKET_VALUE_LEN, TFT_FRAGMENT_LIFETIME_NS, TFT_FRAGMENT_MAX_RANGES,
-    TFT_FRAGMENT_WAYS,
+    COUNTER_TFT_CLASSIFIER_CAPACITY, COUNTER_TFT_CLASSIFIER_INVALID_STATE,
+    COUNTER_TFT_CLASSIFIER_MALFORMED, TFT_FRAGMENT_BUCKETS, TFT_FRAGMENT_BUCKET_VALUE_LEN,
+    TFT_FRAGMENT_LIFETIME_NS, TFT_FRAGMENT_MAX_RANGES, TFT_FRAGMENT_WAYS,
 };
 
 const SPI: u32 = 0x1020_3040;
@@ -236,6 +236,7 @@ enum DropCounter {
     Invalid,
     Malformed,
     Authority,
+    Capacity,
 }
 
 fn reject_fragment(
@@ -260,12 +261,14 @@ fn reject_fragments(
         tft_count(pin_dir, COUNTER_TFT_CLASSIFIER_INVALID_STATE),
         malformed_count(pin_dir),
         pinned_counter(pin_dir, COUNTER_UL_FAR_MISS),
+        tft_count(pin_dir, COUNTER_TFT_CLASSIFIER_CAPACITY),
     ];
     let encapsulated = pinned_counter(pin_dir, COUNTER_UL_ENCAP);
     let index = match counter {
         DropCounter::Invalid => 0,
         DropCounter::Malformed => 1,
         DropCounter::Authority => 2,
+        DropCounter::Capacity => 3,
     };
     let mut expected = before;
     expected[index] += u64::try_from(packets.len()).unwrap();
@@ -276,6 +279,7 @@ fn reject_fragments(
             tft_count(pin_dir, COUNTER_TFT_CLASSIFIER_INVALID_STATE),
             malformed_count(pin_dir),
             pinned_counter(pin_dir, COUNTER_UL_FAR_MISS),
+            tft_count(pin_dir, COUNTER_TFT_CLASSIFIER_CAPACITY),
         ];
         if observed[index] >= expected[index] || Instant::now() >= deadline {
             break observed;
@@ -887,7 +891,7 @@ pub(super) async fn qualify_capacity() -> TestResult {
     let admitted = bucket_bytes(&fixture.pin_dir, bucket);
     fixture.reject(
         &esp_fragment(collisions[TFT_FRAGMENT_WAYS], MORE),
-        DropCounter::Invalid,
+        DropCounter::Capacity,
     );
     assert_eq!(
         bucket_bytes(&fixture.pin_dir, bucket),

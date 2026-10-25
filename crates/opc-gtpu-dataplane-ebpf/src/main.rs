@@ -98,8 +98,9 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_BINDING_INVALID, COUNTER_DL_BINDING_LOCAL_MISMATCH,
     COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH, COUNTER_DL_DECAP,
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_MISSING_CONSUMER,
-    COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_TFT_CLASSIFIER_INVALID_STATE,
-    COUNTER_TFT_CLASSIFIER_MALFORMED, COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP,
+    COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_TFT_CLASSIFIER_CAPACITY,
+    COUNTER_TFT_CLASSIFIER_INVALID_STATE, COUNTER_TFT_CLASSIFIER_MALFORMED,
+    COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP,
     COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
     COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
@@ -1667,7 +1668,19 @@ fn classify_tft_fragment(
             count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_MALFORMED);
             TftClassifierUplinkResult::Drop
         }
+        TftFragmentDisposition::Capacity => {
+            // The subscriber's owner bucket group is full: fail closed and keep
+            // this refusal distinct from a stale/inconsistent classifier state.
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_CAPACITY);
+            TftClassifierUplinkResult::Drop
+        }
         TftFragmentDisposition::Drop => {
+            count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
+            TftClassifierUplinkResult::Drop
+        }
+        // The shared enum is non-exhaustive: an outcome this datapath does not
+        // know must fail closed, never fall through to forwarding.
+        _ => {
             count_tft_classifier_drop(COUNTER_TFT_CLASSIFIER_INVALID_STATE);
             TftClassifierUplinkResult::Drop
         }

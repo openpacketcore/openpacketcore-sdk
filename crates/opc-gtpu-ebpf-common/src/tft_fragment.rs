@@ -5,6 +5,15 @@
 //! lock inline and perform no helper calls or allocations. Expired slots are
 //! reused in place, never deleted. No live slot is evicted, including poisoned
 //! or completed datagrams. The fixed deadline is never refreshed.
+//!
+//! Bucket selection is owner-partitioned. The classifier identity in the first
+//! key bytes (attachment interface index and the subscriber PAA) selects one of
+//! [`TFT_FRAGMENT_OWNER_GROUPS`] owner groups; the remaining key bytes select a
+//! bucket inside that group. One subscriber can therefore occupy at most
+//! [`TFT_FRAGMENT_OWNER_MAX_DATAGRAMS`] concurrent fragmented datagrams and can
+//! never deny a bucket that belongs to another group. Two subscriber addresses
+//! that hash to the same group share that group's bound; the blast radius of a
+//! collision is one group, not the whole table.
 
 use crate::{TftClassifierIpv4Packet, TftClassifierKey, TftClassifierMeta};
 
@@ -14,6 +23,20 @@ pub const MAP_TFT_FRAGMENT_AFFINITY: &str = "GTPU_TFT_FRAG";
 pub const TFT_FRAGMENT_BUCKETS: u32 = 16_384;
 /// Slots in each bucket. A full bucket refuses admission even if others are free.
 pub const TFT_FRAGMENT_WAYS: usize = 4;
+/// Buckets one owner group may select. The first key bytes (attachment plus
+/// subscriber PAA) pick the group, so one subscriber is confined to these
+/// buckets and cannot occupy another owner group's capacity.
+pub const TFT_FRAGMENT_OWNER_BUCKETS: u32 = 64;
+/// Number of independently selected owner groups across the affinity table.
+pub const TFT_FRAGMENT_OWNER_GROUPS: u32 = TFT_FRAGMENT_BUCKETS / TFT_FRAGMENT_OWNER_BUCKETS;
+/// Maximum concurrent fragmented datagrams one owner can occupy:
+/// its buckets times the slots in each bucket. This is the stated
+/// per-subscriber admission bound.
+pub const TFT_FRAGMENT_OWNER_MAX_DATAGRAMS: u32 =
+    TFT_FRAGMENT_OWNER_BUCKETS * TFT_FRAGMENT_WAYS as u32;
+const _: () = assert!(TFT_FRAGMENT_BUCKETS.is_power_of_two());
+const _: () = assert!(TFT_FRAGMENT_OWNER_BUCKETS.is_power_of_two());
+const _: () = assert!(TFT_FRAGMENT_OWNER_BUCKETS < TFT_FRAGMENT_BUCKETS);
 /// Maximum distinct fragments accepted for one datagram, including its first.
 pub const TFT_FRAGMENT_MAX_RANGES: usize = 64;
 const _: () = assert!(TFT_FRAGMENT_MAX_RANGES.is_power_of_two());
@@ -83,15 +106,29 @@ impl TftFragmentKey {
         Self(bytes)
     }
 
-    /// Deterministic bounded bucket selection. Collisions never permit eviction.
+    /// Deterministic owner-partitioned bucket selection.
+    ///
+    /// The first eight bytes are the classifier identity (attachment interface
+    /// index and subscriber PAA); they select the owner group. The remaining
+    /// key bytes continue the same hash and select a bucket inside that group.
+    /// Work is one FNV pass over the 20 key bytes, as before: the group boundary
+    /// adds only masks, not a second hash. Collisions never permit eviction.
     #[must_use]
     #[inline(always)]
     pub fn bucket(self) -> u32 {
         let mut hash = 2_166_136_261_u32;
-        for byte in self.0 {
-            hash = (hash ^ u32::from(byte)).wrapping_mul(16_777_619);
+        let mut index = 0;
+        while index < 8 {
+            hash = (hash ^ u32::from(self.0[index])).wrapping_mul(16_777_619);
+            index += 1;
         }
-        hash & (TFT_FRAGMENT_BUCKETS - 1)
+        let owner = hash & (TFT_FRAGMENT_OWNER_GROUPS - 1);
+        while index < TFT_FRAGMENT_KEY_LEN {
+            hash = (hash ^ u32::from(self.0[index])).wrapping_mul(16_777_619);
+            index += 1;
+        }
+        let within = hash & (TFT_FRAGMENT_OWNER_BUCKETS - 1);
+        owner * TFT_FRAGMENT_OWNER_BUCKETS + within
     }
 
     /// Fixed network-order key bytes for map inspection by a trusted loader.
@@ -191,6 +228,7 @@ impl TftIpv4Fragment {
 }
 
 /// Result of the bounded state transition, before downstream bearer authority.
+#[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TftFragmentDisposition {
     /// No classifier and no retained live key: preserve ordinary lookup behavior.
@@ -199,8 +237,12 @@ pub enum TftFragmentDisposition {
     Selected(u32),
     /// Malformed fragment envelope or incomplete first-fragment transport header.
     Malformed,
-    /// Orphan, stale authority, capacity, or ambiguous/overlapping fragments.
+    /// Orphan, stale authority, or ambiguous/overlapping fragments.
     Drop,
+    /// The classifier owner's bounded bucket group is full of live or poisoned
+    /// entries, so this subscriber's new fragmented datagram cannot be tracked.
+    /// The packet is dropped fail closed; no other owner's entry is evicted.
+    Capacity,
 }
 
 impl core::fmt::Debug for TftFragmentDisposition {
@@ -210,6 +252,7 @@ impl core::fmt::Debug for TftFragmentDisposition {
             Self::Selected(_) => f.write_str("Selected(<redacted>)"),
             Self::Malformed => f.write_str("Malformed"),
             Self::Drop => f.write_str("Drop"),
+            Self::Capacity => f.write_str("Capacity"),
         }
     }
 }
@@ -315,8 +358,14 @@ impl TftFragmentBucket {
             return TftFragmentDisposition::Malformed;
         };
         if matched == TFT_FRAGMENT_WAYS {
-            if !fragment.is_first() || available == TFT_FRAGMENT_WAYS {
+            if !fragment.is_first() {
                 return TftFragmentDisposition::Drop;
+            }
+            if available == TFT_FRAGMENT_WAYS {
+                // Every slot in this owner bucket is live or poisoned: the
+                // per-owner bound refused this datagram without touching
+                // another owner's buckets.
+                return TftFragmentDisposition::Capacity;
             }
             let Some((packet, mark)) = first else {
                 return TftFragmentDisposition::Malformed;
@@ -615,7 +664,7 @@ mod tests {
                 Some((&packet(), 11)),
                 20
             ),
-            TftFragmentDisposition::Drop
+            TftFragmentDisposition::Capacity
         );
         for id in 1..=4 {
             assert_eq!(
@@ -756,6 +805,194 @@ mod tests {
         assert_eq!(
             bucket.apply(key, Some(valid_last), Some(&meta(1)), None, 30),
             TftFragmentDisposition::Drop
+        );
+    }
+
+    fn owner_group(classifier: TftClassifierKey) -> u32 {
+        TftFragmentKey::new(classifier, [192, 0, 2, 1], [198, 51, 100, 2], 50, 0).bucket()
+            / TFT_FRAGMENT_OWNER_BUCKETS
+    }
+
+    fn classifier_for_paa(paa: [u8; 4]) -> TftClassifierKey {
+        TftClassifierKey::new(7, paa).expect("canonical classifier key")
+    }
+
+    fn owner_buckets() -> [TftFragmentBucket; TFT_FRAGMENT_OWNER_BUCKETS as usize] {
+        core::array::from_fn(|_| TftFragmentBucket::new())
+    }
+
+    /// Fill every bucket of `classifier`'s owner group with exactly four live
+    /// first-fragment entries, skipping IDs whose bucket is already full.
+    fn fill_owner_group(
+        classifier: TftClassifierKey,
+        metadata: &TftClassifierMeta,
+    ) -> (
+        [TftFragmentBucket; TFT_FRAGMENT_OWNER_BUCKETS as usize],
+        u16,
+    ) {
+        let first = first();
+        let packet = packet();
+        let mut buckets = owner_buckets();
+        let owner = owner_group(classifier);
+        let mut counts = [0_u8; TFT_FRAGMENT_OWNER_BUCKETS as usize];
+        let mut identification = 0_u16;
+        let mut live = 0_u32;
+        while live < TFT_FRAGMENT_OWNER_MAX_DATAGRAMS {
+            identification = identification.wrapping_add(1);
+            let key = TftFragmentKey::new(
+                classifier,
+                [192, 0, 2, 1],
+                [198, 51, 100, 2],
+                50,
+                identification,
+            );
+            let slot = (key.bucket() - owner * TFT_FRAGMENT_OWNER_BUCKETS) as usize;
+            if counts[slot] == TFT_FRAGMENT_WAYS as u8 {
+                continue;
+            }
+            assert_eq!(
+                buckets[slot].apply(key, Some(first), Some(metadata), Some((&packet, 11)), 10),
+                TftFragmentDisposition::Selected(11)
+            );
+            counts[slot] += 1;
+            live += 1;
+        }
+        (buckets, identification)
+    }
+
+    /// One subscriber's classifier confines every key it can create to one
+    /// owner group of `TFT_FRAGMENT_OWNER_BUCKETS` buckets.
+    #[test]
+    fn owner_bucket_partition_is_exact_and_subscriber_scoped() {
+        assert_eq!(
+            TFT_FRAGMENT_OWNER_GROUPS * TFT_FRAGMENT_OWNER_BUCKETS,
+            TFT_FRAGMENT_BUCKETS
+        );
+        assert_eq!(TFT_FRAGMENT_OWNER_MAX_DATAGRAMS, 256);
+        let classifier = classifier_for_paa([192, 0, 2, 1]);
+        let owner = owner_group(classifier);
+        let mut seen = 0_u64;
+        for identification in 0..4_096_u16 {
+            let key = TftFragmentKey::new(
+                classifier,
+                [192, 0, 2, 1],
+                [198, 51, 100, 2],
+                50,
+                identification,
+            );
+            let bucket = key.bucket();
+            assert!(bucket < TFT_FRAGMENT_BUCKETS);
+            assert_eq!(
+                bucket / TFT_FRAGMENT_OWNER_BUCKETS,
+                owner,
+                "one subscriber must stay inside one owner group"
+            );
+            seen |= 1 << (bucket % TFT_FRAGMENT_OWNER_BUCKETS);
+        }
+        assert_eq!(
+            seen.count_ones(),
+            TFT_FRAGMENT_OWNER_BUCKETS,
+            "one subscriber must be able to reach every bucket in its own group"
+        );
+    }
+
+    /// A subscriber that fills every slot of its own group is refused fail
+    /// closed; another owner group keeps admitting.
+    #[test]
+    fn a_saturating_owner_is_refused_without_touching_another_group() {
+        let classifier = classifier_for_paa([192, 0, 2, 1]);
+        let meta_a = meta(1);
+        let (mut buckets, last_identification) = fill_owner_group(classifier, &meta_a);
+        let owner = owner_group(classifier);
+        // Every bucket in the group now has four live entries; a new datagram
+        // for the same subscriber is refused with the distinct capacity outcome
+        // without resetting any entry.
+        let first = first();
+        let packet = packet();
+        let refused = TftFragmentKey::new(
+            classifier,
+            [192, 0, 2, 1],
+            [198, 51, 100, 2],
+            50,
+            last_identification.wrapping_add(1),
+        );
+        let slot = (refused.bucket() - owner * TFT_FRAGMENT_OWNER_BUCKETS) as usize;
+        assert_eq!(
+            buckets[slot].apply(refused, Some(first), Some(&meta_a), Some((&packet, 11)), 10),
+            TftFragmentDisposition::Capacity
+        );
+        // A different owner group is unaffected.
+        let other = (2_u8..=255)
+            .map(|last| classifier_for_paa([10, 0, 0, last]))
+            .find(|candidate| owner_group(*candidate) != owner)
+            .expect("a different owner group exists");
+        let key = TftFragmentKey::new(other, [192, 0, 2, 1], [198, 51, 100, 2], 50, 1);
+        assert_eq!(
+            TftFragmentBucket::new().apply(
+                key,
+                Some(first),
+                Some(&meta(2)),
+                Some((&packet, 11)),
+                10
+            ),
+            TftFragmentDisposition::Selected(11)
+        );
+    }
+
+    /// A hash collision only shares one group's bound; a third group is still
+    /// admitted, and the colliding subscriber cannot evict the first one's
+    /// entries (they are retained, not reset).
+    #[test]
+    fn colliding_owner_groups_share_only_their_group() {
+        let first_classifier = classifier_for_paa([192, 0, 2, 1]);
+        let mut colliding = None;
+        let mut distinct = None;
+        for last in 2_u8..=255 {
+            let candidate = classifier_for_paa([10, 0, 0, last]);
+            if owner_group(candidate) == owner_group(first_classifier) && colliding.is_none() {
+                colliding = Some(candidate);
+            }
+            if owner_group(candidate) != owner_group(first_classifier) && distinct.is_none() {
+                distinct = Some(candidate);
+            }
+        }
+        let colliding = colliding.expect("a colliding owner group exists");
+        let distinct = distinct.expect("a distinct owner group exists");
+        let meta_a = meta(1);
+        let (mut buckets, last_identification) = fill_owner_group(first_classifier, &meta_a);
+        let owner = owner_group(first_classifier);
+        let first = first();
+        let packet = packet();
+        let refused = TftFragmentKey::new(
+            colliding,
+            [192, 0, 2, 1],
+            [198, 51, 100, 2],
+            50,
+            last_identification.wrapping_add(1),
+        );
+        let slot = (refused.bucket() - owner * TFT_FRAGMENT_OWNER_BUCKETS) as usize;
+        assert_eq!(
+            buckets[slot].apply(
+                refused,
+                Some(first),
+                Some(&meta(2)),
+                Some((&packet, 11)),
+                10
+            ),
+            TftFragmentDisposition::Capacity,
+            "a colliding owner shares the group bound"
+        );
+        let admitted = TftFragmentKey::new(distinct, [192, 0, 2, 1], [198, 51, 100, 2], 50, 1);
+        assert_eq!(
+            TftFragmentBucket::new().apply(
+                admitted,
+                Some(first),
+                Some(&meta(3)),
+                Some((&packet, 11)),
+                10
+            ),
+            TftFragmentDisposition::Selected(11),
+            "a non-colliding owner is unaffected"
         );
     }
 
