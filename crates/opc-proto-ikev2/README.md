@@ -859,10 +859,12 @@ This does not close #786 or establish external interoperability. See
   IKE/Child SA key-material derivation. IKE-SA profiles preserve the complete negotiated
   PRF, DH, encryption/key-size, and optional integrity suite; invalid AEAD plus
   integrity or CBC without integrity combinations cannot be constructed.
-  PRF-HMAC-SHA1 and PRF-HMAC-SHA2-256/384/512 are supported for initial IKE-SA
-  derivation, IKE-SA rekey (including distinct old/new PRFs), Child-SA KEYMAT,
-  restore, and AUTH calculations. MODP-768/MODP-1024 and HMAC-SHA1 are explicit
-  legacy-interoperability choices and are never inserted into caller policy.
+  PRF-HMAC-SHA1, PRF-HMAC-SHA2-256/384/512 and PRF-AES128-XCBC (RFC 4434) are
+  supported for initial IKE-SA derivation, IKE-SA rekey (including distinct
+  old/new PRFs), Child-SA KEYMAT, restore, and AUTH calculations. MODP-768/
+  MODP-1024 and HMAC-SHA1 are explicit legacy-interoperability choices and are
+  never inserted into caller policy; RFC 3526 MODP-3072/4096/6144/8192
+  (Transform IDs 15-18) are caller-selected alternatives with exact widths.
   Child-SA profiles additionally support ENCR_NULL (11) with a mandatory
   separate supported integrity transform and exactly zero
   encryption/salt KEYMAT octets. The notify-only error builder is deliberately bounded to
@@ -878,7 +880,10 @@ This does not close #786 or establish external interoperability. See
   cache the complete already-sealed response for retransmission.
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
   helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
-  selector/proposal helpers. RFC 7427 method 14 signing and verification
+  selector/proposal helpers. Signature AUTH covers RFC 4754 ECDSA methods 9-11
+  (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512 raw-DER AUTH data) and RFC 7427
+  method 14, including RSASSA-PSS SHA-256/384/512 verification (always) and
+  signing behind `rsa-signing`. RFC 7427 method 14 signing and verification
   require distinct signing and verification authorities. They can only be
   minted after the exact correlated SA_INIT request/response bytes prove both
   `SIGNATURE_HASH_ALGORITHMS` offers, both validated Nonce payloads, and current

@@ -75,6 +75,7 @@ impl Ikev2CryptoRequirements {
             Ikev2PrfAlgorithm::HmacSha2_256,
             Ikev2PrfAlgorithm::HmacSha2_384,
             Ikev2PrfAlgorithm::HmacSha2_512,
+            Ikev2PrfAlgorithm::Aes128Xcbc,
         ] {
             requirements.add_prf(prf);
         }
@@ -100,6 +101,10 @@ impl Ikev2CryptoRequirements {
             Ikev2DhGroup::Modp768,
             Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
+            Ikev2DhGroup::Modp3072,
+            Ikev2DhGroup::Modp4096,
+            Ikev2DhGroup::Modp6144,
+            Ikev2DhGroup::Modp8192,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
             Ikev2DhGroup::Ecp521,
@@ -109,9 +114,19 @@ impl Ikev2CryptoRequirements {
         requirements.require_signature(IkeSignatureAlgorithm::EcdsaP256Sha2_256);
         requirements.require_signature(IkeSignatureAlgorithm::EcdsaP384Sha2_256);
         requirements.require_signature(IkeSignatureAlgorithm::EcdsaP384Sha2_384);
+        requirements.require_signature(IkeSignatureAlgorithm::EcdsaP521Sha2_512);
         requirements.require_signature_verification(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256);
+        requirements.require_signature_verification(IkeSignatureAlgorithm::RsaPssSha2_256);
+        requirements.require_signature_verification(IkeSignatureAlgorithm::RsaPssSha2_384);
+        requirements.require_signature_verification(IkeSignatureAlgorithm::RsaPssSha2_512);
         #[cfg(feature = "rsa-signing")]
         requirements.require_signature_generation(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256);
+        #[cfg(feature = "rsa-signing")]
+        requirements.require_signature_generation(IkeSignatureAlgorithm::RsaPssSha2_256);
+        #[cfg(feature = "rsa-signing")]
+        requirements.require_signature_generation(IkeSignatureAlgorithm::RsaPssSha2_384);
+        #[cfg(feature = "rsa-signing")]
+        requirements.require_signature_generation(IkeSignatureAlgorithm::RsaPssSha2_512);
         requirements.require_nat_detection();
         requirements.require_certreq_authority_hash();
         requirements
@@ -1189,6 +1204,7 @@ enum SigningOutputShape {
     Rsa { modulus_len: usize },
     EcdsaP256,
     EcdsaP384,
+    EcdsaP521,
 }
 
 fn signing_output_shape(
@@ -1200,7 +1216,10 @@ fn signing_output_shape(
     }
 
     match algorithm {
-        IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256 => {
+        IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256
+        | IkeSignatureAlgorithm::RsaPssSha2_256
+        | IkeSignatureAlgorithm::RsaPssSha2_384
+        | IkeSignatureAlgorithm::RsaPssSha2_512 => {
             let modulus_len = key
                 .rsa_modulus_len()
                 .filter(|modulus_len| *modulus_len > 0)
@@ -1218,6 +1237,12 @@ fn signing_output_shape(
                 return Err(Ikev2CryptoModuleError::invalid_output());
             }
             Ok(SigningOutputShape::EcdsaP384)
+        }
+        IkeSignatureAlgorithm::EcdsaP521Sha2_512 => {
+            if key.rsa_modulus_len().is_some() {
+                return Err(Ikev2CryptoModuleError::invalid_output());
+            }
+            Ok(SigningOutputShape::EcdsaP521)
         }
         _ => Err(algorithm_unsupported()),
     }
@@ -1237,6 +1262,7 @@ fn validate_signature_output(
         // and rejects either scalar unless it is in the range 1..n.
         SigningOutputShape::EcdsaP256 => p256::ecdsa::Signature::from_der(signature).is_ok(),
         SigningOutputShape::EcdsaP384 => p384::ecdsa::Signature::from_der(signature).is_ok(),
+        SigningOutputShape::EcdsaP521 => p521::ecdsa::Signature::from_der(signature).is_ok(),
     };
     if !valid {
         return Err(Ikev2CryptoModuleError::invalid_output());
@@ -1264,6 +1290,7 @@ const fn map_prf(algorithm: Ikev2PrfAlgorithm) -> IkePrfAlgorithm {
         Ikev2PrfAlgorithm::HmacSha2_256 => IkePrfAlgorithm::HmacSha2_256,
         Ikev2PrfAlgorithm::HmacSha2_384 => IkePrfAlgorithm::HmacSha2_384,
         Ikev2PrfAlgorithm::HmacSha2_512 => IkePrfAlgorithm::HmacSha2_512,
+        Ikev2PrfAlgorithm::Aes128Xcbc => IkePrfAlgorithm::Aes128Xcbc,
     }
 }
 
@@ -1305,6 +1332,10 @@ const fn map_dh_group(group: Ikev2DhGroup) -> IkeDhGroup {
         Ikev2DhGroup::Modp768 => IkeDhGroup::Modp768,
         Ikev2DhGroup::Modp1024 => IkeDhGroup::Modp1024,
         Ikev2DhGroup::Modp2048 => IkeDhGroup::Modp2048,
+        Ikev2DhGroup::Modp3072 => IkeDhGroup::Modp3072,
+        Ikev2DhGroup::Modp4096 => IkeDhGroup::Modp4096,
+        Ikev2DhGroup::Modp6144 => IkeDhGroup::Modp6144,
+        Ikev2DhGroup::Modp8192 => IkeDhGroup::Modp8192,
         Ikev2DhGroup::Ecp256 => IkeDhGroup::Ecp256,
         Ikev2DhGroup::Ecp384 => IkeDhGroup::Ecp384,
         Ikev2DhGroup::Ecp521 => IkeDhGroup::Ecp521,

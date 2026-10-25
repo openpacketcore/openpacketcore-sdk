@@ -98,6 +98,10 @@ impl Profile {
             Prf::HmacSha2_256 => 1,
             Prf::HmacSha2_384 => 2,
             Prf::HmacSha2_512 => 3,
+            // The sealed CBC release recipe has fixed derivation indices for
+            // the four HMAC PRFs. AES-XCBC is a valid IKEv2 PRF but has no
+            // reserved index here; fail closed rather than reusing an index.
+            Prf::Aes128Xcbc => return Err(Error::BindingMismatch),
         };
         Ok(Self {
             encryption,
