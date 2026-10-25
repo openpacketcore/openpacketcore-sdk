@@ -26,9 +26,19 @@ const REQUIRED_IDENTITIES: usize = 50_000;
 const REQUIRED_ATTEMPTS: usize = 10_000;
 /// Required burst event count (#720).
 const REQUIRED_BURST_EVENTS: usize = 40_000;
-/// Events that fit in the current pinned ring, at 96 bytes each.
-const CURRENT_RING_RECORDS: usize =
+/// Payload-only ceiling: ring bytes divided by the 96-byte event payload.
+///
+/// This ignores the per-record BPF ring-buffer header, so it is an upper bound,
+/// not the usable capacity.
+const CURRENT_RING_PAYLOAD_RECORDS: usize =
     (GTPU_TRAFFIC_OBSERVATION_RING_BYTES as usize) / GTPU_TRAFFIC_OBSERVATION_EVENT_LEN;
+
+/// Per-record BPF ring-buffer header charged by `bpf_ringbuf_hdr`.
+const RING_RECORD_HEADER_BYTES: usize = 8;
+
+/// Usable record ceiling including the per-record ring-buffer header.
+const CURRENT_RING_USABLE_RECORDS: usize = (GTPU_TRAFFIC_OBSERVATION_RING_BYTES as usize)
+    / (GTPU_TRAFFIC_OBSERVATION_EVENT_LEN + RING_RECORD_HEADER_BYTES);
 
 /// Full-scan work model: one scan of the shared event set per attempt.
 const fn full_scan_work(events: usize, attempts: usize) -> usize {
@@ -50,14 +60,15 @@ fn assert_evidence(condition: bool, evidence: &str) {
 fn current_limits_are_below_required_pool_scale() {
     assert_eq!(GTPU_TRAFFIC_OBSERVATION_EVENT_LEN, 96);
     assert_eq!(GTPU_TRAFFIC_OBSERVATION_RING_BYTES, 65_536);
-    assert_eq!(CURRENT_RING_RECORDS, 682);
+    assert_eq!(CURRENT_RING_PAYLOAD_RECORDS, 682);
+    assert_eq!(CURRENT_RING_USABLE_RECORDS, 630);
     assert_eq!(MAX_TRAFFIC_PROOF_ATTEMPTS, 256);
     assert_eq!(MAX_TRAFFIC_PROOF_DRAIN_BATCH, 4096);
     assert_eq!(TRAFFIC_OBSERVATION_SEQUENCE_WINDOW, 4096);
 
     assert_evidence(
-        CURRENT_RING_RECORDS < REQUIRED_BURST_EVENTS,
-        "current ring records are below the required burst",
+        CURRENT_RING_USABLE_RECORDS < REQUIRED_BURST_EVENTS,
+        "current usable ring records are below the required burst",
     );
     assert_evidence(
         MAX_TRAFFIC_PROOF_ATTEMPTS < REQUIRED_ATTEMPTS,
@@ -115,8 +126,8 @@ fn observation_drain_marks_the_exact_batch_boundary_overflowed() {
     // The whole current ring fits inside one current drain budget; the
     // required burst does not.
     assert_evidence(
-        CURRENT_RING_RECORDS < MAX_TRAFFIC_PROOF_DRAIN_BATCH,
-        "the current ring fits inside one current drain budget",
+        CURRENT_RING_USABLE_RECORDS < MAX_TRAFFIC_PROOF_DRAIN_BATCH,
+        "the current usable ring fits inside one current drain budget",
     );
     assert_evidence(
         REQUIRED_BURST_EVENTS > MAX_TRAFFIC_PROOF_DRAIN_BATCH,
@@ -126,12 +137,13 @@ fn observation_drain_marks_the_exact_batch_boundary_overflowed() {
 
 #[test]
 fn full_scan_work_dominates_group_indexed_work_at_required_scale() {
-    let baseline_full_scan = full_scan_work(CURRENT_RING_RECORDS, MAX_TRAFFIC_PROOF_ATTEMPTS);
-    let baseline_indexed = group_indexed_work(CURRENT_RING_RECORDS);
+    let baseline_full_scan =
+        full_scan_work(CURRENT_RING_USABLE_RECORDS, MAX_TRAFFIC_PROOF_ATTEMPTS);
+    let baseline_indexed = group_indexed_work(CURRENT_RING_USABLE_RECORDS);
     let required_full_scan = full_scan_work(REQUIRED_BURST_EVENTS, REQUIRED_ATTEMPTS);
     let required_indexed = group_indexed_work(REQUIRED_BURST_EVENTS);
 
-    assert_eq!(baseline_full_scan, 682 * 256);
+    assert_eq!(baseline_full_scan, 630 * 256);
     assert_eq!(required_full_scan, 400_000_000);
     assert_eq!(required_indexed, 40_000);
     assert!(baseline_indexed < baseline_full_scan);
@@ -148,7 +160,7 @@ fn full_scan_work_dominates_group_indexed_work_at_required_scale() {
 #[test]
 fn baseline_scan_and_grouped_index_agree_below_capacity() {
     // Bounded baseline model: one shared event set, every attempt scans it.
-    let events = CURRENT_RING_RECORDS;
+    let events = CURRENT_RING_USABLE_RECORDS;
     let attempts = MAX_TRAFFIC_PROOF_ATTEMPTS;
     let groups: Vec<usize> = (0..events).map(|event| event % attempts).collect();
     let mut full_scan_matches = 0_usize;
