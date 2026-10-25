@@ -264,8 +264,19 @@ the engine running on the unchanged published snapshot (SDK #1254); only an
 indeterminate publication state or a store with no published snapshot at all
 stops the engine. The bounded attempt/backoff, value-free failure classification
 and duplicate-build degradation are documented in the `opc-session-store`
-README. Separate key and ordinary-receipt caps are unchanged. Notification
-rows use a bounded rolling row-count window of the newest 65,536 entries (a
+README. The separate key cap is unchanged. Ordinary command receipts use a
+bounded retention rule derived only from committed state: below committed
+application sequence 65,536 every receipt is retained exactly as before, and
+once active a receipt whose committed response logical time is older than the
+retained 120-second logical-time window is retired. An exact retry of a
+retired command receives the typed outcome-unavailable answer (the command is
+never executed again); an in-window retry replays the original committed
+outcome. A capacity backstop answers with a retryable typed refusal before the
+fixed image cap can be reached. The committed application sequence and logical
+time already carried by every frontier decide the rule, so every voter retires
+identically and no new persisted field or format boundary is added; the
+portable SQL projection and prepared SQL base simply carry the retained map.
+Notification rows use a bounded rolling row-count window of the newest 65,536 entries (a
 row-count bound, not a byte budget): the retention
 floor is derived only from the committed `watch_sequence`, so every voter
 derives the same floor at the same log index and the already-persisted watch

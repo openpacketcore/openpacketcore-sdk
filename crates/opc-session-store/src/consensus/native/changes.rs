@@ -695,10 +695,33 @@ impl BusinessChanges {
         )?;
         for (id, change) in &self.generic {
             check()?;
-            let row = change
-                .after
-                .as_ref()
-                .ok_or_else(|| invalid("native captured request receipt removed"))?;
+            let Some(row) = change.after.as_ref() else {
+                // A journal removal is authoritative only when the committed
+                // ordinary-receipt retention rule retires exactly that row.
+                let before = change.before.as_ref().ok_or_else(|| {
+                    invalid("native captured request receipt removal lacks a predecessor")
+                })?;
+                let NativeGenericReceipt::Ordinary(receipt) = &***before else {
+                    return Err(invalid(
+                        "native captured V1 request receipt removal is not a retention retirement",
+                    ));
+                };
+                let retention = super::retention::ordinary_receipt_retention();
+                if !retention.active(self.target.frontiers.sequence) {
+                    return Err(invalid(
+                        "native captured request receipt removed below retention activation",
+                    ));
+                }
+                let now = self.target.frontiers.logical_time.ok_or_else(|| {
+                    invalid("native captured request receipt removal lacks a committed clock")
+                })?;
+                if !retention.expired(receipt.response.logical_time, now) {
+                    return Err(invalid(
+                        "native captured request receipt removal is inside retention",
+                    ));
+                }
+                continue;
+            };
             validation::validate_generic(id, row, &self.target.frontiers)?;
             if let Some(before) = &change.before {
                 row.validate_replacement(before, self.target.frontiers.logical_time)?;
@@ -895,6 +918,12 @@ fn publish_rows<K: Clone + Eq + Hash, T: RowValue>(
                     let prior = slot.get_mut();
                     prior.after = change.after;
                     prior.after_hash = change.after_hash;
+                    // A row created and retired inside one journal has no
+                    // endpoint: drop the transient change instead of recording
+                    // an unattributable removal.
+                    if prior.before.is_none() && prior.after.is_none() {
+                        slot.remove();
+                    }
                 }
             }
         }
@@ -976,6 +1005,30 @@ impl Publication {
         } = delta;
         let predecessor = Arc::clone(base.require_business_proof()?);
         validate_frontier_transition(&predecessor.frontiers, &frontiers, false)?;
+        // Bounded ordinary-receipt retention, derived from committed state
+        // only. The rule stays inert below the committed activation sequence,
+        // so below-bound behavior is byte-identical. Once active, receipts
+        // whose committed response time is outside the retained logical-time
+        // window are retired from the predecessor map here, before the proof is
+        // built; exact in-window receipts stay resident and idempotency is
+        // untouched.
+        let receipt_retention = super::retention::ordinary_receipt_retention();
+        let mut retired_generic = Vec::new();
+        if receipt_retention.active(frontiers.sequence) {
+            if let Some(now) = frontiers.logical_time {
+                for (id, row) in &base.generic_receipts {
+                    if matches!(
+                        &**row,
+                        NativeGenericReceipt::Ordinary(receipt)
+                            if receipt_retention
+                                .expired(receipt.response.logical_time, now)
+                    ) {
+                        let hash = stamp(2, id, row)?;
+                        retired_generic.push((*id, row.clone(), hash));
+                    }
+                }
+            }
+        }
         let tracking = base.changes.is_some();
         let deleted_before = DeletedRows::before_count(&receipt_removals, &base.receipts)?;
         let mut bytes = scratch_size::<SessionKey, NativeKeyState>(keys.len())?;
@@ -987,7 +1040,10 @@ impl Publication {
         add_bytes(
             &mut bytes,
             scratch_size::<SessionConsensusRequestId, NativeGenericReceipt>(
-                generic_receipts.len(),
+                generic_receipts
+                    .len()
+                    .checked_add(retired_generic.len())
+                    .ok_or_else(|| invalid("native generic receipt reservation overflow"))?,
             )?,
         )?;
         add_bytes(
@@ -1018,9 +1074,12 @@ impl Publication {
             .and_then(|bytes| {
                 generic_receipts
                     .len()
-                    .checked_mul(size_of::<
-                        StagedRow<SessionConsensusRequestId, NativeGenericReceipt>,
-                    >())
+                    .checked_add(retired_generic.len())
+                    .and_then(|rows| {
+                        rows.checked_mul(size_of::<
+                            StagedRow<SessionConsensusRequestId, NativeGenericReceipt>,
+                        >())
+                    })
                     .and_then(|rows| bytes.checked_add(rows))
             })
             .ok_or_else(|| invalid("native staging reservation overflow"))?;
@@ -1211,13 +1270,27 @@ impl Publication {
             &mut tables[1],
             reclaim_memory,
         )?;
-        let generic = staged(
+        let mut generic = staged(
             2,
             generic_receipts,
             &base.generic_receipts,
             tracking,
             &mut tables[2],
         )?;
+        for (id, before, before_hash) in retired_generic {
+            tables[2].replace(Some(before_hash), None)?;
+            let journal_key = tracking.then_some(id);
+            generic.push(StagedRow {
+                key: id,
+                journal_key,
+                change: RowChange {
+                    before: Some(Box::new(before)),
+                    after: None,
+                    before_hash: Some(before_hash),
+                    after_hash: None,
+                },
+            });
+        }
         let delivery = NativeApplied {
             responses,
             notifications: notifications

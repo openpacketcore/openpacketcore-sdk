@@ -1969,6 +1969,21 @@ remains distinct and requires snapshot installation before its resume point.
 Slow consumers are evicted when the live channel fills, and closed or
 cancelled registrations are pruned without unbounded accumulation.
 
+Ordinary command outcomes are retained under a committed-state rule instead of
+for the life of the store. The rule activates only after committed application
+sequence 65,536: below it every receipt is retained exactly as before. Once
+active, a receipt whose committed response logical time is older than the
+120-second retained logical-time window is retired on the next publication, so
+an exact in-window retry replays the original outcome while an out-of-window
+retry receives the typed `BackendOperationOutcomeUnavailable` (or
+`CasIdempotencyOutcomeUnavailable` for compare-and-set) answer and is never
+executed again. A retryable typed capacity refusal protects the fixed image cap
+when retained outcomes fill the window before committed logical time advances.
+The rule derives from the already-persisted application sequence and logical
+time, so every voter retires identically; no new persisted field or format
+boundary is added, and the portable SQL projection/prepared SQL base just carry
+the retained map.
+
 Native state additionally keeps a bounded rolling notification backlog: the
 newest 65,536 notification rows are resident (a row-count bound, not a byte
 budget), and a watcher whose inclusive cursor

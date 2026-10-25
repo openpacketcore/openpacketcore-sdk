@@ -49,6 +49,38 @@ impl NativeDelta<'_> {
                 self.response(index, Err(StoreError::CasIdempotencyConflict))
             });
         }
+        // Bounded ordinary-receipt retention. The rule activates only from a
+        // committed application sequence far beyond every below-bound fixture,
+        // so a store that never approaches the old cap keeps the original
+        // behavior byte-identically. Once active, a command whose committed
+        // submission time is outside the retained logical-time window cannot
+        // be an in-window retry: its exact outcome was retired, so answer with
+        // a typed outcome-unavailable result instead of executing it again.
+        let retention = super::retention::ordinary_receipt_retention();
+        if retention.active(self.frontiers.sequence)
+            && retention.retry_outside_retention(command.logical_time, now)
+        {
+            let error = if matches!(intent, SessionMutationIntent::CompareAndSet(_)) {
+                StoreError::CasIdempotencyOutcomeUnavailable
+            } else {
+                StoreError::BackendOperationOutcomeUnavailable
+            };
+            return Ok(self.clock_response(now, index, error));
+        }
+        // Last-resort retention capacity. A store whose retained outcomes fill
+        // the bounded window before the committed clock advances cannot bind
+        // another outcome without reaching the fixed image cap. Refuse before
+        // evaluating the command (no effect, no binding) with a retryable
+        // typed answer; later committed logical time reclaims the window.
+        if retention.active(self.frontiers.sequence)
+            && self.receipt_count_at_capacity(retention, now)?
+        {
+            return Ok(self.clock_response(
+                now,
+                index,
+                StoreError::BackendUnavailable("native ordinary receipt retention capacity".into()),
+            ));
+        }
         let sequence = self
             .frontiers
             .sequence
@@ -118,6 +150,40 @@ impl NativeDelta<'_> {
         );
         self.compact_one_v1(now)?;
         Ok(response)
+    }
+
+    /// Whether binding a new ordinary receipt would exceed the bounded
+    /// retention admission capacity even after this publication reclaims every
+    /// expired receipt. Scans only when the resident collections are already at
+    /// the capacity bound, so the common path stays O(1).
+    fn receipt_count_at_capacity(
+        &self,
+        retention: super::retention::OrdinaryReceiptRetention,
+        now: Timestamp,
+    ) -> io::Result<bool> {
+        let resident = self
+            .base
+            .generic_receipts
+            .len()
+            .checked_add(self.generic_receipts.len())
+            .ok_or_else(|| invalid("native ordinary receipt count overflow"))?;
+        if resident < retention.capacity() {
+            return Ok(false);
+        }
+        let expired = |row: &NativeGenericReceipt| {
+            matches!(
+                row,
+                NativeGenericReceipt::Ordinary(receipt)
+                    if retention.expired(receipt.response.logical_time, now)
+            )
+        };
+        let reclaimable_base = self
+            .base
+            .generic_receipts
+            .iter()
+            .any(|(_, row)| expired(row));
+        let reclaimable_delta = self.generic_receipts.values().any(expired);
+        Ok(!reclaimable_base && !reclaimable_delta)
     }
 }
 

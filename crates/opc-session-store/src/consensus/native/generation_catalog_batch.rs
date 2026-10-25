@@ -466,10 +466,31 @@ impl Rows {
         } = section;
         match (header, row) {
             (Header::Generic(before), CatalogRow::Generic(id, row)) => {
+                let Some(row) = row else {
+                    // Bounded ordinary-receipt retention encodes a retirement as
+                    // an after-image removal. The predecessor must be the exact
+                    // ordinary receipt row and base generations never remove.
+                    if base {
+                        return Err(invalid("native generation base removes a generic receipt"));
+                    }
+                    let existing = self.generic.get(&id).ok_or_else(|| {
+                        invalid("native catalog removed an absent generic receipt")
+                    })?;
+                    if existing.row.facts.retained_until.is_some() {
+                        return Err(invalid(
+                            "native catalog removed a V1 receipt without its lifecycle codec",
+                        ));
+                    }
+                    if before != Some(existing.row.content) || existing.checkpoint == checkpoint {
+                        return Err(invalid(
+                            "native catalog generic removal predecessor differs",
+                        ));
+                    }
+                    self.summary[2].replace(Some(existing.row.content), None)?;
+                    self.generic.remove(&id);
+                    return Ok(());
+                };
                 predecessor(self.generic.get(&id), before, checkpoint, base)?;
-                let row = row.ok_or_else(|| {
-                    invalid("native generation generic removal lacks its lifecycle codec")
-                })?;
                 if let Some(before) = self.generic.get(&id) {
                     row.facts.validate_replacement(
                         before.row.facts,
