@@ -868,10 +868,10 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
     def test_each_event_runs_a_merge_commit_diff_pass(self):
         cases = (
-            ('pull_request', f'{self.base}..{self.head} --merges -m --first-parent'),
-            ('push', f'--full-history {self.base} --merges -m --first-parent'),
-            ('schedule', '--full-history --all --merges -m --first-parent'),
-            ('workflow_dispatch', '--full-history --all --merges -m --first-parent'),
+            ('pull_request', f'{self.base}..{self.head} --merges --diff-merges=first-parent'),
+            ('push', f'--full-history {self.base} --merges --diff-merges=first-parent'),
+            ('schedule', '--full-history --all --merges --diff-merges=first-parent'),
+            ('workflow_dispatch', '--full-history --all --merges --diff-merges=first-parent'),
         )
         for event, expected in cases:
             with self.subTest(event=event):

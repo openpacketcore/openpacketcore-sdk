@@ -85,9 +85,10 @@ jobs:
           esac
           # `git log -p` prints no diff for a merge commit. A second pass over
           # merge commits only, diffed against the first parent, scans text that
-          # exists solely in a merge resolution. The primary pass stays
-          # unchanged for ordinary commits and side branches.
-          merge_log_opts="${log_opts} --merges -m --first-parent"
+          # exists solely in a merge resolution. Change only the diff format:
+          # traverse every parent so nested side-branch merges are scanned too.
+          # The primary pass stays unchanged for ordinary commits and side branches.
+          merge_log_opts="${log_opts} --merges --diff-merges=first-parent"
           report="${RUNNER_TEMP}/gitleaks-report.json"
           log="${RUNNER_TEMP}/gitleaks.log"
           merge_report="${RUNNER_TEMP}/gitleaks-merge-report.json"

@@ -132,13 +132,13 @@ branches.
 Each run makes two passes with the same pinned scanner. The primary pass reads
 `git log -p` over the pull request's exact range, the pushed commit's full
 reachable history, or all fetched refs; it covers ordinary commits and side
-branches. A second merge-only pass (`--merges -m --first-parent`) diffs merge
-commits against their first parent, so text that exists only in a merge
-commit's conflict resolution is scanned even though `git log -p` prints no diff
-for a merge commit. Both passes must complete cleanly, or report a findings
-count, for the scan to pass; a scan that did not complete is never clean. The
-merge-only pass adds coverage after a clean primary pass, and its report is
-`gitleaks-merge-report.json` in the runner temp directory.
+branches. A second merge-only pass (`--merges --diff-merges=first-parent`) diffs
+each merge against its first parent while traversing every parent. This includes
+nested side-branch merge resolutions, even when an outer merge removes their
+text. `--first-parent` traversal would miss those commits. Both passes must
+complete without findings for the scan to pass; a scan that did not complete
+is never clean. The merge-only pass runs after a clean primary pass, and its
+report is `gitleaks-merge-report.json` in the runner temp directory.
 
 Scheduled runs (daily at 08:17 UTC) fetch and scan all branch and tag refs with
 the `.gitleaksignore` on `main`, including branches without pull requests.

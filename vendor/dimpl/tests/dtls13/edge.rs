@@ -1005,83 +1005,76 @@ fn dtls13_alert_bad_certificate() {
     // and assert the handshake fails with an appropriate error.
 }
 
-/// Regression test for bug #1: advertised signature schemes must all be functional.
+/// Walk the first plaintext record's unfragmented ClientHello and return
+/// one extension body. This test helper does not reassemble fragments.
 ///
-/// Previously, Ed25519 (0x0807) and RSA_PSS_RSAE_SHA256 (0x0804) were advertised
-/// in the ClientHello signature_algorithms extension but could not be verified,
-/// causing handshake failures when a peer selected them.
-/// Walk the plaintext DTLS record and ClientHello structure and return the
-/// body of one extension.
-///
-/// The ClientHello is parsed structurally rather than searched for a byte
-/// pattern: the client random, legacy session ID and key shares can legitimately
-/// contain any 2-byte pair, so a scan can find a false extension type and then
-/// read a bogus length past the end of the packet.
+/// Lengths are scoped to each enclosing container: random bytes, session IDs,
+/// other extension bodies and following records cannot supply an extension.
 fn client_hello_extension(packet: &[u8], extension_type: u16) -> Option<&[u8]> {
-    // DTLSPlaintext header: content_type(1) + version(2) + epoch(2) + seq(6)
-    // + length(2).
-    let record_header_len = 13usize;
-    // Handshake header: msg_type(1) + length(3) + message_seq(2)
-    // + frag_offset(3) + frag_length(3).
-    let handshake_header_len = 12usize;
-    let body_start = record_header_len.checked_add(handshake_header_len)?;
-    if packet.len() < body_start {
+    fn take<'a>(input: &mut &'a [u8], length: usize) -> Option<&'a [u8]> {
+        let (value, rest) = input.split_at_checked(length)?;
+        *input = rest;
+        Some(value)
+    }
+
+    fn vector<'a>(input: &mut &'a [u8], length_bytes: usize) -> Option<&'a [u8]> {
+        let length = take(input, length_bytes)?
+            .iter()
+            .fold(0, |length, byte| (length << 8) | usize::from(*byte));
+        take(input, length)
+    }
+
+    // RFC 9147 Sections 4 and 5.2: the first plaintext record must contain
+    // one complete ClientHello. Never borrow bytes from a following record.
+    let mut packet = packet;
+    let record_header = take(&mut packet, 11)?;
+    if record_header[0] != 22 || record_header[3..5] != [0, 0] {
         return None;
     }
-    let fragment_len = u32::from_be_bytes([
+    let mut record = vector(&mut packet, 2)?;
+    let handshake_header = take(&mut record, 12)?;
+    if handshake_header[0] != 1
+        || handshake_header[6..9] != [0, 0, 0]
+        || handshake_header[1..4] != handshake_header[9..12]
+    {
+        return None;
+    }
+    let body_length = u32::from_be_bytes([
         0,
-        *packet.get(record_header_len + 9)?,
-        *packet.get(record_header_len + 10)?,
-        *packet.get(record_header_len + 11)?,
+        handshake_header[1],
+        handshake_header[2],
+        handshake_header[3],
     ]) as usize;
-    let body_end = body_start.checked_add(fragment_len)?;
-    if body_end > packet.len() {
+    let mut body = take(&mut record, body_length)?;
+    if !record.is_empty() {
         return None;
     }
 
-    // ClientHello body: version(2) + random(32) + session_id_len(1)
-    // + session_id + cookie_len(1) + cookie + cipher_suites_len(2)
-    // + cipher_suites + comp_methods_len(1) + comp_methods
-    // + extensions_len(2) + extensions.
-    let mut pos = body_start.checked_add(2 + 32)?;
-    let session_id_len = usize::from(*packet.get(pos)?);
-    pos = pos.checked_add(1 + session_id_len)?;
-    let cookie_len = usize::from(*packet.get(pos)?);
-    pos = pos.checked_add(1 + cookie_len)?;
-    let cipher_suites_len = usize::from(u16::from_be_bytes([
-        *packet.get(pos)?,
-        *packet.get(pos + 1)?,
-    ]));
-    pos = pos.checked_add(2 + cipher_suites_len)?;
-    let comp_methods_len = usize::from(*packet.get(pos)?);
-    pos = pos.checked_add(1 + comp_methods_len)?;
-    let extensions_len = usize::from(u16::from_be_bytes([
-        *packet.get(pos)?,
-        *packet.get(pos + 1)?,
-    ]));
-    pos = pos.checked_add(2)?;
-    let extensions_end = pos.checked_add(extensions_len)?;
-    if extensions_end > body_end {
+    // RFC 9147 Section 5.3: follow each vector's length to the extensions.
+    take(&mut body, 2 + 32)?; // legacy_version and random
+    vector(&mut body, 1)?; // legacy_session_id
+    vector(&mut body, 1)?; // legacy_cookie
+    vector(&mut body, 2)?; // cipher_suites
+    vector(&mut body, 1)?; // legacy_compression_methods
+    let mut extensions = vector(&mut body, 2)?;
+    if !body.is_empty() {
         return None;
     }
 
-    while pos + 4 <= extensions_end {
-        let current_type = u16::from_be_bytes([*packet.get(pos)?, *packet.get(pos + 1)?]);
-        let current_len = usize::from(u16::from_be_bytes([
-            *packet.get(pos + 2)?,
-            *packet.get(pos + 3)?,
-        ]));
-        let data_start = pos + 4;
-        let data_end = data_start.checked_add(current_len)?;
-        if data_end > extensions_end {
-            return None;
+    // RFC 8446 Section 4.2: finish walking the extension vector before
+    // accepting a match, so a trailing malformed or duplicate entry fails.
+    let mut found = None;
+    while !extensions.is_empty() {
+        let current_type = take(&mut extensions, 2)?;
+        let data = vector(&mut extensions, 2)?;
+        if current_type == extension_type.to_be_bytes() {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(data);
         }
-        if current_type == extension_type {
-            return packet.get(data_start..data_end);
-        }
-        pos = data_end;
     }
-    None
+    found
 }
 
 const SIGNATURE_ALGORITHMS_EXTENSION: [u8; 10] =
@@ -1233,6 +1226,11 @@ fn dtls13_signature_schemes_reject_trailing_body_bytes() {
     assert_eq!(client_hello_extension(&packet, 0x000D), None);
 }
 
+/// Regression test for bug #1: advertised signature schemes must all be functional.
+///
+/// Previously, Ed25519 (0x0807) and RSA_PSS_RSAE_SHA256 (0x0804) were advertised
+/// in the ClientHello signature_algorithms extension but could not be verified,
+/// causing handshake failures when a peer selected them.
 #[test]
 #[cfg(feature = "rcgen")]
 fn dtls13_only_functional_signature_schemes_advertised() {
