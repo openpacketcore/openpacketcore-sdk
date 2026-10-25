@@ -352,6 +352,23 @@ impl RelocationBuilder {
     }
 }
 
+#[cfg(test)]
+impl Relocations {
+    /// Exact notification replacements this append prepared: target ordinal in
+    /// the retained window and the selected row that will replace it.
+    pub(in crate::consensus::native) fn notification_replacements_for_test(
+        &self,
+    ) -> Vec<(usize, NotificationRow)> {
+        self.rows
+            .iter()
+            .filter_map(|replacement| match replacement {
+                Replacement::Notification { index, row } => Some((*index, row.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 impl Relocations {
     pub(crate) fn is_empty(&self) -> bool {
         self.rows.is_empty()

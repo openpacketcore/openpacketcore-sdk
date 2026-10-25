@@ -1006,3 +1006,131 @@ fn native_notification_retention_survives_generation_base_delta_and_reopen() {
         assert_eq!(entry.sequence, floor + 1 + offset as u64);
     }
 }
+
+/// Bounded rolling retention must survive the real delta relocation path: the
+/// delta file contains only sparse appended rows, so each relocation has to
+/// land at its ordinal in the target retained window (raw sequence minus the
+/// derived floor), not at raw sequence minus one.
+#[test]
+fn native_notification_retention_relocates_sparse_rows_after_delta_append() {
+    let _retention =
+        crate::consensus::native::retention::tests_support::override_retained_for_test(4);
+    let (mut storage, _request, mut outcome) = fixture();
+    for index in 2..=10_u64 {
+        let next = request(index, Some(&outcome));
+        let applied = apply(
+            &mut storage,
+            &[command(index, &next, time(index as u8), false)],
+        );
+        let Ok(SessionMutationOutcome::FencedTransition(next_outcome)) =
+            &applied.responses[0].result
+        else {
+            panic!("native retention fixture transition failed")
+        };
+        outcome = next_outcome.clone();
+    }
+    assert!(storage.business.frontiers.watch_sequence > 4);
+    assert!(storage.business.frontiers.notification_floor() > 0);
+
+    let mut file = FileFixture::new(&storage);
+    storage.begin_changes().unwrap();
+    for index in 11..=12_u64 {
+        let next = request(index, Some(&outcome));
+        let applied = apply(
+            &mut storage,
+            &[command(index, &next, time(index as u8), false)],
+        );
+        let Ok(SessionMutationOutcome::FencedTransition(next_outcome)) =
+            &applied.responses[0].result
+        else {
+            panic!("native retention delta transition failed")
+        };
+        outcome = next_outcome.clone();
+    }
+    let delta = PreparedDelta::prepare(
+        file.owner.current(),
+        &file.version,
+        12,
+        21,
+        [0xE2; 32],
+        storage.take_changes().unwrap(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(delta.header.changed[3], 2);
+    let after_watch = delta.header.after.business.frontiers.watch_sequence;
+    let after_floor = delta.header.after.business.frontiers.notification_floor();
+    let (_, mut relocations) = delta
+        .append_with_relocations(&mut file.owner, &|| Ok(()))
+        .unwrap();
+    let replacements = relocations.notification_replacements_for_test();
+    assert_eq!(
+        replacements.len(),
+        2,
+        "both delta notification additions are selected for relocation"
+    );
+
+    // Replay the production ordering: the resident owner already holds the
+    // target retained window (predecessor suffix advanced by the delta), while
+    // the two additions are re-pointed at their delta-file bodies.
+    let predecessor_suffix: Vec<NotificationRow> = storage
+        .business
+        .notifications
+        .iter()
+        .skip(2)
+        .cloned()
+        .collect();
+    assert_eq!(predecessor_suffix.len(), 2);
+    for (index, row) in predecessor_suffix.into_iter().enumerate() {
+        let _ = storage.business.notifications.set(index, row);
+    }
+    for (index, row) in &replacements {
+        assert_eq!(
+            *index as u64,
+            row.sequence() - after_floor - 1,
+            "relocation must use the retained-window ordinal"
+        );
+        let _ = storage.business.notifications.set(*index, row.clone());
+    }
+    let target_raw: Vec<u64> = storage
+        .business
+        .notifications
+        .iter()
+        .map(|row| row.sequence())
+        .collect();
+    assert_eq!(
+        target_raw,
+        (after_floor + 1..=after_watch).collect::<Vec<_>>(),
+        "the resident target window is the sparse retained suffix"
+    );
+
+    let mut steps = 0;
+    while !relocations.is_empty() {
+        drop(relocations.publish_step(&mut storage).unwrap());
+        steps += 1;
+    }
+    assert!(steps > 0, "the relocation batch must have published work");
+    for (index, row) in &replacements {
+        let published = storage.business.notifications.get(*index).unwrap();
+        assert!(
+            published.is_selected_for_test(),
+            "delta addition must be re-pointed at its selected delta-file row"
+        );
+        assert!(
+            published.ptr_eq(row),
+            "re-pointing keeps the exact captured revision"
+        );
+        assert_eq!(published.sequence(), row.sequence());
+    }
+    assert_eq!(
+        storage
+            .business
+            .notifications
+            .iter()
+            .map(|row| row.sequence())
+            .collect::<Vec<_>>(),
+        target_raw,
+        "relocation changes body location only, never sequence order"
+    );
+    storage.business.validate_full_business_rows().unwrap();
+}
