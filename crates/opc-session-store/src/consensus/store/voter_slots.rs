@@ -163,7 +163,10 @@ impl SessionVoterProfile {
                 evidence,
             } => {
                 let local = store.inner.local_node_id;
-                let state = Reader(self.core.clone()).read_voter_slot_state().await?;
+                // `deadline` is the operation budget captured when this
+                // control request was admitted; the publication wait must not
+                // restart it.
+                let state = Reader(self.core.clone()).state_until(deadline).await?;
                 let operation = state
                     .table()
                     .replacement
@@ -205,7 +208,10 @@ impl SessionVoterProfile {
                 marker,
             } => {
                 let local = store.inner.local_node_id;
-                let state = Reader(self.core.clone()).read_voter_slot_state().await?;
+                // `deadline` is the operation budget captured when this
+                // control request was admitted; the publication wait must not
+                // restart it.
+                let state = Reader(self.core.clone()).state_until(deadline).await?;
                 let operation = state
                     .table()
                     .replacement
@@ -239,8 +245,10 @@ impl SessionVoterProfile {
         // The recovered committed table replaces the manifest as authority.
         // Refuse a retired/rebound local key before attaching an engine or
         // enabling any election, heartbeat, or authenticated RPC service.
+        // Opening has no request budget: read the current strict publication
+        // without starting a wait, as before.
         let retained = Reader(core.clone())
-            .read_voter_slot_state()
+            .read_voter_slot_state_now()
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
         if retained.table().cluster_instance != signer.cluster_instance()
@@ -333,7 +341,9 @@ impl SessionVoterProfile {
         loop {
             // Never await admission's serial coordinator while holding the
             // incoming request guard; publication has its own independent task.
-            let state = Reader(self.core.clone()).read_voter_slot_state().await?;
+            // Wait only for strict publication, within the request's original
+            // budget.
+            let state = Reader(self.core.clone()).state_until(deadline).await?;
             if state.table().slots.iter().any(|slot| {
                 slot.member.identity.node_id() == local && slot.phase == VoterSlotPhase::Voting
             }) {
@@ -746,13 +756,18 @@ impl ConsensusSessionStore {
     }
 
     /// Read one atomically published bounded table and provisional intent.
+    ///
+    /// This observer read does not wait for a pending strict publication; a
+    /// caller with a request budget must use a bounded path.
     pub async fn voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError> {
         let profile = self
             .inner
             .voter_profile
             .as_ref()
             .ok_or(VoterReplacementError::IncompatibleProfile)?;
-        Reader(profile.core.clone()).read_voter_slot_state().await
+        Reader(profile.core.clone())
+            .read_voter_slot_state_now()
+            .await
     }
 
     /// Resolve an accepted request using current controller authorization and a
@@ -829,7 +844,10 @@ impl ConsensusSessionStore {
             .transport
             .validate_candidate_route(&request)
             .map_err(|_| VoterReplacementError::UnauthorizedReplacement)?;
-        let state = self.voter_slot_state().await?;
+        // One original budget covers the initial read, the quorum proof,
+        // the liveness probe, dispatch and the final read.
+        let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
+        let state = Reader(profile.core.clone()).state_until(deadline).await?;
         let retained = state
             .table()
             .replacement
@@ -863,7 +881,6 @@ impl ConsensusSessionStore {
                 return Err(VoterReplacementError::ReplacementPastFence);
             }
         }
-        let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         let probe_store = self.clone();
         let probe_request = request.clone();
         let store = self.clone();
@@ -885,7 +902,9 @@ impl ConsensusSessionStore {
                 },
             )
             .await?;
-        self.voter_slot_state().await
+        // Resolve the accepted write within the same original budget: no
+        // restart after the quorum proof, liveness probe or dispatch.
+        Reader(profile.core.clone()).state_until(deadline).await
     }
 
     async fn write_slot_control(
@@ -977,7 +996,8 @@ impl ConsensusSessionStore {
             return Err(VoterReplacementError::TargetStillLive);
         }
         profile.admission.check_target_absent(target)?;
-        let state = self.voter_slot_state().await?;
+        // Strict publication read within the leader intent's original budget.
+        let state = Reader(profile.core.clone()).state_until(deadline).await?;
         let configuration = state.table().current_configuration();
         let voters: BTreeSet<_> = configuration
             .members
@@ -1049,6 +1069,11 @@ impl ConsensusSessionStore {
         &self,
         progress: &mut ReplacementProgress,
     ) -> Result<(), VoterReplacementError> {
+        let profile = self
+            .inner
+            .voter_profile
+            .as_ref()
+            .ok_or(VoterReplacementError::IncompatibleProfile)?;
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         let cut = tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable())
             .await
@@ -1068,7 +1093,7 @@ impl ConsensusSessionStore {
         }
         loop {
             let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
-            let state = self.voter_slot_state().await?;
+            let state = Reader(profile.core.clone()).state_until(deadline).await?;
             let Some(operation) = state.table().replacement.clone() else {
                 *progress = ReplacementProgress::default();
                 return Ok(());
@@ -1784,7 +1809,19 @@ impl std::fmt::Debug for Reader {
 }
 #[async_trait]
 impl VoterSlotStateReader for Reader {
-    async fn read_voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError> {
+    async fn read_voter_slot_state(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+        // `state_until` subscribes before its first read, waits only for a
+        // strict-publication `WouldBlock`, and maps a spent caller budget to
+        // `Deadline` without starting a new timeout.
+        self.state_until(deadline).await
+    }
+
+    async fn read_voter_slot_state_now(
+        &self,
+    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
         #[cfg(target_os = "linux")]
         {
             self.wal()?
