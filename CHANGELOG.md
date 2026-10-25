@@ -47,31 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and loss-qualified same-group restore remain unimplemented; RFC 017 row
   017-1 is now `partial`. Refs #663.
 
-- `opc-persist`: retained-authority provisioning is now crash-resumable. A
-  fixed-size authenticated provisioning intent (`<database>.opc-retained.intent`).
-  It binds the exact topology, backing identity, key scope, audit-key
-  epoch/fingerprint and operation class (new authority or member repair), carries
-  fresh per-publication entropy, and is synced with its parent directory before
-  the first artifact mutation. Request identity for resume/conflict decisions is
-  that authenticated binding digest plus the operation class; the API carries no
-  caller request id, so two publications with the same binding/audit key/class
-  are the same request. A retry
-  of the same interrupted request either reconciles a committed admission
-  exactly once (returning the validated backend even when the original caller
-  never observed success) or removes its authenticated partial prefix under
-  the exclusive lifetime lock and runs one fresh attempt, so no caller marker
-  deletion, guessed cleanup or manual backing replacement is needed for an
-  interruption caused by that transaction. Conflicting requests, foreign data,
-  unverifiable records beside artifacts and established stores are never
-  adopted, overwritten or deleted; committed-store validation failure stays
-  `RecoveryRequired`/`Rejected`. Established database and admission-record
-  formats are unchanged, and cancellation/deadline outcomes remain
-  `AdmissionBound`/`Indeterminate` with same-request resumability, distinct
-  from `RetainedConfigOpenRetirement`. The deterministic crash matrix now
-  covers intent publication, lock/database/schema/binding/sync/record/intent
-  boundaries plus injected I/O faults, same-request resume,
-  conflicting-request refusal, lock-leak, partial-authority and
-  established-store-loss assertions. Refs #1114.
+- `opc-persist`: retained configuration provisioning publishes authenticated,
+  request-bound intent, a complete database and a completion witness using
+  atomic no-replacement links. Explicit resume finishes the same authorized
+  request after interruption without deleting or replacing existing artifacts;
+  ordinary reopen never initializes storage. Conflicting keys, requests and
+  unverifiable records are preserved and refused. Writer exclusion remains held
+  until SQLite and every extra database descriptor close. Subprocess crashes,
+  I/O faults, cancellation/join and public authority/member-repair resume paths
+  cover the lifecycle. Refs #1114.
 
 - `opc-gtpu-dataplane`: publish the RFC 016 external selector-adapter codec
   module `selector_adapter_codec`: versioned canonical namespace binding
@@ -543,6 +527,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority. Refs #1378.
 
 ### Breaking
+
+- `opc-persist`: the retained configuration admission encoding now includes a
+  permanent intent and completion witness. Crossing this format boundary
+  requires a fresh installation. The Linux filesystem must support `O_TMPFILE`,
+  atomic hard links, file/directory synchronization and `flock`; procfs is also
+  required. Use `begin_resume_config_authority` or
+  `begin_resume_config_member_repair` for interrupted binding-based requests.
+  Explicit request IDs use the transaction provision/resume/reopen APIs and
+  must be retained independently of the destination database. Refs #1114.
 
 - `opc-session-net` (fresh-install boundary): session cluster identity, consensus
   node IDs and the configuration digest are installation-qualified. Every

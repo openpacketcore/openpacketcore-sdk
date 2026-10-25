@@ -424,6 +424,7 @@ impl SqliteBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn from_retained_connection(
         path: PathBuf,
         ephemeral: bool,

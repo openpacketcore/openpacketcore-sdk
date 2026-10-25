@@ -25,6 +25,10 @@ accepted single-replica profile.
   opens require an explicit non-zero `AuditKey`; this API is not reopen-only.
 - Retained configuration voters use explicit `provision_config_authority`,
   `reopen_config_authority`, and `provision_config_member_repair` operations.
+  Provisioning publishes authenticated intent and a complete database atomically;
+  `begin_resume_config_authority` and `begin_resume_config_member_repair` resume
+  the same authorized operation after interruption. Explicit request identifiers
+  are available through `RetainedConfigProvisionRequest` and the transaction APIs.
   Missing retained storage never falls back to creation during reopen. See the
   [retained lifecycle contract](RETAINED_CONFIG.md) for scope binding,
   interruption, repair, durability choices and rollback-freshness limits.
