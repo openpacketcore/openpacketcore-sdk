@@ -28,6 +28,216 @@ const DELETE_SESSION_RESPONSE_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/delete_session_response_cause.bin");
 const CREATE_BEARER_REQUEST_FIXTURE: &[u8] =
     include_bytes!("fixtures/spec/create_bearer_request_s2b.bin");
+const CREATE_BEARER_RESPONSE_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/create_bearer_response_s2b.bin");
+const UPDATE_BEARER_REQUEST_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/update_bearer_request_bearer_context.bin");
+const UPDATE_BEARER_RESPONSE_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/update_bearer_response_cause.bin");
+const DELETE_BEARER_REQUEST_FIXTURE: &[u8] =
+    include_bytes!("fixtures/spec/delete_bearer_request_dedicated.bin");
+
+fn append_bearer_member(fixture: &[u8], appended: &[u8]) -> Vec<u8> {
+    let (_, message) = Message::decode(fixture, structural_context()).expect("fixture decodes");
+    let mut ies = message.raw_ies.to_vec();
+    let boundaries = raw_ie_boundaries(&ies);
+    let pair = boundaries
+        .windows(2)
+        .find(|pair| ies[pair[0]] == IE_TYPE_BEARER_CONTEXT)
+        .expect("fixture has a bearer context");
+    let (start, end) = (pair[0], pair[1]);
+    let mut members = ies[start + 4..end].to_vec();
+    members.extend_from_slice(appended);
+    ies.splice(start..end, bearer_context(0, &members));
+    encode_raw_message(message.header, ies)
+}
+
+fn assert_unexpected_bearer_ie_is_ignored(fixture: &[u8], bytes: &[u8]) {
+    let (_, expected) = S2bMessage::decode(fixture, procedure_context()).expect("valid baseline");
+    let (rest, decoded) = S2bMessage::decode_with_diagnostics(bytes, procedure_context())
+        .expect("TS 29.274 clause 7.7.9: unexpected IE must not reject the message");
+    assert!(rest.is_empty());
+    let view = decoded.message().as_view().expect("typed bearer view");
+    let baseline = expected.as_view().expect("typed baseline");
+    assert_eq!(view.ies, baseline.ies, "bearer policy must not change");
+    assert_eq!(view.header.teid, baseline.header.teid);
+    assert_eq!(view.header.sequence_number, baseline.header.sequence_number);
+    assert!(decoded.diagnostics().duplicate_ies().is_empty());
+    let mut canonical = BytesMut::new();
+    decoded
+        .message()
+        .encode(&mut canonical, EncodeContext::default())
+        .expect("canonical encode");
+    assert_eq!(canonical.as_ref(), fixture);
+    let mut preserved = BytesMut::new();
+    decoded
+        .message()
+        .encode(
+            &mut preserved,
+            EncodeContext {
+                raw_preserving: true,
+                ..EncodeContext::default()
+            },
+        )
+        .expect("raw-preserving encode");
+    assert_eq!(preserved.as_ref(), bytes);
+}
+
+#[test]
+fn dedicated_receive_discards_update_pco_at_both_scopes() {
+    // TS 29.274 Tables 7.2.15/16 and clause 7.7.9: PCO belongs to
+    // other interfaces, while Update Bearer on S2b assigns nested APCO.
+    for fixture in [
+        UPDATE_BEARER_REQUEST_FIXTURE,
+        UPDATE_BEARER_RESPONSE_FIXTURE,
+    ] {
+        for instance in [0, 1, 15] {
+            for value in [&[0x80][..], &[][..]] {
+                let mut unexpected = raw_ie(IE_TYPE_PCO, instance, value);
+                unexpected.extend_from_slice(&unexpected.clone());
+                assert_unexpected_bearer_ie_is_ignored(
+                    fixture,
+                    &append_raw_ies(fixture, &unexpected),
+                );
+                assert_unexpected_bearer_ie_is_ignored(
+                    fixture,
+                    &append_bearer_member(fixture, &unexpected),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn dedicated_receive_keeps_create_pco_compatibility_without_changing_bearer_policy() {
+    for fixture in [
+        CREATE_BEARER_REQUEST_FIXTURE,
+        CREATE_BEARER_RESPONSE_FIXTURE,
+    ] {
+        for instance in [0, 1, 15] {
+            let unexpected = raw_ie(IE_TYPE_PCO, instance, &[0x80]);
+            for bytes in [
+                append_raw_ies(fixture, &unexpected),
+                append_bearer_member(fixture, &unexpected),
+            ] {
+                let (_, decoded) = S2bMessage::decode(&bytes, procedure_context())
+                    .expect("Create PCO remains compatible");
+                let mut ies = decoded.as_view().expect("Create view").ies.clone();
+                ies.retain(|ie| ie.ie_type() != IE_TYPE_PCO);
+                for ie in &mut ies {
+                    if let TypedIeValue::BearerContext(context) = &mut ie.value {
+                        context
+                            .members
+                            .retain(|member| member.ie_type() != IE_TYPE_PCO);
+                    }
+                }
+                let (_, baseline) =
+                    S2bMessage::decode(fixture, procedure_context()).expect("baseline");
+                assert_eq!(ies, baseline.as_view().expect("baseline view").ies);
+            }
+        }
+    }
+}
+
+#[test]
+fn dedicated_receive_discards_non_s2b_user_plane_fteid_instances() {
+    // TS 29.274 Tables 7.2.3-2 and 7.2.4-2: S2b-U uses request instance
+    // 4 and response instances 8/9. Table 7.2.16-2 has no S2b-U F-TEID.
+    for (fixture, expected_instances) in [
+        (CREATE_BEARER_REQUEST_FIXTURE, &[4][..]),
+        (CREATE_BEARER_RESPONSE_FIXTURE, &[8, 9][..]),
+        (UPDATE_BEARER_REQUEST_FIXTURE, &[][..]),
+        (UPDATE_BEARER_RESPONSE_FIXTURE, &[][..]),
+    ] {
+        for instance in 0..=15 {
+            if expected_instances.contains(&instance) {
+                continue;
+            }
+            // Even an uninterpretable value is ignored at an unexpected slot.
+            let unexpected = raw_ie(opc_proto_gtpv2c::IE_TYPE_F_TEID, instance, &[]);
+            assert_unexpected_bearer_ie_is_ignored(
+                fixture,
+                &append_bearer_member(fixture, &unexpected),
+            );
+        }
+    }
+}
+
+#[test]
+fn dedicated_receive_ignores_wrong_instances_and_other_interface_control_ies() {
+    for fixture in [
+        CREATE_BEARER_REQUEST_FIXTURE,
+        CREATE_BEARER_RESPONSE_FIXTURE,
+        UPDATE_BEARER_REQUEST_FIXTURE,
+        UPDATE_BEARER_RESPONSE_FIXTURE,
+    ] {
+        for ie_type in [
+            IE_TYPE_EBI,
+            IE_TYPE_CAUSE,
+            IE_TYPE_AMBR,
+            IE_TYPE_BEARER_QOS,
+            opc_proto_gtpv2c::IE_TYPE_BEARER_TFT,
+            IE_TYPE_APCO,
+            IE_TYPE_BEARER_CONTEXT,
+        ] {
+            let unexpected = raw_ie(ie_type, 15, &[]);
+            assert_unexpected_bearer_ie_is_ignored(fixture, &append_raw_ies(fixture, &unexpected));
+            assert_unexpected_bearer_ie_is_ignored(
+                fixture,
+                &append_bearer_member(fixture, &unexpected),
+            );
+        }
+    }
+    for fixture in [
+        CREATE_BEARER_REQUEST_FIXTURE,
+        UPDATE_BEARER_REQUEST_FIXTURE,
+        DELETE_BEARER_REQUEST_FIXTURE,
+    ] {
+        // SGW load/overload entries are not assigned to S2b.
+        for (ie_type, instance) in [
+            (IE_TYPE_LOAD_CONTROL_INFORMATION, 2),
+            (IE_TYPE_OVERLOAD_CONTROL_INFORMATION, 1),
+        ] {
+            let unexpected = raw_ie(ie_type, instance, &[]);
+            assert_unexpected_bearer_ie_is_ignored(fixture, &append_raw_ies(fixture, &unexpected));
+        }
+    }
+}
+
+#[test]
+fn dedicated_receive_keeps_framing_and_required_bearer_validation() {
+    for fixture in [
+        CREATE_BEARER_REQUEST_FIXTURE,
+        CREATE_BEARER_RESPONSE_FIXTURE,
+        UPDATE_BEARER_REQUEST_FIXTURE,
+        UPDATE_BEARER_RESPONSE_FIXTURE,
+    ] {
+        // Unexpected values can be ignored only inside a complete TLIV frame.
+        let truncated = [IE_TYPE_PCO, 0, 2, 15, 0x80];
+        assert!(
+            S2bMessage::decode(&append_raw_ies(fixture, &truncated), procedure_context()).is_err()
+        );
+        assert!(S2bMessage::decode(
+            &append_bearer_member(fixture, &truncated),
+            procedure_context()
+        )
+        .is_err());
+        let (_, message) = Message::decode(fixture, structural_context()).expect("fixture decodes");
+        let mut ies = message.raw_ies.to_vec();
+        let boundaries = raw_ie_boundaries(&ies);
+        let start = boundaries
+            .into_iter()
+            .find(|offset| ies.get(*offset) == Some(&IE_TYPE_BEARER_CONTEXT))
+            .expect("bearer context exists");
+        // An unexpected context cannot replace the mandatory instance zero.
+        ies[start + 3] = 15;
+        assert!(S2bMessage::decode(
+            &encode_raw_message(message.header, ies),
+            procedure_context()
+        )
+        .is_err());
+    }
+}
 
 fn procedure_context() -> DecodeContext {
     DecodeContext {

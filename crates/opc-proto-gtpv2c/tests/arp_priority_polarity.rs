@@ -1,20 +1,9 @@
-//! Pins the TS 29.274 Allocation and Retention Priority polarity (issue #1354).
+//! TS 29.274 clause 8.15 and TS 29.212 clauses 5.3.45-5.3.47 ARP contracts.
 //!
-//! The reported symptom was an allegedly inverted priority level: a higher
-//! numerical level being treated as more important. The GTPv2-C ARP octet packs
-//! Priority-Level (bits 6-3), Pre-emption-Capability (bit 7) and
-//! Pre-emption-Vulnerability (bit 1); bits 8 and 2 are spare. Level 1 is the
-//! highest priority and level 15 the lowest, and the octet's level field is an
-//! identity mapping of that value (`level << 2`), not `16 - level`.
-//!
-//! The sibling ARP carriers audited for the same symptom are direct integer
-//! mappings with no octet packing: `opc-proto-ngap`'s
-//! `AllocationRetentionPriority` stores the 1..=15 priority verbatim
-//! (`crates/opc-proto-ngap/src/n3iwf/qos_fields.rs`), and
-//! `opc-proto-diameter`'s SWm `SwmPriorityLevel` maps the Diameter Unsigned32
-//! 1..=15 verbatim (`crates/opc-proto-diameter/src/apps/swm.rs`). Only the
-//! GTPv2-C octet packing could invert the polarity, so this regression pins it
-//! and the audit records why no sibling change is needed.
+//! Priority-Level is the literal value 1..=15, with 1 the highest priority.
+//! Capability and vulnerability use the Diameter convention: zero enables
+//! pre-emption and one disables it. The public booleans express permission,
+//! independently of the raw PCI/PVI bits. Bits 8 and 2 remain spare.
 
 use opc_proto_gtpv2c::{AllocationRetentionPriority, BearerQos, BearerQosValidationError};
 
@@ -24,11 +13,11 @@ fn arp(level: u8, pci: bool, pvi: bool) -> AllocationRetentionPriority {
 
 #[test]
 fn level_one_is_the_highest_priority_and_encodes_as_0x04() {
-    let highest = arp(1, false, false);
+    let highest = arp(1, true, true);
     assert_eq!(highest.priority_level(), 1);
     assert_eq!(highest.to_octet(), 0x04);
 
-    let lowest = arp(15, false, false);
+    let lowest = arp(15, true, true);
     assert_eq!(lowest.priority_level(), 15);
     assert_eq!(lowest.to_octet(), 0x3c);
 
@@ -53,7 +42,7 @@ fn octet_level_field_is_an_identity_mapping_for_every_level() {
     for level in 1..=15u8 {
         for (pci, pvi) in [(false, false), (true, false), (false, true), (true, true)] {
             let value = arp(level, pci, pvi);
-            let expected = ((pci as u8) << 6) | (level << 2) | (pvi as u8);
+            let expected = ((!pci as u8) << 6) | (level << 2) | (!pvi as u8);
             assert_eq!(
                 value.to_octet(),
                 expected,
@@ -69,7 +58,7 @@ fn octet_level_field_is_an_identity_mapping_for_every_level() {
             if level != 8 {
                 assert_ne!(
                     expected,
-                    ((pci as u8) << 6) | ((16 - level) << 2) | (pvi as u8),
+                    ((!pci as u8) << 6) | ((16 - level) << 2) | (!pvi as u8),
                     "level {level} must not be encoded as 16 - level"
                 );
             }
@@ -133,4 +122,25 @@ fn bearer_qos_octet_keeps_the_same_polarity() {
             .priority_level(),
         15
     );
+}
+
+#[test]
+fn preemption_flags_decode_zero_as_enabled() {
+    // The literal ARP octet in the Update Bearer issue payload has PCI=0,
+    // PL=4 and PVI=1: it may pre-empt, but must not be pre-empted.
+    let decoded = AllocationRetentionPriority::from_octet(0x11).expect("valid ARP");
+    assert_eq!(decoded.priority_level(), 4);
+    assert!(decoded.preemption_capability());
+    assert!(!decoded.preemption_vulnerability());
+    let disabled = AllocationRetentionPriority::from_octet(0x4d).expect("valid ARP");
+    assert!(!disabled.preemption_capability());
+    assert!(!disabled.preemption_vulnerability());
+}
+
+#[test]
+fn preemption_flags_encode_zero_as_enabled() {
+    assert_eq!(arp(2, true, false).to_octet(), 0x09);
+    assert_eq!(arp(2, false, true).to_octet(), 0x48);
+    assert_eq!(arp(2, true, true).to_octet(), 0x08);
+    assert_eq!(arp(2, false, false).to_octet(), 0x49);
 }
