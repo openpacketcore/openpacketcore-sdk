@@ -1206,6 +1206,9 @@ fn qualification_store_error_class(error: &StoreError) -> QualificationTrafficEr
         StoreError::BackendOperationOutcomeUnavailable => {
             QualificationTrafficErrorClass::BackendOperationOutcomeUnavailable
         }
+        StoreError::RestoreScanWorkBudgetExceeded => {
+            QualificationTrafficErrorClass::RestoreScanWorkBudgetExceeded
+        }
         StoreError::NotFound
         | StoreError::StaleFence
         | StoreError::TopologyAuthorityRevoked

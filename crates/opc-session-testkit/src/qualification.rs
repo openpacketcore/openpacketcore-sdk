@@ -6751,6 +6751,11 @@ pub enum QualificationTrafficErrorClass {
     CasIdempotencyOutcomeUnavailable,
     BackendOperationOutcomeUnavailable,
     LeaseLostOrInvalid,
+    /// The authoritative restore scan exhausted its fixed witness/VM work
+    /// budget. This is terminal and distinct from slow progress (which reports
+    /// `BackendUnavailable` and is retryable within the bounded recovery
+    /// episode).
+    RestoreScanWorkBudgetExceeded,
     Other,
 }
 

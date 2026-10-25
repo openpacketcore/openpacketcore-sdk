@@ -211,6 +211,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested campaign; the accelerator stays inactive when automatic elections
   are disabled and never runs on the leader. Refs #1037.
 
+- `opc-session-store` / `opc-session-testkit`: a survivor restore scan whose
+  caller deadline is consumed by the logical-time fence or the backend scan
+  phase now reports a retryable availability outcome instead of the terminal
+  `RestoreScanWorkBudgetExceeded`, so the bounded qualification recovery
+  episode retries it and accepts the later exact page. No deadline is raised and
+  no restore authority or exactly-once behavior changes; genuine fixed
+  scan-work-budget exhaustion remains terminal and is now recorded as its own
+  closed qualification error class instead of opaque `Other`. Refs #1160.
+
 - `opc-persist`: configuration snapshot build, install and repair deadlines now
   derive from the bytes each stage moves instead of one fixed wall-clock budget
   (#1339). Build derives its SQLite backup stage from the database size and its

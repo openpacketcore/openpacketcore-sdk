@@ -1063,6 +1063,12 @@ fn fixed_quorum_application_traffic_authority_is_exact_sync(
     Ok(authority_is_exact)
 }
 
+/// Retryable availability outcome for a restore scan that exhausted the
+/// caller's absolute operation deadline. The deadline itself is unchanged.
+pub(crate) fn restore_scan_deadline_unavailable() -> StoreError {
+    StoreError::BackendUnavailable("session restore scan deadline exceeded".into())
+}
+
 impl SqliteSessionBackend {
     /// Install a test-only I/O fault before opening the native owner. The
     /// callback runs before ordinary generation publication; it cannot replace
@@ -3903,7 +3909,7 @@ impl SqliteSessionBackend {
                 )
                 .await;
             return if tokio::time::Instant::now() >= deadline {
-                Err(StoreError::RestoreScanWorkBudgetExceeded)
+                Err(restore_scan_deadline_unavailable())
             } else {
                 result
             };
@@ -3935,14 +3941,14 @@ impl SqliteSessionBackend {
             Arc::clone(&self.restore_scan_workers).acquire_owned(),
         )
         .await
-        .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?
+        .map_err(|_| restore_scan_deadline_unavailable())?
         .map_err(|_| StoreError::BackendUnavailable("session restore scan unavailable".into()))?;
         // Acquire the async connection guard before entering the blocking
         // pool so a busy connection is part of the same absolute operation
         // deadline and never strands a blocking thread waiting on a mutex.
         let conn = tokio::time::timeout_at(deadline, Arc::clone(&self.conn).lock_owned())
             .await
-            .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)?;
+            .map_err(|_| restore_scan_deadline_unavailable())?;
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((conn, worker_permit, request))));
         let task_job = Arc::clone(&queued_job);
@@ -3955,7 +3961,7 @@ impl SqliteSessionBackend {
                 .take()?;
             let _worker_permit = worker_permit;
             if task_cancellation.load(Ordering::Acquire) {
-                return Some(Err(StoreError::RestoreScanWorkBudgetExceeded));
+                return Some(Err(restore_scan_deadline_unavailable()));
             }
             let read = || {
                 let tx = if profile.is_standalone() {
@@ -3983,7 +3989,7 @@ impl SqliteSessionBackend {
                     Err(error) => return Some(Err(error)),
                 };
                 if task_cancellation.load(Ordering::Acquire) {
-                    return Some(Err(StoreError::RestoreScanWorkBudgetExceeded));
+                    return Some(Err(restore_scan_deadline_unavailable()));
                 }
                 if tx.commit().is_err() {
                     return Some(Err(StoreError::BackendUnavailable(
@@ -4021,7 +4027,7 @@ impl SqliteSessionBackend {
             armed: true,
         };
         match tokio::time::timeout_at(deadline, task).await {
-            Err(_) => Err(StoreError::RestoreScanWorkBudgetExceeded),
+            Err(_) => Err(restore_scan_deadline_unavailable()),
             Ok(Err(_)) => {
                 cancel_on_drop.disarm();
                 Err(StoreError::BackendUnavailable(
@@ -4030,11 +4036,22 @@ impl SqliteSessionBackend {
             }
             Ok(Ok(Some(result))) => {
                 cancel_on_drop.disarm();
-                result
+                // A SQLite/sync progress interrupt can mean either the caller's
+                // deadline/cancellation or the fixed scan work budget. Only the
+                // former is a retryable availability outcome; genuine budget
+                // exhaustion stays terminal.
+                if matches!(result, Err(StoreError::RestoreScanWorkBudgetExceeded))
+                    && (tokio::time::Instant::now() >= deadline
+                        || cancellation.load(Ordering::Acquire))
+                {
+                    Err(restore_scan_deadline_unavailable())
+                } else {
+                    result
+                }
             }
             Ok(Ok(None)) => {
                 cancel_on_drop.disarm();
-                Err(StoreError::RestoreScanWorkBudgetExceeded)
+                Err(restore_scan_deadline_unavailable())
             }
         }
     }
@@ -6099,7 +6116,14 @@ mod restore_cancellation_tests {
                 )
                 .await
                 .expect_err("queued scan must stop at its absolute deadline");
-            assert_eq!(error, StoreError::RestoreScanWorkBudgetExceeded);
+            assert!(
+                matches!(
+                    error,
+                    StoreError::BackendUnavailable(message)
+                        if message == "session restore scan deadline exceeded"
+                ),
+                "a queued worker timeout is retryable availability, not terminal work-budget exhaustion"
+            );
         }
         drop(held_permit);
 
@@ -6124,7 +6148,14 @@ mod restore_cancellation_tests {
             )
             .await
             .expect_err("connection admission must stop at the operation deadline");
-        assert_eq!(error, StoreError::RestoreScanWorkBudgetExceeded);
+        assert!(
+            matches!(
+                error,
+                StoreError::BackendUnavailable(message)
+                    if message == "session restore scan deadline exceeded"
+            ),
+            "a connection-admission timeout is retryable availability"
+        );
         assert_eq!(
             backend.restore_scan_workers.available_permits(),
             RESTORE_SCAN_BLOCKING_WORKERS,

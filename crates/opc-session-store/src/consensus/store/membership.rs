@@ -2204,6 +2204,8 @@ impl ConsensusSessionStore {
             restore_scan_unavailable_for_test: AtomicBool::new(false),
             #[cfg(feature = "test-control")]
             restore_scan_rejections_for_test: AtomicU64::new(0),
+            #[cfg(feature = "test-control")]
+            restore_scan_fence_delay_for_test: Mutex::new(None),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,

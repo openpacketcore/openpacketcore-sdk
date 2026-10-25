@@ -123,6 +123,21 @@ pub fn set_consensus_restore_scan_unavailable_for_test(
         .store(unavailable, Ordering::Release);
 }
 
+/// Delay the logical-time fence phase of the next restore scan by `delay`.
+///
+/// This deterministically places the caller's absolute operation deadline in
+/// the fence phase without changing any deadline or production behavior.
+pub fn set_consensus_restore_scan_fence_delay_for_test(
+    store: &ConsensusSessionStore,
+    delay: Option<std::time::Duration>,
+) {
+    *store
+        .inner
+        .restore_scan_fence_delay_for_test
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = delay;
+}
+
 /// Number of restore scans that reached the armed dispatch fault.
 pub fn consensus_restore_scan_rejections_for_test(store: &ConsensusSessionStore) -> u64 {
     store

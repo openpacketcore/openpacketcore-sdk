@@ -2135,6 +2135,10 @@ struct ConsensusSessionStoreInner {
     restore_scan_unavailable_for_test: AtomicBool,
     #[cfg(feature = "test-control")]
     restore_scan_rejections_for_test: AtomicU64,
+    /// Deterministically delays the logical-time fence phase of one restore
+    /// scan so tests can place the operation deadline squarely in that phase.
+    #[cfg(feature = "test-control")]
+    restore_scan_fence_delay_for_test: Mutex<Option<Duration>>,
     proactive_checkpoint_lane: Option<Arc<crate::sqlite::consensus::ProactiveCheckpointLane>>,
     consensus_log_prune_lane: Option<Arc<crate::sqlite::consensus::ConsensusLogPruneLane>>,
     storage_identity: SessionConsensusIdentity,
@@ -4013,6 +4017,8 @@ impl ConsensusSessionStore {
             restore_scan_unavailable_for_test: AtomicBool::new(false),
             #[cfg(feature = "test-control")]
             restore_scan_rejections_for_test: AtomicU64::new(0),
+            #[cfg(feature = "test-control")]
+            restore_scan_fence_delay_for_test: Mutex::new(None),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,
@@ -4262,6 +4268,8 @@ impl ConsensusSessionStore {
             restore_scan_unavailable_for_test: AtomicBool::new(false),
             #[cfg(feature = "test-control")]
             restore_scan_rejections_for_test: AtomicU64::new(0),
+            #[cfg(feature = "test-control")]
+            restore_scan_fence_delay_for_test: Mutex::new(None),
             proactive_checkpoint_lane,
             consensus_log_prune_lane,
             storage_identity,
@@ -11292,6 +11300,17 @@ fn session_raft_config() -> Result<opc_consensus::engine::Config, ConsensusSessi
         .map_err(|_| ConsensusSessionStoreOpenError::InvalidRuntimeConfiguration)
 }
 
+/// Retryable availability outcome for slow restore-scan progress.
+///
+/// The caller's single absolute operation deadline is unchanged. A deadline in
+/// the logical-time fence or backend scan phase means the store could not
+/// complete the read in time, not that the fixed scan work budget is
+/// exhausted; callers may retry or fail over. Genuine work-budget exhaustion
+/// continues to use `StoreError::RestoreScanWorkBudgetExceeded`.
+fn restore_scan_availability() -> StoreError {
+    StoreError::BackendUnavailable("session restore scan deadline exceeded".into())
+}
+
 fn consensus_unavailable() -> StoreError {
     StoreError::BackendUnavailable("session consensus quorum is unavailable".into())
 }
@@ -16792,11 +16811,28 @@ impl SessionBackend for ConsensusSessionStore {
         request.validate()?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
-            .ok_or(StoreError::RestoreScanWorkBudgetExceeded)?;
-        let logical_time =
-            tokio::time::timeout_at(deadline, self.logical_read_time_before(None, deadline))
-                .await
-                .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)??;
+            .ok_or_else(restore_scan_availability)?;
+        // Phase 1 is the logical-time fence: one committed proposal plus local
+        // apply. Slow consensus progress in this phase is a retryable
+        // availability outcome, not evidence that the fixed scan work budget is
+        // exhausted. Callers keep their single absolute operation deadline.
+        #[cfg(feature = "test-control")]
+        let fence_delay = self
+            .inner
+            .restore_scan_fence_delay_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let fence = async {
+            #[cfg(feature = "test-control")]
+            if let Some(delay) = fence_delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.logical_read_time_before(None, deadline).await
+        };
+        let logical_time = tokio::time::timeout_at(deadline, fence)
+            .await
+            .map_err(|_| restore_scan_availability())??;
         #[cfg(feature = "test-control")]
         if self
             .inner

@@ -1190,7 +1190,7 @@ pub(crate) fn scan_restore_records_sync(
         operation_deadline.clone(),
     );
     if cancellation.load(Ordering::Acquire) {
-        return Err(StoreError::RestoreScanWorkBudgetExceeded);
+        return Err(super::restore_scan_deadline_unavailable());
     }
     if profile.is_standalone() {
         prune_sync(conn, now)?;
@@ -1235,7 +1235,7 @@ pub(crate) fn scan_restore_records_sync(
     let mut records = Vec::with_capacity(selection.candidates.len());
     for candidate in std::mem::take(&mut selection.candidates) {
         if cancellation.load(Ordering::Acquire) || operation_deadline.is_elapsed() {
-            return Err(StoreError::RestoreScanWorkBudgetExceeded);
+            return Err(super::restore_scan_deadline_unavailable());
         }
         let record = candidate.load_record(conn)?;
         profile.validate_record(&record)?;
@@ -1243,7 +1243,7 @@ pub(crate) fn scan_restore_records_sync(
     }
 
     if cancellation.load(Ordering::Acquire) {
-        return Err(StoreError::RestoreScanWorkBudgetExceeded);
+        return Err(super::restore_scan_deadline_unavailable());
     }
 
     selection.finish(

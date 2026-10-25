@@ -273,6 +273,48 @@ async fn restore_scan_reproof_preserves_every_page_validation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn restore_scan_transient_availability_is_retried_then_succeeds() {
+    // A slow logical-time fence or backend scan phase now reports retryable
+    // availability (BackendUnavailable) instead of terminal work-budget
+    // exhaustion. The bounded recovery episode must retry it and accept the
+    // later exact page without changing any deadline or authority.
+    let (expected, page) = exact_restore_page();
+    let observation = QualificationTrafficObservation::new(37, 3);
+    let mut consecutive = 0;
+    assert!(observation.record_availability_interruption(&mut consecutive));
+    let started = tokio::time::Instant::now();
+    let mut calls = 0;
+    let result = prove_traffic_restore_scan_recovery(
+        || {
+            calls += 1;
+            if calls == 1 {
+                std::future::ready(Err(StoreError::BackendUnavailable(
+                    "slow restore-scan progress".into(),
+                )))
+            } else {
+                std::future::ready(Ok(page.clone()))
+            }
+        },
+        &expected,
+        started,
+        traffic_recovery_deadline(started, None),
+        &mut consecutive,
+        &observation,
+    )
+    .await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        calls, 2,
+        "the first transient availability result is retried"
+    );
+    assert_eq!(
+        observation.availability_snapshot().interruptions,
+        2,
+        "the initial interruption and the retried transient result are both recorded"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn restore_scan_reproof_keeps_work_budget_errors_terminal() {
     let (expected, _) = exact_restore_page();
     let observation = QualificationTrafficObservation::new(37, 3);
@@ -292,15 +334,20 @@ async fn restore_scan_reproof_keeps_work_budget_errors_terminal() {
         &observation,
     )
     .await;
+    let failure = result.expect_err("real work-budget exhaustion stays terminal");
     assert_eq!(
-        result,
-        Err(QualificationTrafficFailure::store(
-            QualificationTrafficFailureCode::RestoreScanRejected,
-            QualificationTrafficFailureStage::RestoreScan,
-            &StoreError::RestoreScanWorkBudgetExceeded,
-        ))
+        failure.code,
+        QualificationTrafficFailureCode::RestoreScanRejected
     );
+    assert_eq!(failure.stage, QualificationTrafficFailureStage::RestoreScan);
+    assert_eq!(
+        failure.error_class,
+        QualificationTrafficErrorClass::RestoreScanWorkBudgetExceeded,
+        "the exact terminal variant is recorded instead of the opaque Other class"
+    );
+    assert!(!traffic_failure_is_recoverable(failure));
     assert_eq!(calls, 1);
+    assert_eq!(observation.availability_snapshot().recoveries, 0);
     assert_eq!(consecutive, 1);
     assert_eq!(tokio::time::Instant::now(), started);
 }
