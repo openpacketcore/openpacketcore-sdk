@@ -133,7 +133,7 @@ impl fmt::Display for Teid {
 ///
 /// TEIDs are sensitive routing/session handles. `Debug` and `Display` never
 /// emit the raw value.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct PeerTeid(u32);
 
 impl PeerTeid {

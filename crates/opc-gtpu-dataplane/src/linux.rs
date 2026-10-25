@@ -4488,6 +4488,22 @@ mod tests {
     }
 
     #[test]
+    fn pdp_readback_pins_zero_peer_teid_typed_refusal() {
+        let selector_context = pdp_context();
+        let selector = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(&selector_context).unwrap(),
+        );
+        let mut zero_peer = selector_context;
+        zero_peer.peer_teid = PeerTeid::ZERO;
+        assert!(matches!(
+            parse_pdp_context_response(&pdp_response(&zero_peer, true), &selector, 31),
+            Err(GtpuError::UnsupportedFeature {
+                feature: "peer_teid_zero"
+            })
+        ));
+    }
+
+    #[test]
     fn pdp_readback_decoder_rejects_ambiguous_or_malformed_identity() {
         let context = pdp_context();
         let selector = PdpContextSelector::LocalTeid(

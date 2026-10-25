@@ -6411,6 +6411,11 @@ impl EbpfGtpuDataplaneBackend {
         match self.validate_grouped_model_attachment(&group, context) {
             Ok(()) => match reject_zero_peer_group(&group) {
                 Ok(()) => GtpuSessionGroupReadback::Active(group),
+                // Defense in depth only: the public grouped-readback entry
+                // points return the typed `peer_teid_zero` refusal before this
+                // classifier runs. If a future caller reaches this fallback,
+                // fail closed as indeterminate rather than exposing a
+                // forwarding claim the committed datapath object cannot honor.
                 Err(_) => GtpuSessionGroupReadback::Indeterminate(
                     GtpuSessionGroupIndeterminateReason::IncompleteState,
                 ),
