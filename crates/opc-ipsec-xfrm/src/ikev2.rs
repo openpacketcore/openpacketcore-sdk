@@ -733,6 +733,7 @@ pub fn build_xfrm_requests_from_ikev2_child_sa_with_options(
             output_mark: None,
             if_id: None,
             egress_dscp: None,
+            tfc_pad: None,
         },
     };
     let outbound_sa = InstallSaRequest {
@@ -753,6 +754,7 @@ pub fn build_xfrm_requests_from_ikev2_child_sa_with_options(
             output_mark: None,
             if_id: None,
             egress_dscp: None,
+            tfc_pad: None,
         },
     };
     let inbound_policy = InstallPolicyRequest {

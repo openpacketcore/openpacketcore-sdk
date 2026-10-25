@@ -9,7 +9,10 @@
 //! a deterministic mock backend for tests, an unsupported-platform backend, and
 //! redaction-safe error types. SA parameters can carry an independent Linux
 //! lookup mark and a masked post-transform output mark; the latter is applied
-//! to inbound/decrypt SAs as well as outbound SAs. With the `ikev2` feature,
+//! to inbound/decrypt SAs as well as outbound SAs. They can also request
+//! Traffic Flow Confidentiality padding through `SaParameters::tfc_pad`, which
+//! emits the Linux `XFRMA_TFCPAD` attribute for ESP tunnel-mode SAs and is
+//! reported by exact `GETSA` readback. With the `ikev2` feature,
 //! `Ikev2ChildSaXfrmOptions` carries caller-validated directional initial
 //! ESP-in-UDP templates through the typed Child-SA mapper; NAT detection and
 //! translated-port selection remain caller-owned. An exact single-SA
@@ -450,6 +453,7 @@ mod integration_tests {
             output_mark: None,
             if_id: None,
             egress_dscp: None,
+            tfc_pad: None,
         }
     }
 

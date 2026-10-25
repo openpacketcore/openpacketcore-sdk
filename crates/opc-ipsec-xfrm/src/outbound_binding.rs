@@ -24,6 +24,12 @@ const IPPROTO_ESP: u8 = 50;
 /// freshly validated through its namespace-bound actor. `from_bytes` exists so
 /// persisted plans can decode the correlation value; constructing or matching
 /// an ID alone cannot mint a binding.
+///
+/// The versioned fingerprint behind this ID does not cover
+/// `SaParameters::tfc_pad` in this revision, so two SAs that differ only in
+/// TFC padding produce the same ID. Widening it needs a new
+/// `opc-xfrm-outbound-sa-binding` domain version and a migration plan for
+/// persisted IDs; that is tracked as a follow-up (refs #1344).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutboundSaBindingId([u8; 32]);
 
@@ -460,6 +466,13 @@ fn template_matches_sa(template: &XfrmTemplate, sa: &SaParameters) -> bool {
         && template.mode == sa.mode
 }
 
+/// Versioned keyed fingerprint of one outbound SA install identity.
+///
+/// # Known coverage gap
+///
+/// `SaParameters::tfc_pad` is not hashed. Two outbound installs that differ
+/// only in TFC padding produce the same binding identity; see
+/// [`OutboundSaBindingId`] for the auth-domain-v2 and migration follow-up.
 fn fingerprint_sa(parameters: &SaParameters) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"opc-xfrm-outbound-sa-binding-v1\0");
@@ -685,6 +698,7 @@ pub(crate) mod tests_support {
             output_mark: None,
             if_id: Some(19),
             egress_dscp: None,
+            tfc_pad: None,
         };
         let policy = PolicyParameters {
             selector,

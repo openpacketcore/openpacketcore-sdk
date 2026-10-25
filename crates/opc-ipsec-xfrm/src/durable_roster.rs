@@ -641,6 +641,12 @@ impl fmt::Display for XfrmObjectRosterMemberId {
 }
 
 /// Independent keyed fingerprints of one member's kernel identity and request.
+///
+/// The request fingerprint uses the same encoder as the single-object store
+/// and likewise does not cover `SaParameters::tfc_pad` under the current
+/// `opc-xfrm-roster-install-request-v1` domain. A v1-sealed member therefore
+/// cannot distinguish two requests that differ only in TFC padding. The
+/// auth-domain-v2 and migration follow-up is tracked separately (refs #1344).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct XfrmObjectRosterMemberFingerprints {
     pub(crate) deletion_identity: [u8; 32],
@@ -5043,6 +5049,7 @@ mod tests {
                 output_mark: None,
                 if_id: None,
                 egress_dscp: None,
+                tfc_pad: None,
             },
         })
     }
