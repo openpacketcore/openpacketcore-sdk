@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: staged the RFC 017 mixed-selector-provenance codec and
+  preflight slice (internal; no public API or backend behavior change). Added
+  canonical `DrainQualificationCodecV1` (305 bytes) and `TransferEdgeCodecV1`
+  (289 bytes) codecs per RFC 017 section 4.2, and a mixed-provenance
+  composition preflight that builds the exact provenance partition and exactly
+  one transfer edge per retired atom. It refuses missing/duplicate/foreign/
+  stale drain qualifications, a changed predecessor set, same-group sources
+  cited as transfers, gaps, overlaps, duplicate predecessors, and fresh atoms
+  carrying predecessor lineage, before any durable or backend effect. The
+  one-CAS ledger-v2 admission, transfer-gate transitions, coordinator wiring
+  and loss-qualified same-group restore remain unimplemented; RFC 017 row
+  017-1 is now `partial`. Refs #663.
+
 - `opc-persist`: retained-authority provisioning is now crash-resumable. A
   fixed-size authenticated provisioning intent (`<database>.opc-retained.intent`).
   It binds the exact topology, backing identity, key scope, audit-key
