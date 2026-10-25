@@ -170,6 +170,17 @@ pipelined writes, with outstanding writes and divergent survivor logs at the
 fault. They require fresh quorum authority, a new write and survivor
 reconciliation within 26 seconds, preserving acknowledged writes. These paused
 engine regressions do not qualify process scheduling or disk latency.
+The SDK configuration adapter additionally bounds the avoidable second
+unplanned-loss window without changing this profile: after one complete declared
+leader lease plus the existing stale-route grace of no authenticated leader
+contact, a follower requests an ordinary engine Pre-Vote round
+(`DURABLE_CONSENSUS_FAILOVER_PATIENCE`, polled at
+`DURABLE_CONSENSUS_FAILOVER_POLL_INTERVAL` and staggered by membership rank).
+Peer leader leases still deny the inquiry for a live leader, and the engine's
+normal persisted-vote election remains the only path to leadership, so no vote
+is fabricated. The conditional first-campaign bound derived from the fixed
+profile is documented in `docs/consensus-operator-runbook.md` §2.4.
+
 The `dangerous-test-hooks` feature exposes a scoped Tokio runtime adapter for
 these fixtures. Outside a script it uses Tokio's ordinary RNG, and production
 dependencies do not enable this feature. It uses the engine's existing rand 0.8

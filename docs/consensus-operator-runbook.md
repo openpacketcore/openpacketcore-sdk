@@ -187,6 +187,49 @@ independently persisted committed index, applied index, non-secret audit-key
 epoch/fingerprint, and admission state. Use it for routing and
 diagnostics, but keep readiness gated by the fresh probe.
 
+### 2.4 Unplanned leader loss and failover evidence
+
+The pinned engine treats a follower's committed vote as a leader lease equal to
+`election_timeout_max` (8 seconds) and campaigns only after that lease **and
+then** a sampled election timeout (5-8 seconds). On an unplanned leader loss the
+configuration store therefore does not simply wait for the full second window:
+a follower that has observed no authenticated leader `AppendEntries` or
+`InstallSnapshot` for one complete declared lease plus the existing stale-route
+grace (8.2 seconds) asks the pinned engine for an **ordinary Pre-Vote round**
+through the public engine trigger. The engine still rejects that inquiry while
+any peer's leader lease is live, still persists a real self-vote, and still
+requires real quorum vote grants. No vote is fabricated and no election,
+heartbeat, lease or quorum budget is changed. Requests from survivors are
+staggered deterministically by membership rank.
+
+The derived conditional first-campaign bound is 9.05 seconds from the last
+authenticated leader contact for the highest follower rank: 8.2 seconds of
+declared lease plus stale-route grace, one 500 ms observation poll, and 50 ms of
+stagger per earlier follower for the maximum declared configuration membership
+(rank 0 waits at most 8.7 s; rank 7 in a 9-member configuration waits the 9.05 s
+bound). It assumes the standard engine ticker and network round trips complete
+within the fixed transport bounds above; split votes are outside the bound, as
+with every Raft election. A 5-process leader-kill and full 9-member
+max-membership qualification run remains an explicit deployment qualification
+follow-up; the deterministic SDK fixture covers a 3-voter cluster and the
+derived bound covers the maximum declared membership. The complete
+operation deadline (10 seconds by default) remains the outer typed bound for a
+mutation that was in flight during the loss; the existing request-identity
+idempotency contract keeps such a retry exactly once.
+
+`ConsensusConfigStore::failover_status()` returns value-free typed evidence:
+the current state (`Leading`, `NoKnownLeader`, `Following`,
+`LeaderSilent { millis_since_leader_contact, campaign_requested }`), the derived
+detection bound in milliseconds, and how many ordinary Pre-Vote campaigns this
+store requested. The
+`opc_persist_failover_accelerated_total` and
+`opc_persist_failover_trigger_failures_total` counters expose the same events to
+telemetry. A healthy leader whose heartbeat keeps arriving is never deposed by
+this path: peers deny the inquiry while their lease is live, and a merely
+delayed follower that requests an inquiry consumes no term. Do not disable
+normal elections (`enable_elect`) for a served store; the accelerator observes
+that setting and stays inactive while it is disabled.
+
 ## 3. Normal write and response-loss handling
 
 The application encrypts through `EncryptingManagedDatastore`. A successful

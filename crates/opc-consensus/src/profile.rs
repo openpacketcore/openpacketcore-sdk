@@ -199,6 +199,40 @@ pub const DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL: Duration = Duratio
 /// state machine's idempotency contract keeps it exactly-once.
 pub const DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE: Duration = Duration::from_millis(200);
 
+/// Cadence at which a durable configuration follower evaluates whether its last
+/// authenticated leader contact is old enough to request an ordinary Pre-Vote
+/// round.
+///
+/// This is a detection/observation cadence, not a new election, heartbeat or
+/// quorum budget: it is one quarter of the fixed AppendEntries heartbeat
+/// interval, so the accelerator cannot delay a declared heartbeat window.
+pub const DURABLE_CONSENSUS_FAILOVER_POLL_INTERVAL: Duration =
+    Duration::from_millis(DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis / 4);
+
+/// Leader-silence threshold after which a durable follower may ask the pinned
+/// engine for an ordinary Pre-Vote round on an unplanned leader loss.
+///
+/// The engine already treats a committed follower vote as a leader lease of
+/// `election_timeout_max` and only campaigns after that lease *plus* a sampled
+/// election timeout. Waiting for the complete declared lease plus the declared
+/// stale-route grace before requesting an ordinary (Pre-Vote gated) campaign
+/// removes that avoidable second election window without shortening any
+/// declared lease, heartbeat or quorum budget: peers still refuse the inquiry
+/// while their own lease is live, so a healthy or merely slow leader cannot be
+/// deposed by the request.
+pub const DURABLE_CONSENSUS_FAILOVER_PATIENCE: Duration = Duration::from_millis(
+    DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis
+        + DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE.as_millis() as u64,
+);
+
+/// Deterministic ordering offset between eligible followers that reach the
+/// silence threshold in the same evaluation window.
+///
+/// Staggering requests by a small constant avoids simultaneous campaigns from
+/// every survivor while keeping the documented first-campaign bound far below
+/// the complete operation deadline for the maximum configuration membership.
+pub const DURABLE_CONSENSUS_FAILOVER_TRIGGER_STAGGER: Duration = Duration::from_millis(50);
+
 /// Maximum number of log entries admitted to one durable AppendEntries batch.
 pub const DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES: usize = 64;
 
@@ -417,6 +451,27 @@ mod tests {
             DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE,
             Duration::from_millis(200)
         );
+        assert_eq!(
+            DURABLE_CONSENSUS_FAILOVER_POLL_INTERVAL,
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            DURABLE_CONSENSUS_FAILOVER_POLL_INTERVAL,
+            Duration::from_millis(profile.append_entries_timeout_millis / 4)
+        );
+        assert_eq!(
+            DURABLE_CONSENSUS_FAILOVER_PATIENCE,
+            Duration::from_millis(8_200)
+        );
+        assert_eq!(
+            DURABLE_CONSENSUS_FAILOVER_PATIENCE,
+            DURABLE_CONSENSUS_LEADER_QUORUM_LEASE + DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE
+        );
+        assert_eq!(
+            DURABLE_CONSENSUS_FAILOVER_TRIGGER_STAGGER,
+            Duration::from_millis(50)
+        );
+        assert!(DURABLE_CONSENSUS_FAILOVER_POLL_INTERVAL < DURABLE_CONSENSUS_FAILOVER_PATIENCE);
         assert!(DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE <= profile.operation_timeout());
         assert!(
             DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE

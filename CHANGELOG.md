@@ -165,6 +165,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: an unplanned configuration-consensus leader loss no longer
+  waits for the engine's committed-vote lease **plus** a full sampled election
+  timeout before survivors campaign. A follower that has observed no
+  authenticated leader traffic for one complete declared lease plus the existing
+  stale-route grace (8.2 s) now requests an ordinary Pre-Vote round through the
+  public engine trigger; peer leader leases still deny the inquiry for a live
+  leader and the engine still persists a real self-vote and requires real quorum
+  vote grants, so no vote is fabricated and no election, heartbeat, lease or
+  quorum budget changes. Requests are staggered deterministically by membership
+  rank; the derived conditional first-campaign bound is 9.05 s from the last
+  authenticated leader contact for the highest follower rank (rank 0: 8.7 s;
+  maximum membership 9) while the complete operation deadline remains
+  the outer typed bound for an in-flight mutation. The path is value-free
+  observable through `ConsensusConfigStore::failover_status()`, the
+  `opc_persist_failover_accelerated_total` and
+  `opc_persist_failover_trigger_failures_total` counters and one info log per
+  requested campaign; the accelerator stays inactive when automatic elections
+  are disabled and never runs on the leader. Refs #1037.
+
 - `opc-persist`: configuration snapshot build, install and repair deadlines now
   derive from the bytes each stage moves instead of one fixed wall-clock budget
   (#1339). Build derives its SQLite backup stage from the database size and its

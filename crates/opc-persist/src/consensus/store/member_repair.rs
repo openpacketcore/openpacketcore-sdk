@@ -473,6 +473,15 @@ impl ConsensusConfigStore {
             if self.installed_repair_is_ready().await {
                 *progress = None;
                 self.inner.repair_pending.store(false, Ordering::Release);
+                // A repair root is opened with automatic elections disabled
+                // and no fixed-slot voter profile (the failover accelerator is
+                // ineligible for both), so this completed-repair path is the
+                // only owner that restores the engine flag and the SDK mirror
+                // together.
+                debug_assert!(self.inner.voter_profile.is_none());
+                self.inner
+                    .automatic_elections_enabled
+                    .store(true, Ordering::Release);
                 self.inner.raft.runtime_config().elect(true);
                 self.inner.raft.runtime_config().heartbeat(true);
                 return Ok(());

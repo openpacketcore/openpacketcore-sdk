@@ -259,6 +259,38 @@ These bounds are progress/size based, never unbounded: the largest admissible
 artifact at the documented minimum throughput stays below the ceiling, and an
 operation that reaches its derived bound fails typed instead of extending.
 
+### Unplanned leader-loss failover
+
+The engine's committed-vote leader lease and its sampled election timeout are
+applied consecutively, so an unplanned configuration-leader loss would leave
+survivors quiet for the declared 8 s lease plus another 5-8 s election window.
+The store bounds that avoidable second window without changing any election,
+heartbeat, lease or quorum budget: after one complete declared lease plus the
+existing stale-route grace without authenticated leader traffic (8.2 s), a
+follower asks the pinned engine for an ordinary Pre-Vote round through the
+public trigger API. Peers still refuse the inquiry while their lease is live,
+the engine still persists a real self-vote, and real quorum vote grants are
+still required; no vote is fabricated and a healthy leader cannot be deposed.
+Survivor requests are staggered deterministically by membership rank, and the
+derived conditional first-campaign bound is 9.05 s from the last authenticated
+leader contact for the highest follower rank (8.2 s patience + 500 ms poll +
+50 ms per earlier follower for the maximum-membership stagger; rank 0 waits at
+most 8.7 s). A 5-process leader-kill and full 9-member max-membership
+qualification run remains an explicit deployment qualification follow-up. The default complete operation deadline remains the outer typed bound
+for an in-flight mutation, whose retry keeps the same request identity.
+
+The path is observable through
+`ConsensusConfigStore::failover_status()` (`Leading`, `NoKnownLeader`,
+`Following`, `LeaderSilent { millis_since_leader_contact, campaign_requested }`,
+plus the derived bound and accelerated-campaign count), the
+`opc_persist_failover_accelerated_total` and
+`opc_persist_failover_trigger_failures_total` counters, and one info log per
+requested campaign. The accelerator is inactive while automatic elections are
+disabled (repair roots, fixed-slot voter profiles and explicit test control) and
+never runs on the leader. A partial or delayed heartbeat stream can request at
+most one ordinary campaign per silence episode; it cannot change the term or
+the leader while a quorum still acknowledges the leader.
+
 The HA composition is:
 
 ```text

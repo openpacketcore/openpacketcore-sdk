@@ -1113,6 +1113,8 @@ pub struct SdkMetrics {
     pub persist_snapshot_build_degraded: AtomicU64,
     pub persist_quorum_lease_lost: AtomicU64,
     pub persist_quorum_lease_restored: AtomicU64,
+    pub persist_failover_accelerated: AtomicU64,
+    pub persist_failover_trigger_failures: AtomicU64,
     pub persist_rpc_auth_failures: AtomicU64,
     pub persist_audit_chain_verification_success: AtomicU64,
     pub persist_audit_chain_verification_failure: AtomicU64,
@@ -1295,6 +1297,8 @@ impl SdkMetrics {
             persist_snapshot_build_degraded: AtomicU64::new(0),
             persist_quorum_lease_lost: AtomicU64::new(0),
             persist_quorum_lease_restored: AtomicU64::new(0),
+            persist_failover_accelerated: AtomicU64::new(0),
+            persist_failover_trigger_failures: AtomicU64::new(0),
             persist_rpc_auth_failures: AtomicU64::new(0),
             persist_audit_chain_verification_success: AtomicU64::new(0),
             persist_audit_chain_verification_failure: AtomicU64::new(0),
@@ -1515,6 +1519,10 @@ impl SdkMetrics {
             .store(0, Ordering::Relaxed);
         self.persist_quorum_lease_lost.store(0, Ordering::Relaxed);
         self.persist_quorum_lease_restored
+            .store(0, Ordering::Relaxed);
+        self.persist_failover_accelerated
+            .store(0, Ordering::Relaxed);
+        self.persist_failover_trigger_failures
             .store(0, Ordering::Relaxed);
         self.persist_rpc_auth_failures.store(0, Ordering::Relaxed);
         self.persist_audit_chain_verification_success
@@ -2237,6 +2245,25 @@ pub fn export_prometheus_text() -> String {
         "counter",
         "Total count of configuration-consensus leader quorum-lease renewals that restored leader authority",
         quorum_lease_restored as f64,
+    );
+
+    let failover_accelerated = METRICS.persist_failover_accelerated.load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_persist_failover_accelerated_total",
+        "counter",
+        "Total count of unplanned-leader-loss ordinary Pre-Vote campaigns requested after declared leader silence",
+        failover_accelerated as f64,
+    );
+    let failover_trigger_failures = METRICS
+        .persist_failover_trigger_failures
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_persist_failover_trigger_failures_total",
+        "counter",
+        "Total count of failed failover-campaign trigger requests",
+        failover_trigger_failures as f64,
     );
 
     let snap_build_fail = METRICS
