@@ -8067,15 +8067,14 @@ impl NamespaceState {
         {
             return Err(GtpuSessionSelectorNamespaceError::Indeterminate);
         }
-        let mut codec = [0_u8; 145];
-        codec[0] = 1;
-        codec[1..33].copy_from_slice(&self.pin_commitment);
-        codec[33..49].copy_from_slice(&stable_device);
-        codec[49..65].copy_from_slice(&self.ledger_id);
-        codec[65..97].copy_from_slice(&self.key_commitment);
-        codec[97..129].copy_from_slice(&self.storage_scope_commitment);
-        codec[129..145].copy_from_slice(&self.backend_epoch);
-        Ok(codec)
+        Ok(crate::selector_adapter_codec::encode_binding_parts(
+            self.pin_commitment,
+            stable_device,
+            self.ledger_id,
+            self.key_commitment,
+            self.storage_scope_commitment,
+            self.backend_epoch,
+        ))
     }
 
     fn decommission_fence_is_exact(&self, fence: DecommissionFence) -> bool {

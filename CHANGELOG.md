@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: publish the RFC 016 external selector-adapter codec
+  module `selector_adapter_codec`: versioned canonical namespace binding
+  (145 bytes), operation stamp (208 bytes) and opaque terminal capsule
+  (110 bytes), with canonical rejection of wrong width, version, reserved or
+  inconsistent phase/outcome tuples, constant-time equality, closed
+  phase/request-kind/outcome classes and fully redacted `Debug`. Values can
+  only be decoded from durable bytes or minted from the SDK-issued opaque
+  `GtpuSessionSelectorBackendBinding`; there is no selector secret, raw
+  generation/commitment getter, public field/raw-part constructor, `Clone`, or
+  user-selected value. The built-in eBPF stamp and binding encoders now
+  delegate to the same canonical functions, so one codec serves both the
+  built-in and a future external adapter. External adapters remain
+  `Unsupported` until the RFC 016 §14.11 external-profile conformance harness
+  and qualification evidence exist. Refs #671.
+
 - `opc-proto-ikev2`: the executable IKE_SA_INIT/IKE_AUTH transform surface now
   covers RFC 3526 MODP groups 15-18 (Transform IDs 15/16/17/18, 3072/4096/6144/
   8192-bit) with exact 384/512/768/1024-octet public-value and shared-secret
