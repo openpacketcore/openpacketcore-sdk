@@ -601,6 +601,50 @@ pub struct SessionConsensusStatus {
     pub completed_snapshot_count: u64,
 }
 
+/// Fixed, value-free classification of a local snapshot build failure.
+///
+/// A failed local snapshot build is retried under a fixed bounded attempt and
+/// backoff budget. Only the indeterminate-publication and no-published-snapshot
+/// classes stop the Raft engine; the ordinary build-failure class keeps it
+/// serving on the unchanged current snapshot and stays retryable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSnapshotBuildFailureReason {
+    /// A capture or publication attempt failed and was retried.
+    BuildFailed,
+    /// The publication state is indeterminate and cannot resume in-process;
+    /// only a fresh core may resume snapshot publication.
+    IndeterminatePublication,
+    /// Bounded retries were exhausted and no published snapshot exists to keep
+    /// the engine running at.
+    NoPublishedSnapshot,
+    /// Bounded retries were exhausted and the current published snapshot could
+    /// not be read back; the durable snapshot state cannot be proven servable.
+    CurrentSnapshotUnreadable,
+}
+
+/// Bounded local snapshot build failure observation.
+///
+/// Fixed-width counters only: this never carries paths, identifiers, keys,
+/// payload material, or storage text. A later successful publication resets
+/// the consecutive-failure count but keeps the monotonic totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SessionSnapshotBuildFailure {
+    /// Fixed class of the most recent failure.
+    pub reason: SessionSnapshotBuildFailureReason,
+    /// Build attempts started since this core started, including retries.
+    pub started_attempts: u64,
+    /// Failed build attempts since this core started.
+    pub failed_attempts: u64,
+    /// Retry attempts started after a failed attempt of the same command.
+    pub retried_attempts: u64,
+    /// Build commands that kept the engine on the unchanged current snapshot
+    /// after their bounded retries were exhausted.
+    pub degraded_builds: u64,
+    /// Consecutive failed attempts since the last successful publication.
+    pub consecutive_failures: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperatorRecoveryCommitError {
     NotLocalLeader,
@@ -6709,6 +6753,42 @@ impl ConsensusSessionStore {
             admitted,
             completed_snapshot_count,
         }
+    }
+
+    /// Current bounded local snapshot build failure observation.
+    ///
+    /// Returns `None` while no build attempt has failed since this core
+    /// started. The observation is advisory diagnostics: the store never
+    /// claims an unpublished snapshot and never grants authority from it.
+    pub fn snapshot_build_failure(&self) -> Option<SessionSnapshotBuildFailure> {
+        let (started, failed, retried, degraded, consecutive, reason) = self
+            .inner
+            .backend
+            .snapshot_observation()
+            .build_failure_diagnostics();
+        let reason = reason?;
+        let reason = match reason {
+            crate::sqlite::consensus::SnapshotBuildFailureReason::BuildFailed => {
+                SessionSnapshotBuildFailureReason::BuildFailed
+            }
+            crate::sqlite::consensus::SnapshotBuildFailureReason::IndeterminatePublication => {
+                SessionSnapshotBuildFailureReason::IndeterminatePublication
+            }
+            crate::sqlite::consensus::SnapshotBuildFailureReason::NoPublishedSnapshot => {
+                SessionSnapshotBuildFailureReason::NoPublishedSnapshot
+            }
+            crate::sqlite::consensus::SnapshotBuildFailureReason::CurrentSnapshotUnreadable => {
+                SessionSnapshotBuildFailureReason::CurrentSnapshotUnreadable
+            }
+        };
+        Some(SessionSnapshotBuildFailure {
+            reason,
+            started_attempts: started,
+            failed_attempts: failed,
+            retried_attempts: retried,
+            degraded_builds: degraded,
+            consecutive_failures: consecutive,
+        })
     }
 
     /// Wait for an observed engine status; the fixture supplies its deadline.

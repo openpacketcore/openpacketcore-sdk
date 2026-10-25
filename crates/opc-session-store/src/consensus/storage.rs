@@ -29,6 +29,7 @@ use opc_consensus::engine::{
     RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership, Vote,
 };
 use opc_consensus::DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES;
+use opc_redaction::metrics::METRICS;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -62,7 +63,9 @@ use super::{
 use crate::backend::ReplicationEntry;
 use crate::fenced_mutation_roster::RosterAttestationTrustRootV1;
 use crate::readiness::PlacementResiliencePolicy;
-use crate::sqlite::consensus::{self, SqliteConsensusCore};
+use crate::sqlite::consensus::{
+    self, SnapshotBuildFailureReason, SnapshotBuildObservation, SqliteConsensusCore,
+};
 use crate::sqlite::SqliteSessionBackend;
 
 #[cfg(all(test, target_os = "linux"))]
@@ -87,6 +90,13 @@ const SNAPSHOT_FIXED_INSTALL_RESERVATION_ENTRIES: usize = SNAPSHOT_SQLITE_ARTIFA
 // never occupies a ninth namespace entry alongside that envelope.
 const SNAPSHOT_BUILD_RESERVATION_ENTRIES: usize = SNAPSHOT_SQLITE_ARTIFACT_MAX_ENTRIES * 2;
 const SNAPSHOT_APPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bounded retry attempts for one local snapshot build command. A failed
+/// attempt is retried after a fixed backoff; after the final attempt the
+/// unchanged current snapshot is reported so the Raft engine keeps serving.
+pub(crate) const SNAPSHOT_BUILD_MAX_ATTEMPTS: usize = 3;
+/// Fixed backoff interval between failed local snapshot build attempts.
+pub(crate) const SNAPSHOT_BUILD_RETRY_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(100);
 
 /// One real state-machine install, retained only until its successor starts.
 /// Its identity is an ordering witness, never permission to delete a log.
@@ -7025,8 +7035,22 @@ async fn build_file_backed_snapshot_database(
     ))
 }
 
-impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuilder {
-    async fn build_snapshot(
+/// Why a bounded snapshot build could not report the unchanged current
+/// snapshot to Openraft.
+enum DegradedSnapshotOutcome {
+    /// The store has no published snapshot to keep serving at.
+    NoPublishedSnapshot,
+    /// The durable current snapshot metadata or image cannot be read back.
+    CurrentSnapshotUnreadable(Box<StorageError<SessionConsensusNodeId>>),
+}
+
+impl SqliteConsensusSnapshotBuilder {
+    /// One local snapshot capture and publication attempt.
+    ///
+    /// The retry/degradation policy lives in the [`RaftSnapshotBuilder`]
+    /// implementation below; this attempt keeps the existing stage budgets,
+    /// ownership, and cleanup contract unchanged.
+    async fn build_snapshot_attempt(
         &mut self,
     ) -> Result<Snapshot<SessionRaftTypeConfig>, StorageError<SessionConsensusNodeId>> {
         #[cfg(feature = "test-control")]
@@ -7729,6 +7753,239 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             meta,
             snapshot: Box::new(snapshot),
         })
+    }
+
+    /// Report the unchanged current published snapshot after bounded build
+    /// retries were exhausted.
+    ///
+    /// Openraft treats a build result whose `last_log_id` is not newer than its
+    /// recorded snapshot as a duplicate: it clears the in-flight build state and
+    /// leaves the snapshot frontier and log purging unchanged. This keeps the
+    /// engine serving on the last durable snapshot; it never claims the failed
+    /// attempt was published.
+    async fn degraded_snapshot_result(
+        &self,
+    ) -> Result<Snapshot<SessionRaftTypeConfig>, DegradedSnapshotOutcome> {
+        let _serving_guard = Arc::clone(&self.core.snapshot_serving_gate)
+            .lock_owned()
+            .await;
+        let current = self
+            .core
+            .read_current_snapshot_for_serving()
+            .await
+            .map_err(|error| {
+                DegradedSnapshotOutcome::CurrentSnapshotUnreadable(Box::new(storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    error,
+                )))
+            })?;
+        let Some((meta, file_name, _checksum, _length)) = current else {
+            return Err(DegradedSnapshotOutcome::NoPublishedSnapshot);
+        };
+        let path = self
+            ._snapshot_directory_lease
+            .namespace
+            .sqlite_child_path(std::ffi::OsStr::new(&file_name))
+            .map_err(|error| {
+                DegradedSnapshotOutcome::CurrentSnapshotUnreadable(Box::new(storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    error,
+                )))
+            })?;
+        let file = tokio::fs::File::open(&path).await.map_err(|error| {
+            DegradedSnapshotOutcome::CurrentSnapshotUnreadable(Box::new(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )))
+        })?;
+        let snapshot = SessionSnapshotFile::from_file(file, path)
+            .await
+            .map_err(|error| {
+                DegradedSnapshotOutcome::CurrentSnapshotUnreadable(Box::new(storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )))
+            })?;
+        Ok(Snapshot {
+            meta,
+            snapshot: Box::new(snapshot),
+        })
+    }
+
+    /// Return the fatal error for a latched indeterminate publication state.
+    ///
+    /// The latch can be set during an attempt's own publication path, so it is
+    /// re-checked after every failed attempt and on the exhaustion path instead
+    /// of only before the first attempt.
+    fn indeterminate_publication_failure(
+        &self,
+        observation: &SnapshotBuildObservation,
+    ) -> Option<StorageError<SessionConsensusNodeId>> {
+        let error = reject_indeterminate_snapshot_publication(&self.core).err()?;
+        observation.record_build_failure(SnapshotBuildFailureReason::IndeterminatePublication);
+        METRICS
+            .persist_snapshot_build_failures
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            reason = "snapshot_publication_indeterminate",
+            "session consensus snapshot publication state is indeterminate; the Raft engine stops"
+        );
+        Some(storage_error(
+            ErrorSubject::Snapshot(None),
+            ErrorVerb::Write,
+            error,
+        ))
+    }
+}
+
+impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuilder {
+    /// Build one local snapshot with bounded retries.
+    ///
+    /// A failed capture or publication attempt is retried after a fixed
+    /// backoff. If every bounded attempt fails, the engine is kept running on
+    /// the unchanged current snapshot: the previous snapshot's meta is reported
+    /// again, which Openraft treats as a duplicate build (it clears the pending
+    /// build state without advancing the snapshot frontier or purging logs).
+    /// The next snapshot policy trigger retries the build. This is the
+    /// documented recovery contract: committed-log semantics and every existing
+    /// stage budget are unchanged, no snapshot is claimed before it is durably
+    /// published, and only an indeterminate publication state, an unreadable
+    /// current snapshot, or a store with no published snapshot at all fails the
+    /// build fatally.
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<Snapshot<SessionRaftTypeConfig>, StorageError<SessionConsensusNodeId>> {
+        let observation = Arc::clone(&self.core.snapshot_observation);
+        // An indeterminate publication could have committed snapshot metadata
+        // without a readable artifact. Only a fresh core may resume
+        // publication, so this stays fatal instead of being retried.
+        if let Some(error) = self.indeterminate_publication_failure(&observation) {
+            return Err(error);
+        }
+        let mut last_error = None;
+        for attempt in 1..=SNAPSHOT_BUILD_MAX_ATTEMPTS {
+            observation.record_build_attempt();
+            if attempt > 1 {
+                observation.record_build_retry();
+            }
+            let injected = {
+                #[cfg(feature = "test-control")]
+                {
+                    let injected = observation.take_injected_build_failure_for_test();
+                    // Optionally model a publication path that latches the
+                    // indeterminate state before its attempt reports failure.
+                    if injected && observation.take_injected_indeterminate_publication_for_test() {
+                        self.core
+                            .snapshot_publication_indeterminate
+                            .store(true, Ordering::Release);
+                    }
+                    injected
+                }
+                #[cfg(not(feature = "test-control"))]
+                {
+                    false
+                }
+            };
+            let result = if injected {
+                Err(storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Write,
+                    io::Error::other("injected local snapshot build failure"),
+                ))
+            } else {
+                self.build_snapshot_attempt().await
+            };
+            match result {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => {
+                    // A publication attempt can latch the indeterminate state
+                    // during its own capture/publication path. Re-check it before
+                    // classifying the attempt as retryable.
+                    if let Some(error) = self.indeterminate_publication_failure(&observation) {
+                        return Err(error);
+                    }
+                    let will_retry = attempt < SNAPSHOT_BUILD_MAX_ATTEMPTS;
+                    observation.record_build_failure(SnapshotBuildFailureReason::BuildFailed);
+                    METRICS
+                        .persist_snapshot_build_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    if will_retry {
+                        METRICS
+                            .persist_snapshot_build_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = SNAPSHOT_BUILD_MAX_ATTEMPTS,
+                        retrying = will_retry,
+                        "session consensus local snapshot build failed"
+                    );
+                    last_error = Some(error);
+                    if will_retry {
+                        tokio::time::sleep(SNAPSHOT_BUILD_RETRY_BACKOFF).await;
+                    }
+                }
+            }
+        }
+        // A later attempt or a concurrent publication may have latched the
+        // indeterminacy after the previous check; keep it fatal.
+        if let Some(error) = self.indeterminate_publication_failure(&observation) {
+            return Err(error);
+        }
+        // Retries exhausted: keep the engine running on the unchanged current
+        // snapshot so replication, apply, already-covered purging and client
+        // proposals continue under the existing retained-log gates. The failure
+        // counters, warning, and next policy trigger keep the build retryable.
+        match self.degraded_snapshot_result().await {
+            Ok(snapshot) => {
+                observation.record_build_degraded();
+                METRICS
+                    .persist_snapshot_build_degraded
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    attempts = SNAPSHOT_BUILD_MAX_ATTEMPTS,
+                    "session consensus snapshot build degraded to the unchanged current snapshot; future builds remain retryable"
+                );
+                Ok(snapshot)
+            }
+            Err(DegradedSnapshotOutcome::NoPublishedSnapshot) => {
+                observation.record_build_failure(SnapshotBuildFailureReason::NoPublishedSnapshot);
+                METRICS
+                    .persist_snapshot_build_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    attempts = SNAPSHOT_BUILD_MAX_ATTEMPTS,
+                    "session consensus snapshot build failed with no published snapshot to continue from; the Raft engine stops"
+                );
+                // No published snapshot exists, so the bounded build failure
+                // itself is the fatal cause that must be surfaced.
+                Err(last_error.unwrap_or_else(|| {
+                    storage_error(
+                        ErrorSubject::Snapshot(None),
+                        ErrorVerb::Write,
+                        io::Error::other("local snapshot build failed with no published snapshot"),
+                    )
+                }))
+            }
+            Err(DegradedSnapshotOutcome::CurrentSnapshotUnreadable(error)) => {
+                observation
+                    .record_build_failure(SnapshotBuildFailureReason::CurrentSnapshotUnreadable);
+                METRICS
+                    .persist_snapshot_build_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    attempts = SNAPSHOT_BUILD_MAX_ATTEMPTS,
+                    "session consensus current snapshot cannot be read back after bounded build failures; the Raft engine stops"
+                );
+                // Surface the actual read-back failure instead of the last
+                // build attempt's transient error.
+                Err(*error)
+            }
+        }
     }
 }
 

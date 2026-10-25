@@ -256,11 +256,15 @@ Physical row reclamation removes the accumulated-row lifetime limit. The
 File extent still grows until generation-file rollover (SDK #1253): current
 ceilings are 32 GiB Durable and 8 GiB Async. A Durable ceiling failure fences
 the writer. An Async ceiling failure latches a failed background writer; the
-next snapshot publication fails and stops the engine, within one snapshot
-interval. A restart does not make additional file space available. Stalled
-snapshot work and failed local builds are different cases; any failed local
-build still stops the engine (SDK #1254). Separate key, ordinary-receipt and
-notification caps are unchanged.
+next local snapshot build follows the bounded build-failure recovery contract
+below, within one snapshot interval. A restart does not make additional file
+space available. Stalled snapshot work and failed local builds are different
+cases: a failed local build is retried under a fixed bounded attempt budget and keeps
+the engine running on the unchanged published snapshot (SDK #1254); only an
+indeterminate publication state or a store with no published snapshot at all
+stops the engine. The bounded attempt/backoff, value-free failure classification
+and duplicate-build degradation are documented in the `opc-session-store`
+README. Separate key, ordinary-receipt and notification caps are unchanged.
 
 ## Async writer and local observations
 
