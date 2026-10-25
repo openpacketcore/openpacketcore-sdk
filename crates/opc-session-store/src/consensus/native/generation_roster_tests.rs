@@ -162,6 +162,177 @@ fn roster_durable_bindings(storage: &NativeStorage) -> usize {
         .durable_epoch_bindings()
 }
 
+fn journal_key(signed: &RosterV2PersistenceFixture, stable: &'static [u8]) -> SessionKey {
+    let mut key = signed.authority.key().clone();
+    key.stable_id = bytes::Bytes::from_static(stable)
+        .try_into()
+        .expect("stable ID");
+    key
+}
+
+#[test]
+fn native_key_retirement_journal_stages_exact_once_and_publishes() {
+    let signed = crate::consensus::types::roster_v2_persistence_fixture();
+    let mut storage = configured(&signed);
+    let key = journal_key(&signed, b"journal-retire");
+    let acquire = entry(
+        &signed,
+        1,
+        SessionConsensusRequestId::from_bytes([0xB8; 16]),
+        SessionMutationIntent::AcquireLease {
+            key: key.clone(),
+            owner: signed.authority.owner().clone(),
+            ttl: std::time::Duration::from_secs(60),
+        },
+    );
+    let applied = apply(&mut storage, &[acquire]);
+    let lease = match &applied.responses[0].result {
+        Ok(SessionMutationOutcome::Lease(lease)) => lease.clone(),
+        other => panic!("acquire must succeed before retirement: {other:?}"),
+    };
+    apply(
+        &mut storage,
+        &[entry(
+            &signed,
+            2,
+            SessionConsensusRequestId::from_bytes([0xB9; 16]),
+            SessionMutationIntent::ReleaseLease(lease),
+        )],
+    );
+    let before = storage.business.keys.len();
+    storage
+        .business
+        .apply_key_retirement(key.clone())
+        .expect("exact committed predecessor is staged and published");
+    storage
+        .validate_image()
+        .expect("retirement journal image valid");
+    assert!(storage.business.keys.get(&key).is_none());
+    assert_eq!(storage.business.keys.len(), before - 1);
+    // A stale resident expiry entry would surface as an infrastructure failure
+    // on the next prune; acquire a fresh key after the retirement to exercise it.
+    let prune_trigger = journal_key(&signed, b"journal-prune-trigger");
+    let prune_applied = apply(
+        &mut storage,
+        &[entry(
+            &signed,
+            3,
+            SessionConsensusRequestId::from_bytes([0xBA; 16]),
+            SessionMutationIntent::AcquireLease {
+                key: prune_trigger,
+                owner: signed.authority.owner().clone(),
+                ttl: std::time::Duration::from_secs(60),
+            },
+        )],
+    );
+    assert!(matches!(
+        prune_applied.responses[0].result,
+        Ok(SessionMutationOutcome::Lease(_))
+    ));
+    // The removal journal is exact once: a second retirement of the same key has
+    // no committed predecessor and must fail closed without mutation.
+    let error = match storage.business.apply_key_retirement(key.clone()) {
+        Err(error) => error,
+        Ok(_) => panic!("a retired key has no committed predecessor"),
+    };
+    assert!(error
+        .to_string()
+        .contains("native key removal has no exact predecessor"));
+    assert!(storage.business.keys.get(&key).is_none());
+}
+
+#[test]
+fn native_key_retirement_collapses_same_delta_create_update_and_duplicates() {
+    let signed = crate::consensus::types::roster_v2_persistence_fixture();
+    let mut storage = configured(&signed);
+
+    // Create-then-retire: the key never exists as an endpoint; the candidate
+    // change is collapsed and the transient journal entry is dropped.
+    let created = journal_key(&signed, b"journal-create-retire");
+    storage
+        .business
+        .apply_key_retirements_in_batch(
+            &[entry(
+                &signed,
+                1,
+                SessionConsensusRequestId::from_bytes([0xBB; 16]),
+                SessionMutationIntent::AcquireLease {
+                    key: created.clone(),
+                    owner: signed.authority.owner().clone(),
+                    ttl: std::time::Duration::from_secs(60),
+                },
+            )],
+            vec![created.clone()],
+        )
+        .expect("create-then-retire collapses to no endpoint");
+    storage
+        .validate_image()
+        .expect("create-then-retire image valid");
+    assert!(storage.business.keys.get(&created).is_none());
+
+    // Update-then-retire: an existing committed key is updated in the same
+    // delta and retired; the net change removes the predecessor row.
+    let updated = signed.authority.key().clone();
+    storage
+        .business
+        .apply_key_retirements_in_batch(
+            &[entry(
+                &signed,
+                2,
+                SessionConsensusRequestId::from_bytes([0xBC; 16]),
+                SessionMutationIntent::AcquireLease {
+                    key: updated.clone(),
+                    owner: signed.authority.owner().clone(),
+                    ttl: std::time::Duration::from_secs(60),
+                },
+            )],
+            vec![updated.clone()],
+        )
+        .expect("update-then-retire stages one net removal");
+    storage
+        .validate_image()
+        .expect("update-then-retire image valid");
+    assert!(storage.business.keys.get(&updated).is_none());
+
+    // Same-delta duplicate removals are deduplicated and staged once.
+    let duplicate = journal_key(&signed, b"journal-duplicate");
+    let acquire = entry(
+        &signed,
+        3,
+        SessionConsensusRequestId::from_bytes([0xBD; 16]),
+        SessionMutationIntent::AcquireLease {
+            key: duplicate.clone(),
+            owner: signed.authority.owner().clone(),
+            ttl: std::time::Duration::from_secs(60),
+        },
+    );
+    apply(&mut storage, &[acquire]);
+    storage
+        .business
+        .apply_key_retirements_in_batch(&[], vec![duplicate.clone(), duplicate.clone()])
+        .expect("duplicate removals are staged at most once");
+    storage
+        .validate_image()
+        .expect("duplicate retirement image valid");
+    assert!(storage.business.keys.get(&duplicate).is_none());
+}
+
+#[test]
+fn native_key_retirement_without_exact_predecessor_is_rejected() {
+    let signed = crate::consensus::types::roster_v2_persistence_fixture();
+    let mut storage = configured(&signed);
+    let unknown = journal_key(&signed, b"journal-absent");
+    let before = storage.business.keys.len();
+    let error = match storage.business.apply_key_retirement(unknown) {
+        Err(error) => error,
+        Ok(_) => panic!("an absent predecessor cannot be retired"),
+    };
+    assert!(error
+        .to_string()
+        .contains("native key removal has no exact predecessor"));
+    assert_eq!(storage.business.keys.len(), before);
+}
+
 #[test]
 fn native_key_capacity_batch_boundary_refuses_without_mutation() {
     let signed = crate::consensus::types::roster_v2_persistence_fixture();

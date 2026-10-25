@@ -993,6 +993,7 @@ impl Publication {
             roster,
             roster_changes,
             keys,
+            key_removals,
             receipts,
             receipt_removals,
             reclaim_memory,
@@ -1034,7 +1035,11 @@ impl Publication {
         }
         let tracking = base.changes.is_some();
         let deleted_before = DeletedRows::before_count(&receipt_removals, &base.receipts)?;
-        let mut bytes = scratch_size::<SessionKey, NativeKeyState>(keys.len())?;
+        let key_row_capacity = keys
+            .len()
+            .checked_add(key_removals.len())
+            .ok_or_else(|| invalid("native changed key reservation overflow"))?;
+        let mut bytes = scratch_size::<SessionKey, NativeKeyState>(key_row_capacity)?;
         add_bytes(
             &mut bytes,
             scratch_size::<FencedTransitionV2RequestId, NativeReceipt>(receipts.len())?,
@@ -1065,7 +1070,8 @@ impl Publication {
         }
         let staging_bytes = keys
             .len()
-            .checked_mul(size_of::<StagedRow<SessionKey, NativeKeyState>>())
+            .checked_add(key_removals.len())
+            .and_then(|rows| rows.checked_mul(size_of::<StagedRow<SessionKey, NativeKeyState>>()))
             .and_then(|bytes| {
                 receipts
                     .len()
@@ -1250,10 +1256,48 @@ impl Publication {
             validation::validate_notification(row, sequence, &frontiers)?;
         }
         let mut tables = predecessor.tables;
+        let mut expiry = predecessor.expiry.clone();
+        // Collapse exact-predecessor key retirements against the candidate map
+        // BEFORE rebuilding the resident expiry index. A candidate created or
+        // updated in this delta is dropped (create/update-then-retire is a single
+        // net change); a key that never existed in the predecessor is a
+        // transient with no endpoint and no journal row. The resident expiry
+        // entry for a removed key is still the predecessor value here, so remove
+        // exactly that value; leaving a stale record/lease/released/scope entry
+        // would make the next `prune()` fail with an infrastructure error.
+        let mut key_candidates = keys;
+        let mut key_removal_rows: Vec<StagedRow<SessionKey, NativeKeyState>> =
+            Vec::with_capacity(key_removals.len());
+        let mut retired = std::collections::HashSet::with_capacity(key_removals.len());
+        for key in key_removals {
+            if !retired.insert(key.clone()) {
+                continue;
+            }
+            let created_in_delta = key_candidates.remove(&key);
+            let Some(before) = base.keys.get(&key).cloned() else {
+                if created_in_delta.is_some() {
+                    continue;
+                }
+                return Err(invalid("native key removal has no exact predecessor"));
+            };
+            expiry.replace(&key, Some(&before), None);
+            let before_hash = stamp(0, &key, &before)?;
+            tables[0].replace(Some(before_hash), None)?;
+            let journal_key = tracking.then_some(key.clone());
+            key_removal_rows.push(StagedRow {
+                key,
+                journal_key,
+                change: RowChange {
+                    before: Some(Box::new(before)),
+                    after: None,
+                    before_hash: Some(before_hash),
+                    after_hash: None,
+                },
+            });
+        }
         // Reconstruct the next resident index from the validated after-images,
         // independently of the transaction's temporary pruning index.
-        let mut expiry = predecessor.expiry.clone();
-        for (key, row) in &keys {
+        for (key, row) in &key_candidates {
             expiry.replace(key, base.keys.get(key).map(|row| &**row), Some(row));
         }
         for (id, row) in &generic_receipts {
@@ -1264,7 +1308,8 @@ impl Publication {
             )?;
         }
         expiry.validate_requests(&frontiers)?;
-        let keys = staged(0, keys, &base.keys, tracking, &mut tables[0])?;
+        let mut keys = staged(0, key_candidates, &base.keys, tracking, &mut tables[0])?;
+        keys.extend(key_removal_rows);
         let receipts = staged(1, receipts, &base.receipts, tracking, &mut tables[1])?;
         let deletions = DeletedRows::prepare(
             receipt_removals,
