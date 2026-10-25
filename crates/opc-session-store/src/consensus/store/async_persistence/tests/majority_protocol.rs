@@ -435,15 +435,28 @@ impl Drop for DiskRelease {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_cancelled_promise_owns_disk_until_shutdown_and_replacement() {
-    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(false).await;
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn protected_async_recovery_cancelled_promise_owns_disk_until_shutdown_and_replacement() {
-    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(true).await;
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(true, false).await;
 }
 
-async fn exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(protected: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_promise_deadline_observation_survives_host_delay() {
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_cancelled_promise_deadline_observation_survives_host_delay() {
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(true, true).await;
+}
+
+async fn exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(
+    protected: bool,
+    delay_observation: bool,
+) {
     use crate::sqlite::consensus::wal::Point;
     let _timing = crate::acquire_consensus_timing_test_permit().await;
     let mut fleet = if protected {
@@ -504,9 +517,15 @@ async fn exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(pro
             .background_failure
             .is_none());
         let started = tokio::time::Instant::now();
-        assert!(control(&fleet, 0, Action::Prepare(round.clone()))
-            .await
-            .is_err());
+        let rejected = control(&fleet, 0, Action::Prepare(round.clone())).await;
+        if delay_observation {
+            // The handler has completed, but a descheduled observer need not
+            // inspect the result within another operation interval.
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1_700)))
+                .await
+                .unwrap();
+        }
+        assert!(rejected.is_err());
         assert!(started.elapsed() < OPERATION_BOUND * 2);
         assert!(!fleet.store(0).inner.persistence_protocol.is_active());
 
