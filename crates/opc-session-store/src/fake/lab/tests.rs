@@ -888,18 +888,42 @@ async fn lab_key_capacity_refusal_mutates_nothing_and_is_retryable() {
         .acquire(&occupied, owner.clone(), Duration::from_secs(30))
         .await
         .unwrap();
+    // Add a record that expires while the occupying lease stays live. A
+    // prune-on-refusal implementation would drop this record even though the
+    // capacity check ultimately refuses, so it must survive the refusal.
+    let now = backend.clock.now_utc();
+    let mut occupied_record = record_for_key(occupied.clone());
+    occupied_record.owner = owner.clone();
+    occupied_record.fence = occupied_lease.fence();
+    occupied_record.expires_at =
+        Some(checked_session_deadline(now, Duration::from_secs(5)).expect("record expiry"));
+    backend
+        .compare_and_set(CompareAndSet {
+            key: occupied.clone(),
+            lease: occupied_lease.clone(),
+            expected_generation: None,
+            new_record: occupied_record,
+        })
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(
+        backend.inner.lock().await.records.len(),
+        1,
+        "the occupying record is expired but not yet pruned"
+    );
+
     let snapshot = {
         let state = backend.inner.lock().await;
         (
-            state.key_fences.len(),
-            state.records.len(),
-            state.leases.len(),
+            state.key_fences.clone(),
+            state.leases.clone(),
+            state.records.clone(),
             state.lab_transitions.len(),
             state.next_fence,
             state.retired_fence_high_water,
         )
     };
-
     let blocked = create_request_at(&backend, 2).await;
     let prepared = backend.prepare_fenced_transition(blocked).await.unwrap();
     assert_eq!(
@@ -911,17 +935,17 @@ async fn lab_key_capacity_refusal_mutates_nothing_and_is_retryable() {
     let after = {
         let state = backend.inner.lock().await;
         (
-            state.key_fences.len(),
-            state.records.len(),
-            state.leases.len(),
+            state.key_fences.clone(),
+            state.leases.clone(),
+            state.records.clone(),
             state.lab_transitions.len(),
             state.next_fence,
             state.retired_fence_high_water,
         )
     };
-    assert_eq!(
-        snapshot, after,
-        "a capacity refusal must leave every record, lease, fence and receipt untouched"
+    assert!(
+        snapshot == after,
+        "a capacity refusal must leave every record (including the expired one), lease, fence, receipt and watermark untouched"
     );
 
     // Retryable: once the occupying elapsed state can be retired, a freshly
@@ -948,4 +972,110 @@ async fn lab_key_capacity_refusal_mutates_nothing_and_is_retryable() {
         "capacity must be reclaimable and the transition retryable"
     );
     assert!(backend.get(&target).await.unwrap().is_some());
+}
+
+fn stale_replication_entry(
+    sequence: u64,
+    tx_id: &str,
+    timestamp: Timestamp,
+    op: ReplicationOp,
+) -> ReplicationEntry {
+    ReplicationEntry {
+        sequence,
+        tx_id: tx_id.try_into().expect("valid transaction ID"),
+        op,
+        timestamp,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn replicated_stale_delete_cannot_remove_a_newer_record_after_floor_retirement() {
+    let mut backend = FakeSessionBackend::in_memory_lab();
+    backend.limits.max_tracked_keys = 1;
+    backend.limits.max_replication_entries = 128;
+    let key = session_key_at(17);
+    let owner = OwnerId::new("lab-owner").unwrap();
+
+    // Commit fences 1 and 2 for the key through the direct lease API, then
+    // delete the record and release so only a dead floor remains.
+    let first = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(first.fence(), FenceToken::new(1));
+    backend.release(first).await.unwrap();
+    let second = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(second.fence(), FenceToken::new(2));
+    let mut record = record_for_key(key.clone());
+    record.owner = owner.clone();
+    record.fence = second.fence();
+    backend
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: second.clone(),
+            expected_generation: None,
+            new_record: record,
+        })
+        .await
+        .unwrap();
+    backend.delete_fenced(&second).await.unwrap();
+    backend.release(second).await.unwrap();
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    // Capacity pressure retires the dead floor into the backend high-water.
+    let trigger = session_key_at(18);
+    let trigger_lease = backend
+        .acquire(&trigger, owner.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    {
+        let state = backend.inner.lock().await;
+        assert!(!state
+            .key_fences
+            .contains_key(&FakeSessionBackend::map_key(&key)));
+        assert_eq!(state.retired_fence_high_water, FenceToken::new(2));
+    }
+    backend.release(trigger_lease).await.unwrap();
+
+    // Re-create the SAME key through the lab `Acquire` path (observe, then bind
+    // the record to the observed fence). On the pre-fix backend observation
+    // reports zero here, so this would commit fence 1 and the stale replicated
+    // `DeleteFenced` below would delete the newer record instead of failing.
+    let _outcome = execute_create(&backend, 17).await;
+    let recreated = backend
+        .get(&key)
+        .await
+        .unwrap()
+        .expect("the lab Acquire path re-created the record");
+    assert!(
+        recreated.fence > FenceToken::new(2),
+        "re-created record fence {} must exceed the retired fences",
+        recreated.fence
+    );
+
+    // A stale replicated DeleteFenced carrying an old fence must not remove the
+    // newer record: with the high-water in place the floor check still rejects it.
+    let sequence = backend.max_replication_sequence().await.unwrap() + 1;
+    let stale = stale_replication_entry(
+        sequence,
+        "stale-delete-after-recreate",
+        backend.clock.now_utc(),
+        ReplicationOp::DeleteFenced {
+            key: key.clone(),
+            owner: owner.clone(),
+            fence: FenceToken::new(2),
+        },
+    );
+    assert_eq!(
+        backend.replicate_entry(stale).await.unwrap_err(),
+        StoreError::StaleFence
+    );
+    assert_eq!(
+        backend.get(&key).await.unwrap(),
+        Some(recreated),
+        "the stale replicated delete must not remove the newer record"
+    );
 }

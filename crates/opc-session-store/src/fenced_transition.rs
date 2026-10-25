@@ -819,7 +819,20 @@ pub enum FencedTransitionLease {
         key: SessionKey,
         /// Owner receiving the new credential.
         owner: OwnerId,
-        /// Exact current fence, or zero for a key with no fence history.
+        /// Exact current fence as reported by the backend's observation.
+        ///
+        /// Backends that retain an exact per-key floor report zero when the key
+        /// has no fence history. The in-memory lab backend retires dead per-key
+        /// floors into one backend-wide retired-fence high-water and reports
+        /// that value for a key without a live floor once it has retired any
+        /// floor, so callers must use the observed value instead of assuming
+        /// zero. The committed `expected_fence + 1` is still strictly greater
+        /// than every fence that backend has already committed.
+        ///
+        /// Trade-off: a key that never had committed state can observe a
+        /// nonzero value after any retirement. The value is a conservative,
+        /// bounded-memory monotone floor for that backend, not exact per-key
+        /// history.
         expected_fence: FenceToken,
         /// Bounded lease lifetime from committed admission time.
         ttl: Duration,
