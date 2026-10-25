@@ -148,7 +148,7 @@ fn roster_retained_bindings(storage: &NativeStorage) -> usize {
         .roster
         .witness
         .expect("signed roster cycle witness")
-        .roster
+        .roster_counters()
         .retained_and_live_bindings()
 }
 
@@ -158,7 +158,7 @@ fn roster_durable_bindings(storage: &NativeStorage) -> usize {
         .roster
         .witness
         .expect("signed roster cycle witness")
-        .roster
+        .roster_counters()
         .durable_epoch_bindings()
 }
 

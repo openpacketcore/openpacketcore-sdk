@@ -3669,6 +3669,17 @@ impl GlobalChargeWitness {
         Self::v1(0, 0, zero_counters())
     }
 
+    /// Linux test-only read access to the aggregate roster counters.
+    ///
+    /// The native consent module (and its tests) are Linux-only. This accessor
+    /// lets those tests assert exact retention capacity without widening the
+    /// witness field visibility; it does not exist in production builds or on
+    /// non-Linux test targets.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) const fn roster_counters(self) -> AggregateCounters {
+        self.roster
+    }
+
     /// Construct the current witness from fixed roster-only metadata and rows.
     ///
     /// The legacy `v1` constructor name is retained for the internal callers
