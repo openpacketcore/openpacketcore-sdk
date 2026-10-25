@@ -99,7 +99,18 @@ credentials against the platform's rotating trust bundle; authenticated policy
 and bundle updates apply live. A cluster's consensus identity includes a fresh
 installation nonce; reusing a human-readable cluster name after a fresh install
 must not recreate an old authority domain. This is installation identity, not
-an application activation certificate.
+an application activation certificate. The immutable session manifest takes the
+persisted non-zero installation nonce as an explicit constructor input and
+derives its consensus cluster identity with
+`ConsensusClusterId::for_installation(name, nonce)`; the manifest configuration
+digest (v2), fixed durable quorum identity and consensus node ordinals all
+inherit that qualification, and scope identities (RFC 022) use the same
+installation-qualified cluster ID. The voter-slot table's `cluster_instance`
+and table/manifest identity derive from this manifest consensus identity, so a
+fresh installation nonce is a fresh voter-slot authority domain: retained
+voter-slot tables from an earlier installation are rejected with a typed
+identity/replacement error rather than adopted, and this is a fresh-install
+boundary with no migration.
 
 The manifest digest supplied to `try_from_fixed_voter_slots` must commit to
 those placement rules as well as the slot ordinals and genesis keys. The

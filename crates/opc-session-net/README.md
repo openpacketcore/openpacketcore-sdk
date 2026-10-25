@@ -178,7 +178,12 @@ remain deferred. Crossing the scope stored-format boundary is a fresh install.
 type. A consumer selecting the fixed three- or five-voter profile must pass the
 same policy to `SessionReplicationManifest::try_new_with_epoch_and_placement_policy`
 and to `ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy`.
-Construct one descriptor set with distinct `ReplicaId`, `.invalid`
+Generate one random non-zero 32-byte **installation nonce** at first install
+and persist it with the immutable manifest; every constructor below requires
+it. Reusing the persisted nonce continues the installation, while a fresh
+nonce with the same cluster name is a different authority domain (fresh-install
+boundary: retained stores from the earlier installation are refused, no
+migration). Construct one descriptor set with distinct `ReplicaId`, `.invalid`
 `ReplicaEndpoint`, example SPIFFE `ReplicaTlsIdentity`, and
 `ReplicaBackingIdentity` values (and distinct `ReplicaFailureDomain` values
 under the strict default), then use the manifest's fixed-profile- and
@@ -188,8 +193,10 @@ local store:
 
 ```rust
 let policy = SessionPlacementPolicy::RequireIndependentFailureDomains;
+let installation_nonce = load_persisted_installation_nonce()?; // non-zero [u8; 32]
 let manifest = Arc::new(SessionReplicationManifest::try_new_with_epoch_and_placement_policy(
     SessionClusterId::new("session-fleet.invalid")?,
+    installation_nonce,
     SessionConfigurationGeneration::new("generation-1")?,
     SessionConfigurationEpoch::new(1)?,
     descriptors.clone(),
@@ -293,9 +300,14 @@ a production consensus endpoint. The `insecure-test` feature does not enable it
 implicitly.
 
 `SessionReplicationManifest::try_new_with_epoch` is the production manifest
-constructor. It derives the exact shared consensus identity from the hashed
-cluster ID, positive numeric configuration epoch, and complete descriptor
-fingerprints. Stable non-zero Openraft node IDs are domain-separated hashes of
+constructor. It takes the caller's persisted non-zero installation nonce and
+derives the exact shared, installation-qualified consensus identity from the
+hashed cluster ID and nonce, positive numeric configuration epoch, and complete
+descriptor fingerprints. The configuration digest
+(`opc-session-net/configuration/v2`) commits the nonce, so the same cluster name
+under a fresh installation is a distinct authority domain and a retained store
+from the earlier installation fails typed store-identity admission. This is a
+deliberate fresh-install boundary with no migration (#1187). Stable non-zero Openraft node IDs are domain-separated hashes of
 the cluster identity and immutable logical `ReplicaId`; they survive member
 reordering, addition, removal, and epoch changes. Derived collisions are
 rejected during admission. The legacy `try_new` constructor is deprecated and
@@ -977,11 +989,14 @@ observation, rolling fresh prewarm, and pool-wide cold-setup serialization.
 
 ## API Shape
 
-- `SessionReplicationManifest::try_new_with_epoch` validates one cluster ID,
-  positive consensus configuration epoch, one legacy protocol-v5
-  operator-controlled configuration generation, and the complete replica
-  descriptor set. The deprecated `try_new` compatibility constructor uses
-  epoch 1.
+- `SessionReplicationManifest::try_new_with_epoch` requires the persisted
+  non-zero installation nonce and validates one cluster ID, positive consensus
+  configuration epoch, one legacy protocol-v5 operator-controlled
+  configuration generation, and the complete replica descriptor set. The
+  deprecated `try_new` compatibility constructor also requires the nonce and
+  uses epoch 1. Every manifest constructor is a breaking identity change: the
+  nonce is part of the cluster identity, configuration digest and derived node
+  IDs.
 - `SessionReplicationManifest::bind_local` selects the exact local
   `ReplicaId`; `LocalReplicaBinding::bind_remote` derives the only supported
   production client binding for an admitted peer.

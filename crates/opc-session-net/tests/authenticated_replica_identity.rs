@@ -302,6 +302,7 @@ fn manifest_with_epoch(
     Arc::new(
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new(cluster).expect("cluster ID"),
+            [0x5a; 32],
             SessionConfigurationGeneration::new(generation).expect("configuration generation"),
             SessionConfigurationEpoch::new(epoch).expect("configuration epoch"),
             vec![descriptor(1), descriptor(2), descriptor(3)],

@@ -1197,6 +1197,7 @@ impl TestMtls {
         let manifest = Arc::new(
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("session-net-integration").expect("test cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("v3").expect("test configuration generation"),
                 SessionConfigurationEpoch::new(1).expect("configuration epoch"),
                 descriptors,

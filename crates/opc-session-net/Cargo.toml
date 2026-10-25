@@ -35,6 +35,10 @@ name = "persistent_consumer_transport"
 path = "tests/persistent_consumer_transport.rs"
 
 [[test]]
+name = "installation_identity"
+path = "tests/installation_identity.rs"
+
+[[test]]
 name = "placement_policy"
 path = "tests/placement_policy.rs"
 

@@ -27,6 +27,7 @@ fn manifest(
 ) -> Result<SessionReplicationManifest, SessionManifestError> {
     SessionReplicationManifest::try_new_with_epoch(
         SessionClusterId::new("placement-policy-cluster").expect("test cluster ID"),
+        [0x5a; 32],
         SessionConfigurationGeneration::new("placement-policy-generation")
             .expect("test generation"),
         SessionConfigurationEpoch::new(7).expect("test epoch"),
@@ -39,6 +40,7 @@ fn explicitly_correlated_manifest(
 ) -> Result<SessionReplicationManifest, SessionManifestError> {
     SessionReplicationManifest::try_new_with_epoch_and_placement_policy(
         SessionClusterId::new("placement-policy-cluster").expect("test cluster ID"),
+        [0x5a; 32],
         SessionConfigurationGeneration::new("placement-policy-generation")
             .expect("test generation"),
         SessionConfigurationEpoch::new(7).expect("test epoch"),

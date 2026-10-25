@@ -94,6 +94,7 @@ fn manifest(
     Arc::new(
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new(cluster).unwrap(),
+            [0x5a; 32],
             SessionConfigurationGeneration::new("audit-v1").unwrap(),
             SessionConfigurationEpoch::new(epoch).unwrap(),
             (1..=3)

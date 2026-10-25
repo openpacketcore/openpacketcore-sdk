@@ -131,6 +131,7 @@ fn manifest() -> Arc<SessionReplicationManifest> {
     Arc::new(
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new("bootstrap-retirement").expect("cluster ID"),
+            [0x5a; 32],
             SessionConfigurationGeneration::new("generation-1").expect("generation"),
             SessionConfigurationEpoch::new(1).expect("configuration epoch"),
             vec![descriptor(CLIENT_REPLICA), descriptor(SERVER_REPLICA)],

@@ -648,6 +648,7 @@ async fn publication_authority_failover_rejects_invalid_rosters_before_claiming_
     let root = ProductionRosterAttestationIssuer::trust_root();
     let manifest = SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
         SessionClusterId::new("foreign-publication-roster").expect("cluster"),
+        [0x5a; 32],
         SessionConfigurationGeneration::new("foreign-roster-generation").expect("generation"),
         ConsensusConfigurationEpoch::new(1).expect("epoch"),
         members.clone(),
@@ -1078,6 +1079,7 @@ async fn publication_authority_review_attestation_root_mismatch_is_rejected() {
     let members = (0..3).map(three_voter_member).collect::<Vec<_>>();
     let manifest = SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
         SessionClusterId::new("consumer-three-voter-transition").expect("cluster"),
+        [0x5a; 32],
         SessionConfigurationGeneration::new("consumer-three-voter-v1").expect("generation"),
         ConsensusConfigurationEpoch::new(1).expect("epoch"),
         members.clone(),

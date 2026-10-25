@@ -36,6 +36,8 @@ pub const SESSION_CONFIGURATION_GENERATION_MAX_BYTES: usize = 253;
 pub enum SessionManifestError {
     #[error("invalid session cluster identity")]
     InvalidClusterId,
+    #[error("invalid session installation nonce")]
+    InvalidInstallationNonce,
     #[error("invalid session configuration generation")]
     InvalidConfigurationGeneration,
     #[error("session replication manifest is empty")]
@@ -181,6 +183,7 @@ struct ManifestMember {
 #[derive(Clone)]
 pub struct SessionReplicationManifest {
     cluster_id: SessionClusterId,
+    installation_nonce: [u8; 32],
     configuration_id: SessionConfigurationId,
     configuration_epoch: SessionConfigurationEpoch,
     placement_policy: SessionPlacementPolicy,
@@ -200,11 +203,13 @@ impl SessionReplicationManifest {
     )]
     pub fn try_new(
         cluster_id: SessionClusterId,
+        installation_nonce: [u8; 32],
         generation: SessionConfigurationGeneration,
         descriptors: Vec<QuorumReplicaDescriptor>,
     ) -> Result<Self, SessionManifestError> {
         Self::try_new_with_epoch(
             cluster_id,
+            installation_nonce,
             generation,
             SessionConfigurationEpoch::new(1)
                 .expect("the fixed compatibility configuration epoch is non-zero"),
@@ -214,16 +219,19 @@ impl SessionReplicationManifest {
 
     /// Validate a complete descriptor set and derive its consensus identity.
     ///
-    /// Node IDs are stable cluster-scoped hashes of logical [`ReplicaId`] and
-    /// therefore do not change when another member is added or removed.
+    /// Node IDs are stable installation-scoped hashes of logical
+    /// [`ReplicaId`] and therefore do not change when another member is added
+    /// or removed.
     pub fn try_new_with_epoch(
         cluster_id: SessionClusterId,
+        installation_nonce: [u8; 32],
         generation: SessionConfigurationGeneration,
         configuration_epoch: SessionConfigurationEpoch,
         descriptors: Vec<QuorumReplicaDescriptor>,
     ) -> Result<Self, SessionManifestError> {
         Self::try_new_with_epoch_and_roster_attestation_root(
             cluster_id,
+            installation_nonce,
             generation,
             configuration_epoch,
             descriptors,
@@ -239,6 +247,7 @@ impl SessionReplicationManifest {
     #[doc(hidden)]
     pub fn try_new_with_epoch_and_roster_attestation_root(
         cluster_id: SessionClusterId,
+        installation_nonce: [u8; 32],
         generation: SessionConfigurationGeneration,
         configuration_epoch: SessionConfigurationEpoch,
         descriptors: Vec<QuorumReplicaDescriptor>,
@@ -246,6 +255,7 @@ impl SessionReplicationManifest {
     ) -> Result<Self, SessionManifestError> {
         Self::try_new_with_epoch_and_placement_policy_and_roster_attestation_root(
             cluster_id,
+            installation_nonce,
             generation,
             configuration_epoch,
             descriptors,
@@ -261,6 +271,7 @@ impl SessionReplicationManifest {
     /// remain mandatory under either policy.
     pub fn try_new_with_epoch_and_placement_policy(
         cluster_id: SessionClusterId,
+        installation_nonce: [u8; 32],
         generation: SessionConfigurationGeneration,
         configuration_epoch: SessionConfigurationEpoch,
         descriptors: Vec<QuorumReplicaDescriptor>,
@@ -268,6 +279,7 @@ impl SessionReplicationManifest {
     ) -> Result<Self, SessionManifestError> {
         Self::try_new_with_epoch_and_placement_policy_and_roster_attestation_root(
             cluster_id,
+            installation_nonce,
             generation,
             configuration_epoch,
             descriptors,
@@ -282,12 +294,16 @@ impl SessionReplicationManifest {
     #[doc(hidden)]
     pub fn try_new_with_epoch_and_placement_policy_and_roster_attestation_root(
         cluster_id: SessionClusterId,
+        installation_nonce: [u8; 32],
         generation: SessionConfigurationGeneration,
         configuration_epoch: SessionConfigurationEpoch,
         descriptors: Vec<QuorumReplicaDescriptor>,
         placement_policy: SessionPlacementPolicy,
         roster_attestation_trust_root: Option<RosterAttestationTrustRootV1>,
     ) -> Result<Self, SessionManifestError> {
+        if installation_nonce == [0; 32] {
+            return Err(SessionManifestError::InvalidInstallationNonce);
+        }
         if descriptors.is_empty() {
             return Err(SessionManifestError::EmptyMembership);
         }
@@ -339,8 +355,12 @@ impl SessionReplicationManifest {
         }
 
         let mut hasher = Sha256::new();
-        hasher.update(b"opc-session-net/configuration/v1\0");
+        // Version 2 commits the installation nonce. This is the deliberate
+        // fresh-install boundary from #1187; no v1 configuration digest can be
+        // reproduced by an installation-qualified manifest.
+        hasher.update(b"opc-session-net/configuration/v2\0");
         hash_field(&mut hasher, cluster_id.as_str().as_bytes());
+        hash_field(&mut hasher, &installation_nonce);
         hash_field(&mut hasher, generation.as_str().as_bytes());
         let member_count =
             u16::try_from(members.len()).expect("validated manifest member count fits u16");
@@ -350,8 +370,9 @@ impl SessionReplicationManifest {
         }
         let configuration_id = SessionConfigurationId(hasher.finalize().into());
 
-        let consensus_cluster_id = SessionConsensusClusterId::new(cluster_id.as_str())
-            .map_err(|_| SessionManifestError::InvalidClusterId)?;
+        let consensus_cluster_id =
+            SessionConsensusClusterId::for_installation(cluster_id.as_str(), installation_nonce)
+                .map_err(|_| SessionManifestError::InvalidClusterId)?;
         let consensus_epoch = configuration_epoch;
         let component_fingerprints = members
             .values()
@@ -394,6 +415,7 @@ impl SessionReplicationManifest {
 
         Ok(Self {
             cluster_id,
+            installation_nonce,
             configuration_id,
             configuration_epoch,
             placement_policy,
@@ -408,6 +430,16 @@ impl SessionReplicationManifest {
 
     pub fn cluster_id(&self) -> &SessionClusterId {
         &self.cluster_id
+    }
+
+    /// Installation nonce committed by this manifest.
+    ///
+    /// Consumers generate one random non-zero nonce at first install and
+    /// retain it with the immutable manifest; reusing it with the same
+    /// human-readable cluster name reuses the installation, while a fresh
+    /// non-zero value is a different authority domain (fresh-install boundary).
+    pub const fn installation_nonce(&self) -> [u8; 32] {
+        self.installation_nonce
     }
 
     pub const fn configuration_id(&self) -> SessionConfigurationId {
@@ -534,6 +566,7 @@ impl fmt::Debug for SessionReplicationManifest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionReplicationManifest")
             .field("cluster_id", &self.cluster_id)
+            .field("installation_nonce", &"<redacted>")
             .field("configuration_id", &self.configuration_id)
             .field("configuration_epoch", &self.configuration_epoch)
             .field("placement_policy", &self.placement_policy)
@@ -772,6 +805,7 @@ fn insecure_test_manifest() -> Arc<SessionReplicationManifest> {
     Arc::new(
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new("insecure-test").expect("fixed insecure-test cluster"),
+            [0x5a; 32],
             SessionConfigurationGeneration::new("v3").expect("fixed insecure-test generation"),
             SessionConfigurationEpoch::new(1).expect("fixed insecure-test epoch"),
             vec![
@@ -837,8 +871,19 @@ mod tests {
         epoch: u64,
         descriptors: Vec<QuorumReplicaDescriptor>,
     ) -> SessionReplicationManifest {
+        manifest_with_nonce(cluster, generation, epoch, descriptors, [0x5a; 32])
+    }
+
+    fn manifest_with_nonce(
+        cluster: &str,
+        generation: &str,
+        epoch: u64,
+        descriptors: Vec<QuorumReplicaDescriptor>,
+        installation_nonce: [u8; 32],
+    ) -> SessionReplicationManifest {
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new(cluster).expect("cluster ID"),
+            installation_nonce,
             SessionConfigurationGeneration::new(generation).expect("generation"),
             SessionConfigurationEpoch::new(epoch).expect("configuration epoch"),
             descriptors,
@@ -871,8 +916,8 @@ mod tests {
         let original = manifest("cluster-a", "generation-7", descriptors.clone());
         assert_eq!(
             original.configuration_id().to_hex(),
-            "f29bf07f10d0fc7c0af0edc2647fa374ad2989a6068c4d1ae35edb9480a851c1",
-            "manifest encoding must stay architecture-independent and versioned"
+            "886d2492ac584609707585d44629df925565b608be2be06883727fbf0f773859",
+            "manifest encoding (v2, installation-qualified) must stay architecture-independent"
         );
         let reordered = manifest("cluster-a", "generation-7", reversed);
         assert_eq!(original.configuration_id(), reordered.configuration_id());
@@ -901,6 +946,96 @@ mod tests {
             original.configuration_id(),
             changed_descriptor.configuration_id()
         );
+    }
+
+    #[test]
+    fn installation_nonce_qualifies_cluster_node_and_configuration_identity() {
+        let descriptors = vec![descriptor(1), descriptor(2), descriptor(3)];
+        let first = manifest_with_nonce(
+            "cluster-a",
+            "generation-7",
+            1,
+            descriptors.clone(),
+            [0x21; 32],
+        );
+        let same_installation = manifest_with_nonce(
+            "cluster-a",
+            "generation-7",
+            1,
+            descriptors.clone(),
+            [0x21; 32],
+        );
+        let reinstalled =
+            manifest_with_nonce("cluster-a", "generation-7", 1, descriptors, [0x22; 32]);
+
+        assert_eq!(first.installation_nonce(), [0x21; 32]);
+        assert_eq!(
+            first.installation_nonce(),
+            same_installation.installation_nonce()
+        );
+        assert_eq!(
+            first.configuration_id(),
+            same_installation.configuration_id()
+        );
+        assert_eq!(
+            first.consensus_identity(),
+            same_installation.consensus_identity()
+        );
+        assert_eq!(
+            first.consensus_node_id(&ReplicaId::new("replica-1").expect("replica ID")),
+            same_installation.consensus_node_id(&ReplicaId::new("replica-1").expect("replica ID"))
+        );
+
+        // A fresh installation reusing the same human-readable cluster name,
+        // generation and member names is a distinct authority domain: the
+        // configuration digest, installation-qualified consensus cluster ID and
+        // every derived consensus node ordinal change. A retained store from
+        // the earlier installation therefore fails its typed store-identity
+        // admission instead of joining the new installation.
+        assert_ne!(first.configuration_id(), reinstalled.configuration_id());
+        assert_ne!(
+            first.consensus_identity().cluster_id(),
+            reinstalled.consensus_identity().cluster_id()
+        );
+        assert_ne!(
+            first.fixed_durable_quorum_consensus_identity(),
+            reinstalled.fixed_durable_quorum_consensus_identity()
+        );
+        for replica in ["replica-1", "replica-2", "replica-3"] {
+            let replica = ReplicaId::new(replica).expect("replica ID");
+            assert_ne!(
+                first.consensus_node_id(&replica),
+                reinstalled.consensus_node_id(&replica)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_installation_nonce_is_rejected_before_any_authority_identity() {
+        let descriptors = vec![descriptor(1), descriptor(2), descriptor(3)];
+        assert!(matches!(
+            SessionReplicationManifest::try_new_with_epoch(
+                SessionClusterId::new("cluster-a").expect("cluster ID"),
+                [0; 32],
+                SessionConfigurationGeneration::new("generation-7").expect("generation"),
+                SessionConfigurationEpoch::new(1).expect("configuration epoch"),
+                descriptors.clone(),
+            ),
+            Err(SessionManifestError::InvalidInstallationNonce)
+        ));
+        // Every constructor that takes the nonce enforces the same admission.
+        assert!(matches!(
+            SessionReplicationManifest::try_new_with_epoch_and_placement_policy_and_roster_attestation_root(
+                SessionClusterId::new("cluster-a").expect("cluster ID"),
+                [0; 32],
+                SessionConfigurationGeneration::new("generation-7").expect("generation"),
+                SessionConfigurationEpoch::new(1).expect("configuration epoch"),
+                descriptors,
+                SessionPlacementPolicy::AllowReducedResilience,
+                None,
+            ),
+            Err(SessionManifestError::InvalidInstallationNonce)
+        ));
     }
 
     #[test]
@@ -951,6 +1086,7 @@ mod tests {
         let root_bound =
             SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
                 SessionClusterId::new("cluster-a").expect("cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("legacy-a").expect("generation"),
                 SessionConfigurationEpoch::new(7).expect("configuration epoch"),
                 descriptors.clone(),
@@ -960,6 +1096,7 @@ mod tests {
         let rotated_root =
             SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
                 SessionClusterId::new("cluster-a").expect("cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("legacy-a").expect("generation"),
                 SessionConfigurationEpoch::new(7).expect("configuration epoch"),
                 descriptors,
@@ -1029,6 +1166,7 @@ mod tests {
         let descriptors = vec![descriptor(1), descriptor(2), descriptor(3)];
         let legacy = SessionReplicationManifest::try_new(
             SessionClusterId::new("cluster-a").expect("cluster"),
+            [0x5a; 32],
             SessionConfigurationGeneration::new("legacy-a").expect("generation"),
             descriptors.clone(),
         )
@@ -1075,6 +1213,7 @@ mod tests {
         assert!(matches!(
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("cluster-a").expect("cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("generation-1").expect("generation"),
                 SessionConfigurationEpoch::new(1).expect("configuration epoch"),
                 vec![first, duplicate_id],
@@ -1093,6 +1232,7 @@ mod tests {
         assert!(matches!(
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("cluster-a").expect("cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("generation-1").expect("generation"),
                 SessionConfigurationEpoch::new(1).expect("configuration epoch"),
                 vec![first, duplicate_tls],
@@ -1110,6 +1250,7 @@ mod tests {
         assert!(matches!(
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new("cluster-a").expect("cluster ID"),
+                [0x5a; 32],
                 SessionConfigurationGeneration::new("generation-1").expect("generation"),
                 SessionConfigurationEpoch::new(1).expect("configuration epoch"),
                 vec![malformed],

@@ -46,6 +46,7 @@ async fn actual_mtls_control_progresses_with_both_maintenance_lanes_and_handlers
     let manifest = Arc::new(
         SessionReplicationManifest::try_new_with_epoch(
             SessionClusterId::new("class-network").unwrap(),
+            [0x5a; 32],
             SessionConfigurationGeneration::new("1").unwrap(),
             SessionConfigurationEpoch::new(1).unwrap(),
             descriptors,
