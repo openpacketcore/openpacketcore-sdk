@@ -102,6 +102,23 @@ fn retained_sql_log_end(cluster: &TestCluster, node: usize) -> u64 {
     retained_sql_log_id(cluster, node).index
 }
 
+async fn wait_for_stepdown_publication(store: &ConsensusSessionStore, previous_term: u64) {
+    #[cfg(feature = "test-control")]
+    store
+        .wait_for_status_for_test(|status| {
+            status.term > previous_term && status.leader_id != Some(status.node_id)
+        })
+        .await;
+    #[cfg(not(feature = "test-control"))]
+    loop {
+        let status = store.status();
+        if status.term > previous_term && status.leader_id != Some(status.node_id) {
+            break;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 // The pinned engine reports metrics after sending its response. Hold that
 // publication event itself: an already-ready response need not wake anyone.
 // No engine state or published metrics are replaced by this scheduling fault.
@@ -515,6 +532,14 @@ async fn stepdown_scenario(publication_events: Arc<StdMutex<Option<Arc<Publicati
         "the actual publication event holds the engine before metrics publication"
     );
     let stepdown = async {
+        // Response delivery precedes metrics publication. Observe that actual
+        // publication within the original response budget before asserting.
+        tokio::time::timeout_at(
+            stepdown_deadline,
+            wait_for_stepdown_publication(store, term),
+        )
+        .await
+        .expect("stepdown metrics publish within the original response deadline");
         assert!(store.status().term > term);
         assert_ne!(store.status().leader_id, Some(store.status().node_id));
     };
