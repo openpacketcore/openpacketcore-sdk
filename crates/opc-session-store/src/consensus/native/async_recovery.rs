@@ -392,6 +392,24 @@ impl NativeFrontierValues {
         self.async_recovery.as_ref().map_or(0, |b| b.watch_before)
     }
 
+    /// Number of leading notification rows retired at this committed watch
+    /// sequence. Derived only from committed state, so every voter agrees.
+    pub(super) fn notification_floor(&self) -> u64 {
+        super::retention::notification_retention().floor(self.watch_sequence)
+    }
+
+    /// Number of notification rows that must exist at this committed watch
+    /// sequence.
+    pub(crate) fn retained_notification_count(&self) -> u64 {
+        super::retention::notification_retention().retained_count(self.watch_sequence)
+    }
+
+    /// Raw committed sequence of a zero-based ordinal inside the retained
+    /// notification window.
+    pub(super) fn notification_sequence(&self, ordinal: usize) -> io::Result<u64> {
+        super::retention::notification_retention().sequence(ordinal, self.watch_sequence)
+    }
+
     pub(super) fn outward_watch(&self, raw: u64) -> io::Result<u64> {
         raw.checked_sub(self.async_watch_before())
             .and_then(|sequence| sequence.checked_add(self.async_fence_floor()))

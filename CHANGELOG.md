@@ -40,6 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gtpu_control_port_kernel_owned`, no second socket is ever bound, and
   removal, replacement, adoption or a descriptor generation change retires
   old receive capabilities and plans. Refs #1084.
+- `opc-session-store`: native notification rows now use bounded rolling
+  retention instead of accumulating for the life of the store. The newest
+  65,536 notifications remain resident; that 65,536 is a row-count bound, not a
+  byte budget, and the retention floor is derived only
+  from the committed `watch_sequence`, so every voter derives the same floor at
+  the same log index and the already-persisted snapshot/frontier state carries
+  it across restart with no new persisted-format field or
+  acknowledgement/delivery tracker. Row publication retires the out-of-window
+  prefix, business validation requires exactly the derived retained count and
+  raw sequences, and a watcher whose inclusive cursor is at or below the floor
+  receives the existing `ReplicationLogCursorCompacted { resume_from }` answer
+  so it resynchronises from the lowest replayable sequence; retention is a
+  bounded replay backlog, not delivery tracking. The 1,048,576-row
+  `MAX_ITEMS` cap remains a last defense instead of a lifetime stop. Durable
+  generation/image/export carry for the derived floor is the staged follow-up
+  (#1250) and adds no format boundary in this change. Refs #1250.
 
 - `opc-session-net`: `PersistentSessionConsumerConfig::with_cooldown_admission`
   selects the explicit reconnect-cooldown admission policy for a persistent

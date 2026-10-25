@@ -26,6 +26,7 @@ mod memory_observation;
 #[cfg(test)]
 mod memory_tests;
 mod ordinary;
+mod retention;
 pub(crate) mod roster;
 mod row_map;
 mod scope_authority;
