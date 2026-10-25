@@ -92,6 +92,7 @@ pub(crate) fn fixture() -> (SaParameters, PolicyParameters) {
         output_mark: None,
         if_id: Some(55),
         egress_dscp: None,
+        tfc_pad: None,
     };
     let policy = PolicyParameters {
         selector: sa.selector.clone(),

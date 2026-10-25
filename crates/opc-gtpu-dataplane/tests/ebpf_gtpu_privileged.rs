@@ -3199,6 +3199,7 @@ fn inbound_sa_parameters(spi: u32, output_mark: XfrmMark) -> SaParameters {
         output_mark: Some(output_mark),
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     }
 }
 
@@ -3241,6 +3242,7 @@ fn downlink_sa_parameters(spi: u32, mark: Option<XfrmLookupMark>) -> SaParameter
         output_mark: None,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     }
 }
 
@@ -3290,6 +3292,7 @@ fn protected_v6_inbound_sa_parameters(output_mark: Option<XfrmMark>) -> SaParame
         output_mark,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     }
 }
 
@@ -3318,6 +3321,7 @@ fn protected_v6_downlink_sa_parameters(mark: Option<XfrmLookupMark>) -> SaParame
         output_mark: None,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     }
 }
 

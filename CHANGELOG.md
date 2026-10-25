@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `opc-ipsec-xfrm`: SAs can request Linux Traffic Flow Confidentiality (TFC)
+  padding through the new `SaParameters::tfc_pad: Option<u32>`. A `Some(n)`
+  value serializes the `XFRMA_TFCPAD` attribute (UAPI attribute 22, `__u32`) on
+  install and rekey; Linux ESP output then pads the protected packet to at
+  least `n` bytes when shorter, capped at the path MTU. Validation rejects a
+  zero length, non-ESP SAs, and non-tunnel modes before any netlink mutation,
+  matching the kernel's `verify_newsa_info`. `SaState::tfc_pad` reports the
+  value from exact `GETSA` readback. `None` emits no attribute and keeps the
+  pre-TFC bytes exactly unchanged. Dummy-packet generation with Next Header 59
+  is not part of this netlink model. Refs #1344.
+
 ### Fixed
 
 - `opc-proto-gtpv2c`: an S2b Update Bearer request or response carrying a
@@ -20,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refs #1441.
 
 ### Breaking
+
+- `opc-ipsec-xfrm`: `SaParameters` and `SaState` add a public
+  `tfc_pad: Option<u32>` field for Linux Traffic Flow Confidentiality padding.
+  Callers constructing either struct with a literal must add `tfc_pad: None`;
+  SAs that do not configure TFC emit byte-identical netlink and report `None`
+  on readback, so no installed-state behaviour changes. Downstream exhaustive
+  struct literals must be updated. Refs #1344.
 
 - `opc-session-net`: `StartupError` adds `PlatformInvalid`,
   `PlatformChanged`, and `PrerequisiteRefused`. Issuer probe and retained-session

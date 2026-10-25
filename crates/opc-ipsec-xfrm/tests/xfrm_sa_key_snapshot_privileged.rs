@@ -136,6 +136,7 @@ fn sa(spi: u32, mark: Option<XfrmLookupMark>, request_id: u32) -> SaParameters {
         output_mark: None,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     }
 }
 

@@ -2955,6 +2955,7 @@ mod tests {
                 output_mark: None,
                 if_id: None,
                 egress_dscp: None,
+                tfc_pad: None,
             },
         })
     }

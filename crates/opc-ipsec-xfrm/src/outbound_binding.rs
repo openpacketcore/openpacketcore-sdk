@@ -685,6 +685,7 @@ pub(crate) mod tests_support {
             output_mark: None,
             if_id: Some(19),
             egress_dscp: None,
+            tfc_pad: None,
         };
         let policy = PolicyParameters {
             selector,

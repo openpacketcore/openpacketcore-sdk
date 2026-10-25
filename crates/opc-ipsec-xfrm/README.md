@@ -877,6 +877,26 @@ Readback rejects mixed, duplicated, or flag-inconsistent replay
 representations. Dynamic counters and last-used timestamps are permitted, but
 unmodeled semantic SA or policy attributes fail closed.
 
+Linux Traffic Flow Confidentiality padding is modeled through
+`SaParameters::tfc_pad`: `Some(n)` emits the `XFRMA_TFCPAD` attribute (UAPI
+attribute 22, `__u32`) so Linux ESP output pads the protected packet to at
+least `n` bytes when it is shorter, capped at the SA's path MTU. Validation
+rejects a zero length, non-ESP SAs, and non-tunnel modes before any netlink
+mutation, matching the kernel's `verify_newsa_info`. `None` emits no attribute
+and keeps the pre-TFC request bytes unchanged. `SaState::tfc_pad` reports the
+value from exact `GETSA` readback; the kernel omits the attribute for an unset
+length, and a zero-valued attribute is reported as absent. Dummy-packet
+generation (RFC 4303 2.6, Next Header 59) builds ESP packets and is a
+dataplane concern outside this netlink model.
+
+Keyed identity encodings are versioned store formats. The durable
+object/roster install-request authentication domains
+(`...install-request-v1`) and the outbound-binding fingerprint are unchanged
+in this revision, so `tfc_pad` is not covered by those keyed fingerprints;
+in-memory `SaParameters` comparisons do include it. Widening an authenticated
+encoding requires its own auth-domain/version decision and migration plan, so
+that is deliberately out of scope here.
+
 Binding and inbound peer-observation readback recognize the Linux 6.10+
 `XFRMA_SA_DIR` attribute at its UAPI number 33 and validate its one-byte
 direction against the requested role. Number 34 is
@@ -1017,6 +1037,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         output_mark: None,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     };
 
     backend.install_sa(InstallSaRequest { parameters: sa }).await?;

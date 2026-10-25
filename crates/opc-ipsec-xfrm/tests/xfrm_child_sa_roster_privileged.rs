@@ -192,6 +192,7 @@ fn sa(id: u64, incarnation: u64, inbound: bool) -> SaParameters {
         output_mark: None,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     }
 }
 
