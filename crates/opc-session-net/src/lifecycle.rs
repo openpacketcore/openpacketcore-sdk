@@ -21,6 +21,26 @@ pub const DEFAULT_ROTATION_DRAIN_WINDOW: Duration = Duration::from_secs(30);
 pub const DEFAULT_RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(50);
 /// Default maximum delay between reconnect attempts.
 pub const DEFAULT_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Admission policy for a caller that reaches a peer whose shared reconnect
+/// back-off (cooldown) is currently active.
+///
+/// The default is [`Self::Wait`]: a caller waits for the single coalesced
+/// cooldown edge (or its own deadline) before one serialized probe may run.
+/// [`Self::FailOver`] is the explicit routed-consumer policy: a caller that
+/// is only one candidate route returns immediately with an authoritative
+/// pre-write cooldown outcome so its routing loop can select another peer.
+/// Both policies keep the same exponential back-off, the same single
+/// serialized probe at cooldown expiry, and the same request-byte boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReconnectCooldownPolicy {
+    /// Wait for the coalesced cooldown edge, bounded by the caller deadline.
+    #[default]
+    Wait,
+    /// Fail over immediately with the remaining cooldown instead of waiting.
+    FailOver,
+}
 /// Default per-peer spread applied when a material epoch changes.
 pub const DEFAULT_ROTATION_JITTER: Duration = Duration::from_secs(30);
 
@@ -308,7 +328,7 @@ impl ReconnectGate {
             .await
         {
             ReconnectAdmission::Admitted(attempt) => Some(attempt),
-            ReconnectAdmission::Cooldown
+            ReconnectAdmission::Cooldown { .. }
             | ReconnectAdmission::Superseded
             | ReconnectAdmission::Deadline => None,
         }
@@ -324,9 +344,9 @@ impl ReconnectGate {
             .await
     }
 
-    /// Acquire one shared reconnect attempt and publish `failure_jitter` as
-    /// part of that attempt's single cooldown deadline. Waiting callers never
-    /// apply independent sleeps, so they observe one bounded backoff edge.
+    /// Acquire one shared reconnect attempt with the default waiting cooldown
+    /// policy and publish `failure_jitter` as part of that attempt's single
+    /// cooldown deadline.
     pub(crate) async fn acquire_classified_with_jitter(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
@@ -334,11 +354,69 @@ impl ReconnectGate {
         material: Option<opc_tls::TlsMaterialEpoch>,
         failure_jitter: Duration,
     ) -> ReconnectAdmission {
+        self.acquire_classified_with_jitter_and_cooldown(
+            deadline,
+            generation,
+            material,
+            failure_jitter,
+            ReconnectCooldownPolicy::Wait,
+        )
+        .await
+    }
+
+    /// Acquire one shared reconnect attempt under an explicit cooldown policy.
+    ///
+    /// `ReconnectCooldownPolicy::Wait` preserves the coalesced wait. Under
+    /// `ReconnectCooldownPolicy::FailOver`, a caller that observes an active
+    /// cooldown returns [`ReconnectAdmission::Cooldown`] immediately without
+    /// taking the serial admission or starting a probe, so a routing caller can
+    /// select another peer. No caller applies an independent sleep or probe;
+    /// the first caller at cooldown expiry still owns the single serialized
+    /// probe.
+    pub(crate) async fn acquire_classified_with_jitter_and_cooldown(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        generation: u64,
+        material: Option<opc_tls::TlsMaterialEpoch>,
+        failure_jitter: Duration,
+        cooldown_policy: ReconnectCooldownPolicy,
+    ) -> ReconnectAdmission {
         let epoch = ReconnectEpoch {
             generation,
             material,
         };
         self.observe_epoch(generation, material);
+        if cooldown_policy == ReconnectCooldownPolicy::FailOver {
+            // Fast fail-over path: never queue behind the serial admission (or
+            // an in-flight probe) when the shared cooldown is already visible.
+            // The routing caller receives the bounded remaining cooldown now
+            // and may select another peer; no probe is started here.
+            let (remaining, superseded) = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.epoch != Some(epoch) {
+                    (None, true)
+                } else {
+                    (
+                        state
+                            .next_attempt_at
+                            .filter(|wait| *wait > tokio::time::Instant::now())
+                            .map(|wait| {
+                                wait.saturating_duration_since(tokio::time::Instant::now())
+                            }),
+                        false,
+                    )
+                }
+            };
+            if superseded {
+                return ReconnectAdmission::Superseded;
+            }
+            if let Some(remaining) = remaining {
+                return ReconnectAdmission::Cooldown { remaining };
+            }
+        }
         let permit =
             match tokio::time::timeout_at(deadline, Arc::clone(&self.serial).acquire_owned()).await
             {
@@ -366,8 +444,10 @@ impl ReconnectGate {
             else {
                 break;
             };
-            if wait_until >= deadline {
-                return ReconnectAdmission::Cooldown;
+            if wait_until >= deadline || cooldown_policy == ReconnectCooldownPolicy::FailOver {
+                return ReconnectAdmission::Cooldown {
+                    remaining: wait_until.saturating_duration_since(tokio::time::Instant::now()),
+                };
             }
             tokio::select! {
                 biased;
@@ -460,7 +540,10 @@ impl ReconnectGate {
 
 pub(crate) enum ReconnectAdmission {
     Admitted(ReconnectAttempt),
-    Cooldown,
+    Cooldown {
+        /// Bounded remaining shared cooldown at the observation instant.
+        remaining: Duration,
+    },
     Superseded,
     Deadline,
 }

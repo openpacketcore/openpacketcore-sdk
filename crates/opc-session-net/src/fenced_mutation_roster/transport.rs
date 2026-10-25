@@ -674,6 +674,7 @@ fn publication_authority_read_error(
         PublicationAuthorityReadError::NoApplicationProtocol
         | PublicationAuthorityReadError::Local(
             SessionConsumerClientError::Unavailable
+            | SessionConsumerClientError::Cooldown { .. }
             | SessionConsumerClientError::Deadline
             | SessionConsumerClientError::Overloaded
             | SessionConsumerClientError::Authentication
@@ -698,6 +699,7 @@ fn publication_authority_client_error(
     use crate::consumer::SessionConsumerClientError;
     match error {
         SessionConsumerClientError::Unavailable
+        | SessionConsumerClientError::Cooldown { .. }
         | SessionConsumerClientError::Deadline
         | SessionConsumerClientError::Overloaded => PublicationAuthorityCheckError::Unavailable,
         SessionConsumerClientError::Authentication

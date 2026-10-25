@@ -1731,7 +1731,7 @@ async fn run_detached_consensus_connection_attempt_inner(
     };
     let reconnect_attempt = match reconnect_admission {
         Some(ReconnectAdmission::Admitted(attempt)) => attempt,
-        Some(ReconnectAdmission::Cooldown) => {
+        Some(ReconnectAdmission::Cooldown { .. }) => {
             coordinator
                 .publish_no_admission(attempt_id, epoch, SessionConsensusPeerError::Unavailable)
                 .await;
