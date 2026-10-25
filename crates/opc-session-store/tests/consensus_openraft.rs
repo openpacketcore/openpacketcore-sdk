@@ -878,6 +878,12 @@ async fn commit_snapshot_triggering_commands(store: &ConsensusSessionStore) {
     }
 }
 
+async fn snapshot_command_batch<F: std::future::Future>(
+    commands: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    Ok(commands.await)
+}
+
 /// One store-published status observation used only as preparation progress.
 ///
 /// These are the store's own published indices and counters (no file or path
@@ -1034,65 +1040,60 @@ async fn commit_snapshot_triggering_commands_observed(
     Ok(())
 }
 
-#[test]
-fn snapshot_preparation_progress_is_event_driven_not_total_runtime_bounded() {
-    let started_at = Instant::now();
-    let mut publication = SnapshotPreparationPublication {
-        applied_index: Some(1),
-        last_log_index: Some(1),
-        completed_snapshot_count: 0,
-    };
-    let mut progress = SnapshotPreparationProgress::new(publication, started_at);
-    let mut sampled_at = started_at;
-    // A slow batch: 180 commands at 5 s each publish store progress well inside
-    // the hang-guard window, for 900 s total. That is far longer than the
-    // removed 300 s aggregate bound, and total duration is never the failure
-    // condition.
-    for applied in 2..=181_u64 {
-        sampled_at += Duration::from_secs(5);
-        publication.applied_index = Some(applied);
-        publication.last_log_index = Some(applied);
-        assert_eq!(
-            None,
-            progress.observe(sampled_at, publication, SNAPSHOT_PREPARATION_STALL_TIMEOUT),
-            "a slow preparation that keeps publishing store progress must not fail on elapsed time"
-        );
+#[tokio::test(start_paused = true)]
+async fn snapshot_preparation_progress_keeps_the_original_aggregate_bound() {
+    // Each command makes progress inside the store's operation deadline, but
+    // a 900-second batch must still fail at the original 300-second deadline.
+    let completed = std::cell::Cell::new(0);
+    let started = tokio::time::Instant::now();
+    let slow_batch = snapshot_command_batch(async {
+        for _ in 0..180 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            completed.set(completed.get() + 1);
+        }
+    });
+    tokio::pin!(slow_batch);
+    assert!(futures_util::poll!(slow_batch.as_mut()).is_pending());
+    for expected in 1..=59 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(futures_util::poll!(slow_batch.as_mut()).is_pending());
+        assert_eq!(completed.get(), expected);
     }
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert!(futures_util::poll!(slow_batch.as_mut()).is_pending());
+    assert_eq!(started.elapsed(), Duration::from_secs(299));
+    tokio::time::advance(Duration::from_secs(1)).await;
     assert!(
-        sampled_at.saturating_duration_since(started_at) > SNAPSHOT_COMMAND_BATCH_TIMEOUT,
-        "the regression covers a preparation longer than the removed aggregate bound"
+        matches!(
+            futures_util::poll!(slow_batch.as_mut()),
+            std::task::Poll::Ready(Err(_))
+        ),
+        "continuous command progress cannot extend the 300-second aggregate deadline"
     );
-    // A completed snapshot is store publication progress even when the apply
-    // head does not move.
-    sampled_at += Duration::from_secs(5);
-    publication.completed_snapshot_count = 1;
-    assert_eq!(
-        None,
-        progress.observe(sampled_at, publication, SNAPSHOT_PREPARATION_STALL_TIMEOUT),
-        "snapshot publication alone counts as store progress"
-    );
-    // No published store change for the full hang-guard window is the only
-    // failure condition.
-    sampled_at += SNAPSHOT_PREPARATION_STALL_TIMEOUT;
-    let stalled_for = progress
-        .observe(sampled_at, publication, SNAPSHOT_PREPARATION_STALL_TIMEOUT)
-        .expect("a stalled preparation is reported");
-    assert_eq!(stalled_for, SNAPSHOT_PREPARATION_STALL_TIMEOUT);
-    let diagnostic = snapshot_preparation_stall_diagnostic(
-        "predecessor",
-        SNAPSHOT_CATCH_UP_COMMANDS,
-        stalled_for,
-        progress.publication,
-    );
-    assert!(
-        diagnostic.contains("predecessor snapshot preparation published no store progress"),
-        "the diagnostic names the closed preparation phase: {diagnostic}"
-    );
-    assert!(
-        diagnostic.contains("applied_index=Some(181)")
-            && diagnostic.contains("completed_snapshot_count=1"),
-        "the diagnostic retains the last published store indices/counters: {diagnostic}"
-    );
+    assert_eq!(started.elapsed(), Duration::from_secs(300));
+    assert!(completed.get() < 180, "the late batch is not accepted");
+
+    // Finishing within the same bound remains successful, including its value.
+    let started = tokio::time::Instant::now();
+    let completed_batch = snapshot_command_batch(async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        180
+    })
+    .await;
+    assert_eq!(completed_batch.unwrap(), 180);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+
+    // A batch with no progress is bounded too; no storage observer is needed.
+    let started = tokio::time::Instant::now();
+    let stalled_batch = snapshot_command_batch(std::future::pending::<()>());
+    tokio::pin!(stalled_batch);
+    assert!(futures_util::poll!(stalled_batch.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_secs(300)).await;
+    assert!(matches!(
+        futures_util::poll!(stalled_batch.as_mut()),
+        std::task::Poll::Ready(Err(_))
+    ));
+    assert_eq!(started.elapsed(), Duration::from_secs(300));
 }
 
 impl TestCluster {
@@ -6628,14 +6629,18 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
     // First make every voter compact, publish, and purge its predecessor
     // phase. The later isolated voter keeps its selected predecessor P, but
     // has no retained P+1..S log interval from which it can catch up.
-    commit_snapshot_triggering_commands_observed(&cluster.stores[initial_leader], "predecessor")
-        .await
-        .unwrap_or_else(|failure| {
-            panic!(
-                "{failure}; {}",
-                snapshot_catch_up_failure_diagnostic(&cluster, lagging)
-            );
-        });
+    snapshot_command_batch(commit_snapshot_triggering_commands_observed(
+        &cluster.stores[initial_leader],
+        "predecessor",
+    ))
+    .await
+    .expect("snapshot preparation retains its aggregate deadline")
+    .unwrap_or_else(|failure| {
+        panic!(
+            "{failure}; {}",
+            snapshot_catch_up_failure_diagnostic(&cluster, lagging)
+        );
+    });
     let predecessor = tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
         loop {
             let progress = futures_util::future::join_all(
@@ -6688,14 +6693,18 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
     .await
     .expect("surviving majority remains ready while predecessor voter is isolated");
 
-    commit_snapshot_triggering_commands_observed(&cluster.stores[initial_leader], "successor")
-        .await
-        .unwrap_or_else(|failure| {
-            panic!(
-                "{failure}; {}",
-                snapshot_catch_up_failure_diagnostic(&cluster, lagging)
-            );
-        });
+    snapshot_command_batch(commit_snapshot_triggering_commands_observed(
+        &cluster.stores[initial_leader],
+        "successor",
+    ))
+    .await
+    .expect("snapshot preparation retains its aggregate deadline")
+    .unwrap_or_else(|failure| {
+        panic!(
+            "{failure}; {}",
+            snapshot_catch_up_failure_diagnostic(&cluster, lagging)
+        );
+    });
     tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
         loop {
             let progress = futures_util::future::join_all(
