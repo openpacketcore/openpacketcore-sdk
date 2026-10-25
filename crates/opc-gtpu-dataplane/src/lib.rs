@@ -88,6 +88,7 @@ pub mod mock;
 pub mod model;
 pub mod n3;
 pub mod reassembly;
+pub mod selector_adapter_codec;
 pub mod selector_namespace;
 mod selector_namespace_v2;
 pub mod testkit;

@@ -3080,8 +3080,6 @@ impl fmt::Debug for GroupedObservation {
     }
 }
 
-const SELECTOR_OPERATION_STAMP_VERSION: u8 = 1;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectorOperationStampPhase {
     Installing = 1,
@@ -3290,108 +3288,57 @@ impl SelectorOperationStamp {
     }
 
     fn encode(self) -> [u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN] {
-        let mut output = [0_u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN];
-        output[0] = SELECTOR_OPERATION_STAMP_VERSION;
-        output[1] = self.phase as u8;
-        output[2] = self.operation as u8;
-        output[3] = self.outcome as u8;
-        output[8..16].copy_from_slice(&self.selector_generation.to_be_bytes());
-        output[16..32].copy_from_slice(&self.nonce);
-        output[32..48].copy_from_slice(&self.backend_epoch);
-        output[48..64].copy_from_slice(&self.transaction_id);
-        output[64..96].copy_from_slice(&self.namespace_binding);
-        output[96..128].copy_from_slice(&self.group_commitment);
-        output[128..160].copy_from_slice(&self.set_commitment);
-        output[160..192].copy_from_slice(&self.desired_commitment);
-        output[192..200].copy_from_slice(&self.dataplane_generation.to_be_bytes());
-        output
+        crate::selector_adapter_codec::encode_stamp_parts(
+            crate::selector_adapter_codec::StampParts {
+                phase: self.phase as u8,
+                operation: self.operation as u8,
+                outcome: self.outcome as u8,
+                selector_generation: self.selector_generation,
+                nonce: self.nonce,
+                backend_epoch: self.backend_epoch,
+                transaction_id: self.transaction_id,
+                namespace_binding: self.namespace_binding,
+                group_commitment: self.group_commitment,
+                set_commitment: self.set_commitment,
+                desired_commitment: self.desired_commitment,
+                dataplane_generation: self.dataplane_generation,
+            },
+        )
     }
 
     fn decode(value: &[u8; GTPU_SESSION_SELECTOR_STAMP_VALUE_LEN]) -> Option<Self> {
-        if value[0] != SELECTOR_OPERATION_STAMP_VERSION
-            || value[4..8] != [0; 4]
-            || value[200..208] != [0; 8]
-        {
-            return None;
-        }
-        let phase = match value[1] {
+        let parts = crate::selector_adapter_codec::decode_stamp_parts(value)?;
+        let phase = match parts.phase {
             1 => SelectorOperationStampPhase::Installing,
             2 => SelectorOperationStampPhase::Active,
             3 => SelectorOperationStampPhase::Retiring,
             4 => SelectorOperationStampPhase::Retired,
             _ => return None,
         };
-        let operation = match value[2] {
+        let operation = match parts.operation {
             1 => SelectorOperationStampKind::Install,
             2 => SelectorOperationStampKind::Remove,
             _ => return None,
         };
-        let outcome = match value[3] {
+        let outcome = match parts.outcome {
             1 => SelectorOperationStampOutcome::Pending,
             2 => SelectorOperationStampOutcome::Active,
             3 => SelectorOperationStampOutcome::Absent,
             _ => return None,
         };
-        let selector_generation = u64::from_be_bytes(value[8..16].try_into().ok()?);
-        let dataplane_generation = u64::from_be_bytes(value[192..200].try_into().ok()?);
-        let nonce = value[16..32].try_into().ok()?;
-        let backend_epoch = value[32..48].try_into().ok()?;
-        let transaction_id = value[48..64].try_into().ok()?;
-        let namespace_binding = value[64..96].try_into().ok()?;
-        let group_commitment = value[96..128].try_into().ok()?;
-        let set_commitment = value[128..160].try_into().ok()?;
-        let desired_commitment = value[160..192].try_into().ok()?;
-        if selector_generation == 0
-            || dataplane_generation == 0
-            || nonce == [0; 16]
-            || backend_epoch == [0; 16]
-            || namespace_binding == [0; 32]
-            || group_commitment == [0; 32]
-            || set_commitment == [0; 32]
-            || desired_commitment == [0; 32]
-        {
-            return None;
-        }
-        match (phase, operation, outcome, transaction_id == [0; 16]) {
-            (
-                SelectorOperationStampPhase::Installing,
-                SelectorOperationStampKind::Install,
-                SelectorOperationStampOutcome::Pending,
-                false,
-            )
-            | (
-                SelectorOperationStampPhase::Active,
-                SelectorOperationStampKind::Install,
-                SelectorOperationStampOutcome::Active,
-                true,
-            )
-            | (
-                SelectorOperationStampPhase::Retiring,
-                SelectorOperationStampKind::Remove,
-                SelectorOperationStampOutcome::Pending,
-                false,
-            )
-            | (
-                SelectorOperationStampPhase::Retired,
-                SelectorOperationStampKind::Remove,
-                SelectorOperationStampOutcome::Absent,
-                true,
-            ) => {}
-            _ => return None,
-        }
         Some(Self {
             phase,
             operation,
             outcome,
-            selector_generation,
-            nonce,
-            backend_epoch,
-            transaction_id,
-            namespace_binding,
-            group_commitment,
-            set_commitment,
-            desired_commitment,
-            dataplane_generation,
+            selector_generation: parts.selector_generation,
+            nonce: parts.nonce,
+            backend_epoch: parts.backend_epoch,
+            transaction_id: parts.transaction_id,
+            namespace_binding: parts.namespace_binding,
+            group_commitment: parts.group_commitment,
+            set_commitment: parts.set_commitment,
+            desired_commitment: parts.desired_commitment,
+            dataplane_generation: parts.dataplane_generation,
         })
     }
 
