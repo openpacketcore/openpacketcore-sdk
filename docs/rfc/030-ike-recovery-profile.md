@@ -326,7 +326,11 @@ drops without changing state.
 Message-ID accounting is explicitly volatile. The probe advances an in-memory
 send high-water mark; the next committed window operation (ordinary
 request/response, rekey, synchronization or terminal record) folds the advance
-into the durable `next_send`. A crash before any such commit loses the advanced
+into the durable `next_send`. Both the initiating and the peer-initiated
+responding synchronization paths advertise the volatile advance and fold it into
+their committed counters, so a sync cutover cannot commit a floor below a burned
+probe ID; a sync admitted while a probe is still outstanding is recorded as
+`OutcomeUncertain` instead. A crash before any such commit loses the advanced
 IDs as a bounded lead ([RFC 6311 §5.1](https://www.rfc-editor.org/rfc/rfc6311.html#section-5.1)):
 the restored window expects its durable floor and may reuse an unrecoverable
 probe ID. A consumer that cannot tolerate the peer having observed such an ID
