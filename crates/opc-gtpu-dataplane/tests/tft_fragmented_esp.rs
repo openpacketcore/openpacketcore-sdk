@@ -42,6 +42,10 @@ fn invalid() -> Classification {
     dropped(TftUplinkDropReason::InvalidState)
 }
 
+fn capacity() -> Classification {
+    dropped(TftUplinkDropReason::CapacityExhausted)
+}
+
 fn checksum(packet: &mut [u8]) {
     packet[10..12].fill(0);
     let value = internet_checksum(&packet[..20]);
@@ -643,7 +647,8 @@ fn full_bucket_refuses_new_ids_and_never_evicts_live_or_completed_entries() {
             &esp(refused, MORE, SPI),
             FIRST_TIME + 1
         ),
-        invalid()
+        capacity(),
+        "a new first fragment in a full bucket reports the distinct capacity reason"
     );
     assert_eq!(
         classify(
@@ -672,7 +677,8 @@ fn full_bucket_refuses_new_ids_and_never_evicts_live_or_completed_entries() {
             &esp(refused, MORE, SPI),
             FIRST_TIME + 4
         ),
-        invalid()
+        capacity(),
+        "the refused identity is still not admitted after its peers complete"
     );
     let other = (0..=u16::MAX)
         .find(|id| fragment_bucket(*id) != fragment_bucket(refused))

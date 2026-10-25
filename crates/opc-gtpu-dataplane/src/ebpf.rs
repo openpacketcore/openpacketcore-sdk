@@ -17220,7 +17220,10 @@ mod aya_runtime {
             map_type: bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY as u32,
             key_size: 4,
             value_size: 8,
-            max_entries: TFT_CLASSIFIER_COUNTER_SLOTS,
+            // Frozen pre-selector generation: its counter map has three slots.
+            // Never follow the current constant here; the frozen map definition
+            // is historical recognition authority.
+            max_entries: 3,
         },
     ];
 
