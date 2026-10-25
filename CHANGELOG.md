@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation are unchanged, and Create Bearer behaviour is unchanged.
   Refs #1441.
 
+- `opc-session-store`: a cancelled Dynamic-authority current-snapshot
+  admission no longer releases publication exclusion, its namespace lease or
+  its shutdown evidence while the detached descriptor scan still reads the
+  selected snapshot. Dynamic admission now runs the bounded envelope scan on a
+  blocking worker that owns the serving gate, the admitted snapshot-directory
+  lease and a shutdown child through its last read, matching the Fixed
+  admission contract. Fixed admission, snapshot bytes, admission deadlines and
+  published artifacts are unchanged. Refs #1371.
+
 - `opc-session-net`: prepared protected V2 transition status no longer caches
   a transient local recovery-preflight failure as the handle's final
   `Unavailable`. A transient journal, backing, key-provider or
