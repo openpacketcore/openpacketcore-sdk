@@ -342,9 +342,8 @@ fn singleton_policy_wrapper_metadata_and_nested_framing() {
         .iter()
         .find(|v| v["name"] == "single-7-1")
         .unwrap();
-    let pdu = read(row, context()).unwrap();
     for change in 0..3 {
-        let mut bad = pdu.clone();
+        let mut bad = read(row, context()).unwrap();
         if let PduKind::Successful {
             procedure_code,
             criticality,

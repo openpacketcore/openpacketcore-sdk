@@ -12,12 +12,14 @@
 //! - [`DecodeContext`] – security limits and validation policies for decoders.
 //! - [`EncodeContext`] – version and mode selectors for encoders.
 //! - [`DecodeError`] / [`EncodeError`] – structured, log-safe error types.
+//! - [`SensitiveBytes`] – a uniquely owned buffer zeroized on drop.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 mod context;
 mod error;
+mod sensitive;
 mod traits;
 
 pub use context::{
@@ -25,4 +27,5 @@ pub use context::{
     UnknownIePolicy, ValidationLevel,
 };
 pub use error::{DecodeError, DecodeErrorCode, EncodeError, EncodeErrorCode, SpecRef};
+pub use sensitive::SensitiveBytes;
 pub use traits::{BorrowDecode, DecodeResult, Encode, OwnedDecode, ToOwnedPdu};

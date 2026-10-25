@@ -15,6 +15,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 use bytes::Bytes;
+use opc_protocol::SensitiveBytes;
 use thiserror::Error;
 
 use crate::{
@@ -167,8 +168,15 @@ impl N2OutboundMessage {
 /// One admitted opaque NGAP record and its original SCTP metadata.
 ///
 /// The association identifier is backend metadata, not a generation token.
+///
+/// ```compile_fail
+/// fn requires_clone<T: Clone>(_: &T) {}
+/// fn probe(payload: &opc_sctp::n2::N2Payload) {
+///     requires_clone(payload);
+/// }
+/// ```
 pub struct N2Payload {
-    payload: Bytes,
+    payload: SensitiveBytes,
     stream_id: u16,
     assoc_id: i32,
 }
@@ -181,8 +189,11 @@ impl fmt::Debug for N2Payload {
 
 impl N2Payload {
     /// Borrow the admitted opaque NGAP bytes for the caller's codec.
+    ///
+    /// The returned buffer is uniquely owned by this record and is zeroized
+    /// when the record is dropped.
     #[must_use]
-    pub fn payload(&self) -> &Bytes {
+    pub fn payload(&self) -> &SensitiveBytes {
         &self.payload
     }
 
@@ -199,8 +210,10 @@ impl N2Payload {
     }
 
     /// Transfer the admitted payload to the caller.
+    ///
+    /// The caller now owns the zeroizing buffer; it clears itself on drop.
     #[must_use]
-    pub fn into_payload(self) -> Bytes {
+    pub fn into_payload(self) -> SensitiveBytes {
         self.payload
     }
 }

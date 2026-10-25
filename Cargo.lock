@@ -3528,6 +3528,7 @@ dependencies = [
 name = "opc-proto-ngap"
 version = "0.2.0"
 dependencies = [
+ "allocation-counter",
  "bytes",
  "opc-protocol",
  "opc-types",
@@ -3564,6 +3565,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
@@ -3684,6 +3686,7 @@ dependencies = [
  "allocation-counter",
  "bytes",
  "opc-libsctp-sys",
+ "opc-protocol",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

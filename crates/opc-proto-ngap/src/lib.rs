@@ -19,7 +19,7 @@
 //! bounded before `rasn` materializes it, known IE identifiers and criticality
 //! are checked against the generated source's pinned object set, and unknown/duplicate
 //! entries follow the selected policies. `Drop`, `First`, and `Last` affect the
-//! typed message view only. [`Pdu::raw`] remains the immutable received PDU, so
+//! typed message view only. [`Pdu::raw()`] remains the immutable received PDU, so
 //! raw-preserving [`encode`] deliberately reproduces entries filtered from the
 //! typed view.
 //!
@@ -31,8 +31,9 @@ use std::fmt;
 
 use bytes::{Bytes, BytesMut};
 use opc_protocol::{
-    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, Encode, EncodeContext,
-    EncodeError, EncodeErrorCode, OwnedDecode, UnknownIePolicy, ValidationLevel,
+    BorrowDecode, DecodeContext, DecodeError, DecodeErrorCode, DecodeResult, DuplicateIePolicy,
+    Encode, EncodeContext, EncodeError, EncodeErrorCode, OwnedDecode, SensitiveBytes,
+    UnknownIePolicy, ValidationLevel,
 };
 
 mod aper;
@@ -67,20 +68,82 @@ pub mod messages {
 
 /// A constructed or decoded NGAP PDU with a policy-filtered typed view.
 ///
-/// For received PDUs, [`Self::raw`] contains the immutable received PDU. A
-/// constructed PDU has empty `raw` and can use canonical encoding. When decoding with
+/// For received PDUs, [`Self::raw`] contains the immutable received PDU in a
+/// uniquely owned buffer that is zeroized on drop. A constructed PDU has empty
+/// raw bytes and can use canonical encoding. When decoding with
 /// [`UnknownIePolicy::Drop`] or a duplicate policy that selects one occurrence,
-/// the typed [`Self::kind`] may omit entries that remain present in `raw`.
-#[derive(Clone, PartialEq, Eq)]
+/// the typed [`Self::kind`] may omit entries that remain present in raw bytes.
+///
+/// `Pdu` is deliberately not `Clone`, `PartialEq`, `Eq` or `Debug`-over-bytes:
+/// a received PDU can carry security-key material, so duplicating, comparing or
+/// formatting it must be explicit. Dropping a PDU clears the raw receive copy,
+/// the opaque unknown-message copy and every retained security-key IE payload.
+///
+/// ```compile_fail
+/// // A received PDU cannot be duplicated implicitly.
+/// fn requires_clone<T: Clone>(_: &T) {}
+/// fn probe(pdu: &opc_proto_ngap::Pdu) {
+///     requires_clone(pdu);
+/// }
+/// ```
 pub struct Pdu {
-    /// Original receive bytes for byte-exact re-emission, or empty on construction.
-    pub raw: Bytes,
+    raw: SensitiveBytes,
+    /// Security-key IE values extracted from the typed open-type view.
+    ///
+    /// The generated `Any` copies are emptied during decode and the key octets
+    /// are owned here in zeroizing buffers. Canonical encoding substitutes
+    /// them back in order; dropping the PDU clears them.
+    security_key_values: Vec<SensitiveBytes>,
     /// Decoded PDU kind and message body.
     pub kind: PduKind,
 }
 
+impl Pdu {
+    /// Construct a PDU without raw receive bytes for canonical encoding.
+    #[must_use]
+    pub fn new(kind: PduKind) -> Self {
+        Self {
+            raw: SensitiveBytes::new(),
+            security_key_values: Vec::new(),
+            kind,
+        }
+    }
+
+    /// Borrow the original receive bytes for byte-exact re-emission.
+    #[must_use]
+    pub fn raw(&self) -> &[u8] {
+        self.raw.as_slice()
+    }
+
+    /// Return whether this PDU carries original receive bytes.
+    #[must_use]
+    pub fn has_raw(&self) -> bool {
+        !self.raw.is_empty()
+    }
+
+    pub(crate) fn from_parts(
+        raw: SensitiveBytes,
+        security_key_values: Vec<SensitiveBytes>,
+        kind: PduKind,
+    ) -> Self {
+        Self {
+            raw,
+            security_key_values,
+            kind,
+        }
+    }
+
+    pub(crate) fn security_key_values(&self) -> &[SensitiveBytes] {
+        &self.security_key_values
+    }
+}
+
 /// NGAP PDU outcome kind and decoded message body.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Security-key IE octets are not retained in this typed view: decoding moves
+/// them into the owning [`Pdu`]'s zeroizing storage. The view is deliberately
+/// not `Clone`/`PartialEq` so decoded structures cannot be duplicated or
+/// compared implicitly; `Debug` reports structure only.
 pub enum PduKind {
     /// Initiating message.
     Initiating {
@@ -117,7 +180,9 @@ pub enum PduKind {
 /// structural typed-dispatch coverage only. Unsupported procedure/outcome
 /// combinations are surfaced as [`Message::Unknown`] with body bytes preserved
 /// raw.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// Security-key IE octets are not retained in this typed view; see [`Pdu`].
+/// `Debug` reports only structure, never IE payload octets.
 pub enum Message {
     /// NG Setup Request (initiating message, procedure code 21).
     NgSetupRequest(messages::NGSetupRequest),
@@ -167,8 +232,9 @@ pub enum Message {
     UeContextReleaseComplete(messages::UEContextReleaseComplete),
     /// Paging (initiating message, procedure code 24).
     Paging(messages::Paging),
-    /// Message not in the typed subset; raw bytes are preserved.
-    Unknown(Bytes),
+    /// Message not in the typed subset; raw bytes are preserved in a uniquely
+    /// owned buffer that is zeroized on drop.
+    Unknown(SensitiveBytes),
 }
 
 impl fmt::Debug for Pdu {
@@ -358,8 +424,9 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
     let consumed = buf.len() - remainder.len();
     // Capture exactly this PDU, including every fragment terminator, never
     // trailing input belonging to a subsequent message.
-    let raw = Bytes::copy_from_slice(&buf[..consumed]);
-    let message = decode_message(outcome, procedure_code, criticality, &value, ctx)?;
+    let raw = SensitiveBytes::from_slice(&buf[..consumed]);
+    let (message, security_key_values) =
+        decode_message(outcome, procedure_code, criticality, &value, ctx)?;
     let kind = match outcome {
         Outcome::Initiating => PduKind::Initiating {
             procedure_code,
@@ -377,7 +444,7 @@ pub fn decode(buf: &[u8], ctx: DecodeContext) -> Result<Pdu, DecodeError> {
             message,
         },
     };
-    Ok(Pdu { raw, kind })
+    Ok(Pdu::from_parts(raw, security_key_values, kind))
 }
 
 /// NGAP-PDU outcome class, used to dispatch message-body decoding: the same
@@ -394,13 +461,17 @@ pub enum Outcome {
     Unsuccessful,
 }
 
+/// Decoded typed message plus the security-key IE payloads moved out of the
+/// generated open-type view into zeroizing custody.
+type DecodedNgapMessage = (Message, Vec<SensitiveBytes>);
+
 fn decode_message(
     outcome: Outcome,
     procedure_code: u8,
     criticality: Criticality,
     value: &[u8],
     ctx: DecodeContext,
-) -> Result<Message, DecodeError> {
+) -> Result<DecodedNgapMessage, DecodeError> {
     if value.len() > ctx.max_message_len {
         return Err(length_error(value.len(), ctx.max_message_len));
     }
@@ -420,6 +491,24 @@ fn decode_message(
             enforce_depth(NGAP_TYPED_MESSAGE_DEPTH, ctx)?;
             let declared_count = policy::preflight_ie_count(value, ctx, $reason)?;
             let invalid = || DecodeError::new(DecodeErrorCode::Structural { reason: $reason }, 0);
+            // Any failure after this point must not release a retained
+            // security-key IE copy uncleared. Every early return scrubs the
+            // generated open-type copies first; the success path keeps them in
+            // the decoded PDU, whose drop clears them.
+            macro_rules! scrub_and_return {
+                ($message:ident, $error:expr) => {{
+                    // The message is invalid, so its exact IE identities no
+                    // longer matter: clear every partial open-type copy.
+                    for ie in &mut $message.protocol_ies.0 {
+                        let mut contents =
+                            core::mem::replace(&mut ie.value, rasn::types::Any::new(Vec::new()))
+                                .into_bytes();
+                        zeroize::Zeroize::zeroize(&mut contents);
+                    }
+                    return Err($error);
+                }};
+            }
+            let mut security_key_values: Vec<SensitiveBytes> = Vec::new();
             let mut msg: $ty = if value[0] & 0x80 != 0 {
                 // Retain generated handling of SEQUENCE extension additions.
                 // Fragmented additions are outside this root-container subset.
@@ -432,31 +521,74 @@ fn decode_message(
                         remainder: next,
                         header,
                         value: payload,
-                    } = aper::ie(remaining)?;
+                    } = match aper::ie(remaining) {
+                        Ok(framed) => framed,
+                        Err(error) => scrub_and_return!(msg, error),
+                    };
                     // Type inference selects the generated anonymous IE type.
                     // Push before filling so its concrete type is known here.
-                    msg.protocol_ies
-                        .0
-                        .push(rasn::aper::decode(&header).map_err(|_| invalid())?);
+                    let decoded_header = match rasn::aper::decode(&header) {
+                        Ok(header) => header,
+                        Err(_) => scrub_and_return!(msg, invalid()),
+                    };
+                    msg.protocol_ies.0.push(decoded_header);
+                    let id = u16::from_be_bytes([header[0], header[1]]);
                     if let Some(ie) = msg.protocol_ies.0.last_mut() {
-                        ie.value = rasn::types::Any::new(payload.into_owned());
+                        if id == constructed::SECURITY_KEY_IE_ID {
+                            security_key_values
+                                .push(SensitiveBytes::from_vec(payload.into_owned()));
+                            ie.value = rasn::types::Any::new(Vec::new());
+                        } else {
+                            ie.value = rasn::types::Any::new(payload.into_owned());
+                        }
                     }
                     remaining = next;
                 }
                 if !remaining.is_empty() {
-                    return Err(invalid());
+                    scrub_and_return!(msg, invalid());
                 }
                 msg
             };
-            policy::apply_ie_policy(
+            if let Err(error) = policy::apply_ie_policy(
                 &mut msg.protocol_ies.0,
                 declared_count,
                 $profile,
                 ctx,
                 $id_of,
                 |ie| ie.criticality as u8,
-            )?;
-            Ok(Message::$variant(msg))
+            ) {
+                scrub_and_return!(msg, error);
+            }
+            // Extension-additions decoding leaves the key value inside the
+            // generated open-type copy; move it out here. Root-container
+            // decoding already extracted it during the IE walk (empty
+            // placeholder), so this only counts the retained entries.
+            let retained = constructed::extract_security_key_ie_values(
+                &mut msg.protocol_ies.0,
+                $id_of,
+                |ie| {
+                    core::mem::replace(&mut ie.value, rasn::types::Any::new(Vec::new()))
+                        .into_bytes()
+                },
+                &mut security_key_values,
+            );
+            // The id-SecurityKey IE is a singleton with a duplicate policy. When
+            // permissive duplicate handling retained one of several captured
+            // occurrences, keep exactly the occurrence the policy kept so
+            // canonical encoding substitutes the right bytes.
+            if security_key_values.len() > retained && retained > 0 {
+                match ctx.duplicate_ie_policy {
+                    DuplicateIePolicy::First => security_key_values.truncate(retained),
+                    DuplicateIePolicy::Last => {
+                        let keep_from = security_key_values.len() - retained;
+                        let kept: Vec<_> = security_key_values.split_off(keep_from);
+                        security_key_values.clear();
+                        security_key_values.extend(kept);
+                    }
+                    DuplicateIePolicy::Reject => security_key_values.truncate(retained),
+                }
+            }
+            Ok((Message::$variant(msg), security_key_values))
         }};
     }
 
@@ -658,7 +790,10 @@ fn decode_message(
         _ if reject_unknown_message(ctx) => Err(unknown_message_error(criticality)),
         _ => {
             enforce_depth(NGAP_UNKNOWN_MESSAGE_DEPTH, ctx)?;
-            Ok(Message::Unknown(Bytes::copy_from_slice(value)))
+            Ok((
+                Message::Unknown(SensitiveBytes::from_slice(value)),
+                Vec::new(),
+            ))
         }
     }
 }
@@ -705,7 +840,7 @@ pub fn encode(pdu: &Pdu, ctx: EncodeContext) -> Result<Vec<u8>, EncodeError> {
         return constructed::encode(pdu, ctx);
     }
     let len = checked_raw_preserving_len(pdu, ctx)?;
-    Ok(pdu.raw[..len].to_vec())
+    Ok(pdu.raw()[..len].to_vec())
 }
 
 fn checked_raw_preserving_len(pdu: &Pdu, ctx: EncodeContext) -> Result<usize, EncodeError> {
@@ -714,14 +849,14 @@ fn checked_raw_preserving_len(pdu: &Pdu, ctx: EncodeContext) -> Result<usize, En
             reason: "NGAP encode only supports raw-preserving mode",
         }));
     }
-    if pdu.raw.is_empty() {
+    if !pdu.has_raw() {
         return Err(EncodeError::new(EncodeErrorCode::Structural {
             reason: "raw-preserving NGAP encode requires decoded raw bytes",
         }));
     }
 
-    ctx.check_capacity(pdu.raw.len())?;
-    Ok(pdu.raw.len())
+    ctx.check_capacity(pdu.raw().len())?;
+    Ok(pdu.raw().len())
 }
 
 impl<'a> BorrowDecode<'a> for Pdu {
@@ -729,7 +864,7 @@ impl<'a> BorrowDecode<'a> for Pdu {
         let pdu = decode(input, ctx)?;
         // Report the bytes this PDU did NOT consume rather than claiming the
         // whole input was used. `pdu.raw` is exactly the consumed prefix.
-        let consumed = pdu.raw.len();
+        let consumed = pdu.raw().len();
         Ok((&input[consumed..], pdu))
     }
 }
@@ -1452,7 +1587,7 @@ mod tests {
     fn strict_decode_rejects_unknown_reject_criticality_procedure() {
         let bytes = empty_ie_pdu(FixtureOutcome::Initiating, 200, Criticality::reject);
         let default = decode(&bytes, DecodeContext::default()).unwrap();
-        match default.kind {
+        match &default.kind {
             PduKind::Initiating {
                 message: Message::Unknown(body),
                 ..
@@ -1639,15 +1774,48 @@ mod tests {
     }
 
     #[test]
+    fn decoded_security_key_ie_is_held_in_the_audited_carrier() {
+        let wire = encode(
+            &Pdu::from_protocol_ies(
+                MessageType::InitialContextSetupRequest,
+                &[
+                    ProtocolIe::new(94, Criticality::reject, &[0x5a; 32]),
+                    ProtocolIe::new(65_535, Criticality::ignore, &[0x11]),
+                ],
+                DecodeContext::default(),
+            )
+            .unwrap(),
+            EncodeContext::default(),
+        )
+        .unwrap();
+        let pdu = decode(&wire, DecodeContext::default()).unwrap();
+        let held: &crate::SensitiveBytes = &pdu.security_key_values()[0];
+        assert_eq!(held.as_slice(), &[0x5a; 32]);
+        assert!(pdu.security_key_values().len() == 1);
+        match &pdu.kind {
+            PduKind::Initiating {
+                message: Message::InitialContextSetupRequest(request),
+                ..
+            } => {
+                let placeholder = request
+                    .protocol_ies
+                    .0
+                    .iter()
+                    .find(|ie| ie.id == 94)
+                    .unwrap();
+                assert!(placeholder.value.as_bytes().is_empty());
+            }
+            _ => panic!("expected key-bearing InitialContextSetupRequest"),
+        }
+    }
+
+    #[test]
     fn raw_preserving_encode_requires_decoded_raw_bytes() {
-        let pdu = Pdu {
-            raw: Bytes::new(),
-            kind: PduKind::Initiating {
-                procedure_code: PROCEDURE_CODE_NG_SETUP,
-                criticality: Criticality::ignore,
-                message: Message::Unknown(Bytes::from_static(b"body")),
-            },
-        };
+        let pdu = Pdu::new(PduKind::Initiating {
+            procedure_code: PROCEDURE_CODE_NG_SETUP,
+            criticality: Criticality::ignore,
+            message: Message::Unknown(SensitiveBytes::from_slice(b"body")),
+        });
         let err = encode(&pdu, raw_preserving_context()).unwrap_err();
         assert!(matches!(
             err.code(),

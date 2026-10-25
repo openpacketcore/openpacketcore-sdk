@@ -112,7 +112,7 @@ fn ngap_dispatch_is_structural_and_rejects_malformed_containers() {
             }
         } else {
             let pdu = result.expect("structural APER dispatch");
-            assert_eq!(pdu.raw.as_ref(), wire);
+            assert_eq!(pdu.raw(), wire);
             // Empty mandatory-IE containers deliberately demonstrate only
             // dispatch. Admission to a real N3IWF procedure is unproven.
         }

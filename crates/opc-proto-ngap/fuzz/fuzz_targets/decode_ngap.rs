@@ -285,8 +285,10 @@ fuzz_target!(|data: &[u8]| {
         }
         if let Ok(wire) = encode(&pdu, output) {
             assert_eq!(pdu.wire_len(output).unwrap(), wire.len());
-            let received = Pdu::decode_owned(Bytes::from(wire), decode).unwrap();
-            assert!(received.kind == pdu.kind);
+            let received = Pdu::decode_owned(Bytes::from(wire.clone()), decode).unwrap();
+            // Canonical wire round-trip is the semantic invariant: it catches
+            // key-substitution, IE reorder/duplication and payload corruption.
+            assert_eq!(encode(&received, output).unwrap(), wire);
         }
     }
     // Independent construction input: bounded borrowed chunks, including
@@ -324,7 +326,8 @@ fuzz_target!(|data: &[u8]| {
         ) {
             let wire = encode(&pdu, output).unwrap();
             assert_eq!(pdu.wire_len(output).unwrap(), wire.len());
-            assert!(Pdu::decode_owned(Bytes::from(wire), decode).unwrap().kind == pdu.kind);
+            let received = Pdu::decode_owned(Bytes::from(wire.clone()), decode).unwrap();
+            assert_eq!(encode(&received, output).unwrap(), wire);
         }
     }
     let large = Pdu::from_protocol_ies(
@@ -334,5 +337,6 @@ fuzz_target!(|data: &[u8]| {
     )
     .unwrap();
     let wire = encode(&large, output).unwrap();
-    assert!(Pdu::decode_owned(Bytes::from(wire), decode).unwrap().kind == large.kind);
+    let received = Pdu::decode_owned(Bytes::from(wire.clone()), decode).unwrap();
+    assert_eq!(encode(&received, output).unwrap(), wire);
 });
