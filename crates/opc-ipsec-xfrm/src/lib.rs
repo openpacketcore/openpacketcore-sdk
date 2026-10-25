@@ -353,7 +353,7 @@ pub use installed_child_sa::{
 pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use local_scope::LocalXfrmProfile;
 #[cfg(feature = "scope-store")]
-pub use local_scope::{ScopedXfrmReceipt, ScopedXfrmRequest};
+pub use local_scope::{ScopedXfrmReceipt, ScopedXfrmRequest, ScopedXfrmSuccessorStatus};
 pub use mock::{MockExclusiveNamespaceReset, MockOperation, MockSaRelocation, MockXfrmBackend};
 pub use model::{
     AeadAlgorithm, Algorithm, AllocateSpiRequest, AuthAlgorithm, ExactRemovePolicyRequest,

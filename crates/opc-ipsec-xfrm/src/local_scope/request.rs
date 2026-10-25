@@ -61,13 +61,77 @@ impl ScopedXfrmRequest {
             expectation,
         })
     }
+
+    /// Validate that this request can succeed `predecessor` for one flow.
+    ///
+    /// A Child-SA rekey successor keeps the exact flow identity: the policy
+    /// lookup key (selector, direction, selector mark, interface ID), the SA
+    /// outer selector, destination/protocol/source, lookup mark, interface ID
+    /// and mode, the policy priority/action, the policy template selector,
+    /// source address and mode, and the packet-marking presentation
+    /// (`output_mark`, fixed outer DSCP) are unchanged. Only the SA SPI and the
+    /// policy/SA request ID may differ, so the existing protective policy can
+    /// be repointed to the successor SA in one atomic policy update while the
+    /// predecessor SA remains installed. This keeps the rekeyed flow's
+    /// scheduling and byte-level packet presentation identical.
+    ///
+    /// Construction of each request already validated its own profile.
+    /// This does not reserve a key, grant committed activation authority or
+    /// touch the kernel.
+    /// # Errors
+    /// [`XfrmError::StateMismatch`] `local_scope_successor_flow` when the two
+    /// requests name different flows, or `local_scope_successor_identity` when
+    /// the successor does not have a distinct SPI and request ID.
+    pub fn validate_successor_of(&self, predecessor: &Self) -> Result<(), XfrmError> {
+        let same_flow = self.policy.selector == predecessor.policy.selector
+            && self.policy.direction == predecessor.policy.direction
+            && self.policy.mark == predecessor.policy.mark
+            && self.policy.if_id == predecessor.policy.if_id
+            && self.sa.selector == predecessor.sa.selector
+            && self.sa.id.destination == predecessor.sa.id.destination
+            && self.sa.id.protocol == predecessor.sa.id.protocol
+            && self.sa.source_address == predecessor.sa.source_address
+            && self.sa.mark == predecessor.sa.mark
+            && self.sa.if_id == predecessor.sa.if_id
+            && self.sa.mode == predecessor.sa.mode
+            && self.sa.output_mark == predecessor.sa.output_mark
+            && self.sa.egress_dscp == predecessor.sa.egress_dscp
+            && self.policy.priority == predecessor.policy.priority
+            && self.policy.action == predecessor.policy.action
+            && self.policy.templates.len() == predecessor.policy.templates.len()
+            && self
+                .policy
+                .templates
+                .iter()
+                .zip(predecessor.policy.templates.iter())
+                .all(|(successor, predecessor)| {
+                    successor.id.destination == predecessor.id.destination
+                        && successor.id.protocol == predecessor.id.protocol
+                        && successor.id.spi == predecessor.id.spi
+                        && successor.source_address == predecessor.source_address
+                        && successor.mode == predecessor.mode
+                });
+        if !same_flow {
+            return Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_flow",
+            });
+        }
+        if self.sa.id.spi == predecessor.sa.id.spi
+            || self.sa.request_id == predecessor.sa.request_id
+        {
+            return Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_identity",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn fixture() -> (SaParameters, PolicyParameters) {
     use crate::*;
-    let source = IpAddress::Ipv4([192, 0, 2, 10]);
-    let destination = IpAddress::Ipv4([192, 0, 2, 20]);
+    let source = crate::IpAddress::Ipv4([192, 0, 2, 10]);
+    let destination = crate::IpAddress::Ipv4([192, 0, 2, 20]);
     let sa = SaParameters {
         selector: XfrmSelector::new(source, destination, 0),
         id: XfrmId {
@@ -76,12 +140,12 @@ pub(crate) fn fixture() -> (SaParameters, PolicyParameters) {
             protocol: 50,
         },
         source_address: source,
-        request_id: XfrmRequestId::new(99),
+        request_id: crate::XfrmRequestId::new(99),
         auth: None,
         crypt: None,
         aead: Some((
-            AeadAlgorithm::rfc4106_gcm_aes(128),
-            KeyMaterial::new(vec![0x7b; 20]),
+            crate::AeadAlgorithm::rfc4106_gcm_aes(128),
+            crate::KeyMaterial::new(vec![0x7b; 20]),
         )),
         mode: XfrmMode::Tunnel,
         lifetime: LifetimeConfig::default(),
@@ -169,6 +233,119 @@ mod tests {
             let mut policy = policy.clone();
             policy.direction = direction;
             ScopedXfrmRequest::new(sa.clone(), policy).unwrap();
+        }
+    }
+
+    fn successor_request(predecessor: &ScopedXfrmRequest) -> ScopedXfrmRequest {
+        let mut sa = predecessor.sa.clone();
+        sa.id.spi = sa.id.spi.checked_add(1).unwrap();
+        sa.request_id = Some(crate::XfrmRequestId::new(100).unwrap());
+        sa.aead = Some((
+            crate::AeadAlgorithm::rfc4106_gcm_aes(128),
+            crate::KeyMaterial::new(vec![0x8c; 20]),
+        ));
+        let mut policy = predecessor.policy.clone();
+        policy.templates[0].request_id = sa.request_id;
+        ScopedXfrmRequest::new(sa, policy).unwrap()
+    }
+
+    #[test]
+    fn successor_keeps_one_exact_flow_and_changes_the_sa_identity() {
+        let (sa, policy) = fixture();
+        let predecessor = ScopedXfrmRequest::new(sa, policy).unwrap();
+        let successor = successor_request(&predecessor);
+        successor.validate_successor_of(&predecessor).unwrap();
+
+        let mut changed_selector = successor.sa.clone();
+        changed_selector.selector.destination = crate::IpAddress::Ipv4([192, 0, 2, 21]);
+        let mut changed_selector_policy = successor.policy.clone();
+        changed_selector_policy.selector.destination = crate::IpAddress::Ipv4([192, 0, 2, 21]);
+        let changed_selector =
+            ScopedXfrmRequest::new(changed_selector, changed_selector_policy).unwrap();
+        assert!(matches!(
+            changed_selector.validate_successor_of(&predecessor),
+            Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_flow"
+            })
+        ));
+
+        let mut changed_direction = successor.policy.clone();
+        changed_direction.direction = XfrmDirection::In;
+        let changed_direction =
+            ScopedXfrmRequest::new(successor.sa.clone(), changed_direction).unwrap();
+        assert!(matches!(
+            changed_direction.validate_successor_of(&predecessor),
+            Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_flow"
+            })
+        ));
+
+        let mut same_spi = successor.sa.clone();
+        same_spi.id.spi = predecessor.sa.id.spi;
+        let same_spi = ScopedXfrmRequest::new(same_spi, successor.policy.clone()).unwrap();
+        assert!(matches!(
+            same_spi.validate_successor_of(&predecessor),
+            Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_identity"
+            })
+        ));
+
+        let same_request_id = successor_request(&predecessor);
+        assert!(same_request_id.validate_successor_of(&predecessor).is_ok());
+        let mut reused_request_id = successor_request(&predecessor);
+        let mut reused_sa = reused_request_id.sa.clone();
+        reused_sa.request_id = predecessor.sa.request_id;
+        let mut reused_policy = reused_request_id.policy.clone();
+        reused_policy.templates[0].request_id = predecessor.sa.request_id;
+        reused_request_id = ScopedXfrmRequest::new(reused_sa, reused_policy).unwrap();
+        assert!(matches!(
+            reused_request_id.validate_successor_of(&predecessor),
+            Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_identity"
+            })
+        ));
+    }
+
+    #[test]
+    fn successor_pins_flow_presentation_dscp_and_policy_priority() {
+        let (sa, policy) = fixture();
+        let predecessor = ScopedXfrmRequest::new(sa, policy).unwrap();
+        let successor = successor_request(&predecessor);
+
+        let mut changed_priority = successor.policy.clone();
+        changed_priority.priority = predecessor.policy.priority.checked_add(1).unwrap();
+        let changed_priority =
+            ScopedXfrmRequest::new(successor.sa.clone(), changed_priority).unwrap();
+        assert!(matches!(
+            changed_priority.validate_successor_of(&predecessor),
+            Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_flow"
+            })
+        ));
+
+        let mut changed_output_mark = successor.sa.clone();
+        changed_output_mark.output_mark = Some(crate::XfrmMark {
+            value: 0x0001_0000,
+            mask: 0x00ff_0000,
+        });
+        let changed_output_mark =
+            ScopedXfrmRequest::new(changed_output_mark, successor.policy.clone()).unwrap();
+        assert!(matches!(
+            changed_output_mark.validate_successor_of(&predecessor),
+            Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_flow"
+            })
+        ));
+
+        let mut changed_dscp = successor.sa.clone();
+        changed_dscp.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+        if let Ok(changed_dscp) = ScopedXfrmRequest::new(changed_dscp, successor.policy.clone()) {
+            assert!(matches!(
+                changed_dscp.validate_successor_of(&predecessor),
+                Err(XfrmError::StateMismatch {
+                    operation: "local_scope_successor_flow"
+                })
+            ));
         }
     }
 }

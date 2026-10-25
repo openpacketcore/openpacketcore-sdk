@@ -30,7 +30,7 @@ pub(crate) trait Kernel: Send {
     async fn remove_sa(&mut self) -> Result<(), XfrmError>;
     async fn remove_policy(&mut self) -> Result<(), XfrmError>;
 }
-fn unresolved() -> XfrmError {
+pub(super) fn unresolved() -> XfrmError {
     XfrmError::StateIndeterminate {
         operation: "local_scope_effect",
     }
