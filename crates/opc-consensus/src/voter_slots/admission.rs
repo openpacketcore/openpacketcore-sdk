@@ -22,7 +22,21 @@ mod tests;
 #[async_trait]
 pub trait VoterSlotStateReader: Send + Sync + std::fmt::Debug {
     /// Read one internally consistent strict-durability publication.
-    async fn read_voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError>;
+    ///
+    /// The caller owns `deadline`; implementations may wait only while strict
+    /// publication is pending and must never start a new budget or timeout.
+    async fn read_voter_slot_state(
+        &self,
+        deadline: Instant,
+    ) -> Result<VoterSlotDurableState, VoterReplacementError>;
+
+    /// Read the current strict-durability publication without waiting.
+    ///
+    /// Opening and background reconciliation have no caller-owned budget. They
+    /// keep their existing non-waiting behavior and retry from their own loops.
+    async fn read_voter_slot_state_now(
+        &self,
+    ) -> Result<VoterSlotDurableState, VoterReplacementError>;
 }
 
 /// The engine-owned response fence and its surrounding application lease boundary.
@@ -199,7 +213,9 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
         local: ConsensusNodeId,
         reader: Arc<dyn VoterSlotStateReader>,
     ) -> Result<Arc<Self>, VoterReplacementError> {
-        let durable = reader.read_voter_slot_state().await?;
+        // Store opening has no caller-owned request budget. Preserve its
+        // existing immediate read; the open path already fails closed.
+        let durable = reader.read_voter_slot_state_now().await?;
         let members = known_members(durable.table());
         if !members.contains(&local) && !durable.table().is_retired(local) {
             return Err(VoterReplacementError::UnauthorizedReplacement);
@@ -559,7 +575,7 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
                 if origin == VoterIntentOrigin::Leader
                     && runtime
                         .reader
-                        .read_voter_slot_state()
+                        .read_voter_slot_state(deadline)
                         .await?
                         .intent()
                         .is_some()
@@ -588,7 +604,9 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
                     attempt.definitive = true;
                 }
             }
-            let reconciled = runtime.reconcile_locked(&mut receipts).await;
+            let reconciled = runtime
+                .reconcile_locked(&mut receipts, Some(deadline))
+                .await;
             if reconciled.is_err() {
                 runtime.notify_durable_changed();
             }
@@ -615,7 +633,9 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
             .get()
             .ok_or(VoterReplacementError::Unavailable)?;
         let target = target_of(request);
-        let durable = self.reader.read_voter_slot_state().await?;
+        // The caller's original Prepare budget bounds the strict publication
+        // wait; do not restart it after the quorum proof or dispatch.
+        let durable = self.reader.read_voter_slot_state(deadline).await?;
         if durable
             .intent()
             .is_some_and(|intent| !same_request(&intent.request, request))
@@ -679,7 +699,7 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
     /// Call outside engine storage callbacks; callbacks use `notify_durable_changed`.
     pub async fn reconcile(&self) -> Result<(), VoterReplacementError> {
         let mut receipts = self.serial.lock().await;
-        self.reconcile_locked(&mut receipts).await
+        self.reconcile_locked(&mut receipts, None).await
     }
 
     /// Fence a fully verified snapshot's retirement floors before engine installation.
@@ -712,7 +732,7 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
                     .engine
                     .get()
                     .ok_or(VoterReplacementError::Unavailable)?;
-                let current = runtime.reader.read_voter_slot_state().await?;
+                let current = runtime.reader.read_voter_slot_state(deadline).await?;
                 incoming
                     .validate_successor_of(current.table())
                     .map_err(|_| VoterReplacementError::InvalidTransition)?;
@@ -781,7 +801,9 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
                 dispatch().await
             }
             .await;
-            let reconciled = runtime.reconcile_locked(&mut receipts).await;
+            let reconciled = runtime
+                .reconcile_locked(&mut receipts, Some(deadline))
+                .await;
             if reconciled.is_err() {
                 runtime.notify_durable_changed();
             }
@@ -799,12 +821,19 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
     async fn reconcile_locked(
         &self,
         receipts: &mut BTreeMap<ConsensusNodeId, E::Receipt>,
+        deadline: Option<Instant>,
     ) -> Result<(), VoterReplacementError> {
         let engine = self
             .engine
             .get()
             .ok_or(VoterReplacementError::Unavailable)?;
-        let durable = self.reader.read_voter_slot_state().await?;
+        // Owned post-dispatch reconciliation inherits the caller's original
+        // budget. Background reconciliation and engine attachment have no
+        // caller budget and keep their existing non-waiting open lifecycle.
+        let durable = match deadline {
+            Some(deadline) => self.reader.read_voter_slot_state(deadline).await?,
+            None => self.reader.read_voter_slot_state_now().await?,
+        };
         let effective = engine.effective_members().await?;
         let mut needed = durable.engine_fences(&effective);
         {
