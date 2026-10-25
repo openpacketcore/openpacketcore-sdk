@@ -192,6 +192,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: native touched-key retention foundation (partial #1252).
+  A committed-state-only fence floor `next_fence - RETAINED_KEY_FENCES` now
+  identifies protected credentials issued before a provably non-authoritative
+  key's retirement; credentials below the floor for a dead key are refused with
+  the typed `StaleFence` outcome while live records, leases, reservations and
+  scope/roster-authoritative keys keep their exact authority. A new ordinary
+  key at the fixed image capacity now fails closed with a typed
+  `BackendUnavailable` retention-required outcome instead of surfacing a fatal
+  image error. The floor is zero below the window, so fresh and below-window
+  state is byte-identical and no persisted field or fresh-install boundary is
+  added. Actual bounded key-row retirement (the capacity-triggered sweep and
+  its exact generation base+delta/relocation/cold and SQLite prepared
+  base/full-image carry), exact-bound reduced-window round-trip tests, and the
+  >1,048,576-distinct-key qualification remain open (PR2/PR3); a store still
+  cannot pass the lifetime key cap, and #1252 stays partial until they land.
+  Refs #1252.
+
 - `opc-persist`: an unplanned configuration-consensus leader loss no longer
   waits for the engine's committed-vote lease **plus** a full sampled election
   timeout before survivors campaign. A follower that has observed no

@@ -40,6 +40,29 @@ use std::io;
 /// and snapshot work instead of only removing the lifetime stop.
 pub(crate) const RETAINED_NOTIFICATIONS: u64 = 65_536;
 
+/// Production retained fence window for touched native keys.
+///
+/// A key entry is logically retired when it is provably non-authoritative (no
+/// record, lease or reservation) and its fence is below
+/// `next_fence - RETAINED_KEY_FENCES`. The floor is derived from committed
+/// state only, so every voter derives the same value and floor zero keeps
+/// fresh/below-window state byte-identical. Key rows are not sequence-ordered;
+/// retirement decisions therefore use the per-key fence window and the
+/// committed key set, not a sequence prefix.
+pub(crate) const RETAINED_KEY_FENCES: u64 = 65_536;
+
+/// Derive the protected-credential floor from the committed global fence
+/// counter. Credentials issued strictly below this floor are logically retired.
+pub(super) fn key_retirement_floor(next_fence: u64) -> u64 {
+    PrefixRetention::new(RETAINED_KEY_FENCES).floor(next_fence)
+}
+
+/// Test-only production-parity retained fence window override.
+#[cfg(test)]
+pub(crate) fn key_retention_floor_with(retained_fences: u64, next_fence: u64) -> u64 {
+    PrefixRetention::new(retained_fences).floor(next_fence)
+}
+
 /// One append-only sequence family's bounded retention window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PrefixRetention {
@@ -202,5 +225,20 @@ mod tests {
                 "the rolling backlog stays inside the hard admission cap"
             );
         }
+    }
+
+    #[test]
+    fn key_retirement_floor_is_derived_and_keeps_floor_zero_byte_identical() {
+        assert_eq!(super::key_retirement_floor(0), 0);
+        assert_eq!(
+            super::key_retirement_floor(super::RETAINED_KEY_FENCES),
+            0,
+            "a fresh or below-window store keeps floor zero"
+        );
+        assert_eq!(
+            super::key_retirement_floor(super::RETAINED_KEY_FENCES + 7),
+            7
+        );
+        assert_eq!(super::key_retention_floor_with(4, 10), 6);
     }
 }

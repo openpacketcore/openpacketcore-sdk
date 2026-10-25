@@ -122,6 +122,58 @@ impl NativeDelta<'_> {
 }
 
 impl Transaction<'_, '_> {
+    /// Committed protected-credential floor derived from `next_fence`.
+    fn key_retirement_floor(&self) -> u64 {
+        retention::key_retirement_floor(self.frontiers.next_fence)
+    }
+
+    /// A key is provably non-authoritative only when no live record, live lease,
+    /// explicit reservation or roster reference names it. Scope checkpoint rows
+    /// and reserved keys stay authoritative regardless of age.
+    fn key_is_provably_non_authoritative(key: &SessionKey, row: &NativeKeyState) -> bool {
+        !crate::scope_storage::is_scope_record_key(key)
+            && row.record.is_none()
+            && row.lease.is_none()
+            && !row.reserved
+    }
+
+    /// Refuse a credential issued before a logically retired key's floor.
+    ///
+    /// The foundation does not yet remove retired key rows, so the check is
+    /// applied only when the key state is provably non-authoritative; a live
+    /// older lease keeps its exact authority. Once PR2 wires row retirement, the
+    /// same floor is the typed refusal for a missing retired entry.
+    fn retired_credential_floor_refusal(
+        &self,
+        key: &SessionKey,
+        row: &NativeKeyState,
+        fence: crate::FenceToken,
+    ) -> Result<(), StoreError> {
+        if Self::key_is_provably_non_authoritative(key, row)
+            && fence.get() < self.key_retirement_floor()
+        {
+            return Err(StoreError::StaleFence);
+        }
+        Ok(())
+    }
+
+    /// Capacity-triggered retirement decision.
+    ///
+    /// The foundation cannot remove key rows yet, so a new key at the fixed
+    /// `MAX_ITEMS` cap fails closed with a typed outcome instead of surfacing a
+    /// fatal image error. PR2 replaces this decision with the bounded sweep.
+    fn key_capacity_exhausted(&self, key: &SessionKey) -> bool {
+        if self.base.base.keys.get(key).is_some() || self.keys.contains_key(key) {
+            return false;
+        }
+        let new_overlay = self
+            .keys
+            .keys()
+            .filter(|candidate| self.base.base.keys.get(*candidate).is_none())
+            .count();
+        self.base.base.keys.len().saturating_add(new_overlay) >= validation::MAX_ITEMS
+    }
+
     fn key(&self, key: &SessionKey) -> NativeKeyState {
         self.keys
             .get(key)
@@ -196,6 +248,7 @@ impl Transaction<'_, '_> {
             return Err(StoreError::LeaseExpired);
         }
         let row = self.key(guard.key());
+        self.retired_credential_floor_refusal(guard.key(), &row, guard.fence())?;
         if !row.lease.as_ref().is_some_and(|lease| lease.matches(guard))
             || guard.fence().get() < row.fence
         {
@@ -206,6 +259,7 @@ impl Transaction<'_, '_> {
 
     fn lease_guard(&self, guard: &LeaseGuard) -> Result<NativeKeyState, StoreError> {
         let row = self.key(guard.key());
+        self.retired_credential_floor_refusal(guard.key(), &row, guard.fence())?;
         let Some(lease) = &row.lease else {
             return Err(if guard.fence().get() <= row.fence {
                 StoreError::StaleFence
@@ -304,6 +358,11 @@ impl Transaction<'_, '_> {
                 }
                 let expires_at = checked_session_deadline(self.now, *ttl)?;
                 self.prune()?;
+                if self.key_capacity_exhausted(key) {
+                    return Err(StoreError::BackendUnavailable(
+                        "native key capacity exhausted; bounded key retirement is required".into(),
+                    ));
+                }
                 let mut row = self.key(key);
                 if row.lease.as_ref().is_some_and(|lease| {
                     lease.active && lease.owner != *owner && lease.guard_expires_at > self.now
