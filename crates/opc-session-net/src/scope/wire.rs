@@ -10,6 +10,10 @@ pub(super) const MAX_SCOPE_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 pub(super) const MAX_SCOPE_FRAME_BYTES: usize = MAX_SCOPE_COMMAND_BYTES + 512;
 pub(super) const MAX_NOTICE_FRAME_BYTES: usize = 64 * 1024;
 pub(super) const MAX_AUTHORITY_BYTES: usize = 4096;
+/// Exact body of one authenticated candidate boot-refusal frame:
+/// attempt nonce (32) + boot process nonce (16) + boot key digest (32) +
+/// closed reason code (1). It carries no credential, identity or evidence bytes.
+pub(super) const BOOT_REFUSAL_PAYLOAD_BYTES: usize = 32 + 16 + 32 + 1;
 
 /// A malformed, noncanonical or out-of-bounds scope wire claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -24,6 +28,7 @@ pub(super) enum FrameKind {
     Proof = 3,
     Result = 4,
     TicketNotice = 5,
+    BootRefusal = 6,
 }
 impl TryFrom<u8> for FrameKind {
     type Error = WireError;
@@ -34,6 +39,7 @@ impl TryFrom<u8> for FrameKind {
             3 => Ok(Self::Proof),
             4 => Ok(Self::Result),
             5 => Ok(Self::TicketNotice),
+            6 => Ok(Self::BootRefusal),
             _ => Err(WireError),
         }
     }
@@ -357,6 +363,16 @@ impl Header {
                     return Err(WireError);
                 }
                 MAX_NOTICE_FRAME_BYTES - HEADER_BYTES
+            }
+            FrameKind::BootRefusal => {
+                // A refusal is only meaningful on the authenticated candidate
+                // startup attempt and has one exact bounded body.
+                if self.method != Method::Candidate
+                    || self.payload_len != BOOT_REFUSAL_PAYLOAD_BYTES
+                {
+                    return Err(WireError);
+                }
+                BOOT_REFUSAL_PAYLOAD_BYTES
             }
             FrameKind::Call => self.method.command_limit() + 36,
             FrameKind::Result => {

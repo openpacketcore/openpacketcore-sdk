@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-net`: an issuer can now deliver one authenticated, typed boot
+  refusal to the exact proven candidate worker boot instead of a ticket notice.
+  `IssuerStartupSession::deliver_boot_refusal` takes a closed, value-free
+  `scope::BootRefusalReason` (`PlatformInvalid`, `PlatformChanged`,
+  `PrerequisiteRefused`) and sends one bounded revision-two frame on the
+  retained startup connection; the frame reuses the connection's existing
+  mutual-TLS issuer authentication and is bound to the exact candidate attempt
+  (header identity/scope/request digest plus attempt nonce) and the proved boot
+  (process nonce and boot key digest). The worker's
+  `StartupSession::receive_ticket_notice` returns the terminal typed
+  `StartupError::BootRefused(reason)`; a lost, truncated, mismatched or replayed
+  refusal remains an unavailable/invalid startup failure and is never treated
+  as a refusal. A refusal conveys no authority, no closure evidence and no
+  credential, identity, endpoint or key material, and never bypasses an
+  admitted worker's drain/close obligations; only candidate startup sessions
+  can carry it. The issuer-side observation-sandwich limit (two consistent
+  workload-record reads around the proof do not establish that the platform has
+  published the current container restart) is documented on the delivery API
+  and in the crate README. Refs #1245.
+
 - `opc-proto-ikev2`: the recovery profile can send the RFC 7296 §2.4 empty
   `INFORMATIONAL` liveness probe that it could previously only answer. New
   `Ikev2CommittedWindow` APIs (`send_empty_request`,
@@ -121,6 +141,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority. Refs #1378.
 
 ### Breaking
+
+- `opc-session-net`: `StartupError` adds `BootRefused(BootRefusalReason)` for an
+  authenticated issuer refusal of one exact candidate boot attempt. It is
+  distinct from retryable `Unavailable`/`AuthTimeUnavailable` results and grants
+  no authority; downstream exhaustive matches must handle the new variant.
+  Refs #1245.
 
 - `opc-gtpu-dataplane`: `GtpPdpContext.peer_teid` is now `PeerTeid`, a new
   public peer/outgoing-TEID type that admits the TS 29.281 section 5.1 all-zero

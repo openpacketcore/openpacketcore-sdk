@@ -80,6 +80,16 @@ impl IssuerStartupSession {
             .map_err(platform_error)?;
         self.check_authentication()
     }
+    /// Revalidate bootstrap credential freshness and the live authenticated
+    /// connection without re-reading the platform workload record.
+    ///
+    /// Authenticated boot-refusal delivery uses this: the caller has already
+    /// made its definitive platform/prerequisite decision, so a changed or
+    /// invalid platform observation must not prevent this terminal result from
+    /// reaching the proved worker boot.
+    pub(super) fn revalidate_authentication(&self) -> Result<(), StartupError> {
+        self.check_authentication()
+    }
     fn check_authentication(&self) -> Result<(), StartupError> {
         let interval = self
             .clock

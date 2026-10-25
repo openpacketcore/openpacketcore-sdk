@@ -38,6 +38,7 @@ struct Api {
     reads: AtomicUsize,
     observe_error: Option<PlatformError>,
     revalidate_error: Mutex<Option<PlatformError>>,
+    revalidate_container_id: Mutex<Option<String>>,
 }
 #[async_trait::async_trait]
 impl KubernetesPodSource for Api {
@@ -60,7 +61,13 @@ impl KubernetesPodSource for Api {
             tokio::task::yield_now().await;
             self.clock.0.store(120, Ordering::Release);
         }
-        Ok(serde_json::to_vec(&json!({"metadata":{"name":name,"namespace":namespace,"uid":uuid::Uuid::from_bytes([3;16]).to_string(),"resourceVersion":"42","ownerReferences":[{"uid":uuid::Uuid::from_bytes([4;16]).to_string(),"controller":true}]},"spec":{"serviceAccountName":"worker"},"status":{"podIP":self.address.lock().unwrap().unwrap().ip().to_string(),"containerStatuses":[{"name":"worker","containerID":"cri-o://exact","state":{"running":{"startedAt":"2026-10-01T00:00:00Z"}}}]}})).unwrap())
+        let container_id = if read > 0 {
+            self.revalidate_container_id.lock().unwrap().clone()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| "cri-o://exact".to_string());
+        Ok(serde_json::to_vec(&json!({"metadata":{"name":name,"namespace":namespace,"uid":uuid::Uuid::from_bytes([3;16]).to_string(),"resourceVersion":"42","ownerReferences":[{"uid":uuid::Uuid::from_bytes([4;16]).to_string(),"controller":true}]},"spec":{"serviceAccountName":"worker"},"status":{"podIP":self.address.lock().unwrap().unwrap().ip().to_string(),"containerStatuses":[{"name":"worker","containerID":container_id,"state":{"running":{"startedAt":"2026-10-01T00:00:00Z"}}}]}})).unwrap())
     }
 }
 struct Keys(Vec<u8>);
@@ -133,6 +140,38 @@ fn retained_session_revalidation_preserves_changed_platform_observation() {
     );
 }
 
+#[test]
+fn authenticated_refusal_after_updated_container_facts_is_typed_for_the_worker() {
+    run_issuer(
+        Scenario::RefuseAfterChangedFacts,
+        "scope::issuer_tests::authenticated_refusal_after_updated_container_facts_is_typed_for_the_worker",
+    );
+}
+
+#[test]
+fn a_refused_boot_does_not_block_the_next_fresh_boot_ticket() {
+    run_issuer(
+        Scenario::RefuseThenFreshBootTickets,
+        "scope::issuer_tests::a_refused_boot_does_not_block_the_next_fresh_boot_ticket",
+    );
+}
+
+#[test]
+fn a_lost_refusal_stays_unavailable_and_never_refuses_the_boot() {
+    run_issuer(
+        Scenario::LostRefusalStaysUnavailable,
+        "scope::issuer_tests::a_lost_refusal_stays_unavailable_and_never_refuses_the_boot",
+    );
+}
+
+#[test]
+fn a_liveness_startup_session_cannot_carry_a_boot_refusal() {
+    run_issuer(
+        Scenario::RefuseOnLiveness,
+        "scope::issuer_tests::a_liveness_startup_session_cannot_carry_a_boot_refusal",
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scenario {
     Verify,
@@ -143,6 +182,10 @@ enum Scenario {
     ProbePlatformInvalid,
     ProbePlatformUnavailable,
     RevalidatePlatformChanged,
+    RefuseAfterChangedFacts,
+    RefuseThenFreshBootTickets,
+    LostRefusalStaysUnavailable,
+    RefuseOnLiveness,
 }
 struct NoPredecessors;
 #[async_trait::async_trait]
@@ -218,6 +261,7 @@ fn run_issuer(scenario: Scenario, test_name: &str) {
         let mut ca_params=rcgen::CertificateParams::default();ca_params.is_ca=rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca=rcgen::CertifiedIssuer::self_signed(ca_params,rcgen::KeyPair::generate().unwrap()).unwrap();
         let (_client_tx,client_rx)=watch::channel(Some(material(ISSUER,&ca)));let (_server_tx,server_rx)=watch::channel(Some(material(WORKER,&ca)));
+        let client_rx_next=client_rx.clone();let server_rx_next=server_rx.clone();
         let client=TlsConfigBuilder::new(client_rx).with_policy(PeerPolicy{allowed_instances:Some(HashSet::from([InstanceId::new("worker-0").unwrap()])),..Default::default()}).build_authenticated_client_config().unwrap();
         let server=TlsConfigBuilder::new(server_rx).with_policy(PeerPolicy{allowed_instances:Some(HashSet::from([InstanceId::new("issuer-0").unwrap()])),..Default::default()}).build_authenticated_server_config().unwrap();
         let key=SigningKey::from_slice(&[1;32]).unwrap();let point=key.verifying_key().to_sec1_point(false);
@@ -229,21 +273,29 @@ fn run_issuer(scenario: Scenario, test_name: &str) {
         let credentials=Arc::new(BootstrapCredentialVerifier::activate("https://cluster.test".into(),"https://cluster.test/openid/v1/jwks".into(),Arc::new(Keys(jwks))).await.unwrap());
         let root=tempfile::tempdir().unwrap();let process=Arc::new(ScopeProcess::new(scope(),[3;16],super::BootIdentity::generate().unwrap(),std::fs::File::open(root.path()).unwrap()).unwrap());
         let policy=super::ScopePolicy::new(vec![super::PrincipalGrant::new(SpiffeId::new(ISSUER).unwrap(),super::ScopeRole::Controller,vec![scope()]).unwrap()]).unwrap();
-        let responder=BootProofResponder::new(process.clone(),SpiffeId::new(ISSUER).unwrap(),policy,Arc::new(Clock),Arc::new(Token(token)),server,super::ProofBudgets::default()).unwrap();
+        let responder=BootProofResponder::new(process.clone(),SpiffeId::new(ISSUER).unwrap(),policy.clone(),Arc::new(Clock),Arc::new(Token(token.clone())),server,super::ProofBudgets::default()).unwrap();
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
         let enrollment=PodEnrollment::new(scope(),"test".into(),"worker-0".into(),"worker".into(),[6;16],"worker".into(),[4;16],SpiffeId::new(WORKER).unwrap(),address.port()).unwrap();
         let issuer_clock=Arc::new(IssuerClock(AtomicI64::new(0)));
-        let api=Arc::new(Api{address:Mutex::new(Some(address)),clock:issuer_clock.clone(),expire_on_recheck:scenario==Scenario::ExpiresWhileReading,reads:AtomicUsize::new(0),observe_error:match scenario { Scenario::ProbePlatformInvalid=>Some(PlatformError::Invalid), Scenario::ProbePlatformUnavailable=>Some(PlatformError::Unavailable), _=>None }, revalidate_error:Mutex::new(None)});
+        let api=Arc::new(Api{address:Mutex::new(Some(address)),clock:issuer_clock.clone(),expire_on_recheck:scenario==Scenario::ExpiresWhileReading,reads:AtomicUsize::new(0),observe_error:match scenario { Scenario::ProbePlatformInvalid=>Some(PlatformError::Invalid), Scenario::ProbePlatformUnavailable=>Some(PlatformError::Unavailable), _=>None }, revalidate_error:Mutex::new(None), revalidate_container_id:Mutex::new(None)});
         let reader=Arc::new(KubernetesBootReader::new(api.clone()));
-        let issuer=BootstrapIssuerClient::new(client,issuer_clock.clone(),credentials,reader,super::ProofBudgets::default()).unwrap();
+        let issuer=BootstrapIssuerClient::new(client,issuer_clock.clone(),credentials.clone(),reader.clone(),super::ProofBudgets::default()).unwrap();
         if matches!(scenario, Scenario::ProbePlatformInvalid | Scenario::ProbePlatformUnavailable) {
             let error = issuer.probe(&enrollment, BootstrapProofMode::Candidate).await.err().expect("probe must refuse the platform observation");
             let expected = if scenario == Scenario::ProbePlatformInvalid { StartupError::PlatformInvalid } else { StartupError::Unavailable };
             assert_eq!(error, expected, "probe must preserve the platform failure class");
             return;
         }
-        let (verified,worker)=tokio::time::timeout(std::time::Duration::from_secs(5),async{tokio::join!(issuer.probe(&enrollment,BootstrapProofMode::Candidate),async {let (stream,_)=listener.accept().await.unwrap();responder.respond_once(stream).await})}).await.unwrap();
+        let probe_mode=if scenario==Scenario::RefuseOnLiveness {BootstrapProofMode::Liveness} else {BootstrapProofMode::Candidate};
+        let (verified,worker)=tokio::time::timeout(std::time::Duration::from_secs(5),async{tokio::join!(issuer.probe(&enrollment,probe_mode),async {let (stream,_)=listener.accept().await.unwrap();responder.respond_once(stream).await})}).await.unwrap();
         let worker=worker.unwrap();
+        if scenario==Scenario::RefuseOnLiveness {
+            let verified=verified.expect("liveness proof");
+            let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(5);
+            assert_eq!(verified.deliver_boot_refusal(super::BootRefusalReason::PrerequisiteRefused,deadline).await.err(),Some(StartupError::Invalid),"a liveness startup session cannot carry a candidate boot refusal");
+            assert!(process.enter_peer_control().await.is_err());
+            return;
+        }
         if scenario==Scenario::ExpiresWhileReading {
             assert!(matches!(verified,Err(StartupError::AuthTimeUnavailable)),"JWT expiry after independent Pod read must refuse startup with a retryable authentication-time result");
             assert!(process.enter_peer_control().await.is_err());
@@ -256,6 +308,51 @@ fn run_issuer(scenario: Scenario, test_name: &str) {
             assert_eq!(verified.revalidate().await.unwrap_err(),StartupError::PlatformChanged,"retained-session revalidation must preserve a changed observation as definitive");
             *api.revalidate_error.lock().unwrap()=None;
             verified.revalidate().await.expect("a reconciled observation is accepted on a later attempt");
+            return;
+        }
+        if scenario==Scenario::RefuseAfterChangedFacts {
+            // The proof observed the preceding container; the platform record
+            // catches up on the retained-session revalidation.
+            *api.revalidate_container_id.lock().unwrap()=Some("cri-o://restarted".to_string());
+            assert_eq!(verified.revalidate().await.unwrap_err(),StartupError::PlatformChanged,"updated container facts after the proof are definitive");
+            let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(5);
+            let (sent,received)=tokio::join!(verified.deliver_boot_refusal(super::BootRefusalReason::PlatformChanged,deadline),worker.receive_ticket_notice(deadline,|_|Err(StartupError::Invalid)));
+            sent.expect("authenticated refusal delivery");
+            assert_eq!(received.err(),Some(StartupError::BootRefused(super::BootRefusalReason::PlatformChanged)),"the worker receives the closed typed reason");
+            assert!(process.enter_peer_control().await.is_err(),"a refusal grants no authority");
+            return;
+        }
+        if scenario==Scenario::LostRefusalStaysUnavailable {
+            // The issuer connection disappears without a complete refusal.
+            drop(verified);
+            let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(5);
+            assert_eq!(worker.receive_ticket_notice(deadline,|_|Err(StartupError::Invalid)).await.err(),Some(StartupError::Unavailable),"a lost refusal stays unavailable");
+            assert!(process.enter_peer_control().await.is_err());
+            return;
+        }
+        if scenario==Scenario::RefuseThenFreshBootTickets {
+            let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(5);
+            let (sent,received)=tokio::join!(verified.deliver_boot_refusal(super::BootRefusalReason::PlatformChanged,deadline),worker.receive_ticket_notice(deadline,|_|Err(StartupError::Invalid)));
+            sent.expect("first boot refusal");
+            assert_eq!(received.err(),Some(StartupError::BootRefused(super::BootRefusalReason::PlatformChanged)));
+            assert!(process.enter_peer_control().await.is_err());
+            // A fresh boot (new process nonce and boot key) completes normally.
+            let client_next=TlsConfigBuilder::new(client_rx_next).with_policy(PeerPolicy{allowed_instances:Some(HashSet::from([InstanceId::new("worker-0").unwrap()])),..Default::default()}).build_authenticated_client_config().unwrap();
+            let server_next=TlsConfigBuilder::new(server_rx_next).with_policy(PeerPolicy{allowed_instances:Some(HashSet::from([InstanceId::new("issuer-0").unwrap()])),..Default::default()}).build_authenticated_server_config().unwrap();
+            let process_next=Arc::new(ScopeProcess::new(scope(),[3;16],super::BootIdentity::generate().unwrap(),std::fs::File::open(root.path()).unwrap()).unwrap());
+            let responder_next=BootProofResponder::new(process_next.clone(),SpiffeId::new(ISSUER).unwrap(),policy.clone(),Arc::new(Clock),Arc::new(Token(token.clone())),server_next,super::ProofBudgets::default()).unwrap();
+            let issuer_next=BootstrapIssuerClient::new(client_next,issuer_clock.clone(),credentials.clone(),reader.clone(),super::ProofBudgets::default()).unwrap();
+            let (verified,worker)=tokio::time::timeout(std::time::Duration::from_secs(5),async{tokio::join!(issuer_next.probe(&enrollment,BootstrapProofMode::Candidate),async {let (stream,_)=listener.accept().await.unwrap();responder_next.respond_once(stream).await})}).await.unwrap();
+            let verified=verified.expect("fresh boot candidate proof");let worker=worker.expect("fresh boot responder");
+            assert_ne!(verified.proof().process_nonce(),process.boot().process_nonce(),"a fresh boot has a fresh process nonce");
+            assert_ne!(verified.proof().boot_key_digest(),process.boot().key_digest(),"a fresh boot has a fresh key");
+            let notice=super::IssuedTicketNotice::new(128,b"issuer-record-uid".to_vec(),b"opaque:0042".to_vec(),0).unwrap();
+            let deadline=tokio::time::Instant::now()+std::time::Duration::from_secs(5);
+            let (sent,received)=tokio::join!(verified.deliver_ticket_notice(notice,&NoPredecessors,deadline),worker.receive_ticket_notice(deadline,|_|Err(StartupError::Invalid)));
+            sent.expect("fresh boot ticket");
+            let ticket=received.expect("the fresh boot receives a ticket");
+            assert_eq!(ticket.generation(),128);
+            assert!(process_next.enter_peer_control().await.is_err(),"the notice is a hint, not admission");
             return;
         }
         if scenario==Scenario::ExpiredBeforeIssuance {

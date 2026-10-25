@@ -33,6 +33,25 @@ Activate `BootstrapCredentialVerifier` against the configured issuer discovery
 and keys before serving. Missing discovery access is an unsupported prerequisite;
 there is no TokenReview, cluster-wide grant or `pods/proxy` fallback.
 
+The issuer may instead deliver one authenticated, typed boot refusal on the
+same retained startup stream: `IssuerStartupSession::deliver_boot_refusal` sends
+a closed `BootRefusalReason` (`PlatformInvalid`, `PlatformChanged`,
+`PrerequisiteRefused`) bound to the exact candidate call attempt and proven boot
+(process nonce and boot key digest), under the existing mutual-TLS issuer
+authentication and revision-two startup framing. The worker's
+`StartupSession::receive_ticket_notice` returns the terminal typed
+`StartupError::BootRefused(reason)`; a lost, truncated, mismatched or replayed
+refusal stays an unavailable/invalid startup failure and is never a refusal.
+The refusal carries no authority, closure evidence, credential, identity,
+endpoint or key material and never bypasses an admitted worker's drain/close
+obligations. It exists for the **observation-sandwich limit** of the issuer's
+platform read: two consistent workload-record reads around the proof do not
+establish that the platform has already published the current container restart,
+so when the record later catches up the issuer must refuse the retained key
+before staging anything and let the worker shut down and start a fresh boot.
+Only candidate startup sessions can carry a refusal; liveness sessions and
+already admitted workers keep their existing handling.
+
 The issuer sends a bounded `IssuedTicketNotice` on the retained startup stream.
 Its generation and record reference are hints: `ScopeServer` independently reads
 the current issuance again before a new admission. Each streamed `ClosureNotice`

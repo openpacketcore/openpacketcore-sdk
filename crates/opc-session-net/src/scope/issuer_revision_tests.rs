@@ -42,7 +42,7 @@ fn issuer_revision_mismatch_is_typed_for_alpn_and_both_proof_purposes() {
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
         let enrollment=PodEnrollment::new(scope(),"test".into(),"worker-0".into(),"worker".into(),[6;16],"worker".into(),[4;16],SpiffeId::new(WORKER).unwrap(),address.port()).unwrap();
         let issuer_clock=Arc::new(IssuerClock(AtomicI64::new(0)));
-        let reader=Arc::new(KubernetesBootReader::new(Arc::new(Api{address:Mutex::new(Some(address)),clock:issuer_clock.clone(),expire_on_recheck:false,reads:AtomicUsize::new(0),observe_error:None,revalidate_error:Mutex::new(None)})));
+        let reader=Arc::new(KubernetesBootReader::new(Arc::new(Api{address:Mutex::new(Some(address)),clock:issuer_clock.clone(),expire_on_recheck:false,reads:AtomicUsize::new(0),observe_error:None,revalidate_error:Mutex::new(None),revalidate_container_id:Mutex::new(None)})));
         let issuer=BootstrapIssuerClient::new(client,issuer_clock.clone(),credentials,reader,crate::scope::ProofBudgets::default()).unwrap();
 
             for mode in [BootstrapProofMode::Liveness, BootstrapProofMode::Candidate] {
