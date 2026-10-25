@@ -40,6 +40,20 @@ impl Receipt {
     }
 }
 
+impl FakeBackendState {
+    /// Retire exact receipts whose replay/answer window has elapsed.
+    ///
+    /// This is called only when the retained-receipt bound is already reached,
+    /// so a receipt inside its `FENCED_TRANSITION_OUTCOME_RETENTION` window is
+    /// never evicted early. A request whose receipt was retired has left the
+    /// stated retention contract: the volatile lab then reports it like any
+    /// other unknown identity instead of promising a typed expiry answer.
+    fn retire_expired_lab_receipts(&mut self, now: Timestamp) {
+        self.lab_transitions
+            .retain(|_, receipt| receipt.retained_until > now);
+    }
+}
+
 impl FakeSessionBackend {
     /// Construct volatile lab storage with process-local atomic transitions.
     ///
@@ -48,6 +62,36 @@ impl FakeSessionBackend {
     /// It cannot coordinate other workers or grant production HA authority.
     /// Opaque restore cursors use the SDK's authenticated seek format, scoped
     /// to this volatile allocation and invalidated by record mutation/expiry.
+    ///
+    /// # Retention contract
+    ///
+    /// The lab bounds memory instead of refusing work for the process lifetime:
+    ///
+    /// - A fence floor is retired once no live record and no live lease names its
+    ///   key. Each retired floor raises one bounded backend-wide retired-fence
+    ///   high-water, which observation reports and allocation requires for a key
+    ///   without a live floor, so fence tokens never regress for a re-created
+    ///   key. Guards remain credential-checked: mutations require the exact live
+    ///   lease, so a retired floor cannot authorize a stale credential.
+    /// - A fenced-transition receipt is authoritative for the fixed
+    ///   `FENCED_TRANSITION_OUTCOME_RETENTION` window: inside it, a replay
+    ///   returns the original outcome or `RequestConflict`; a retained but
+    ///   elapsed receipt reports `Expired` and execution returns the typed
+    ///   `FencedTransitionRequestExpired`.
+    /// - When the retained-receipt bound is reached, only receipts whose window
+    ///   has elapsed are retired to make room. Receipts inside their window are
+    ///   never evicted early: if every retained receipt is still authoritative,
+    ///   the lab fails closed with the typed `FencedTransitionHistoryFull`
+    ///   without mutating any record, lease or fence.
+    /// - A tracked-key capacity refusal likewise mutates nothing and is
+    ///   retryable; capacity can return once elapsed records/leases are retired.
+    ///   An accepted admission may prune elapsed state even when the transition
+    ///   itself is later rejected on its own record/lease/fence conditions.
+    ///
+    /// Receipts retired after their window are outside the replay contract above;
+    /// callers must not retry a request identity beyond the retention window
+    /// (the durable V1/V2 stores provide the typed expired answer this volatile
+    /// lab no longer retains). A process restart loses every receipt.
     pub fn in_memory_lab() -> Self {
         let mut backend = Self::with_limits(FakeBackendLimits {
             max_tracked_keys: 100_000,
@@ -81,12 +125,22 @@ impl FakeSessionBackend {
     ) -> Result<FencedTransitionStatus, StoreError> {
         let request = self.lab_request(prepared)?;
         let state = self.inner.lock().await;
-        Ok(match state.lab_transitions.get(&request.request_id()) {
-            Some(receipt) => receipt.status(&request, self.clock.now_utc()),
-            None if state.lab_transitions.len() >= self.limits.max_replication_entries => {
-                FencedTransitionStatus::HistoryFull
-            }
-            None => FencedTransitionStatus::NotFound,
+        let now = self.clock.now_utc();
+        if let Some(receipt) = state.lab_transitions.get(&request.request_id()) {
+            return Ok(receipt.status(&request, now));
+        }
+        // Status stays read-only. It reports the bound as full only while every
+        // retained receipt is still inside its authoritative window; elapsed
+        // receipts are retired by the next execution and would not block it.
+        let at_bound = state.lab_transitions.len() >= self.limits.max_replication_entries;
+        let reclaimable = state
+            .lab_transitions
+            .values()
+            .any(|receipt| receipt.retained_until <= now);
+        Ok(if at_bound && !reclaimable {
+            FencedTransitionStatus::HistoryFull
+        } else {
+            FencedTransitionStatus::NotFound
         })
     }
 
@@ -106,6 +160,13 @@ impl FakeSessionBackend {
                 _ => Err(StoreError::FencedTransitionRequestExpired),
             };
         }
+        // The bound covers authoritative receipts only. When it is reached,
+        // retire receipts whose exact-answer window has elapsed and retry the
+        // check; a receipt still inside its window is never evicted early, so a
+        // fully-retained history keeps failing closed with the typed refusal.
+        if state.lab_transitions.len() >= self.limits.max_replication_entries {
+            state.retire_expired_lab_receipts(now);
+        }
         if state.lab_transitions.len() >= self.limits.max_replication_entries {
             return Err(StoreError::FencedTransitionHistoryFull);
         }
@@ -114,7 +175,7 @@ impl FakeSessionBackend {
         // Stage both lease and record. A failed record condition cannot leak a
         // newly minted fence or a renewed lease into the authoritative map.
         let key = Self::map_key(request.lease().key());
-        Self::ensure_key_capacity(&state, &key, self.limits.max_tracked_keys)?;
+        Self::ensure_key_capacity(&mut state, &key, self.limits.max_tracked_keys, now)?;
         let mut staged = FakeBackendState::empty();
         staged.next_fence = state.next_fence;
         staged.next_credential_id = state.next_credential_id;
@@ -127,6 +188,10 @@ impl FakeSessionBackend {
         if let Some(fence) = state.key_fences.get(&key) {
             staged.key_fences.insert(key.clone(), *fence);
         }
+        // The observation basis for a key without a live floor is the
+        // backend-wide retired-fence high-water; the staged validation must see
+        // the same value the caller observed.
+        staged.retired_fence_high_water = state.retired_fence_high_water;
         let result = self.lab_apply(&mut staged, &request, now);
         if let Ok((outcome, replication)) = &result {
             let sequence = self.next_direct_replication_sequence(&state)?;
@@ -184,7 +249,7 @@ impl FakeSessionBackend {
         request.validate_at(now)?;
         let key = request.lease().key();
         let mk = Self::map_key(key);
-        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys)?;
+        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys, now)?;
         let expires_at = checked_session_deadline(now, request.lease().ttl())?;
         let (lease, lease_op) = match request.lease() {
             FencedTransitionLease::Acquire {
