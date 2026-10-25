@@ -719,6 +719,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::FencedTransitionHistoryFull => "fenced_transition_history_full",
         StoreError::FencedTransitionRetentionExhausted => "fenced_transition_retention_exhausted",
         StoreError::FencedTransitionStorageExhausted => "fenced_transition_storage_exhausted",
+        StoreError::KeyCapacityExhausted => "key_capacity_exhausted",
         StoreError::FencedTransitionHistoryEpochRetired => {
             "fenced_transition_history_epoch_retired"
         }

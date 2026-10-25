@@ -1738,6 +1738,10 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
         StoreError::InvalidKey(_) => {
             IpsecLbError::invalid_config("session_store.key", "session-store key rejected")
         }
+        StoreError::KeyCapacityExhausted => IpsecLbError::invalid_config(
+            "session_store.capacity",
+            "native key capacity exhausted; bounded key retention is required",
+        ),
         StoreError::CasIdempotencyConflict => IpsecLbError::invalid_config(
             "session_store.idempotency",
             "session-store mutation identity was reused",

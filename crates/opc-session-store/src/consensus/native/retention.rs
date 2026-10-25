@@ -145,6 +145,35 @@ pub(super) fn notification_retention() -> PrefixRetention {
 
 #[cfg(test)]
 pub(crate) mod tests_support {
+    use std::cell::Cell as KeyCapacityCell;
+
+    thread_local! {
+        static KEY_CAPACITY_LIMIT: KeyCapacityCell<Option<usize>> = const { KeyCapacityCell::new(None) };
+    }
+
+    /// Test-only override of the native key admission cap so a batch boundary can
+    /// be exercised without materializing a million keys.
+    pub(crate) struct KeyCapacityLimitOverride {
+        previous: Option<usize>,
+    }
+
+    impl KeyCapacityLimitOverride {
+        pub(crate) fn new(limit: usize) -> Self {
+            let previous = KEY_CAPACITY_LIMIT.with(|current| current.replace(Some(limit)));
+            Self { previous }
+        }
+    }
+
+    impl Drop for KeyCapacityLimitOverride {
+        fn drop(&mut self) {
+            KEY_CAPACITY_LIMIT.with(|current| current.set(self.previous));
+        }
+    }
+
+    pub(crate) fn key_capacity_limit_override() -> Option<usize> {
+        KEY_CAPACITY_LIMIT.with(|current| current.get())
+    }
+
     use std::cell::Cell;
 
     thread_local! {

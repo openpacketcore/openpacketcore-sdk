@@ -262,6 +262,13 @@ pub enum StoreError {
     /// Append-only to preserve every existing serialized discriminant.
     #[error("key provider unavailable: {0}")]
     KeyProviderUnavailable(String),
+    /// The native authoritative image cannot admit another distinct key at its
+    /// fixed `MAX_ITEMS` capacity. This is a deterministic no-effect result:
+    /// bounded key retirement must free capacity before the key is created.
+    ///
+    /// Append-only to preserve every existing serialized discriminant.
+    #[error("native key capacity exhausted; bounded key retention is required")]
+    KeyCapacityExhausted,
 }
 
 /// Error type for lease operations.

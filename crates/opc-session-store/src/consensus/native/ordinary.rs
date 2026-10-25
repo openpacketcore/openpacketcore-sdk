@@ -121,6 +121,23 @@ impl NativeDelta<'_> {
     }
 }
 
+/// Whether admitting a new key would exceed the committed image capacity.
+///
+/// Counts the committed map, keys published earlier in the same batch
+/// (`delta_new`) and new keys in the current transaction, so a batch cannot
+/// pass the cap one command at a time.
+fn key_capacity_decision(
+    committed: usize,
+    delta_new: usize,
+    transaction_new: usize,
+    limit: usize,
+) -> bool {
+    committed
+        .saturating_add(delta_new)
+        .saturating_add(transaction_new)
+        >= limit
+}
+
 impl Transaction<'_, '_> {
     /// Committed protected-credential floor derived from `next_fence`.
     fn key_retirement_floor(&self) -> u64 {
@@ -163,15 +180,43 @@ impl Transaction<'_, '_> {
     /// `MAX_ITEMS` cap fails closed with a typed outcome instead of surfacing a
     /// fatal image error. PR2 replaces this decision with the bounded sweep.
     fn key_capacity_exhausted(&self, key: &SessionKey) -> bool {
-        if self.base.base.keys.get(key).is_some() || self.keys.contains_key(key) {
+        if self.base.base.keys.get(key).is_some()
+            || self.base.keys.contains_key(key)
+            || self.keys.contains_key(key)
+        {
             return false;
         }
-        let new_overlay = self
+        let committed = self.base.base.keys.len();
+        // New keys already published by an earlier command in this ordered
+        // batch (the NativeDelta overlay), plus new keys in this transaction.
+        let delta_new = self
+            .base
             .keys
             .keys()
             .filter(|candidate| self.base.base.keys.get(*candidate).is_none())
             .count();
-        self.base.base.keys.len().saturating_add(new_overlay) >= validation::MAX_ITEMS
+        let transaction_new = self
+            .keys
+            .keys()
+            .filter(|candidate| {
+                self.base.base.keys.get(*candidate).is_none()
+                    && !self.base.keys.contains_key(*candidate)
+            })
+            .count();
+        key_capacity_decision(
+            committed,
+            delta_new,
+            transaction_new,
+            Self::key_capacity_limit(),
+        )
+    }
+
+    fn key_capacity_limit() -> usize {
+        #[cfg(test)]
+        if let Some(limit) = retention::tests_support::key_capacity_limit_override() {
+            return limit;
+        }
+        validation::MAX_ITEMS
     }
 
     fn key(&self, key: &SessionKey) -> NativeKeyState {
@@ -247,8 +292,12 @@ impl Transaction<'_, '_> {
         if guard.expires_at() <= self.now {
             return Err(StoreError::LeaseExpired);
         }
+        // A mutation requires the exact live lease entry, so a credential for a
+        // logically retired (or absent/replaced) lease is already refused
+        // below. The derived floor is enforced on the read/release path in
+        // `lease_guard` and will also cover absent retired rows when bounded key
+        // retirement lands; mutating paths need no duplicate floor check.
         let row = self.key(guard.key());
-        self.retired_credential_floor_refusal(guard.key(), &row, guard.fence())?;
         if !row.lease.as_ref().is_some_and(|lease| lease.matches(guard))
             || guard.fence().get() < row.fence
         {
@@ -359,9 +408,7 @@ impl Transaction<'_, '_> {
                 let expires_at = checked_session_deadline(self.now, *ttl)?;
                 self.prune()?;
                 if self.key_capacity_exhausted(key) {
-                    return Err(StoreError::BackendUnavailable(
-                        "native key capacity exhausted; bounded key retirement is required".into(),
-                    ));
+                    return Err(StoreError::KeyCapacityExhausted);
                 }
                 let mut row = self.key(key);
                 if row.lease.as_ref().is_some_and(|lease| {
@@ -574,5 +621,34 @@ impl Transaction<'_, '_> {
                 new_record: op.new_record.clone(),
             }),
         ))
+    }
+}
+#[cfg(test)]
+mod key_retention_tests {
+    use super::*;
+
+    #[test]
+    fn batch_capacity_decision_counts_the_delta_overlay() {
+        // One committed key away from a ten-key cap: a transaction-local new
+        // key, an earlier-batch overlay key, or their combination must refuse.
+        assert!(!key_capacity_decision(9, 0, 0, 10));
+        assert!(key_capacity_decision(9, 1, 0, 10));
+        assert!(key_capacity_decision(9, 0, 1, 10));
+        assert!(key_capacity_decision(10, 0, 0, 10));
+        // max-1 + two new keys across a batch must not admit both.
+        assert!(key_capacity_decision(9, 1, 1, 10));
+        // An existing key never adds capacity pressure.
+        assert!(!key_capacity_decision(9, 0, 0, 10));
+    }
+
+    #[test]
+    fn capacity_refusal_is_a_deterministic_result_not_an_infrastructure_fault() {
+        assert!(business::deterministic(&StoreError::KeyCapacityExhausted));
+        assert!(
+            !business::deterministic(&StoreError::BackendUnavailable(
+                "genuine native infrastructure fault".into()
+            )),
+            "capacity typing must not mask infrastructure faults"
+        );
     }
 }
