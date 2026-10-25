@@ -720,7 +720,8 @@ args = sys.argv[1:]
 opts = args[args.index('--log-opts') + 1] if '--log-opts' in args else '--all'
 history = subprocess.run(['git', 'rev-list', *shlex.split(opts)], capture_output=True, text=True)
 patches = subprocess.run(['git', 'log', '-p', '-U0', *shlex.split(opts)], capture_output=True, text=True)
-record = dict(args=args, commits=history.stdout.splitlines(), ignore=Path('.gitleaksignore').read_text())
+record = dict(args=args, commits=history.stdout.splitlines(), ignore=Path('.gitleaksignore').read_text(),
+              scan_marker=('SCOPE_FIXTURE_' + 'A' * 12) in patches.stdout)
 plain = bool(os.environ.get('NO_COLOR')) and not os.environ.get('FAKE_IGNORES_NO_COLOR')
 def line(level, text):
     # gitleaks 8.30.1 colours every log line unless NO_COLOR is not empty.
@@ -736,8 +737,9 @@ if history.returncode or patches.returncode or patches.stderr:
     sys.stderr.write(line(level, '[git] ' + error.splitlines()[0]) + line(level, 'error="stderr is not empty"')
                      + line('INF', 'no leaks found'))
     sys.exit(0)
-count = int(os.environ.get('FAKE_FINDINGS', '3'))
-exit_code = int(os.environ.get('SCAN_EXIT', '0'))
+merge_pass = '--merges' in ' '.join(args)
+count = 0 if merge_pass else int(os.environ.get('FAKE_FINDINGS', '3'))
+exit_code = 0 if merge_pass else int(os.environ.get('SCAN_EXIT', '0'))
 if 'SCOPE_FIXTURE_' + 'A' * 12 in patches.stdout:
     count, exit_code = 1, 2
     sys.stderr.write(line('WRN', 'leaks found: 1'))
@@ -787,7 +789,10 @@ sys.exit(int(os.environ.get('GH_EXIT', '0')))
         self.scan_report.unlink(missing_ok=True)
         result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', step['run']],
                                 cwd=self.repo, env={**self.env, **env}, capture_output=True, text=True, check=False)
-        records = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+        all_records = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+        self.last_records = all_records
+        records = [record for record in all_records
+                   if 'detect' not in record['args'] or '--merges' not in ' '.join(record['args'])]
         return result, records
 
     def scan_event(self, event, **env):
@@ -860,6 +865,56 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                                         '--log-opts', f'{self.base}..{self.head}'])
         self.assertEqual(scan['commits'], [self.head])
         self.assertEqual(scan['ignore'], 'PR head fingerprint\n')
+
+    def test_each_event_runs_a_merge_commit_diff_pass(self):
+        cases = (
+            ('pull_request', f'{self.base}..{self.head} --merges -m --first-parent'),
+            ('push', f'--full-history {self.base} --merges -m --first-parent'),
+            ('schedule', '--full-history --all --merges -m --first-parent'),
+            ('workflow_dispatch', '--full-history --all --merges -m --first-parent'),
+        )
+        for event, expected in cases:
+            with self.subTest(event=event):
+                result, primary = self.scan_event(event)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(primary), 1)
+                self.assertEqual(len(self.last_records), 2)
+                merge = [record for record in self.last_records
+                         if '--merges' in ' '.join(record['args'])]
+                self.assertEqual(len(merge), 1)
+                self.assertEqual(merge[0]['args'][-2:], ['--log-opts', expected])
+                self.assertIn(str(self.root / 'gitleaks-merge-report.json'), merge[0]['args'])
+
+    def test_merge_resolution_text_is_scanned(self):
+        # Text that exists only in a merge commit's resolution: the primary
+        # pass (ordinary git log patches) cannot see it; the merge-diff pass
+        # must. Before the second pass existed this scan exited 0.
+        self.git('checkout', '-qb', 'merge-side', 'main', repo=self.origin)
+        side = self.commit('merge-side', 'clean side change')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        main_edit = self.commit('main-diverged', 'clean main change')
+        self.git('merge', '--no-commit', '--no-ff', 'merge-side', repo=self.origin)
+        (self.origin / 'merge-resolution.txt').write_text('SCOPE_FIXTURE_' + 'A' * 12 + '\n')
+        self.git('add', 'merge-resolution.txt', repo=self.origin)
+        self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'merge resolution', repo=self.origin)
+        merge_head = self.git('rev-parse', 'HEAD', repo=self.origin)
+        self.git('fetch', '-q', 'origin', 'main', repo=self.repo)
+        self.git('checkout', '-q', merge_head, repo=self.repo)
+
+        result, primary = self.scan_event('pull_request', PR_BASE_SHA=self.base, PR_HEAD_SHA=merge_head)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(self.output.read_text(), 'findings=1\n')
+        self.assertEqual(len(primary), 1)
+        self.assertEqual(set(primary[0]['commits']), {main_edit, side, merge_head})
+        self.assertFalse(primary[0]['scan_marker'],
+                         "ordinary git log patches must not see merge-only text")
+        merge = [record for record in self.last_records
+                 if '--merges' in ' '.join(record['args'])]
+        self.assertEqual(len(merge), 1)
+        self.assertEqual(merge[0]['commits'], [merge_head])
+        self.assertTrue(merge[0]['scan_marker'],
+                        "the merge-diff pass must see the resolution text")
+        self.assertEqual(primary[0]['ignore'], 'base fingerprint\n')
 
     def test_main_push_scans_full_pushed_history_only(self):
         result, records = self.scan_event('push')
