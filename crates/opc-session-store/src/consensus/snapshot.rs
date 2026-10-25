@@ -1292,8 +1292,12 @@ fn fixed_prepublication_scan_gates(
     GATES.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
+/// Test-only, directory-scoped admission-scan gate.
+///
+/// Used by Fixed prepublication verification and by Dynamic current-snapshot
+/// admission to hold a real descriptor scan while a test cancels its caller.
 #[cfg(test)]
-fn block_fixed_prepublication_scan(path: &Path) {
+pub(crate) fn block_fixed_prepublication_scan(path: &Path) {
     let Some(snapshot_directory) = path.parent() else {
         return;
     };
