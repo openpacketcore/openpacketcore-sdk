@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ikev2`: the recovery profile can send the RFC 7296 §2.4 empty
+  `INFORMATIONAL` liveness probe that it could previously only answer. New
+  `Ikev2CommittedWindow` APIs (`send_empty_request`,
+  `retransmit_empty_request`, `complete_empty_request`,
+  `abandon_empty_request`, plus the `pending_empty_request_message_id` and
+  `next_send_message_id` query accessors) seal one empty request at the volatile
+  next send ID without a store command, retransmit its exact bytes with the same
+  Message ID and IV, correlate a matching authenticated empty response, and
+  refuse ordinary preparation or sync initiation while it is outstanding. The
+  caller owns the complete liveness decision, including authenticated ESP
+  traffic under the IKE SA (NAT keepalives never count), and the retransmission
+  budget. The probe's send-ID advance is volatile: the next committed operation
+  persists it, and a crash before that commit loses it as a bounded lead
+  (RFC 6311 §5.1) that the consumer must synchronize before relying on the
+  peer's receive expectation. GCM sealing requires an allocation from an
+  already committed reservation block; CBC uses its admitted random IV.
+  Refs #1241.
+
 - `opc-ipsec-xfrm`: SAs can request Linux Traffic Flow Confidentiality (TFC)
   padding through the new `SaParameters::tfc_pad: Option<u32>`. A `Some(n)`
   value serializes the `XFRMA_TFCPAD` attribute (UAPI attribute 22, `__u32`) on

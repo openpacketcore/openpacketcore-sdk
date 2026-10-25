@@ -446,12 +446,34 @@ never use a settled request as a liveness probe. `replay_request` returns `None`
 for settled exchanges, as specified in
 [RFC 030](../../docs/rfc/030-ike-recovery-profile.md). A live peer
 may have forgotten an old response, and replies to old bytes establish no fresh
-liveness. Without a pending request there is no artificial probe. This profile
-has no local empty-INFORMATIONAL liveness-check API: fresh empty requests are
-refused as durable work; `reply_empty` answers peer requests only. Use fresh
-authenticated inbound traffic or genuine new committed work, such as rekey,
-with its declared retry/liveness bound. Keepalives remain outside IKE windows;
-negotiation grants no fresh-DPD bypass or IV reservation for a probe.
+liveness; a settled exchange is never an artificial probe.
+
+The opt-in send-side twin of `reply_empty` is the volatile empty-INFORMATIONAL
+probe. `send_empty_request` seals one fresh empty request at the volatile next
+send ID and issues no store command; `retransmit_empty_request` replays the
+exact sealed bytes with the same Message ID and IV; a matching authenticated
+empty response completes it through `complete_empty_request`; and
+`abandon_empty_request` ends the caller's retransmission budget. The caller
+owns the complete liveness decision: [RFC 7296 §2.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.4)
+and 3GPP TS 24.302 §7.4.1A cover IKE **and** IPsec, so the caller must establish
+that no authenticated protected traffic arrived on the IKE SA or any Child SA
+for the period; NAT keepalives
+([RFC 3948 §4](https://www.rfc-editor.org/rfc/rfc3948.html#section-4)) never
+count and the primitive never decides idleness itself. While a probe is
+outstanding it occupies the single local request slot (ordinary preparation and
+sync initiation are refused with `RequestOutstanding`), while peer requests in
+the independent receive direction remain admissible.
+
+The probe's send-ID advance is volatile: the next committed window operation
+folds it into the durable `next_send`, and a crash before that commit loses it
+as a bounded lead
+([RFC 6311 §5.1](https://www.rfc-editor.org/rfc/rfc6311.html#section-5.1)) that
+the consumer must synchronize before relying on the peer's receive expectation.
+An answered probe is caller-owned liveness evidence only; it is never durable
+work, an outcome or replay evidence. GCM sealing requires an
+`Ikev2AesGcmIvAllocation` from an already committed reservation block (a
+per-probe reservation would be a periodic liveness write); CBC uses its admitted
+random IV and needs no allocation.
 
 ### Zero-write empty requests and restart reconstruction
 

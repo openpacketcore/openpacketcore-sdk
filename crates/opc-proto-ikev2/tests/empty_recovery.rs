@@ -1533,3 +1533,49 @@ fn empty_restart_child() {
         }
     }
 }
+
+#[test]
+fn volatile_empty_probe_public_api_retransmits_completes_and_never_writes() {
+    support::ensure_ike_crypto();
+    for (algorithm, encryption) in ALGORITHMS.into_iter().enumerate() {
+        for (role, direction) in DIRECTIONS.into_iter().enumerate() {
+            let mut f = Fixture::new(
+                24_000 + (algorithm * 2 + role) as u64,
+                encryption,
+                direction,
+            );
+            let allocation = f
+                .allocator
+                .allocate(Purpose::Ordinary)
+                .expect("committed probe IV block");
+            let request = f
+                .window
+                .send_empty_request(f.profile, &f.keys, allocation)
+                .unwrap();
+            let id = request.message_id();
+            let bytes = request.bytes().to_vec();
+            drop(request);
+
+            let durable_before = f.window.record().clone();
+            assert_eq!(
+                f.window.retransmit_empty_request().unwrap(),
+                Some(bytes.as_slice())
+            );
+            assert_eq!(f.window.record(), &durable_before);
+
+            let response = f.peer(
+                id,
+                true,
+                Exchange::Informational.as_u8(),
+                empty(),
+                0,
+                0x4000,
+            );
+            let opened = f.window.open_peer(f.profile, &f.keys, &response).unwrap();
+            let completion = f.window.complete_empty_request(&opened).unwrap();
+            assert_eq!(completion.message_id(), id);
+            assert_eq!(f.window.pending_empty_request_message_id(), None);
+            assert_eq!(f.window.record(), &durable_before);
+        }
+    }
+}
