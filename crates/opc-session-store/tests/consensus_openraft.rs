@@ -4882,7 +4882,14 @@ async fn fenced_transition_expired_lease_is_rejected_at_committed_admission() {
     )
     .expect("build expiry transition");
     cluster.delay_calls(source, Duration::from_millis(200));
-    let result = store.fenced_transition(expiry_request).await;
+    let renewal = store.fenced_transition(expiry_request);
+    tokio::pin!(renewal);
+    assert!(
+        futures_util::poll!(&mut renewal).is_pending(),
+        "the renewal is admitted before the runtime stall"
+    );
+    std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+    let result = renewal.await;
     cluster.stop_delaying_calls(source);
     assert!(
         matches!(result, Err(StoreError::LeaseExpired)),
@@ -7241,10 +7248,14 @@ async fn committed_write_with_a_late_forward_result_is_typed_ambiguous_and_appli
 
         if response_was_delayed {
             assert_eq!(result, Err(StoreError::CasIdempotencyOutcomeUnavailable));
-            let committed = cluster.stores[source]
-                .get(&key)
-                .await
-                .expect("linearizable read after late result");
+            let read = cluster.stores[source].get(&key);
+            tokio::pin!(read);
+            assert!(
+                futures_util::poll!(&mut read).is_pending(),
+                "the read queues its logical-time request before the runtime stall"
+            );
+            std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+            let committed = read.await.expect("linearizable read after late result");
             assert_eq!(committed, Some(expected));
             let after = cluster.stores[source]
                 .max_replication_sequence()

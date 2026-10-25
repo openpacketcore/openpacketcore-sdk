@@ -155,10 +155,14 @@ async fn delayed_distinct_acquire_can_supersede_acknowledged_same_owner_replacem
         .acquire(&key, owner, ttl)
         .await
         .expect("distinct same-owner replacement is acknowledged");
-    let before = cluster.stores[leader]
-        .observe_fenced_transition(&key)
-        .await
-        .expect("read fence before old arrival");
+    let before = cluster.stores[leader].observe_fenced_transition(&key);
+    tokio::pin!(before);
+    assert!(
+        futures_util::poll!(&mut before).is_pending(),
+        "the fence observation is admitted before the runtime stall"
+    );
+    std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+    let before = before.await.expect("read fence before old arrival");
     assert_eq!(before.current_fence(), replacement.fence());
 
     let response = capture.deliver_original().await;
