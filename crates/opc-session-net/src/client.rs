@@ -7066,15 +7066,13 @@ mod tests {
             // accept checked first so a simultaneous reconnect is never missed;
             // no wall-clock window decides the count.
             let mut probe = [0_u8; 1];
-            loop {
-                tokio::select! {
-                    biased;
-                    accepted = listener.accept() => {
-                        let _ = accepted;
-                        break 2;
-                    }
-                    _ = stream.read(&mut probe) => break 1,
+            tokio::select! {
+                biased;
+                accepted = listener.accept() => {
+                    let _ = accepted;
+                    2
                 }
+                _ = stream.read(&mut probe) => 1,
             }
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
