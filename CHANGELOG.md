@@ -26,6 +26,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AES-CCM_8 and Ed25519/Ed448 remain deliberately excluded pending dependency
   and security-owner approval (see the #1352 follow-up scope); they are not
   advertised. Refs #1352.
+- `opc-session-net`: `PersistentSessionConsumerConfig::with_cooldown_admission`
+  selects the explicit reconnect-cooldown admission policy for a persistent
+  consumer client. The default `ReconnectCooldownPolicy::Wait` preserves the
+  existing single-peer behaviour (wait for the one coalesced cooldown edge or
+  the caller deadline). `ReconnectCooldownPolicy::FailOver` is the routed
+  policy: a foreground call that reaches a peer whose shared reconnect cooldown
+  is active returns the bounded, value-free pre-write
+  `SessionConsumerClientError::Cooldown` immediately (remaining cooldown and
+  gate wait in milliseconds) so the caller's routing loop can select another
+  voter without waiting for this peer's recovery edge. No request byte is
+  accepted before that outcome, so the unchanged request may be routed to
+  another peer; once a byte may have been accepted the existing
+  exact-identity/status recovery is unchanged. Both policies retain the shared
+  exponential backoff, the single serialized probe at cooldown expiry, and the
+  existing deadlines, retry and authority rules. Refs #1248.
+- `opc-gtpu-dataplane`: ordinary inner-IPv6 PDP contexts can now opt into
+  in-tunnel RFC 4443 Packet Too Big. The family-tagged entry gains a versioned
+  opt-in downlink inner MTU profile (entry versions 3/4, the 2-byte field at
+  bytes 73..74, byte 75 reserved); tc's
+  family-tagged decapsulation steers an over-MTU inner IPv6 packet to the
+  existing packet-too-big hand-off queue, and the consumer sends exactly one
+  RFC 4443 error on the subscriber's default-bearer uplink, quoting up to 1,232
+  octets with the same per-session rate limit, 255-second eviction grace and
+  never-answer-before-token order as the IPv4 opt-in. The IPv4
+  fragment-inner default remains refused for IPv6
+  (`downlink_inner_mtu_inner_ipv6_fragmentation`), and the IPv6 MTU must be at
+  least 1,280. Refusal is explicit rather than installing without enforcement.
+  Refs #1007.
+
 - `opc-session-net`: an issuer can now deliver one authenticated, typed boot
   refusal to the exact proven candidate worker boot instead of a ticket notice.
   `IssuerStartupSession::deliver_boot_refusal` takes a closed, value-free
@@ -100,6 +129,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the configuration/encoding acceptance is met). Refs #1344.
 
 ### Fixed
+
+- `opc-persist`: a configuration-consensus leader that cannot obtain a quorum
+  acknowledgement within the fixed quorum-authority ceiling
+  (`election_timeout_max` = 8 s; the engine exposes only the
+  acknowledgement-age metric and defines no application leader lease, and this
+  is not the SDK's 2 s read-lease reuse constant) now withholds leader
+  authority instead of holding clients: local proposals fail with a typed
+  retryable `PersistErrorKind::Unavailable` before any proposal is attempted,
+  `ensure_local_authority[_at_config_head]` reports
+  `ConfigLocalAuthorityOutcome::Retry { leader_hint: None }`, and forwarded
+  mutations/read barriers receive the additive `NoQuorum` reply, which the
+  forwarding replica converts to the same bounded retryable outcome. A withheld
+  call proposes/applies/commits nothing and callers retry the same request
+  identity, so exactly-once behavior is unchanged. The transition is typed and
+  value-free through `ConsensusConfigStore::quorum_lease_state()`, the
+  `opc_persist_quorum_lease_lost_total` / `_restored_total` counters and one
+  warning/info log per transition, and authority returns automatically after two
+  consecutive healthy observations (a one-flush recovery debounce that prevents
+  marginal acknowledgements from flapping the fence). The ceiling is the latest
+  safe point — it waits until every follower's 5–8 s election timer has expired,
+  so a leader that just lost its majority may still accept uncommittable
+  proposals for up to about 8 s of the 10 s operation budget before the typed
+  retryable rejection; fencing earlier could reject a merely slow quorum and is
+  deliberately not done. The engine's election, heartbeat, quorum and
+  committed-log semantics are unchanged; the majority side independently elects
+  a successor. Refs #1048.
+
+- `opc-session-store`: the deterministic in-memory backend no longer refuses new
+  work for the process lifetime after a fixed number of keys or lab
+  fenced-transitions. Under capacity pressure it first retires only state that
+  is provably no longer authoritative: fence floors whose key has neither a
+  live record nor a live lease, and `in_memory_lab` transition receipts past
+  `FENCED_TRANSITION_OUTCOME_RETENTION`. A retired floor raises one
+  backend-wide retired-fence high-water that observation reports and
+  allocation requires for a key without a live floor, so fence tokens never
+  regress for a re-created key; stale credentials still fail closed against
+  the exact live lease. Receipts inside their exact-answer
+  window are never evicted early; when the retained history is entirely
+  authoritative the backend keeps the typed `FencedTransitionHistoryFull`
+  failure without mutating state. Refs #1257.
 
 - `opc-proto-ngap` / `opc-sctp` / `opc-protocol`: the N3IWF receive path no
   longer leaves N3IWF security-key octets in uncleared SDK-owned heap buffers.
@@ -212,6 +281,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority. Refs #1378.
 
 ### Breaking
+
+- `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
+  to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned
+  opt-in downlink inner MTU profiles (versions 3 and 4, the 2-byte field at
+  bytes 73..74, byte 75 reserved); the
+  entry still occupies 80 bytes, but an old decoder rejects the new profile as
+  non-canonical. A retained version-6 graph is therefore refused and needs a
+  fresh attachment, and downgrading to an SDK that predates version 7 likewise
+  refuses the newer marker. No in-place migration is provided; drain or
+  re-create the attachment in either direction. Refs #1007.
 
 - `opc-sctp`: `InboundMessage.payload` is now `opc_protocol::SensitiveBytes`
   (uniquely owned, zeroized on drop, `Debug` length-only, no `Clone`,

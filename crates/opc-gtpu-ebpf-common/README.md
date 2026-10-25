@@ -65,9 +65,14 @@ GTP-U encapsulation/classification helpers.
   `/32` or `/128` endpoints, generation/slot index candidates, one normal HASH
   authority value, exact device configuration, and a bounded in-flight
   transaction journal.
-  Entry version 2 binds one six-bit N3 QFI at byte 72; version 1 retains its
-  exact legacy encoding. Both occupy 80 bytes inside the same 208-byte group
-  authority, and typed/zero-copy readers enforce the same canonical contract.
+  Entry version 1 retains its exact legacy encoding; version 2 binds one
+  six-bit N3 QFI at byte 72. Versions 3 and 4 add a canonical
+  `DownlinkInnerMtu` field at bytes 73..74, with byte 75 reserved (the family-tagged opt-in used by
+  ordinary inner-IPv6 in-tunnel Packet Too Big); version 0, bytes 3 and
+  bytes 75..79 stay reserved. Every profile occupies 80 bytes inside the same
+  208-byte group authority, and typed/zero-copy readers enforce the same
+  canonical contract. The grouped schema marker advances to
+  `OPC-GROUP-IP-v7`; a retained version-6 graph needs a fresh attachment.
 
 All multi-byte wire and map fields are network byte order unless noted in the
 Rust docs.

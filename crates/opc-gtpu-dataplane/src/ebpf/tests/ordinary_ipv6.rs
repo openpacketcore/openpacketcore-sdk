@@ -285,6 +285,70 @@ async fn ordinary_ipv6_marked_bearers_share_one_prefix() {
 }
 
 #[tokio::test]
+async fn ordinary_inner_ipv6_ptb_opt_in_is_committed_read_back_and_removed() {
+    let (backend, runtime) = backend_with_fake();
+    backend.create_device(create_request()).await.unwrap();
+    let mut desired = ipv6_context();
+    desired.downlink_inner_mtu =
+        Some(crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(1_300).unwrap());
+
+    assert_eq!(
+        backend
+            .install_pdp_context_classified(desired.clone())
+            .await
+            .unwrap(),
+        PdpContextInstallOutcome::Installed
+    );
+    assert_eq!(
+        backend
+            .read_pdp_context(local_selector(&desired))
+            .await
+            .unwrap(),
+        PdpContextReadback::Present(desired.clone())
+    );
+    // IPv6 cannot fragment in the network (RFC 8200 section 4.5): the
+    // fragment-inner policy has no meaning on this path.
+    let mut fragment = ipv6_context();
+    fragment.downlink_inner_mtu = Some(crate::GtpuDownlinkInnerMtu::new(1_300).unwrap());
+    assert!(matches!(
+        backend.install_pdp_context(fragment).await,
+        Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_inner_mtu_inner_ipv6_fragmentation"
+        })
+    ));
+
+    // An MTU below the IPv6 minimum link MTU is not a usable IPv6 path.
+    let mut tiny = ipv6_context();
+    tiny.downlink_inner_mtu =
+        Some(crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(1_279).unwrap());
+    assert!(matches!(
+        backend.install_pdp_context(tiny).await,
+        Err(GtpuError::InvalidConfig { .. })
+    ));
+
+    backend
+        .remove_pdp_context(RemovePdpContextRequest {
+            local_teid: desired.local_teid,
+            link_ifindex: S2BU_IFINDEX,
+            gtp_version: GtpVersion::V1,
+            address_family: GtpAddressFamily::Ipv6,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .read_pdp_context(local_selector(&desired))
+            .await
+            .unwrap(),
+        PdpContextReadback::Absent
+    ));
+    let state = runtime.state();
+    assert!(state.session_groups.is_empty());
+    assert!(state.session_uplink_index.is_empty());
+    assert!(state.session_downlink_index.is_empty());
+}
+
+#[tokio::test]
 async fn ordinary_ipv6_conflicts_are_classified_without_mutation() {
     let (backend, runtime) = backend_with_fake();
     backend.create_device(create_request()).await.unwrap();

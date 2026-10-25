@@ -4756,7 +4756,8 @@ impl fmt::Debug for GtpuDownlinkEndpoint {
 }
 
 /// What the eBPF backend does with a downlink inner IPv4 packet that has
-/// Don't Fragment set and exceeds its session's [`GtpuDownlinkInnerMtu`].
+/// Don't Fragment set and exceeds its session's [`GtpuDownlinkInnerMtu`], or
+/// any downlink inner IPv6 packet that exceeds it.
 ///
 /// Under both policies tc hands the packet, undecapsulated, to the
 /// backend-owned consumer
@@ -4802,16 +4803,24 @@ pub enum GtpuDownlinkOversizePolicy {
 /// [`GtpPdpContext::downlink_inner_mtu`] `None` to keep the existing
 /// behaviour.
 ///
-/// Under either policy the eBPF backend also hands every inner IPv4 fragment
-/// of the session (More Fragments set, or a non-zero fragment offset) to the
-/// backend-owned consumer instead of decapsulating it in tc, so that all
+/// Under either IPv4 policy the eBPF backend also hands every inner IPv4
+/// fragment of the session (More Fragments set, or a non-zero fragment offset)
+/// to the backend-owned consumer instead of decapsulating it in tc, so that all
 /// fragments of one datagram take one path; see
 /// [`GtpPdpContext::downlink_inner_mtu`].
 ///
+/// An ordinary inner-IPv6 context accepts only
+/// [`GtpuDownlinkOversizePolicy::InTunnelPacketTooBig`]: IPv6 has no in-network
+/// fragmentation (RFC 8200 section 4.5), so the fragment-inner policy is
+/// refused and the MTU must be at least the IPv6 minimum 1,280. Its
+/// family-tagged entry carries the opt-in MTU in a versioned profile and the
+/// consumer sends one RFC 4443 Packet Too Big per offending packet.
+///
 /// The MTU is from [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MIN`] (576, the
 /// RFC 791 IPv4 floor) to [`opc_gtpu_ebpf_common::DOWNLINK_INNER_MTU_MAX`]
-/// (32,767, the commit record's 15-bit field). `Debug` exposes the value and
-/// policy; they are path properties, not subscriber identifiers.
+/// (32,767, the commit record's 15-bit field); an inner-IPv6 context requires
+/// at least 1,280. `Debug` exposes the value and policy; they are path
+/// properties, not subscriber identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GtpuDownlinkInnerMtu {
     mtu: std::num::NonZeroU16,
@@ -4990,6 +4999,13 @@ pub struct GtpPdpContext {
     /// recovery rejects the non-canonical commit and refuses the whole attachment
     /// as indeterminate, not just that context. Before downgrading, drain every
     /// MTU-bearing context (reinstall it with `None`, or remove it).
+    ///
+    /// For an ordinary inner-IPv6 context only
+    /// [`GtpuDownlinkInnerMtu::in_tunnel_packet_too_big`] is installable, with
+    /// an MTU of at least 1,280; the opt-in is stored in a versioned profile of
+    /// the family-tagged entry and the in-tunnel error is RFC 4443 ICMPv6.
+    /// The grouped schema marker advances to `OPC-GROUP-IP-v7`, so a retained
+    /// version-6 graph needs a fresh attachment before it can carry this field.
     pub downlink_inner_mtu: Option<GtpuDownlinkInnerMtu>,
 }
 
