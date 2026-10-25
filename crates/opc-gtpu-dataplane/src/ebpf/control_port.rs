@@ -439,11 +439,7 @@ impl GtpuControlPort for BackendControlPort {
             };
             *slot = slot.saturating_add(1);
             Ok(Some(crate::GtpuDownlinkEvent::PacketTooBig(
-                crate::GtpuDownlinkPacketTooBig::new(
-                    crate::GtpAddressFamily::Ipv4,
-                    plan.mtu(),
-                    signal,
-                ),
+                crate::GtpuDownlinkPacketTooBig::new(plan.family(), plan.mtu(), signal),
             )))
         })
     }

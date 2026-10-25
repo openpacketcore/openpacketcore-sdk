@@ -108,12 +108,22 @@ pub(super) fn ordinary_ipv6_plan(
     local_ip: Ipv4Addr,
 ) -> Result<OrdinaryIpv6Plan, GtpuError> {
     validate_gtp_version(context.gtp_version)?;
-    // The family-tagged entry carries no downlink inner MTU. Refuse the
-    // in-tunnel Packet Too Big opt-in rather than install without it.
-    if context.downlink_inner_mtu.is_some() {
-        return Err(GtpuError::UnsupportedFeature {
-            feature: "downlink_inner_mtu_inner_ipv6",
-        });
+    // IPv6 has no in-network fragmentation (RFC 8200 section 4.5), so the
+    // fragment-inner default policy cannot be enforced here: only the explicit
+    // in-tunnel Packet Too Big opt-in is meaningful. The family-tagged entry
+    // carries that MTU in its versioned profile.
+    if let Some(mtu) = context.downlink_inner_mtu {
+        if mtu.policy() == crate::GtpuDownlinkOversizePolicy::FragmentInner {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "downlink_inner_mtu_inner_ipv6_fragmentation",
+            });
+        }
+        if mtu.get() < 1_280 {
+            return Err(GtpuError::invalid_config(
+                "pdp.downlink_inner_mtu",
+                "an IPv6 downlink inner MTU must be at least the IPv6 minimum MTU (1280)",
+            ));
+        }
     }
     let IpAddr::V6(ms_address) = context.ms_address else {
         return Err(GtpuError::invalid_config(
@@ -168,6 +178,10 @@ pub(super) fn ordinary_ipv6_plan(
             "uplink source-port policy and PDP graph must be canonical",
         )
     })?;
+    let entry = match context.downlink_inner_mtu.and_then(|mtu| mtu.to_wire()) {
+        Some(mtu) => entry.with_downlink_inner_mtu(mtu),
+        None => entry,
+    };
     Ok(OrdinaryIpv6Plan {
         entry,
         uplink_key: GtpuSessionUplinkKey::from_entry(entry).encode(),
@@ -196,7 +210,9 @@ fn context_from_entry(entry: EbpfSessionEntry, ifindex: u32) -> Option<GtpPdpCon
             .transpose()
             .ok()?,
         uplink_source_port_policy: entry.uplink_source_port_policy(),
-        downlink_inner_mtu: None,
+        downlink_inner_mtu: entry
+            .downlink_inner_mtu()
+            .and_then(crate::GtpuDownlinkInnerMtu::from_wire),
     })
 }
 

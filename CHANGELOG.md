@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact-identity/status recovery is unchanged. Both policies retain the shared
   exponential backoff, the single serialized probe at cooldown expiry, and the
   existing deadlines, retry and authority rules. Refs #1248.
+- `opc-gtpu-dataplane`: ordinary inner-IPv6 PDP contexts can now opt into
+  in-tunnel RFC 4443 Packet Too Big. The family-tagged entry gains a versioned
+  opt-in downlink inner MTU profile (entry versions 3/4, the 2-byte field at
+  bytes 73..74, byte 75 reserved); tc's
+  family-tagged decapsulation steers an over-MTU inner IPv6 packet to the
+  existing packet-too-big hand-off queue, and the consumer sends exactly one
+  RFC 4443 error on the subscriber's default-bearer uplink, quoting up to 1,232
+  octets with the same per-session rate limit, 255-second eviction grace and
+  never-answer-before-token order as the IPv4 opt-in. The IPv4
+  fragment-inner default remains refused for IPv6
+  (`downlink_inner_mtu_inner_ipv6_fragmentation`), and the IPv6 MTU must be at
+  least 1,280. Refusal is explicit rather than installing without enforcement.
+  Refs #1007.
 
 - `opc-session-net`: an issuer can now deliver one authenticated, typed boot
   refusal to the exact proven candidate worker boot instead of a ticket notice.
@@ -237,6 +250,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority. Refs #1378.
 
 ### Breaking
+
+- `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
+  to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned
+  opt-in downlink inner MTU profiles (versions 3 and 4, the 2-byte field at
+  bytes 73..74, byte 75 reserved); the
+  entry still occupies 80 bytes, but an old decoder rejects the new profile as
+  non-canonical. A retained version-6 graph is therefore refused and needs a
+  fresh attachment, and downgrading to an SDK that predates version 7 likewise
+  refuses the newer marker. No in-place migration is provided; drain or
+  re-create the attachment in either direction. Refs #1007.
 
 - `opc-sctp`: `InboundMessage.payload` is now `opc_protocol::SensitiveBytes`
   (uniquely owned, zeroized on drop, `Debug` length-only, no `Clone`,

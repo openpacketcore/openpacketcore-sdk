@@ -379,9 +379,13 @@ pub const GTPU_SESSION_SCHEMA_MARKER_LEN: usize = 16;
 /// Marker for the additive family-tagged grouped-session ABI.
 ///
 /// This marker lives in the new schema map and never occupies or reinterprets
-/// a legacy four-byte IPv4 selector.
+/// a legacy four-byte IPv4 selector. Version 7 adds the versioned downlink
+/// inner MTU field to family-tagged entries (in-tunnel ICMPv6 Packet Too Big
+/// for ordinary inner-IPv6 contexts); a retained version-6 graph is refused
+/// and needs a fresh attachment, exactly like the earlier pinned-ABI
+/// generations.
 pub const GTPU_SESSION_SCHEMA_MARKER_VALUE: [u8; GTPU_SESSION_SCHEMA_MARKER_LEN] =
-    *b"OPC-GROUP-IP-v6\0";
+    *b"OPC-GROUP-IP-v7\0";
 /// Single-slot key for [`MAP_CONFIG_IPV6`].
 pub const GTPU_SESSION_CONFIG_KEY: u32 = 0;
 
@@ -2026,6 +2030,19 @@ pub const fn downlink_ipv4_is_fragment(flags_fragment: u16) -> bool {
     flags_fragment & 0x3fff != 0
 }
 
+/// Return whether a complete inner IPv6 packet exceeds the session's tunnel
+/// MTU.
+///
+/// IPv6 has no in-network fragmentation (RFC 8200 section 4.5), so an outer
+/// ICMPv6 Packet Too Big is the only per-packet response; `mtu == 0` (unset)
+/// never matches. `payload_length` is the IPv6 payload length field, so the
+/// complete packet is its fixed 40-octet header plus that payload.
+#[must_use]
+#[inline(always)]
+pub const fn downlink_ipv6_exceeds_inner_mtu(mtu: u16, payload_length: u16) -> bool {
+    mtu != 0 && 40 + payload_length as u32 > mtu as u32
+}
+
 /// Return the backend-owned queue that tc hands an authorized downlink inner
 /// IPv4 packet to instead of decapsulating it, or `None` to decapsulate.
 ///
@@ -3376,6 +3393,25 @@ mod tests {
                 downlink_ipv4_exceeds_inner_mtu(mtu, total, flags),
                 expected,
                 "mtu {mtu} total {total} flags {flags:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn downlink_ipv6_inner_mtu_compares_the_complete_packet() {
+        // (mtu, IPv6 payload length, exceeds)
+        for (mtu, payload_length, expected) in [
+            (0, 1_400, false),
+            (1_280, 1_240, false),
+            (1_300, 1_260, false),
+            (1_300, 1_261, true),
+            (1_300, u16::MAX, true),
+            (65_535, 65_495, false),
+        ] {
+            assert_eq!(
+                downlink_ipv6_exceeds_inner_mtu(mtu, payload_length),
+                expected,
+                "mtu {mtu} payload {payload_length}"
             );
         }
     }
