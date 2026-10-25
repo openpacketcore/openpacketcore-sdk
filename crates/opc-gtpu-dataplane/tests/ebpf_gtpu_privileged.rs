@@ -6874,6 +6874,29 @@ fn pinned_default_commit(pin_dir: &std::path::Path) -> Option<[u8; UPLINK_SOURCE
     commits.get(&UE_PAA.octets(), 0).ok()
 }
 
+fn pinned_far_miss_counters(pin_dir: &Path) -> [u64; 3] {
+    // Read the raw ABI slots so this packet regression also compiles against
+    // the unsplit datapath. Slots 8 and 9 already exist in its 16-slot map.
+    [COUNTER_UL_FAR_MISS, 8, 9].map(|index| pinned_counter(pin_dir, index))
+}
+
+fn assert_pinned_far_miss_delta(before: [u64; 3], after: [u64; 3], passed: u64, dropped: u64) {
+    assert_eq!(
+        after,
+        [
+            before[0] + passed + dropped,
+            before[1] + passed,
+            before[2] + dropped,
+        ],
+        "raw FAR-miss counters [total, passed, dropped] must track packet outcomes"
+    );
+    assert_eq!(
+        after[0],
+        after[1] + after[2],
+        "the raw compatibility counter must equal both outcome counters"
+    );
+}
+
 fn pinned_counter(pin_dir: &std::path::Path, index: u32) -> u64 {
     let map = Map::from_map_data(
         MapData::from_pin(pin_dir.join(MAP_COUNTERS)).expect("open pinned counters"),
@@ -7768,11 +7791,64 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     // boundary: no GTP-U packet and no raw inner UDP packet leaks to the PGW.
     drain_datagrams(&pgw_socket);
     drain_datagrams(&pgw_plaintext_socket);
+    let raw_far_miss_before = pinned_far_miss_counters(&marked_pin_dir);
     for _ in 0..3 {
         ue_unknown_mark_socket.send_to(b"must-not-leak", (REMOTE_HOST, 53))?;
     }
     expect_no_datagram(&pgw_socket);
     expect_no_datagram(&pgw_plaintext_socket);
+    assert_pinned_far_miss_delta(
+        raw_far_miss_before,
+        pinned_far_miss_counters(&marked_pin_dir),
+        0,
+        3,
+    );
+
+    // A missing marked owner drops even when the complete FAR is present.
+    let owner_map = Map::from_map_data(MapData::from_pin(
+        marked_pin_dir.join(MAP_MARKED_BEARER_OWNER),
+    )?)?;
+    let mut owners =
+        BpfHashMap::<_, [u8; UPLINK_MARK_KEY_LEN], [u8; MARKED_BEARER_OWNER_VALUE_LEN]>::try_from(
+            owner_map,
+        )?;
+    let owner_key = UplinkFarKey {
+        ue_ip: UE_PAA.octets(),
+        bearer_mark: MARK_A.to_be_bytes(),
+    }
+    .encode();
+    let owner = owners.get(&owner_key, 0)?;
+    owners.remove(&owner_key)?;
+    let raw_owner_miss_before = pinned_far_miss_counters(&marked_pin_dir);
+    for _ in 0..3 {
+        ue_mark_a_socket.send_to(b"missing-owner-must-not-leak", (REMOTE_HOST, 53))?;
+    }
+    expect_no_datagram(&pgw_socket);
+    expect_no_datagram(&pgw_plaintext_socket);
+    owners.insert(owner_key, owner, 0)?;
+    assert_pinned_far_miss_delta(
+        raw_owner_miss_before,
+        pinned_far_miss_counters(&marked_pin_dir),
+        0,
+        3,
+    );
+
+    // Control datagrams sent with mark zero pass unchanged without a FAR.
+    let raw_passed_before = pinned_far_miss_counters(&marked_pin_dir);
+    pgw_socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    for message_type in [1, 2] {
+        let control = [0x32, message_type, 0, 4, 0, 0, 0, 0, 0, 42, 0, 0];
+        epdg_cp_socket.send_to(&control, (PGW_IP, GTPU_PORT))?;
+        let (length, source) = pgw_socket.recv_from(&mut buffer)?;
+        assert_eq!(&buffer[..length], &control);
+        assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    }
+    assert_pinned_far_miss_delta(
+        raw_passed_before,
+        pinned_far_miss_counters(&marked_pin_dir),
+        2,
+        0,
+    );
 
     // A non-G-PDU retains the priority-10 injected outer sentinel and passes
     // to the local control plane. This exact-mark INPUT gate proves the
