@@ -65,11 +65,15 @@ impl ScopedXfrmRequest {
     /// Validate that this request can succeed `predecessor` for one flow.
     ///
     /// A Child-SA rekey successor keeps the exact flow identity: the policy
-    /// lookup key (selector, direction, mark, interface ID) and the SA outer
-    /// selector, destination/protocol/source, mark and mode are unchanged. Only
-    /// the SA SPI and the policy/SA request ID may differ, so the existing
-    /// protective policy can be repointed to the successor SA in one atomic
-    /// policy update while the predecessor SA remains installed.
+    /// lookup key (selector, direction, selector mark, interface ID), the SA
+    /// outer selector, destination/protocol/source, lookup mark, interface ID
+    /// and mode, the policy priority/action, the policy template selector,
+    /// source address and mode, and the packet-marking presentation
+    /// (`output_mark`, fixed outer DSCP) are unchanged. Only the SA SPI and the
+    /// policy/SA request ID may differ, so the existing protective policy can
+    /// be repointed to the successor SA in one atomic policy update while the
+    /// predecessor SA remains installed. This keeps the rekeyed flow's
+    /// scheduling and byte-level packet presentation identical.
     ///
     /// Construction of each request already validated its own profile.
     /// This does not reserve a key, grant committed activation authority or
@@ -89,7 +93,24 @@ impl ScopedXfrmRequest {
             && self.sa.source_address == predecessor.sa.source_address
             && self.sa.mark == predecessor.sa.mark
             && self.sa.if_id == predecessor.sa.if_id
-            && self.sa.mode == predecessor.sa.mode;
+            && self.sa.mode == predecessor.sa.mode
+            && self.sa.output_mark == predecessor.sa.output_mark
+            && self.sa.egress_dscp == predecessor.sa.egress_dscp
+            && self.policy.priority == predecessor.policy.priority
+            && self.policy.action == predecessor.policy.action
+            && self.policy.templates.len() == predecessor.policy.templates.len()
+            && self
+                .policy
+                .templates
+                .iter()
+                .zip(predecessor.policy.templates.iter())
+                .all(|(successor, predecessor)| {
+                    successor.id.destination == predecessor.id.destination
+                        && successor.id.protocol == predecessor.id.protocol
+                        && successor.id.spi == predecessor.id.spi
+                        && successor.source_address == predecessor.source_address
+                        && successor.mode == predecessor.mode
+                });
         if !same_flow {
             return Err(XfrmError::StateMismatch {
                 operation: "local_scope_successor_flow",
@@ -283,5 +304,48 @@ mod tests {
                 operation: "local_scope_successor_identity"
             })
         ));
+    }
+
+    #[test]
+    fn successor_pins_flow_presentation_dscp_and_policy_priority() {
+        let (sa, policy) = fixture();
+        let predecessor = ScopedXfrmRequest::new(sa, policy).unwrap();
+        let successor = successor_request(&predecessor);
+
+        let mut changed_priority = successor.policy.clone();
+        changed_priority.priority = predecessor.policy.priority.checked_add(1).unwrap();
+        let changed_priority =
+            ScopedXfrmRequest::new(successor.sa.clone(), changed_priority).unwrap();
+        assert!(matches!(
+            changed_priority.validate_successor_of(&predecessor),
+            Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_flow"
+            })
+        ));
+
+        let mut changed_output_mark = successor.sa.clone();
+        changed_output_mark.output_mark = Some(crate::XfrmMark {
+            value: 0x0001_0000,
+            mask: 0x00ff_0000,
+        });
+        let changed_output_mark =
+            ScopedXfrmRequest::new(changed_output_mark, successor.policy.clone()).unwrap();
+        assert!(matches!(
+            changed_output_mark.validate_successor_of(&predecessor),
+            Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_flow"
+            })
+        ));
+
+        let mut changed_dscp = successor.sa.clone();
+        changed_dscp.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
+        if let Ok(changed_dscp) = ScopedXfrmRequest::new(changed_dscp, successor.policy.clone()) {
+            assert!(matches!(
+                changed_dscp.validate_successor_of(&predecessor),
+                Err(XfrmError::StateMismatch {
+                    operation: "local_scope_successor_flow"
+                })
+            ));
+        }
     }
 }

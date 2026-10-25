@@ -416,9 +416,10 @@ impl Operations {
                     .find(|entry| same_receipt(&entry.receipt, &receipt))
                 {
                     if entry.successor.is_some() {
-                        Err(XfrmError::StateMismatch {
-                            operation: "local_scope_successor_moved",
-                        })
+                        // The receipt stays live and readable; its SA is no
+                        // longer the published forwarding target. Milestones are
+                        // reported separately by `scoped_successor_status`.
+                        Ok(false)
                     } else if entry.progress.published && !entry.progress.undo {
                         Self::read(backend, entry).await
                     } else {
@@ -441,12 +442,16 @@ impl Operations {
                             || entry.retirement.is_some()
                     })
                     .map(|entry| entry.schedule.progress())
-                    .chain(self.successors.iter().filter_map(|entry| {
-                        (!entry.install_progress.published
-                            || entry.install_progress.undo
-                            || entry.removal_requested)
-                            .then(|| entry.schedule.progress())
-                    }))
+                    .chain(
+                        self.successors
+                            .iter()
+                            .filter(|entry| {
+                                !entry.install_progress.published
+                                    || entry.install_progress.undo
+                                    || entry.removal_requested
+                            })
+                            .map(|entry| entry.schedule.progress()),
+                    )
                     .chain(profile_progress)
                     .collect();
                 let _ = reply.send(Ok(progress));

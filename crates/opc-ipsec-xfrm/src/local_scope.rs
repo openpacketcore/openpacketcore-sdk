@@ -55,6 +55,7 @@ impl LocalXfrmProfile {
                 operation: "local_scope_profile_epoch",
             })
     }
+    #[cfg(feature = "scope-store")]
     pub(crate) fn try_begin_operation(
         &self,
     ) -> Result<Option<opc_local_kernel_lifecycle::LocalOperation>, LocalLifecycleError> {

@@ -143,10 +143,6 @@ impl Operations {
             crate::XfrmDirection::Out => LocalEffectUse::XfrmOutbound,
             crate::XfrmDirection::Forward => LocalEffectUse::XfrmForward,
         };
-        if effect.consume(target).is_err() {
-            let _ = reply.send(Err(mismatch()));
-            return;
-        }
         let reservation = {
             let primary = &self.entries[predecessor_index];
             let Some(predecessor_reservation) = primary.reservation.as_ref() else {
@@ -164,6 +160,13 @@ impl Operations {
                 }
             }
         };
+        // Consume the one-shot activation only after the last refusal gate, so
+        // a refused reservation never burns committed authority.
+        if effect.consume(target).is_err() {
+            let _ = self.registry.retired(&reservation);
+            let _ = reply.send(Err(mismatch()));
+            return;
+        }
         let receipt = ScopedXfrmReceipt::successor_receipt(&supplied, predecessor.clone());
         self.successors.push(SuccessorEntry {
             predecessor,

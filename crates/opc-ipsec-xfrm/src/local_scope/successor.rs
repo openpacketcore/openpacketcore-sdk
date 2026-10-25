@@ -236,8 +236,12 @@ pub(crate) async fn retire_predecessor<K: SuccessorKernel>(
         return Ok(());
     }
     kernel.local()?;
-    // Only a live successor policy authorizes dropping the predecessor SA.
-    if kernel.successor_policy().await? != PolicyReadback::Exact {
+    // Only a live successor (SA *and* policy) authorizes dropping the
+    // predecessor SA. If the successor SA expired or was removed, keeping the
+    // predecessor is the last working path; never drop both.
+    if kernel.successor_policy().await? != PolicyReadback::Exact
+        || kernel.successor_sa().await? != Readback::Exact
+    {
         return Err(XfrmError::StateMismatch {
             operation: "local_scope_successor_not_live",
         });
@@ -574,6 +578,26 @@ mod tests {
             .unwrap();
         assert_eq!(port.policy, Policy::Successor);
         assert_eq!(port.successor_sa, Readback::Exact);
+    }
+
+    #[tokio::test]
+    async fn retirement_refuses_when_the_successor_sa_is_no_longer_live() {
+        let mut port = Port::default();
+        install_move_publish(&mut port).await;
+        // Model a kernel hard-lifetime expiry of the successor SA: the policy
+        // still selects it, but the successor SA is gone.
+        port.successor_sa = Readback::Absent;
+        let mut retirement = PredecessorRetirementProgress::default();
+        assert!(matches!(
+            retire_predecessor(&mut port, &mut retirement).await,
+            Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_not_live"
+            })
+        ));
+        assert!(!retirement.sa_started && !retirement.retired);
+        // The predecessor SA is retained as the last working path.
+        assert_eq!(port.predecessor_sa, Readback::Exact);
+        assert!(!port.events().contains(&"remove-predecessor-sa"));
     }
 
     #[tokio::test]

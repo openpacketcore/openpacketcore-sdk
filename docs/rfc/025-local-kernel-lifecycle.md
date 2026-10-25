@@ -417,8 +417,10 @@ one. The scoped actor therefore offers exactly one successor operation for one
 live flow receipt:
 
 - The successor request keeps the predecessor's complete policy lookup identity
-  (selector, direction, mark, interface ID) and SA flow identity (outer
-  selector, destination/protocol/source, mark, mode). Only its SA SPI and the
+  (selector, direction, selector mark, interface ID), SA flow identity (outer
+  selector, destination/protocol/source, lookup mark, interface ID, mode) and
+  packet presentation (output mark, fixed outer DSCP), plus the policy
+  priority/action and template selector/source/mode. Only its SA SPI and the
   SA/policy request ID may differ; the actor refuses a different flow, a
   different direction or a reused SPI/request ID with a typed
   `StateMismatch`.
@@ -431,10 +433,14 @@ live flow receipt:
   traffic could still select the flow, so there is no unprotected interval.
   Publication requires fresh exact successor SA and policy readback.
 - The predecessor SA and its receipt stay live and readable until the caller
-  calls `remove_scoped` on the predecessor. That retirement removes the
-  predecessor SA only and never the policy the successor now owns. Removing the
-  successor is refused while its predecessor is still reserved, and removes the
-  successor SA before its policy.
+  calls `remove_scoped` on the predecessor. `read_scoped` reports `false` for a
+  superseded predecessor once traffic moved (its SA is no longer the published
+  forwarding target) while `scoped_successor_status` reports the milestones.
+  That retirement removes the predecessor SA only and never the policy the
+  successor now owns; it is refused unless the successor SA **and** policy are
+  both still live, so an expired successor never takes the predecessor with it.
+  Removing the successor is refused while its predecessor is still reserved,
+  and removes the successor SA before its policy.
 - Every step records progress before its first possible effect. A lost
   acknowledgement, cancellation or panic resumes through readback (`undo`), and
   an ambiguous policy readback retains both objects instead of guessing.
