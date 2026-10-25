@@ -24,6 +24,18 @@ pub enum StartupError {
     /// The authenticated issuer is no longer authorized for this exact scope.
     #[error("scope startup issuer unauthorized")]
     Unauthorized,
+    /// The installed platform observation is definitively invalid.
+    #[error("scope startup platform observation invalid")]
+    PlatformInvalid,
+    /// The installed platform observation changed and no longer matches the
+    /// enrollment; retrying the same observation cannot succeed until the
+    /// platform and enrollment are reconciled.
+    #[error("scope startup platform observation changed")]
+    PlatformChanged,
+    /// The trusted API definitively refused the issuer discovery or key-set
+    /// prerequisite after activation. This is not transient.
+    #[error("scope startup prerequisite refused")]
+    PrerequisiteRefused,
     /// A bounded I/O attempt or trusted source is temporarily unavailable.
     #[error("scope startup unavailable")]
     Unavailable,

@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-session-net`: `StartupError` adds `PlatformInvalid`,
+  `PlatformChanged`, and `PrerequisiteRefused`. Issuer probe and retained-session
+  revalidation now preserve a definitively invalid or changed installed
+  platform observation and a definitively refused discovery/key-set
+  prerequisite instead of collapsing them into retryable `Unavailable`;
+  transient reads and transport failures remain `Unavailable`. This is an
+  error-classification change only: no read absence, closed connection or
+  refusal becomes authority, evidence a worker ended, or an authenticated boot
+  refusal. Downstream exhaustive matches must handle the new variants.
+  Refs #1246.
+
 - `opc-session-store`: `StoreError` adds `KeyProviderUnavailable`. Key-provider
   outages from record sealing/unsealing (KMS restart, TLS failure, refused
   connection, timeout) are now reported as this retryable variant, classified

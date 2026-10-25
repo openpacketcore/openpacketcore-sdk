@@ -36,6 +36,8 @@ struct Api {
     clock: Arc<IssuerClock>,
     expire_on_recheck: bool,
     reads: AtomicUsize,
+    observe_error: Option<PlatformError>,
+    revalidate_error: Mutex<Option<PlatformError>>,
 }
 #[async_trait::async_trait]
 impl KubernetesPodSource for Api {
@@ -45,7 +47,16 @@ impl KubernetesPodSource for Api {
         name: &str,
     ) -> Result<Vec<u8>, PlatformError> {
         assert_eq!((namespace, name), ("test", "worker-0"));
-        if self.reads.fetch_add(1, Ordering::AcqRel) == 1 && self.expire_on_recheck {
+        if let Some(error) = self.observe_error {
+            return Err(error);
+        }
+        let read = self.reads.fetch_add(1, Ordering::AcqRel);
+        if read > 0 {
+            if let Some(error) = *self.revalidate_error.lock().unwrap() {
+                return Err(error);
+            }
+        }
+        if read == 1 && self.expire_on_recheck {
             tokio::task::yield_now().await;
             self.clock.0.store(120, Ordering::Release);
         }
@@ -98,6 +109,30 @@ fn bootstrap_expiry_during_independent_pod_read_is_retryable() {
         "scope::issuer_tests::bootstrap_expiry_during_independent_pod_read_is_retryable",
     );
 }
+#[test]
+fn probe_preserves_definitive_platform_refusal() {
+    run_issuer(
+        Scenario::ProbePlatformInvalid,
+        "scope::issuer_tests::probe_preserves_definitive_platform_refusal",
+    );
+}
+
+#[test]
+fn probe_keeps_transient_platform_failure_retryable() {
+    run_issuer(
+        Scenario::ProbePlatformUnavailable,
+        "scope::issuer_tests::probe_keeps_transient_platform_failure_retryable",
+    );
+}
+
+#[test]
+fn retained_session_revalidation_preserves_changed_platform_observation() {
+    run_issuer(
+        Scenario::RevalidatePlatformChanged,
+        "scope::issuer_tests::retained_session_revalidation_preserves_changed_platform_observation",
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scenario {
     Verify,
@@ -105,6 +140,9 @@ enum Scenario {
     Refresh,
     ExpiredBeforeIssuance,
     ExpiresWhileReading,
+    ProbePlatformInvalid,
+    ProbePlatformUnavailable,
+    RevalidatePlatformChanged,
 }
 struct NoPredecessors;
 #[async_trait::async_trait]
@@ -195,8 +233,15 @@ fn run_issuer(scenario: Scenario, test_name: &str) {
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
         let enrollment=PodEnrollment::new(scope(),"test".into(),"worker-0".into(),"worker".into(),[6;16],"worker".into(),[4;16],SpiffeId::new(WORKER).unwrap(),address.port()).unwrap();
         let issuer_clock=Arc::new(IssuerClock(AtomicI64::new(0)));
-        let reader=Arc::new(KubernetesBootReader::new(Arc::new(Api{address:Mutex::new(Some(address)),clock:issuer_clock.clone(),expire_on_recheck:scenario==Scenario::ExpiresWhileReading,reads:AtomicUsize::new(0)})));
+        let api=Arc::new(Api{address:Mutex::new(Some(address)),clock:issuer_clock.clone(),expire_on_recheck:scenario==Scenario::ExpiresWhileReading,reads:AtomicUsize::new(0),observe_error:match scenario { Scenario::ProbePlatformInvalid=>Some(PlatformError::Invalid), Scenario::ProbePlatformUnavailable=>Some(PlatformError::Unavailable), _=>None }, revalidate_error:Mutex::new(None)});
+        let reader=Arc::new(KubernetesBootReader::new(api.clone()));
         let issuer=BootstrapIssuerClient::new(client,issuer_clock.clone(),credentials,reader,super::ProofBudgets::default()).unwrap();
+        if matches!(scenario, Scenario::ProbePlatformInvalid | Scenario::ProbePlatformUnavailable) {
+            let error = issuer.probe(&enrollment, BootstrapProofMode::Candidate).await.err().expect("probe must refuse the platform observation");
+            let expected = if scenario == Scenario::ProbePlatformInvalid { StartupError::PlatformInvalid } else { StartupError::Unavailable };
+            assert_eq!(error, expected, "probe must preserve the platform failure class");
+            return;
+        }
         let (verified,worker)=tokio::time::timeout(std::time::Duration::from_secs(5),async{tokio::join!(issuer.probe(&enrollment,BootstrapProofMode::Candidate),async {let (stream,_)=listener.accept().await.unwrap();responder.respond_once(stream).await})}).await.unwrap();
         let worker=worker.unwrap();
         if scenario==Scenario::ExpiresWhileReading {
@@ -206,6 +251,13 @@ fn run_issuer(scenario: Scenario, test_name: &str) {
         }
         let verified=verified.unwrap();assert_eq!(verified.proof().workload(),&[3;16]);assert_eq!(verified.proof().process_nonce(),process.boot().process_nonce());assert_eq!(verified.proof().boot_key_digest(),process.boot().key_digest());
         assert!(verified.proof().is_candidate());
+        if scenario==Scenario::RevalidatePlatformChanged {
+            *api.revalidate_error.lock().unwrap()=Some(PlatformError::Changed);
+            assert_eq!(verified.revalidate().await.unwrap_err(),StartupError::PlatformChanged,"retained-session revalidation must preserve a changed observation as definitive");
+            *api.revalidate_error.lock().unwrap()=None;
+            verified.revalidate().await.expect("a reconciled observation is accepted on a later attempt");
+            return;
+        }
         if scenario==Scenario::ExpiredBeforeIssuance {
             verified.revalidate().await.unwrap();
             issuer_clock.0.store(120,Ordering::Release);
