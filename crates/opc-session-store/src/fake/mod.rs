@@ -64,6 +64,15 @@ struct FakeBackendState {
     records: BTreeMap<FakeMapKey, StoredSessionRecord>,
     leases: HashMap<FakeMapKey, LeaseEntry>,
     key_fences: HashMap<FakeMapKey, FenceToken>,
+    /// Highest fence token of any key floor this backend has retired.
+    ///
+    /// A retired per-key floor may no longer be reported as zero: clients build
+    /// `Acquire` requests from the observed fence, and fence tokens must never
+    /// regress for a key. Instead of retaining a per-key high-water forever
+    /// (which would reintroduce the lifetime key ceiling), one bounded
+    /// backend-wide high-water replaces every retired floor and is the
+    /// observation/allocation basis for a key without a live floor.
+    retired_fence_high_water: FenceToken,
     next_fence: u64,
     next_credential_id: u64,
     compacted_replication_sequence: u64,
@@ -94,6 +103,7 @@ impl FakeBackendState {
             records: BTreeMap::new(),
             leases: HashMap::new(),
             key_fences: HashMap::new(),
+            retired_fence_high_water: FenceToken::new(0),
             next_fence: 1,
             next_credential_id: 1,
             compacted_replication_sequence: 0,
@@ -112,6 +122,7 @@ impl FakeBackendState {
             records: self.records.clone(),
             leases: self.leases.clone(),
             key_fences: self.key_fences.clone(),
+            retired_fence_high_water: self.retired_fence_high_water,
             next_fence: self.next_fence,
             next_credential_id: self.next_credential_id,
             compacted_replication_sequence: self.compacted_replication_sequence,
@@ -242,12 +253,34 @@ impl FakeSessionBackend {
     }
 
     /// Get the current recorded fence for a key.
+    ///
+    /// A key without a live floor (fresh, or its dead floor was retired under
+    /// capacity pressure) reports the backend-wide retired-fence high-water
+    /// instead of zero. That keeps the value used as `expected_fence` for a new
+    /// `Acquire` at or above every fence this backend has already committed, so
+    /// fence tokens cannot regress for a re-created key.
     fn current_fence(state: &FakeBackendState, map_key: &FakeMapKey) -> FenceToken {
         state
             .key_fences
             .get(map_key)
             .copied()
-            .unwrap_or_else(|| FenceToken::new(0))
+            .unwrap_or(state.retired_fence_high_water)
+    }
+
+    /// Whether this key still owns a live record or a live lease at `now`.
+    ///
+    /// This is the pure, non-mutating form of the pruning predicates: it is
+    /// used to decide whether capacity retirement would free a slot without
+    /// touching state when the answer is "no".
+    fn key_is_live(state: &FakeBackendState, map_key: &FakeMapKey, now: Timestamp) -> bool {
+        state
+            .records
+            .get(map_key)
+            .is_some_and(|record| record.expires_at.is_none_or(|expires_at| expires_at > now))
+            || state
+                .leases
+                .get(map_key)
+                .is_some_and(|entry| entry.active && entry.expires_at > now)
     }
 
     fn ensure_key_capacity(
@@ -259,37 +292,55 @@ impl FakeSessionBackend {
         if state.key_fences.contains_key(map_key) || state.key_fences.len() < max_tracked_keys {
             return Ok(());
         }
-        // The bound is reached. Retire only state that is provably no longer
-        // authoritative before refusing: expired records, expired/inactive
-        // leases, and the fence floors of keys that neither names any more.
-        // Authority checks never depend on a dead floor: every mutation needs
-        // the exact live lease entry, and fence tokens are process-monotone, so
-        // any future lease for that key receives a strictly higher fence.
+        // The bound is reached. Decide from the pure predicates whether
+        // maintenance could free a slot, without mutating state yet: a capacity
+        // refusal must leave every record, lease, fence and receipt untouched
+        // and remain retryable.
+        let surviving = state
+            .key_fences
+            .keys()
+            .filter(|existing| Self::key_is_live(state, existing, now))
+            .count();
+        if surviving >= max_tracked_keys {
+            return Err(StoreError::BackendUnavailable(
+                "fake backend tracked-key limit reached".into(),
+            ));
+        }
+        // Maintenance will free a slot. Commit it now: prune expired records
+        // and inactive/expired leases, then retire dead floors into the
+        // backend-wide retired-fence high-water.
         Self::prune_state(state, now);
         Self::retire_dead_key_fences(state);
-        if state.key_fences.contains_key(map_key) || state.key_fences.len() < max_tracked_keys {
-            Ok(())
-        } else {
-            Err(StoreError::BackendUnavailable(
-                "fake backend tracked-key limit reached".into(),
-            ))
-        }
+        Ok(())
     }
 
     /// Retire the fence floors of keys with no live record and no lease entry.
     ///
     /// `prune_state` has already removed expired records and inactive/expired
-    /// leases; any remaining lease is live. Retiring a dead floor is safe for
-    /// stale-credential protection because mutations require the exact live
-    /// lease entry and future fences are allocated from a process-monotone
-    /// counter. This is the only place fence floors are forgotten.
+    /// leases; any remaining lease is live. Each retired floor raises the
+    /// backend-wide `retired_fence_high_water`, which is what
+    /// [`Self::current_fence`] reports for a key without a live floor, so a
+    /// re-created key can never be handed a lower fence token. Retiring a floor
+    /// is also safe for stale-credential protection because mutations require
+    /// the exact live lease entry (with its monotone credential id).
     fn retire_dead_key_fences(state: &mut FakeBackendState) {
         let FakeBackendState {
             records,
             leases,
             key_fences,
+            retired_fence_high_water,
             ..
         } = state;
+        let retired_high_water = key_fences
+            .iter()
+            .filter(|(map_key, _)| {
+                !records.contains_key(*map_key) && !leases.contains_key(*map_key)
+            })
+            .map(|(_, fence)| *fence)
+            .max();
+        if let Some(retired_high_water) = retired_high_water {
+            *retired_fence_high_water = (*retired_fence_high_water).max(retired_high_water);
+        }
         key_fences
             .retain(|map_key, _| records.contains_key(map_key) || leases.contains_key(map_key));
     }
@@ -959,6 +1010,9 @@ impl SessionBackend for FakeSessionBackend {
         let state = self.inner.lock().await;
         crate::FencedTransitionObservation::new(
             Self::get_with_state(&state, key, self.clock.now_utc()),
+            // A key without a live floor reports the backend-wide retired-fence
+            // high-water, never zero, once this process has retired any floor.
+            // The value is the allocation basis for the next `Acquire`.
             Self::current_fence(&state, &Self::map_key(key)),
         )
     }

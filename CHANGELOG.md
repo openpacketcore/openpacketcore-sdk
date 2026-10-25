@@ -143,9 +143,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   work for the process lifetime after a fixed number of keys or lab
   fenced-transitions. Under capacity pressure it first retires only state that
   is provably no longer authoritative: fence floors whose key has neither a
-  live record nor a live lease (stale credentials still fail closed against the
-  exact live lease), and `in_memory_lab` transition receipts past
-  `FENCED_TRANSITION_OUTCOME_RETENTION`. Receipts inside their exact-answer
+  live record nor a live lease, and `in_memory_lab` transition receipts past
+  `FENCED_TRANSITION_OUTCOME_RETENTION`. A retired floor raises one
+  backend-wide retired-fence high-water that observation reports and
+  allocation requires for a key without a live floor, so fence tokens never
+  regress for a re-created key; stale credentials still fail closed against
+  the exact live lease. Receipts inside their exact-answer
   window are never evicted early; when the retained history is entirely
   authoritative the backend keeps the typed `FencedTransitionHistoryFull`
   failure without mutating state. Refs #1257.

@@ -68,8 +68,11 @@ impl FakeSessionBackend {
     /// The lab bounds memory instead of refusing work for the process lifetime:
     ///
     /// - A fence floor is retired once no live record and no live lease names its
-    ///   key. Fence tokens remain process-monotone, so a retired floor cannot
-    ///   authorize a stale credential; mutations require the exact live lease.
+    ///   key. Each retired floor raises one bounded backend-wide retired-fence
+    ///   high-water, which observation reports and allocation requires for a key
+    ///   without a live floor, so fence tokens never regress for a re-created
+    ///   key. Guards remain credential-checked: mutations require the exact live
+    ///   lease, so a retired floor cannot authorize a stale credential.
     /// - A fenced-transition receipt is authoritative for the fixed
     ///   `FENCED_TRANSITION_OUTCOME_RETENTION` window: inside it, a replay
     ///   returns the original outcome or `RequestConflict`; a retained but
@@ -80,6 +83,10 @@ impl FakeSessionBackend {
     ///   never evicted early: if every retained receipt is still authoritative,
     ///   the lab fails closed with the typed `FencedTransitionHistoryFull`
     ///   without mutating any record, lease or fence.
+    /// - A tracked-key capacity refusal likewise mutates nothing and is
+    ///   retryable; capacity can return once elapsed records/leases are retired.
+    ///   An accepted admission may prune elapsed state even when the transition
+    ///   itself is later rejected on its own record/lease/fence conditions.
     ///
     /// Receipts retired after their window are outside the replay contract above;
     /// callers must not retry a request identity beyond the retention window
@@ -181,6 +188,10 @@ impl FakeSessionBackend {
         if let Some(fence) = state.key_fences.get(&key) {
             staged.key_fences.insert(key.clone(), *fence);
         }
+        // The observation basis for a key without a live floor is the
+        // backend-wide retired-fence high-water; the staged validation must see
+        // the same value the caller observed.
+        staged.retired_fence_high_water = state.retired_fence_high_water;
         let result = self.lab_apply(&mut staged, &request, now);
         if let Ok((outcome, replication)) = &result {
             let sequence = self.next_direct_replication_sequence(&state)?;

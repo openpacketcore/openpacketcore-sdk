@@ -565,18 +565,33 @@ fn record_for_key(key: SessionKey) -> StoredSessionRecord {
     value
 }
 
-fn create_request_at(index: u32) -> FencedTransitionRequest {
+/// Build a create request the way an SDK client does: observe the key's fence
+/// first, then bind the record to `observed + 1`.
+///
+/// A key whose dead floor was retired under capacity pressure observes the
+/// backend-wide retired-fence high-water instead of zero, so a fixed zero
+/// expectation would be rejected and would silently reintroduce the fence
+/// regression the high-water prevents.
+async fn create_request_at(backend: &FakeSessionBackend, index: u32) -> FencedTransitionRequest {
     let key = session_key_at(index);
+    let observed = backend
+        .observe_fenced_transition(&key)
+        .await
+        .unwrap()
+        .current_fence();
+    let mut record = record_for_key(key.clone());
+    record.owner = OwnerId::new("lab-owner").unwrap();
+    record.fence = FenceToken::new(observed.get() + 1);
     FencedTransitionRequest::new(
         FencedTransitionRequestId::new(),
         FencedTransitionLease::acquire(
-            key.clone(),
+            key,
             OwnerId::new("lab-owner").unwrap(),
-            FenceToken::new(0),
+            observed,
             Duration::from_secs(30),
         )
         .unwrap(),
-        FencedTransitionMutation::create(record_for_key(key)),
+        FencedTransitionMutation::create(record),
     )
     .unwrap()
 }
@@ -598,6 +613,21 @@ async fn execute_transition(
     backend.fenced_transition(&prepared).await.unwrap()
 }
 
+/// Execute a fresh create transition, rebuilding it from a fresh observation if
+/// a retired-floor maintenance step raced the request (retryable `StaleFence`).
+async fn execute_create(backend: &FakeSessionBackend, index: u32) -> FencedTransitionOutcome {
+    for _ in 0..4 {
+        let request = create_request_at(backend, index).await;
+        let prepared = backend.prepare_fenced_transition(request).await.unwrap();
+        match backend.fenced_transition(&prepared).await {
+            Ok(outcome) => return outcome,
+            Err(FencedTransitionExecuteError::Rejected(StoreError::StaleFence)) => continue,
+            Err(other) => panic!("unexpected create transition failure: {other:?}"),
+        }
+    }
+    panic!("create transition was not admitted after rebuilding from observation");
+}
+
 #[tokio::test(start_paused = true)]
 async fn lab_retires_only_elapsed_receipts_at_capacity_and_keeps_typed_expiry() {
     let mut backend = FakeSessionBackend::in_memory_lab();
@@ -607,7 +637,7 @@ async fn lab_retires_only_elapsed_receipts_at_capacity_and_keeps_typed_expiry() 
     for index in 0..4u32 {
         prepared.push(
             backend
-                .prepare_fenced_transition(create_request_at(index))
+                .prepare_fenced_transition(create_request_at(&backend, index).await)
                 .await
                 .unwrap(),
         );
@@ -621,7 +651,7 @@ async fn lab_retires_only_elapsed_receipts_at_capacity_and_keeps_typed_expiry() 
     // Every retained receipt is still inside its answer window, so the bound is
     // authoritative and the next transition fails closed without mutation.
     let fifth = backend
-        .prepare_fenced_transition(create_request_at(99))
+        .prepare_fenced_transition(create_request_at(&backend, 99).await)
         .await
         .unwrap();
     assert_eq!(
@@ -675,7 +705,7 @@ async fn lab_bounds_receipts_past_sixty_five_thousand_fenced_transitions() {
     let mut index = 0u32;
     while completed <= 65_536 {
         for _ in 0..256 {
-            let create = execute_transition(&backend, create_request_at(index)).await;
+            let create = execute_create(&backend, index).await;
             index += 1;
             let _delete = execute_transition(&backend, delete_request_after(&create)).await;
             completed += 2;
@@ -732,4 +762,190 @@ async fn lab_bounds_created_and_deleted_keys_past_one_hundred_thousand() {
         backend.inner.lock().await.key_fences.len() <= 1_024,
         "only live key floors are retained"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retired_floor_high_water_keeps_recreated_key_fences_monotone_and_log_rebuildable() {
+    let mut backend = FakeSessionBackend::in_memory_lab();
+    backend.limits.max_tracked_keys = 1;
+    backend.limits.max_replication_entries = 128;
+    let key = session_key_at(7);
+    let owner = OwnerId::new("lab-owner").unwrap();
+
+    // Commit fences 1 and 2 for the key through the direct lease API, then
+    // delete the record and release so only a dead floor remains.
+    let mut committed = Vec::new();
+    let first = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    committed.push(first.fence());
+    backend.release(first).await.unwrap();
+    let second = backend
+        .acquire(&key, owner.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    committed.push(second.fence());
+    assert_eq!(committed, vec![FenceToken::new(1), FenceToken::new(2)]);
+    let mut record = record_for_key(key.clone());
+    record.owner = owner.clone();
+    record.fence = second.fence();
+    backend
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease: second.clone(),
+            expected_generation: None,
+            new_record: record,
+        })
+        .await
+        .unwrap();
+    backend.delete_fenced(&second).await.unwrap();
+    backend.release(second).await.unwrap();
+    tokio::time::advance(Duration::from_secs(31)).await;
+
+    // Capacity pressure retires the dead floor: its fence becomes the
+    // backend-wide high-water instead of being forgotten.
+    let trigger = session_key_at(8);
+    let trigger_lease = backend
+        .acquire(&trigger, owner.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    {
+        let state = backend.inner.lock().await;
+        assert!(!state
+            .key_fences
+            .contains_key(&FakeSessionBackend::map_key(&key)));
+        assert_eq!(state.retired_fence_high_water, FenceToken::new(2));
+    }
+    backend.release(trigger_lease).await.unwrap();
+
+    // Observation -> prepare -> execute can race the retired-floor maintenance:
+    // a maintenance step may raise the high-water after the key was observed, so
+    // the exact request is rebuilt from a fresh observation (retryable
+    // `StaleFence`).
+    let mut recreated = None;
+    for _ in 0..4 {
+        let observed = backend
+            .observe_fenced_transition(&key)
+            .await
+            .unwrap()
+            .current_fence();
+        let mut record = record_for_key(key.clone());
+        record.owner = owner.clone();
+        record.fence = FenceToken::new(observed.get() + 1);
+        let request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::new(),
+            FencedTransitionLease::acquire(
+                key.clone(),
+                owner.clone(),
+                observed,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+            FencedTransitionMutation::create(record.clone()),
+        )
+        .unwrap();
+        let prepared = backend.prepare_fenced_transition(request).await.unwrap();
+        match backend.fenced_transition(&prepared).await {
+            Ok(outcome) => {
+                recreated = Some((outcome, record));
+                break;
+            }
+            Err(FencedTransitionExecuteError::Rejected(StoreError::StaleFence)) => continue,
+            Err(other) => panic!("unexpected transition failure: {other:?}"),
+        }
+    }
+    let (outcome, record) = recreated.expect("the re-acquire must eventually commit");
+    assert!(
+        committed
+            .iter()
+            .all(|prior| outcome.lease().fence() > *prior),
+        "a re-created key must commit a fence strictly above every earlier fence: {} vs {:?}",
+        outcome.lease().fence(),
+        committed
+    );
+    assert_eq!(backend.get(&key).await.unwrap(), Some(record.clone()));
+
+    // The self-generated replication log replays deterministically through the
+    // same capacity-retirement rules instead of depending on the live bound.
+    let log = backend.get_replication_log(1, 128).await.unwrap();
+    backend
+        .rebuild_replication_state(log)
+        .await
+        .expect("the self-generated log must rebuild after floor retirement");
+    assert_eq!(backend.get(&key).await.unwrap(), Some(record));
+}
+
+#[tokio::test(start_paused = true)]
+async fn lab_key_capacity_refusal_mutates_nothing_and_is_retryable() {
+    let mut backend = FakeSessionBackend::in_memory_lab();
+    backend.caps.ordered_replication_log = false;
+    backend.limits.max_tracked_keys = 1;
+    let owner = OwnerId::new("lab-owner").unwrap();
+
+    let occupied = session_key_at(1);
+    let occupied_lease = backend
+        .acquire(&occupied, owner.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let snapshot = {
+        let state = backend.inner.lock().await;
+        (
+            state.key_fences.len(),
+            state.records.len(),
+            state.leases.len(),
+            state.lab_transitions.len(),
+            state.next_fence,
+            state.retired_fence_high_water,
+        )
+    };
+
+    let blocked = create_request_at(&backend, 2).await;
+    let prepared = backend.prepare_fenced_transition(blocked).await.unwrap();
+    assert_eq!(
+        backend.fenced_transition(&prepared).await,
+        Err(FencedTransitionExecuteError::Rejected(
+            StoreError::BackendUnavailable("fake backend tracked-key limit reached".into())
+        ))
+    );
+    let after = {
+        let state = backend.inner.lock().await;
+        (
+            state.key_fences.len(),
+            state.records.len(),
+            state.leases.len(),
+            state.lab_transitions.len(),
+            state.next_fence,
+            state.retired_fence_high_water,
+        )
+    };
+    assert_eq!(
+        snapshot, after,
+        "a capacity refusal must leave every record, lease, fence and receipt untouched"
+    );
+
+    // Retryable: once the occupying elapsed state can be retired, a freshly
+    // observed request is admitted (the first retry may see a retryable
+    // StaleFence if retiring that state raises the high-water first).
+    tokio::time::advance(Duration::from_secs(61)).await;
+    drop(occupied_lease);
+    let target = session_key_at(2);
+    let mut admitted = false;
+    for _ in 0..4 {
+        let request = create_request_at(&backend, 2).await;
+        let prepared = backend.prepare_fenced_transition(request).await.unwrap();
+        match backend.fenced_transition(&prepared).await {
+            Ok(_) => {
+                admitted = true;
+                break;
+            }
+            Err(FencedTransitionExecuteError::Rejected(StoreError::StaleFence)) => continue,
+            Err(other) => panic!("unexpected transition failure: {other:?}"),
+        }
+    }
+    assert!(
+        admitted,
+        "capacity must be reclaimable and the transition retryable"
+    );
+    assert!(backend.get(&target).await.unwrap().is_some());
 }
