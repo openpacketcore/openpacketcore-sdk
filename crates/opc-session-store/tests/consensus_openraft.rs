@@ -1,6 +1,9 @@
 #[path = "support/formation_clock.rs"]
 mod formation_clock;
 
+#[path = "support/election_progress.rs"]
+mod election_progress;
+
 #[path = "consensus_openraft/late_acquire.rs"]
 mod late_acquire;
 
@@ -65,9 +68,8 @@ use tempfile::TempDir;
 
 const MEMBER_COUNT: usize = 3;
 const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
-// Allow one complete resampled election after a split vote, followed by one
-// complete profiled operation. These test-evidence ceilings follow the shared
-// timing authority instead of assuming the former short election window.
+// Retain the profiled watchdog interval. Election acquisition renews it only
+// on a published higher term; randomized split retries have no fixed count.
 const RECOVERY_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
@@ -1096,20 +1098,31 @@ impl TestCluster {
     }
 
     async fn wait_all_ready(&self, deadline: Duration) -> Result<(), ()> {
-        tokio::time::timeout(deadline, async {
-            loop {
-                let reports = futures_util::future::join_all(
-                    self.stores
-                        .iter()
-                        .map(ConsensusSessionStore::probe_durable_readiness),
-                )
-                .await;
-                if reports.iter().all(|report| report.is_ready()) {
-                    return;
+        let term = self
+            .stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(0);
+        election_progress::wait(
+            deadline,
+            term,
+            async {
+                loop {
+                    let reports = futures_util::future::join_all(
+                        self.stores
+                            .iter()
+                            .map(ConsensusSessionStore::probe_durable_readiness),
+                    )
+                    .await;
+                    if reports.iter().all(|report| report.is_ready()) {
+                        return;
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
                 }
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        })
+            },
+            |term| next_election_term(&self.stores, term),
+        )
         .await
         .map_err(|_| ())
     }
@@ -1431,6 +1444,27 @@ impl TestCluster {
             .max()
             .unwrap_or(0)
     }
+}
+
+async fn next_election_term(stores: &[ConsensusSessionStore], term: u64) -> u64 {
+    #[cfg(feature = "test-control")]
+    {
+        use futures_util::StreamExt;
+        let mut changes = stores
+            .iter()
+            .map(|store| store.wait_for_status_for_test(move |status| status.term > term))
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
+        let _ = changes.next().await;
+    }
+    #[cfg(not(feature = "test-control"))]
+    while stores.iter().all(|store| store.status().term <= term) {
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    stores
+        .iter()
+        .map(|store| store.status().term)
+        .max()
+        .unwrap_or(term)
 }
 
 struct CountingKeyProvider {
@@ -6184,34 +6218,42 @@ async fn observed_leader_loss_elects_a_different_higher_term_leader_and_recovers
     let survivors = (0..MEMBER_COUNT)
         .filter(|index| *index != old_leader_index)
         .collect::<Vec<_>>();
-    let recovery_deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
+    let survivor_stores = survivors
+        .iter()
+        .map(|index| cluster.stores[*index].clone())
+        .collect::<Vec<_>>();
 
-    let (new_leader_id, new_term) = tokio::time::timeout_at(recovery_deadline, async {
-        loop {
-            let statuses = survivors
-                .iter()
-                .map(|index| cluster.stores[*index].status())
-                .collect::<Vec<_>>();
-            if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
-                let new_term = statuses.first().expect("survivor status").term;
-                if new_leader_id != old_leader_id
-                    && new_term > old_term
-                    && statuses.iter().all(|status| {
-                        status.leader_id == Some(new_leader_id) && status.term == new_term
-                    })
-                {
-                    break (new_leader_id, new_term);
+    let (new_leader_id, new_term) = election_progress::wait(
+        RECOVERY_TIMEOUT,
+        old_term,
+        async {
+            loop {
+                let statuses = survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].status())
+                    .collect::<Vec<_>>();
+                if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
+                    let new_term = statuses.first().expect("survivor status").term;
+                    if new_leader_id != old_leader_id
+                        && new_term > old_term
+                        && statuses.iter().all(|status| {
+                            status.leader_id == Some(new_leader_id) && status.term == new_term
+                        })
+                    {
+                        break (new_leader_id, new_term);
+                    }
                 }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(&survivor_stores, term),
+    )
     .await
     .expect("surviving majority elects a different higher-term leader");
     assert_ne!(new_leader_id, old_leader_id);
     assert!(new_term > old_term);
 
-    tokio::time::timeout_at(recovery_deadline, async {
+    tokio::time::timeout(RECOVERY_TIMEOUT, async {
         loop {
             let reports = futures_util::future::join_all(
                 survivors

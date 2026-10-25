@@ -3,6 +3,9 @@ mod management_audit_authority;
 #[path = "../../opc-session-store/tests/support/formation_clock.rs"]
 mod formation_clock;
 
+#[path = "../../opc-session-store/tests/support/election_progress.rs"]
+mod election_progress;
+
 #[path = "consensus_openraft/fixture_formation.rs"]
 mod fixture_formation;
 
@@ -620,21 +623,58 @@ impl ThreeNodeCluster {
     }
 
     async fn wait_ready(&self) {
-        tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
-            loop {
-                let (one, two, three) = tokio::join!(
-                    self.stores[0].probe_durable_readiness(),
-                    self.stores[1].probe_durable_readiness(),
-                    self.stores[2].probe_durable_readiness(),
-                );
-                if one.is_ok() && two.is_ok() && three.is_ok() {
-                    return;
+        let term = self
+            .stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(0);
+        election_progress::wait(
+            CLUSTER_TRANSITION_TIMEOUT,
+            term,
+            async {
+                loop {
+                    let (one, two, three) = tokio::join!(
+                        self.stores[0].probe_durable_readiness(),
+                        self.stores[1].probe_durable_readiness(),
+                        self.stores[2].probe_durable_readiness(),
+                    );
+                    if one.is_ok() && two.is_ok() && three.is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(term),
+        )
         .await
         .expect("cluster ready");
+    }
+
+    async fn next_election_term(&self, term: u64) -> u64 {
+        #[cfg(feature = "dangerous-test-hooks")]
+        {
+            use futures_util::StreamExt;
+            let mut changes = self
+                .stores
+                .iter()
+                .map(|store| store.wait_for_raft_status_for_test(move |status| status.term > term))
+                .collect::<futures_util::stream::FuturesUnordered<_>>();
+            changes
+                .next()
+                .await
+                .expect("config voters")
+                .expect("live config engine during election wait");
+        }
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        while self.stores.iter().all(|store| store.status().term <= term) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(term)
     }
 
     fn leader(&self) -> usize {

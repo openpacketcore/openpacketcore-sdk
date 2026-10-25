@@ -2,6 +2,9 @@
 
 #![cfg(feature = "test-control")]
 
+#[path = "../../opc-session-store/tests/support/election_progress.rs"]
+mod election_progress;
+
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[path = "stateless_quorum_consumer/fenced_non_execution.rs"]
 mod fenced_non_execution;
@@ -1344,32 +1347,43 @@ impl ThreeVoterConsumerFleet {
     }
 
     async fn wait_for_observed_leader(&self) -> (usize, SessionConsensusNodeId, u64) {
-        let observed = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
-            loop {
-                let statuses = self
-                    .stores
-                    .iter()
-                    .map(ConsensusSessionStore::status)
-                    .collect::<Vec<_>>();
-                if let (Some(leader_id), Some(term)) = (
-                    statuses.first().and_then(|status| status.leader_id),
-                    statuses.first().map(|status| status.term),
-                ) {
-                    if statuses.iter().all(|status| {
-                        status.leader_id == Some(leader_id)
-                            && status.term == term
-                            && status.admitted
-                    }) {
-                        let leader = statuses
-                            .iter()
-                            .position(|status| status.node_id == leader_id)
-                            .expect("elected leader belongs to fleet");
-                        return (leader, leader_id, term);
+        let eligible_voters = [0, 1, 2];
+        let term = eligible_voters
+            .iter()
+            .map(|index| self.stores[*index].status().term)
+            .max()
+            .unwrap_or(0);
+        let observed = election_progress::wait(
+            THREE_VOTER_READY_TIMEOUT,
+            term,
+            async {
+                loop {
+                    let statuses = self
+                        .stores
+                        .iter()
+                        .map(ConsensusSessionStore::status)
+                        .collect::<Vec<_>>();
+                    if let (Some(leader_id), Some(term)) = (
+                        statuses.first().and_then(|status| status.leader_id),
+                        statuses.first().map(|status| status.term),
+                    ) {
+                        if statuses.iter().all(|status| {
+                            status.leader_id == Some(leader_id)
+                                && status.term == term
+                                && status.admitted
+                        }) {
+                            let leader = statuses
+                                .iter()
+                                .position(|status| status.node_id == leader_id)
+                                .expect("elected leader belongs to fleet");
+                            return (leader, leader_id, term);
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(&eligible_voters, term),
+        )
         .await;
         if let Ok(observed) = observed {
             return observed;
@@ -1426,6 +1440,22 @@ impl ThreeVoterConsumerFleet {
         (engines_running, format!("{durable_progress:?}"))
     }
 
+    async fn next_election_term(&self, eligible_voters: &[usize], term: u64) -> u64 {
+        use futures_util::StreamExt;
+        let mut changes = eligible_voters
+            .iter()
+            .map(|index| {
+                self.stores[*index].wait_for_status_for_test(move |status| status.term > term)
+            })
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
+        let _ = changes.next().await;
+        eligible_voters
+            .iter()
+            .map(|index| self.stores[*index].status().term)
+            .max()
+            .unwrap_or(term)
+    }
+
     async fn wait_for_admitted_quorum_leader(
         &self,
         eligible_voters: &[usize],
@@ -1449,35 +1479,47 @@ impl ThreeVoterConsumerFleet {
             "eligible voters are unique"
         );
 
-        let observed = tokio::time::timeout(THREE_VOTER_READY_TIMEOUT, async {
-            loop {
-                let statuses = eligible_voters
-                    .iter()
-                    .map(|index| (*index, self.stores[*index].status()))
-                    .collect::<Vec<_>>();
-                for (candidate, status) in &statuses {
-                    let Some(leader_id) = status.leader_id else {
-                        continue;
-                    };
-                    if !status.admitted || status.node_id != leader_id || status.term < minimum_term
-                    {
-                        continue;
-                    }
-                    let admitted_reports = statuses
+        let term = eligible_voters
+            .iter()
+            .map(|index| self.stores[*index].status().term)
+            .max()
+            .unwrap_or(0);
+        let observed = election_progress::wait(
+            THREE_VOTER_READY_TIMEOUT,
+            term,
+            async {
+                loop {
+                    let statuses = eligible_voters
                         .iter()
-                        .filter(|(_, observer)| {
-                            observer.admitted
-                                && observer.leader_id == Some(leader_id)
-                                && observer.term == status.term
-                        })
-                        .count();
-                    if admitted_reports >= 2 {
-                        return (*candidate, leader_id, status.term);
+                        .map(|index| (*index, self.stores[*index].status()))
+                        .collect::<Vec<_>>();
+                    for (candidate, status) in &statuses {
+                        let Some(leader_id) = status.leader_id else {
+                            continue;
+                        };
+                        if !status.admitted
+                            || status.node_id != leader_id
+                            || status.term < minimum_term
+                        {
+                            continue;
+                        }
+                        let admitted_reports = statuses
+                            .iter()
+                            .filter(|(_, observer)| {
+                                observer.admitted
+                                    && observer.leader_id == Some(leader_id)
+                                    && observer.term == status.term
+                            })
+                            .count();
+                        if admitted_reports >= 2 {
+                            return (*candidate, leader_id, status.term);
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(eligible_voters, term),
+        )
         .await;
         if let Ok(observed) = observed {
             return observed;
