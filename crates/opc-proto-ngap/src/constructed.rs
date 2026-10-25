@@ -21,7 +21,7 @@ pub(crate) fn extract_security_key_ie_values<T, Id, Extract>(
     entries: &mut [T],
     id_of: Id,
     mut extract: Extract,
-    out: &mut Vec<zeroize::Zeroizing<Vec<u8>>>,
+    out: &mut Vec<crate::SensitiveBytes>,
 ) -> usize
 where
     Id: Fn(&T) -> u16,
@@ -35,7 +35,7 @@ where
         retained += 1;
         let value = extract(entry);
         if !value.is_empty() {
-            out.push(zeroize::Zeroizing::new(value));
+            out.push(crate::SensitiveBytes::from_vec(value));
         }
     }
     retained

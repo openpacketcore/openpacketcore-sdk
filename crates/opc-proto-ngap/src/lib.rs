@@ -93,7 +93,7 @@ pub struct Pdu {
     /// The generated `Any` copies are emptied during decode and the key octets
     /// are owned here in zeroizing buffers. Canonical encoding substitutes
     /// them back in order; dropping the PDU clears them.
-    security_key_values: Vec<zeroize::Zeroizing<Vec<u8>>>,
+    security_key_values: Vec<SensitiveBytes>,
     /// Decoded PDU kind and message body.
     pub kind: PduKind,
 }
@@ -123,7 +123,7 @@ impl Pdu {
 
     pub(crate) fn from_parts(
         raw: SensitiveBytes,
-        security_key_values: Vec<zeroize::Zeroizing<Vec<u8>>>,
+        security_key_values: Vec<SensitiveBytes>,
         kind: PduKind,
     ) -> Self {
         Self {
@@ -133,7 +133,7 @@ impl Pdu {
         }
     }
 
-    pub(crate) fn security_key_values(&self) -> &[zeroize::Zeroizing<Vec<u8>>] {
+    pub(crate) fn security_key_values(&self) -> &[SensitiveBytes] {
         &self.security_key_values
     }
 }
@@ -463,7 +463,7 @@ pub enum Outcome {
 
 /// Decoded typed message plus the security-key IE payloads moved out of the
 /// generated open-type view into zeroizing custody.
-type DecodedNgapMessage = (Message, Vec<zeroize::Zeroizing<Vec<u8>>>);
+type DecodedNgapMessage = (Message, Vec<SensitiveBytes>);
 
 fn decode_message(
     outcome: Outcome,
@@ -508,7 +508,7 @@ fn decode_message(
                     return Err($error);
                 }};
             }
-            let mut security_key_values: Vec<zeroize::Zeroizing<Vec<u8>>> = Vec::new();
+            let mut security_key_values: Vec<SensitiveBytes> = Vec::new();
             let mut msg: $ty = if value[0] & 0x80 != 0 {
                 // Retain generated handling of SEQUENCE extension additions.
                 // Fragmented additions are outside this root-container subset.
@@ -535,7 +535,8 @@ fn decode_message(
                     let id = u16::from_be_bytes([header[0], header[1]]);
                     if let Some(ie) = msg.protocol_ies.0.last_mut() {
                         if id == constructed::SECURITY_KEY_IE_ID {
-                            security_key_values.push(zeroize::Zeroizing::new(payload.into_owned()));
+                            security_key_values
+                                .push(SensitiveBytes::from_vec(payload.into_owned()));
                             ie.value = rasn::types::Any::new(Vec::new());
                         } else {
                             ie.value = rasn::types::Any::new(payload.into_owned());
@@ -1770,6 +1771,42 @@ mod tests {
             generated::ngap_constants::ID_PAGING.0,
             PROCEDURE_CODE_PAGING
         );
+    }
+
+    #[test]
+    fn decoded_security_key_ie_is_held_in_the_audited_carrier() {
+        let wire = encode(
+            &Pdu::from_protocol_ies(
+                MessageType::InitialContextSetupRequest,
+                &[
+                    ProtocolIe::new(94, Criticality::reject, &[0x5a; 32]),
+                    ProtocolIe::new(65_535, Criticality::ignore, &[0x11]),
+                ],
+                DecodeContext::default(),
+            )
+            .expect("structural key-bearing PDU"),
+            EncodeContext::default(),
+        )
+        .expect("encode");
+        let pdu = decode(&wire, DecodeContext::default()).expect("decode");
+        let held: &crate::SensitiveBytes = &pdu.security_key_values()[0];
+        assert_eq!(held.as_slice(), &[0x5a; 32]);
+        assert!(pdu.security_key_values().len() == 1);
+        match &pdu.kind {
+            PduKind::Initiating {
+                message: Message::InitialContextSetupRequest(request),
+                ..
+            } => {
+                let placeholder = request
+                    .protocol_ies
+                    .0
+                    .iter()
+                    .find(|ie| ie.id == 94)
+                    .expect("key IE");
+                assert!(placeholder.value.as_bytes().is_empty());
+            }
+            _ => panic!("expected key-bearing InitialContextSetupRequest"),
+        }
     }
 
     #[test]
