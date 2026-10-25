@@ -1278,6 +1278,11 @@ impl fmt::Debug for ProtocolConfigurationOptions {
 }
 
 /// Typed Allocation and Retention Priority carried by Bearer QoS.
+///
+/// TS 29.274 clause 8.15 refers to TS 29.212 clauses 5.3.45-5.3.47:
+/// level 1 is highest, and the capability/vulnerability wire bits are zero
+/// when enabled. The public booleans express permission, so `true` encodes
+/// as a clear PCI/PVI bit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocationRetentionPriority {
     priority_level: u8,
@@ -1316,19 +1321,33 @@ impl AllocationRetentionPriority {
         if octet & 0x82 != 0 {
             return Err(BearerQosValidationError::InvalidArpSpareBits);
         }
-        Self::new((octet >> 2) & 0x0f, octet & 0x40 != 0, octet & 0x01 != 0)
+        Self::new((octet >> 2) & 0x0f, octet & 0x40 == 0, octet & 0x01 == 0)
     }
 
     /// Encode the canonical TS 29.274 ARP octet with both spare bits zero.
     pub const fn to_octet(self) -> u8 {
-        ((self.preemption_capability as u8) << 6)
+        ((!self.preemption_capability as u8) << 6)
             | (self.priority_level << 2)
-            | self.preemption_vulnerability as u8
+            | !self.preemption_vulnerability as u8
     }
 
     /// Allocation and Retention Priority level (1 is highest, 15 lowest).
     pub const fn priority_level(self) -> u8 {
         self.priority_level
+    }
+
+    /// Compare priority levels, returning [`std::cmp::Ordering::Greater`] when
+    /// this bearer has higher priority than `other`.
+    ///
+    /// TS 29.274 clause 8.15 refers to TS 29.212 clause 5.3.45: level 1 is
+    /// highest and level 15 is lowest. PCI and PVI do not affect this
+    /// comparison; equal levels compare equal even when those flags differ.
+    /// Admission and pre-emption decisions must separately consider the flags.
+    ///
+    /// This is a priority comparison, not a total ordering of ARP values.
+    #[must_use]
+    pub fn cmp_priority(&self, other: &Self) -> std::cmp::Ordering {
+        other.priority_level.cmp(&self.priority_level)
     }
 
     /// Whether the bearer may pre-empt another bearer.
@@ -4816,7 +4835,7 @@ mod tests {
     use super::*;
 
     fn arp() -> AllocationRetentionPriority {
-        let Ok(value) = AllocationRetentionPriority::new(3, true, true) else {
+        let Ok(value) = AllocationRetentionPriority::new(3, false, false) else {
             panic!("test ARP must be valid");
         };
         value

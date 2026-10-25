@@ -32,6 +32,18 @@
   planner cover the Release 18 protocol-error response boundary without
   retaining packet bodies or transaction state.
 
+Procedure-aware Create/Update Bearer receive applies TS 29.274 clause 7.7.9
+before decoding unexpected values. Create Bearer user-plane F-TEIDs use request
+instance 4 and response instances 8/9; Update Bearer has no user-plane F-TEID.
+Update Bearer PCO at either scope and SGW-only load/overload entries in
+Create/Update/Delete Bearer requests are discarded. Nested Update request APCO
+instance 0 remains supported, and the existing Create Bearer PCO compatibility
+view is retained. Raw-preserving encoding retains received octets; canonical
+encoding omits discarded IEs. The profile-less structural view and canonical
+builders retain their stricter projection checks. `tests/s2b_receive_policy.rs`
+and `tests/dedicated_bearer.rs` cover wrong instances, discarded values,
+mandatory fields, framing, literal payloads and bearer correlation.
+
 ## N1-mode APCO value boundary
 
 `src/n1_mode.rs` implements the ordinary APCO value format from TS 24.008
@@ -499,6 +511,13 @@ coverage.
    - Bearer QoS decodes the fixed 22-octet shape into a typed
      Allocation/Retention Priority, QCI, and 40-bit integer-kbit/s maximum and
      guaranteed bit-rate fields. ARP priority level and spare bits are checked.
+     `AllocationRetentionPriority::cmp_priority` ranks level 1 highest and
+     level 15 lowest per TS 29.274 clause 8.15 and TS 29.212 clause 5.3.45.
+     Equal levels compare equal regardless of PCI/PVI. Capability and
+     vulnerability follow TS 29.212 clauses 5.3.46-5.3.47: a clear wire bit
+     means enabled; the public booleans express that permission. Tests cover
+     all levels and flag combinations, literal wire values, spare bits and
+     range rejection. Consumers apply the flags separately from priority.
      GBR QCIs require a non-zero maximum in at least one direction and each GBR
      must be no greater than its same-direction MBR; a direction may
      intentionally carry zero MBR/GBR. Standardized non-GBR QCIs require all

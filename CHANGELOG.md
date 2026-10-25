@@ -516,15 +516,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readback; the eBPF userspace adapter returns the same typed refusal until its
   committed datapath object is rebuilt with zero-peer-TEID support. Refs #1346.
 
-- `opc-proto-gtpv2c`: an S2b Update Bearer request or response carrying a
-  Protocol Configuration Options (PCO) IE no longer rejects the rest of the
-  procedure. PCO is not S2b-applicable (`CONFORMANCE.md`; TS 29.274 Tables
-  7.2.15/7.2.16), so it is handled as an unexpected IE under clause 7.7.9: the
-  procedure continues, the IE is retained byte-for-byte in the projection's
-  additional IEs, and the SDK never interprets it (a caller that re-encodes the
-  projected message will carry it). Malformed PCO and mandatory-field
-  validation are unchanged, and Create Bearer behaviour is unchanged.
-  Refs #1441.
+- `opc-proto-gtpv2c`: S2b receive discards unexpected Update Bearer PCO,
+  non-S2b-U Create/Update Bearer F-TEIDs, and SGW-only Create/Update/Delete
+  Bearer control entries before typed decoding. Mandatory fields, TLIV framing,
+  strict sender validation and Create Bearer PCO compatibility are preserved.
+  Raw-preserving encoding retains the received bytes. Fixes #1441.
 
 - `opc-session-store`: a cancelled Dynamic-authority current-snapshot
   admission no longer releases publication exclusion, its namespace lease or
@@ -551,6 +547,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority. Refs #1378.
 
 ### Breaking
+
+- `opc-proto-gtpv2c`: correct ARP capability and vulnerability wire polarity.
+  The public booleans mean "may pre-empt" and "may be pre-empted"; `true` now
+  maps to a clear PCI/PVI bit, as TS 29.212 requires. Callers that compensated
+  for the old inversion must remove that compensation. Priority levels remain
+  literal 1..=15; `cmp_priority` compares importance with level 1 highest.
+  Fixes #1354.
 
 - `opc-session-net` (fresh-install boundary): session cluster identity, consensus
   node IDs and the configuration digest are installation-qualified. Every

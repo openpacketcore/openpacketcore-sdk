@@ -188,11 +188,7 @@ fn dedicated_receive_ignores_wrong_instances_and_other_interface_control_ies() {
             );
         }
     }
-    for fixture in [
-        CREATE_BEARER_REQUEST_FIXTURE,
-        UPDATE_BEARER_REQUEST_FIXTURE,
-        DELETE_BEARER_REQUEST_FIXTURE,
-    ] {
+    for fixture in [CREATE_BEARER_REQUEST_FIXTURE, UPDATE_BEARER_REQUEST_FIXTURE] {
         // SGW load/overload entries are not assigned to S2b.
         for (ie_type, instance) in [
             (IE_TYPE_LOAD_CONTROL_INFORMATION, 2),
@@ -201,6 +197,21 @@ fn dedicated_receive_ignores_wrong_instances_and_other_interface_control_ies() {
             let unexpected = raw_ie(ie_type, instance, &[]);
             assert_unexpected_bearer_ie_is_ignored(fixture, &append_raw_ies(fixture, &unexpected));
         }
+    }
+}
+
+#[test]
+fn delete_bearer_receive_discards_sgw_control_ies() {
+    // Table 7.2.9.2-1 assigns both SGW entries to S11/S4, not S2b.
+    for (ie_type, instance) in [
+        (IE_TYPE_LOAD_CONTROL_INFORMATION, 2),
+        (IE_TYPE_OVERLOAD_CONTROL_INFORMATION, 1),
+    ] {
+        let unexpected = raw_ie(ie_type, instance, &[]);
+        assert_unexpected_bearer_ie_is_ignored(
+            DELETE_BEARER_REQUEST_FIXTURE,
+            &append_raw_ies(DELETE_BEARER_REQUEST_FIXTURE, &unexpected),
+        );
     }
 }
 
