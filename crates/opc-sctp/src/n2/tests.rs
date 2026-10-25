@@ -18,27 +18,13 @@ fn hex_bytes(source: &str) -> Vec<u8> {
         .collect()
 }
 
-fn copy_message(message: &InboundMessage) -> InboundMessage {
-    InboundMessage {
-        payload: opc_protocol::SensitiveBytes::from_slice(message.payload.as_slice()),
-        stream_id: message.stream_id,
-        ppid: message.ppid,
-        order: message.order,
-        assoc_id: message.assoc_id,
-        notification: message.notification,
-        event: message.event,
-        truncated: message.truncated,
-        control_truncated: message.control_truncated,
-    }
-}
-
 fn profile() -> UnprotectedN2Profile {
     UnprotectedN2Profile::new(3).unwrap()
 }
 
 fn data(ppid: u32) -> InboundMessage {
     InboundMessage {
-        payload: opc_protocol::SensitiveBytes::from_slice(b"nas"),
+        payload: Bytes::from_static(b"nas"),
         stream_id: 7,
         ppid: PayloadProtocolIdentifier::new(ppid),
         order: DeliveryOrder::Ordered,
@@ -88,20 +74,17 @@ fn strict_inbound_ppid_rejects_protected_and_non_ngap_data() {
 #[test]
 fn accepted_record_keeps_payload_stream_and_association_exactly() {
     let original = data(60);
-    let N2Inbound::Payload(admitted) = profile().admit(copy_message(&original)).unwrap() else {
+    let N2Inbound::Payload(admitted) = profile().admit(data(60)).unwrap() else {
         panic!("DATA became a notification");
     };
-    assert!(
-        admitted.payload().as_slice() == original.payload.as_slice(),
-        "payload changed"
-    );
+    assert!(admitted.payload() == &original.payload, "payload changed");
     assert!(admitted.stream_id() == original.stream_id, "stream changed");
     assert!(
         admitted.association_id() == original.assoc_id,
         "association changed"
     );
     assert!(
-        admitted.into_payload().as_slice() == original.payload.as_slice(),
+        admitted.into_payload() == original.payload,
         "payload changed"
     );
 }
@@ -133,7 +116,7 @@ fn empty_and_oversized_data_fail_at_both_boundaries() {
         (Bytes::from_static(b"over"), N2Error::MessageTooLarge),
     ] {
         let mut inbound = data(60);
-        inbound.payload = opc_protocol::SensitiveBytes::from_slice(&payload);
+        inbound.payload = payload.clone();
         assert!(matches!(profile().admit(inbound), Err(error) if error == expected));
         assert!(matches!(profile().outbound_message(payload, 0), Err(error) if error == expected));
     }
@@ -165,20 +148,22 @@ fn truncated_and_unordered_data_cannot_become_payload() {
 #[test]
 fn notification_bytes_never_become_ngap_and_do_not_use_the_data_cap_or_ppid() {
     let event = SctpEvent::Shutdown { assoc_id: 41 };
-    let mut notification = data(66);
-    notification.notification = true;
-    notification.event = Some(event);
-    notification.payload =
-        opc_protocol::SensitiveBytes::from_slice(b"synthetic notification beyond DATA cap");
-    let admitted = profile().admit(copy_message(&notification)).unwrap();
+    let make_notification = || InboundMessage {
+        notification: true,
+        event: Some(event),
+        payload: Bytes::from_static(b"synthetic notification beyond DATA cap"),
+        ..data(66)
+    };
+    let admitted = profile().admit(make_notification()).unwrap();
     assert!(matches!(admitted, N2Inbound::Notification(actual) if actual == event));
     assert!(format!("{admitted:?}") == "N2Inbound::Notification { .. }");
+    let mut notification = make_notification();
     notification.truncated = true;
     assert!(matches!(
-        profile().admit(copy_message(&notification)),
+        profile().admit(notification),
         Err(N2Error::TruncatedPayload)
     ));
-    notification.truncated = false;
+    let mut notification = make_notification();
     notification.control_truncated = true;
     assert!(matches!(
         profile().admit(notification),

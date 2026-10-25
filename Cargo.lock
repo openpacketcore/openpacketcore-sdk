@@ -3565,7 +3565,6 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
- "zeroize",
 ]
 
 [[package]]

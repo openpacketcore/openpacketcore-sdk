@@ -1,5 +1,8 @@
 #![no_main]
 
+#[path = "../../tests/support/pdu_equivalence.rs"]
+mod pdu_equivalence;
+
 #[path = "../../tests/support/remaining_tunnels.rs"]
 mod remaining_tunnels;
 
@@ -12,10 +15,10 @@ mod qos_profiles;
 #[path = "../../tests/support/network_instance.rs"]
 mod network_instance;
 
-#[path = "../../tests/support/setup_optionals.rs"]
-mod setup_optionals;
 #[path = "../../tests/support/release_sessions.rs"]
 mod release_sessions;
+#[path = "../../tests/support/setup_optionals.rs"]
+mod setup_optionals;
 
 #[path = "../../tests/support/response_diagnostics.rs"]
 mod response_diagnostics;
@@ -91,7 +94,15 @@ fuzz_target!(|data: &[u8]| {
         ..EncodeContext::default()
     };
     qos_admission::exercise(data, decode, output);
-    remaining_tunnels::exercise(data, DecodeContext { max_depth: 32, max_ies: 320, ..decode }, output);
+    remaining_tunnels::exercise(
+        data,
+        DecodeContext {
+            max_depth: 32,
+            max_ies: 320,
+            ..decode
+        },
+        output,
+    );
     qos_profiles::exercise(data, decode, output);
     release_sessions::exercise(data, decode, output);
     network_instance::exercise(data, decode, output);
@@ -165,7 +176,9 @@ fuzz_target!(|data: &[u8]| {
         assert!(QosFlowSetupList::decode(wire.as_bytes(), decode).unwrap() == field);
     }
     if let Ok(admitted) = SetupRequestTransfer::decode(data, decode) {
-        let wire = resource_setup::resource_security::request(&admitted.transfer).encode(output).unwrap();
+        let wire = resource_setup::resource_security::request(&admitted.transfer)
+            .encode(output)
+            .unwrap();
         let received = SetupRequestTransfer::decode(wire.as_bytes(), decode).unwrap();
         assert!(received.transfer == admitted.transfer);
         assert_eq!(received.ignored_ie_count, 0);
@@ -175,8 +188,25 @@ fuzz_target!(|data: &[u8]| {
         max_ies: 64,
         ..decode
     };
-    setup_tunnels::exercise(data, DecodeContext { max_ies: 320, ..result_ctx }, EncodeContext { max_message_len: decode.max_message_len, ..EncodeContext::default() });
-    setup_failure_diagnostics::exercise(data, DecodeContext { max_ies: 256, ..result_ctx }, output);
+    setup_tunnels::exercise(
+        data,
+        DecodeContext {
+            max_ies: 320,
+            ..result_ctx
+        },
+        EncodeContext {
+            max_message_len: decode.max_message_len,
+            ..EncodeContext::default()
+        },
+    );
+    setup_failure_diagnostics::exercise(
+        data,
+        DecodeContext {
+            max_ies: 256,
+            ..result_ctx
+        },
+        output,
+    );
     let list_ctx = DecodeContext {
         max_ies: 256,
         ..decode
@@ -286,9 +316,8 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(wire) = encode(&pdu, output) {
             assert_eq!(pdu.wire_len(output).unwrap(), wire.len());
             let received = Pdu::decode_owned(Bytes::from(wire.clone()), decode).unwrap();
-            // Canonical wire round-trip is the semantic invariant: it catches
-            // key-substitution, IE reorder/duplication and payload corruption.
             assert_eq!(encode(&received, output).unwrap(), wire);
+            assert!(pdu_equivalence::equivalent(&received.kind, &pdu.kind));
         }
     }
     // Independent construction input: bounded borrowed chunks, including
@@ -328,6 +357,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(pdu.wire_len(output).unwrap(), wire.len());
             let received = Pdu::decode_owned(Bytes::from(wire.clone()), decode).unwrap();
             assert_eq!(encode(&received, output).unwrap(), wire);
+            assert!(pdu_equivalence::equivalent(&received.kind, &pdu.kind));
         }
     }
     let large = Pdu::from_protocol_ies(
@@ -339,4 +369,5 @@ fuzz_target!(|data: &[u8]| {
     let wire = encode(&large, output).unwrap();
     let received = Pdu::decode_owned(Bytes::from(wire.clone()), decode).unwrap();
     assert_eq!(encode(&received, output).unwrap(), wire);
+    assert!(pdu_equivalence::equivalent(&received.kind, &large.kind));
 });

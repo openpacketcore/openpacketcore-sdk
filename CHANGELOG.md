@@ -440,24 +440,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authoritative the backend keeps the typed `FencedTransitionHistoryFull`
   failure without mutating state. Refs #1257.
 
-- `opc-proto-ngap` / `opc-sctp` / `opc-protocol`: the N3IWF receive path no
-  longer leaves N3IWF security-key octets in uncleared SDK-owned heap buffers.
-  SCTP inbound payloads use a uniquely owned `SensitiveBytes` buffer zeroized on
-  drop; the NGAP raw receive copy uses the same carrier; and the id-SecurityKey
-  IE payload is moved out of the generated typed `Any` copy into the owning
-  PDU's zeroizing storage, with canonical encoding substituting the exact bytes
-  back. Every decode error after the key IE is parsed scrubs partial open-type
-  copies first. `SecurityKey::copy_into_zeroizing` provides the explicit
-  `Zeroizing<Vec<u8>>` hand-off the IKEv2 protocol-key import requires. Received
-  payload/Pdu types no longer clone or compare implicitly, and `Debug` stays
-  length/structure-only. Content clearing is proven by safe drop-audit unit
-  tests on the shared `SensitiveBytes` carrier, which now owns the raw receive
-  copy, the SCTP inbound payload and the extracted id-SecurityKey octets
-  (`SensitiveBytes::from_vec` adopts an owned vector's allocation without an
-  intermediate copy); the explicit IKEv2 hand-off copy remains
-  `Zeroizing<Vec<u8>>`. Allocation-counter integration tests prove the decode,
-  error and drop paths retain no allocation, with positive controls for `Vec`
-  and `bytes::Bytes` retention. Refs #1262.
+- `opc-proto-ngap` / `opc-sctp`: retain wiping custody of received security
+  material through SCTP accumulation and growth, the last payload reference,
+  raw PDU storage, each decoded IE, coalesced fragments and error/policy discards.
+  The typed SecurityKey value remains intact for admission and reconstruction.
+  `SecurityKey::to_zeroizing()` provides an explicit protected provider handoff.
+  Live drop observers check every owner before release, with and without keys;
+  allocation-counter tests additionally check for retained allocations. Valid
+  fragmented SEQUENCE extension bitmaps remain accepted without copying their
+  additions. Non-canonical short bitmap lengths are rejected. Refs #1262.
+
 - `opc-gtpu-dataplane`: one subscriber can no longer monopolize the shared
   inner-uplink IPv4 fragment-affinity table. Bucket selection is partitioned by
   the attachment interface index and the subscriber PAA, so a subscriber is
@@ -577,24 +569,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses the newer marker. No in-place migration is provided; drain or
   re-create the attachment in either direction. Refs #1007.
 
-- `opc-sctp`: `InboundMessage.payload` is now `opc_protocol::SensitiveBytes`
-  (uniquely owned, zeroized on drop, `Debug` length-only, no `Clone`,
-  `PartialEq` or `Eq`); `InboundMessage` itself no longer derives
-  `Clone`/`PartialEq`/`Eq`. `N2Payload::payload()` returns `&SensitiveBytes` and
-  `N2Payload::into_payload()` returns `SensitiveBytes`;
-  `DiameterSctpPeer::inbound_payload` returns `&[u8]`. `OutboundMessage` now has
-  a redacted `Debug` implementation instead of a derived payload-printing one.
-  Callers that copied or compared received payloads must make the copy/compare
-  explicit. Refs #1262.
+- `opc-proto-ngap`: `Pdu`, `PduKind`, `Message` and borrowed `ProtocolIe`
+  no longer implement cloning or equality over opaque key-bearing bytes.
+  `Pdu.raw`, unknown message bodies and decoded IE values use redacted
+  `SensitiveBytes` owners that clear storage on drop. `messages` exposes owned
+  containers with uniform `u16` IE identifiers and `Criticality`, replacing the
+  generated containers. Use borrowed bytes and explicit reconstruction instead
+  of cloning. `opc-sctp::InboundMessage` likewise loses cloning and equality;
+  its payload retains the `Bytes` API with wiping ownership through N2 handoff
+  and the final shared reference. Outbound message diagnostics expose payload
+  length only. Refs #1262.
 
-- `opc-proto-ngap`: `Pdu.raw` is private; use `Pdu::raw()` (and
-  `Pdu::has_raw()`), with `Pdu::new(kind)` for constructed PDUs. `Pdu` no longer
-  derives `Clone`, `PartialEq` or `Eq`, and `Message`/`PduKind` no longer derive
-  `Clone`/`PartialEq`/`Eq` because received structures must not be duplicated or
-  compared implicitly. `Message::Unknown` carries `SensitiveBytes` instead of
-  `bytes::Bytes`. The id-SecurityKey IE appears as an empty typed placeholder;
-  admission reads the key from the PDU's zeroizing storage and canonical
-  encoding reproduces the original bytes. Refs #1262.
+- `opc-proto-ngap`: uplink/downlink transport `address()` now returns
+  `TransportLayerAddress`, preserving IPv4, IPv6 or both addresses from a
+  160-bit NGAP value. Existing `new(IpAddr, teid)` constructors remain; use
+  `with_address` for combined values and match the address variant before
+  selecting a destination. Setup and Modify tunnel codecs preserve both
+  families in TS 38.414 order, including nested additional tunnels. Refs #1357.
+
 - `opc-session-net`: `StartupError` adds `BootRefused(BootRefusalReason)` for an
   authenticated issuer refusal of one exact candidate boot attempt. It is
   distinct from retryable `Unavailable`/`AuthTimeUnavailable` results and grants

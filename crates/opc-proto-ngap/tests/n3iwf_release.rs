@@ -170,7 +170,7 @@ fn complete_release_construction_and_receive_match_reference() {
         let wire = octets(row["wire_hex"].as_str().unwrap());
         let expected = construct(row);
         let constructed = expected.construct(context()).unwrap();
-        assert!(constructed.raw().is_empty());
+        assert!(constructed.raw.is_empty());
         assert!(encode(&constructed, EncodeContext::default()).unwrap() == wire);
         let received = decode(&wire, context()).unwrap();
         let admitted = ReleaseMessage::from_pdu(&received, context()).unwrap();
@@ -204,7 +204,7 @@ fn independent_missing_fields_duplicates_and_unknown_criticality_obey_policy() {
                     ..context()
                 };
                 let pdu = decode(&wire, ctx).unwrap();
-                assert!(pdu.raw() == wire);
+                assert!(pdu.raw.as_ref() == wire);
                 let admitted = ReleaseMessage::from_pdu(&pdu, ctx).unwrap();
                 same_fields(&construct(row), &admitted.message);
             }
@@ -242,7 +242,7 @@ fn independent_missing_fields_duplicates_and_unknown_criticality_obey_policy() {
                 },
             )
             .unwrap();
-            assert!(dropped.raw() == wire);
+            assert!(dropped.raw.as_ref() == wire);
             let filtered = ReleaseMessage::from_pdu(&dropped, context()).unwrap();
             assert_eq!(filtered.ignored_ie_count, 0);
             assert!(filtered.notify_ie_ids.is_empty());
@@ -262,7 +262,7 @@ fn with_extra(pdu: &Pdu, id: u16, criticality: Criticality, value: &[u8]) -> Pdu
                 .0
                 .iter()
                 .map(|ie| {
-                    ProtocolIe::new(ie.id.0, crit_of(ie.criticality as u8), ie.value.as_bytes())
+                    ProtocolIe::new(ie.id, crit_of(ie.criticality as u8), ie.value.as_bytes())
                 })
                 .collect(),
         ),
@@ -275,7 +275,7 @@ fn with_extra(pdu: &Pdu, id: u16, criticality: Criticality, value: &[u8]) -> Pdu
                 .0
                 .iter()
                 .map(|ie| {
-                    ProtocolIe::new(ie.id.0, crit_of(ie.criticality as u8), ie.value.as_bytes())
+                    ProtocolIe::new(ie.id, crit_of(ie.criticality as u8), ie.value.as_bytes())
                 })
                 .collect(),
         ),
