@@ -44,7 +44,8 @@ composition guarantees merely by remaining callable.
 | Exchange classes | Final IKE_AUTH seeding/replay, CREATE_CHILD_SA and INFORMATIONAL. Handshake authentication precedes established-SA effects. |
 | Request windows | One outstanding ordinary request in each independent direction, for both original roles. Never send `SET_WINDOW_SIZE`. Zero is a valid ID where that direction's history permits it; `None` means exhaustion. |
 | Empty receive | Canonical policy and preflight, checked restore, then `enable_empty_replies`. CBC uses `preflight_cbc`; sync readiness does not qualify canonical replies. |
-| Base recovery | Restore committed history and reconstruct the lost empty prefix. No synthetic local liveness probe. |
+| Liveness probe (opt-in) | Volatile empty `INFORMATIONAL` request at the next send ID: no store command, exact-byte retransmission, matching empty response, caller-owned idleness decision and retransmission budget. The caller must cover IKE and IPsec (ESP) idleness; NAT keepalives never count. |
+| Base recovery | Restore committed history and reconstruct the lost empty prefix. No synthetic local liveness probe is sent by recovery itself; an opt-in volatile probe is a separate caller-driven primitive (below). |
 | Negotiated sync | Persist authenticated bilateral agreement; require `sync_readiness`, initiation and response handlers. Never assert `IPSEC_REPLAY_COUNTER_SYNC_SUPPORTED` (16421); ESP counter restoration is outside this profile. |
 | Persistence | Exact prior birth/generation CAS under the current RFC 022 execution stamp, with the SA, window, IV state and operation outcome committed atomically. |
 | Execution | One live window and allocator owner per immutable SA key epoch, including within one process. Positive authority is required to recover that cohort. |
@@ -274,7 +275,7 @@ missing/corrupt recovery inputs use the scoped terminal rule and checkpoint
 removal above. An IKE rekey is never "cancelled" by deleting its new IKE SPI as a
 Child of the old SA.
 
-## Empty receive, replay and liveness
+## Empty receive, probe, replay and liveness
 
 An admitted empty request advances only the volatile next receive ID. Exact
 retransmissions reuse the cached response; changed bytes, retired IDs and gaps in
@@ -294,18 +295,49 @@ have forgotten its response, and even an answer to old bytes is not fresh
 liveness. [RFC 7296 §§2.1 and 2.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.1)
 distinguish retransmission from a new liveness exchange.
 
-This profile has **no local empty-INFORMATIONAL liveness-check API**. Such a
-check requires a fresh request; it cannot be implemented by settled replay.
-Empty local requests remain `NoDurableWork`, and no DPD write stream is added.
-Fresh authenticated IKE/ESP traffic, including genuinely new peer DPD, supplies
-inbound evidence; reconstructed uncertain DPD does not. With only outgoing
-traffic, the consumer must schedule genuine committed new work, such as rekey,
-within its declared liveness bound. Failure follows unanswered new requests and
-their bounded retransmission policy, or the legitimate SA lifetime policy, not
-silence after a settled replay. Detection is consequently bounded by that rekey/
-lifetime interval plus protocol retries; this is not a fast local DPD facility.
-With no prior request, `replay_request` yields `None`; real new work can still
-progress at the retained send ID after reconciliation.
+Settled replay is never a liveness check: even an answer to old bytes is not
+fresh evidence, and a conforming live peer may have forgotten its response.
+This profile provides a **separate opt-in volatile probe** for that purpose:
+`send_empty_request` seals one empty `INFORMATIONAL` request at the live volatile
+next send ID and issues **no store command** (no window, IV or outcome record).
+It is not settled replay and it is never counted as durable work.
+
+The caller owns the liveness decision. [RFC 7296 §2.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.4)
+and 3GPP TS 24.302 §7.4.1A cover both IKE and IPsec, so before probing the
+caller must establish that neither this IKE SA nor any Child SA under it has
+received authenticated protected traffic for the period. NAT keepalives
+([RFC 3948 §4](https://www.rfc-editor.org/rfc/rfc3948.html#section-4)) and
+unauthenticated input never count; this primitive cannot observe ESP traffic and
+never decides idleness itself.
+
+While a probe is outstanding it occupies the single local request slot:
+ordinary preparation and sync initiation are refused with `RequestOutstanding`,
+while peer requests in the independent receive direction (for example
+`reply_empty` and `prepare_response`) stay admissible. Retransmission
+(`retransmit_empty_request`) replays the exact sealed bytes with the same
+Message ID and IV and allocates nothing. The caller stops at its own
+retransmission budget and calls `abandon_empty_request`; a matching
+authenticated empty response completes the probe (`complete_empty_request`).
+Only that matching response is fresh liveness evidence, and only for the
+caller's current SA fence. A response with another Message ID, inner payloads, a
+duplicate after completion, a response after abandonment or failing integrity
+drops without changing state.
+
+Message-ID accounting is explicitly volatile. The probe advances an in-memory
+send high-water mark; the next committed window operation (ordinary
+request/response, rekey, synchronization or terminal record) folds the advance
+into the durable `next_send`. A crash before any such commit loses the advanced
+IDs as a bounded lead ([RFC 6311 §5.1](https://www.rfc-editor.org/rfc/rfc6311.html#section-5.1)):
+the restored window expects its durable floor and may reuse an unrecoverable
+probe ID. A consumer that cannot tolerate the peer having observed such an ID
+must run the RFC 6311 synchronization hooks before relying on the peer's receive
+expectation. Probe IDs are never persisted as work, outcomes or replay evidence.
+
+GCM sealing requires an `Ikev2AesGcmIvAllocation` from an **already committed**
+reservation block. A per-probe reservation would be a periodic liveness write,
+so none is provided; allocating from an uncommitted block tail could let a crash
+restore the allocator and reuse the probe IV. CBC uses its admitted random IV and
+needs no allocation.
 
 ### Store outage must not silence empty replies
 
