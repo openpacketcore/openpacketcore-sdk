@@ -271,8 +271,18 @@ async fn superseded_leader_stops_replication_before_truncating_its_uncommitted_s
     > = decode_bounded(&response.result.expect("scoped append transport")).unwrap();
     assert_eq!(decoded, Ok(AppendEntriesResponse::Conflict));
     assert_eq!(retained_sql_log_end(&cluster, leader), tail - 1);
-    assert!(store.status().term > term);
-    assert_ne!(store.status().leader_id, Some(store.status().node_id));
+    // Openraft publishes the successor term and non-leader state from its own
+    // engine task; a single immediate status read can observe the pre-stepdown
+    // snapshot. Wait on the engine's status change within the existing recovery
+    // bound instead of polling, and keep both original assertions exact.
+    tokio::time::timeout(
+        RECOVERY_TIMEOUT,
+        store.wait_for_status_for_test(|status| {
+            status.term > term && status.leader_id != Some(status.node_id)
+        }),
+    )
+    .await
+    .expect("stepdown publishes the higher term and non-leader state before the recovery bound");
 
     // The removed suffix stays absent during the original one-second
     // negative guard. It is not a timeout for recovery or a storage exemption.
