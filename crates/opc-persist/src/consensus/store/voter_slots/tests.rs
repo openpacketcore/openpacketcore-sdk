@@ -897,7 +897,7 @@ async fn voter_admission_read_uses_the_original_sqlite_deadline() {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
     let observed = tokio::time::timeout(
         Duration::from_millis(250),
-        reader.read_voter_slot_state(deadline),
+        reader.read_voter_slot_state_until(deadline),
     )
     .await;
     let expired = tokio::time::Instant::now() >= deadline;
@@ -905,7 +905,7 @@ async fn voter_admission_read_uses_the_original_sqlite_deadline() {
     // Always release the held connection and close the fleet, including when
     // the request incorrectly starts a separate SQLite lifecycle timeout.
     let published = reader
-        .read_voter_slot_state(tokio::time::Instant::now() + Duration::from_secs(5))
+        .read_voter_slot_state_until(tokio::time::Instant::now() + Duration::from_secs(5))
         .await;
     fleet.close().await;
     assert_eq!(observed, Ok(Err(VoterReplacementError::Deadline)));

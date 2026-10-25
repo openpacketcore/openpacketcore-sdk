@@ -27,7 +27,7 @@ impl DeadlineReader {
 
 #[async_trait]
 impl VoterSlotStateReader for DeadlineReader {
-    async fn read_voter_slot_state(
+    async fn read_voter_slot_state_until(
         &self,
         deadline: Instant,
     ) -> Result<VoterSlotDurableState, VoterReplacementError> {
@@ -45,12 +45,10 @@ impl VoterSlotStateReader for DeadlineReader {
         if let Some(error) = self.failure.lock().unwrap().clone() {
             return Err(error);
         }
-        self.read_voter_slot_state_now().await
+        self.read_voter_slot_state().await
     }
 
-    async fn read_voter_slot_state_now(
-        &self,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+    async fn read_voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError> {
         Ok(self.state.lock().unwrap().clone())
     }
 }

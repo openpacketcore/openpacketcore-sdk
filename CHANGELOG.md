@@ -260,6 +260,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store` and `opc-persist`: retain the `Unplanned` shutdown reason
+  when an unplanned request races admission fencing or preparation completion.
+  Already published reports remain unchanged. (#1376)
+
+- `opc-consensus`, `opc-session-store` and `opc-persist`: voter-slot request
+  reads retain the original deadline while waiting for strict publication.
+  Control replies read state and evidence from one durable cut; post-dispatch
+  expiry remains an unknown outcome. The public session `voter_slot_state()`
+  observer now waits for publication up to the store's operation timeout.
+  The reader trait retains its original method and adds a defaulted bounded
+  method. (#1205)
+
 - `opc-session-store`: native key-removal business-change journal (partial
   #1252, PR2a). `BusinessChanges` can now stage an exact-predecessor key
   retirement as one `after=None` change with the predecessor content stamp and
