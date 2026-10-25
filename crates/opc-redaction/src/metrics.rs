@@ -1108,6 +1108,9 @@ pub struct SdkMetrics {
     pub persist_peer_replication_lag: Mutex<HashMap<usize, u64>>,
     pub persist_snapshot_install_failures: AtomicU64,
     pub persist_snapshot_verify_failures: AtomicU64,
+    pub persist_snapshot_build_failures: AtomicU64,
+    pub persist_snapshot_build_retries: AtomicU64,
+    pub persist_snapshot_build_degraded: AtomicU64,
     pub persist_rpc_auth_failures: AtomicU64,
     pub persist_audit_chain_verification_success: AtomicU64,
     pub persist_audit_chain_verification_failure: AtomicU64,
@@ -1285,6 +1288,9 @@ impl SdkMetrics {
             persist_peer_replication_lag: Mutex::new(HashMap::new()),
             persist_snapshot_install_failures: AtomicU64::new(0),
             persist_snapshot_verify_failures: AtomicU64::new(0),
+            persist_snapshot_build_failures: AtomicU64::new(0),
+            persist_snapshot_build_retries: AtomicU64::new(0),
+            persist_snapshot_build_degraded: AtomicU64::new(0),
             persist_rpc_auth_failures: AtomicU64::new(0),
             persist_audit_chain_verification_success: AtomicU64::new(0),
             persist_audit_chain_verification_failure: AtomicU64::new(0),
@@ -1496,6 +1502,12 @@ impl SdkMetrics {
         self.persist_snapshot_install_failures
             .store(0, Ordering::Relaxed);
         self.persist_snapshot_verify_failures
+            .store(0, Ordering::Relaxed);
+        self.persist_snapshot_build_failures
+            .store(0, Ordering::Relaxed);
+        self.persist_snapshot_build_retries
+            .store(0, Ordering::Relaxed);
+        self.persist_snapshot_build_degraded
             .store(0, Ordering::Relaxed);
         self.persist_rpc_auth_failures.store(0, Ordering::Relaxed);
         self.persist_audit_chain_verification_success
@@ -2198,6 +2210,39 @@ pub fn export_prometheus_text() -> String {
         "counter",
         "Total count of snapshot verification failures",
         snap_ver_fail as f64,
+    );
+
+    let snap_build_fail = METRICS
+        .persist_snapshot_build_failures
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_persist_snapshot_build_failures_total",
+        "counter",
+        "Total count of bounded local snapshot build attempt failures",
+        snap_build_fail as f64,
+    );
+
+    let snap_build_retry = METRICS
+        .persist_snapshot_build_retries
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_persist_snapshot_build_retries_total",
+        "counter",
+        "Total count of local snapshot build retries",
+        snap_build_retry as f64,
+    );
+
+    let snap_build_degraded = METRICS
+        .persist_snapshot_build_degraded
+        .load(Ordering::Relaxed);
+    write_metric(
+        &mut out,
+        "opc_persist_snapshot_build_degraded_total",
+        "counter",
+        "Total count of snapshot builds that kept the engine on the unchanged current snapshot after bounded retries",
+        snap_build_degraded as f64,
     );
 
     let rpc_auth_fail = METRICS.persist_rpc_auth_failures.load(Ordering::Relaxed);

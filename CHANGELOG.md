@@ -93,6 +93,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale/invalid classifier state, and another subscriber's owner group keeps
   admitting. Refs #1087.
 
+- `opc-session-store`: a failed local snapshot build no longer stops the Raft
+  engine. A failed attempt is retried under a fixed bounded budget (three
+  attempts, 100 ms fixed backoff) with a fixed, value-free failure reason, a
+  warning, and `opc_persist_snapshot_build_failures_total` /
+  `opc_persist_snapshot_build_retries_total` counters. If every attempt fails,
+  the builder reports the unchanged current published snapshot as a duplicate
+  build result, so the engine keeps serving with unchanged committed-log
+  semantics and the next snapshot trigger retries the build. A later success
+  resets the consecutive-failure streak while the historical reason remains
+  observable through `ConsensusSessionStore::snapshot_build_failure()`. Only an
+  indeterminate publication state (re-checked after every failed attempt and on
+  the exhaustion path), a current snapshot that cannot be read back, or a store
+  with no published snapshot at all still stops the engine; the retained-log
+  gates bound accumulation meanwhile. Refs #1254.
+
 - `opc-persist`: a configuration-consensus leader-routed call is now bounded by
   this replica's own leader view. Once the engine has observed a successor for
   a lost leader, an unanswered forwarded mutation or linearizable read barrier
