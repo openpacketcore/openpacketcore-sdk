@@ -182,9 +182,9 @@ pub use identity::{
     SessionPlacementDisposition, SessionPlacementPolicy, SessionReplicationManifest,
 };
 pub use lifecycle::{
-    ConnectionLifecycleError, ConnectionLifecyclePolicy, SessionReauthenticationControl,
-    DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX, DEFAULT_RECONNECT_BACKOFF_MIN,
-    DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
+    ConnectionLifecycleError, ConnectionLifecyclePolicy, ReconnectCooldownPolicy,
+    SessionReauthenticationControl, DEFAULT_MAX_AUTHENTICATION_AGE, DEFAULT_RECONNECT_BACKOFF_MAX,
+    DEFAULT_RECONNECT_BACKOFF_MIN, DEFAULT_ROTATION_DRAIN_WINDOW, DEFAULT_ROTATION_JITTER,
 };
 pub use membership::{
     SessionMembershipAdmission, SessionMembershipAdmissionError,

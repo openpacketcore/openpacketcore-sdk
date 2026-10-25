@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-session-net`: `PersistentSessionConsumerConfig::with_cooldown_admission`
+  selects the explicit reconnect-cooldown admission policy for a persistent
+  consumer client. The default `ReconnectCooldownPolicy::Wait` preserves the
+  existing single-peer behaviour (wait for the one coalesced cooldown edge or
+  the caller deadline). `ReconnectCooldownPolicy::FailOver` is the routed
+  policy: a foreground call that reaches a peer whose shared reconnect cooldown
+  is active returns the bounded, value-free pre-write
+  `SessionConsumerClientError::Cooldown` immediately (remaining cooldown and
+  gate wait in milliseconds) so the caller's routing loop can select another
+  voter without waiting for this peer's recovery edge. No request byte is
+  accepted before that outcome, so the unchanged request may be routed to
+  another peer; once a byte may have been accepted the existing
+  exact-identity/status recovery is unchanged. Both policies retain the shared
+  exponential backoff, the single serialized probe at cooldown expiry, and the
+  existing deadlines, retry and authority rules. Refs #1248.
+
 - `opc-session-net`: an issuer can now deliver one authenticated, typed boot
   refusal to the exact proven candidate worker boot instead of a ticket notice.
   `IssuerStartupSession::deliver_boot_refusal` takes a closed, value-free
