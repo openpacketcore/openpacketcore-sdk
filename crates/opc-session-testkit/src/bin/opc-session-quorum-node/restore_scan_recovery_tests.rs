@@ -2,8 +2,10 @@
 
 use super::*;
 use opc_session_store::test_support::{
-    consensus_restore_scan_rejections_for_test, set_consensus_restore_scan_unavailable_for_test,
+    consensus_restore_scan_rejections_for_test, set_consensus_restore_scan_fence_delay_for_test,
+    set_consensus_restore_scan_unavailable_for_test,
 };
+use opc_session_store::SessionBackend;
 use opc_session_testkit::ConsensusTestCluster;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,16 +200,28 @@ async fn restore_scan_recovery_case(clear: ClearScan) {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "consensus test-cluster durable fixture requires the Linux CI environment"
+)]
 async fn restore_scan_checkpoint_rejects_still_unavailable_scan_after_exact_get() {
     restore_scan_recovery_case(ClearScan::Never).await;
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "consensus test-cluster durable fixture requires the Linux CI environment"
+)]
 async fn restore_scan_checkpoint_accepts_cleared_scan_with_original_authority() {
     restore_scan_recovery_case(ClearScan::BeforeCheckpoint).await;
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "consensus test-cluster durable fixture requires the Linux CI environment"
+)]
 async fn restore_scan_checkpoint_recovers_after_counting_real_failed_scan() {
     restore_scan_recovery_case(ClearScan::AfterFailedProof).await;
 }
@@ -270,6 +284,43 @@ async fn restore_scan_reproof_preserves_every_page_validation() {
         assert_eq!(observation.availability_snapshot().recoveries, 0);
         assert_eq!(tokio::time::Instant::now(), started);
     }
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "consensus test-cluster durable fixture requires the Linux CI environment"
+)]
+async fn restore_scan_fence_phase_deadline_is_retryable_and_recovers() {
+    // Deterministically consume the store operation deadline in the
+    // logical-time fence phase only, using the test-control delay hook.
+    let cluster = ConsensusTestCluster::start(3).await;
+    let store = cluster.store(0);
+    set_consensus_restore_scan_fence_delay_for_test(&store, Some(Duration::from_secs(60)));
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(30),
+        store.scan_restore_records(opc_session_store::RestoreScanRequest::all(1)),
+    )
+    .await
+    .expect("the store deadline is bounded")
+    .expect_err("a fence-phase deadline is not a successful page");
+    assert!(
+        matches!(error, StoreError::BackendUnavailable(_)),
+        "fence-phase slowness is retryable availability, not terminal work-budget exhaustion"
+    );
+    // The recovery retry clears the one-shot delay and accepts the later exact
+    // page; no deadline, authority or page validation changes.
+    let page = tokio::time::timeout(
+        Duration::from_secs(30),
+        store.scan_restore_records(opc_session_store::RestoreScanRequest::all(1)),
+    )
+    .await
+    .expect("the recovery scan is bounded")
+    .expect("the later exact page is accepted");
+    assert!(page.complete);
+    assert!(page.next_cursor.is_none());
+    assert!(started.elapsed() >= Duration::from_secs(1));
 }
 
 #[tokio::test(start_paused = true)]

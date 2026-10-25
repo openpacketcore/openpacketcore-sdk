@@ -11174,12 +11174,15 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> Result<RestoreScanPage, StoreError> {
         request.validate()?;
+        // Same phase rule as the primary restore scan: a fence-phase timeout is
+        // slow consensus progress (retryable availability), not fixed
+        // work-budget exhaustion.
         let logical_time = tokio::time::timeout_at(
             deadline,
             self.logical_read_time_before(Some(scope.consensus_identity()), deadline),
         )
         .await
-        .map_err(|_| StoreError::RestoreScanWorkBudgetExceeded)??;
+        .map_err(|_| restore_scan_availability())??;
         let _admission = self
             .admit_consumer_scope(scope, deadline)
             .await
@@ -22809,6 +22812,39 @@ mod membership_tests {
             .authorize(&identity)
             .expect("consumer authorization");
         (directory, store, scope, authorization, key, lease)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    #[tokio::test]
+    async fn consumer_scan_restore_records_fence_deadline_is_retryable_availability() {
+        let (_directory, store, scope, _authorization, _key, _lease) =
+            consumer_boundary_store().await;
+        crate::consensus::store::test_support::set_consensus_restore_scan_fence_delay_for_test(
+            &store,
+            Some(std::time::Duration::from_millis(100)),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+        let error = store
+            .consumer_scan_restore_records(scope, RestoreScanRequest::all(1), deadline)
+            .await
+            .expect_err("a consumer fence-phase deadline must be retryable");
+        assert!(
+            matches!(
+                error,
+                StoreError::BackendUnavailable(message)
+                    if message == "session restore scan deadline exceeded"
+            ),
+            "consumer restore scans use the same phase rule as the primary path"
+        );
+        // The bounded recovery episode retries the same scan and accepts the
+        // later exact page without any authority change.
+        let deadline = tokio::time::Instant::now() + store.inner.operation_timeout;
+        let page = store
+            .consumer_scan_restore_records(scope, RestoreScanRequest::all(1), deadline)
+            .await
+            .expect("the consumer scan recovers after the transient fence deadline");
+        assert!(page.complete);
+        store.shutdown().await.expect("shutdown consumer fixture");
     }
 
     #[tokio::test]

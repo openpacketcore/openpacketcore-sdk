@@ -4036,18 +4036,10 @@ impl SqliteSessionBackend {
             }
             Ok(Ok(Some(result))) => {
                 cancel_on_drop.disarm();
-                // A SQLite/sync progress interrupt can mean either the caller's
-                // deadline/cancellation or the fixed scan work budget. Only the
-                // former is a retryable availability outcome; genuine budget
-                // exhaustion stays terminal.
-                if matches!(result, Err(StoreError::RestoreScanWorkBudgetExceeded))
-                    && (tokio::time::Instant::now() >= deadline
-                        || cancellation.load(Ordering::Acquire))
-                {
-                    Err(restore_scan_deadline_unavailable())
-                } else {
-                    result
-                }
+                // `scan_restore_records_sync` owns the deadline/cancellation vs
+                // fixed-work-budget classification with the progress-handler
+                // evidence; do not re-demote a genuine budget error here.
+                result
             }
             Ok(Ok(None)) => {
                 cancel_on_drop.disarm();

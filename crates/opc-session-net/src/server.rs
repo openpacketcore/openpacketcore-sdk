@@ -844,7 +844,12 @@ fn store_deadline_error(
         (BackendDeadlineOutcome::CompareAndSet, BackendOperationPhase::Execute) => {
             StoreError::CasIdempotencyOutcomeUnavailable
         }
-        (BackendDeadlineOutcome::RestoreScan, _) => StoreError::RestoreScanWorkBudgetExceeded,
+        // A server transport deadline firing before the store's own operation
+        // timeout is slow progress, not proof that the fixed scan work budget
+        // is exhausted; callers may retry or fail over.
+        (BackendDeadlineOutcome::RestoreScan, _) => {
+            StoreError::BackendUnavailable("backend restore scan deadline exceeded".to_string())
+        }
         (BackendDeadlineOutcome::Preflight, _) => {
             StoreError::BackendUnavailable("backend preflight deadline exceeded".to_string())
         }
@@ -5560,5 +5565,16 @@ mod tests {
                     if error.kind() == std::io::ErrorKind::TimedOut
             ));
         }
+    }
+
+    #[test]
+    fn restore_scan_transport_deadline_is_retryable_availability() {
+        assert!(matches!(
+            store_deadline_error(
+                BackendDeadlineOutcome::RestoreScan,
+                BackendOperationPhase::Queue
+            ),
+            StoreError::BackendUnavailable(_)
+        ));
     }
 }

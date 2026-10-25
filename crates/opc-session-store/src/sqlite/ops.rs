@@ -90,9 +90,14 @@ fn install_restore_scan_progress_budget(
     conn: &Connection,
     cancellation: Arc<AtomicBool>,
     operation_deadline: SqliteWorkDeadline,
-) -> RestoreScanProgressGuard<'_> {
+) -> (RestoreScanProgressGuard<'_>, Arc<AtomicBool>) {
     let callbacks = Arc::new(AtomicUsize::new(0));
     let callback_count = Arc::clone(&callbacks);
+    // Set only for the fixed VM-work callback limit or the independent SQLite
+    // wall-clock cap. A set flag means a genuine fixed work-budget exhaustion
+    // even if the caller deadline or cancellation happened to elapse too.
+    let hard_budget = Arc::new(AtomicBool::new(false));
+    let hard_budget_progress = Arc::clone(&hard_budget);
     let started = std::time::Instant::now();
     // The configured interval is a small positive compile-time constant.
     let progress_interval = RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL as usize;
@@ -104,17 +109,28 @@ fn install_restore_scan_progress_budget(
     conn.progress_handler(
         RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL,
         Some(move || {
-            cancellation.load(Ordering::Acquire)
-                || restore_scan_callback_limit_reached(
-                    callback_count.fetch_add(1, Ordering::Relaxed),
-                    max_callbacks,
-                )
-                || operation_deadline.is_elapsed()
-                || sqlite_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            if cancellation.load(Ordering::Acquire) {
+                return true;
+            }
+            if restore_scan_callback_limit_reached(
+                callback_count.fetch_add(1, Ordering::Relaxed),
+                max_callbacks,
+            ) {
+                hard_budget_progress.store(true, Ordering::Release);
+                return true;
+            }
+            if operation_deadline.is_elapsed() {
+                return true;
+            }
+            if sqlite_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                hard_budget_progress.store(true, Ordering::Release);
+                return true;
+            }
+            false
         }),
     )
     .expect("restore scan owns its SQLite connection");
-    RestoreScanProgressGuard(conn)
+    (RestoreScanProgressGuard(conn), hard_budget)
 }
 
 pub(crate) fn persisted_owner_id(value: String) -> Result<OwnerId, StoreError> {
@@ -1184,11 +1200,41 @@ pub(crate) fn scan_restore_records_sync(
     profile: RestoreScanValidationProfile,
 ) -> Result<RestoreScanPage, StoreError> {
     request.validate()?;
-    let _progress_guard = install_restore_scan_progress_budget(
+    let (_progress_guard, hard_budget) = install_restore_scan_progress_budget(
         conn,
         Arc::clone(&cancellation),
         operation_deadline.clone(),
     );
+    let result = scan_restore_records_sync_body(
+        conn,
+        request,
+        now,
+        Arc::clone(&cancellation),
+        operation_deadline.clone(),
+        profile,
+    );
+    // Prefer the terminal fixed-work-budget class whenever the progress
+    // handler actually observed the VM/wall cap. Otherwise a deadline or
+    // caller cancellation that interrupted the scan is retryable availability.
+    match result {
+        Err(StoreError::RestoreScanWorkBudgetExceeded)
+            if !hard_budget.load(Ordering::Acquire)
+                && (operation_deadline.is_elapsed() || cancellation.load(Ordering::Acquire)) =>
+        {
+            Err(super::restore_scan_deadline_unavailable())
+        }
+        other => other,
+    }
+}
+
+fn scan_restore_records_sync_body(
+    conn: &Connection,
+    request: RestoreScanRequest,
+    now: Timestamp,
+    cancellation: Arc<AtomicBool>,
+    operation_deadline: SqliteWorkDeadline,
+    profile: RestoreScanValidationProfile,
+) -> Result<RestoreScanPage, StoreError> {
     if cancellation.load(Ordering::Acquire) {
         return Err(super::restore_scan_deadline_unavailable());
     }
