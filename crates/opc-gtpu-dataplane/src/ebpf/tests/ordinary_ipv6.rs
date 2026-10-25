@@ -245,7 +245,7 @@ async fn ordinary_ipv6_marked_bearers_share_one_prefix() {
     let default = ipv6_context();
     let mut dedicated = ipv6_context();
     dedicated.local_teid = teid(0x1000_0002);
-    dedicated.peer_teid = teid(0x2000_0002);
+    dedicated.peer_teid = teid(0x2000_0002).into();
     dedicated.bearer_mark = GtpBearerMark::new(0x51);
     dedicated.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
 
@@ -315,7 +315,7 @@ async fn ordinary_ipv6_conflicts_are_classified_without_mutation() {
     assert_eq!(conflict.mismatches(), &[PdpContextMismatchField::MsAddress]);
 
     let mut other_peer_teid = installed.clone();
-    other_peer_teid.peer_teid = teid(0x2000_0009);
+    other_peer_teid.peer_teid = teid(0x2000_0009).into();
     let PdpContextInstallOutcome::Conflict(conflict) = backend
         .install_pdp_context_classified(other_peer_teid.clone())
         .await

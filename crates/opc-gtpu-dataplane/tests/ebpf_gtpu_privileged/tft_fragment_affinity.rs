@@ -418,7 +418,7 @@ pub(super) async fn qualify_exact_key() -> TestResult {
         let mut context = session_context(fixture.device.ifindex);
         context.ms_address = IpAddr::V4(alternate_paa);
         context.local_teid = Teid::new(local).unwrap();
-        context.peer_teid = Teid::new(peer).unwrap();
+        context.peer_teid = PeerTeid::new(peer);
         context.bearer_mark = mark.map(|mark| GtpBearerMark::new(mark).unwrap());
         fixture.backend.install_pdp_context(context).await?;
     }
@@ -928,7 +928,7 @@ pub(super) async fn qualify_cross_attachment() -> TestResult {
     ] {
         let mut context = session_context(second.ifindex);
         context.local_teid = Teid::new(local).unwrap();
-        context.peer_teid = Teid::new(peer).unwrap();
+        context.peer_teid = PeerTeid::new(peer);
         context.peer_address = IpAddr::V4(UE_PAA);
         context.bearer_mark = mark.map(|mark| GtpBearerMark::new(mark).unwrap());
         fixture.backend.install_pdp_context(context).await?;

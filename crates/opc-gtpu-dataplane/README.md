@@ -211,6 +211,7 @@ MTU-bearing contexts must be drained before an SDK downgrade. See
   preserving trait-object usage on non-Linux or disabled builds.
 - Model exports include `CreateGtpDeviceRequest`, `GtpDevice`,
   `GtpPdpContext`, `GtpBearerMark`, `RemovePdpContextRequest`, `Teid`,
+  `PeerTeid`,
   `GtpuProbe`, `GtpuBackendKind`, `GtpuCapability`,
   `GtpuDownlinkEndpoint`, `GtpuSourcePortPolicy`, `GtpuSourcePortRange`,
   `PdpContextSelector`, `PdpContextReadback`, `PdpContextInstallOutcome`,
@@ -362,7 +363,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, GtpPdpContext, GtpVersion, GtpuDataplaneBackend,
     GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, MockGtpuDataplaneBackend,
-    RemovePdpContextRequest, Teid,
+    PeerTeid, RemovePdpContextRequest, Teid,
 };
 
 #[tokio::main]
@@ -374,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let context = GtpPdpContext {
         local_teid: Teid::new(0x1000_0001).unwrap(),
-        peer_teid: Teid::new(0x2000_0001).unwrap(),
+        peer_teid: PeerTeid::new(0x2000_0001),
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
         peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         link_ifindex: device.ifindex,

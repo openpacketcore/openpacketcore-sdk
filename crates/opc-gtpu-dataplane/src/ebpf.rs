@@ -100,7 +100,9 @@ use rand::{rngs::SysRng, TryRng};
 use sha2::{Digest, Sha256};
 
 use crate::backend::error_proves_no_requested_mutation;
-use crate::model::{classify_dual_selector_state, DualSelectorState};
+use crate::model::{
+    classify_dual_selector_state, reject_unsupported_zero_peer_teid, DualSelectorState,
+};
 use crate::traffic_observation::{
     GtpuTrafficProofAuthorityStoreIdentity, GtpuTrafficProofAuthorityStoreRebindReady,
     GtpuTrafficProofAuthorityToken, GtpuTrafficProofDispatchAuthority, GtpuTrafficProofRevoker,
@@ -2894,6 +2896,35 @@ fn commit_downlink_inner_mtu(
     }
 }
 
+fn reject_zero_peer_group(group: &GtpuSessionGroup) -> Result<(), GtpuError> {
+    for entry in group.entries() {
+        reject_unsupported_zero_peer_teid(entry.context().peer_teid)?;
+    }
+    Ok(())
+}
+
+/// Refuse a persisted grouped-session observation whose peer TEID is zero.
+///
+/// The committed tc object validates that field as nonzero, so surfacing such
+/// an observation as a readback would describe forwarding the datapath cannot
+/// perform. Return the stable typed refusal until the object rebuild lands.
+fn reject_zero_peer_group_observation(observation: &GroupedObservation) -> Result<(), GtpuError> {
+    let Some(encoded) = observation.authority.as_ref() else {
+        return Ok(());
+    };
+    let Some(record) = GtpuSessionGroupRecord::decode(encoded) else {
+        return Ok(());
+    };
+    for family in [GtpuSessionIpFamily::Ipv4, GtpuSessionIpFamily::Ipv6] {
+        if let Some(entry) = record.entry(family) {
+            reject_unsupported_zero_peer_teid(crate::PeerTeid::new(u32::from_be_bytes(
+                entry.peer_teid(),
+            )))?;
+        }
+    }
+    Ok(())
+}
+
 fn grouped_entry_to_ebpf(entry: &GtpuSessionEntry) -> Option<EbpfSessionEntry> {
     let context = entry.context();
     validate_gtp_version(context.gtp_version).ok()?;
@@ -2948,7 +2979,7 @@ fn grouped_model_from_record(
         let mark = u32::from_be_bytes(entry.bearer_mark());
         let context = GtpPdpContext {
             local_teid: Teid::new(u32::from_be_bytes(entry.local_teid()))?,
-            peer_teid: Teid::new(u32::from_be_bytes(entry.peer_teid()))?,
+            peer_teid: crate::PeerTeid::new(u32::from_be_bytes(entry.peer_teid())),
             ms_address: ip_address(entry.inner_paa().canonical_address()),
             peer_address: ip_address(entry.peer_outer_address()),
             link_ifindex: device.ifindex,
@@ -6378,7 +6409,17 @@ impl EbpfGtpuDataplaneBackend {
             );
         };
         match self.validate_grouped_model_attachment(&group, context) {
-            Ok(()) => GtpuSessionGroupReadback::Active(group),
+            Ok(()) => match reject_zero_peer_group(&group) {
+                Ok(()) => GtpuSessionGroupReadback::Active(group),
+                // Defense in depth only: the public grouped-readback entry
+                // points return the typed `peer_teid_zero` refusal before this
+                // classifier runs. If a future caller reaches this fallback,
+                // fail closed as indeterminate rather than exposing a
+                // forwarding claim the committed datapath object cannot honor.
+                Err(_) => GtpuSessionGroupReadback::Indeterminate(
+                    GtpuSessionGroupIndeterminateReason::IncompleteState,
+                ),
+            },
             Err(reason) => GtpuSessionGroupReadback::Indeterminate(reason),
         }
     }
@@ -6400,9 +6441,10 @@ impl EbpfGtpuDataplaneBackend {
                 operation: "ebpf_grouped_raw_readback_bound",
             })?;
         let result = match self.stable_grouped_observation(&context, selector.id()) {
-            Ok(Some(observation)) => {
-                Ok(self.classify_grouped_readback(selector, &context, observation))
-            }
+            Ok(Some(observation)) => match reject_zero_peer_group_observation(&observation) {
+                Ok(()) => Ok(self.classify_grouped_readback(selector, &context, observation)),
+                Err(error) => Err(error),
+            },
             Ok(None) => Ok(GtpuSessionGroupReadback::Indeterminate(
                 GtpuSessionGroupIndeterminateReason::StateChanged,
             )),
@@ -6455,6 +6497,7 @@ impl EbpfGtpuDataplaneBackend {
                             ))
                         };
                     }
+                    reject_zero_peer_group_observation(&observation)?;
                     let readback = self.classify_grouped_readback(
                         GtpuSessionGroupSelector::new(expected.id(), expected.device_id()),
                         &context,
@@ -7918,6 +7961,9 @@ impl EbpfGtpuDataplaneBackend {
     ) -> Result<GtpuSessionGroupReconcileOutcome, GtpuError> {
         let _operation = self.operation_guard()?;
         let (desired, admission, provenance) = request.into_parts();
+        for entry in desired.entries() {
+            reject_unsupported_zero_peer_teid(entry.context().peer_teid)?;
+        }
         // The affine admission is consumed under the host-global operation
         // lease before even journal recovery can mutate a map. `run_blocking`
         // owns its worker to terminal completion, so cancellation cannot leave
@@ -11207,7 +11253,11 @@ impl EbpfGtpuDataplaneBackend {
         let uplink_source_port_policy = commit.uplink_source_port_policy();
         let downlink_inner_mtu = commit_downlink_inner_mtu(commit).ok_or_else(indeterminate)?;
         let local_teid = Teid::new(u32::from_be_bytes(local_teid)).ok_or_else(indeterminate)?;
-        let peer_teid = Teid::new(u32::from_be_bytes(far.o_teid)).ok_or_else(indeterminate)?;
+        let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(far.o_teid));
+        // eBPF userspace readback cannot expose a context the committed
+        // datapath object would drop; refuse it with the stable typed label
+        // until the object rebuild follow-up lands.
+        reject_unsupported_zero_peer_teid(peer_teid)?;
         Ok(GtpPdpContext {
             local_teid,
             peer_teid,
@@ -11286,8 +11336,8 @@ impl EbpfGtpuDataplaneBackend {
         }
         let local_teid =
             Teid::new(u32::from_be_bytes(owner.local_teid)).ok_or_else(indeterminate)?;
-        let peer_teid =
-            Teid::new(u32::from_be_bytes(owner.uplink_far.o_teid)).ok_or_else(indeterminate)?;
+        let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(owner.uplink_far.o_teid));
+        reject_unsupported_zero_peer_teid(peer_teid)?;
         let bearer_mark =
             GtpBearerMark::new(u32::from_be_bytes(key.bearer_mark)).ok_or_else(indeterminate)?;
         let egress_dscp = match owner.egress_dscp() {
@@ -11541,6 +11591,7 @@ impl EbpfGtpuDataplaneBackend {
         &self,
         request: GtpPdpContext,
     ) -> Result<PdpContextInstallOutcome, GtpuError> {
+        reject_unsupported_zero_peer_teid(request.peer_teid)?;
         let _operation = self.operation_guard()?;
         self.with_graph_effect(request.link_ifindex, || {
             self.validate_reconciliation_context_locked(&request)?;
@@ -11768,6 +11819,11 @@ impl EbpfGtpuDataplaneBackend {
     }
 
     fn install_pdp_context_sync(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
+        // The committed tc object validates the FAR/owner TEID as nonzero; a
+        // zero peer TEID context would install and then drop every uplink
+        // packet. Refuse it with a stable typed label until the datapath
+        // object rebuild follow-up lands.
+        reject_unsupported_zero_peer_teid(request.peer_teid)?;
         let _operation = self.operation_guard()?;
         self.with_graph_effect(request.link_ifindex, || {
             self.install_pdp_context_locked(request)
@@ -11775,6 +11831,7 @@ impl EbpfGtpuDataplaneBackend {
     }
 
     fn install_pdp_context_locked(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
+        reject_unsupported_zero_peer_teid(request.peer_teid)?;
         validate_gtp_version(request.gtp_version)?;
         if request.ms_address.is_ipv6() {
             let local_ip = {
@@ -66108,7 +66165,7 @@ mod tests {
     fn context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: teid(0x1000_0001),
-            peer_teid: teid(0x2000_0001),
+            peer_teid: teid(0x2000_0001).into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: S2BU_IFINDEX,
@@ -66133,7 +66190,7 @@ mod tests {
     fn marked_context(mark: u32, local_teid: u32, peer_teid: u32) -> GtpPdpContext {
         let mut context = context();
         context.local_teid = teid(local_teid);
-        context.peer_teid = teid(peer_teid);
+        context.peer_teid = teid(peer_teid).into();
         context.bearer_mark = GtpBearerMark::new(mark);
         context
     }
@@ -69530,7 +69587,7 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: teid(peer_teid),
+                peer_teid: crate::PeerTeid::new(peer_teid),
                 ms_address: IpAddr::V6(ipv6_inner()),
                 peer_address: IpAddr::V6(peer),
                 link_ifindex: S2BU_IFINDEX,
@@ -69550,7 +69607,7 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: teid(peer_teid),
+                peer_teid: crate::PeerTeid::new(peer_teid),
                 ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
                 peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
                 link_ifindex: S2BU_IFINDEX,
@@ -69577,7 +69634,7 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: teid(peer_teid),
+                peer_teid: crate::PeerTeid::new(peer_teid),
                 ms_address: inner,
                 peer_address: peer_outer,
                 link_ifindex: S2BU_IFINDEX,
@@ -69599,6 +69656,26 @@ mod tests {
         entries: Vec<GtpuSessionEntry>,
     ) -> GtpuSessionGroup {
         GtpuSessionGroup::new(grouped_group_id(id), device_id, entries).unwrap()
+    }
+
+    #[test]
+    fn grouped_zero_peer_teid_is_refused_with_the_stable_typed_label() {
+        let device_id = GtpuSessionDeviceId::new([0x42; 16]).unwrap();
+        let zero_peer = grouped_group(1, device_id, vec![grouped_v4_entry(0x1234_5678, 0)]);
+        let error = reject_zero_peer_group(&zero_peer).unwrap_err();
+        assert!(matches!(
+            error,
+            GtpuError::UnsupportedFeature {
+                feature: "peer_teid_zero"
+            }
+        ));
+
+        let nonzero_peer = grouped_group(
+            1,
+            device_id,
+            vec![grouped_v4_entry(0x1234_5678, 0x2000_0001)],
+        );
+        assert!(reject_zero_peer_group(&nonzero_peer).is_ok());
     }
 
     fn selector_namespace_current() -> impl FnMut() -> Result<(), GtpuError> {
@@ -80968,7 +81045,7 @@ mod tests {
             backend.install_pdp_context(original.clone()).await.unwrap();
 
             let mut relocated = original.clone();
-            relocated.peer_teid = teid(0x3000_0003);
+            relocated.peer_teid = teid(0x3000_0003).into();
             relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
             relocated.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(21_152);
             relocated.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
@@ -81033,7 +81110,7 @@ mod tests {
             backend.install_pdp_context(original.clone()).await.unwrap();
 
             let mut relocated = original.clone();
-            relocated.peer_teid = teid(0x3000_0003);
+            relocated.peer_teid = teid(0x3000_0003).into();
             relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
             relocated.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(21_152);
             relocated.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
@@ -81292,7 +81369,7 @@ mod tests {
         // The same UE/local-TEID identity may relocate to a new peer. The
         // binding-map replacement is the downlink authorization cutover.
         let mut relocated = context();
-        relocated.peer_teid = teid(0x3000_0003);
+        relocated.peer_teid = teid(0x3000_0003).into();
         relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
         backend.install_pdp_context(relocated).await.unwrap();
         {
@@ -81446,7 +81523,7 @@ mod tests {
         let mut first = context();
         first.egress_dscp = Some(crate::DscpCodepoint::new(10).unwrap());
         let mut second = context();
-        second.peer_teid = teid(0x3000_0003);
+        second.peer_teid = teid(0x3000_0003).into();
         second.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
         second.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
         let barrier = Arc::new(Barrier::new(3));
@@ -81509,7 +81586,7 @@ mod tests {
         backend.install_pdp_context(context()).await.unwrap();
 
         let mut replacement = context();
-        replacement.peer_teid = teid(0x3000_0003);
+        replacement.peer_teid = teid(0x3000_0003).into();
         replacement.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
         let barrier = Arc::new(Barrier::new(3));
         let install_task = {
@@ -82164,7 +82241,7 @@ mod tests {
         ));
         let mut default_on_marked_teid = default.clone();
         default_on_marked_teid.local_teid = first.local_teid;
-        default_on_marked_teid.peer_teid = teid(0x2000_0005);
+        default_on_marked_teid.peer_teid = teid(0x2000_0005).into();
         assert!(matches!(
             backend
                 .install_pdp_context(default_on_marked_teid)
@@ -82958,7 +83035,7 @@ mod tests {
 
             let mut desired = original.clone();
             match drift {
-                "far" => desired.peer_teid = teid(0x2000_0003),
+                "far" => desired.peer_teid = teid(0x2000_0003).into(),
                 "dscp" => desired.egress_dscp = Some(crate::DscpCodepoint::new(10).unwrap()),
                 "local_teid" => desired.local_teid = teid(0x1000_0003),
                 _ => desired.bearer_mark = GtpBearerMark::new(0x1002),
@@ -83306,7 +83383,7 @@ mod tests {
 
         let mut same_uplink = installed.clone();
         same_uplink.local_teid = teid(0x1000_0002);
-        same_uplink.peer_teid = teid(0x2000_0002);
+        same_uplink.peer_teid = teid(0x2000_0002).into();
         assert!(matches!(
             backend
                 .install_pdp_context_classified(same_uplink.clone())

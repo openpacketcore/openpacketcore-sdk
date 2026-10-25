@@ -32,7 +32,7 @@ async fn assert_cross_profile_mark_history_stays_reserved(child_first: bool, his
     let mut legacy_context = child.entries()[0].context().clone();
     legacy_context.ms_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 223));
     legacy_context.local_teid = teid(0x1111);
-    legacy_context.peer_teid = teid(0x2111);
+    legacy_context.peer_teid = teid(0x2111).into();
     let legacy = grouped_group(
         0xb5,
         fixture.parent.device_id(),
@@ -230,7 +230,7 @@ impl Fixture {
     fn child(&self, id: u8, teid: u32, mark: u32) -> GtpuSessionGroup {
         let mut context = self.parent.entries()[0].context().clone();
         context.local_teid = super::teid(teid);
-        context.peer_teid = super::teid(teid + 0x1000);
+        context.peer_teid = super::teid(teid + 0x1000).into();
         context.bearer_mark = GtpBearerMark::new(mark);
         context.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(3000 + id as u16);
         grouped_group(
@@ -1087,7 +1087,7 @@ async fn protected_grouped_bearer_profile_same_mark_is_scoped_to_exact_parent_pa
     let active = fixture.add(child.clone()).await.unwrap();
     let mut other_context = fixture.sibling.entries()[0].context().clone();
     other_context.local_teid = teid(0x1111);
-    other_context.peer_teid = teid(0x2111);
+    other_context.peer_teid = teid(0x2111).into();
     other_context.bearer_mark = GtpBearerMark::new(6);
     let other = grouped_group(
         0xb5,
@@ -1178,7 +1178,7 @@ async fn protected_grouped_bearer_profile_default_reattach_preserves_exact_child
     );
     let mut next_context = fixture.parent.entries()[0].context().clone();
     next_context.local_teid = teid(0x1115);
-    next_context.peer_teid = teid(0x2115);
+    next_context.peer_teid = teid(0x2115).into();
     let parent = grouped_group(
         0xb6,
         fixture.parent.device_id(),

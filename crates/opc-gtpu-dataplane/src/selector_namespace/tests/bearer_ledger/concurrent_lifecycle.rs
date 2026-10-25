@@ -18,7 +18,7 @@ fn held_backend(lab: &Lab, before: bool) -> Arc<HeldAcknowledgement> {
 fn next_child(parent: &GtpuSessionGroup, id: u8, teid: u32) -> GtpuSessionGroup {
     let mut context = parent.entries()[0].context().clone();
     context.local_teid = Teid::new(teid).unwrap();
-    context.peer_teid = Teid::new(teid + 0x1000).unwrap();
+    context.peer_teid = crate::PeerTeid::new(teid + 0x1000);
     context.bearer_mark = crate::GtpBearerMark::new(6);
     GtpuSessionGroup::new(
         GtpuSessionGroupId::new([id; 16]).unwrap(),
@@ -50,7 +50,7 @@ async fn independent_fixtures_do_not_share_admission_capacity() {
 fn reattached(source: &GtpuSessionGroup, id: u8, teid: u32) -> GtpuSessionGroup {
     let mut context = source.entries()[0].context().clone();
     context.local_teid = Teid::new(teid).unwrap();
-    context.peer_teid = Teid::new(teid + 0x1000).unwrap();
+    context.peer_teid = crate::PeerTeid::new(teid + 0x1000);
     GtpuSessionGroup::new(
         GtpuSessionGroupId::new([id; 16]).unwrap(),
         source.device_id(),

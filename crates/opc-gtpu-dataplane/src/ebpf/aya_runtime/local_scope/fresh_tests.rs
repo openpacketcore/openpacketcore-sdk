@@ -18,7 +18,7 @@ pub(super) fn session_request(
     use crate::*;
     let context = GtpPdpContext {
         local_teid: Teid::new(700 + u32::from(selector)).unwrap(),
-        peer_teid: Teid::new(800 + u32::from(selector)).unwrap(),
+        peer_teid: PeerTeid::new(800 + u32::from(selector)),
         ms_address: std::net::IpAddr::from([10, 79, 0, selector]),
         peer_address: "192.0.2.2".parse().unwrap(),
         link_ifindex: ifindex,
