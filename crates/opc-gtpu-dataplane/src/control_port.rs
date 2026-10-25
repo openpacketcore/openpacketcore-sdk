@@ -200,8 +200,17 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// Tracked destinations keep their Identification sequences and at most
     /// their current tokens.
     ///
+    /// A replacement is accepted only when it cannot combine with this
+    /// registration's earlier admissions into more than 65,535 admissions in
+    /// any 255-second window: an unchanged limit, before the registration's
+    /// first fragmentation admission, after at least 255 seconds without an
+    /// admission, or when the carried conservative window bound plus the new
+    /// limit's 255-second maximum stays within 65,535. A deployment that needs
+    /// a larger budget mid-session must re-register the attachment.
+    ///
     /// # Errors
-    /// Returns [`GtpuControlPortError::Unsupported`] for ports without a
+    /// Returns [`GtpuControlPortError::InvalidLimits`] when the replacement is
+    /// refused, [`GtpuControlPortError::Unsupported`] for ports without a
     /// backend-authoritative consumer, or `Unavailable`/`Busy`.
     fn set_inner_fragment_rate_limit(
         &self,

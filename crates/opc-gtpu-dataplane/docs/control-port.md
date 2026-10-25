@@ -1006,12 +1006,16 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
 3. **Budget.** One token bucket per destination (the session PAA):
    `GtpuInnerFragmentRateLimit`, a burst of 64 with one token per 4 ms by
    default, set by `set_inner_fragment_rate_limit`. At most 4,096
-   destinations are tracked per attachment, least recently used first out;
-   a refused admission still counts as a use. An evicted destination
-   restarts with a full bucket, so past 4,096 concurrently tracked
-   destinations the per-destination bound does not hold (#1018). An empty
-   bucket is an `InnerFragmentRateLimited` drop. Steps 1 and 2 take no
-   token.
+   destinations are tracked per attachment. A destination used within the
+   last 255 seconds is never evicted: when the table holds only such
+   destinations, a new destination is refused fail closed as
+   `InnerFragmentCapacityExhausted` (counted in
+   `inner_fragment_capacity_exhausted`) instead of resetting another
+   destination's budget or Identification sequence. A destination idle for
+   at least 255 seconds may be evicted and restarts with a full bucket; no
+   255-second window can then contain admissions from both lives. A refused
+   admission still counts as a use. An empty bucket is an
+   `InnerFragmentRateLimited` drop. Steps 1 and 2 take no token.
 4. **Fragmentation** by the RFC 791 section 3.2 procedure, generalized to
    an n-way split. Every fragment except the last carries the largest
    multiple of 8 data octets that fits the MTU, so the count is minimal
@@ -1031,14 +1035,20 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
    `GtpuInnerFragmentRateLimit::new` refuses any limit above 65,535. While
    the destination stays tracked under one unchanged limit, its sequence
    therefore cannot repeat within the maximum datagram lifetime (RFC 791
-   Time to Live; RFC 6864 sections 4.3 and 5.2). Past 4,096 concurrently
-   tracked destinations, an evicted destination restarts from a fresh
-   keyed-random value, so uniqueness is probabilistic. A new attachment
-   registration (a process restart, a re-adoption or a re-created
-   attachment) likewise restarts every destination from a new random value
-   and a full bucket, possibly within 255 seconds of the previous
-   registration's Identifications. Admissions before and after a limit
-   replacement are not counted together (#1018).
+   Time to Live; RFC 6864 sections 4.3 and 5.2). A destination evicted only
+   after the 255-second grace restarts from a fresh keyed-random value; the
+   grace guarantees no 255-second window contains both lives'
+   Identifications. A new attachment registration (a process restart, a
+   re-adoption or a re-created attachment) still restarts every destination
+   from a new random value and a full bucket, possibly within 255 seconds of
+   the previous registration's Identifications; that reset is the documented
+   residual of the host-side budget (#1018). A limit replacement is accepted
+   only when a carried conservative 255-second bound proves it cannot combine
+   with earlier admissions of the registration into more than 65,535 packets:
+   an unchanged limit, no prior admission, 255 seconds without an admission,
+   or carried bound plus the new limit's 255-second maximum within 65,535.
+   Otherwise `set_inner_fragment_rate_limit` returns `InvalidLimits` and the
+   deployment must re-register to change the budget mid-session.
 
 The result is `GtpuDownlinkEvent::Fragmented`: the fragments in offset order,
 the MTU and the bearer mark. Its `Debug` output shows only the fragment
@@ -1117,18 +1127,22 @@ Destination Unreachable (Fragmentation Needed) error is sent:
 - **Rate limit.** One token bucket per offending session (RFC 1812 section
   4.3.2.8): a burst of 16 with one token per 10 ms by default, set by
   `set_packet_too_big_rate_limit`. At most 4,096 sessions are tracked per
-  attachment, least recently used first out. While the session stays
-  tracked, a flood toward one PAA exhausts only that session's budget. Past
-  4,096 concurrently tracked sessions, a re-tracked session restarts with a
-  full bucket (#1018).
+  attachment. A session used within the last 255 seconds is never evicted;
+  while the table holds only such sessions, a new session's error budget is
+  refused fail closed (`CapacityExhausted`, counted in
+  `packet_too_big_capacity_exhausted`). A session idle for at least 255
+  seconds may be evicted and re-created with a full bucket; no 255-second
+  window can then contain admissions from both lives, so a flood toward one
+  PAA still exhausts only that session's budget.
 - **Tradeoff.** The error's source is the subscriber's own address. The ePDG
   is routing, so RFC 1812 4.3.2.4 would have it use its own address, but the
   PGW's per-PDN anti-spoofing admits only the PAA. The originator therefore
   attributes the error to the subscriber.
 
 **Counters.** Value-free counters report fragmented packets and fragments,
-rate-limited and unfragmentable packets under the default policy, and
-too-big, signalled, rate-limited and unsendable packets under the opt-in.
+rate-limited, capacity-exhausted and unfragmentable packets under the default
+policy, and too-big, signalled, rate-limited, capacity-exhausted and
+unsendable packets under the opt-in.
 `decapsulated_inner_fragments` reports the decapsulated packets that were
 inner fragments. `SO_RXQ_OVFL` reports kernel drops from the shared queue,
 from the packet-too-big queue and from the inner-fragment queue. The kernel

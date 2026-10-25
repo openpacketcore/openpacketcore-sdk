@@ -404,17 +404,23 @@ impl GtpuControlPort for BackendControlPort {
             // default-bearer uplink G-PDU; nothing is ever sent unencapsulated.
             let signal = match plan.build_uplink_gpdu() {
                 None => crate::GtpuPacketTooBigSignal::Unsendable,
-                Some(_)
-                    if !state
-                        .too_big_limiter
-                        .admit(plan.session(), std::time::Instant::now()) =>
-                {
-                    crate::GtpuPacketTooBigSignal::RateLimited
-                }
                 Some((gpdu, local, peer)) => {
-                    match socket.send_in_tunnel_error(local, peer, &gpdu) {
-                        Ok(_) => crate::GtpuPacketTooBigSignal::Sent,
-                        Err(_) => crate::GtpuPacketTooBigSignal::Unsendable,
+                    match state
+                        .too_big_limiter
+                        .admit(plan.session(), std::time::Instant::now())
+                    {
+                        crate::reassembly::PacketTooBigAdmission::Admitted => {
+                            match socket.send_in_tunnel_error(local, peer, &gpdu) {
+                                Ok(_) => crate::GtpuPacketTooBigSignal::Sent,
+                                Err(_) => crate::GtpuPacketTooBigSignal::Unsendable,
+                            }
+                        }
+                        crate::reassembly::PacketTooBigAdmission::RateLimited => {
+                            crate::GtpuPacketTooBigSignal::RateLimited
+                        }
+                        crate::reassembly::PacketTooBigAdmission::CapacityExhausted => {
+                            crate::GtpuPacketTooBigSignal::CapacityExhausted
+                        }
                     }
                 }
             };
@@ -423,6 +429,9 @@ impl GtpuControlPort for BackendControlPort {
                 crate::GtpuPacketTooBigSignal::Sent => &mut counters.packet_too_big_signalled,
                 crate::GtpuPacketTooBigSignal::RateLimited => {
                     &mut counters.packet_too_big_rate_limited
+                }
+                crate::GtpuPacketTooBigSignal::CapacityExhausted => {
+                    &mut counters.packet_too_big_capacity_exhausted
                 }
                 crate::GtpuPacketTooBigSignal::Unsendable => {
                     &mut counters.packet_too_big_unsendable
@@ -454,8 +463,11 @@ impl GtpuControlPort for BackendControlPort {
         limit: crate::GtpuInnerFragmentRateLimit,
     ) -> Result<(), GtpuControlPortError> {
         self.with_attachment(|_, state, _| {
-            state.inner_fragment_budget.set_limit(limit);
-            Ok(())
+            state
+                .inner_fragment_budget
+                .set_limit(limit, std::time::Instant::now())
+                .then_some(())
+                .ok_or(GtpuControlPortError::InvalidLimits)
         })
     }
 
@@ -544,12 +556,21 @@ pub(super) fn fragment_inner(
             return drop(state, crate::GtpuDownlinkDrop::Malformed);
         }
     };
-    let Some(assigned) = state.inner_fragment_budget.admit(
+    let assigned = match state.inner_fragment_budget.admit(
         plan.destination(),
         std::time::Instant::now(),
         source.is_atomic(),
-    ) else {
-        return drop(state, crate::GtpuDownlinkDrop::InnerFragmentRateLimited);
+    ) {
+        crate::reassembly::InnerFragmentAdmission::Admitted(assigned) => assigned,
+        crate::reassembly::InnerFragmentAdmission::RateLimited => {
+            return drop(state, crate::GtpuDownlinkDrop::InnerFragmentRateLimited);
+        }
+        crate::reassembly::InnerFragmentAdmission::CapacityExhausted => {
+            return drop(
+                state,
+                crate::GtpuDownlinkDrop::InnerFragmentCapacityExhausted,
+            );
+        }
     };
     let identification = assigned.unwrap_or_else(|| source.identification());
     let Some(fragments) = source.fragment(plan.mtu(), identification) else {

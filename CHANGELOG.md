@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peer's receive expectation. GCM sealing requires an allocation from an
   already committed reservation block; CBC uses its admitted random IV.
   Refs #1241.
+- `opc-gtpu-dataplane`: `GtpuDownlinkCounters::inner_fragment_capacity_exhausted`
+  and `packet_too_big_capacity_exhausted`, plus the typed reasons
+  `GtpuDownlinkDrop::InnerFragmentCapacityExhausted` and
+  `GtpuPacketTooBigSignal::CapacityExhausted`, distinguish fail-closed
+  capacity refusals from per-key rate limiting. The added enum variants and
+  counter fields are additive: both enums and the counter struct are
+  `#[non_exhaustive]`. Refs #1018.
 
 - `opc-ipsec-xfrm`: SAs can request Linux Traffic Flow Confidentiality (TFC)
   padding through the new `SaParameters::tfc_pad: Option<u32>`. A `Some(n)`
@@ -56,6 +63,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request identity, so the configuration store still applies it exactly once.
   Election, heartbeat and forwarded-mutation timing budgets are unchanged.
   Refs #1049.
+- `opc-gtpu-dataplane`: the per-destination inner fragmentation budget and
+  the per-session in-tunnel Packet Too Big error budget no longer evict a
+  destination or session that was used within the last 255 seconds. The
+  bounded tables fail closed with a new typed reason instead of resetting an
+  active token bucket or Identification sequence, and eviction uses an O(1)
+  LRU instead of a full-table scan. A limit replacement is accepted only when
+  a carried conservative 255-second bound proves it cannot combine with this
+  registration's earlier admissions into more than 65,535 packets; otherwise
+  `set_inner_fragment_rate_limit` returns `InvalidLimits` and the deployment
+  must re-register to change the budget mid-session. New value-free counters
+  and typed outcomes are listed under "Added". Refs #1018.
 
 - `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
   TS 29.281 section 5.1 all-zero value is now representable and installable on
