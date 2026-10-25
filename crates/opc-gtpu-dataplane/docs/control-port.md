@@ -173,6 +173,8 @@ attachment invalidation.
 
 ```text
 let readiness = port.downlink_readiness()?;
+// The handle must outlive every epoll/AsyncFd registration that borrows its
+// descriptor: `as_fd()` borrows from the handle and does not keep it alive.
 let async_fd = tokio::io::unix::AsyncFd::new(readiness.as_fd())?; // the SDK epoll
 loop {
     let mut guard = async_fd.readable().await?;
@@ -194,8 +196,17 @@ queues are empty. Every wake from the exposed descriptor must be consumed with
 The source is bound to one registration. Attachment removal, replacement,
 fencing or a failed readback revokes every outstanding source: readiness and
 receive return `Unavailable`, and the source never becomes readable again.
-Drop it and reopen the port after a fresh exact registration. Backends without
-backend-owned sockets inherit the default `Unsupported` result.
+Revocation is passive and observed lazily: it sets a flag and does not wake the
+epoll, so a blocked `wait(long_timeout)` returns `Unavailable` only on its next
+return (at the latest when the timeout expires), and the exposed descriptor is
+not a revocation wakeup. An `AsyncFd`/epoll loop can therefore sleep
+indefinitely after revocation. After each wake or timeout, call
+`try_readiness`, or drive `try_receive_downlink` (it re-validates the
+registration and returns `Unavailable`); stop waiting on readiness and surface
+`Unavailable` to the caller. Do not treat readiness silence as a liveness
+signal. Drop the source and reopen the port after a fresh exact registration.
+Backends without backend-owned sockets inherit the default `Unsupported`
+result.
 
 ## Backend-authoritative downlink consumer
 

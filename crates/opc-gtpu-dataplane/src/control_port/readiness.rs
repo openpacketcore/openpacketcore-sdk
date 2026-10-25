@@ -15,10 +15,20 @@
 //!
 //! A readiness source is bound to one control port registration. When the
 //! attachment is removed, replaced, fenced or its readback fails, the port
-//! revokes every outstanding source: wait and receive return
+//! revokes every outstanding source: readiness and receive return
 //! [`GtpuControlPortError::Unavailable`] and the source never becomes
-//! readable again. A consumer must drop the source and reopen the port through
-//! the backend after a fresh registration.
+//! readable again. Revocation is **passive**: it sets a revocation flag and
+//! never signals the epoll, so a blocked [`GtpuControlReadiness::wait`]
+//! returns `Unavailable` only on its next return (at the latest when its
+//! timeout expires), and the exposed descriptor is *not* a revocation wakeup.
+//! Observe revocation by calling [`GtpuControlReadiness::try_readiness`] or by
+//! driving [`crate::control_port::GtpuControlPort::try_receive_downlink`],
+//! which re-validates the registration and returns `Unavailable`. An
+//! `epoll`/`AsyncFd` consumer loop must not treat readiness silence as a
+//! liveness signal: after each wake or timeout it must call
+//! `try_readiness`/`try_receive_downlink`, and stop waiting on readiness once
+//! `Unavailable` is returned. A consumer must drop the source and reopen the
+//! port through the backend after a fresh registration.
 
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -126,6 +136,20 @@ impl fmt::Debug for GtpuDownlinkReadiness {
 /// proof for any session. Attachment removal, replacement, readback failure or
 /// fencing revokes the source: [`GtpuControlPortError::Unavailable`] is
 /// returned and it never becomes readable again.
+///
+/// Revocation is passive and observed lazily: it sets a flag without waking
+/// the epoll, so a blocked [`Self::wait`] returns `Unavailable` only on its
+/// next return, and the exposed descriptor never becomes readable as a
+/// revocation signal. An `epoll`/`AsyncFd` loop must therefore not treat
+/// readiness silence as liveness: after each wake or timeout, call
+/// [`Self::try_readiness`] or drive
+/// [`crate::control_port::GtpuControlPort::try_receive_downlink`] (which
+/// re-validates the registration), and stop waiting once `Unavailable` is
+/// returned.
+///
+/// The handle must outlive every `epoll`/`AsyncFd` registration that borrows
+/// its [`AsFd`] descriptor: the descriptor is borrowed from this handle and
+/// does not keep it alive.
 pub struct GtpuControlReadiness {
     inner: Arc<ReadinessInner>,
 }
@@ -136,6 +160,11 @@ impl fmt::Debug for GtpuControlReadiness {
     }
 }
 
+/// Borrow the SDK's private epoll descriptor.
+///
+/// The descriptor is owned by this handle. Keep the handle alive for as long
+/// as an `epoll`/`AsyncFd` registration borrows it; the borrow does not extend
+/// the handle's lifetime.
 impl AsFd for GtpuControlReadiness {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.inner.epoll.0.as_fd()
@@ -194,7 +223,10 @@ impl GtpuControlReadiness {
     /// Wait at most `timeout` for a watched queue to report readiness.
     ///
     /// The call is advisory exactly like [`Self::try_readiness`]; an empty
-    /// result is a timeout, not a refusal.
+    /// result is a timeout, not a refusal. Revocation does not wake a blocked
+    /// wait: a source revoked during this call reports
+    /// [`GtpuControlPortError::Unavailable`] on its next return, which may be
+    /// when the timeout expires.
     ///
     /// # Errors
     /// Returns [`GtpuControlPortError::Unavailable`] after revocation,
