@@ -417,7 +417,12 @@ pub(super) struct BusinessChanges {
     deleted_rows: usize,
     retained_bytes: usize,
     generic: HashMap<SessionConsensusRequestId, RowChange<NativeGenericReceipt>>,
+    // Retained additions to the notification suffix, and their raw committed
+    // sequences in the same order. Journal captures validate both.
     notifications: Vec<NotificationRow>,
+    notification_sequences: Vec<u64>,
+    // Exact predecessor stamps of retired notification rows, in journal order.
+    notification_retired: Vec<RowStamp>,
     roster: roster::changes::Journal,
     // Conservative container-growth reservations precede allocation. Captures
     // transfer these guards; cloned business images do not clone a journal.
@@ -437,6 +442,8 @@ impl BusinessChanges {
             retained_bytes: 0,
             generic: HashMap::new(),
             notifications: Vec::new(),
+            notification_sequences: Vec::new(),
+            notification_retired: Vec::new(),
             memory: Vec::new(),
         }
     }
@@ -500,11 +507,20 @@ impl BusinessChanges {
             })?;
         }
         current(&self.generic, &state.generic_receipts)?;
-        let start = self.base.tables[3].count;
-        for (offset, row) in self.notifications.iter().enumerate() {
-            if state
-                .notifications
-                .get(start + offset)
+        let floor = state.frontiers.notification_floor();
+        for (row, sequence) in self.notifications.iter().zip(&self.notification_sequences) {
+            // A journal addition retired by a later publication in the same
+            // journal is no longer resident; table replay still accounts for
+            // its addition and retirement stamps.
+            if *sequence <= floor {
+                continue;
+            }
+            let index = sequence
+                .checked_sub(floor)
+                .and_then(|position| position.checked_sub(1))
+                .and_then(|index| usize::try_from(index).ok());
+            if index
+                .and_then(|index| state.notifications.get(index))
                 .is_none_or(|current| !current.ptr_eq(row))
             {
                 return Err(invalid(
@@ -568,11 +584,13 @@ impl BusinessChanges {
         let (deleted_before, deleted_transient, witnessed_journal_removals) =
             self.check_deletions(&mut tables[1], check)?;
         Self::check_rows(2, &self.generic, &mut tables[2], check)?;
-        let start = self.base.tables[3].count;
         for row in &self.notifications {
             scratch::small(check, || {
                 tables[3].replace(None, Some(notification_stamp(row)?))
             })?;
+        }
+        for retired in &self.notification_retired {
+            scratch::small(check, || tables[3].replace(Some(*retired), None))?;
         }
         if tables != self.target.tables {
             return Err(invalid("native capture omitted or changed published rows"));
@@ -686,15 +704,9 @@ impl BusinessChanges {
                 row.validate_replacement(before, self.target.frontiers.logical_time)?;
             }
         }
-        for (offset, row) in self.notifications.iter().enumerate() {
+        for (row, sequence) in self.notifications.iter().zip(&self.notification_sequences) {
             check()?;
-            let sequence = start
-                .checked_add(offset)
-                .and_then(|index| index.checked_add(1))
-                .ok_or_else(|| invalid("native captured notification sequence overflow"))?;
-            scratch::small(check, || {
-                row.validate(sequence as u64, &self.target.frontiers)
-            })?;
+            scratch::small(check, || row.validate(*sequence, &self.target.frontiers))?;
         }
         check()
     }
@@ -715,6 +727,12 @@ impl BusinessChanges {
         self.notifications
             .try_reserve(publication.notifications.len())
             .map_err(|_| invalid("native dirty notification allocation failed"))?;
+        self.notification_sequences
+            .try_reserve(publication.notification_sequences.len())
+            .map_err(|_| invalid("native dirty notification sequence allocation failed"))?;
+        self.notification_retired
+            .try_reserve(publication.notification_retired.len())
+            .map_err(|_| invalid("native dirty notification retirement allocation failed"))?;
         self.memory
             .try_reserve(1)
             .map_err(|_| invalid("native dirty reservation allocation failed"))?;
@@ -893,7 +911,12 @@ pub(super) struct Publication {
     receipts: StagedRows<FencedTransitionV2RequestId, NativeReceipt>,
     deletions: DeletedRows,
     generic: StagedRows<SessionConsensusRequestId, NativeGenericReceipt>,
+    // Retained notification additions, their raw committed sequences and the
+    // exact predecessor stamps removed from the retired prefix.
     notifications: Vec<NotificationRow>,
+    notification_sequences: Vec<u64>,
+    notification_retired: Vec<RowStamp>,
+    notification_retained: usize,
     delivery: NativeApplied,
     memory: Arc<VerificationMemory>,
     tracking: bool,
@@ -1156,11 +1179,13 @@ impl Publication {
             }
         }
         for (offset, row) in notifications.iter().enumerate() {
-            validation::validate_notification(
-                row,
-                (predecessor.tables[3].count + offset) as u64 + 1,
-                &frontiers,
-            )?;
+            let sequence = base
+                .frontiers
+                .watch_sequence
+                .checked_add(offset as u64)
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| invalid("native notification sequence overflow"))?;
+            validation::validate_notification(row, sequence, &frontiers)?;
         }
         let mut tables = predecessor.tables;
         // Reconstruct the next resident index from the validated after-images,
@@ -1205,13 +1230,47 @@ impl Publication {
                 })
                 .collect::<io::Result<Vec<_>>>()?,
         };
-        let notifications = notifications
+        let appended = notifications
             .into_iter()
             .map(|row| NotificationRow::new(NativeNotification::new(row)))
             .collect::<io::Result<Vec<_>>>()?;
-        for row in &notifications {
-            tables[3].replace(None, Some(notification_stamp(row)?))?;
+        // Bounded rolling retention. The floor is derived from the committed
+        // watch sequence alone; the oldest retained additions and predecessor
+        // rows outside the window are retired here, before the proof is built.
+        let retention = super::retention::notification_retention();
+        let candidate = predecessor.tables[3]
+            .count
+            .checked_add(appended.len())
+            .ok_or_else(|| invalid("native notification candidate overflow"))?;
+        let retire = retention.retire_count(frontiers.watch_sequence, candidate)?;
+        let retired_from_predecessor = retire.min(predecessor.tables[3].count);
+        let skipped_appended = retire - retired_from_predecessor;
+        let mut notification_retired = Vec::with_capacity(retired_from_predecessor);
+        for ordinal in 0..retired_from_predecessor {
+            let row = base
+                .notifications
+                .get(ordinal)
+                .ok_or_else(|| invalid("native notification prefix missing"))?;
+            let stamp = notification_stamp(row)?;
+            tables[3].replace(Some(stamp), None)?;
+            notification_retired.push(stamp);
         }
+        let retained: Vec<NotificationRow> = appended.into_iter().skip(skipped_appended).collect();
+        let mut notification_sequences = Vec::with_capacity(retained.len());
+        for (ordinal, row) in retained.iter().enumerate() {
+            tables[3].replace(None, Some(notification_stamp(row)?))?;
+            let sequence = base
+                .frontiers
+                .watch_sequence
+                .checked_add(skipped_appended as u64)
+                .and_then(|index| index.checked_add(ordinal as u64))
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| invalid("native retained notification sequence overflow"))?;
+            notification_sequences.push(sequence);
+        }
+        let notification_retained =
+            usize::try_from(retention.retained_count(frontiers.watch_sequence))
+                .map_err(|_| invalid("native retained notification count overflow"))?;
         validation::validate_frontiers(
             base.identity,
             &base.members,
@@ -1244,7 +1303,10 @@ impl Publication {
             receipts,
             deletions,
             generic,
-            notifications,
+            notifications: retained,
+            notification_sequences,
+            notification_retired,
+            notification_retained,
             delivery,
             memory,
             tracking,
@@ -1355,9 +1417,24 @@ impl Publication {
             dirty
                 .notifications
                 .extend(self.notifications.iter().cloned());
+            dirty
+                .notification_sequences
+                .extend(self.notification_sequences.iter().copied());
+            dirty
+                .notification_retired
+                .extend(self.notification_retired.iter().copied());
             dirty.target = Arc::clone(&self.proof);
         }
         state.notifications.extend(self.notifications);
+        // No fallible work follows: drop the retained prefix computed during
+        // preparation, leaving exactly the derived retained window.
+        let excess = state
+            .notifications
+            .len()
+            .saturating_sub(self.notification_retained);
+        if excess != 0 {
+            state.notifications = state.notifications.skip(excess);
+        }
         state.roster = self.roster;
         state.frontiers = self.frontiers;
         state.proof = Some(self.proof);

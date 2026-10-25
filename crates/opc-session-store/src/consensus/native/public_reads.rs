@@ -156,18 +156,40 @@ impl NativeState {
         check: &dyn Fn() -> io::Result<()>,
     ) -> Result<Vec<ReplicationEntry>, StoreError> {
         let original = crate::backend::ReplicationLogRange::try_new(start, limit)?;
+        let empty_request = original.is_empty();
         let floor = self.frontiers.async_fence_floor();
         original.ensure_not_compacted(floor)?;
         let first = (original.first_sequence() - floor)
             .checked_add(self.frontiers.async_watch_before())
             .ok_or_else(unavailable)?;
+        // Bounded rolling retention: a cursor below the derived floor has no
+        // authoritative replay. Answer with the existing typed stale-cursor
+        // outcome so the watcher resynchronises instead of receiving silence or
+        // a wrong replay. The floor is derived from committed state, identical
+        // on every voter and carried by the already-persisted watch sequence.
+        let retirement_floor = self.frontiers.notification_floor();
+        if !empty_request && first <= retirement_floor {
+            // The lowest replayable physical row is the later of the retention
+            // floor and the asynchronous watch boundary; translate it back into
+            // the caller's outward sequence space.
+            let lowest_physical = retirement_floor
+                .max(self.frontiers.async_watch_before())
+                .checked_add(1)
+                .ok_or_else(unavailable)?;
+            let resume_from = lowest_physical
+                .checked_sub(self.frontiers.async_watch_before())
+                .and_then(|sequence| sequence.checked_add(floor))
+                .ok_or_else(unavailable)?;
+            return Err(StoreError::ReplicationLogCursorCompacted { resume_from });
+        }
         let range = crate::backend::ReplicationLogRange::try_new(first, limit)?;
         if range.is_empty() || range.first_sequence() > self.frontiers.watch_sequence {
             return Ok(Vec::new());
         }
         check().map_err(|_| unavailable())?;
         self.require_business_proof().map_err(|_| unavailable())?;
-        let first = usize::try_from(range.first_sequence() - 1).map_err(|_| unavailable())?;
+        let first = usize::try_from(range.first_sequence() - retirement_floor - 1)
+            .map_err(|_| unavailable())?;
         let count = self
             .notifications
             .len()
@@ -180,7 +202,11 @@ impl NativeState {
         let mut output_bytes = 0_usize;
         for position in first..first + count {
             check().map_err(|_| unavailable())?;
-            let sequence = u64::try_from(position).map_err(|_| unavailable())? + 1;
+            let sequence = u64::try_from(position)
+                .map_err(|_| unavailable())?
+                .checked_add(retirement_floor)
+                .and_then(|sequence| sequence.checked_add(1))
+                .ok_or_else(unavailable)?;
             let row = self.notifications.get(position).ok_or_else(unavailable)?;
             if row.sequence() != sequence {
                 return Err(unavailable());
@@ -210,7 +236,11 @@ impl NativeState {
         for position in first..first + count {
             check().map_err(|_| unavailable())?;
             let row = self.notifications.get(position).ok_or_else(unavailable)?;
-            let sequence = u64::try_from(position).map_err(|_| unavailable())? + 1;
+            let sequence = u64::try_from(position)
+                .map_err(|_| unavailable())?
+                .checked_add(retirement_floor)
+                .and_then(|sequence| sequence.checked_add(1))
+                .ok_or_else(unavailable)?;
             row.validate(sequence, &self.frontiers)
                 .map_err(|_| unavailable())?;
             rows.push(row);

@@ -1969,6 +1969,20 @@ remains distinct and requires snapshot installation before its resume point.
 Slow consumers are evicted when the live channel fills, and closed or
 cancelled registrations are pruned without unbounded accumulation.
 
+Native state additionally keeps a bounded rolling notification backlog: the
+newest 65,536 notifications are resident, and a watcher whose inclusive cursor
+is at or below the derived retention floor receives the existing
+`ReplicationLogCursorCompacted { resume_from }` answer with the lowest
+replayable sequence described above. The floor is derived only from the
+committed watch sequence, so every voter agrees at the same log index and the
+already-persisted snapshot/frontier state carries it; there is no new persisted
+field, acknowledgement or delivery tracker. Retention is therefore a bounded
+replay backlog, not delivery tracking: a slow or lost watcher resynchronises
+from the returned sequence (or installs a snapshot for the compacted-async
+case). The hard 1,048,576-row admission cap remains a last defense instead of
+a lifetime stop. Durable generation/image/export carry for the derived floor is
+the staged follow-up for this change and adds no format boundary here.
+
 `ConsensusSessionStore` completes a linearizable read barrier before the
 atomic local handoff using `opc-consensus::LinearizableReadBarrier` in its
 default full-round mode. The shared gate waits for the serving node's local

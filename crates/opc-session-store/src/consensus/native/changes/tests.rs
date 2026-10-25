@@ -1620,3 +1620,83 @@ fn native_deferral_capture_rejects_transient_removals_without_witnesses() {
         "deferral removals require deletion witnesses even when both endpoint images are valid"
     );
 }
+
+/// A bounded rolling notification window keeps a store alive past the old
+/// lifetime cap: the front prefix is retired from committed watch sequence
+/// alone, the retained window still validates exactly, a below-floor watcher
+/// receives the typed stale-cursor answer, and capture/detach replay accounts
+/// for the retired rows.
+#[test]
+fn native_notification_retention_keeps_a_bounded_committed_window() {
+    let _retention =
+        crate::consensus::native::retention::tests_support::override_retained_for_test(4);
+    let (mut storage, _request, mut outcome) = fixture();
+    // Fixture activation does not notify; each accepted fenced transition
+    // update appends exactly one notification.
+    for index in 2..=10_u64 {
+        let next = request(index, Some(&outcome));
+        let applied = apply(
+            &mut storage,
+            &[command(index, &next, time(index as u8), false)],
+        );
+        let Ok(SessionMutationOutcome::FencedTransition(next_outcome)) =
+            &applied.responses[0].result
+        else {
+            panic!("native retention fixture transition failed")
+        };
+        outcome = next_outcome.clone();
+    }
+    let watch = storage.business.frontiers.watch_sequence;
+    let floor = storage.business.frontiers.notification_floor();
+    assert!(watch > 4, "the fixture passes the reduced retention window");
+    assert_eq!(floor, watch - 4);
+    assert_eq!(
+        storage.business.notifications.len() as u64,
+        4,
+        "only the bounded suffix remains resident"
+    );
+    assert_eq!(
+        storage.business.notifications.front().unwrap().sequence(),
+        floor + 1,
+        "the retained window starts at the derived floor"
+    );
+    storage
+        .business
+        .validate_full_business_rows()
+        .expect("the bounded window still validates completely");
+    storage
+        .validate_image()
+        .expect("the bounded image validates");
+
+    // A watcher at or below the floor gets the existing typed stale-cursor
+    // answer, never silence and never a wrong replay.
+    match storage.business.replication_log(0, 8, &|| Ok(())) {
+        Err(StoreError::ReplicationLogCursorCompacted { resume_from }) => {
+            assert_eq!(resume_from, floor + 1);
+        }
+        other => panic!("below-floor watcher did not receive the typed cursor answer: {other:?}"),
+    }
+    let page = storage
+        .business
+        .replication_log(floor + 1, 8, &|| Ok(()))
+        .expect("the retained suffix remains replayable");
+    assert_eq!(page.len() as u64, 4);
+    for (offset, entry) in page.iter().enumerate() {
+        assert_eq!(entry.sequence, floor + 1 + offset as u64);
+    }
+
+    // Capture/detach replays the exact retained additions and retired prefix
+    // stamps, so a successor can validate the same bounded window.
+    storage.business.begin_changes().unwrap();
+    let next_request = request(11, Some(&outcome));
+    apply(&mut storage, &[command(11, &next_request, time(11), false)]);
+    let captured = storage.business.capture_changes().unwrap();
+    captured
+        .validate_captured(&|| Ok(()))
+        .expect("a bounded retention journal replays exactly");
+    assert_eq!(
+        captured.target_proof().frontiers.notification_floor(),
+        storage.business.frontiers.notification_floor(),
+        "capture target retains the committed floor"
+    );
+}

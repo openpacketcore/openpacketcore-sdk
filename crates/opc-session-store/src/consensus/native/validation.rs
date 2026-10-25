@@ -295,7 +295,7 @@ pub(super) fn validate_frontiers(
     if let Some(boundary) = &frontiers.async_recovery {
         boundary.validate_protected_scope(identity, members, root)?;
     }
-    if notifications as u64 != frontiers.watch_sequence {
+    if u64::try_from(notifications).ok() != Some(frontiers.retained_notification_count()) {
         return Err(invalid("native image watch count differs"));
     }
     if let Some(snapshot) = &frontiers.current_snapshot {
@@ -441,7 +441,7 @@ impl NativeState {
             return Err(invalid("native V1 receipt count exceeds lifetime bound"));
         }
         for (ordinal, row) in self.notifications.iter().enumerate() {
-            row.validate(ordinal as u64 + 1, frontiers)?;
+            row.validate(frontiers.notification_sequence(ordinal)?, frontiers)?;
         }
         Ok(receipt_order)
     }
