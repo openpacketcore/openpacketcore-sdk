@@ -3,6 +3,9 @@
 use super::*;
 use opc_consensus::engine::raft::AppendEntriesResponse;
 use opc_consensus::engine::{LogId, Vote};
+use std::cell::RefCell;
+use std::future::Future;
+use std::sync::Condvar;
 
 // The entries vector is deliberately empty. Keep the exact engine request
 // field order and use its real vote/log types without exposing a storage port.
@@ -64,11 +67,18 @@ fn retained_sql_log_id_at(
     node: usize,
     index: Option<u64>,
 ) -> LogId<SessionConsensusNodeId> {
-    let connection = rusqlite::Connection::open_with_flags(
-        cluster
+    retained_sql_log_id_from(
+        &cluster
             ._directory
             .path()
             .join(format!("node-{node}.sqlite")),
+        index,
+    )
+}
+
+fn retained_sql_log_id_from(path: &Path, index: Option<u64>) -> LogId<SessionConsensusNodeId> {
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .expect("independent read-only log witness");
@@ -92,8 +102,212 @@ fn retained_sql_log_end(cluster: &TestCluster, node: usize) -> u64 {
     retained_sql_log_id(cluster, node).index
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn superseded_leader_stops_replication_before_truncating_its_uncommitted_suffix() {
+// The pinned engine reports metrics after sending its response. Hold that
+// publication event itself: an already-ready response need not wake anyone.
+// No engine state or published metrics are replaced by this scheduling fault.
+struct PublicationHold {
+    log_cut: Option<(PathBuf, u64)>,
+    metrics_prefix: String,
+    before_publication: tokio::sync::Notify,
+    deadline: tokio::time::Instant,
+    held: AtomicBool,
+    released: StdMutex<bool>,
+    release: Condvar,
+}
+
+impl PublicationHold {
+    fn before_publication(&self) {
+        let released = self.released.lock().expect("publication hold mutex");
+        if *released {
+            return;
+        }
+        if let Some((path, truncated_end)) = &self.log_cut {
+            if retained_sql_log_id_from(path, None).index != *truncated_end {
+                return;
+            }
+        }
+        self.held.store(true, Ordering::Release);
+        self.before_publication.notify_one();
+        let (released, _) = self
+            .release
+            .wait_timeout_while(
+                released,
+                self.deadline
+                    .saturating_duration_since(tokio::time::Instant::now()),
+                |released| !*released,
+            )
+            .expect("publication hold wait");
+        let completed = *released;
+        // Do not poison the release guard if the fixture watchdog expires.
+        drop(released);
+        assert!(
+            completed,
+            "publication hold exceeded the shared recovery deadline"
+        );
+    }
+
+    fn release(&self) {
+        *self.released.lock().expect("publication hold mutex") = true;
+        self.release.notify_all();
+    }
+}
+
+struct ReleasePublication(Arc<PublicationHold>);
+
+impl Drop for ReleasePublication {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+async fn receive_response<F: Future>(
+    response: F,
+    publication: &Arc<PublicationHold>,
+    deadline: tokio::time::Instant,
+) -> F::Output {
+    let response = tokio::time::timeout_at(deadline, response)
+        .await
+        .expect("configured higher-vote peer completes conflict handling");
+    tokio::time::timeout_at(deadline, async {
+        while !publication.held.load(Ordering::Acquire) {
+            publication.before_publication.notified().await;
+        }
+    })
+    .await
+    .expect("engine acknowledges the publication hold within the shared deadline");
+    response
+}
+
+// Openraft 2e1fb7455752455a3505b354d003d6effa55985d emits this event
+// immediately before tx_metrics.send(). An engine update that changes the event
+// must update this fixture: a missing hold fails within the shared deadline.
+// This acknowledgment also lets the channel regression force a response to
+// arrive before its first receiver poll, without relying on thread timing.
+struct PublicationEvents(Arc<StdMutex<Option<Arc<PublicationHold>>>>);
+
+impl tracing::Subscriber for PublicationEvents {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.is_event() && metadata.target() == "openraft::core::raft_core"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        unreachable!("the publication observer enables events only")
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let publication = self.0.lock().expect("publication observer mutex").clone();
+        if let Some(publication) = publication {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            if message.0.starts_with(&publication.metrics_prefix) {
+                publication.before_publication();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn publication_hold_survives_response_before_first_poll() {
+    let deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
+    let publication = Arc::new(PublicationHold {
+        // This regression isolates the exact channel schedule. The full
+        // stepdown fixture below also witnesses real SQL and Raft metrics.
+        log_cut: None,
+        metrics_prefix: "report_metrics: ready-response".to_owned(),
+        before_publication: tokio::sync::Notify::new(),
+        deadline,
+        held: AtomicBool::new(false),
+        released: StdMutex::new(false),
+        release: Condvar::new(),
+    });
+    let _release_publication = ReleasePublication(publication.clone());
+    let dispatch = tracing::Dispatch::new(PublicationEvents(Arc::new(StdMutex::new(Some(
+        publication.clone(),
+    )))));
+    let (respond, response) = tokio::sync::oneshot::channel();
+    let (publish, mut published) = tokio::sync::watch::channel(false);
+    let responder = std::thread::spawn(move || {
+        // The pinned call_core sends its request before polling this exact
+        // channel type. Deschedule the receiver until the sender reaches
+        // its publication event: send() cannot invoke an unregistered wake.
+        respond.send(()).expect("response receiver remains alive");
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::debug!(target: "openraft::core::raft_core", "report_metrics: ready-response");
+        });
+        publish
+            .send(true)
+            .expect("publication receiver remains alive");
+    });
+    tokio::time::timeout_at(deadline, publication.before_publication.notified())
+        .await
+        .expect("sender reached publication before the first receiver poll");
+    receive_response(response, &publication, deadline)
+        .await
+        .expect("response was sent before its first poll");
+    assert!(
+        publication.held.load(Ordering::Acquire),
+        "an immediately ready response must still hold publication"
+    );
+    let observation = published.wait_for(|published| *published);
+    tokio::pin!(observation);
+    assert!(
+        futures_util::poll!(observation.as_mut()).is_pending(),
+        "publication remains pending after the already-ready response"
+    );
+    publication.release();
+    tokio::time::timeout_at(deadline, observation)
+        .await
+        .expect("publication completes within the same deadline")
+        .expect("publication sender remains alive until it publishes");
+    responder.join().expect("publication sender completes");
+}
+
+thread_local! {
+    static PUBLICATION_DISPATCH: RefCell<Option<tracing::dispatcher::DefaultGuard>> =
+        const { RefCell::new(None) };
+}
+
+#[test]
+fn superseded_leader_stops_replication_before_truncating_its_uncommitted_suffix() {
+    let publication = Arc::new(StdMutex::new(None));
+    let dispatch = tracing::Dispatch::new(PublicationEvents(publication.clone()));
+    let worker_dispatch = dispatch.clone();
+    // A task-local subscriber would miss events on the engine's spawned
+    // tasks. Install this observer only on this fixture's runtime threads.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .on_thread_start(move || {
+            PUBLICATION_DISPATCH.with(|guard| {
+                *guard.borrow_mut() = Some(tracing::dispatcher::set_default(&worker_dispatch));
+            });
+        })
+        .on_thread_stop(|| {
+            PUBLICATION_DISPATCH.with(|guard| {
+                guard.borrow_mut().take();
+            });
+        })
+        .build()
+        .expect("stepdown fixture runtime");
+    tracing::dispatcher::with_default(&dispatch, || {
+        runtime.block_on(stepdown_scenario(publication));
+    });
+}
+
+async fn stepdown_scenario(publication_events: Arc<StdMutex<Option<Arc<PublicationHold>>>>) {
     let _election_permit = ELECTION_AND_SNAPSHOT_TEST_PERMIT
         .acquire()
         .await
@@ -259,30 +473,58 @@ async fn superseded_leader_stops_replication_before_truncating_its_uncommitted_s
         encode_bounded(&rpc).expect("bounded conflicting append"),
     )
     .unwrap();
-    let response = tokio::time::timeout(
-        RECOVERY_TIMEOUT,
-        store.rpc_handler().handle(successor_id, envelope),
+    let stepdown_deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
+    let publication = Arc::new(PublicationHold {
+        log_cut: Some((
+            cluster
+                ._directory
+                .path()
+                .join(format!("node-{leader}.sqlite")),
+            tail - 1,
+        )),
+        metrics_prefix: format!(
+            "report_metrics: Metrics{{id:{}, Follower, term:{successor_term},",
+            store.status().node_id
+        ),
+        before_publication: tokio::sync::Notify::new(),
+        deadline: stepdown_deadline,
+        held: AtomicBool::new(false),
+        released: StdMutex::new(false),
+        release: Condvar::new(),
+    });
+    // Unwind must release the engine even when an assertion detects the race.
+    let _release_publication = ReleasePublication(publication.clone());
+    *publication_events
+        .lock()
+        .expect("publication observer mutex") = Some(publication.clone());
+    let handler = store.rpc_handler();
+    let response = receive_response(
+        handler.handle(successor_id, envelope),
+        &publication,
+        stepdown_deadline,
     )
-    .await
-    .expect("configured higher-vote peer completes conflict handling");
+    .await;
     let decoded: Result<
         AppendEntriesResponse<SessionConsensusNodeId>,
         RaftError<SessionConsensusNodeId>,
     > = decode_bounded(&response.result.expect("scoped append transport")).unwrap();
     assert_eq!(decoded, Ok(AppendEntriesResponse::Conflict));
     assert_eq!(retained_sql_log_end(&cluster, leader), tail - 1);
-    // Openraft publishes the successor term and non-leader state from its own
-    // engine task; a single immediate status read can observe the pre-stepdown
-    // snapshot. Wait on the engine's status change within the existing recovery
-    // bound instead of polling, and keep both original assertions exact.
-    tokio::time::timeout(
-        RECOVERY_TIMEOUT,
-        store.wait_for_status_for_test(|status| {
-            status.term > term && status.leader_id != Some(status.node_id)
-        }),
-    )
-    .await
-    .expect("stepdown publishes the higher term and non-leader state before the recovery bound");
+    assert!(
+        publication.held.load(Ordering::Acquire),
+        "the actual publication event holds the engine before metrics publication"
+    );
+    let stepdown = async {
+        assert!(store.status().term > term);
+        assert_ne!(store.status().leader_id, Some(store.status().node_id));
+    };
+    tokio::pin!(stepdown);
+    assert!(
+        futures_util::poll!(stepdown.as_mut()).is_pending(),
+        "post-stepdown assertions wait while publication is held"
+    );
+    publication.release();
+    stepdown.await;
 
     // The removed suffix stays absent during the original one-second
     // negative guard. It is not a timeout for recovery or a storage exemption.
