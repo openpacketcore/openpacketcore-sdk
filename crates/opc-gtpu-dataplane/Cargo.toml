@@ -46,7 +46,7 @@ aya-obj = { version = "0.3" }
 sha1 = { workspace = true }
 rustix = { version = "1", features = ["fs", "process", "system", "thread", "time"] }
 # recvmsg/IP_PKTINFO provenance extraction for the reassembly consumer.
-nix = { workspace = true, features = ["net", "socket", "uio"] }
+nix = { workspace = true, features = ["event", "net", "socket", "uio"] }
 
 [dev-dependencies]
 opc-identity = { path = "../opc-identity", version = "0.2.0" }
@@ -69,6 +69,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # setns() for the privileged multi-netns integration test.
 nix = { workspace = true, features = ["net", "sched", "socket", "uio"] }
+# `AsyncFd` for the readiness-source integration test.
+tokio = { workspace = true, features = ["net"] }
 opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0", features = ["scope-store"] }
 
 [lints]

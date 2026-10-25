@@ -161,6 +161,53 @@ check adds the existing IPv4 configuration map to the downlink program's exact
 map-identity set; map layouts, pin inventory and frozen historical objects do
 not change.
 
+## Readiness without polling
+
+`GtpuControlPort::downlink_readiness` returns a `GtpuControlReadiness` for one
+control port registration. The port keeps ownership of every receive socket:
+the source owns only a private epoll instance in which the backend-owned
+UDP/2152, UDP/2153 and UDP/2154 queues are registered, and its `AsFd`
+descriptor is that epoll instance, not a socket. A consumer therefore cannot
+read, close or duplicate a socket through it, and cannot use it to bypass
+attachment invalidation.
+
+```text
+let readiness = port.downlink_readiness()?;
+// The handle must outlive every epoll/AsyncFd registration that borrows its
+// descriptor: `as_fd()` borrows from the handle and does not keep it alive.
+let async_fd = tokio::io::unix::AsyncFd::new(readiness.as_fd())?; // the SDK epoll
+loop {
+    let mut guard = async_fd.readable().await?;
+    // Consume the SDK notification, then drain with the production consumer.
+    let ready = readiness.try_readiness()?;
+    while port.try_receive_downlink(65_507)?.is_some() {}
+    guard.clear_ready();
+}
+```
+
+Readiness is advisory and value-free: it consumes no datagram, grants no
+forwarding or peer authority, and does not change the service order documented
+below (the shared queue first for at most eight datagrams, then one turn for
+the hand-off queues, alternating). An empty readiness snapshot never proves the
+queues are empty. Every wake from the exposed descriptor must be consumed with
+`try_readiness` (which names the ready queue classes) or `wait(timeout)`;
+`try_readiness` never blocks and `wait` blocks for a bounded interval.
+
+The source is bound to one registration. Attachment removal, replacement,
+fencing or a failed readback revokes every outstanding source: readiness and
+receive return `Unavailable`, and the source never becomes readable again.
+Revocation is passive and observed lazily: it sets a flag and does not wake the
+epoll, so a blocked `wait(long_timeout)` returns `Unavailable` only on its next
+return (at the latest when the timeout expires), and the exposed descriptor is
+not a revocation wakeup. An `AsyncFd`/epoll loop can therefore sleep
+indefinitely after revocation. After each wake or timeout, call
+`try_readiness`, or drive `try_receive_downlink` (it re-validates the
+registration and returns `Unavailable`); stop waiting on readiness and surface
+`Unavailable` to the caller. Do not treat readiness silence as a liveness
+signal. Drop the source and reopen the port after a fresh exact registration.
+Backends without backend-owned sockets inherit the default `Unsupported`
+result.
+
 ## Backend-authoritative downlink consumer
 
 `GtpuControlPort::try_receive_downlink` is the production consumer for G-PDUs

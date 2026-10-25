@@ -9,6 +9,13 @@
 #[cfg(all(test, target_os = "linux"))]
 mod native_tests;
 
+#[cfg(target_os = "linux")]
+mod readiness;
+#[cfg(target_os = "linux")]
+pub(crate) use readiness::ReadinessInner;
+#[cfg(target_os = "linux")]
+pub use readiness::{GtpuControlQueue, GtpuControlReadiness, GtpuDownlinkReadiness};
+
 #[cfg(any(test, target_os = "linux"))]
 use std::sync::Arc;
 use std::{fmt, net::SocketAddrV4, num::NonZeroU32};
@@ -119,6 +126,46 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
         maximum_bytes: usize,
     ) -> Result<Option<crate::GtpuDownlinkEvent>, GtpuControlPortError> {
         let _ = maximum_bytes;
+        Err(GtpuControlPortError::Unsupported)
+    }
+
+    /// Return an SDK-owned readiness source for the downlink queues this port
+    /// serves.
+    ///
+    /// The port keeps ownership of every receive socket. The source owns only
+    /// a private epoll instance in which those sockets are registered; its
+    /// [`std::os::fd::AsFd`] descriptor is that epoll instance, not a socket.
+    /// A consumer can therefore wait with `epoll(7)`,
+    /// `tokio::io::unix::AsyncFd`, or [`GtpuControlReadiness::wait`] without
+    /// polling, and cannot read, close or duplicate a socket through it.
+    ///
+    /// Readiness is advisory and value-free: it consumes no datagram, makes no
+    /// forwarding decision and changes nothing in [`Self::try_receive_downlink`].
+    /// The queue service order documented there is unchanged: the shared
+    /// UDP/2152 queue first for at most eight datagrams, then one turn for the
+    /// UDP/2153 and UDP/2154 hand-off queues, alternating between them. After
+    /// the source reports readiness, consume that notification with
+    /// [`GtpuControlReadiness::try_readiness`] (it also names the ready queue
+    /// classes) and then drain with `try_receive_downlink` as usual; an empty
+    /// readiness snapshot never proves the queues are empty.
+    ///
+    /// The source is bound to this port registration. When the attachment is
+    /// removed, replaced, fenced, or its readback fails, the port revokes every
+    /// outstanding source: readiness and receive return
+    /// [`GtpuControlPortError::Unavailable`] and the source never becomes
+    /// readable again. Drop it and reopen the port through
+    /// [`crate::GtpuDataplaneBackend::open_gtpu_control_port`] after a fresh
+    /// exact registration. Each call returns an independent source; consumers
+    /// should request one source per registration and keep it for its lifetime.
+    ///
+    /// The default implementation belongs to ports without backend state and
+    /// returns [`GtpuControlPortError::Unsupported`] without binding anything.
+    ///
+    /// # Errors
+    /// Refuses a busy or retired attachment, an unverifiable socket binding, a
+    /// missing backend-owned queue, or an epoll allocation failure.
+    #[cfg(target_os = "linux")]
+    fn downlink_readiness(&self) -> Result<GtpuControlReadiness, GtpuControlPortError> {
         Err(GtpuControlPortError::Unsupported)
     }
 
