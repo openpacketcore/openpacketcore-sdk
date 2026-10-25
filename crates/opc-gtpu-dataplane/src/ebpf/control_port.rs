@@ -141,6 +141,10 @@ pub(super) struct ControlSocketState {
     /// Per-destination inner fragmentation budgets and Identification
     /// sequences of this registration.
     inner_fragment_budget: crate::reassembly::InnerFragmentBudget,
+    /// Readiness sources opened for this registration's queues. Weak: the
+    /// consumer owns its source; the port only revokes it when the queues are
+    /// withdrawn, so a late open cannot revive an old one.
+    readiness: Vec<Weak<crate::control_port::ReadinessInner>>,
 }
 
 impl ControlSocketState {
@@ -151,10 +155,9 @@ impl ControlSocketState {
 
     #[cfg(test)]
     pub(super) fn with_inner_fragment_limit(limit: crate::GtpuInnerFragmentRateLimit) -> Self {
-        Self {
-            inner_fragment_budget: crate::reassembly::InnerFragmentBudget::new(limit),
-            ..Self::default()
-        }
+        let mut state = Self::default();
+        state.inner_fragment_budget = crate::reassembly::InnerFragmentBudget::new(limit);
+        state
     }
 
     #[cfg(test)]
@@ -172,11 +175,30 @@ impl ControlSocketState {
     /// Keep counters, rate limits and fragment Identification sequences: a
     /// transient read failure must not reset their per-registration scope.
     fn invalidate_queues(&mut self) {
+        // Revoke before the sockets close: a wait that already returned events
+        // must observe the revocation, not a stale registration.
+        self.revoke_readiness();
         self.socket = None;
         self.too_big_socket = None;
         self.inner_fragment_socket = None;
         self.generation = Arc::new(());
         self.service_order = DownlinkServiceOrder::default();
+    }
+}
+
+impl ControlSocketState {
+    fn revoke_readiness(&mut self) {
+        for readiness in self.readiness.drain(..) {
+            if let Some(readiness) = readiness.upgrade() {
+                readiness.revoke();
+            }
+        }
+    }
+}
+
+impl Drop for ControlSocketState {
+    fn drop(&mut self) {
+        self.revoke_readiness();
     }
 }
 
@@ -453,6 +475,48 @@ impl GtpuControlPort for BackendControlPort {
                 .as_ref()
                 .map_or(0, |socket| u64::from(socket.queue_drops()));
             Ok(counters)
+        })
+    }
+
+    fn downlink_readiness(
+        &self,
+    ) -> Result<crate::control_port::GtpuControlReadiness, GtpuControlPortError> {
+        self.with_attachment(|_, state, _| {
+            use crate::control_port::{GtpuControlQueue, GtpuControlReadiness};
+
+            // The opener binds all three queues; a missing one means the
+            // registration is not in the state that published this port.
+            let shared = state
+                .socket
+                .as_ref()
+                .ok_or(GtpuControlPortError::Unavailable)?;
+            let packet_too_big = state
+                .too_big_socket
+                .as_ref()
+                .ok_or(GtpuControlPortError::Unavailable)?;
+            let inner_fragment = state
+                .inner_fragment_socket
+                .as_ref()
+                .ok_or(GtpuControlPortError::Unavailable)?;
+            let readiness = GtpuControlReadiness::new(
+                [
+                    (GtpuControlQueue::Shared, shared.readiness_fd()),
+                    (
+                        GtpuControlQueue::PacketTooBig,
+                        packet_too_big.readiness_fd(),
+                    ),
+                    (
+                        GtpuControlQueue::InnerFragment,
+                        inner_fragment.readiness_fd(),
+                    ),
+                ],
+                None,
+            )?;
+            state
+                .readiness
+                .retain(|readiness| readiness.upgrade().is_some());
+            state.readiness.push(readiness.weak_inner());
+            Ok(readiness)
         })
     }
 }
@@ -909,6 +973,40 @@ mod tests {
         assert_eq!(
             port.try_receive_datagram(8).unwrap_err(),
             GtpuControlPortError::Unavailable
+        );
+    }
+
+    /// The readiness source names exactly the three queues of the bounded
+    /// downlink service order and cannot change it: the shared queue keeps its
+    /// eight-datagram run ahead of both hand-off queues, which alternate.
+    #[test]
+    fn readiness_queue_classes_follow_the_bounded_downlink_service_order() {
+        use crate::control_port::GtpuControlQueue;
+
+        assert_eq!(SHARED_QUEUE_RUN, 8);
+        assert_eq!(
+            GtpuControlQueue::ALL,
+            [
+                GtpuControlQueue::Shared,
+                GtpuControlQueue::PacketTooBig,
+                GtpuControlQueue::InnerFragment,
+            ],
+            "readiness queues keep the downlink priority order"
+        );
+        // The default hand-off turn starts with the over-MTU queue and
+        // alternates; readiness reports the same two classes.
+        assert_eq!(HandOffQueue::default(), HandOffQueue::PacketTooBig);
+        assert_eq!(
+            HandOffQueue::PacketTooBig.other(),
+            HandOffQueue::InnerFragment
+        );
+        // A mask that reports every queue ready is advisory: the service order
+        // still serves a full shared run first.
+        let mut queues = ThreeQueues::new(1_000, 3, 3);
+        let served = queues.drain(usize::from(SHARED_QUEUE_RUN));
+        assert!(
+            served.iter().all(|(_, steered)| !steered),
+            "shared queue keeps its bounded run whatever readiness reports"
         );
     }
 

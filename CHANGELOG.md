@@ -220,6 +220,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ownership, effect classification, request identity and wire format are
   unchanged; `into_error` recovers exactly the previous error. Resolved
   rejections and lease deferrals carry no diagnostic. Refs #1129.
+- `opc-gtpu-dataplane`: expose `control_port::GtpuControlPort::downlink_readiness`,
+  an SDK-owned readiness source for the backend-owned downlink queues. The
+  returned `GtpuControlReadiness` owns a private epoll instance in which the
+  port's UDP/2152, UDP/2153 and UDP/2154 sockets are registered; its `AsFd`
+  descriptor is that epoll instance, never a receive socket, so a consumer can
+  wait with `epoll(7)` or `tokio::io::unix::AsyncFd` instead of polling and
+  cannot read, close, duplicate or use it to bypass attachment invalidation.
+  Readiness is advisory: it consumes no datagram and does not change the
+  existing bounded service order (shared queue first for eight datagrams, then
+  the alternating hand-off queues). Attachment removal, replacement, fencing or
+  readback failure revokes every outstanding source, after which it reports
+  `Unavailable` and never becomes readable again. Ports without backend-owned
+  sockets keep the default `Unsupported` result. Refs #1021.
 
 - `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
   verification time for certificate validity checks while preserving SPIFFE ID,
