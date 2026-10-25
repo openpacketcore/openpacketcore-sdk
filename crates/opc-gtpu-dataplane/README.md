@@ -87,9 +87,11 @@ The [`control_port` module](docs/control-port.md) adds bounded control
 datagrams and response plans on the existing Linux IPv4 reassembly socket.
 One consumer shares its UDP/2152 queue with user-packet reassembly. Plans
 preserve message-specific response tuples and require the exact receiving
-socket; admission and aggregate rate policy remain with the caller. This
-does not yet expose Linux kernel-GTP sockets or qualify backend parity,
-End Marker ordering or N3 forwarding.
+socket; admission and aggregate rate policy remain with the caller. The
+Linux kernel-GTP backend exposes the userspace socket retained by an ordinary
+creation for unknown-TEID/non-G-PDU observations and Error Indication plans
+(TS 29.281 7.3.1); kernel-owned recoverable attachments remain unsupported.
+End Marker ordering and N3 forwarding parity are still unqualified.
 On an eBPF attachment, `try_receive_downlink` on the same port is the
 backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
 it authorizes against the backend's own grouped and v5 maps (commit read
@@ -3206,9 +3208,11 @@ sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 carg
 ```
 
 The backend trait exposes `open_gtpu_control_port` for eBPF attachments with
-an IPv4 endpoint. Handles share one queue and lose access on removal,
-replacement, backend loss or observed hook loss. Linux kernel/mock adapters
-return an exact unsupported result. See the [control-port contract](docs/control-port.md)
+an IPv4 endpoint and for Linux kernel-GTP userspace-socket attachments. The
+former lose access on removal, replacement, backend loss or observed hook
+loss; the latter are retired on removal, replacement, adoption or socket
+generation change, and a kernel-owned recoverable attachment returns an exact
+unsupported result. See the [control-port contract](docs/control-port.md)
 for socket lifetime, response budgets and the remaining backend limitations.
 Validated nonzero unknown-TEID G-PDUs can reach only the configured local
 control endpoint without decapsulation. Retained inconsistent ownership stays
