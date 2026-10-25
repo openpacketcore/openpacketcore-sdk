@@ -1784,11 +1784,11 @@ mod tests {
                 ],
                 DecodeContext::default(),
             )
-            .expect("structural key-bearing PDU"),
+            .unwrap(),
             EncodeContext::default(),
         )
-        .expect("encode");
-        let pdu = decode(&wire, DecodeContext::default()).expect("decode");
+        .unwrap();
+        let pdu = decode(&wire, DecodeContext::default()).unwrap();
         let held: &crate::SensitiveBytes = &pdu.security_key_values()[0];
         assert_eq!(held.as_slice(), &[0x5a; 32]);
         assert!(pdu.security_key_values().len() == 1);
@@ -1802,7 +1802,7 @@ mod tests {
                     .0
                     .iter()
                     .find(|ie| ie.id == 94)
-                    .expect("key IE");
+                    .unwrap();
                 assert!(placeholder.value.as_bytes().is_empty());
             }
             _ => panic!("expected key-bearing InitialContextSetupRequest"),

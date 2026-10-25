@@ -185,6 +185,7 @@ mod test_audit {
 
     #[test]
     fn from_bytes_mut_is_zeroized_too() {
+        let _guard = lock();
         let value = SensitiveBytes::from_bytes_mut(bytes::BytesMut::from(&[0x11; 16][..]));
         assert_eq!(value.len(), 16);
         drop(value);
@@ -194,6 +195,7 @@ mod test_audit {
 
     #[test]
     fn from_vec_copies_and_clears() {
+        let _guard = lock();
         let value = SensitiveBytes::from_vec(vec![0x22; 24]);
         assert_eq!(value.len(), 24);
     }

@@ -52,7 +52,7 @@ use bytes::Bytes;
 use bytes::BytesMut;
 use opc_protocol::SensitiveBytes;
 use thiserror::Error;
-#[cfg_attr(not(any(target_os = "linux", test)), allow(unused_imports))]
+#[cfg(target_os = "linux")]
 use zeroize::Zeroize;
 #[cfg_attr(not(any(target_os = "linux", test)), allow(unused_imports))]
 use zeroize::Zeroizing;
