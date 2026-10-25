@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: `LinuxGtpuDataplaneBackend` now opens an
+  attachment-bound control port over the userspace UDP/2152 socket retained by
+  an ordinary creation. The Linux `gtp` driver passes non-G-PDUs and G-PDUs
+  whose TEID matches no PDP context back to that socket (the TS 29.281 7.3.1
+  unknown-tunnel trigger), so `try_receive_downlink` reports them as
+  value-free `UnknownTunnel`/`Control` observations and one consuming
+  `unknown_tunnel_error` plan sends an Error Indication through the same
+  retained socket with the Peer Address, TEID Data I and triggering UDP
+  source-port fields. Receipt grants no tunnel or peer authority; the caller
+  keeps tunnel lookup, peer admission, budgets and answer policy. A
+  kernel-owned recoverable attachment returns
+  `gtpu_control_port_kernel_owned`, no second socket is ever bound, and
+  removal, replacement, adoption or a descriptor generation change retires
+  old receive capabilities and plans. Refs #1084.
+
 - `opc-session-net`: `PersistentSessionConsumerConfig::with_cooldown_admission`
   selects the explicit reconnect-cooldown admission policy for a persistent
   consumer client. The default `ReconnectCooldownPolicy::Wait` preserves the
