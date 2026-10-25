@@ -1224,7 +1224,7 @@ pub(crate) struct Opening {
     binding: Binding,
     limits: Limits,
     control: IoControl,
-    lock: File,
+    lock: RootLock,
     selected: Option<checkpoint::Anchor>,
     proof: Proof,
     snapshots: Vec<CurrentSnapshot>,
@@ -1244,8 +1244,7 @@ impl Opening {
         if !fs::symlink_metadata(directory)?.is_dir() {
             return Err(invalid_data("private WAL opening directory is invalid"));
         }
-        let lock = file_read(&directory.join("LOCK"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        let lock = RootLock::acquire_existing(&directory.join("LOCK"))?;
         let mut opening = Self {
             directory: directory.to_path_buf(),
             binding,

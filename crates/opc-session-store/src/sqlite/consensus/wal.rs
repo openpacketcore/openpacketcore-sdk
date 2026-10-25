@@ -811,8 +811,7 @@ impl Wal {
         let directory_pin = owner::pin_directory(directory)?;
         let pinned_path = owner::directory_path(&directory_pin);
         let directory = pinned_path.as_path();
-        let lock = file_create(&directory.join("LOCK"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        let lock = RootLock::acquire(&directory.join("LOCK"))?;
         lock.sync_all()?;
         let basis_path = directory.join("basis.sqlite");
         file_create(&basis_path)?.sync_all()?;
@@ -886,8 +885,7 @@ impl Wal {
         if !fs::symlink_metadata(directory)?.is_dir() {
             return Err(invalid_data("private WAL directory is invalid"));
         }
-        let lock = file_read(&directory.join("LOCK"))?;
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        let lock = RootLock::acquire_existing(&directory.join("LOCK"))?;
         let anchor = checkpoint::read(directory, binding, limits)?;
         let conn = match &anchor {
             Some(anchor) => anchor.load_basis(directory, binding)?,
@@ -1505,7 +1503,7 @@ impl Drop for Group {
 
 struct Disk {
     directory: PathBuf,
-    _lock: File,
+    _lock: RootLock,
     file: File,
     binding: [u8; 32],
     segment: u64,
@@ -2306,6 +2304,51 @@ fn create_segment(
     Ok(file)
 }
 
+/// Exclusive kernel `flock` on the store root `LOCK` file.
+///
+/// The lock is released explicitly before the descriptor closes. `flock`
+/// locks belong to the open file description, so a duplicated or inherited
+/// descriptor can outlive this owner's handle: closing only this handle would
+/// leave the root locked until every duplicated description is gone, blocking
+/// a successor reopen after a clean release.
+pub(super) struct RootLock {
+    file: Option<File>,
+}
+
+impl RootLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let file = file_create(path)?;
+        Self::lock(file)
+    }
+
+    fn acquire_existing(path: &Path) -> io::Result<Self> {
+        let file = file_read(path)?;
+        Self::lock(file)
+    }
+
+    fn lock(file: File) -> io::Result<Self> {
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        Ok(Self { file: Some(file) })
+    }
+
+    fn sync_all(&self) -> io::Result<()> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("root lock descriptor is already released"))?
+            .sync_all()
+    }
+}
+
+impl Drop for RootLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            // Release the lock even if duplicated descriptors remain alive; a
+            // failed unlock is not recoverable at drop, but it must not panic.
+            let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
+        }
+    }
+}
+
 fn file_create(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
@@ -2581,7 +2624,7 @@ fn recover(
     binding: Binding,
     limits: Limits,
     conn: &Connection,
-    lock: File,
+    lock: RootLock,
     control: &IoControl,
     anchor: Option<checkpoint::Anchor>,
 ) -> io::Result<(Disk, usize)> {
@@ -3052,7 +3095,7 @@ impl RecoveryAudit {
     fn finish(
         self,
         directory: &Path,
-        lock: File,
+        lock: RootLock,
         control: &IoControl,
     ) -> io::Result<(Disk, usize)> {
         let Self {
@@ -3140,5 +3183,33 @@ impl RecoveryAudit {
             },
             history_bytes,
         ))
+    }
+}
+
+#[cfg(test)]
+mod root_lock_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_release_releases_root_lock_despite_duplicated_descriptor() {
+        let directory = tempfile::tempdir().expect("root lock workspace");
+        let path = directory.path().join("LOCK");
+        let lock = RootLock::acquire(&path).expect("acquire root lock");
+        let duplicate = lock
+            .file
+            .as_ref()
+            .expect("held root lock")
+            .try_clone()
+            .expect("duplicate root lock descriptor");
+
+        // Without an explicit unlock, flock would stay held through the
+        // duplicate open file description after the owner closes its handle.
+        drop(lock);
+
+        let probe = file_read(&path).expect("probe root lock file");
+        rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("successor must acquire the root lock after a clean release");
+
+        drop(duplicate);
     }
 }
