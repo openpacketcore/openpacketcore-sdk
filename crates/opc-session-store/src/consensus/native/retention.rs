@@ -157,13 +157,23 @@ pub(crate) const ORDINARY_RECEIPT_RETENTION_ACTIVE_AFTER: u64 = 65_536;
 /// A retry replays the original command bytes, so `command.logical_time` is
 /// the submission time that was committed with the receipt. A retry whose
 /// committed submission time is at or before `frontiers.logical_time - window`
-/// is outside retention and receives a typed outcome-unavailable answer
-/// instead of being executed again.
+/// (the boundary is inclusive) is outside retention and receives a typed
+/// outcome-unavailable answer instead of being executed again.
 pub(crate) const ORDINARY_RECEIPT_RETENTION_WINDOW_SECONDS: i64 = 120;
 
 /// Hard retained-receipt admission bound before the fail-closed capacity
-/// answer. Kept below [`super::validation::MAX_ITEMS`] so receipt rows can
-/// never reach the fixed image admission cap.
+/// answer. Kept below [`super::validation::MAX_ITEMS`] so new bindings cannot
+/// grow the receipt map to the fixed image admission cap.
+///
+/// The bound is enforced on every ordinary apply while the rule is active,
+/// including mid-delta: a command is refused whenever the resident map is at or
+/// above this bound, even when expired rows are reclaimable at the next
+/// publication. Reclamation happens only at publication, so "reclaimable
+/// exists" is not permission to grow the current delta; a committed delta has
+/// no RPC cap, and a window-crossing batch must not be able to bypass the
+/// bound. A rejected command may still advance the committed logical clock
+/// (the pre-existing deterministic `clock_response` behavior), but it never
+/// binds a receipt.
 pub(crate) const MAX_RETAINED_ORDINARY_RECEIPTS: usize = 1_044_480;
 
 /// Ordinary-command receipt retention rule, derived only from committed state.
@@ -222,12 +232,10 @@ impl OrdinaryReceiptRetention {
 /// publishing 65,536 commands.
 pub(super) fn ordinary_receipt_retention() -> OrdinaryReceiptRetention {
     #[cfg(test)]
-    if let Some((active_after, window_seconds)) = tests_support::ordinary_receipt_override() {
-        return OrdinaryReceiptRetention::new(
-            active_after,
-            window_seconds,
-            MAX_RETAINED_ORDINARY_RECEIPTS,
-        );
+    if let Some((active_after, window_seconds, capacity)) =
+        tests_support::ordinary_receipt_override()
+    {
+        return OrdinaryReceiptRetention::new(active_after, window_seconds, capacity);
     }
     OrdinaryReceiptRetention::new(
         ORDINARY_RECEIPT_RETENTION_ACTIVE_AFTER,
@@ -311,12 +319,13 @@ pub(crate) mod tests_support {
     }
 
     thread_local! {
-        // Ordinary-receipt active-sequence threshold and logical-time window.
-        static ORDINARY_RECEIPT: Cell<Option<(u64, i64)>> = const { Cell::new(None) };
+        // Ordinary-receipt active-sequence threshold, logical-time window and
+        // admission capacity.
+        static ORDINARY_RECEIPT: Cell<Option<(u64, i64, usize)>> = const { Cell::new(None) };
     }
 
     pub(crate) struct OrdinaryReceiptOverride {
-        previous: Option<(u64, i64)>,
+        previous: Option<(u64, i64, usize)>,
     }
 
     impl Drop for OrdinaryReceiptOverride {
@@ -332,13 +341,28 @@ pub(crate) mod tests_support {
         active_after: u64,
         window_seconds: i64,
     ) -> OrdinaryReceiptOverride {
+        override_ordinary_receipt_retention_with_capacity_for_test(
+            active_after,
+            window_seconds,
+            super::MAX_RETAINED_ORDINARY_RECEIPTS,
+        )
+    }
+
+    /// Reduced rule including the admission capacity, so a regression can drive
+    /// the capacity answer without publishing a million receipts.
+    pub(crate) fn override_ordinary_receipt_retention_with_capacity_for_test(
+        active_after: u64,
+        window_seconds: i64,
+        capacity: usize,
+    ) -> OrdinaryReceiptOverride {
         assert!(window_seconds > 0, "a test receipt window must be positive");
-        let previous =
-            ORDINARY_RECEIPT.with(|value| value.replace(Some((active_after, window_seconds))));
+        assert!(capacity > 0, "a test receipt capacity must be positive");
+        let previous = ORDINARY_RECEIPT
+            .with(|value| value.replace(Some((active_after, window_seconds, capacity))));
         OrdinaryReceiptOverride { previous }
     }
 
-    pub(super) fn ordinary_receipt_override() -> Option<(u64, i64)> {
+    pub(super) fn ordinary_receipt_override() -> Option<(u64, i64, usize)> {
         ORDINARY_RECEIPT.with(Cell::get)
     }
 }

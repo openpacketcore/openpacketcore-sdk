@@ -267,12 +267,15 @@ and duplicate-build degradation are documented in the `opc-session-store`
 README. The separate key cap is unchanged. Ordinary command receipts use a
 bounded retention rule derived only from committed state: below committed
 application sequence 65,536 every receipt is retained exactly as before, and
-once active a receipt whose committed response logical time is older than the
-retained 120-second logical-time window is retired. An exact retry of a
-retired command receives the typed outcome-unavailable answer (the command is
-never executed again); an in-window retry replays the original committed
-outcome. A capacity backstop answers with a retryable typed refusal before the
-fixed image cap can be reached. The committed application sequence and logical
+once active a receipt whose committed response logical time is at or before
+`frontiers.logical_time - 120 seconds` (inclusive boundary) is retired. An
+exact retry of a retired command receives the typed outcome-unavailable answer
+(the command is never executed again); an in-window retry replays the original
+committed outcome. A capacity backstop refuses every new binding while the
+resident receipt map is at or above its capacity bound, including mid-delta, so
+new bindings cannot grow the map to the fixed image cap; refusals are retryable,
+typed, effect-free and binding-free, and may advance the committed logical clock
+(the pre-existing deterministic `clock_response` behavior). The committed application sequence and logical
 time already carried by every frontier decide the rule, so every voter retires
 identically and no new persisted field or format boundary is added; the
 portable SQL projection and prepared SQL base simply carry the retained map.

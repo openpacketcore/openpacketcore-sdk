@@ -71,13 +71,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed-state retention rule instead of accumulating for the life of the
   store. The rule stays inert below committed application sequence 65,536
   (byte-identical behavior); once active, receipts whose committed response
-  logical time is older than the 120-second retained logical-time window are
-  retired on publication. Exact in-window retries replay the original outcome;
-  out-of-window retries receive the typed
+  logical time is at or before `frontiers.logical_time - 120 seconds`
+  (inclusive boundary) are retired on publication. Exact in-window retries
+  replay the original outcome; out-of-window retries receive the typed
   `BackendOperationOutcomeUnavailable`/`CasIdempotencyOutcomeUnavailable`
-  answer and are never executed again. A retryable typed capacity refusal
-  protects the 1,048,576-row `MAX_ITEMS` admission cap when retained outcomes
-  fill the window before committed logical time advances. The rule derives
+  answer and are never executed again. A retryable typed capacity refusal is
+  returned for every new binding while the resident receipt map is at or above
+  its capacity bound, including mid-delta, so new bindings cannot grow the map
+  to the 1,048,576-row `MAX_ITEMS` admission cap; refusals are effect-free,
+  binding-free and may advance the committed logical clock. The rule derives
   only from the already-persisted committed application sequence and logical
   time, so every voter retires identically and no new persisted field or
   format boundary is added; generation catalog base/delta replay, full images,

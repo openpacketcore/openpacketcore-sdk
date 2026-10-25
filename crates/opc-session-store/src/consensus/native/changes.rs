@@ -1011,7 +1011,10 @@ impl Publication {
         // whose committed response time is outside the retained logical-time
         // window are retired from the predecessor map here, before the proof is
         // built; exact in-window receipts stay resident and idempotency is
-        // untouched.
+        // untouched. Retirement intentionally scans only the predecessor base:
+        // every delta receipt was bound with the current committed logical time,
+        // so it starts inside the retained window and becomes a predecessor for
+        // the next publication's retirement pass.
         let receipt_retention = super::retention::ordinary_receipt_retention();
         let mut retired_generic = Vec::new();
         if receipt_retention.active(frontiers.sequence) {

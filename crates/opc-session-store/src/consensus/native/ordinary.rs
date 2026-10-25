@@ -67,14 +67,16 @@ impl NativeDelta<'_> {
             };
             return Ok(self.clock_response(now, index, error));
         }
-        // Last-resort retention capacity. A store whose retained outcomes fill
-        // the bounded window before the committed clock advances cannot bind
-        // another outcome without reaching the fixed image cap. Refuse before
-        // evaluating the command (no effect, no binding) with a retryable
-        // typed answer; later committed logical time reclaims the window.
-        if retention.active(self.frontiers.sequence)
-            && self.receipt_count_at_capacity(retention, now)?
-        {
+        // Last-resort retention capacity. The bound is enforced on every apply
+        // while the rule is active, including mid-delta: refuse whenever the
+        // resident map is at or above the bound, even when expired rows are
+        // reclaimable at the next publication. Reclamation happens only at
+        // publication, so "reclaimable exists" is not permission to grow the
+        // current delta; a committed delta has no RPC cap and a window-crossing
+        // batch must not bypass the bound. Refuse before evaluating the command
+        // (no effect, no binding) with a retryable typed answer; the next
+        // publication's committed-clock retirement reclaims the window.
+        if retention.active(self.frontiers.sequence) && self.receipt_count_at_capacity(retention)? {
             return Ok(self.clock_response(
                 now,
                 index,
@@ -152,14 +154,14 @@ impl NativeDelta<'_> {
         Ok(response)
     }
 
-    /// Whether binding a new ordinary receipt would exceed the bounded
-    /// retention admission capacity even after this publication reclaims every
-    /// expired receipt. Scans only when the resident collections are already at
-    /// the capacity bound, so the common path stays O(1).
+    /// Whether the resident ordinary-receipt collections have reached the
+    /// bounded admission capacity. This deliberately does not consult
+    /// expiration: retired rows leave the map only at publication, and a
+    /// committed delta has no RPC cap, so a batch must not be able to grow past
+    /// the bound by observing reclaimable-but-not-yet-reclaimed base rows.
     fn receipt_count_at_capacity(
         &self,
         retention: super::retention::OrdinaryReceiptRetention,
-        now: Timestamp,
     ) -> io::Result<bool> {
         let resident = self
             .base
@@ -167,23 +169,7 @@ impl NativeDelta<'_> {
             .len()
             .checked_add(self.generic_receipts.len())
             .ok_or_else(|| invalid("native ordinary receipt count overflow"))?;
-        if resident < retention.capacity() {
-            return Ok(false);
-        }
-        let expired = |row: &NativeGenericReceipt| {
-            matches!(
-                row,
-                NativeGenericReceipt::Ordinary(receipt)
-                    if retention.expired(receipt.response.logical_time, now)
-            )
-        };
-        let reclaimable_base = self
-            .base
-            .generic_receipts
-            .iter()
-            .any(|(_, row)| expired(row));
-        let reclaimable_delta = self.generic_receipts.values().any(expired);
-        Ok(!reclaimable_base && !reclaimable_delta)
+        Ok(resident >= retention.capacity())
     }
 }
 

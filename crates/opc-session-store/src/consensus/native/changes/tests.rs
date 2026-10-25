@@ -1870,3 +1870,50 @@ fn native_ordinary_receipt_retention_stays_inert_below_activation() {
     );
     storage.validate_image().unwrap();
 }
+
+/// Capacity refusals must not be able to grow a single committed delta past the
+/// bounded receipt capacity. A refusal may advance the committed logical clock,
+/// which makes base receipts reclaimable at the next publication; that must
+/// never be permission to bind more receipts inside the current delta (a
+/// committed delta has no RPC cap).
+#[test]
+fn native_ordinary_receipt_capacity_refusals_cannot_grow_the_delta_past_the_bound() {
+    let _retention =
+        crate::consensus::native::retention::tests_support::override_ordinary_receipt_retention_with_capacity_for_test(
+            1, 2, 4,
+        );
+    let (mut storage, _, _) = fixture();
+    for _ in 0..4 {
+        let index = next_apply_index(&storage);
+        let applied = apply(&mut storage, &[clock(index, time(1))]);
+        assert!(matches!(
+            applied.responses[0].result,
+            Ok(SessionMutationOutcome::Unit)
+        ));
+    }
+    assert_eq!(storage.business.generic_receipts.len(), 4);
+
+    // Every command below advances past the 2-second window. The first refusal
+    // makes all four base receipts reclaimable at publication, so a
+    // reclaimability-aware backstop would disable itself for the rest of this
+    // uncapped delta and bind these receipts.
+    let base_index = next_apply_index(&storage);
+    let mut entries = Vec::new();
+    for step in 0..8_u64 {
+        entries.push(clock(base_index + step, time(20 + step as u8)));
+    }
+    let applied = apply(&mut storage, &entries);
+    for (offset, response) in applied.responses.iter().enumerate() {
+        assert!(
+            matches!(response.result, Err(StoreError::BackendUnavailable(_))),
+            "capacity refusal {offset} must stay typed, got {:?}",
+            response.result
+        );
+    }
+    assert!(
+        storage.business.generic_receipts.len() <= 4,
+        "the published receipt map must not grow past the capacity bound, got {}",
+        storage.business.generic_receipts.len()
+    );
+    storage.validate_image().unwrap();
+}
