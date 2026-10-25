@@ -4,7 +4,7 @@ use super::{
     credential::{
         BootstrapCredentialError, BootstrapCredentialVerifier, VerifiedBootstrapCredential,
     },
-    platform::{KubernetesBootReader, PodEnrollment},
+    platform::{KubernetesBootReader, PlatformError, PodEnrollment},
     pool::ProofBudgets,
     revision::{self, ISSUER_PROOF},
     startup::StartupError,
@@ -77,7 +77,7 @@ impl IssuerStartupSession {
         self.platform
             .revalidate(&self.enrollment, &self.proof.observation)
             .await
-            .map_err(|_| StartupError::Unavailable)?;
+            .map_err(platform_error)?;
         self.check_authentication()
     }
     fn check_authentication(&self) -> Result<(), StartupError> {
@@ -143,7 +143,7 @@ impl BootstrapIssuerClient {
             .platform
             .observe(enrollment)
             .await
-            .map_err(|_| StartupError::Unavailable)?;
+            .map_err(platform_error)?;
         let handshake = self
             .tls
             .begin_handshake()
@@ -307,7 +307,7 @@ impl BootstrapIssuerClient {
                         self.platform
                             .revalidate(enrollment, &observed)
                             .await
-                            .map_err(|_| StartupError::Unavailable)?;
+                            .map_err(platform_error)?;
                         let interval = self
                             .clock
                             .interval()
@@ -342,11 +342,64 @@ impl BootstrapIssuerClient {
         })
     }
 }
+/// Preserve definitive platform refusals through the public startup error.
+///
+/// Unavailable reads and transport failures stay retryable; only a definitive
+/// invalid or changed installed observation is reported as final.
+fn platform_error(error: PlatformError) -> StartupError {
+    match error {
+        PlatformError::Invalid => StartupError::PlatformInvalid,
+        PlatformError::Changed => StartupError::PlatformChanged,
+        PlatformError::Unavailable => StartupError::Unavailable,
+    }
+}
+
 fn credential_error(error: BootstrapCredentialError) -> StartupError {
     match error {
         BootstrapCredentialError::AuthTimeUnavailable => StartupError::AuthTimeUnavailable,
         BootstrapCredentialError::Rejected => StartupError::Unauthorized,
-        BootstrapCredentialError::Unavailable
-        | BootstrapCredentialError::UnsupportedPrerequisite => StartupError::Unavailable,
+        BootstrapCredentialError::UnsupportedPrerequisite => StartupError::PrerequisiteRefused,
+        BootstrapCredentialError::Unavailable => StartupError::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    #[test]
+    fn platform_error_preserves_definitive_refusals() {
+        assert_eq!(
+            platform_error(PlatformError::Invalid),
+            StartupError::PlatformInvalid
+        );
+        assert_eq!(
+            platform_error(PlatformError::Changed),
+            StartupError::PlatformChanged
+        );
+        assert_eq!(
+            platform_error(PlatformError::Unavailable),
+            StartupError::Unavailable
+        );
+    }
+
+    #[test]
+    fn credential_error_preserves_prerequisite_refusal() {
+        assert_eq!(
+            credential_error(BootstrapCredentialError::UnsupportedPrerequisite),
+            StartupError::PrerequisiteRefused
+        );
+        assert_eq!(
+            credential_error(BootstrapCredentialError::Unavailable),
+            StartupError::Unavailable
+        );
+        assert_eq!(
+            credential_error(BootstrapCredentialError::Rejected),
+            StartupError::Unauthorized
+        );
+        assert_eq!(
+            credential_error(BootstrapCredentialError::AuthTimeUnavailable),
+            StartupError::AuthTimeUnavailable
+        );
     }
 }
