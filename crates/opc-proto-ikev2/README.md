@@ -881,7 +881,7 @@ This does not close #786 or establish external interoperability. See
 - `ike_auth` and `ike_auth_signature` provide cleartext IKE_AUTH payload
   helpers, shared-key AUTH MIC helpers, signature AUTH helpers, and Child SA
   selector/proposal helpers. Signature AUTH covers RFC 4754 ECDSA methods 9-11
-  (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512 raw-DER AUTH data) and RFC 7427
+  (P-256/SHA-256, P-384/SHA-384, P-521/SHA-512 fixed-width r || s AUTH data) and RFC 7427
   method 14, including RSASSA-PSS SHA-256/384/512 verification (always) and
   signing behind `rsa-signing`. RFC 7427 method 14 signing and verification
   require distinct signing and verification authorities. They can only be

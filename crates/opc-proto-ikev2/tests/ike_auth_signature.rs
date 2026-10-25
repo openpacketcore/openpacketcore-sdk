@@ -156,7 +156,7 @@ fn ecdsa_p384_method_14_signature_round_trips() {
 }
 
 #[test]
-fn ecdsa_p256_method_9_signature_round_trips_as_raw_der() {
+fn ecdsa_p256_method_9_signature_round_trips_as_fixed_width_rs() {
     let identity = identity_payload_body();
     let octets = signed_octets(&[0x91; 64], PEER_NONCE, &identity);
     let key =
@@ -165,11 +165,31 @@ fn ecdsa_p256_method_9_signature_round_trips_as_raw_der() {
 
     let auth_data =
         compute_ike_auth_signature(profile(), &key_material(), octets, &key, None).expect("sign");
-    // RFC 4754 method 9 carries the raw DER ECDSA-Sig-Value; there is no RFC
-    // 7427 AlgorithmIdentifier prefix.
-    assert_eq!(auth_data.first().copied(), Some(0x30));
-
+    // RFC 4754 sections 3/7 method 9 carries fixed-width r || s
+    // (2 x 32 octets), with no DER SEQUENCE/INTEGER framing and no RFC 7427
+    // AlgorithmIdentifier.
+    assert_eq!(auth_data.len(), 64);
+    assert!(!(auth_data[0] == 0x30 && auth_data[1] == 0x2d || auth_data[1] == 0x2b));
+    let r = &auth_data[..32];
+    let s = &auth_data[32..];
+    assert!(r.iter().any(|byte| *byte != 0) && s.iter().any(|byte| *byte != 0));
     let public = Ikev2SignaturePublicKey::from_spki_der(P256_SPKI_DER).expect("P-256 SPKI");
+    // A DER-encoded value must not be accepted as method 9 AUTH data.
+    let mut der = vec![0x30, 0x00];
+    der.extend_from_slice(&auth_data);
+    der[1] = u8::try_from(der.len() - 2).unwrap();
+    assert_eq!(
+        verify_ike_auth_signature(
+            profile(),
+            &key_material(),
+            octets,
+            &public,
+            &auth_payload(9, &der),
+            None,
+        ),
+        Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
+    );
+
     verify_ike_auth_signature(
         profile(),
         &key_material(),
@@ -195,7 +215,7 @@ fn ecdsa_p256_method_9_signature_round_trips_as_raw_der() {
 }
 
 #[test]
-fn ecdsa_p384_method_10_signature_round_trips_as_raw_der() {
+fn ecdsa_p384_method_10_signature_round_trips_as_fixed_width_rs() {
     let identity = identity_payload_body();
     let octets = signed_octets(&[0x92; 64], PEER_NONCE, &identity);
     let key =
@@ -204,7 +224,8 @@ fn ecdsa_p384_method_10_signature_round_trips_as_raw_der() {
 
     let auth_data =
         compute_ike_auth_signature(profile(), &key_material(), octets, &key, None).expect("sign");
-    assert_eq!(auth_data.first().copied(), Some(0x30));
+    // RFC 4754 method 10: fixed-width r || s, 2 x 48 octets.
+    assert_eq!(auth_data.len(), 96);
 
     let public = Ikev2SignaturePublicKey::from_spki_der(P384_SPKI_DER).expect("P-384 SPKI");
     verify_ike_auth_signature(
@@ -219,7 +240,7 @@ fn ecdsa_p384_method_10_signature_round_trips_as_raw_der() {
 }
 
 #[test]
-fn ecdsa_p521_method_11_signature_round_trips_as_raw_der() {
+fn ecdsa_p521_method_11_signature_round_trips_as_fixed_width_rs() {
     let identity = identity_payload_body();
     let octets = signed_octets(&[0x93; 64], PEER_NONCE, &identity);
     let key =
@@ -228,7 +249,8 @@ fn ecdsa_p521_method_11_signature_round_trips_as_raw_der() {
 
     let auth_data =
         compute_ike_auth_signature(profile(), &key_material(), octets, &key, None).expect("sign");
-    assert_eq!(auth_data.first().copied(), Some(0x30));
+    // RFC 4754 method 11: fixed-width r || s, 2 x 66 octets.
+    assert_eq!(auth_data.len(), 132);
 
     let public = Ikev2SignaturePublicKey::from_spki_der(P521_SPKI_DER).expect("P-521 SPKI");
     verify_ike_auth_signature(

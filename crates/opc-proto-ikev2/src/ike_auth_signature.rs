@@ -3,7 +3,9 @@
 //! These helpers compute and verify the AUTH payload for RSA Digital Signature
 //! (method 1, RFC 7296), ECDSA Digital Signature (methods 9-11, RFC 4754) and
 //! Digital Signature (method 14, RFC 7427) over the same RFC 7296
-//! signed-octets transcript used by the shared-key MIC path.
+//! signed-octets transcript used by the shared-key MIC path. RFC 4754 methods
+//! 9-11 carry fixed-width raw `r || s` AUTH data; method 14 keeps its RFC 7427
+//! AlgorithmIdentifier plus DER `ECDSA-Sig-Value`.
 //!
 //! Trust scope: the verifier checks only that a signature made by the supplied
 //! public key covers the transcript-bound signed octets. Extracting a public
@@ -645,29 +647,22 @@ pub fn compute_ike_auth_signature(
     }
 
     match key.method {
-        Ikev2SignatureAuthMethod::EcdsaSha2_256 => {
-            if key.algorithm != IkeSignatureAlgorithm::EcdsaP256Sha2_256 {
+        Ikev2SignatureAuthMethod::EcdsaSha2_256
+        | Ikev2SignatureAuthMethod::EcdsaSha2_384
+        | Ikev2SignatureAuthMethod::EcdsaSha2_512 => {
+            let expected = match key.method {
+                Ikev2SignatureAuthMethod::EcdsaSha2_256 => IkeSignatureAlgorithm::EcdsaP256Sha2_256,
+                Ikev2SignatureAuthMethod::EcdsaSha2_384 => IkeSignatureAlgorithm::EcdsaP384Sha2_384,
+                _ => IkeSignatureAlgorithm::EcdsaP521Sha2_512,
+            };
+            if key.algorithm != expected {
                 return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
             }
             let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
-            return execute_signing_key(key.algorithm, key.signing_key.as_ref(), &signed)
-                .map_err(map_signature_module_error);
-        }
-        Ikev2SignatureAuthMethod::EcdsaSha2_384 => {
-            if key.algorithm != IkeSignatureAlgorithm::EcdsaP384Sha2_384 {
-                return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
-            }
-            let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
-            return execute_signing_key(key.algorithm, key.signing_key.as_ref(), &signed)
-                .map_err(map_signature_module_error);
-        }
-        Ikev2SignatureAuthMethod::EcdsaSha2_512 => {
-            if key.algorithm != IkeSignatureAlgorithm::EcdsaP521Sha2_512 {
-                return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
-            }
-            let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
-            return execute_signing_key(key.algorithm, key.signing_key.as_ref(), &signed)
-                .map_err(map_signature_module_error);
+            let der = execute_signing_key(key.algorithm, key.signing_key.as_ref(), &signed)
+                .map_err(map_signature_module_error)?;
+            // RFC 4754 sections 3/7: methods 9-11 carry fixed-width r || s.
+            return ecdsa_der_to_raw(key.method.as_u8(), &der);
         }
         _ => {}
     }
@@ -731,7 +726,7 @@ pub fn verify_ike_auth_signature(
         IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE => match public_key {
             Ikev2SignaturePublicKey::Rsa(_) => (
                 IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256,
-                authentication.auth_data,
+                std::borrow::Cow::Borrowed(authentication.auth_data),
                 None,
             ),
             _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
@@ -739,7 +734,10 @@ pub fn verify_ike_auth_signature(
         IKEV2_AUTH_METHOD_ECDSA_SHA2_256 => match public_key {
             Ikev2SignaturePublicKey::EcdsaP256(_) => (
                 IkeSignatureAlgorithm::EcdsaP256Sha2_256,
-                authentication.auth_data,
+                std::borrow::Cow::Owned(ecdsa_raw_to_der(
+                    IKEV2_AUTH_METHOD_ECDSA_SHA2_256,
+                    authentication.auth_data,
+                )?),
                 None,
             ),
             _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
@@ -747,7 +745,10 @@ pub fn verify_ike_auth_signature(
         IKEV2_AUTH_METHOD_ECDSA_SHA2_384 => match public_key {
             Ikev2SignaturePublicKey::EcdsaP384(_) => (
                 IkeSignatureAlgorithm::EcdsaP384Sha2_384,
-                authentication.auth_data,
+                std::borrow::Cow::Owned(ecdsa_raw_to_der(
+                    IKEV2_AUTH_METHOD_ECDSA_SHA2_384,
+                    authentication.auth_data,
+                )?),
                 None,
             ),
             _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
@@ -755,7 +756,10 @@ pub fn verify_ike_auth_signature(
         IKEV2_AUTH_METHOD_ECDSA_SHA2_512 => match public_key {
             Ikev2SignaturePublicKey::EcdsaP521(_) => (
                 IkeSignatureAlgorithm::EcdsaP521Sha2_512,
-                authentication.auth_data,
+                std::borrow::Cow::Owned(ecdsa_raw_to_der(
+                    IKEV2_AUTH_METHOD_ECDSA_SHA2_512,
+                    authentication.auth_data,
+                )?),
                 None,
             ),
             _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
@@ -763,7 +767,11 @@ pub fn verify_ike_auth_signature(
         IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE => {
             let (algorithm, signature, signature_hash) =
                 decode_method14_signature(public_key, authentication.auth_data)?;
-            (algorithm, signature, Some(signature_hash))
+            (
+                algorithm,
+                std::borrow::Cow::Borrowed(signature),
+                Some(signature_hash),
+            )
         }
         method => {
             return Err(Ikev2IkeAuthVerificationError::UnsupportedAuthenticationMethod { method });
@@ -782,7 +790,7 @@ pub fn verify_ike_auth_signature(
         signed_octets,
         public_key,
         algorithm,
-        signature,
+        signature.as_ref(),
     )
 }
 
@@ -843,6 +851,142 @@ pub fn verify_local_ike_auth_signature(
         authorization.signature_algorithm,
         signature,
     )
+}
+
+/// RFC 4754 section 7 methods 9-11 carry the fixed-width raw `r || s`
+/// concatenation, not a DER `ECDSA-Sig-Value`.
+fn ecdsa_auth_algorithm_and_field_len(method: u8) -> Option<(IkeSignatureAlgorithm, usize)> {
+    match method {
+        IKEV2_AUTH_METHOD_ECDSA_SHA2_256 => Some((IkeSignatureAlgorithm::EcdsaP256Sha2_256, 32)),
+        IKEV2_AUTH_METHOD_ECDSA_SHA2_384 => Some((IkeSignatureAlgorithm::EcdsaP384Sha2_384, 48)),
+        IKEV2_AUTH_METHOD_ECDSA_SHA2_512 => Some((IkeSignatureAlgorithm::EcdsaP521Sha2_512, 66)),
+        _ => None,
+    }
+}
+
+fn ecdsa_raw_to_der(method: u8, raw: &[u8]) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
+    let (_, field_len) = ecdsa_auth_algorithm_and_field_len(method)
+        .ok_or(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported)?;
+    if raw.len() != field_len * 2 {
+        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
+    }
+    let integer = |bytes: &[u8]| {
+        let first = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .ok_or(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?;
+        let value = &bytes[first..];
+        let mut encoded = Vec::with_capacity(value.len() + 2);
+        encoded.push(0x02);
+        let leading = usize::from(value[0] & 0x80 != 0);
+        encoded.push(
+            u8::try_from(value.len() + leading)
+                .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?,
+        );
+        if leading == 1 {
+            encoded.push(0);
+        }
+        encoded.extend_from_slice(value);
+        Ok(encoded)
+    };
+    let r = integer(&raw[..field_len])?;
+    let s = integer(&raw[field_len..])?;
+    let body = r.len() + s.len();
+    if body > 255 {
+        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
+    }
+    let mut der = Vec::with_capacity(body + 3);
+    der.push(0x30);
+    if body < 0x80 {
+        der.push(
+            u8::try_from(body)
+                .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?,
+        );
+    } else {
+        // P-521 r || s produces a SEQUENCE body above 127 octets, which needs
+        // DER long-form length encoding.
+        der.push(0x81);
+        der.push(
+            u8::try_from(body)
+                .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?,
+        );
+    }
+    der.extend_from_slice(&r);
+    der.extend_from_slice(&s);
+    Ok(der)
+}
+
+fn ecdsa_der_to_raw(method: u8, der: &[u8]) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
+    let (_, field_len) = ecdsa_auth_algorithm_and_field_len(method)
+        .ok_or(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported)?;
+    fn take_length(
+        input: &[u8],
+        index: &mut usize,
+    ) -> Result<usize, Ikev2IkeAuthVerificationError> {
+        let first = *input
+            .get(*index)
+            .ok_or(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?;
+        *index += 1;
+        if first & 0x80 == 0 {
+            return Ok(usize::from(first));
+        }
+        let bytes = usize::from(first & 0x7f);
+        if bytes == 0 || bytes > 2 {
+            return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
+        }
+        let mut length = 0_usize;
+        for _ in 0..bytes {
+            let byte = *input
+                .get(*index)
+                .ok_or(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?;
+            *index += 1;
+            length = (length << 8) | usize::from(byte);
+        }
+        Ok(length)
+    }
+    fn take_integer(
+        input: &[u8],
+        index: &mut usize,
+        field_len: usize,
+    ) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
+        if input.get(*index) != Some(&0x02) {
+            return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
+        }
+        *index += 1;
+        let length = take_length(input, index)?;
+        let value = input
+            .get(*index..*index + length)
+            .ok_or(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?;
+        *index += length;
+        let value = match value {
+            [0x00, rest @ ..] if rest.first().is_some_and(|byte| byte & 0x80 != 0) => rest,
+            [first, ..] if first & 0x80 == 0 => value,
+            _ => return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid),
+        };
+        if value.is_empty() || value.len() > field_len || value.iter().all(|byte| *byte == 0) {
+            return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
+        }
+        let mut padded = vec![0_u8; field_len];
+        padded[field_len - value.len()..].copy_from_slice(value);
+        Ok(padded)
+    }
+    if der.first() != Some(&0x30) {
+        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
+    }
+    let mut index = 1;
+    let body_len = take_length(der, &mut index)?;
+    if der.len() != index + body_len {
+        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
+    }
+    let r = take_integer(der, &mut index, field_len)?;
+    let s = take_integer(der, &mut index, field_len)?;
+    if index != der.len() {
+        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
+    }
+    let mut raw = Vec::with_capacity(field_len * 2);
+    raw.extend_from_slice(&r);
+    raw.extend_from_slice(&s);
+    Ok(raw)
 }
 
 fn verify_signature_bytes(
@@ -1000,6 +1144,64 @@ fn require_verification_hash_authority(
     authorization
         .validate(required, signed_octets)
         .map_err(map_signature_hash_authority_error)
+}
+
+#[cfg(test)]
+mod rfc4754_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn p521_raw_to_der_and_back_is_exact() {
+        let mut raw = vec![0_u8; 132];
+        raw[65] = 1;
+        raw[131] = 2;
+        let der = ecdsa_raw_to_der(11, &raw).unwrap();
+        assert_eq!(der, vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02]);
+        assert_eq!(ecdsa_der_to_raw(11, &der).unwrap(), raw);
+    }
+
+    #[test]
+    fn p256_raw_to_der_handles_high_bit_scalars() {
+        let mut raw = vec![0_u8; 64];
+        raw[31] = 0x80;
+        raw[63] = 0x7f;
+        let der = ecdsa_raw_to_der(9, &raw).unwrap();
+        assert_eq!(
+            der,
+            vec![0x30, 0x07, 0x02, 0x02, 0x00, 0x80, 0x02, 0x01, 0x7f]
+        );
+        assert_eq!(ecdsa_der_to_raw(9, &der).unwrap(), raw);
+    }
+
+    #[test]
+    fn real_p521_der_signature_roundtrips_through_raw_rs() {
+        use p521::ecdsa::signature::hazmat::PrehashSigner;
+        use p521::pkcs8::DecodePrivateKey;
+        use sha2::{Digest, Sha512};
+
+        let der_bytes = include_bytes!("../tests/data/p521_pkcs8.der");
+        let signing_key = p521::ecdsa::SigningKey::from_pkcs8_der(der_bytes).expect("P-521 key");
+        let message = b"rfc4754-p521-roundtrip";
+        let digest = Sha512::digest(message);
+        let signature: p521::ecdsa::Signature = signing_key.sign_prehash(&digest).expect("sign");
+        let der = signature.to_der();
+        let raw = ecdsa_der_to_raw(11, der.as_bytes()).expect("der to raw");
+        assert_eq!(raw.len(), 132);
+        let roundtrip = ecdsa_raw_to_der(11, &raw).expect("raw to der");
+        p521::ecdsa::Signature::from_der(&roundtrip).expect("roundtripped DER parses");
+    }
+
+    #[test]
+    fn wrong_width_and_non_minimal_der_fail_closed() {
+        assert_eq!(
+            ecdsa_raw_to_der(9, &[0_u8; 63]),
+            Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
+        );
+        assert_eq!(
+            ecdsa_der_to_raw(9, &[0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x01]),
+            Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
+        );
+    }
 }
 
 const fn map_signature_hash_authority_error(

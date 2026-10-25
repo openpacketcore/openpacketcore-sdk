@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covers RFC 3526 MODP groups 15-18 (Transform IDs 15/16/17/18, 3072/4096/6144/
   8192-bit) with exact 384/512/768/1024-octet public-value and shared-secret
   widths; RFC 4754 ECDSA AUTH methods 9/10/11 (P-256/SHA-256, P-384/SHA-384,
-  P-521/SHA-512) including raw DER `ECDSA-Sig-Value` framing and P-521 signing/
+  P-521/SHA-512) including RFC 4754 fixed-width r || s AUTH framing and P-521 signing/
   verification; RFC 7427 method-14 RSASSA-PSS signature identifiers
   (SHA-256/384/512, MGF1 with the same hash, salt = digest length) with
   verification always available and PSS signing compiled only behind the
