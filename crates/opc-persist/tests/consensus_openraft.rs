@@ -24,6 +24,10 @@ mod planned_shutdown;
 #[path = "consensus_openraft/member_repair.rs"]
 mod member_repair;
 
+#[cfg(target_os = "linux")]
+#[path = "consensus_openraft/quorum_lease.rs"]
+mod quorum_lease;
+
 #[cfg(feature = "dangerous-test-hooks")]
 #[path = "consensus_openraft/route_retirement.rs"]
 mod route_retirement;
@@ -88,6 +92,7 @@ struct LoopbackPeer {
     compatibility: Option<opc_consensus::ConsensusCompatibility>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
+    drop_append_entries_responses: Arc<AtomicBool>,
     drop_forward_responses: Arc<AtomicUsize>,
     forward_mutation_attempts: Arc<AtomicUsize>,
     stall_forward_mutation: Arc<AtomicBool>,
@@ -112,6 +117,7 @@ impl LoopbackPeer {
             compatibility: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
+            drop_append_entries_responses: Arc::new(AtomicBool::new(false)),
             drop_forward_responses: Arc::new(AtomicUsize::new(0)),
             forward_mutation_attempts: Arc::new(AtomicUsize::new(0)),
             stall_forward_mutation: Arc::new(AtomicBool::new(false)),
@@ -140,6 +146,16 @@ impl LoopbackPeer {
 
     fn drop_forward_responses(&self, count: usize) {
         self.drop_forward_responses.store(count, Ordering::SeqCst);
+    }
+
+    /// Drop AppendEntries responses after the target has processed the request.
+    /// This models a black-holed response path: a follower keeps its leader view
+    /// and lease from received heartbeats, while the leader accumulates no
+    /// quorum acknowledgement.
+    #[cfg(target_os = "linux")]
+    fn drop_append_entries_responses(&self, drop: bool) {
+        self.drop_append_entries_responses
+            .store(drop, Ordering::SeqCst);
     }
 
     #[cfg(feature = "dangerous-test-hooks")]
@@ -350,6 +366,15 @@ impl ConsensusPeer for LoopbackPeer {
             self.release_forward_response.notified().await;
         }
         if family == ConsensusRpcFamily::ForwardMutation && take_one(&self.drop_forward_responses) {
+            return Err(ConsensusPeerError::Unavailable);
+        }
+        if family == ConsensusRpcFamily::AppendEntries
+            && self.drop_append_entries_responses.load(Ordering::SeqCst)
+        {
+            // The target has already processed the request (follower view,
+            // lease, log and commit state are updated); only its response is
+            // black-holed. The leader therefore accumulates no quorum
+            // acknowledgement while the follower keeps treating it as leader.
             return Err(ConsensusPeerError::Unavailable);
         }
         Ok(opc_consensus::ConsensusCallResponse {

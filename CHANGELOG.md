@@ -100,6 +100,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: a configuration-consensus leader that cannot obtain a quorum
+  acknowledgement within the fixed quorum-authority ceiling
+  (`election_timeout_max` = 8 s; the engine exposes only the
+  acknowledgement-age metric and defines no application leader lease, and this
+  is not the SDK's 2 s read-lease reuse constant) now withholds leader
+  authority instead of holding clients: local proposals fail with a typed
+  retryable `PersistErrorKind::Unavailable` before any proposal is attempted,
+  `ensure_local_authority[_at_config_head]` reports
+  `ConfigLocalAuthorityOutcome::Retry { leader_hint: None }`, and forwarded
+  mutations/read barriers receive the additive `NoQuorum` reply, which the
+  forwarding replica converts to the same bounded retryable outcome. A withheld
+  call proposes/applies/commits nothing and callers retry the same request
+  identity, so exactly-once behavior is unchanged. The transition is typed and
+  value-free through `ConsensusConfigStore::quorum_lease_state()`, the
+  `opc_persist_quorum_lease_lost_total` / `_restored_total` counters and one
+  warning/info log per transition, and authority returns automatically after two
+  consecutive healthy observations (a one-flush recovery debounce that prevents
+  marginal acknowledgements from flapping the fence). The ceiling is the latest
+  safe point — it waits until every follower's 5–8 s election timer has expired,
+  so a leader that just lost its majority may still accept uncommittable
+  proposals for up to about 8 s of the 10 s operation budget before the typed
+  retryable rejection; fencing earlier could reject a merely slow quorum and is
+  deliberately not done. The engine's election, heartbeat, quorum and
+  committed-log semantics are unchanged; the majority side independently elects
+  a successor. Refs #1048.
+
 - `opc-proto-ngap` / `opc-sctp` / `opc-protocol`: the N3IWF receive path no
   longer leaves N3IWF security-key octets in uncleared SDK-owned heap buffers.
   SCTP inbound payloads use a uniquely owned `SensitiveBytes` buffer zeroized on

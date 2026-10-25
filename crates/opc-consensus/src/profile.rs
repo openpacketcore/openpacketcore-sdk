@@ -162,6 +162,21 @@ pub const DURABLE_CONSENSUS_TIMING_PROFILE: DurableConsensusTimingProfile =
 pub const DURABLE_CONSENSUS_OPERATION_TIMEOUT: Duration =
     DURABLE_CONSENSUS_TIMING_PROFILE.operation_timeout();
 
+/// Ceiling on the engine-reported quorum-acknowledgement age for a durable
+/// consensus leader before the SDK withholds leader authority.
+///
+/// This equals the fixed timing profile's `election_timeout_max` (8 s): the
+/// point by which every follower's election timer has expired, so a leader with
+/// no younger quorum acknowledgement can conclude it no longer holds a majority
+/// for new authority. The pinned Openraft engine exposes only the
+/// acknowledgement age (`RaftMetrics::millis_since_quorum_ack`); it defines no
+/// application leader lease of its own. This constant is unrelated to the SDK's
+/// separate 2 s `DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE` read-lease reuse
+/// constant. It adds no timing budget and changes no election, heartbeat or
+/// quorum parameter.
+pub const DURABLE_CONSENSUS_LEADER_QUORUM_LEASE: Duration =
+    Duration::from_millis(DURABLE_CONSENSUS_TIMING_PROFILE.election_timeout_max_millis);
+
 /// Fixed interval between authenticated remote-retirement setup probes for one
 /// exact durable-consensus peer and local authentication epoch.
 ///
@@ -385,6 +400,14 @@ mod tests {
         }
         assert_eq!(profile.election_timeout_min_millis, 5_000);
         assert_eq!(profile.election_timeout_max_millis, 8_000);
+        assert_eq!(
+            DURABLE_CONSENSUS_LEADER_QUORUM_LEASE,
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            DURABLE_CONSENSUS_LEADER_QUORUM_LEASE,
+            Duration::from_millis(profile.election_timeout_max_millis)
+        );
         assert_eq!(profile.operation_timeout(), Duration::from_millis(10_000));
         assert_eq!(
             DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
