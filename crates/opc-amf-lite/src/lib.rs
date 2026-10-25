@@ -564,9 +564,7 @@ impl AmfLite {
             }
             if tokio::time::Instant::now() >= deadline {
                 self.runtime.shutdown().await;
-                return Err(RuntimeError::Supervisor(
-                    "AMF-lite startup timeout".to_string(),
-                ));
+                return Err(startup_timeout_error(timeout, phase, readiness));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1067,6 +1065,22 @@ async fn spawn_registration_worker(
     Ok(())
 }
 
+/// Bounded, value-free startup-timeout diagnostic.
+///
+/// The supervisor's fixed wall-clock deadline is a product bound, not a test
+/// observation. When it elapses, report the observed phase and readiness so the
+/// stalled startup step is named without exposing identities, keys or config.
+fn startup_timeout_error(
+    timeout: Duration,
+    phase: RuntimePhase,
+    readiness: Readiness,
+) -> RuntimeError {
+    RuntimeError::Supervisor(format!(
+        "AMF-lite startup timeout after {} ms (phase={phase:?}, readiness={readiness:?})",
+        timeout.as_millis()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1292,5 +1306,25 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[test]
+    fn startup_timeout_diagnostic_names_the_observed_phase_without_values() {
+        let error = startup_timeout_error(
+            Duration::from_secs(5),
+            RuntimePhase::ServiceBind,
+            Readiness::NotReady,
+        );
+        let text = error.to_string();
+        assert!(text.contains("5000 ms"), "report the expired product bound");
+        assert!(
+            text.contains("phase=ServiceBind"),
+            "report the last observed startup phase"
+        );
+        assert!(
+            text.contains("readiness=NotReady"),
+            "report the last observed readiness"
+        );
+        assert!(text.len() < 256, "keep the diagnostic bounded");
     }
 }
