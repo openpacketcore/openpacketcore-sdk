@@ -324,7 +324,8 @@ fn complete_setup_responses_construct_and_admit_additional_tunnels() {
             assert!(ResourceSetupMessage::from_pdu(&pdu, short).is_err());
             assert!(construct(name, value.clone(), short).is_err());
         }
-        let mut malformed = pdu.clone();
+        let mut malformed =
+            Pdu::decode_owned(Bytes::from(wire.clone()), context()).expect("re-decode fixture");
         let PduKind::Successful { criticality, .. } = &mut malformed.kind else {
             panic!("outcome");
         };

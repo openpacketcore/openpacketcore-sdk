@@ -170,7 +170,7 @@ fn complete_release_construction_and_receive_match_reference() {
         let wire = octets(row["wire_hex"].as_str().unwrap());
         let expected = construct(row);
         let constructed = expected.construct(context()).unwrap();
-        assert!(constructed.raw.is_empty());
+        assert!(constructed.raw().is_empty());
         assert!(encode(&constructed, EncodeContext::default()).unwrap() == wire);
         let received = decode(&wire, context()).unwrap();
         let admitted = ReleaseMessage::from_pdu(&received, context()).unwrap();
@@ -204,7 +204,7 @@ fn independent_missing_fields_duplicates_and_unknown_criticality_obey_policy() {
                     ..context()
                 };
                 let pdu = decode(&wire, ctx).unwrap();
-                assert!(pdu.raw.as_ref() == wire);
+                assert!(pdu.raw() == wire);
                 let admitted = ReleaseMessage::from_pdu(&pdu, ctx).unwrap();
                 same_fields(&construct(row), &admitted.message);
             }
@@ -242,7 +242,7 @@ fn independent_missing_fields_duplicates_and_unknown_criticality_obey_policy() {
                 },
             )
             .unwrap();
-            assert!(dropped.raw.as_ref() == wire);
+            assert!(dropped.raw() == wire);
             let filtered = ReleaseMessage::from_pdu(&dropped, context()).unwrap();
             assert_eq!(filtered.ignored_ie_count, 0);
             assert!(filtered.notify_ie_ids.is_empty());

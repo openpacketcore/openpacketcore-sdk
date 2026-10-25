@@ -2,7 +2,6 @@
 
 use std::fmt;
 
-use bytes::Bytes;
 use thiserror::Error;
 
 use crate::{DeliveryOrder, InboundMessage, PayloadProtocolIdentifier};
@@ -182,7 +181,7 @@ impl<'a> DataChunk<'a> {
             return Err(DataChunkError::Fragmented);
         }
         Ok(InboundMessage {
-            payload: Bytes::copy_from_slice(self.user_data),
+            payload: opc_protocol::SensitiveBytes::from_slice(self.user_data),
             stream_id: self.stream_id,
             ppid: self.ppid,
             order: if self.flags.unordered {

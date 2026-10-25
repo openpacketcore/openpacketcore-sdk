@@ -268,6 +268,17 @@ impl<'a> SecurityKey<'a> {
     pub const fn expose_bytes(&self) -> &[u8; 32] {
         self.0
     }
+
+    /// Copy the key into a zeroizing owner for an authorized consumer.
+    ///
+    /// This is the explicit hand-off for callers that must outlive the
+    /// borrowed receive buffers, for example an IKEv2 protocol-key import that
+    /// requires `Zeroizing<Vec<u8>>`. The receive buffers remain zeroized on
+    /// their own drop; this copy is zeroized when the returned value is dropped.
+    #[must_use]
+    pub fn copy_into_zeroizing(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.0.to_vec())
+    }
     /// Encode the aligned fixed BIT STRING into a buffer cleared on drop.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {
         capacity(32, ctx)?;

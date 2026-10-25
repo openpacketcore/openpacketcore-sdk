@@ -278,7 +278,7 @@ fn complete_setup_construction_and_receive_match_independent_messages() {
         let (expected, drx) = expected(row, &reference);
         let name = row["name"].as_str().unwrap();
         let pdu = construct(&expected, drx, context()).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        assert!(pdu.raw.is_empty());
+        assert!(pdu.raw().is_empty());
         assert!(
             encode(&pdu, EncodeContext::default()).unwrap() == wire,
             "{name}: independent message differs"
@@ -362,7 +362,7 @@ fn independent_missing_fields_duplicates_and_unknown_policies() {
                 continue;
             }
             let pdu = decode(&wire, context()).unwrap();
-            let raw = pdu.raw.clone();
+            let raw = pdu.raw().to_vec();
             let admitted = SetupMessage::from_pdu(&pdu, context()).unwrap();
             assert_eq!(
                 admitted.ignored_ie_count,
@@ -376,7 +376,7 @@ fn independent_missing_fields_duplicates_and_unknown_policies() {
                     vec![]
                 }
             );
-            assert!(pdu.raw == raw);
+            assert!(pdu.raw() == raw.as_slice());
             assert!(decode(
                 &wire,
                 DecodeContext {

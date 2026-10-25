@@ -380,25 +380,48 @@ fn ngap_security_key_placeholder_supplies_both_auth_known_answers() {
         })
         .expect("initial context request");
     let pdu = opc_proto_ngap::decode(wire, DecodeContext::default()).expect("NGAP request");
-    let opc_proto_ngap::PduKind::Initiating {
-        message: opc_proto_ngap::Message::InitialContextSetupRequest(request),
-        ..
-    } = pdu.kind
-    else {
-        panic!("wrong key-handoff message")
+    // The typed open-type placeholder is empty: the actual key octets are in
+    // the PDU's zeroizing custody and are obtained through the admitted N3IWF
+    // request, not by reading the generated Any copy.
+    match &pdu.kind {
+        opc_proto_ngap::PduKind::Initiating {
+            message: opc_proto_ngap::Message::InitialContextSetupRequest(request),
+            ..
+        } => {
+            let keys = request
+                .protocol_ies
+                .0
+                .iter()
+                .filter(|ie| ie.id == 94)
+                .collect::<Vec<_>>();
+            assert_eq!(keys.len(), 1);
+            assert!(keys[0].value.as_bytes().is_empty());
+        }
+        _ => panic!("wrong key-handoff message"),
+    }
+    let admission_context = DecodeContext {
+        max_message_len: 200_000,
+        max_ies: 256,
+        max_depth: 24,
+        validation_level: opc_protocol::ValidationLevel::Strict,
+        duplicate_ie_policy: opc_protocol::DuplicateIePolicy::Reject,
+        ..DecodeContext::default()
     };
-    let keys = request
-        .protocol_ies
-        .0
-        .iter()
-        .filter(|ie| ie.id == 94)
-        .collect::<Vec<_>>();
-    assert_eq!(keys.len(), 1);
+    let admitted = opc_proto_ngap::n3iwf::resource_setup::ResourceSetupMessage::from_pdu(
+        &pdu,
+        admission_context,
+    )
+    .expect("admitted N3IWF request");
+    let opc_proto_ngap::n3iwf::resource_setup::ResourceSetupMessage::InitialRequest(value) =
+        admitted.message
+    else {
+        panic!("wrong key-handoff admission")
+    };
     // The independent ASN.1 gate validates this fixed 256-bit SecurityKey
-    // encoding. This passes its placeholder octets to the existing IKE API;
-    // it does not claim a typed or consume-once key import implementation.
-    let key = keys[0].value.as_bytes();
-    assert!(key == [0u8; 32]);
+    // encoding. This passes its admitted octets to the existing IKE API; it
+    // does not claim a typed or consume-once key import implementation.
+    let key = value.key.expose_bytes();
+    assert_eq!(key, &[0u8; 32]);
     for case in reference["cases"]
         .as_array()
         .expect("cases")
@@ -406,7 +429,7 @@ fn ngap_security_key_placeholder_supplies_both_auth_known_answers() {
         .filter(|c| c["case_class"] == "positive")
     {
         let inputs = Inputs::new(&case["inputs"]);
-        assert!(inputs.auth_key == key);
+        assert_eq!(inputs.auth_key.as_slice(), key.as_slice());
         let mic =
             compute_ike_auth_shared_key_mic(profile(), &inputs.material, inputs.signed(), key)
                 .expect("synthetic handoff AUTH");

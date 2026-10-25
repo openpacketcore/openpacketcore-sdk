@@ -137,9 +137,17 @@ extension container ID. Bounded explicit receive layout and a fixed aligned
 CHOICE wrapper avoid those defects; qualified generated encoders handle the
 inner structures. NAS shares the independently tested open-type length codec.
 
-All wrappers redact identity, NAS, key and peer values. Security Key decoding
-borrows the input without copying; encoded buffers use `zeroize::Zeroizing`.
-Caller-owned input, generic PDU and final wire copies remain caller custody.
+All wrappers redact identity, NAS, key and peer values. A received PDU keeps
+its original bytes in an owned `SensitiveBytes` buffer that is zeroized when the
+PDU is dropped, and the id-SecurityKey IE payload is moved out of the generated
+open-type view into the PDU's zeroizing storage (the typed placeholder is
+empty; canonical encoding substitutes the exact bytes back, so the wire contract
+is unchanged). The borrowed `SecurityKey` can be copied into a
+`Zeroizing<Vec<u8>>` hand-off via `SecurityKey::copy_into_zeroizing` for an
+authorized consumer that outlives the PDU. A decode failure after the key IE was
+parsed scrubs every partial open-type copy before returning. Caller-owned input
+and explicit non-zeroizing copies remain caller custody; the generated
+extension-addition decoder's internal allocations are outside this scrub path.
 No association authorization, derivation, import, cryptographic decision or
 backend effect occurs. Location addressing/port assignment, required TAI and
 message-level presence remain caller responsibilities. Nested extensions other

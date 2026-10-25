@@ -27,6 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-proto-ngap` / `opc-sctp` / `opc-protocol`: the N3IWF receive path no
+  longer leaves N3IWF security-key octets in uncleared SDK-owned heap buffers.
+  SCTP inbound payloads use a uniquely owned `SensitiveBytes` buffer zeroized on
+  drop; the NGAP raw receive copy uses the same carrier; and the id-SecurityKey
+  IE payload is moved out of the generated typed `Any` copy into the owning
+  PDU's zeroizing storage, with canonical encoding substituting the exact bytes
+  back. Every decode error after the key IE is parsed scrubs partial open-type
+  copies first. `SecurityKey::copy_into_zeroizing` provides the explicit
+  `Zeroizing<Vec<u8>>` hand-off the IKEv2 protocol-key import requires. Received
+  payload/Pdu types no longer clone or compare implicitly, and `Debug` stays
+  length/structure-only. A dedicated test-only allocator probe
+  (`opc-key-hygiene-probe`) proves the dropped buffers are cleared, with
+  positive controls for `Vec` and `bytes::Bytes` deallocation. Refs #1262.
+
 - `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
   TS 29.281 section 5.1 all-zero value is now representable and installable on
   the model and mock-software paths, and the N3 software G-PDU encoder emits
@@ -63,6 +77,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority. Refs #1378.
 
 ### Breaking
+
+- `opc-sctp`: `InboundMessage.payload` is now `opc_protocol::SensitiveBytes`
+  (uniquely owned, zeroized on drop, `Debug` length-only, no `Clone`,
+  `PartialEq` or `Eq`); `InboundMessage` itself no longer derives
+  `Clone`/`PartialEq`/`Eq`. `N2Payload::payload()` returns `&SensitiveBytes` and
+  `N2Payload::into_payload()` returns `SensitiveBytes`;
+  `DiameterSctpPeer::inbound_payload` returns `&[u8]`. `OutboundMessage` now has
+  a redacted `Debug` implementation instead of a derived payload-printing one.
+  Callers that copied or compared received payloads must make the copy/compare
+  explicit. Refs #1262.
+
+- `opc-proto-ngap`: `Pdu.raw` is private; use `Pdu::raw()` (and
+  `Pdu::has_raw()`), with `Pdu::new(kind)` for constructed PDUs. `Pdu` no longer
+  derives `Clone`, `PartialEq` or `Eq`, and `Message`/`PduKind` no longer derive
+  `Clone`/`PartialEq`/`Eq` because received structures must not be duplicated or
+  compared implicitly. `Message::Unknown` carries `SensitiveBytes` instead of
+  `bytes::Bytes`. The id-SecurityKey IE appears as an empty typed placeholder;
+  admission reads the key from the PDU's zeroizing storage and canonical
+  encoding reproduces the original bytes. Refs #1262.
 
 - `opc-gtpu-dataplane`: `GtpPdpContext.peer_teid` is now `PeerTeid`, a new
   public peer/outgoing-TEID type that admits the TS 29.281 section 5.1 all-zero

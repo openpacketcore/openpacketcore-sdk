@@ -286,7 +286,9 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(wire) = encode(&pdu, output) {
             assert_eq!(pdu.wire_len(output).unwrap(), wire.len());
             let received = Pdu::decode_owned(Bytes::from(wire), decode).unwrap();
-            assert!(received.kind == pdu.kind);
+            // Structural identity without implicit partial equality on
+            // received key-bearing structures.
+            assert_eq!(format!("{:?}", received.kind), format!("{:?}", pdu.kind));
         }
     }
     // Independent construction input: bounded borrowed chunks, including
@@ -324,7 +326,10 @@ fuzz_target!(|data: &[u8]| {
         ) {
             let wire = encode(&pdu, output).unwrap();
             assert_eq!(pdu.wire_len(output).unwrap(), wire.len());
-            assert!(Pdu::decode_owned(Bytes::from(wire), decode).unwrap().kind == pdu.kind);
+            assert_eq!(
+                format!("{:?}", Pdu::decode_owned(Bytes::from(wire), decode).unwrap().kind),
+                format!("{:?}", pdu.kind)
+            );
         }
     }
     let large = Pdu::from_protocol_ies(
@@ -334,5 +339,8 @@ fuzz_target!(|data: &[u8]| {
     )
     .unwrap();
     let wire = encode(&large, output).unwrap();
-    assert!(Pdu::decode_owned(Bytes::from(wire), decode).unwrap().kind == large.kind);
+    assert_eq!(
+        format!("{:?}", Pdu::decode_owned(Bytes::from(wire), decode).unwrap().kind),
+        format!("{:?}", large.kind)
+    );
 });

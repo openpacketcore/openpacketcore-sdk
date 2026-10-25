@@ -46,12 +46,15 @@ use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(unused_imports))]
 use bytes::Bytes;
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
+use opc_protocol::SensitiveBytes;
 use thiserror::Error;
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(any(target_os = "linux", test)), allow(unused_imports))]
 use zeroize::Zeroize;
+#[cfg_attr(not(any(target_os = "linux", test)), allow(unused_imports))]
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
@@ -1139,7 +1142,10 @@ impl SctpConnectConfig {
 }
 
 /// Outbound SCTP message metadata and payload.
-#[derive(Debug, Clone)]
+///
+/// `Debug` reports only the payload length: caller-provided payloads may
+/// contain sensitive protocol data and must never be formatted.
+#[derive(Clone)]
 pub struct OutboundMessage {
     /// Payload bytes.
     pub payload: Bytes,
@@ -1151,6 +1157,18 @@ pub struct OutboundMessage {
     pub order: DeliveryOrder,
     /// Target association for one-to-many sockets. Use zero for one-to-one.
     pub assoc_id: i32,
+}
+
+impl fmt::Debug for OutboundMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutboundMessage")
+            .field("payload_len", &self.payload.len())
+            .field("stream_id", &self.stream_id)
+            .field("ppid", &self.ppid)
+            .field("order", &self.order)
+            .field("assoc_id", &self.assoc_id)
+            .finish()
+    }
 }
 
 impl OutboundMessage {
@@ -1470,9 +1488,9 @@ impl DiameterSctpPeer {
     pub fn inbound_payload<'a>(
         &self,
         message: &'a InboundMessage,
-    ) -> Result<&'a Bytes, DiameterSctpError> {
+    ) -> Result<&'a [u8], DiameterSctpError> {
         self.validate_inbound_message(message)?;
-        Ok(&message.payload)
+        Ok(message.payload.as_slice())
     }
 
     /// Open a live SDK SCTP association to this Diameter peer.
@@ -1822,7 +1840,12 @@ impl DiameterSctpAssociation {
                 "accepted legacy inbound Diameter SCTP PPID 0"
             );
         }
-        Ok(DiameterSctpInbound::Payload(message.payload))
+        // Diameter payloads are caller-owned Diameter PDUs, not N2 key
+        // material. Materialize a caller-owned Bytes handle at this legacy
+        // convenience boundary; the SCTP-owned carrier still clears itself.
+        Ok(DiameterSctpInbound::Payload(Bytes::copy_from_slice(
+            message.payload.as_slice(),
+        )))
     }
 
     /// Receive one Diameter payload after SCTP metadata validation.
@@ -2349,10 +2372,21 @@ impl fmt::Debug for SctpPathHealth {
 }
 
 /// Inbound SCTP message metadata and payload.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// The payload is a uniquely owned [`SensitiveBytes`] buffer that is zeroized
+/// when the message is dropped. It is deliberately not `Clone`: duplicating a
+/// received payload must be an explicit, visible copy with its own custody.
+/// `Debug` reports only the payload length.
+///
+/// ```compile_fail
+/// fn requires_clone<T: Clone>(_: &T) {}
+/// fn probe(message: &opc_sctp::InboundMessage) {
+///     requires_clone(message);
+/// }
+/// ```
 pub struct InboundMessage {
-    /// Payload bytes.
-    pub payload: Bytes,
+    /// Owned payload bytes, zeroized when the message is dropped.
+    pub payload: SensitiveBytes,
     /// SCTP stream identifier.
     pub stream_id: u16,
     /// Payload protocol identifier.
@@ -3704,7 +3738,7 @@ fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMes
         None
     };
     InboundMessage {
-        payload: buffer.freeze(),
+        payload: SensitiveBytes::from_bytes_mut(buffer),
         stream_id: info.stream_id,
         ppid: PayloadProtocolIdentifier::from_network_order(info.ppid_network_order),
         order,
@@ -5255,7 +5289,7 @@ mod tests {
 
     fn diameter_inbound(ppid: PayloadProtocolIdentifier) -> InboundMessage {
         InboundMessage {
-            payload: Bytes::from_static(b"diameter"),
+            payload: SensitiveBytes::from_slice(b"diameter"),
             stream_id: DIAMETER_DEFAULT_STREAM_ID,
             ppid,
             order: DeliveryOrder::Ordered,

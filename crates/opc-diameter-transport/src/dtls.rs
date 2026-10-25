@@ -1159,7 +1159,10 @@ fn kernel_dtls_message(
         DeliveryOrder::Unordered => SctpDeliveryOrder::Unordered,
     };
     Ok(Some(SctpUserMessage::new(
-        received.payload,
+        // Diameter user messages are caller-owned DTLS/TLS records, not N2
+        // key material. Materialize the caller-owned Bytes handle here; the
+        // SCTP receive carrier zeroizes its own allocation on drop.
+        Bytes::copy_from_slice(received.payload.as_slice()),
         received.ppid.get(),
         received.stream_id,
         order,

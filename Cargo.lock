@@ -3063,6 +3063,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-key-hygiene-probe"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "opc-proto-ngap",
+ "opc-protocol",
+ "opc-sctp",
+ "zeroize",
+]
+
+[[package]]
 name = "opc-key-vault"
 version = "0.2.0"
 dependencies = [
@@ -3557,6 +3568,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
@@ -3677,6 +3689,7 @@ dependencies = [
  "allocation-counter",
  "bytes",
  "opc-libsctp-sys",
+ "opc-protocol",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

@@ -237,7 +237,7 @@ fn complete_reference_messages_exercise_every_sdk_typed_field() {
         assert_eq!(crit, criticality(&outer["criticality"]));
         let (message_name, observed) = message_fields(message);
         assert_eq!(message_name, case["message"].as_str().expect("message"));
-        let expected: Vec<Field> = case["encoded_ies"]
+        let mut expected: Vec<Field> = case["encoded_ies"]
             .as_array()
             .expect("IEs")
             .iter()
@@ -249,6 +249,25 @@ fn complete_reference_messages_exercise_every_sdk_typed_field() {
                 )
             })
             .collect();
+        // The id-SecurityKey payload is deliberately absent from the typed view:
+        // decoding moves it into the PDU's zeroizing custody and canonical
+        // encoding substitutes it back. The raw-preserving equality assertion
+        // below proves the exact bytes are still emitted.
+        let mut observed = observed;
+        for (id, _, value) in &mut expected {
+            if *id == 94 {
+                assert!(!value.is_empty(), "reference key IE must be nonempty");
+                value.clear();
+            }
+        }
+        for (id, _, value) in &mut observed {
+            if *id == 94 {
+                assert!(
+                    value.is_empty(),
+                    "security-key typed placeholder must be empty"
+                );
+            }
+        }
         assert!(
             observed == expected,
             "SDK typed fields differ from reference for {name}"
@@ -335,7 +354,7 @@ fn constructed_containers_match_every_independent_admitted_outcome() {
             .map(|(id, crit, value)| ProtocolIe::new(*id, *crit, value))
             .collect();
         let pdu = Pdu::from_protocol_ies(kind, &ies, DecodeContext::default()).expect("construct");
-        assert!(pdu.raw.is_empty());
+        assert!(pdu.raw().is_empty());
         let expected = octets(case["wire_hex"].as_str().expect("wire"));
         assert!(
             opc_proto_ngap::encode(&pdu, EncodeContext::default()).expect("encode") == expected,

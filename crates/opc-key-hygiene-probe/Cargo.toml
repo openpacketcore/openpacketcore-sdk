@@ -1,0 +1,25 @@
+[package]
+name = "opc-key-hygiene-probe"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Test-only global-allocator probe for SDK key-material zeroization"
+readme = "README.md"
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
+opc-proto-ngap = { path = "../opc-proto-ngap", version = "0.2.0" }
+opc-sctp = { path = "../opc-sctp", version = "0.2.0" }
+zeroize = { workspace = true }
+
+# This crate exists solely to run an allocator-level drop probe for security
+# key hygiene. Implementing `GlobalAlloc` requires `unsafe`, which the rest of
+# the SDK forbids. The exception is scoped to this publish=false test crate;
+# the SDK crates themselves keep `unsafe_code = "forbid"`.
+[lints.rust]
+unsafe_code = "allow"
