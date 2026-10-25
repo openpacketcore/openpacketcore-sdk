@@ -13,7 +13,7 @@ use opc_crypto::{
 };
 use opc_key::{
     decode_bound_aad, key_id_from_bound_aad, serialize_bound_aad, AeadAlgorithm, EnvelopeAad,
-    EnvelopeMetadata, KeyHandle, KeyProvider, KeyPurpose, RemoteSealProvider, SessionAad,
+    EnvelopeMetadata, KeyError, KeyHandle, KeyProvider, KeyPurpose, RemoteSealProvider, SessionAad,
     Zeroizing, AEAD_TAG_LEN,
 };
 use opc_types::Timestamp;
@@ -37,6 +37,19 @@ const SESSION_ENVELOPE_INVALID_MESSAGE: &str = "session envelope is invalid";
 
 fn invalid_session_envelope() -> StoreError {
     StoreError::Crypto(SESSION_ENVELOPE_INVALID_MESSAGE.into())
+}
+
+/// Map a key-provider failure without weakening the encryption-oracle defence.
+///
+/// Only `KeyError::Unavailable` is reported as retryable: it happens before
+/// any ciphertext or envelope content is processed, so distinguishing it
+/// reveals nothing about persisted data. Every content-dependent failure stays
+/// collapsed into the coarse [`StoreError::Crypto`].
+fn map_key_provider_error(error: KeyError, message: &'static str) -> StoreError {
+    match error {
+        KeyError::Unavailable => StoreError::KeyProviderUnavailable(message.into()),
+        _ => StoreError::Crypto(message.into()),
+    }
 }
 
 use serde::{Deserialize, Serialize};
@@ -588,8 +601,11 @@ impl EncryptedSessionPayload {
     /// The AAD binds tenant, NF kind, a keyed digest of the session key,
     /// state type, generation, fence, and `backend_namespace`, so the
     /// ciphertext only ever decrypts for exactly this record version in this
-    /// namespace. Failures are reported as a deliberately coarse
-    /// `StoreError::Crypto` to avoid acting as an encryption oracle.
+    /// namespace. Content-dependent failures are reported as a deliberately
+    /// coarse `StoreError::Crypto` to avoid acting as an encryption oracle;
+    /// only a provider outage (`KeyError::Unavailable`, before any content is
+    /// processed) is reported as the retryable
+    /// [`StoreError::KeyProviderUnavailable`].
     pub async fn encrypt<P: KeyProvider + ?Sized>(
         provider: &P,
         record: &StoredSessionRecord,
@@ -598,7 +614,9 @@ impl EncryptedSessionPayload {
         let handle = provider
             .get_active_key(KeyPurpose::Session, &record.key.tenant)
             .await
-            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
+            .map_err(|error| {
+                map_key_provider_error(error, SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
+            })?;
         let aad = build_session_envelope_aad(record, backend_namespace, &handle)?;
         let ciphertext = encrypt_envelope_with_handle(&handle, &aad, record.payload.as_bytes())
             .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
@@ -623,7 +641,9 @@ impl EncryptedSessionPayload {
         let sealed = provider
             .seal(&aad, record.payload.as_bytes())
             .await
-            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into()))?;
+            .map_err(|error| {
+                map_key_provider_error(error, SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE)
+            })?;
         if sealed.ciphertext_and_tag.len() < AEAD_TAG_LEN {
             return Err(StoreError::Crypto(
                 SESSION_ENVELOPE_ENCRYPT_FAILED_MESSAGE.into(),
@@ -664,7 +684,9 @@ impl EncryptedSessionPayload {
     /// (i.e. the record's own header fields), otherwise decryption fails with
     /// `StoreError::Crypto`. That failure is the integrity check: ciphertext
     /// spliced onto a different record, generation, or namespace cannot
-    /// decode.
+    /// decode. A provider outage before content is processed is the sole
+    /// exception and is reported as the retryable
+    /// [`StoreError::KeyProviderUnavailable`].
     pub async fn decrypt<P: KeyProvider + ?Sized>(
         &self,
         provider: &P,
@@ -698,7 +720,9 @@ impl EncryptedSessionPayload {
         let handle = provider
             .get_key_by_id(&envelope.key_id)
             .await
-            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into()))?;
+            .map_err(|error| {
+                map_key_provider_error(error, SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE)
+            })?;
         let aad = build_session_aad(
             key,
             state_type,
@@ -765,7 +789,7 @@ impl EncryptedSessionPayload {
         provider
             .unseal(&envelope.key_id, &aad, &envelope.ciphertext_and_tag)
             .await
-            .map_err(|_| StoreError::Crypto(SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE.into()))
+            .map_err(|error| map_key_provider_error(error, SESSION_ENVELOPE_DECRYPT_FAILED_MESSAGE))
     }
 }
 
@@ -936,11 +960,217 @@ fn build_session_aad_with_digest(
 #[cfg(test)]
 mod tests {
     use super::{
-        EncryptedSessionPayloadOwnershipTestCounters, WipingPayloadBytes,
-        ENCRYPTED_SESSION_PAYLOAD_OWNERSHIP_TEST_COUNTERS,
+        EncryptedSessionPayload, EncryptedSessionPayloadOwnershipTestCounters, StoredSessionRecord,
+        WipingPayloadBytes, ENCRYPTED_SESSION_PAYLOAD_OWNERSHIP_TEST_COUNTERS,
     };
     use serde::{de, Deserialize};
     use std::sync::Arc;
+
+    use crate::error::StoreError;
+    use crate::model::{
+        FenceToken, Generation, OwnerId, SessionKey, SessionKeyType, StateClass, StateType,
+    };
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use opc_key::{
+        EncryptedPayload, EnvelopeAad, KeyError, KeyHandle, KeyId, KeyProvider, KeyPurpose,
+        MemoryKeyProvider, MemoryRemoteSealProvider, RemoteSealProvider, Zeroizing,
+    };
+    use opc_types::{NetworkFunctionKind, TenantId};
+
+    const PROVIDER_TEST_KEY_ID: &str = "provider-classification-key";
+    const PROVIDER_TEST_TENANT: &str = "provider-classification-tenant";
+    const PROVIDER_TEST_NAMESPACE: &str = "provider-classification-namespace";
+    const PROVIDER_TEST_PAYLOAD: &[u8] = b"provider-classification-payload";
+
+    fn provider_test_key() -> SessionKey {
+        SessionKey {
+            tenant: TenantId::from_static(PROVIDER_TEST_TENANT),
+            nf_kind: NetworkFunctionKind::from_static("smf"),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"provider-classification-stable-id")
+                .try_into()
+                .expect("valid stable ID"),
+        }
+    }
+
+    fn provider_test_record() -> StoredSessionRecord {
+        StoredSessionRecord {
+            key: provider_test_key(),
+            generation: Generation::new(1),
+            owner: OwnerId::new("provider-classification-owner").expect("valid owner"),
+            fence: FenceToken::new(1),
+            state_class: StateClass::AuthoritativeSession,
+            state_type: StateType::from_static("provider-classification-state"),
+            expires_at: None,
+            payload: EncryptedSessionPayload::new(PROVIDER_TEST_PAYLOAD),
+        }
+    }
+
+    fn working_local_provider() -> MemoryKeyProvider {
+        let provider = MemoryKeyProvider::new();
+        provider
+            .insert_active_key(
+                KeyId::new(PROVIDER_TEST_KEY_ID).expect("key id"),
+                KeyPurpose::Session,
+                provider_test_key().tenant,
+                Zeroizing::new([0x5a; 32]),
+            )
+            .expect("install provider key");
+        provider
+    }
+
+    struct UnavailableKeyProvider;
+
+    #[async_trait]
+    impl KeyProvider for UnavailableKeyProvider {
+        async fn get_active_key(
+            &self,
+            _purpose: KeyPurpose,
+            _tenant: &TenantId,
+        ) -> Result<KeyHandle, KeyError> {
+            Err(KeyError::Unavailable)
+        }
+
+        async fn get_key_by_id(&self, _key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+            Err(KeyError::Unavailable)
+        }
+
+        async fn rotate_key(
+            &self,
+            _purpose: KeyPurpose,
+            _tenant: &TenantId,
+        ) -> Result<KeyId, KeyError> {
+            Err(KeyError::Unavailable)
+        }
+    }
+
+    struct MissingKeyProvider;
+
+    #[async_trait]
+    impl KeyProvider for MissingKeyProvider {
+        async fn get_active_key(
+            &self,
+            _purpose: KeyPurpose,
+            _tenant: &TenantId,
+        ) -> Result<KeyHandle, KeyError> {
+            Err(KeyError::NotFound)
+        }
+
+        async fn get_key_by_id(&self, _key_id: &KeyId) -> Result<KeyHandle, KeyError> {
+            Err(KeyError::NotFound)
+        }
+
+        async fn rotate_key(
+            &self,
+            _purpose: KeyPurpose,
+            _tenant: &TenantId,
+        ) -> Result<KeyId, KeyError> {
+            Err(KeyError::NotFound)
+        }
+    }
+
+    struct UnavailableRemoteSealProvider;
+
+    #[async_trait]
+    impl RemoteSealProvider for UnavailableRemoteSealProvider {
+        async fn seal(
+            &self,
+            _aad: &EnvelopeAad,
+            _plaintext: &[u8],
+        ) -> Result<EncryptedPayload, KeyError> {
+            Err(KeyError::Unavailable)
+        }
+
+        async fn unseal(
+            &self,
+            _key_id: &KeyId,
+            _aad: &EnvelopeAad,
+            _ciphertext_and_tag: &[u8],
+        ) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+            Err(KeyError::Unavailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn key_provider_unavailable_on_seal_is_retryable() {
+        let record = provider_test_record();
+        let error = EncryptedSessionPayload::encrypt(
+            &UnavailableKeyProvider,
+            &record,
+            PROVIDER_TEST_NAMESPACE,
+        )
+        .await
+        .expect_err("provider outage must fail");
+        assert!(matches!(error, StoreError::KeyProviderUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn key_provider_unavailable_on_unseal_is_retryable() {
+        let provider = working_local_provider();
+        let record = provider_test_record();
+        let sealed = EncryptedSessionPayload::encrypt(&provider, &record, PROVIDER_TEST_NAMESPACE)
+            .await
+            .expect("seal with available provider");
+        let error = sealed
+            .decrypt(
+                &UnavailableKeyProvider,
+                &record.key,
+                &record.state_type,
+                record.generation,
+                record.fence,
+                PROVIDER_TEST_NAMESPACE,
+            )
+            .await
+            .expect_err("provider outage must fail");
+        assert!(matches!(error, StoreError::KeyProviderUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn remote_key_provider_unavailable_on_seal_and_unseal_is_retryable() {
+        let record = provider_test_record();
+        let error = EncryptedSessionPayload::remote_seal(
+            &UnavailableRemoteSealProvider,
+            &record,
+            PROVIDER_TEST_NAMESPACE,
+        )
+        .await
+        .expect_err("remote provider outage must fail");
+        assert!(matches!(error, StoreError::KeyProviderUnavailable(_)));
+
+        let remote = MemoryRemoteSealProvider::new(
+            KeyId::new(PROVIDER_TEST_KEY_ID).expect("key id"),
+            KeyPurpose::Session,
+            provider_test_key().tenant,
+            Zeroizing::new([0x6b; 32]),
+        );
+        let sealed =
+            EncryptedSessionPayload::remote_seal(&remote, &record, PROVIDER_TEST_NAMESPACE)
+                .await
+                .expect("remote seal with available provider");
+        let error = sealed
+            .remote_unseal(
+                &UnavailableRemoteSealProvider,
+                &record.key,
+                &record.state_type,
+                record.generation,
+                record.fence,
+                PROVIDER_TEST_NAMESPACE,
+            )
+            .await
+            .expect_err("remote provider outage must fail");
+        assert!(matches!(error, StoreError::KeyProviderUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn content_dependent_key_failures_remain_crypto() {
+        let record = provider_test_record();
+        let error =
+            EncryptedSessionPayload::encrypt(&MissingKeyProvider, &record, PROVIDER_TEST_NAMESPACE)
+                .await
+                .expect_err("unknown key must fail");
+        assert!(matches!(error, StoreError::Crypto(_)));
+    }
 
     #[test]
     fn envelope_validation_allocation_is_independent_of_ciphertext_size() {

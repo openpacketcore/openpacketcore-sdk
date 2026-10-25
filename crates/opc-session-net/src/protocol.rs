@@ -1931,6 +1931,9 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             }
             StoreError::LeaseHeld => Self::LeaseHeld,
             StoreError::LeaseExpired => Self::LeaseExpired,
+            StoreError::KeyProviderUnavailable(_) => {
+                Self::BackendUnavailable("key provider unavailable")
+            }
             StoreError::Crypto(_) => Self::Crypto("cryptographic operation failed"),
             StoreError::Serialization(_) => Self::Serialization("serialization failed"),
             StoreError::PayloadTooLarge { actual, max } => Self::PayloadTooLarge {

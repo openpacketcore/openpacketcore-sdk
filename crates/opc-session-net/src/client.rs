@@ -3173,6 +3173,7 @@ fn store_error_kind(err: &StoreError) -> &'static str {
         StoreError::BackendOperationOutcomeUnavailable => "backend_operation_outcome_unavailable",
         StoreError::TopologyAuthorityRevoked => "topology_authority_revoked",
         StoreError::CapabilityNotSupported(_) => "capability_not_supported",
+        StoreError::KeyProviderUnavailable(_) => "key_provider_unavailable",
         StoreError::BackendUnavailable(_)
         | StoreError::FencedTransitionRecoveryJournalUnavailable => "backend_unavailable",
         StoreError::InvalidKey(_) => "invalid_key",

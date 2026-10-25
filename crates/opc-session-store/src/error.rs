@@ -251,6 +251,17 @@ pub enum StoreError {
     /// Append-only to preserve every existing serialized discriminant.
     #[error("backend unavailable: protected fenced-transition V2 recovery journal unavailable")]
     FencedTransitionRecoveryJournalUnavailable,
+    /// The key provider backing record encryption/decryption is temporarily
+    /// unavailable (for example a KMS restart, TLS failure, refused connection,
+    /// or timeout). The failure happens before any envelope content is
+    /// processed, so it reveals nothing about persisted data and is safe to
+    /// retry like [`StoreError::BackendUnavailable`]. Content-dependent key
+    /// failures (invalid envelope, unknown key id, authentication failure)
+    /// remain collapsed into [`StoreError::Crypto`].
+    ///
+    /// Append-only to preserve every existing serialized discriminant.
+    #[error("key provider unavailable: {0}")]
+    KeyProviderUnavailable(String),
 }
 
 /// Error type for lease operations.
@@ -560,6 +571,7 @@ mod tests {
             StoreError::FencedTransitionStorageExhausted,
             StoreError::SessionRecordReserved,
             StoreError::FencedTransitionRecoveryJournalUnavailable,
+            StoreError::KeyProviderUnavailable("envelope encryption failed".into()),
         ] {
             let encoded = opc_consensus::encode_bounded(&appended)
                 .expect("appended StoreError postcard encoding");
