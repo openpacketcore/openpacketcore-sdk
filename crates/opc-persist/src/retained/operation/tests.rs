@@ -66,6 +66,7 @@ fn work(options: &RetainedConfigOptions) -> AdmissionWork {
         hook: None,
         lock_hook: None,
         completion_hook: None,
+        fault: None,
     }
 }
 
