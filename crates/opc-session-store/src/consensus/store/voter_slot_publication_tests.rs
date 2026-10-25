@@ -786,3 +786,94 @@ async fn voter_candidate_ack_waits_for_strict_publication_without_the_coordinato
     fleet.close().await;
     result.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_snapshot_control_keeps_one_cut_when_another_publication_starts() {
+    use super::super::voter_slots::ControlRequest;
+    let (mut fleet, _leader, prepared) = super::progress_tests::prepared_fleet().await;
+    let read_gate = Arc::new(SnapshotArtifactGate::new());
+    let publication = Arc::new(SnapshotArtifactGate::new());
+    let control_thread = Arc::new(std::sync::Mutex::new(None));
+    let directory = fleet.candidate_directory(3, 2);
+    let backend = SqliteSessionBackend::open(directory.path().join("session.sqlite")).unwrap();
+    let read_hook = read_gate.clone();
+    let write_hook = publication.clone();
+    let thread_hook = control_thread.clone();
+    backend
+        .native_owner
+        .as_ref()
+        .unwrap()
+        .set_io_hook_for_test(Arc::new(move |point| {
+            if point == Point::AfterNativeVoterRead
+                && *thread_hook.lock().unwrap() == Some(std::thread::current().id())
+            {
+                read_hook.block_if_armed_blocking();
+            }
+            if point == Point::AfterCutPublish {
+                write_hook.block_if_armed_blocking();
+            }
+            Ok(())
+        }));
+    let candidate = ConsensusSessionStore::open_with_voter_slots_and_integrity(
+        fleet.topology(3),
+        prepared.table().clone(),
+        member(3, 2).identity.node_id(),
+        backend,
+        directory.path().join("snapshots"),
+        Arc::new(Resolver(fleet.network.clone())),
+        crate::consensus::SnapshotIntegrityPolicy::PortableVerified,
+    )
+    .await
+    .unwrap();
+    // Keep the candidate disconnected: its durable Prepared table is valid,
+    // but no snapshot has been installed or attested yet.
+    fleet.nodes.push(candidate.clone());
+    fleet.directories.push(directory);
+    let result = AssertUnwindSafe(async {
+        let _release_read = ReleasePublication(read_gate.clone());
+        let _release_write = ReleasePublication(publication.clone());
+        assert!(candidate.inner.raft.get_snapshot().await.unwrap().is_none());
+        let operation = prepared.table().replacement.as_ref().unwrap();
+        let request = ControlRequest::SnapshotInstalled {
+            request_digest: operation.attestation.request_digest,
+            evidence: VoterSnapshotEvidence {
+                cut: operation.evidence.prepare,
+                snapshot_id: "not-installed".into(),
+                digest: [0xA3; 32],
+            },
+        };
+        let observer = candidate.clone();
+        read_gate.arm();
+        let call = tokio::task::spawn_blocking(move || {
+            *control_thread.lock().unwrap() = Some(std::thread::current().id());
+            observer
+                .inner
+                .voter_profile
+                .as_ref()
+                .unwrap()
+                .control(
+                    &observer,
+                    request,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .now_or_never()
+                .expect("the selected publication is already durable")
+        });
+        tokio::time::timeout(Duration::from_secs(5), read_gate.wait_started())
+            .await
+            .expect("control must capture the first durable publication");
+        let write = hold_vote_publication(&candidate, &publication).await;
+        read_gate.release();
+        let observed = call.await.unwrap();
+        publication.release();
+        write.await.unwrap().unwrap();
+        assert!(
+            matches!(observed, Err(VoterReplacementError::InvalidTransition)),
+            "missing snapshot evidence belongs to the captured cut; a later publication cannot turn it into a storage refusal: {observed:?}"
+        );
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap();
+}

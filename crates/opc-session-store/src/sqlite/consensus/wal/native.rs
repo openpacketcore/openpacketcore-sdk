@@ -2183,12 +2183,20 @@ impl Wal {
                 "native voter-slot publication is not durable",
             ));
         }
-        read(
+        let result = read(
             state
                 .native
                 .as_ref()
                 .ok_or_else(|| invalid_data("native voter-slot owner missing"))?,
-        )
+        );
+        #[cfg(test)]
+        {
+            drop(state);
+            if result.is_ok() {
+                (self.control.hook)(Point::AfterNativeVoterRead)?;
+            }
+        }
+        result
     }
 
     #[cfg(any(test, feature = "test-control"))]
