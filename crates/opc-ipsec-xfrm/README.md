@@ -1837,6 +1837,19 @@ roles, retained by the lifecycle across authority-adapter rebuilds. Completed
 effects cannot be reinstalled by replaying a token, and the actor retains no
 history proportional to session churn.
 
+`install_scoped_successor` adds Child-SA rekey overlap for one already-live
+scoped receipt. A distinct committed activation supplies the successor's role
+use; the successor request must keep the predecessor's exact flow identity and
+bring a distinct SPI and request ID. The actor installs the successor SA, moves
+the single protective policy to it in one update, and publishes only after
+exact readback. The predecessor SA and receipt stay live; `remove_scoped` on the
+predecessor then retires only that SA (never the successor-owned policy), and
+the successor cannot be removed before its predecessor is retired.
+`scoped_successor_status` reports the completed install/move/publication/
+retirement milestones after a lost reply or cancellation. Ambiguous readback
+retains both objects and retries through the actor's supervised readback path;
+rekey-trigger ownership and peer signalling remain caller policy.
+
 The scoped actor refuses `allocate_spi` and legacy mutation/reset entry points;
 generic `remove_sa_exact` remains unsupported. It adds no persistent object
 journal. The native expiration/ACQUIRE and readback tests qualify only the

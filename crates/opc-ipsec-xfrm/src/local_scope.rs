@@ -10,7 +10,11 @@ mod registry;
 #[cfg(feature = "scope-store")]
 pub(crate) mod request;
 #[cfg(feature = "scope-store")]
-pub use operations::ScopedXfrmReceipt;
+pub(crate) mod successor;
+#[cfg(feature = "scope-store")]
+mod successor_ops;
+#[cfg(feature = "scope-store")]
+pub use operations::{ScopedXfrmReceipt, ScopedXfrmSuccessorStatus};
 #[cfg(feature = "scope-store")]
 pub use request::ScopedXfrmRequest;
 
@@ -50,6 +54,11 @@ impl LocalXfrmProfile {
             .map_err(|_| XfrmError::StateMismatch {
                 operation: "local_scope_profile_epoch",
             })
+    }
+    pub(crate) fn try_begin_operation(
+        &self,
+    ) -> Result<Option<opc_local_kernel_lifecycle::LocalOperation>, LocalLifecycleError> {
+        self.binding.epoch.try_begin_operation()
     }
     /// Recheck that no subsequent reset invalidated this local profile.
     pub fn recheck(&self) -> Result<(), XfrmError> {

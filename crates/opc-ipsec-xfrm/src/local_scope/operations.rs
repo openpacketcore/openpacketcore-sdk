@@ -1,6 +1,6 @@
 //! One namespace actor owns transient intent, publication and exact undo.
 
-use super::{effect, registry::Registry, LocalXfrmProfile, ScopedXfrmRequest};
+use super::{effect, registry::Registry, successor, LocalXfrmProfile, ScopedXfrmRequest};
 use crate::{InstallPolicyRequest, InstallSaRequest, LinuxXfrmBackend, XfrmBackend, XfrmError};
 use futures_util::FutureExt;
 use opc_local_kernel_lifecycle::{
@@ -10,7 +10,7 @@ use opc_local_kernel_lifecycle::{
 use std::{
     panic::AssertUnwindSafe,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
     time::Duration,
@@ -24,9 +24,29 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit};
 pub struct ScopedXfrmReceipt {
     binding: Arc<ReceiptBinding>,
 }
-struct ReceiptBinding {
-    profile: LocalXfrmProfile,
-    retired: AtomicBool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReceiptRole {
+    /// Receipt of one complete flow install.
+    Install,
+    /// Receipt of one Child-SA rekey successor.
+    Successor,
+}
+pub(crate) const SUCCESSOR_SA_INSTALLED: u8 = 1;
+pub(crate) const SUCCESSOR_TRAFFIC_MOVED: u8 = 2;
+pub(crate) const SUCCESSOR_PUBLISHED: u8 = 4;
+pub(crate) const PREDECESSOR_RETIRED: u8 = 8;
+pub(crate) struct ReceiptBinding {
+    pub(crate) profile: LocalXfrmProfile,
+    pub(crate) retired: AtomicBool,
+    pub(crate) role: ReceiptRole,
+    /// The predecessor receipt, for a successor receipt only.
+    pub(crate) predecessor: Option<ScopedXfrmReceipt>,
+    pub(crate) successor_flags: AtomicU8,
+}
+impl ReceiptBinding {
+    pub(crate) fn mark_successor_flag(&self, flag: u8) {
+        self.successor_flags.fetch_or(flag, Ordering::AcqRel);
+    }
 }
 impl std::fmt::Debug for ScopedXfrmReceipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -36,6 +56,95 @@ impl std::fmt::Debug for ScopedXfrmReceipt {
 impl ScopedXfrmReceipt {
     pub(crate) async fn begin(&self) -> Result<LocalOperation, XfrmError> {
         self.binding.profile.begin().await
+    }
+    /// Whether the exact local effect was verified retired.
+    pub fn is_retired(&self) -> bool {
+        self.binding.retired.load(Ordering::Acquire)
+    }
+    pub(crate) fn role(&self) -> ReceiptRole {
+        self.binding.role
+    }
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.binding, &other.binding)
+    }
+    /// Recheck the supplied contained operation against this receipt's epoch.
+    pub(crate) fn epoch_matches(&self, guard: &LocalOperation) -> bool {
+        guard.recheck().is_ok() && guard.epoch().is_same(&self.binding.profile.binding.epoch)
+    }
+    pub(crate) fn profile(&self) -> &LocalXfrmProfile {
+        &self.binding.profile
+    }
+    pub(crate) fn has_successor_progress(&self) -> bool {
+        self.binding.successor_flags.load(Ordering::Acquire) != 0
+    }
+    pub(crate) fn successor_receipt(
+        profile: &LocalXfrmProfile,
+        predecessor: ScopedXfrmReceipt,
+    ) -> Self {
+        Self {
+            binding: Arc::new(ReceiptBinding {
+                profile: profile.clone(),
+                retired: AtomicBool::new(false),
+                role: ReceiptRole::Successor,
+                predecessor: Some(predecessor),
+                successor_flags: AtomicU8::new(0),
+            }),
+        }
+    }
+    pub(crate) fn binding_retire(&self) {
+        self.binding.retired.store(true, Ordering::Release);
+    }
+    pub(crate) fn mark_successor_flags(&self, flags: u8) {
+        self.binding.mark_successor_flag(flags);
+    }
+    pub(crate) fn status(&self) -> ScopedXfrmSuccessorStatus {
+        let flags = &self.binding.successor_flags;
+        let predecessor_retired = if self.binding.role == ReceiptRole::Install {
+            flags.load(Ordering::Acquire) & PREDECESSOR_RETIRED != 0
+        } else {
+            self.binding
+                .predecessor
+                .as_ref()
+                .is_some_and(|predecessor| predecessor.binding.retired.load(Ordering::Acquire))
+        };
+        ScopedXfrmSuccessorStatus {
+            successor_sa_installed: flags.load(Ordering::Acquire) & SUCCESSOR_SA_INSTALLED != 0,
+            traffic_moved: flags.load(Ordering::Acquire) & SUCCESSOR_TRAFFIC_MOVED != 0,
+            published: flags.load(Ordering::Acquire) & SUCCESSOR_PUBLISHED != 0,
+            predecessor_retired,
+        }
+    }
+}
+
+/// Which successor steps have completed, readable after a lost reply.
+///
+/// The milestones are actor-owned process-local observations; they grant no
+/// send, effect or retry authority. A non-exhaustive value means callers must
+/// keep future milestones representable.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopedXfrmSuccessorStatus {
+    successor_sa_installed: bool,
+    traffic_moved: bool,
+    published: bool,
+    predecessor_retired: bool,
+}
+impl ScopedXfrmSuccessorStatus {
+    /// The successor SA is installed exactly and read back.
+    pub const fn successor_sa_installed(self) -> bool {
+        self.successor_sa_installed
+    }
+    /// The protective policy selects the successor SA.
+    pub const fn traffic_moved(self) -> bool {
+        self.traffic_moved
+    }
+    /// The successor effect was published to the caller.
+    pub const fn published(self) -> bool {
+        self.published
+    }
+    /// The predecessor SA was retired after the successor was live.
+    pub const fn predecessor_retired(self) -> bool {
+        self.predecessor_retired
     }
 }
 
@@ -47,12 +156,26 @@ pub(crate) struct Install {
     pub(crate) permit: OwnedSemaphorePermit,
     pub(crate) reply: oneshot::Sender<Result<ScopedXfrmReceipt, XfrmError>>,
 }
+pub(crate) struct SuccessorInstall {
+    pub(crate) profile: LocalXfrmProfile,
+    pub(crate) effect: CommittedScopeEffect,
+    pub(crate) predecessor: ScopedXfrmReceipt,
+    pub(crate) request: Arc<ScopedXfrmRequest>,
+    pub(crate) guard: LocalOperation,
+    pub(crate) permit: OwnedSemaphorePermit,
+    pub(crate) reply: oneshot::Sender<Result<ScopedXfrmReceipt, XfrmError>>,
+}
 pub(crate) enum Command {
     #[cfg(test)]
     Retained(oneshot::Sender<Result<usize, XfrmError>>),
     #[cfg(test)]
     Fault(TestFault, oneshot::Sender<Result<(), XfrmError>>),
     Install(Box<Install>),
+    Successor(Box<SuccessorInstall>),
+    SuccessorStatus {
+        receipt: ScopedXfrmReceipt,
+        reply: oneshot::Sender<Result<ScopedXfrmSuccessorStatus, XfrmError>>,
+    },
     Remove {
         receipt: ScopedXfrmReceipt,
         guard: LocalOperation,
@@ -79,6 +202,12 @@ impl Command {
             Self::Install(install) => {
                 let _ = install.reply.send(Err(error));
             }
+            Self::Successor(install) => {
+                let _ = install.reply.send(Err(error));
+            }
+            Self::SuccessorStatus { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
             Self::Remove { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
@@ -91,26 +220,50 @@ impl Command {
         }
     }
 }
-struct Entry {
+pub(crate) struct Entry {
     #[cfg(test)]
     fault: Option<TestFault>,
-    effect: CommittedScopeEffect,
-    request: Arc<ScopedXfrmRequest>,
-    receipt: ScopedXfrmReceipt,
-    reservation: Option<super::registry::Reservation>,
-    guard: Option<LocalOperation>,
-    permit: Option<OwnedSemaphorePermit>,
-    observer: Option<oneshot::Sender<Result<ScopedXfrmReceipt, XfrmError>>>,
-    remover: Option<oneshot::Sender<Result<(), XfrmError>>>,
-    progress: effect::Progress,
-    schedule: CleanupSchedule,
+    pub(crate) effect: CommittedScopeEffect,
+    pub(crate) request: Arc<ScopedXfrmRequest>,
+    pub(crate) receipt: ScopedXfrmReceipt,
+    pub(crate) reservation: Option<super::registry::Reservation>,
+    pub(crate) guard: Option<LocalOperation>,
+    pub(crate) permit: Option<OwnedSemaphorePermit>,
+    pub(crate) observer: Option<oneshot::Sender<Result<ScopedXfrmReceipt, XfrmError>>>,
+    pub(crate) remover: Option<oneshot::Sender<Result<(), XfrmError>>>,
+    pub(crate) progress: effect::Progress,
+    /// Published successor that now owns this flow's policy identity.
+    pub(crate) successor: Option<SuccessorLink>,
+    /// Retirement of this superseded predecessor SA, when requested.
+    pub(crate) retirement: Option<successor::PredecessorRetirementProgress>,
+    pub(crate) schedule: CleanupSchedule,
+}
+pub(crate) struct SuccessorLink {
+    pub(crate) request: Arc<ScopedXfrmRequest>,
+    pub(crate) receipt: ScopedXfrmReceipt,
+}
+pub(crate) struct SuccessorEntry {
+    pub(crate) predecessor: ScopedXfrmReceipt,
+    pub(crate) request: Arc<ScopedXfrmRequest>,
+    pub(crate) receipt: ScopedXfrmReceipt,
+    pub(crate) effect: CommittedScopeEffect,
+    pub(crate) reservation: Option<super::registry::Reservation>,
+    pub(crate) guard: Option<LocalOperation>,
+    pub(crate) permit: Option<OwnedSemaphorePermit>,
+    pub(crate) observer: Option<oneshot::Sender<Result<ScopedXfrmReceipt, XfrmError>>>,
+    pub(crate) remover: Option<oneshot::Sender<Result<(), XfrmError>>>,
+    pub(crate) install_progress: successor::SuccessorProgress,
+    pub(crate) removal_progress: successor::SuccessorRemovalProgress,
+    pub(crate) removal_requested: bool,
+    pub(crate) schedule: CleanupSchedule,
 }
 #[derive(Default)]
 pub(crate) struct Operations {
     #[cfg(test)]
     next_fault: Option<TestFault>,
-    registry: Registry,
-    entries: Vec<Entry>,
+    pub(crate) registry: Registry,
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) successors: Vec<SuccessorEntry>,
 }
 fn mismatch() -> XfrmError {
     XfrmError::StateMismatch {
@@ -148,11 +301,23 @@ impl Operations {
         *self = Self::default();
     }
     pub(crate) fn next_attempt(&self) -> Option<tokio::time::Instant> {
-        self.entries
+        let primary = self
+            .entries
             .iter()
-            .filter(|entry| !entry.progress.published || entry.progress.undo)
-            .map(|entry| entry.schedule.next_attempt())
-            .min()
+            .filter(|entry| {
+                !entry.progress.published || entry.progress.undo || entry.retirement.is_some()
+            })
+            .map(|entry| entry.schedule.next_attempt());
+        let successor = self
+            .successors
+            .iter()
+            .filter(|entry| {
+                !entry.install_progress.published
+                    || entry.install_progress.undo
+                    || entry.removal_requested
+            })
+            .map(|entry| entry.schedule.next_attempt());
+        primary.chain(successor).min()
     }
     pub(crate) async fn command(
         &mut self,
@@ -172,6 +337,12 @@ impl Operations {
                 let _ = reply.send(Ok(()));
             }
             Command::Install(install) => self.admit(backend, profile, *install).await,
+            Command::Successor(install) => {
+                self.admit_successor(backend, profile, *install).await;
+            }
+            Command::SuccessorStatus { receipt, reply } => {
+                let _ = reply.send(self.successor_status_for(&receipt));
+            }
             Command::Remove {
                 receipt,
                 guard,
@@ -185,18 +356,43 @@ impl Operations {
                     let _ = reply.send(Err(mismatch()));
                     return;
                 }
-                if receipt.binding.retired.load(Ordering::Acquire) {
+                if receipt.role() == ReceiptRole::Successor {
+                    self.command_successor_remove(receipt, guard, reply);
+                } else if receipt.binding.retired.load(Ordering::Acquire) {
                     let _ = reply.send(Ok(()));
                 } else if let Some(entry) = self
                     .entries
                     .iter_mut()
                     .find(|entry| same_receipt(&entry.receipt, &receipt))
                 {
-                    if let Some(previous) = entry.remover.replace(reply) {
-                        let _ = previous.send(Err(uncertain()));
+                    if entry.successor.is_some() {
+                        // A published successor owns the protective policy; only
+                        // the predecessor SA may be retired from here.
+                        if entry.retirement.is_some() {
+                            if let Some(previous) = entry.remover.replace(reply) {
+                                let _ = previous.send(Err(uncertain()));
+                            }
+                        } else {
+                            entry.retirement =
+                                Some(successor::PredecessorRetirementProgress::default());
+                            entry.guard.get_or_insert(guard);
+                            entry.remover = Some(reply);
+                        }
+                    } else if self
+                        .successors
+                        .iter()
+                        .any(|successor| same_receipt(&successor.predecessor, &receipt))
+                    {
+                        let _ = reply.send(Err(XfrmError::StateMismatch {
+                            operation: "local_scope_successor_pending",
+                        }));
+                    } else {
+                        if let Some(previous) = entry.remover.replace(reply) {
+                            let _ = previous.send(Err(uncertain()));
+                        }
+                        entry.guard.get_or_insert(guard);
+                        entry.progress.undo = true;
                     }
-                    entry.guard.get_or_insert(guard);
-                    entry.progress.undo = true;
                 } else {
                     let _ = reply.send(Err(mismatch()));
                 }
@@ -212,12 +408,18 @@ impl Operations {
                         .is_same(&receipt.binding.profile.binding.epoch)
                 {
                     Err(mismatch())
+                } else if receipt.role() == ReceiptRole::Successor {
+                    self.read_successor(backend, &receipt).await
                 } else if let Some(entry) = self
                     .entries
                     .iter()
                     .find(|entry| same_receipt(&entry.receipt, &receipt))
                 {
-                    if entry.progress.published && !entry.progress.undo {
+                    if entry.successor.is_some() {
+                        Err(XfrmError::StateMismatch {
+                            operation: "local_scope_successor_moved",
+                        })
+                    } else if entry.progress.published && !entry.progress.undo {
                         Self::read(backend, entry).await
                     } else {
                         Err(uncertain())
@@ -233,8 +435,18 @@ impl Operations {
                 let progress = self
                     .entries
                     .iter()
-                    .filter(|entry| !entry.progress.published || entry.progress.undo)
+                    .filter(|entry| {
+                        !entry.progress.published
+                            || entry.progress.undo
+                            || entry.retirement.is_some()
+                    })
                     .map(|entry| entry.schedule.progress())
+                    .chain(self.successors.iter().filter_map(|entry| {
+                        (!entry.install_progress.published
+                            || entry.install_progress.undo
+                            || entry.removal_requested)
+                            .then(|| entry.schedule.progress())
+                    }))
                     .chain(profile_progress)
                     .collect();
                 let _ = reply.send(Ok(progress));
@@ -322,6 +534,9 @@ impl Operations {
                 binding: Arc::new(ReceiptBinding {
                     profile: supplied,
                     retired: AtomicBool::new(false),
+                    role: ReceiptRole::Install,
+                    predecessor: None,
+                    successor_flags: AtomicU8::new(0),
                 }),
             },
             reservation: None,
@@ -330,10 +545,15 @@ impl Operations {
             observer: Some(reply),
             remover: None,
             progress: effect::Progress::default(),
+            successor: None,
+            retirement: None,
             schedule: CleanupSchedule::default(),
         });
     }
     pub(crate) async fn step(&mut self, backend: &LinuxXfrmBackend) {
+        if self.service_successors(backend).await {
+            return;
+        }
         let Some(index) = self
             .entries
             .iter()

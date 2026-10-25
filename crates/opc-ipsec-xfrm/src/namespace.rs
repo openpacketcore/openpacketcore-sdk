@@ -2430,6 +2430,71 @@ impl NamespaceBoundLinuxXfrmBackend {
         .await
     }
 
+    /// Install one Child-SA rekey successor beside a live scoped receipt.
+    ///
+    /// The successor must keep the predecessor's exact flow identity (policy
+    /// selector, direction, mark and interface ID) and bring a distinct SA SPI
+    /// and request ID. A new committed activation supplies the successor's own
+    /// use authority. The actor installs the successor SA, moves the single
+    /// protective policy to it in one update and publishes only after exact
+    /// readback; the predecessor SA and its receipt stay live until
+    /// [`Self::remove_scoped`] retires the predecessor SA only. Cancellation or
+    /// reply loss is resolved by the actor's supervised undo/retry path, and
+    /// [`Self::scoped_successor_status`] reports the durable-free milestones.
+    #[cfg(feature = "scope-store")]
+    pub async fn install_scoped_successor(
+        &self,
+        profile: &crate::LocalXfrmProfile,
+        effect: opc_local_kernel_lifecycle::CommittedScopeEffect,
+        predecessor: &crate::ScopedXfrmReceipt,
+        request: crate::ScopedXfrmRequest,
+    ) -> Result<crate::ScopedXfrmReceipt, XfrmError> {
+        let permit = self
+            .inner
+            .local_installs
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| XfrmError::Unavailable)?;
+        let guard = profile.begin().await?;
+        self.dispatch(LostReply::Mutation("local_scope_successor"), |reply| {
+            NamespaceCommand::LocalEffect(crate::local_scope::operations::Command::Successor(
+                Box::new(crate::local_scope::operations::SuccessorInstall {
+                    profile: profile.clone(),
+                    effect,
+                    predecessor: predecessor.clone(),
+                    request: Arc::new(request),
+                    guard,
+                    permit,
+                    reply,
+                }),
+            ))
+        })
+        .await
+    }
+
+    /// Report which scoped Child-SA rekey successor steps completed.
+    ///
+    /// Accepts either the successor receipt or its predecessor receipt. The
+    /// milestones are process-local actor observations that authorize no send,
+    /// effect or retry; a lost reply or cancellation therefore never has to be
+    /// guessed from a completed kernel state.
+    #[cfg(feature = "scope-store")]
+    pub async fn scoped_successor_status(
+        &self,
+        receipt: &crate::ScopedXfrmReceipt,
+    ) -> Result<crate::ScopedXfrmSuccessorStatus, XfrmError> {
+        self.dispatch(LostReply::ReadOnly, |reply| {
+            NamespaceCommand::LocalEffect(
+                crate::local_scope::operations::Command::SuccessorStatus {
+                    receipt: receipt.clone(),
+                    reply,
+                },
+            )
+        })
+        .await
+    }
+
     /// Retire exactly the receipt's SA, then its protective policy, using
     /// fresh full-key readback. Cleanup needs no fresh store authority, bypasses
     /// install admission, and remains supervised if this future is dropped.
