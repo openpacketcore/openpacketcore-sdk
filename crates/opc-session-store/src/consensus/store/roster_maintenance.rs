@@ -13,7 +13,8 @@
 //!
 //! The lane is deliberately bounded: one observation per base tick, one
 //! proposal in flight at a time (the loop awaits each proposal), and an
-//! exponential back-off up to a fixed ceiling while a turn reclaims nothing.
+//! exponential back-off up to a fixed ceiling while a turn reclaims or retires
+//! nothing, and it treats every transient submission outcome as a bounded skip.
 //! It never reclaims before the existing retention boundary and never falls
 //! back to a busy loop.
 
@@ -26,8 +27,9 @@ const ROSTER_MAINTENANCE_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Bounded exponential back-off used by the lane.
 ///
-/// Every turn that frees roster occupancy resets the delay to the base tick;
-/// a turn that frees nothing doubles it up to the fixed ceiling. The value is
+/// Every turn that reclaims a retained row or retires a tombstone resets the
+/// delay to the base tick; a turn that makes no retention progress doubles it up
+/// to the fixed ceiling. The value is
 /// bounded below by the base tick and above by the ceiling, so the lane cannot
 /// busy-loop when nothing is eligible for reclamation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,13 +76,19 @@ const fn roster_maintenance_pending(snapshot: &ProtectedRosterConsensusDiagnosti
     snapshot.retained_reservations > 0 || snapshot.tombstone_reservations > 0
 }
 
-/// Total retention occupancy the lane uses to detect progress.
-const fn roster_maintenance_occupancy(
-    snapshot: &ProtectedRosterConsensusDiagnosticSnapshot,
-) -> u64 {
-    snapshot
-        .retained_reservations
-        .saturating_add(snapshot.tombstone_reservations)
+/// Whether one maintained turn reduced protected-roster retention state.
+///
+/// A reclaim turn moves one retained terminal row into one compact tombstone,
+/// so the retained-plus-tombstone total can stay flat while real progress was
+/// made. Progress therefore requires that a deterministic maintenance turn
+/// either reclaimed a retained row or retired a tombstone; only a turn that
+/// reduces neither can grow the lane's back-off.
+const fn roster_maintenance_progressed(
+    before: &ProtectedRosterConsensusDiagnosticSnapshot,
+    after: &ProtectedRosterConsensusDiagnosticSnapshot,
+) -> bool {
+    after.retained_reservations < before.retained_reservations
+        || after.tombstone_reservations < before.tombstone_reservations
 }
 
 /// The lane's only two interactions with the store.
@@ -94,10 +102,13 @@ trait RosterMaintenanceLane {
     /// owning store has been dropped.
     fn occupancy(&self) -> Option<ProtectedRosterConsensusDiagnosticSnapshot>;
 
-    /// Propose one ordinary logical-time advance, or `None` when the owning
-    /// store has been dropped or the proposal could not be accepted through
-    /// the leader/authority/deadline path. A returned `Some` does not imply
-    /// that a maintenance turn reclaimed anything.
+    /// Propose one ordinary logical-time advance. `None` means exclusively
+    /// that the owning store has been dropped; every submission outcome (a
+    /// deterministic rejection, leadership loss, no-quorum/authority refusal,
+    /// deadline expiry, outcome-unknown or any other transient store error)
+    /// returns `Some(())` so the bounded back-off continues instead of tearing
+    /// the lane down. A returned `Some` never implies that a maintenance turn
+    /// reclaimed anything.
     async fn propose(&self) -> Option<()>;
 }
 
@@ -122,12 +133,26 @@ where
         let Some(after) = lane.occupancy() else {
             return;
         };
-        if roster_maintenance_occupancy(&after) < roster_maintenance_occupancy(&before) {
+        if roster_maintenance_progressed(&before, &after) {
             backoff.reset();
         } else {
             backoff = backoff.grew();
         }
     }
+}
+
+/// Map one submission attempt to the lane's next-step outcome.
+///
+/// Every submission result keeps the lane alive: accepted, deterministic
+/// rejection, leadership/authority refusal, no-quorum, deadline expiry,
+/// outcome-unknown or any other transient store error. The lane then re-reads
+/// occupancy and keeps its existing back-off; only the store disappearing is a
+/// teardown, and that is observed exclusively through the `Weak::upgrade`
+/// failure before submission. This function is compiled in test configurations
+/// so the error-mapping regression is host-testable without a live store.
+fn roster_maintenance_submission_outcome<T, E>(submission: Result<T, E>) -> Option<()> {
+    let _ = submission;
+    Some(())
 }
 
 /// Production lane over one store. It holds only a weak reference so the last
@@ -147,6 +172,7 @@ impl RosterMaintenanceLane for ConsensusStoreRosterMaintenanceLane {
     }
 
     async fn propose(&self) -> Option<()> {
+        // `None` here is exclusively the store-disappeared teardown signal.
         let inner = self.inner.upgrade()?;
         // Leadership can move between the occupancy observation and this
         // proposal. Re-check the local leader fence here; a lost lease simply
@@ -156,7 +182,10 @@ impl RosterMaintenanceLane for ConsensusStoreRosterMaintenanceLane {
         if inner.raft.metrics().borrow().current_leader != Some(inner.local_node_id) {
             return Some(());
         }
-        let deadline = tokio::time::Instant::now().checked_add(inner.operation_timeout)?;
+        let Some(deadline) = tokio::time::Instant::now().checked_add(inner.operation_timeout)
+        else {
+            return Some(());
+        };
         let store = ConsensusSessionStore {
             inner: Arc::clone(&inner),
         };
@@ -164,17 +193,18 @@ impl RosterMaintenanceLane for ConsensusStoreRosterMaintenanceLane {
         // Its committed response makes both native and SQLite state machines
         // run their bounded deterministic roster maintenance turn. This
         // proposal has no opaque payload, consumer scope, wire-format change,
-        // Q1/Q2 command or caller-visible outcome.
-        let _ = store
-            .submit_request_before(
-                SessionConsensusRequestId::new(),
-                SessionMutationIntent::AdvanceLogicalTime,
-                None,
-                deadline,
-            )
-            .await
-            .ok()?;
-        Some(())
+        // Q1/Q2 command or caller-visible outcome. Every submission result is a
+        // bounded skip; a transient failure must never tear down the lane.
+        roster_maintenance_submission_outcome(
+            store
+                .submit_request_before(
+                    SessionConsensusRequestId::new(),
+                    SessionMutationIntent::AdvanceLogicalTime,
+                    None,
+                    deadline,
+                )
+                .await,
+        )
     }
 }
 
@@ -196,6 +226,9 @@ mod tests {
         proposals: Mutex<usize>,
         proposal_delay: Option<std::time::Duration>,
         clears_on_proposal: bool,
+        /// Simulate the owning store disappearing immediately after this many
+        /// proposals.
+        drop_after: Mutex<Option<usize>>,
     }
 
     impl MockObservation {
@@ -213,6 +246,7 @@ mod tests {
                 proposals: Mutex::new(0),
                 proposal_delay,
                 clears_on_proposal,
+                drop_after: Mutex::new(None),
             })
         }
 
@@ -246,6 +280,15 @@ mod tests {
             if self.observation.clears_on_proposal {
                 *self.observation.snapshot.lock().unwrap() =
                     ProtectedRosterConsensusDiagnosticSnapshot::default();
+            }
+            let drop_now = self
+                .observation
+                .drop_after
+                .lock()
+                .unwrap()
+                .is_some_and(|limit| *self.observation.proposals.lock().unwrap() >= limit);
+            if drop_now {
+                self.alive.store(false, Ordering::Relaxed);
             }
             Some(())
         }
@@ -330,6 +373,68 @@ mod tests {
         alive.store(false, Ordering::Relaxed);
         tokio::time::advance(ROSTER_MAINTENANCE_MAX_BACKOFF).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
+    }
+
+    #[test]
+    fn transient_submission_errors_are_bounded_skips_not_teardown() {
+        // Regression for C1 HIGH: a transient submission error (leadership
+        // stepdown, no-quorum/operator-recovery gate, deadline expiry,
+        // OutcomeUnknown, backend unavailability) must keep the lane alive.
+        // `None` is exclusively the Weak::upgrade store-disappeared signal.
+        let rejected: Result<(), StoreError> = Err(StoreError::BackendUnavailable(
+            "transient roster maintenance submission failure".into(),
+        ));
+        assert_eq!(
+            roster_maintenance_submission_outcome(rejected),
+            Some(()),
+            "a transient submission error is a bounded skip, never teardown"
+        );
+        let accepted: Result<SessionConsensusResponse, StoreError> =
+            Err(StoreError::BackendOperationOutcomeUnavailable);
+        assert_eq!(
+            roster_maintenance_submission_outcome(accepted),
+            Some(()),
+            "outcome-unknown also keeps the lane alive for a later bounded retry"
+        );
+    }
+
+    #[test]
+    fn reclaim_is_progress_even_when_the_retained_plus_tombstone_total_is_flat() {
+        // Reclaim moves one retained terminal row into one tombstone, so the
+        // total stays flat while real progress was made (C1 LOW).
+        let mut before = ProtectedRosterConsensusDiagnosticSnapshot::default();
+        before.retained_reservations = 1;
+        let mut after = ProtectedRosterConsensusDiagnosticSnapshot::default();
+        after.tombstone_reservations = 1;
+        assert!(
+            roster_maintenance_progressed(&before, &after),
+            "retained -> tombstone must reset the lane back-off"
+        );
+        assert!(!roster_maintenance_progressed(&before, &before));
+        let cleared = ProtectedRosterConsensusDiagnosticSnapshot::default();
+        assert!(
+            roster_maintenance_progressed(&after, &cleared),
+            "tombstone retirement is progress"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_store_stops_the_lane() {
+        let observation = MockObservation::new(1, 0, None, false);
+        *observation.drop_after.lock().unwrap() = Some(1);
+        let (_, task) = spawn_mock(Arc::clone(&observation));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::time::advance(ROSTER_MAINTENANCE_TICK).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(proposals(&observation), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("the lane exits once Weak::upgrade fails")
+            .expect("lane task does not panic");
     }
 
     #[tokio::test(start_paused = true)]

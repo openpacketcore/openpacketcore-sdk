@@ -152,8 +152,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the operation deadline, and proposes the existing ordinary
   `AdvanceLogicalTime` intent so the existing deterministic reclaim/retire turn
   runs on native and SQLite state machines. It keeps at most one proposal in
-  flight and backs off exponentially to a fixed 60 s ceiling while a turn
-  reclaims nothing, so it cannot busy-loop. The 24 h `TERMINAL_RETENTION`
+  flight and backs off exponentially to a fixed 60 s ceiling while a turn makes
+  no retention progress (neither reclaims a retained row nor retires a
+  tombstone), so it cannot busy-loop; a reclaim that keeps the retained-plus-
+  tombstone total flat still counts as progress. Every transient submission
+  outcome (leadership loss, no-quorum/authority refusal, deadline expiry,
+  outcome-unknown or any other store error) is a bounded skip that keeps the
+  lane alive, and only dropping the store stops it. The 24 h `TERMINAL_RETENTION`
   boundary, the fixed caps, the frozen Q1/Q2 protected-roster mutation width,
   fencing, stale-guard and exactly-once semantics are unchanged: a roster-only
   store no longer waits for unrelated ordinary traffic before reclaiming
