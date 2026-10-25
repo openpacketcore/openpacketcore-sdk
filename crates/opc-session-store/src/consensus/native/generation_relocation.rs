@@ -256,15 +256,17 @@ impl RelocationBuilder {
                     let sequence = row.sequence();
                     // The replacement lands at its ordinal in the retained
                     // window, not at raw sequence - 1: retired rows are gone.
-                    let index = sequence
+                    // A bounded window can retire an addition immediately when
+                    // one delta appends more rows than it keeps; such a row has
+                    // no resident target position to relocate.
+                    let Some(index) = sequence
                         .checked_sub(notification_floor)
                         .and_then(|position| position.checked_sub(1))
-                        .ok_or_else(|| invalid("native relocation notification sequence is zero"))
-                        .and_then(|index| {
-                            usize::try_from(index).map_err(|_| {
-                                invalid("native relocation notification index overflow")
-                            })
-                        })?;
+                    else {
+                        continue;
+                    };
+                    let index = usize::try_from(index)
+                        .map_err(|_| invalid("native relocation notification index overflow"))?;
                     let facts = facts::Row {
                         content: row.row_fingerprint(3, &sequence)?,
                         facts: facts::Notification {
