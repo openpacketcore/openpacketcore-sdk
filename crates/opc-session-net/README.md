@@ -865,6 +865,17 @@ accepted material rotation, idle/lifecycle retirement, and the public bounded
 shutdown apply to both ALPN-isolated pools; shutdown begins both drains together
 so V2 cannot add a second drain window.
 
+The prepared V2 handle's `execute_once_with_failure_diagnostic` performs the
+same dispatch as `execute_once` and returns the same effect-boundary error
+(recoverable through `into_error`), additionally attaching a value-free
+`SessionConsumerPreparedFencedTransitionV2FailureDiagnostic` to a
+`NotTransmitted` or `OutcomeUnknown` result. It reports only a closed stage
+(`setup`, `send`, `awaiting_reply`, `reply_lost`) and the remaining original
+budget in milliseconds, so a cold-setup expiry, a held refusal and a lost reply
+are distinguishable in logs and metrics. Dispatch authority, ownership, request
+identity, wire format and every classification rule are unchanged; resolved
+rejections and lease deferrals carry no diagnostic.
+
 An original prepared V2 handle settles its exact journal row when preflight
 fails or every voter proves that dispatch never occurred. Failed or cancelled
 deletion leaves that handle resolved so `release_resolved` can retry. The
