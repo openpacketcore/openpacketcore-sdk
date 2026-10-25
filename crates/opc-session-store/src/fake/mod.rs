@@ -157,14 +157,20 @@ struct LeaseEntry {
 
 /// Resource limits for the deterministic in-memory backend.
 ///
-/// `max_tracked_keys` bounds the union of session records, leases, and fence
-/// floors. Once reached, the fake rejects brand-new keys rather than evicting
-/// fence floors and weakening stale-owner protection. `max_replication_entries`
-/// bounds retained log history; older committed entries are compacted from the
-/// in-memory log while the maximum sequence still advances monotonically.
+/// `max_tracked_keys` bounds the union of live session records, live leases and
+/// the fence floors that protect them. It is not a lifetime key count: a fence
+/// floor is retired as soon as neither a live record nor a live lease names its
+/// key, so a long-lived test process that keeps creating and deleting sessions
+/// stays within the bound. Brand-new keys are still rejected with a typed
+/// [`StoreError::BackendUnavailable`] while the bound covers only authoritative
+/// state.
+///
+/// `max_replication_entries` bounds retained log history and, together with the
+/// `lab-memory` retention contract on [`FakeSessionBackend::in_memory_lab`],
+/// the exact fenced-transition receipts retained for replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FakeBackendLimits {
-    /// Maximum number of distinct session keys the fake will track.
+    /// Maximum number of distinct session keys the fake currently tracks.
     pub max_tracked_keys: usize,
     /// Maximum number of committed replication entries retained in memory.
     pub max_replication_entries: usize,
@@ -245,10 +251,22 @@ impl FakeSessionBackend {
     }
 
     fn ensure_key_capacity(
-        state: &FakeBackendState,
+        state: &mut FakeBackendState,
         map_key: &FakeMapKey,
         max_tracked_keys: usize,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
+        if state.key_fences.contains_key(map_key) || state.key_fences.len() < max_tracked_keys {
+            return Ok(());
+        }
+        // The bound is reached. Retire only state that is provably no longer
+        // authoritative before refusing: expired records, expired/inactive
+        // leases, and the fence floors of keys that neither names any more.
+        // Authority checks never depend on a dead floor: every mutation needs
+        // the exact live lease entry, and fence tokens are process-monotone, so
+        // any future lease for that key receives a strictly higher fence.
+        Self::prune_state(state, now);
+        Self::retire_dead_key_fences(state);
         if state.key_fences.contains_key(map_key) || state.key_fences.len() < max_tracked_keys {
             Ok(())
         } else {
@@ -256,6 +274,24 @@ impl FakeSessionBackend {
                 "fake backend tracked-key limit reached".into(),
             ))
         }
+    }
+
+    /// Retire the fence floors of keys with no live record and no lease entry.
+    ///
+    /// `prune_state` has already removed expired records and inactive/expired
+    /// leases; any remaining lease is live. Retiring a dead floor is safe for
+    /// stale-credential protection because mutations require the exact live
+    /// lease entry and future fences are allocated from a process-monotone
+    /// counter. This is the only place fence floors are forgotten.
+    fn retire_dead_key_fences(state: &mut FakeBackendState) {
+        let FakeBackendState {
+            records,
+            leases,
+            key_fences,
+            ..
+        } = state;
+        key_fences
+            .retain(|map_key, _| records.contains_key(map_key) || leases.contains_key(map_key));
     }
 
     fn get_with_state(
@@ -405,7 +441,7 @@ impl FakeSessionBackend {
         if op.lease.fence() < current_fence {
             return Err(StoreError::StaleFence);
         }
-        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys)?;
+        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys, now)?;
 
         let existing = state
             .records
@@ -464,7 +500,7 @@ impl FakeSessionBackend {
         if lease.fence() < current_fence {
             return Err(StoreError::StaleFence);
         }
-        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys)?;
+        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys, now)?;
 
         state.records.remove(&mk);
         state.key_fences.insert(mk, lease.fence());
@@ -496,7 +532,7 @@ impl FakeSessionBackend {
         if lease.fence() < current_fence {
             return Err(StoreError::StaleFence);
         }
-        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys)?;
+        Self::ensure_key_capacity(state, &mk, self.limits.max_tracked_keys, now)?;
 
         let Some(record) = state.records.get_mut(&mk) else {
             return Err(StoreError::NotFound);
@@ -537,7 +573,7 @@ impl FakeSessionBackend {
                 if new_record.fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
-                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys, now)?;
 
                 let Some(lease_entry) = state.leases.get(&mk) else {
                     return Err(StoreError::StaleFence);
@@ -588,7 +624,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
-                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys, now)?;
                 state.records.remove(&mk);
                 state.key_fences.insert(mk, fence);
                 Ok(())
@@ -605,7 +641,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
-                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys, now)?;
                 if let Some(record) = state.records.get_mut(&mk) {
                     record.expires_at = Some(expires_at);
                     state.key_fences.insert(mk, fence);
@@ -627,7 +663,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
-                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys, now)?;
                 if let Some(entry) = state.leases.get(&mk) {
                     if entry.active && entry.owner != owner && entry.expires_at > now {
                         return Err(StoreError::LeaseHeld);
@@ -663,7 +699,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
-                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys, now)?;
                 let acquired_at = state
                     .leases
                     .get(&mk)
@@ -697,7 +733,7 @@ impl FakeSessionBackend {
                 if fence < current_fence {
                     return Err(StoreError::StaleFence);
                 }
-                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys, now)?;
                 if let Some(entry) = state.leases.get_mut(&mk) {
                     if entry.credential_id == credential_id {
                         entry.active = false;
@@ -732,7 +768,7 @@ impl FakeSessionBackend {
                 if current_fence > fence {
                     return Err(StoreError::StaleFence);
                 }
-                Self::ensure_key_capacity(state, &mk, max_tracked_keys)?;
+                Self::ensure_key_capacity(state, &mk, max_tracked_keys, now)?;
                 let Some(lease_entry) = state.leases.get(&mk) else {
                     return Err(StoreError::StaleFence);
                 };
@@ -1336,12 +1372,12 @@ impl SessionLeaseManager for FakeSessionBackend {
                 return Err(LeaseError::AlreadyHeld);
             }
         }
-        Self::ensure_key_capacity(&state, &mk, self.limits.max_tracked_keys).map_err(|err| {
-            match err {
+        Self::ensure_key_capacity(&mut state, &mk, self.limits.max_tracked_keys, now).map_err(
+            |err| match err {
                 StoreError::BackendUnavailable(message) => LeaseError::Backend(message),
                 other => LeaseError::from(other),
-            }
-        })?;
+            },
+        )?;
 
         let current_fence = Self::current_fence(&state, &mk);
         let next_for_key = current_fence

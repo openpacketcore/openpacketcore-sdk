@@ -139,6 +139,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed-log semantics are unchanged; the majority side independently elects
   a successor. Refs #1048.
 
+- `opc-session-store`: the deterministic in-memory backend no longer refuses new
+  work for the process lifetime after a fixed number of keys or lab
+  fenced-transitions. Under capacity pressure it first retires only state that
+  is provably no longer authoritative: fence floors whose key has neither a
+  live record nor a live lease (stale credentials still fail closed against the
+  exact live lease), and `in_memory_lab` transition receipts past
+  `FENCED_TRANSITION_OUTCOME_RETENTION`. Receipts inside their exact-answer
+  window are never evicted early; when the retained history is entirely
+  authoritative the backend keeps the typed `FencedTransitionHistoryFull`
+  failure without mutating state. Refs #1257.
+
 - `opc-proto-ngap` / `opc-sctp` / `opc-protocol`: the N3IWF receive path no
   longer leaves N3IWF security-key octets in uncleared SDK-owned heap buffers.
   SCTP inbound payloads use a uniquely owned `SensitiveBytes` buffer zeroized on

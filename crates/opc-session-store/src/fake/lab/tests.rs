@@ -552,3 +552,184 @@ async fn lab_restore_sparse_scope_pages_bound_work_and_advance_without_matches()
     assert_eq!(last.excluded_count, 1);
     assert!(last.complete);
 }
+
+fn session_key_at(index: u32) -> SessionKey {
+    let mut value = key();
+    value.stable_id = StableId::new(Bytes::copy_from_slice(&index.to_be_bytes())).unwrap();
+    value
+}
+
+fn record_for_key(key: SessionKey) -> StoredSessionRecord {
+    let mut value = record(1, 1);
+    value.key = key;
+    value
+}
+
+fn create_request_at(index: u32) -> FencedTransitionRequest {
+    let key = session_key_at(index);
+    FencedTransitionRequest::new(
+        FencedTransitionRequestId::new(),
+        FencedTransitionLease::acquire(
+            key.clone(),
+            OwnerId::new("lab-owner").unwrap(),
+            FenceToken::new(0),
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+        FencedTransitionMutation::create(record_for_key(key)),
+    )
+    .unwrap()
+}
+
+fn delete_request_after(outcome: &FencedTransitionOutcome) -> FencedTransitionRequest {
+    FencedTransitionRequest::new(
+        FencedTransitionRequestId::new(),
+        FencedTransitionLease::renew(outcome.lease().clone(), Duration::from_secs(30)).unwrap(),
+        FencedTransitionMutation::delete(Generation::new(1)),
+    )
+    .unwrap()
+}
+
+async fn execute_transition(
+    backend: &FakeSessionBackend,
+    request: FencedTransitionRequest,
+) -> FencedTransitionOutcome {
+    let prepared = backend.prepare_fenced_transition(request).await.unwrap();
+    backend.fenced_transition(&prepared).await.unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn lab_retires_only_elapsed_receipts_at_capacity_and_keeps_typed_expiry() {
+    let mut backend = FakeSessionBackend::in_memory_lab();
+    backend.caps.ordered_replication_log = false;
+    backend.limits.max_replication_entries = 4;
+    let mut prepared = Vec::new();
+    for index in 0..4u32 {
+        prepared.push(
+            backend
+                .prepare_fenced_transition(create_request_at(index))
+                .await
+                .unwrap(),
+        );
+        backend
+            .fenced_transition(prepared.last().unwrap())
+            .await
+            .unwrap();
+    }
+    assert_eq!(backend.inner.lock().await.lab_transitions.len(), 4);
+
+    // Every retained receipt is still inside its answer window, so the bound is
+    // authoritative and the next transition fails closed without mutation.
+    let fifth = backend
+        .prepare_fenced_transition(create_request_at(99))
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.fenced_transition(&fifth).await,
+        Err(FencedTransitionExecuteError::Rejected(
+            StoreError::FencedTransitionHistoryFull
+        ))
+    );
+    assert!(backend.get(&session_key_at(99)).await.unwrap().is_none());
+    assert_eq!(backend.inner.lock().await.lab_transitions.len(), 4);
+
+    // Inside the window the exact outcome still replays.
+    let first = backend.fenced_transition(&prepared[0]).await.unwrap();
+    assert_eq!(
+        backend
+            .fenced_transition_status(&prepared[0])
+            .await
+            .unwrap(),
+        FencedTransitionStatus::Recorded(Box::new(Ok(first)))
+    );
+
+    // Past the window the retained receipt reports the typed expiry.
+    tokio::time::advance(FENCED_TRANSITION_OUTCOME_RETENTION + Duration::from_secs(1)).await;
+    assert_eq!(
+        backend
+            .fenced_transition_status(&prepared[0])
+            .await
+            .unwrap(),
+        FencedTransitionStatus::Expired
+    );
+    assert_eq!(
+        backend.fenced_transition(&prepared[0]).await,
+        Err(FencedTransitionExecuteError::Rejected(
+            StoreError::FencedTransitionRequestExpired
+        ))
+    );
+
+    // Capacity pressure now retires only those elapsed receipts and the new
+    // transition proceeds with the retained set still bounded.
+    backend.fenced_transition(&fifth).await.unwrap();
+    let state = backend.inner.lock().await;
+    assert!(state.lab_transitions.len() <= 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lab_bounds_receipts_past_sixty_five_thousand_fenced_transitions() {
+    let mut backend = FakeSessionBackend::in_memory_lab();
+    backend.caps.ordered_replication_log = false;
+    backend.limits.max_tracked_keys = 1_024;
+    let mut completed = 0usize;
+    let mut index = 0u32;
+    while completed <= 65_536 {
+        for _ in 0..256 {
+            let create = execute_transition(&backend, create_request_at(index)).await;
+            index += 1;
+            let _delete = execute_transition(&backend, delete_request_after(&create)).await;
+            completed += 2;
+        }
+        tokio::time::advance(FENCED_TRANSITION_OUTCOME_RETENTION + Duration::from_secs(1)).await;
+    }
+    // Trigger the ordinary expiry prune for the final batch before the bounds.
+    let _ = backend.get(&session_key_at(0)).await.unwrap();
+    let state = backend.inner.lock().await;
+    assert!(
+        completed > 65_536,
+        "the run passes the old lifetime ceiling"
+    );
+    assert!(
+        state.lab_transitions.len() <= 65_536,
+        "retained receipts stay bounded"
+    );
+    assert!(
+        state.key_fences.len() <= 1_024,
+        "tracked key floors stay bounded"
+    );
+    assert!(state.records.is_empty(), "every created record was deleted");
+    assert!(state.leases.len() <= 1_024);
+}
+
+#[tokio::test]
+async fn lab_bounds_created_and_deleted_keys_past_one_hundred_thousand() {
+    let mut backend = FakeSessionBackend::in_memory_lab();
+    backend.caps.ordered_replication_log = false;
+    backend.limits.max_tracked_keys = 1_024;
+    let owner = OwnerId::new("lab-owner").unwrap();
+    for index in 0..100_010u32 {
+        let key = session_key_at(index);
+        let lease = backend
+            .acquire(&key, owner.clone(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        let mut record = record_for_key(key.clone());
+        record.owner = lease.owner().clone();
+        record.fence = lease.fence();
+        backend
+            .compare_and_set(CompareAndSet {
+                key: key.clone(),
+                lease: lease.clone(),
+                expected_generation: None,
+                new_record: record,
+            })
+            .await
+            .unwrap();
+        backend.delete_fenced(&lease).await.unwrap();
+        backend.release(lease).await.unwrap();
+    }
+    assert!(
+        backend.inner.lock().await.key_fences.len() <= 1_024,
+        "only live key floors are retained"
+    );
+}

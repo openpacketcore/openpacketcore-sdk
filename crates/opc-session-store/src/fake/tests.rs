@@ -372,21 +372,30 @@ async fn late_capacity_failure_rolls_back_batch_and_preserves_watcher() {
     let key_b = test_key("t1", b"capacity-b");
     let owner = OwnerId::new("owner-a").expect("owner");
     let now = backend.clock.now_utc();
+    let lease_expires_at = checked_session_deadline(now, Duration::from_secs(60))
+        .expect("capacity fixture lease expiry");
     let mut watch = backend.watch(1).await.expect("watch rejected batch");
     let before = backend_data_snapshot(&backend).await;
+    // The first child establishes authoritative state (a live lease), so the
+    // second child genuinely exceeds the tracked-key bound. A fence floor with
+    // no record or lease is dead state and may now be retired under capacity
+    // pressure instead of forming a deterministic refusal.
     let rejected = replication_entry(
         1,
         "capacity-rejected",
         now,
         ReplicationOp::Batch {
             ops: vec![
-                ReplicationOp::DeleteFenced {
+                ReplicationOp::AcquireLease {
                     key: key_a.clone(),
                     owner: owner.clone(),
                     fence: FenceToken::new(1),
+                    credential_id: 1,
+                    ttl: Duration::from_secs(60),
+                    expires_at: lease_expires_at,
                 },
                 ReplicationOp::DeleteFenced {
-                    key: key_b,
+                    key: key_b.clone(),
                     owner: owner.clone(),
                     fence: FenceToken::new(2),
                 },
@@ -2001,4 +2010,103 @@ async fn repeated_idle_watch_disconnects_do_not_accumulate_in_fake_backend() {
     let live = backend.watch(1).await.expect("register live watch");
     assert_eq!(backend.inner.lock().await.watchers.len(), 1);
     drop(live);
+}
+
+#[tokio::test]
+async fn dead_key_fences_are_retired_under_capacity_and_stale_guards_stay_refused() {
+    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
+        max_tracked_keys: 2,
+        max_replication_entries: 16,
+    });
+    let stale_key = test_key("t1", b"dead-fence-stale-guard");
+    let lease = acquire_test_lease(&backend, &stale_key, "owner-a").await;
+    backend
+        .compare_and_set(cas_for_lease(stale_key.clone(), &lease, None, 1))
+        .await
+        .unwrap();
+    backend.delete_fenced(&lease).await.unwrap();
+    let stale_guard = lease.clone();
+    backend.release(lease).await.unwrap();
+
+    // A live record plus a live lease keep the second slot authoritative.
+    let live_key = test_key("t1", b"live-record");
+    let live_lease = acquire_test_lease(&backend, &live_key, "owner-a").await;
+    backend
+        .compare_and_set(cas_for_lease(live_key.clone(), &live_lease, None, 1))
+        .await
+        .unwrap();
+    {
+        let state = backend.inner.lock().await;
+        assert_eq!(state.key_fences.len(), 2);
+        assert!(state
+            .key_fences
+            .contains_key(&FakeSessionBackend::map_key(&stale_key)));
+    }
+
+    // Capacity pressure retires only the dead floor, so the newcomer fits.
+    let newcomer = test_key("t1", b"newcomer");
+    let newcomer_lease = acquire_test_lease(&backend, &newcomer, "owner-c").await;
+    assert!(newcomer_lease.fence().get() > 0);
+    {
+        let state = backend.inner.lock().await;
+        assert_eq!(state.key_fences.len(), 2);
+        assert!(!state
+            .key_fences
+            .contains_key(&FakeSessionBackend::map_key(&stale_key)));
+        assert!(state
+            .key_fences
+            .contains_key(&FakeSessionBackend::map_key(&live_key)));
+        assert!(state
+            .key_fences
+            .contains_key(&FakeSessionBackend::map_key(&newcomer)));
+    }
+    // The stale credential is still refused: mutations require the exact live
+    // lease, and the retired floor cannot admit it.
+    assert_eq!(
+        backend
+            .compare_and_set(cas_for_lease(stale_key.clone(), &stale_guard, None, 1))
+            .await
+            .unwrap_err(),
+        StoreError::StaleFence
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_record_and_lease_retire_their_key_floor_at_capacity() {
+    let backend = FakeSessionBackend::with_limits(FakeBackendLimits {
+        max_tracked_keys: 1,
+        max_replication_entries: 16,
+    });
+    let key = test_key("t1", b"expired-dead-key");
+    let lease = acquire_test_lease(&backend, &key, "owner-a").await;
+    let now = backend.clock.now_utc();
+    let mut record = test_record_for_lease(key.clone(), 1, &lease);
+    record.expires_at =
+        Some(checked_session_deadline(now, Duration::from_secs(30)).expect("record expiry"));
+    backend
+        .compare_and_set(CompareAndSet {
+            key: key.clone(),
+            lease,
+            expected_generation: None,
+            new_record: record,
+        })
+        .await
+        .unwrap();
+    // Both the record TTL (30 s) and the lease TTL (60 s) must elapse before
+    // the key is genuinely dead; a live lease still owns its fence floor.
+    tokio::time::advance(Duration::from_secs(61)).await;
+
+    let newcomer = test_key("t1", b"after-expiry");
+    let newcomer_lease = acquire_test_lease(&backend, &newcomer, "owner-b").await;
+    assert!(newcomer_lease.fence().get() > 0);
+    let state = backend.inner.lock().await;
+    assert_eq!(state.key_fences.len(), 1);
+    assert!(!state
+        .key_fences
+        .contains_key(&FakeSessionBackend::map_key(&key)));
+    assert!(state
+        .key_fences
+        .contains_key(&FakeSessionBackend::map_key(&newcomer)));
+    assert!(state.records.is_empty());
+    assert!(state.leases.len() <= 1);
 }
