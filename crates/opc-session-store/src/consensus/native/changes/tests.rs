@@ -1700,3 +1700,56 @@ fn native_notification_retention_keeps_a_bounded_committed_window() {
         "capture target retains the committed floor"
     );
 }
+
+/// A bounded rolling notification window is a native business property, so a
+/// full image must round-trip the retained suffix, the derived floor and the
+/// stale-cursor answer without a persisted floor field.
+#[test]
+fn native_notification_retention_survives_full_image_round_trip() {
+    let _retention =
+        crate::consensus::native::retention::tests_support::override_retained_for_test(4);
+    let (mut storage, _request, mut outcome) = fixture();
+    for index in 2..=10_u64 {
+        let next = request(index, Some(&outcome));
+        let applied = apply(
+            &mut storage,
+            &[command(index, &next, time(index as u8), false)],
+        );
+        let Ok(SessionMutationOutcome::FencedTransition(next_outcome)) =
+            &applied.responses[0].result
+        else {
+            panic!("native retention fixture transition failed")
+        };
+        outcome = next_outcome.clone();
+    }
+    let watch = storage.business.frontiers.watch_sequence;
+    let floor = storage.business.frontiers.notification_floor();
+    assert!(watch > 4);
+    let mut image = Vec::new();
+    storage.write_image(&mut image, [0xCE; 32], 17).unwrap();
+    let cold =
+        NativeStorage::read_image(&mut image.as_slice(), [0xCE; 32], 17, identity()).unwrap();
+    assert_eq!(cold.business.frontiers.watch_sequence, watch);
+    assert_eq!(cold.business.frontiers.notification_floor(), floor);
+    assert_eq!(cold.business.notifications.len() as u64, 4);
+    assert_eq!(
+        cold.business.notifications.front().unwrap().sequence(),
+        floor + 1
+    );
+    cold.business.validate_full_business_rows().unwrap();
+    cold.validate_image().unwrap();
+    match cold.business.replication_log(0, 8, &|| Ok(())) {
+        Err(StoreError::ReplicationLogCursorCompacted { resume_from }) => {
+            assert_eq!(resume_from, floor + 1);
+        }
+        other => panic!("cold below-floor watcher did not receive the typed answer: {other:?}"),
+    }
+    let page = cold
+        .business
+        .replication_log(floor + 1, 8, &|| Ok(()))
+        .unwrap();
+    assert_eq!(page.len() as u64, 4);
+    for (offset, entry) in page.iter().enumerate() {
+        assert_eq!(entry.sequence, floor + 1 + offset as u64);
+    }
+}

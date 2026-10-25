@@ -1981,8 +1981,13 @@ field, acknowledgement or delivery tracker. Retention is therefore a bounded
 replay backlog, not delivery tracking: a slow or lost watcher resynchronises
 from the returned sequence (or installs a snapshot for the compacted-async
 case). The hard 1,048,576-row admission cap remains a last defense instead of
-a lifetime stop. Durable generation/image/export carry for the derived floor is
-the staged follow-up for this change and adds no format boundary here.
+a lifetime stop. Durable carry for the derived floor is included: generation
+base and delta catalogs, full images, the portable SQLite snapshot projection
+and the prepared SQL base preserve the sparse raw sequences and re-derive the
+identical floor on replay, so close/reopen and snapshot install continue the
+same bounded window. The million-mutation qualification job and
+leader-to-snapshot-install parity remain the final follow-up; no format
+boundary is added.
 
 `ConsensusSessionStore` completes a linearizable read barrier before the
 atomic local handoff using `opc-consensus::LinearizableReadBarrier` in its

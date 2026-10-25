@@ -194,6 +194,7 @@ impl RelocationBuilder {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare(
         self,
         source: Arc<VerifiedPrefix>,
@@ -201,6 +202,7 @@ impl RelocationBuilder {
         applied: Option<LogId<SessionConsensusNodeId>>,
         members: &BTreeSet<SessionConsensusNodeId>,
         root: Option<Arc<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>>,
+        notification_floor: u64,
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Relocations> {
         let Self {
@@ -252,10 +254,19 @@ impl RelocationBuilder {
                     length,
                 } => {
                     let sequence = row.sequence();
-                    let index = usize::try_from(sequence.checked_sub(1).ok_or_else(|| {
-                        invalid("native relocation notification sequence is zero")
-                    })?)
-                    .map_err(|_| invalid("native relocation notification index overflow"))?;
+                    // The replacement lands at its ordinal in the retained
+                    // window, not at raw sequence - 1: retired rows are gone.
+                    // A bounded window can retire an addition immediately when
+                    // one delta appends more rows than it keeps; such a row has
+                    // no resident target position to relocate.
+                    let Some(index) = sequence
+                        .checked_sub(notification_floor)
+                        .and_then(|position| position.checked_sub(1))
+                    else {
+                        continue;
+                    };
+                    let index = usize::try_from(index)
+                        .map_err(|_| invalid("native relocation notification index overflow"))?;
                     let facts = facts::Row {
                         content: row.row_fingerprint(3, &sequence)?,
                         facts: facts::Notification {
@@ -340,6 +351,23 @@ impl RelocationBuilder {
             root,
             _memory,
         })
+    }
+}
+
+#[cfg(test)]
+impl Relocations {
+    /// Exact notification replacements this append prepared: target ordinal in
+    /// the retained window and the selected row that will replace it.
+    pub(in crate::consensus::native) fn notification_replacements_for_test(
+        &self,
+    ) -> Vec<(usize, NotificationRow)> {
+        self.rows
+            .iter()
+            .filter_map(|replacement| match replacement {
+                Replacement::Notification { index, row } => Some((*index, row.clone())),
+                _ => None,
+            })
+            .collect()
     }
 }
 

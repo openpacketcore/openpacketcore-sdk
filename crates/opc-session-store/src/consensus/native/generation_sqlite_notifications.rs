@@ -109,8 +109,13 @@ fn emit(
     writer: &mut dyn Write,
     binary: &mut SqliteBinaryRows,
     context: &mut Context,
+    notification_floor: u64,
 ) -> io::Result<()> {
-    if row.sequence != context.business.counts[3] as u64 + 1 {
+    let expected = notification_floor
+        .checked_add(context.business.counts[3] as u64)
+        .and_then(|position| position.checked_add(1))
+        .ok_or_else(|| invalid("native SQL notification sequence overflow"))?;
+    if row.sequence != expected {
         return Err(invalid("native SQL notification projection differs"));
     }
     account(
@@ -248,6 +253,7 @@ impl Batch {
         writer: &mut dyn Write,
         binary: &mut SqliteBinaryRows,
         context: &mut Context,
+        notification_floor: u64,
         check: &impl Fn() -> io::Result<()>,
         resources: &Resources<'_>,
     ) -> io::Result<()> {
@@ -270,7 +276,7 @@ impl Batch {
                 .take()
                 .ok_or_else(|| invalid("native SQL notification worker did not complete"))??;
             check()?;
-            emit(decoded, writer, binary, context)?;
+            emit(decoded, writer, binary, context, notification_floor)?;
         }
         worker_result?;
         self.rows.clear();
@@ -303,6 +309,21 @@ fn write_with_resources(
     check: &impl Fn() -> io::Result<()>,
     resources: &Resources<'_>,
 ) -> io::Result<()> {
+    // Bounded rolling retention: the portable snapshot stores only the
+    // retained suffix, whose first raw sequence is the derived floor. Validate
+    // every appended row against that committed position rather than assuming
+    // the file starts at sequence one. A fresh or below-bound state derives
+    // floor zero and keeps the original behavior byte-identical.
+    let retained_rows: i64 = tx
+        .query_row("SELECT count(*) FROM session_replication_log", [], |row| {
+            row.get(0)
+        })
+        .map_err(db)?;
+    let retained_rows = u64::try_from(retained_rows)
+        .map_err(|_| invalid("native SQL notification row count invalid"))?;
+    let watch_sequence = context.business.frontiers.watch_sequence;
+    let notification_floor =
+        super::retention::notification_retention().floor(watch_sequence.max(retained_rows));
     let mut statement = tx.prepare("SELECT sequence,tx_id,entry_json,timestamp FROM session_replication_log ORDER BY sequence").map_err(db)?;
     let mut rows = statement.query([]).map_err(db)?;
     // Metadata admission failure keeps the original one-row memory behavior.
@@ -312,7 +333,14 @@ fn write_with_resources(
             Ok(Some(row)) => row,
             next => {
                 if let Some(batch) = &mut batch {
-                    batch.flush(writer, binary, context, check, resources)?;
+                    batch.flush(
+                        writer,
+                        binary,
+                        context,
+                        notification_floor,
+                        check,
+                        resources,
+                    )?;
                 }
                 return next.map(|_| ());
             }
@@ -322,7 +350,14 @@ fn write_with_resources(
             Ok(encoded) => encoded,
             Err(error) => {
                 if let Some(batch) = &mut batch {
-                    batch.flush(writer, binary, context, check, resources)?;
+                    batch.flush(
+                        writer,
+                        binary,
+                        context,
+                        notification_floor,
+                        check,
+                        resources,
+                    )?;
                 }
                 return Err(error);
             }
@@ -335,7 +370,14 @@ fn write_with_resources(
             .ok_or_else(|| invalid("native SQL notification reservation overflow"))?;
         if let Some(batch) = &mut batch {
             if batch.rows.len() == BATCH_ROWS || charged_bytes > BATCH_BYTES - batch.bytes {
-                batch.flush(writer, binary, context, check, resources)?;
+                batch.flush(
+                    writer,
+                    binary,
+                    context,
+                    notification_floor,
+                    check,
+                    resources,
+                )?;
             }
         }
         if charged_bytes > BATCH_BYTES {
@@ -349,7 +391,14 @@ fn write_with_resources(
                     Err(_) => {
                         // Release the previous batch before retrying: staging
                         // must not reject a row the original decoder can admit.
-                        pending.flush(writer, binary, context, check, resources)?;
+                        pending.flush(
+                            writer,
+                            binary,
+                            context,
+                            notification_floor,
+                            check,
+                            resources,
+                        )?;
                         (resources.reserve)(charged_bytes)
                     }
                 };
@@ -359,8 +408,11 @@ fn write_with_resources(
                         .try_reserve_exact(encoded.len())
                         .map_err(|_| invalid("native SQL notification input allocation failed"))?;
                     copied.extend_from_slice(encoded);
-                    let expected =
-                        context.business.counts[3] as u64 + pending.rows.len() as u64 + 1;
+                    let expected = notification_floor
+                        .checked_add(context.business.counts[3] as u64)
+                        .and_then(|position| position.checked_add(pending.rows.len() as u64))
+                        .and_then(|position| position.checked_add(1))
+                        .ok_or_else(|| invalid("native SQL notification sequence overflow"))?;
                     pending.rows.push(StagedRow {
                         encoded: copied,
                         projection: Some(Projection::read(row).into_owned()),
@@ -377,13 +429,17 @@ fn write_with_resources(
             }
         }
         let _memory = (resources.reserve)(original_bytes)?;
+        let expected = notification_floor
+            .checked_add(context.business.counts[3] as u64)
+            .and_then(|position| position.checked_add(1))
+            .ok_or_else(|| invalid("native SQL notification sequence overflow"))?;
         let decoded = decode(
             encoded,
             Projection::read(row),
-            context.business.counts[3] as u64 + 1,
+            expected,
             &context.business.frontiers,
         )?;
-        emit(decoded, writer, binary, context)?;
+        emit(decoded, writer, binary, context, notification_floor)?;
     }
 }
 
@@ -961,5 +1017,96 @@ mod tests {
         assert_eq!(actual, expected);
         assert!(actual_context == expected_context);
         assert_eq!(budget.peak.get(), limit);
+    }
+
+    /// The portable SQLite snapshot stores the sparse raw sequences of the
+    /// retained notification suffix. The prepared base reader must validate
+    /// against the committed floor instead of a dense 1..N ordinal.
+    fn fixture_rows_with_retention(watch: u64, retained: u64) -> (Connection, Context) {
+        assert!(retained > 0 && retained <= watch);
+        let (storage, _, _) = fixture();
+        let original = storage
+            .business
+            .notifications
+            .front()
+            .unwrap()
+            .resident()
+            .unwrap();
+        let mut context = Version::capture(&storage).unwrap().context();
+        context.business.counts[3] = 0;
+        context.business.content[3] = [0; 32];
+        context.business.frontiers.watch_sequence = watch;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_replication_log(sequence,tx_id,entry_json,timestamp)",
+        )
+        .unwrap();
+        let floor = watch - retained;
+        for sequence in floor + 1..=watch {
+            let entry = ReplicationEntry {
+                sequence,
+                tx_id: ReplicationTxId::from_request_bytes((sequence as u128).to_le_bytes()),
+                ..original.clone()
+            };
+            conn.execute(
+                "INSERT INTO session_replication_log VALUES(?1,?2,?3,?4)",
+                params![
+                    entry.sequence,
+                    entry.tx_id.as_str(),
+                    serde_json::to_vec(&entry).unwrap(),
+                    ops::format_rfc3339_normalized(entry.timestamp)
+                ],
+            )
+            .unwrap();
+        }
+        (conn, context)
+    }
+
+    #[test]
+    fn native_sql_notification_base_reader_carries_the_bounded_retention_floor() {
+        static USED: AtomicUsize = AtomicUsize::new(0);
+        let (mut conn, context) = fixture_rows_with_retention(9, 4);
+        let tx = conn.transaction().unwrap();
+        let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
+        let mut actual = Vec::new();
+        let mut actual_context = context.clone();
+        candidate(
+            &tx,
+            &mut actual,
+            &mut actual_context,
+            &|| Ok(()),
+            &budget,
+            8,
+        )
+        .unwrap();
+        assert_eq!(actual_context.business.counts[3], 4);
+        assert!(!actual.is_empty());
+        drop(tx);
+
+        // A sparse row below the derived floor must be rejected, never
+        // silently renumbered into a dense base.
+        let (mut conn, context) = fixture_rows_with_retention(9, 4);
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "UPDATE session_replication_log SET sequence=?1 WHERE sequence=?2",
+            params![4_i64, 6_i64],
+        )
+        .unwrap();
+        let budget = Budget::new(&USED, PROCESS_VERIFICATION_BYTES);
+        let mut actual = Vec::new();
+        let mut actual_context = context.clone();
+        let error = candidate(
+            &tx,
+            &mut actual,
+            &mut actual_context,
+            &|| Ok(()),
+            &budget,
+            8,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "native SQL notification projection differs"
+        );
     }
 }

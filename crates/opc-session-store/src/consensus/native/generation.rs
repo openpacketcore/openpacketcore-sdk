@@ -665,6 +665,7 @@ impl PreparedDelta {
             self.header.after.business.frontiers.applied,
             &self.header.after.business.members,
             self.capture.business.target_proof().roster_root(),
+            self.header.after.business.frontiers.notification_floor(),
             check,
         )?;
         Ok((source, relocations))
