@@ -245,6 +245,24 @@ fn node_open_failure(stage: QualificationNodeOpenStage) -> NodeFailure {
     NodeFailure
 }
 
+/// Test-only startup delay injected after the control listener is bound and the
+/// node is open, immediately before readiness is published. The qualification
+/// regression uses it to prove that socket appearance is not readiness and that
+/// waiters observe the publication event instead of polling the socket file.
+#[cfg(feature = "test-control")]
+fn inject_control_startup_delay() {
+    const MAX_INJECTED_STARTUP_DELAY_MILLIS: u64 = 10_000;
+    let Some(millis) = env::var("OPC_QUALIFICATION_CONTROL_STARTUP_DELAY_MILLIS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(
+        millis.min(MAX_INJECTED_STARTUP_DELAY_MILLIS),
+    ));
+}
+
 #[derive(Clone)]
 struct QualificationConsensusRpcGate {
     available: Arc<AtomicBool>,
@@ -6864,7 +6882,13 @@ fn run_control_server(arguments: NodeArguments, control_socket: &Path) -> Result
     let runtime = runtime()?;
     let listener = runtime
         .block_on(TcpListener::bind(arguments.bind_addr))
-        .map_err(|_| NodeFailure)?;
+        .map_err(|_| {
+            // Closed stage label only. A competing listener or an address
+            // collision is the common early-exit cause, and no address, path
+            // or port is published here.
+            eprintln!("qualification node transport bind failed");
+            NodeFailure
+        })?;
     let bind_addr = listener.local_addr().map_err(|_| NodeFailure)?;
     // Test-only port-zero startup retains the child listener while the
     // harness writes membership from Bound, just like the stdio harness.
@@ -6898,12 +6922,35 @@ fn run_control_server(arguments: NodeArguments, control_socket: &Path) -> Result
         bind_control_socket(&config.workspace_directory, control_socket)?;
     let mut node = runtime.block_on(QualificationNode::open(&config, listener))?;
     let _terminal_exit = TerminalFailureExit::start(&runtime, Arc::clone(&node.store));
+    // The control socket file exists from `bind_control_socket`, but the
+    // process is not ready to serve commands until the node is open and this
+    // loop starts. Publishing readiness only here prevents a waiter from
+    // mistaking socket appearance for readiness. The port-zero bootstrap has
+    // already published Bound and Started on its stdio handshake, so only the
+    // fixed-address path publishes this single readiness frame.
+    #[cfg(all(target_os = "linux", feature = "test-control"))]
+    let port_zero_bootstrap = startup_writer.is_some();
+    #[cfg(not(all(target_os = "linux", feature = "test-control")))]
+    let port_zero_bootstrap = false;
     #[cfg(all(target_os = "linux", feature = "test-control"))]
     if let Some(mut writer) = startup_writer {
         write_json_line(
             &mut writer,
             &QualificationNodeReply::Started {
                 node_index: config.node_index,
+            },
+        )
+        .map_err(|_| NodeFailure)?;
+    }
+    if !port_zero_bootstrap {
+        #[cfg(feature = "test-control")]
+        inject_control_startup_delay();
+        let mut writer = BufWriter::new(io::stdout());
+        write_json_line(
+            &mut writer,
+            &QualificationNodeReply::Bound {
+                node_index: config.node_index,
+                bind_addr,
             },
         )
         .map_err(|_| NodeFailure)?;
