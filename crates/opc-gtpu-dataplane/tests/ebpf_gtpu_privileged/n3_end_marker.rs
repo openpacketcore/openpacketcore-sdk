@@ -158,28 +158,24 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         while pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED) < redirects_before + 6 {
-            if Instant::now() >= deadline {
-                eprintln!(
-                    "N3_END_MARKER_REDIRECTS before={redirects_before} current={}",
-                    pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED)
-                );
-                for arguments in [
-                    ["-6", "addr", "show", "dev", "s2bu"],
-                    ["-6", "neigh", "show", "dev", "s2bu"],
-                ] {
-                    let output = Command::new("ip")
-                        .args(arguments)
-                        .output()
-                        .expect("inspect End Marker fixture IPv6 readiness");
-                    eprintln!(
-                        "N3_END_MARKER_IPV6 {arguments:?}: {}",
-                        String::from_utf8_lossy(&output.stdout)
-                    );
-                }
-            }
             assert!(
                 Instant::now() < deadline,
-                "six GPDU redirects must precede retirement"
+                "{}",
+                super::DatapathTimeoutDiagnostics::new(
+                    "six GPDU redirects must precede retirement"
+                )
+                .redirect_delta(
+                    i128::from(pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED))
+                        - i128::from(redirects_before)
+                        - 6
+                )
+                .shared_peer_iteration(usize::from(shared_peer_tunnel))
+                .observe(
+                    "redirect-resolved counter",
+                    redirects_before + 6,
+                    pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED)
+                )
+                .render()
             );
             std::thread::sleep(Duration::from_millis(5));
         }
