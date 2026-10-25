@@ -86,12 +86,17 @@ permission to initialize authority.
 While a provisioning operation is in flight, the SDK also publishes one
 fixed-size authenticated provisioning intent beside those files
 (`<database>.opc-retained.intent`). It binds the same topology/backing/key-scope
-digest and audit key epoch/fingerprint as admission, plus the operation class
-(new authority or member repair) and a random request identifier, and its file
-and parent directory are synced before the first artifact mutation. The intent
-is SDK-owned recovery metadata only: it is never admission authority, a
-capability, or permission to create or adopt a store, and the established
-database and admission-record formats are unchanged.
+digest and audit key epoch/fingerprint as admission plus the operation class
+(new authority or member repair), carries fresh random entropy unique to that
+publication, and its file and parent directory are synced before the first
+artifact mutation. Consent is per publication, but request identity for
+resume/conflict decisions is the authenticated binding digest (topology,
+backing identity, key scope, audit-key epoch/fingerprint) plus the operation
+class: the caller API carries no request id, so two publications with the same
+binding, audit key and operation class are the same request even though their
+entropy differs. The intent is SDK-owned recovery metadata only: it is never
+admission authority, a capability, or permission to create or adopt a store,
+and the established database and admission-record formats are unchanged.
 
 The profile requires private regular files without hard-link aliases or
 symlink path components on a supported Unix filesystem. Atomic `create_new`
@@ -133,13 +138,14 @@ alone.
 | Admission file and/or database reserved, base/consensus schema, local binding, database sync | Reject incomplete state; preserve artifacts. | Authenticated intent matches: remove that partial prefix while holding the exclusive lock, then run one fresh admitted attempt. |
 | Complete authenticated admission record present | Validate the exact binding, schema and sealed history; reconcile a completed operation even if its original caller received no result. | Reconcile this committed request exactly once, retire the intent and return the validated backend. |
 | Intent missing but provisioning artifacts exist | Reject; never adopt or overwrite. | Refuse `AlreadyExists`; explicit recovery/replacement is still required for foreign or legacy partial state. |
-| Intent authentic but for a different request or operation class, or unverifiable beside artifacts | Reject; never adopt, overwrite or delete. | Refuse without mutation; the conflicting request must be resolved explicitly. |
+| Intent authentic but for a different authenticated binding or operation class, or unverifiable beside artifacts | Reject; never adopt, overwrite or delete. | Refuse without mutation; the conflicting request must be resolved explicitly. |
 
 An interruption caused by this transaction therefore needs no caller-owned
 marker deletion, guessed cleanup or manual backing replacement: retrying the
 same request either completes it exactly once or removes its authenticated
-partial prefix and retries from clean state. A different request, foreign data
-or an unverifiable record beside artifacts is never adopted or overwritten.
+partial prefix and retries from clean state. A different authenticated binding
+or operation class, foreign data or an unverifiable record beside artifacts is
+never adopted or overwritten.
 Operator recovery remains required for foreign/legacy partial state and for a
 committed store whose authenticated content fails validation; established-store
 loss is never accepted as a provisioning side effect. Coherent whole-store

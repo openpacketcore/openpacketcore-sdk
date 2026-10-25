@@ -267,16 +267,23 @@ const CRASH_STAGES: [&str; 9] = [
 ];
 
 fn crash_provision(path: &Path, stage: &str) {
-    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+    crash_provision_with(path, stage, false);
+}
+
+fn crash_provision_with(path: &Path, stage: &str, repair: bool) {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    command
         .args([
             "--exact",
             "retained::tests::provisioning_crash_child",
             "--nocapture",
         ])
         .env("OPC_RETAINED_TEST_DATABASE", path)
-        .env("OPC_RETAINED_TEST_CRASH_STAGE", stage)
-        .output()
-        .expect("crash child");
+        .env("OPC_RETAINED_TEST_CRASH_STAGE", stage);
+    if repair {
+        command.env("OPC_RETAINED_TEST_DISPOSITION", "repair");
+    }
+    let output = command.output().expect("crash child");
     assert_eq!(output.status.code(), Some(91), "{stage}");
 }
 
@@ -287,18 +294,17 @@ fn provisioning_crash_child() {
         return;
     };
     let stage = std::env::var("OPC_RETAINED_TEST_CRASH_STAGE").expect("stage");
+    let intent = match std::env::var("OPC_RETAINED_TEST_DISPOSITION").as_deref() {
+        Ok("repair") => OpenIntent::RepairMember,
+        _ => OpenIntent::NewAuthority,
+    };
     let mut work = work();
     work.hook = Some(Arc::new(move |_, observed| {
         if observed == stage {
             std::process::exit(91);
         }
     }));
-    let _ = open_authority_sync(
-        options(Path::new(&path)),
-        key(),
-        OpenIntent::NewAuthority,
-        &Arc::new(work),
-    );
+    let _ = open_authority_sync(options(Path::new(&path)), key(), intent, &Arc::new(work));
     panic!("crash boundary not reached");
 }
 
@@ -720,4 +726,214 @@ fn an_independent_process_cannot_open_live_retained_authority() {
     assert!(
         open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work())).is_ok()
     );
+}
+
+#[test]
+fn durable_intent_publication_is_classified_as_a_mutation() {
+    // After the intent is durable, any later failure is an indeterminate
+    // mutation (the operation wrapper maps `mutated`), not a pre-effect
+    // rejection. Before publication it stays a clean pre-effect failure.
+    for step in [
+        "lock_create",
+        "database_create",
+        "base_schema",
+        "consensus_schema",
+        "binding_write",
+        "database_sync",
+        "database_parent_sync",
+        "record_write",
+        "record_sync",
+        "record_parent_sync",
+    ] {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        let mut failing = work();
+        let target = step.to_string();
+        failing.fault = Some(Arc::new(move |observed| {
+            (observed == target).then_some(RetainedConfigError::Unavailable)
+        }));
+        let admission = Arc::new(failing);
+        assert!(
+            open_authority_sync(options(&path), key(), OpenIntent::NewAuthority, &admission)
+                .is_err(),
+            "{step}"
+        );
+        assert!(
+            admission.mutated.load(Ordering::Acquire),
+            "durable intent/artifact effect at {step} must be classified as mutation"
+        );
+        assert!(provision_intent_path(&path).exists(), "{step}");
+    }
+
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    let mut failing = work();
+    failing.fault = Some(Arc::new(|observed| {
+        (observed == "intent_create").then_some(RetainedConfigError::Unavailable)
+    }));
+    let admission = Arc::new(failing);
+    assert!(
+        open_authority_sync(options(&path), key(), OpenIntent::NewAuthority, &admission).is_err()
+    );
+    assert!(
+        !admission.mutated.load(Ordering::Acquire),
+        "a refused intent publication creates nothing"
+    );
+    assert!(!provision_intent_path(&path).exists());
+}
+
+#[test]
+fn remove_intent_file_refuses_foreign_file_types() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    let intent = provision_intent_path(&path);
+
+    // Group/other-writable regular file: never unlinked by SDK cleanup.
+    std::fs::write(&intent, [0u8; INTENT_BYTES]).expect("write");
+    std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o666)).expect("permissions");
+    assert!(matches!(
+        remove_intent_file(&intent, &Arc::new(work())),
+        Err(RetainedConfigError::Rejected)
+    ));
+    assert!(intent.exists(), "foreign regular file preserved");
+    std::fs::remove_file(&intent).expect("test cleanup");
+
+    // Symlink at the intent path: never followed or unlinked.
+    let foreign = dir.path().join("foreign");
+    std::fs::write(&foreign, b"foreign").expect("foreign");
+    std::os::unix::fs::symlink(&foreign, &intent).expect("symlink");
+    assert!(matches!(
+        remove_intent_file(&intent, &Arc::new(work())),
+        Err(RetainedConfigError::Rejected)
+    ));
+    assert!(intent.symlink_metadata().is_ok(), "symlink preserved");
+    assert!(foreign.exists());
+}
+
+#[test]
+fn torn_first_intent_without_artifacts_is_replaced_and_completes() {
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    // A torn first publication is SDK-owned recovery metadata with no artifact
+    // mutation behind it; it is replaced rather than requiring operator action.
+    std::fs::write(provision_intent_path(&path), [0u8; INTENT_BYTES]).expect("torn intent");
+    drop(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::NewAuthority,
+            &Arc::new(work()),
+        )
+        .expect("torn intent is replaced"),
+    );
+    assert!(!provision_intent_path(&path).exists());
+    drop(
+        open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+            .expect("provisioned authority reopens"),
+    );
+}
+
+#[test]
+fn abort_does_not_remove_a_concurrent_owners_fresh_lock() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    // Crash before lock creation, then model a concurrent same-path opener
+    // that has just claimed the empty lock slot and is still live.
+    crash_provision(&path, "intent_published");
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(lock_path(&path))
+        .expect("concurrent owner claims lock");
+    let held = AdmissionFileLock::acquire(owner).expect("owner lock");
+    let before = files(dir.path());
+    let resumed = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::NewAuthority,
+        &Arc::new(work()),
+    );
+    assert!(
+        matches!(resumed, Err(RetainedConfigError::InUse)),
+        "abort under a live owner must fail closed: {resumed:?}"
+    );
+    assert_eq!(
+        before,
+        files(dir.path()),
+        "a live owner's lock and partial state are not removed"
+    );
+    drop(held);
+    drop(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::NewAuthority,
+            &Arc::new(work()),
+        )
+        .expect("retry after the concurrent owner retires"),
+    );
+}
+
+#[test]
+fn repair_member_provisioning_resumes_and_disposition_conflicts_fail_closed() {
+    for stage in ["intent_published", "binding_stored", "record_synced"] {
+        let dir = tempfile::tempdir().expect("storage");
+        let path = dir.path().join("retained.sqlite");
+        crash_provision_with(&path, stage, true);
+        let before = files(dir.path());
+
+        // Same binding, different operation class: never adopt/abort/overwrite.
+        let conflict = open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::NewAuthority,
+            &Arc::new(work()),
+        );
+        assert!(
+            matches!(
+                conflict,
+                Err(RetainedConfigError::RecoveryRequired) | Err(RetainedConfigError::Rejected)
+            ),
+            "disposition conflict at {stage}: {conflict:?}"
+        );
+        assert_eq!(
+            before,
+            files(dir.path()),
+            "disposition conflict must not mutate {stage}"
+        );
+
+        // The authenticated repair request itself resumes.
+        drop(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::RepairMember,
+                &Arc::new(work()),
+            )
+            .unwrap_or_else(|error| panic!("repair resumes at {stage}: {error:?}")),
+        );
+        assert!(!provision_intent_path(&path).exists());
+        // The established repair store refuses fresh authority provisioning and
+        // reopens through the ordinary path.
+        assert!(matches!(
+            open_authority_sync(
+                options(&path),
+                key(),
+                OpenIntent::NewAuthority,
+                &Arc::new(work())
+            ),
+            Err(RetainedConfigError::AlreadyExists)
+        ));
+        drop(
+            open_authority_sync(options(&path), key(), OpenIntent::Reopen, &Arc::new(work()))
+                .expect("established repair store reopens"),
+        );
+    }
 }

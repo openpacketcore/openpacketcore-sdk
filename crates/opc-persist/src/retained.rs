@@ -287,8 +287,9 @@ impl SqliteBackend {
     /// Explicitly provision conclusively new retained configuration storage.
     ///
     /// This is an operator-authorized provisioning operation, never a restart
-    /// fallback. The SDK publishes a durable authenticated intent for this exact
-    /// request before the first artifact mutation. Retrying the same request
+    /// fallback. The SDK publishes a durable authenticated intent for this
+    /// request (identity is the authenticated binding digest plus the operation
+    /// class) before the first artifact mutation. Retrying the same request
     /// after an interruption finishes a committed operation exactly once, or
     /// removes its authenticated partial prefix under the exclusive lock and
     /// runs one fresh attempt. Existing established storage, foreign data, a
@@ -383,16 +384,19 @@ fn intent_disposition(intent: OpenIntent) -> Result<u8, RetainedConfigError> {
 }
 
 #[cfg(unix)]
+/// Build one intent publication. `publication_entropy` is fresh entropy per
+/// publication so each intent HMAC is unique; it is not a caller request id and
+/// is not compared for identity (resume identity is binding digest + class).
 fn make_intent(
     binding: &RetainedConfigBinding,
     key: &AuditKey,
-    request_id: [u8; 32],
+    publication_entropy: [u8; 32],
     disposition: u8,
 ) -> Result<[u8; INTENT_BYTES], RetainedConfigError> {
     let mut intent = [0; INTENT_BYTES];
     intent[..8].copy_from_slice(INTENT_MAGIC);
     intent[8..40].copy_from_slice(&binding.digest(key));
-    intent[40..72].copy_from_slice(&request_id);
+    intent[40..72].copy_from_slice(&publication_entropy);
     intent[72] = disposition;
     let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
         .map_err(|_| RetainedConfigError::Rejected)?;
@@ -430,9 +434,9 @@ fn validate_intent(
     {
         return Err(RetainedConfigError::Rejected);
     }
-    let mut request_id = [0; 32];
-    request_id.copy_from_slice(&intent[40..72]);
-    Ok((intent[72], request_id))
+    let mut publication_entropy = [0; 32];
+    publication_entropy.copy_from_slice(&intent[40..72]);
+    Ok((intent[72], publication_entropy))
 }
 
 #[cfg(unix)]
@@ -480,15 +484,17 @@ fn create_intent_file(
     disposition: u8,
     work: &Arc<AdmissionWork>,
 ) -> Result<(), RetainedConfigError> {
-    #[cfg(not(test))]
-    let _ = work;
     #[cfg(test)]
     work.fault("intent_create")?;
-    let mut request_id = [0; 32];
+    // A durable intent is already a possible effect, so a deadline must be
+    // rechecked before publishing it and failures after publication are
+    // classified as indeterminate rather than pre-effect rejections.
+    work.check()?;
+    let mut publication_entropy = [0; 32];
     SysRng
-        .try_fill_bytes(&mut request_id)
+        .try_fill_bytes(&mut publication_entropy)
         .map_err(|_| RetainedConfigError::Unavailable)?;
-    let intent = make_intent(binding, key, request_id, disposition)?;
+    let intent = make_intent(binding, key, publication_entropy, disposition)?;
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -503,7 +509,6 @@ fn create_intent_file(
                 RetainedConfigError::Unavailable
             }
         })?;
-    #[cfg(test)]
     work.mutated.store(true, Ordering::Release);
     file.write_all(&intent)
         .map_err(|_| RetainedConfigError::Unavailable)?;
@@ -521,11 +526,10 @@ fn remove_intent_file(path: &Path, work: &Arc<AdmissionWork>) -> Result<(), Reta
     let _ = work;
     #[cfg(test)]
     work.fault("intent_remove")?;
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(RetainedConfigError::Unavailable),
-    }
+    // The intent is SDK-owned, but hold it to the same foreign-type bar as
+    // committed artifacts: never unlink a symlink, non-regular file, hard-link
+    // alias or group/other-writable file at this path.
+    remove_sdk_artifact(path)?;
     sync_parent(path)?;
     #[cfg(test)]
     work.stage("intent_removed");
@@ -639,10 +643,28 @@ fn abort_partial_provision(
     let _ = work;
     // Hold the exclusive lifetime lock while removing the authenticated partial
     // prefix. A live owner means another opener is running: never abort under it.
+    // If the lock does not exist yet, claim the slot atomically with create_new
+    // instead of racing a concurrent opener's fresh lock creation.
     let lock = lock_path(&options.path);
     let _lock = match open_file(&lock, true, false) {
-        Ok(file) => Some(AdmissionFileLock::acquire(file)?),
-        Err(RetainedConfigError::RecoveryRequired) => None,
+        Ok(file) => AdmissionFileLock::acquire(file)?,
+        Err(RetainedConfigError::RecoveryRequired) => {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&lock)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        RetainedConfigError::InUse
+                    } else {
+                        RetainedConfigError::Unavailable
+                    }
+                })?;
+            AdmissionFileLock::acquire(file)?
+        }
         Err(error) => return Err(error),
     };
     remove_sdk_artifact(&options.path)?;
@@ -692,7 +714,7 @@ fn resume_or_abort_provision(
             Ok(ProvisionResume::Fresh)
         }
         Ok(Some(stored)) => match validate_intent(&stored, &options.binding, key) {
-            Ok((stored_disposition, _request_id)) => {
+            Ok((stored_disposition, _publication_entropy)) => {
                 if stored_disposition != disposition {
                     // A different provisioning operation for the same binding.
                     // An existing established store or partial prefix is never

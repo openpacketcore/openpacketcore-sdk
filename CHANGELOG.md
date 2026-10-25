@@ -10,10 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `opc-persist`: retained-authority provisioning is now crash-resumable. A
-  fixed-size authenticated provisioning intent (`<database>.opc-retained.intent`)
-  binds the exact topology, backing identity, key scope, audit-key
-  epoch/fingerprint, operation class and a random request identifier, and is
-  synced with its parent directory before the first artifact mutation. A retry
+  fixed-size authenticated provisioning intent (`<database>.opc-retained.intent`).
+  It binds the exact topology, backing identity, key scope, audit-key
+  epoch/fingerprint and operation class (new authority or member repair), carries
+  fresh per-publication entropy, and is synced with its parent directory before
+  the first artifact mutation. Request identity for resume/conflict decisions is
+  that authenticated binding digest plus the operation class; the API carries no
+  caller request id, so two publications with the same binding/audit key/class
+  are the same request. A retry
   of the same interrupted request either reconciles a committed admission
   exactly once (returning the validated backend even when the original caller
   never observed success) or removes its authenticated partial prefix under
