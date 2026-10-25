@@ -45,6 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: a configuration-consensus leader-routed call is now bounded by
+  this replica's own leader view. Once the engine has observed a successor for
+  a lost leader, an unanswered forwarded mutation or linearizable read barrier
+  is abandoned after `DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (200 ms) and
+  re-offered through that successor, instead of occupying the complete
+  operation deadline. A route with no observed successor keeps the existing
+  operation deadline and its typed ambiguous outcome; an abandoned forwarded
+  mutation is classified as possibly transmitted and retries on the same
+  request identity, so the configuration store still applies it exactly once.
+  Election, heartbeat and forwarded-mutation timing budgets are unchanged.
+  Refs #1049.
+
 - `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
   TS 29.281 section 5.1 all-zero value is now representable and installable on
   the model and mock-software paths, and the N3 software G-PDU encoder emits

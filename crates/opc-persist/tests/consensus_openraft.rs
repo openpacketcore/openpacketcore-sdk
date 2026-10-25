@@ -24,6 +24,10 @@ mod planned_shutdown;
 #[path = "consensus_openraft/member_repair.rs"]
 mod member_repair;
 
+#[cfg(feature = "dangerous-test-hooks")]
+#[path = "consensus_openraft/route_retirement.rs"]
+mod route_retirement;
+
 use quorum_admission::rolling_election;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -85,6 +89,7 @@ struct LoopbackPeer {
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
     drop_forward_responses: Arc<AtomicUsize>,
+    forward_mutation_attempts: Arc<AtomicUsize>,
     stall_forward_mutation: Arc<AtomicBool>,
     stall_read_barrier: Arc<AtomicBool>,
     stall_read_proof: Arc<AtomicBool>,
@@ -108,6 +113,7 @@ impl LoopbackPeer {
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
             drop_forward_responses: Arc::new(AtomicUsize::new(0)),
+            forward_mutation_attempts: Arc::new(AtomicUsize::new(0)),
             stall_forward_mutation: Arc::new(AtomicBool::new(false)),
             stall_read_barrier: Arc::new(AtomicBool::new(false)),
             stall_read_proof: Arc::new(AtomicBool::new(false)),
@@ -134,6 +140,11 @@ impl LoopbackPeer {
 
     fn drop_forward_responses(&self, count: usize) {
         self.drop_forward_responses.store(count, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "dangerous-test-hooks")]
+    fn forward_mutation_attempts(&self) -> usize {
+        self.forward_mutation_attempts.load(Ordering::SeqCst)
     }
 
     fn stall_family(&self, family: ConsensusRpcFamily, stalled: bool) {
@@ -191,6 +202,10 @@ impl ConsensusPeer for LoopbackPeer {
     ) -> Result<opc_consensus::ConsensusCallResponse, ConsensusPeerError> {
         if !self.enabled.load(Ordering::SeqCst) {
             return Err(ConsensusPeerError::Unavailable);
+        }
+        if request.family == ConsensusRpcFamily::ForwardMutation {
+            self.forward_mutation_attempts
+                .fetch_add(1, Ordering::SeqCst);
         }
         self.captured_payloads
             .lock()

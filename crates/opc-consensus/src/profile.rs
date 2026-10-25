@@ -170,6 +170,20 @@ pub const DURABLE_CONSENSUS_OPERATION_TIMEOUT: Duration =
 /// probes after a remote peer has authenticated and declined bootstrap.
 pub const DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Grace after this replica's own engine names a successor before an
+/// outstanding leader-routed call is abandoned and re-offered through that
+/// successor.
+///
+/// This is a route-retirement bound, not an election or RPC timing change: the
+/// lease, heartbeat, election and forwarded-mutation budgets in
+/// [`DURABLE_CONSENSUS_TIMING_PROFILE`] are unchanged. It bounds how long a
+/// black-holed former leader can hold a leader-routed call after the local
+/// replica has already observed the successor. A route that was never
+/// transmitted is abandoned without ambiguity; an attempted route is reported
+/// as possibly transmitted so a retry reuses the same request identity and the
+/// state machine's idempotency contract keeps it exactly-once.
+pub const DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE: Duration = Duration::from_millis(200);
+
 /// Maximum number of log entries admitted to one durable AppendEntries batch.
 pub const DURABLE_OPENRAFT_MAX_PAYLOAD_ENTRIES: usize = 64;
 
@@ -375,6 +389,15 @@ mod tests {
         assert_eq!(
             DURABLE_CONSENSUS_REMOTE_RETIREMENT_PROBE_INTERVAL,
             Duration::from_secs(5)
+        );
+        assert_eq!(
+            DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE,
+            Duration::from_millis(200)
+        );
+        assert!(DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE <= profile.operation_timeout());
+        assert!(
+            DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE
+                < Duration::from_millis(profile.append_entries_timeout_millis)
         );
         assert_eq!(profile.server_idle_timeout(), Duration::from_millis(30_000));
         assert_eq!(
