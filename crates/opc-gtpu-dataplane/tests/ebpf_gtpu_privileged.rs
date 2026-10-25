@@ -314,10 +314,11 @@ use opc_gtpu_dataplane::{
     GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, GtpuV2DrainProof,
     PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
     PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
-    PdpContextUplinkSelector, RemovePdpContextRequest, RetainedGraphCleanupClassification,
-    RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid, TftUplinkBearer,
-    TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
-    TftUplinkClassifierRemovalOutcome, TrafficContinuityPolicy,
+    PdpContextUplinkSelector, PeerTeid, RemovePdpContextRequest,
+    RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
+    Teid, TftUplinkBearer, TftUplinkClassifier, TftUplinkClassifierReadback,
+    TftUplinkClassifierReconcileOutcome, TftUplinkClassifierRemovalOutcome,
+    TrafficContinuityPolicy,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, udp_ipv6_checksum,
@@ -10231,14 +10232,12 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     let mut marked_v4 = session_context(device.ifindex);
     marked_v4.local_teid =
         Teid::new(GROUP_LOCAL_TEID_V4_INITIAL).expect("nonzero grouped v4 local TEID");
-    marked_v4.peer_teid =
-        Teid::new(GROUP_PEER_TEID_V4_INITIAL).expect("nonzero grouped v4 peer TEID");
+    marked_v4.peer_teid = PeerTeid::new(GROUP_PEER_TEID_V4_INITIAL);
     marked_v4.bearer_mark = Some(GtpBearerMark::new(MARK_A).expect("nonzero XFRM bearer mark"));
     let mut grouped_v6 = session_context(device.ifindex);
     grouped_v6.local_teid =
         Teid::new(GROUP_LOCAL_TEID_V6_INITIAL).expect("nonzero grouped v6 local TEID");
-    grouped_v6.peer_teid =
-        Teid::new(GROUP_PEER_TEID_V6_INITIAL).expect("nonzero grouped v6 peer TEID");
+    grouped_v6.peer_teid = PeerTeid::new(GROUP_PEER_TEID_V6_INITIAL);
     grouped_v6.ms_address = IpAddr::V6(UE_PAA_IPV6);
     grouped_v6.peer_address = IpAddr::V6(PGW_IPV6);
     grouped_v6.bearer_mark =

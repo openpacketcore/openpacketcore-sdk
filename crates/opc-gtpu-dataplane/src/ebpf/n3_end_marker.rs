@@ -117,7 +117,16 @@ fn end_marker_targets(
                     feature: "n3_end_marker_selected_source_port",
                 });
             }
-            Ok((local, peer, context.peer_teid))
+            // The eBPF userspace adapter refuses the TS 29.281 section 5.1
+            // all-zero peer TEID until the committed datapath object is
+            // rebuilt with zero-peer-TEID support (#1461), so a grouped
+            // context installed here cannot carry one. Fail closed instead of
+            // widening this nullable type.
+            let peer_teid =
+                crate::Teid::new(context.peer_teid.get()).ok_or(GtpuError::UnsupportedFeature {
+                    feature: "n3_end_marker_peer_teid_zero",
+                })?;
+            Ok((local, peer, peer_teid))
         })
         .collect()
 }

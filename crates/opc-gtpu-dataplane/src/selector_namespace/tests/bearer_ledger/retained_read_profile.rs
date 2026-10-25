@@ -3,6 +3,7 @@
 //! no ledger, receipt, durability rule or production limit is changed.
 
 use super::*;
+use crate::PeerTeid;
 use opc_session_testkit::authenticated_consumer_fixture::AuthenticatedPreparedFencedTransitionFixture;
 use std::io::Write;
 

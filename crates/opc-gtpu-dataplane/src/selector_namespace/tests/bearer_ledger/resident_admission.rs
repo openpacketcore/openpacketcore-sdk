@@ -2,6 +2,7 @@
 //! namespace bound. A requested count is not a claim of admitted residents.
 
 use super::*;
+use crate::PeerTeid;
 use opc_session_testkit::authenticated_consumer_fixture::AuthenticatedPreparedFencedTransitionFixture;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -1046,7 +1046,7 @@ async fn dedicated_bearer_errors_use_the_default_bearer_uplink() {
 
 #[test]
 fn packet_too_big_limiter_is_an_exact_per_session_token_bucket() {
-    use crate::reassembly::PacketTooBigLimiter;
+    use crate::reassembly::{PacketTooBigAdmission, PacketTooBigLimiter};
     use std::time::Instant;
     assert!(crate::GtpuPacketTooBigRateLimit::new(0, Duration::from_secs(1)).is_none());
     assert!(crate::GtpuPacketTooBigRateLimit::new(1, Duration::ZERO).is_none());
@@ -1054,27 +1054,65 @@ fn packet_too_big_limiter_is_an_exact_per_session_token_bucket() {
     let mut limiter = PacketTooBigLimiter::new(limit);
     let (a, b) = ([0, 0, 0, 1], [0, 0, 0, 2]);
     let start = Instant::now();
-    assert!(limiter.admit(a, start));
-    assert!(limiter.admit(a, start));
-    assert!(!limiter.admit(a, start));
+    assert_eq!(limiter.admit(a, start), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(a, start), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(a, start), PacketTooBigAdmission::RateLimited);
     // Exhausting one session never limits another.
-    assert!(limiter.admit(b, start));
-    assert!(limiter.admit(b, start));
-    assert!(!limiter.admit(b, start));
-    assert!(!limiter.admit(a, start + Duration::from_millis(99)));
-    assert!(limiter.admit(a, start + Duration::from_millis(100)));
-    assert!(!limiter.admit(a, start + Duration::from_millis(150)));
+    assert_eq!(limiter.admit(b, start), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(b, start), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(b, start), PacketTooBigAdmission::RateLimited);
+    assert_eq!(
+        limiter.admit(a, start + Duration::from_millis(99)),
+        PacketTooBigAdmission::RateLimited
+    );
+    assert_eq!(
+        limiter.admit(a, start + Duration::from_millis(100)),
+        PacketTooBigAdmission::Admitted
+    );
+    assert_eq!(
+        limiter.admit(a, start + Duration::from_millis(150)),
+        PacketTooBigAdmission::RateLimited
+    );
     // A long idle period refills to the burst, never beyond it.
     let later = start + Duration::from_secs(60);
-    assert!(limiter.admit(a, later));
-    assert!(limiter.admit(a, later));
-    assert!(!limiter.admit(a, later));
-    // The table is bounded; the least recently used session is evicted.
+    assert_eq!(limiter.admit(a, later), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(a, later), PacketTooBigAdmission::Admitted);
+    assert_eq!(limiter.admit(a, later), PacketTooBigAdmission::RateLimited);
+
+    // The table is bounded and protects every session inside its 255-second
+    // eviction grace: a new session is refused, not admitted by resetting
+    // another session's budget.
     let mut limiter = PacketTooBigLimiter::new(limit);
-    for index in 0..4_097_u32 {
+    for index in 0..4_096_u32 {
         let now = start + Duration::from_micros(u64::from(index));
-        assert!(limiter.admit(index.to_be_bytes(), now));
+        assert_eq!(
+            limiter.admit(index.to_be_bytes(), now),
+            PacketTooBigAdmission::Admitted
+        );
     }
+    let recent = start + Duration::from_millis(500);
+    assert_eq!(
+        limiter.admit(4_096_u32.to_be_bytes(), recent),
+        PacketTooBigAdmission::CapacityExhausted,
+        "a table of sessions inside the grace fails closed instead of evicting"
+    );
+    // A session idle past the grace may be the least recently used tail and
+    // is then replaced.
+    let after_grace = start + Duration::from_secs(256);
+    assert_eq!(
+        limiter.admit(4_096_u32.to_be_bytes(), after_grace),
+        PacketTooBigAdmission::Admitted
+    );
+    // The replacement session's own budget starts full, and an exhausted
+    // session that stayed tracked keeps its empty bucket.
+    assert_eq!(
+        limiter.admit(4_096_u32.to_be_bytes(), after_grace),
+        PacketTooBigAdmission::Admitted
+    );
+    assert_eq!(
+        limiter.admit(4_096_u32.to_be_bytes(), after_grace),
+        PacketTooBigAdmission::RateLimited
+    );
     let default = crate::GtpuPacketTooBigRateLimit::default();
     assert_eq!(
         (default.burst(), default.refill_interval()),
@@ -1437,7 +1475,7 @@ async fn default_policy_refuses_options_and_malformed_headers_before_taking_a_to
 
 #[test]
 fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications() {
-    use crate::reassembly::InnerFragmentBudget;
+    use crate::reassembly::{InnerFragmentAdmission, InnerFragmentBudget};
     use crate::GtpuInnerFragmentRateLimit as Limit;
     use std::time::Instant;
     assert!(Limit::new(0, Duration::from_secs(1)).is_none());
@@ -1460,24 +1498,51 @@ fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications()
     let mut budget = InnerFragmentBudget::new(limit);
     let (a, b) = ([10, 45, 0, 2], [10, 45, 0, 3]);
     let start = Instant::now();
-    let first = budget.admit(a, start, true).unwrap().unwrap();
+    let InnerFragmentAdmission::Admitted(Some(first)) = budget.admit(a, start, true) else {
+        panic!("first atomic datagram must be admitted");
+    };
     assert_ne!(first, 0);
     assert_eq!(
         budget.admit(a, start, false),
-        Some(None),
+        InnerFragmentAdmission::Admitted(None),
         "a non-atomic datagram keeps its own Identification but takes a token"
     );
-    assert_eq!(budget.admit(a, start, true), None);
+    assert_eq!(
+        budget.admit(a, start, true),
+        InnerFragmentAdmission::RateLimited
+    );
     assert!(
-        budget.admit(b, start, true).unwrap().is_some(),
+        matches!(
+            budget.admit(b, start, true),
+            InnerFragmentAdmission::Admitted(Some(_))
+        ),
         "per destination"
     );
     let refilled = start + Duration::from_millis(100);
-    let second = budget.admit(a, refilled, true).unwrap().unwrap();
+    let InnerFragmentAdmission::Admitted(Some(second)) = budget.admit(a, refilled, true) else {
+        panic!("refilled atomic datagram must be admitted");
+    };
     assert_eq!(second, first.checked_add(1).unwrap_or(1));
-    // A replacement keeps the sequence and never grants an extra burst.
-    budget.set_limit(Limit::new(64, Duration::from_secs(3_600)).unwrap());
-    assert_eq!(budget.admit(a, refilled, true), None);
+
+    // An equal replacement is always accepted; an increase after admissions is
+    // refused unless the carried conservative window bound allows it.
+    assert!(budget.set_limit(limit, refilled));
+    assert!(
+        budget.set_limit(
+            Limit::new(64, Duration::from_secs(3_600)).unwrap(),
+            refilled
+        ),
+        "the carried bound plus this tightening limit stays within 65,535"
+    );
+    assert_eq!(
+        budget.admit(a, refilled, true),
+        InnerFragmentAdmission::RateLimited,
+        "a replacement keeps the sequence and never grants an extra burst"
+    );
+    assert!(
+        !budget.set_limit(default, refilled),
+        "a later mid-registration increase is refused by the carried bound"
+    );
 
     // One destination's sequence assigns every non-zero Identification
     // exactly once before its budget is exhausted: the largest burst, then
@@ -1488,20 +1553,42 @@ fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications()
     let hour_later = start + Duration::from_secs(3_600);
     for index in 0..65_535 {
         let now = if index < 65_534 { start } else { hour_later };
-        let identification = budget.admit(a, now, true).unwrap().unwrap();
+        let InnerFragmentAdmission::Admitted(Some(identification)) = budget.admit(a, now, true)
+        else {
+            panic!("admission {index} must be inside the exact bound");
+        };
         assert_ne!(identification, 0);
         assert!(!seen[usize::from(identification)]);
         seen[usize::from(identification)] = true;
     }
-    assert_eq!(budget.admit(a, hour_later, true), None);
+    assert_eq!(
+        budget.admit(a, hour_later, true),
+        InnerFragmentAdmission::RateLimited
+    );
     assert!(format!("{budget:?}").contains("tracked: 1"));
 
-    // The table is bounded; the least recently used destination is evicted.
+    // The table is bounded and protects every destination inside its
+    // 255-second eviction grace: a new destination is refused fail closed
+    // instead of resetting another destination's budget or sequence.
     let mut budget = InnerFragmentBudget::new(limit);
-    for index in 0..4_097_u32 {
+    for index in 0..4_096_u32 {
         let now = start + Duration::from_micros(u64::from(index));
-        assert!(budget.admit(index.to_be_bytes(), now, true).is_some());
+        assert!(matches!(
+            budget.admit(index.to_be_bytes(), now, true),
+            InnerFragmentAdmission::Admitted(_)
+        ));
     }
+    let recent = start + Duration::from_millis(500);
+    assert_eq!(
+        budget.admit(4_096_u32.to_be_bytes(), recent, true),
+        InnerFragmentAdmission::CapacityExhausted
+    );
+    // A destination idle past the grace is evicted and re-created.
+    let after_grace = start + Duration::from_secs(256);
+    assert!(matches!(
+        budget.admit(4_096_u32.to_be_bytes(), after_grace, true),
+        InnerFragmentAdmission::Admitted(_)
+    ));
     assert!(format!("{budget:?}").contains("tracked: 4096"));
 }
 
