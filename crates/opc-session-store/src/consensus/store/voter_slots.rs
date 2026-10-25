@@ -14,6 +14,29 @@ use opc_consensus::engine::{
 use opc_consensus::voter_slots::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Test-only injection for the transient voter-store reopen class. The hook
+/// exists only in test builds; production opening never consults it.
+#[cfg(test)]
+pub(crate) mod transient_open_test_hook {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static REMAINING: AtomicUsize = AtomicUsize::new(0);
+
+    /// Require the next `count` opening attempts to report the transient
+    /// `StorageUnavailable` class before any real work starts.
+    pub(crate) fn inject(count: usize) {
+        REMAINING.store(count, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take() -> bool {
+        REMAINING
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+}
+
 pub(crate) type SessionVoterAdmission =
     VoterAdmission<RaftVoterResponseFence<SessionRaftTypeConfig>>;
 pub(crate) type SessionVoterTransport =
@@ -651,6 +674,10 @@ impl ConsensusSessionStore {
         resolver: Arc<dyn VoterPeerResolver>,
         snapshot_integrity: super::super::SnapshotIntegrityPolicy,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
+        #[cfg(test)]
+        if transient_open_test_hook::take() {
+            return Err(ConsensusSessionStoreOpenError::StorageUnavailable);
+        }
         let genesis = topology
             .voter_slot_genesis()
             .cloned()
