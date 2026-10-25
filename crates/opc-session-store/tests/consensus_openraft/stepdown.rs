@@ -130,6 +130,15 @@ struct PublicationHold {
     held: AtomicBool,
     released: StdMutex<bool>,
     release: Condvar,
+    observations: StdMutex<PublicationObservations>,
+}
+
+#[derive(Debug, Default)]
+struct PublicationObservations {
+    metrics_events: usize,
+    matching_events: usize,
+    unmatched_log_end: Option<u64>,
+    recent_metrics: std::collections::VecDeque<String>,
 }
 
 impl PublicationHold {
@@ -139,7 +148,12 @@ impl PublicationHold {
             return;
         }
         if let Some((path, truncated_end)) = &self.log_cut {
-            if retained_sql_log_id_from(path, None).index != *truncated_end {
+            let observed = retained_sql_log_id_from(path, None).index;
+            if observed != *truncated_end {
+                self.observations
+                    .lock()
+                    .expect("publication observations mutex")
+                    .unmatched_log_end = Some(observed);
                 return;
             }
         }
@@ -185,13 +199,24 @@ async fn receive_response<F: Future>(
     let response = tokio::time::timeout_at(deadline, response)
         .await
         .expect("configured higher-vote peer completes conflict handling");
-    tokio::time::timeout_at(deadline, async {
+    let held = tokio::time::timeout_at(deadline, async {
         while !publication.held.load(Ordering::Acquire) {
             publication.before_publication.notified().await;
         }
     })
-    .await
-    .expect("engine acknowledges the publication hold within the shared deadline");
+    .await;
+    if held.is_err() {
+        eprintln!(
+            "publication hold expected={:?} log_cut={:?} observed={:?}",
+            publication.metrics_prefix,
+            publication.log_cut,
+            publication
+                .observations
+                .lock()
+                .expect("publication observations mutex")
+        );
+    }
+    held.expect("engine acknowledges the publication hold within the shared deadline");
     response
 }
 
@@ -201,6 +226,18 @@ async fn receive_response<F: Future>(
 // This acknowledgment also lets the channel regression force a response to
 // arrive before its first receiver poll, without relying on thread timing.
 struct PublicationEvents(Arc<StdMutex<Option<Arc<PublicationHold>>>>);
+
+struct PublicationDispatch {
+    observer: tracing::Dispatch,
+}
+
+impl PublicationDispatch {
+    fn new(publication: Arc<StdMutex<Option<Arc<PublicationHold>>>>) -> Self {
+        Self {
+            observer: tracing::Dispatch::new(PublicationEvents(publication)),
+        }
+    }
+}
 
 impl tracing::Subscriber for PublicationEvents {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
@@ -229,7 +266,23 @@ impl tracing::Subscriber for PublicationEvents {
         if let Some(publication) = publication {
             let mut message = Message(String::new());
             event.record(&mut message);
+            if message.0.starts_with("report_metrics:") {
+                let mut observations = publication
+                    .observations
+                    .lock()
+                    .expect("publication observations mutex");
+                observations.metrics_events += 1;
+                if observations.recent_metrics.len() == 8 {
+                    observations.recent_metrics.pop_front();
+                }
+                observations.recent_metrics.push_back(message.0.clone());
+            }
             if message.0.starts_with(&publication.metrics_prefix) {
+                publication
+                    .observations
+                    .lock()
+                    .expect("publication observations mutex")
+                    .matching_events += 1;
                 publication.before_publication();
             }
         }
@@ -249,11 +302,10 @@ async fn publication_hold_survives_response_before_first_poll() {
         held: AtomicBool::new(false),
         released: StdMutex::new(false),
         release: Condvar::new(),
+        observations: StdMutex::new(PublicationObservations::default()),
     });
     let _release_publication = ReleasePublication(publication.clone());
-    let dispatch = tracing::Dispatch::new(PublicationEvents(Arc::new(StdMutex::new(Some(
-        publication.clone(),
-    )))));
+    let dispatch = PublicationDispatch::new(Arc::new(StdMutex::new(Some(publication.clone()))));
     let (respond, response) = tokio::sync::oneshot::channel();
     let (publish, mut published) = tokio::sync::watch::channel(false);
     let responder = std::thread::spawn(move || {
@@ -261,7 +313,7 @@ async fn publication_hold_survives_response_before_first_poll() {
         // channel type. Deschedule the receiver until the sender reaches
         // its publication event: send() cannot invoke an unregistered wake.
         respond.send(()).expect("response receiver remains alive");
-        tracing::dispatcher::with_default(&dispatch, || {
+        tracing::dispatcher::with_default(&dispatch.observer, || {
             tracing::debug!(target: "openraft::core::raft_core", "report_metrics: ready-response");
         });
         publish
@@ -292,6 +344,60 @@ async fn publication_hold_survives_response_before_first_poll() {
     responder.join().expect("publication sender completes");
 }
 
+#[test]
+fn publication_observer_sees_callsites_first_used_without_a_subscriber() {
+    const CHILD: &str = "OPC_STEPDOWN_CALLSITE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Tracing's callsite registry is process-wide. Give this ordering its
+        // own registry so concurrent tests cannot mask the first registration.
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "stepdown::publication_observer_sees_callsites_first_used_without_a_subscriber",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("callsite registration child");
+        assert!(
+            output.status.success(),
+            "callsite registration child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    fn report_metrics() {
+        tracing::debug!(target: "openraft::core::raft_core", "report_metrics: registration-probe");
+    }
+
+    let publication = Arc::new(PublicationHold {
+        log_cut: None,
+        metrics_prefix: "report_metrics: registration-probe".to_owned(),
+        before_publication: tokio::sync::Notify::new(),
+        deadline: tokio::time::Instant::now() + RECOVERY_TIMEOUT,
+        held: AtomicBool::new(false),
+        released: StdMutex::new(true),
+        release: Condvar::new(),
+        observations: StdMutex::new(PublicationObservations::default()),
+    });
+    let dispatch = PublicationDispatch::new(Arc::new(StdMutex::new(Some(publication.clone()))));
+    std::thread::spawn(report_metrics)
+        .join()
+        .expect("unobserved thread registers the callsite");
+    tracing::dispatcher::with_default(&dispatch.observer, report_metrics);
+    assert_eq!(
+        publication
+            .observations
+            .lock()
+            .expect("publication observations mutex")
+            .metrics_events,
+        1,
+        "the same callsite must remain visible on the observed runtime"
+    );
+}
+
 thread_local! {
     static PUBLICATION_DISPATCH: RefCell<Option<tracing::dispatcher::DefaultGuard>> =
         const { RefCell::new(None) };
@@ -300,8 +406,8 @@ thread_local! {
 #[test]
 fn superseded_leader_stops_replication_before_truncating_its_uncommitted_suffix() {
     let publication = Arc::new(StdMutex::new(None));
-    let dispatch = tracing::Dispatch::new(PublicationEvents(publication.clone()));
-    let worker_dispatch = dispatch.clone();
+    let dispatch = PublicationDispatch::new(publication.clone());
+    let worker_dispatch = dispatch.observer.clone();
     // A task-local subscriber would miss events on the engine's spawned
     // tasks. Install this observer only on this fixture's runtime threads.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -319,7 +425,7 @@ fn superseded_leader_stops_replication_before_truncating_its_uncommitted_suffix(
         })
         .build()
         .expect("stepdown fixture runtime");
-    tracing::dispatcher::with_default(&dispatch, || {
+    tracing::dispatcher::with_default(&dispatch.observer, || {
         runtime.block_on(stepdown_scenario(publication));
     });
 }
@@ -508,6 +614,7 @@ async fn stepdown_scenario(publication_events: Arc<StdMutex<Option<Arc<Publicati
         held: AtomicBool::new(false),
         released: StdMutex::new(false),
         release: Condvar::new(),
+        observations: StdMutex::new(PublicationObservations::default()),
     });
     // Unwind must release the engine even when an assertion detects the race.
     let _release_publication = ReleasePublication(publication.clone());
