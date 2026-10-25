@@ -508,9 +508,17 @@ coverage.
      to prevent. The first *usable* value wins, so an unusable instance does
      not shadow a later usable one; `is_empty()` reports on addresses only, so
      an MTU-only value is still empty.
-   - Bearer QoS decodes the fixed 22-octet shape into a typed
+   - Bearer QoS decodes the required 22-octet prefix into a typed
      Allocation/Retention Priority, QCI, and 40-bit integer-kbit/s maximum and
      guaranteed bit-rate fields. ARP priority level and spare bits are checked.
+     TS 29.274 Table 8.1-1 classifies this IE as Extendable: unknown trailing
+     octets are ignored on decode per clause 7.7.7, omitted by canonical
+     encoding, and retained by raw-preserving message encoding. The rates use
+     the GTP encoding in clause 8.15; NAS extended-rate octets from
+     TS 24.008 clause 10.5.6.5 are a separate encoding. Construction and
+     encoding reject rates wider than 40 bits. `tests/extended_bearer_qos.rs`
+     covers these wire bounds, prefix length, invalid rate relationships,
+     TLIV overruns and nested S2b receive.
      `AllocationRetentionPriority::cmp_priority` ranks level 1 highest and
      level 15 lowest per TS 29.274 clause 8.15 and TS 29.212 clause 5.3.45.
      Equal levels compare equal regardless of PCI/PVI. Capability and

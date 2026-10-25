@@ -1450,6 +1450,10 @@ impl std::error::Error for BearerQosValidationError {}
 /// specific QCIs remain wire-preservable but require an explicit resource
 /// type through [`BearerQos::validate_with_resource_type`] before policy use.
 ///
+/// The IE has a required 22-octet prefix. Decoding ignores unknown trailing
+/// octets per TS 29.274 clause 7.7.7; canonical encoding emits only the known
+/// fields. Raw-preserving message encoding retains the received octets.
+///
 /// @spec 3GPP TS29274 R18 8.15
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-BEARER-QOS-001
 #[derive(Clone, PartialEq, Eq)]
@@ -1611,7 +1615,17 @@ impl BearerQos {
     }
 
     fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
-        require_exact_len(value, 22, offset, "Bearer QoS IE must be twenty-two octets")?;
+        // The raw TLIV parser has already checked the declared boundary.
+        // A complete but short value is an invalid length, not truncated input.
+        if value.len() < 22 {
+            return Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "Bearer QoS IE must be twenty-two octets",
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref()));
+        }
         let decoded = Self {
             priority_flags: value[0],
             qci: value[1],

@@ -516,6 +516,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readback; the eBPF userspace adapter returns the same typed refusal until its
   committed datapath object is rebuilt with zero-peer-TEID support. Refs #1346.
 
+- `opc-proto-gtpv2c`: accept unknown extension octets after the required
+  Bearer QoS prefix while retaining 40-bit rate bounds and QoS validation.
+  Canonical encoding emits the known fields; raw-preserving message encoding
+  retains the extension. Refs #1356 (GTPv2-C item).
+
 - `opc-proto-gtpv2c`: S2b receive discards unexpected Update Bearer PCO,
   non-S2b-U Create/Update Bearer F-TEIDs, and SGW-only Create/Update/Delete
   Bearer control entries before typed decoding. Mandatory fields, TLIV framing,
