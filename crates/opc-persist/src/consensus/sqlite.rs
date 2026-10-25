@@ -35,6 +35,7 @@ use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusResponse, ConfigMutationFailure,
     ConfigMutationIntent, ConfigRaftTypeConfig,
 };
+use super::{SnapshotReadVerification, SnapshotWorkHooks};
 use crate::backend::SqliteBackend;
 use crate::types::{AuditKey, AuditOpType, CommitSource};
 
@@ -369,6 +370,10 @@ pub(crate) struct ConfigConsensusCore {
     pub(crate) snapshot_build_gate: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     pub(crate) snapshot_test_hooks: Arc<super::storage::SnapshotTestHooks>,
+    /// Always-compiled snapshot work accounting shared with the backend.
+    pub(crate) snapshot_work_hooks: Arc<SnapshotWorkHooks>,
+    /// Evidence from this core's most recent whole-file snapshot verification.
+    snapshot_read_verification: Arc<std::sync::Mutex<Option<SnapshotReadVerification>>>,
     pub(crate) audit_key: Arc<AuditKey>,
     pub(crate) management_audit_keys: Option<Arc<crate::audit_authority::continuity::AuditKeyRing>>,
     pub(crate) _snapshot_dir_guard: Arc<std::fs::File>,
@@ -389,6 +394,27 @@ pub(crate) struct ConfigConsensusCore {
 impl ConfigConsensusCore {
     pub(crate) fn storage_shutdown_observer(&self) -> tokio::sync::watch::Receiver<()> {
         self.storage_owner.subscribe()
+    }
+
+    /// Reuse the digest computed by the single verification of an engine
+    /// snapshot read, instead of hashing the whole file a second time.
+    pub(crate) fn snapshot_read_verification(
+        &self,
+        snapshot_id: &str,
+    ) -> Option<SnapshotReadVerification> {
+        self.snapshot_read_verification
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|verification| verification.snapshot_id == snapshot_id)
+            .cloned()
+    }
+
+    pub(crate) fn record_snapshot_read_verification(&self, verification: SnapshotReadVerification) {
+        *self
+            .snapshot_read_verification
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(verification);
     }
 
     pub(crate) fn snapshot_directory_owner(
@@ -603,6 +629,8 @@ impl ConfigConsensusCore {
             snapshot_build_gate: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             snapshot_test_hooks: Arc::clone(&backend.consensus_snapshot_test_hooks),
+            snapshot_work_hooks: backend.snapshot_work_hooks(),
+            snapshot_read_verification: Arc::new(std::sync::Mutex::new(None)),
             audit_key: Arc::new(backend.audit_key().clone()),
             management_audit_keys: backend.management_audit_keys(),
             _snapshot_dir_guard: snapshot_dir_guard,
@@ -4073,6 +4101,30 @@ pub(crate) type CurrentSnapshot = (
     [u8; 32],
     u64,
 );
+
+/// Byte size of the main SQLite database file, derived from page metadata.
+///
+/// This is a cheap, read-only estimate used to derive a size-following
+/// snapshot build budget before the backup is captured. It is a point-in-time
+/// observation: concurrent writes can grow the file (and WAL/freelist) past
+/// this value, so the derived backup budget may be slightly short. Such an
+/// under-budget fails typed at the derived bound and is recoverable by retrying
+/// the build; it is never a durability or admission decision.
+pub(crate) fn database_storage_bytes_sync(conn: &Connection) -> io::Result<u64> {
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .map_err(db_error)?;
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .map_err(db_error)?;
+    let page_count =
+        u64::try_from(page_count).map_err(|_| invalid_data("invalid SQLite page count"))?;
+    let page_size =
+        u64::try_from(page_size).map_err(|_| invalid_data("invalid SQLite page size"))?;
+    page_count
+        .checked_mul(page_size)
+        .ok_or_else(|| invalid_data("SQLite database size overflow"))
+}
 
 pub(crate) fn read_current_snapshot_sync(
     conn: &Connection,
