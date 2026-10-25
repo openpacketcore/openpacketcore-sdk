@@ -1095,10 +1095,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-store` and `opc-persist`: add `shutdown_unplanned()` for an
   embedder with a failed replication listener. It fences admission, suppresses
-  leadership handoff, and retains clone-wide, cancellation-safe engine and
-  storage drain with the original caller bounds and native reopen-proof checks.
-  Config bus adapters expose the same lifecycle through their consensus store.
-  Planned shutdown keeps automatic bounded handoff. (#1370)
+  new handoff preparation, and cancels and joins an outstanding preparation
+  before the same clone-wide, cancellation-safe engine and storage drain with
+  the original caller bounds and native reopen-proof checks. Handoff RPCs
+  already dispatched cannot be retracted, so a successor may already be
+  campaigning; the retained report uses `PlannedShutdownFallback::Unplanned`
+  and does not certify a successor. Config bus adapters expose the same lifecycle
+  through their consensus store. Planned shutdown keeps automatic bounded
+  handoff. `opc-consensus` gains the non-breaking
+  `PlannedShutdownFallback::Unplanned` variant. (#1370, #1376)
 - `opc-proto-ikev2`: CREATE_CHILD_SA request/response construction, dedicated-bearer
   response decoding and correlation, and NWu creation responses validate the
   KE public-value width for the supplied DH group, including 96 octets for group 1.

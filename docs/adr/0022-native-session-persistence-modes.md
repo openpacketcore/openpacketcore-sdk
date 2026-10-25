@@ -405,6 +405,13 @@ same drain; cancellation of an observer never cancels the owned operation.
 An explicit prior preparation retains its original deadline and outcome.
 Handoff neither changes persistence mode nor certifies a storage close.
 
+An unplanned loss (for example a failed replication listener) uses
+`shutdown_unplanned()` instead: it fences local admission, suppresses new
+handoff preparation, and cancels and joins an outstanding preparation before the
+same owned drain. RPCs already dispatched cannot be retracted, so a successor
+may already be campaigning; the retained report uses
+`PlannedShutdownFallback::Unplanned` and does not certify a successor.
+
 The coordinator then joins maintenance lanes, Raft and every actual
 storage/snapshot owner. Only an incarnation that was Active and
 whose engine stopped normally can request certification. Openraft shutdown's

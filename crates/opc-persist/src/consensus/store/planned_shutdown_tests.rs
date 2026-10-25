@@ -556,3 +556,27 @@ async fn standard_snapshot_rejects_incomparable_vote_before_staging() {
         "an engine-rejected incomparable vote must not create staging"
     );
 }
+
+#[test]
+fn unplanned_flag_wins_over_other_fallbacks() {
+    let (sender, receiver) = watch::channel(false);
+    assert_eq!(
+        prefer_unplanned(Err(PlannedShutdownFallback::NotAdmitted), &receiver),
+        Err(PlannedShutdownFallback::NotAdmitted)
+    );
+    sender.send_replace(true);
+    assert_eq!(
+        prefer_unplanned(Err(PlannedShutdownFallback::NotAdmitted), &receiver),
+        Err(PlannedShutdownFallback::Unplanned)
+    );
+    assert_eq!(
+        prefer_unplanned(Err(PlannedShutdownFallback::DeadlineElapsed), &receiver),
+        Err(PlannedShutdownFallback::Unplanned)
+    );
+    // A flag that lands after a completed transfer still yields the weaker
+    // Unplanned report; it never claims successor authority.
+    assert_eq!(
+        prefer_unplanned(Ok(PlannedShutdownOutcome::FollowerRetired), &receiver),
+        Err(PlannedShutdownFallback::Unplanned)
+    );
+}

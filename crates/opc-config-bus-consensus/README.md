@@ -88,6 +88,16 @@ worker must still call `reconcile_and_open()` on its live projection before
 writing; handoff does not bypass the projection-head authority check. Abrupt
 loss retains the engine's ordinary election behavior.
 
+For an unplanned loss (for example a failed replication listener), close
+external config-write admission, retain the failure diagnostic, and call the
+underlying `ConsensusConfigStore::shutdown_unplanned()` instead of the planned
+route. It suppresses new handoff preparation and cancels and joins an
+outstanding preparation before the same owned engine/storage drain; handoff
+RPCs already dispatched cannot be retracted, and `shutdown_with_report()`
+reports `PlannedShutdownFallback::Unplanned`. A promoted worker still calls
+`reconcile_and_open()` before writing, and no successor is certified by this
+route.
+
 The authority check also compares the config bus's payload-free
 `{tx_id, version}` projection head with the canonical local state-machine head
 while all fixed proposal-admission slots are drained under the existing

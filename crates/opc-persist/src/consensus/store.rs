@@ -1180,9 +1180,13 @@ impl ConsensusConfigStore {
     /// listener available until this call finishes. The clone-wide handoff is
     /// bounded within the existing operation budget; failure falls back to
     /// ordinary shutdown and is logged with a typed reason. Use
-    /// [`Self::shutdown_with_report`] to inspect that result. Cancelling a caller
-    /// does not cancel the owned shutdown or reopen local admission. If a caller
-    /// times out, a later clone must observe completion before reopening storage.
+    /// [`Self::shutdown_with_report`] to inspect that result. For an unplanned
+    /// loss (for example a failed replication listener), call
+    /// [`Self::shutdown_unplanned`] instead; it suppresses new handoff
+    /// preparation and cancels and joins an outstanding preparation before the
+    /// same drain. Cancelling a caller does not cancel the owned shutdown or
+    /// reopen local admission. If a caller times out, a later clone must observe
+    /// completion before reopening storage.
     pub async fn shutdown(&self) -> Result<(), PersistError> {
         self.shutdown_with_report().await.map(|_| ())
     }
