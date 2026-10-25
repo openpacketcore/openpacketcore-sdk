@@ -1605,6 +1605,13 @@ mod tests {
         assert!(error.source().is_some(), "typed source remains available");
     }
 
+    /// Hang watchdog for the test-only worker-reply observation. This is not a
+    /// correctness bound: the product's 25 ms acknowledgement/shutdown bounds
+    /// are exercised separately, and the event observed here is the worker's
+    /// own reply after `release()`. A hosted-runner scheduling delay may move
+    /// that reply, but only a genuinely wedged worker hits the watchdog.
+    const WORKER_REPLY_WATCHDOG: Duration = Duration::from_secs(30);
+
     #[tokio::test]
     async fn stalled_worker_bounds_acknowledgement_and_shutdown() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1653,11 +1660,12 @@ mod tests {
 
         // Acknowledgement timeout and bounded shutdown do not establish the
         // admitted append's outcome. Release the worker and observe its real
-        // result within the old readback wait before reopening the database.
+        // reply; the reply is the event, and WORKER_REPLY_WATCHDOG only guards
+        // against a genuinely wedged worker (not a correctness deadline).
         held_worker.release();
         assert!(matches!(
             admitted_reply
-                .recv_timeout(Duration::from_millis(250))
+                .recv_timeout(WORKER_REPLY_WATCHDOG)
                 .expect("observe the admitted append's final result")
                 .expect("the admitted append must complete successfully"),
             WorkerReply::Appended
@@ -1713,7 +1721,7 @@ mod tests {
         drop(sink);
         held_worker.release();
         match admitted_reply
-            .recv_timeout(Duration::from_millis(250))
+            .recv_timeout(WORKER_REPLY_WATCHDOG)
             .expect("observe the admitted append's final failure")
         {
             Err(DurableAuditSinkError::Store(ManagementAuditStoreError::Persistence(error))) => {
