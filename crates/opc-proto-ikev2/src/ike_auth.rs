@@ -1840,8 +1840,9 @@ impl fmt::Debug for Ikev2CreateChildSaRekeyResponsePayloads {
 }
 
 /// Select a Child SA and selectors, preferring a stronger common PFS group
-/// over group 1. Only implemented non-NONE DH groups are eligible, including
-/// with an accept-any DH requirement. Other accepted alternatives retain wire order.
+/// over group 1. DH NONE remains eligible; non-NONE DH groups must be
+/// implemented, including with an accept-any DH requirement. Other accepted
+/// alternatives retain wire order.
 ///
 /// Supply `key_exchange` for PFS; a different KE group returns a typed retry
 /// naming the selected group, including when the received group is unsupported.
