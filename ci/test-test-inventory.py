@@ -740,9 +740,11 @@ if history.returncode or patches.returncode or patches.stderr:
 merge_pass = '--merges' in ' '.join(args)
 count = 0 if merge_pass else int(os.environ.get('FAKE_FINDINGS', '3'))
 exit_code = 0 if merge_pass else int(os.environ.get('SCAN_EXIT', '0'))
-if 'SCOPE_FIXTURE_' + 'A' * 12 in patches.stdout:
-    count, exit_code = 1, 2
-    sys.stderr.write(line('WRN', 'leaks found: 1'))
+marker_lines = [line for line in patches.stdout.splitlines()
+                if line.startswith('+') and 'SCOPE_FIXTURE_' + 'A' * 12 in line]
+if marker_lines:
+    count, exit_code = len(marker_lines), 2
+    sys.stderr.write(line('WRN', f'leaks found: {count}'))
 sys.stderr.write(os.environ.get('FAKE_SCAN_LOG', ''))
 if exit_code == 0:
     sys.stderr.write(line('INF', 'no leaks found'))
@@ -1029,6 +1031,28 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                 self.assertEqual(len(records), 1)
                 self.assertIn(head, records[0]['commits'])
                 self.assertEqual(self.output.read_text(), 'findings=1\n')
+                self.assertIn('WRN leaks found: 1', result.stderr)
+
+    def test_ordinary_and_merge_findings_share_one_report(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'merge-side', self.base, repo=self.origin)
+        side = self.commit('side-file', 'clean side change')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        ordinary = self.commit('ordinary-finding', marker)
+        self.git('merge', '--no-ff', '--no-commit', side, repo=self.origin)
+        head = self.commit('merge-only-finding', marker)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn(ordinary, records[0]['commits'])
+                self.assertIn(head, records[0]['commits'])
+                self.assertEqual(self.output.read_text(), 'findings=2\n')
+                self.assertIn('WRN leaks found: 2', result.stderr)
 
     def test_merged_side_branch_history_is_still_scanned(self):
         marker = 'SCOPE_FIXTURE_' + 'A' * 12
