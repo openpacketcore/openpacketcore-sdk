@@ -514,7 +514,7 @@ impl<'a> ResourceSetupMessage<'a> {
                 admit(
                     MessageType::$kind,
                     $value.protocol_ies.0.iter().map(|ie| {
-                        let value = if ie.id == 94 {
+                        let value = if ie.id == crate::constructed::SECURITY_KEY_IE_ID {
                             key_values
                                 .next()
                                 .map_or(ie.value.as_bytes(), |value| value.as_slice())

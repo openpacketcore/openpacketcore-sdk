@@ -13,7 +13,7 @@
 use std::fmt;
 use std::ops::Deref;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
@@ -53,13 +53,18 @@ impl SensitiveBytes {
         Self(bytes)
     }
 
-    /// Copy an owned vector into a new zeroizing buffer.
+    /// Adopt an owned vector's allocation without copying.
     ///
-    /// The input allocation is the caller's; drop it after this copy (or move
-    /// it into [`Self::copy_into_zeroizing`] where the API requires that type).
+    /// `Bytes::from(Vec<u8>)` takes ownership of the vector's allocation and
+    /// the immediate unique conversion to [`BytesMut`] reuses it, so no second
+    /// heap copy of the contents is created and the original allocation is the
+    /// one zeroized on drop. Prefer this over a copy when a secret arrives as
+    /// an owned `Vec<u8>`.
     #[must_use]
     pub fn from_vec(value: Vec<u8>) -> Self {
-        Self(BytesMut::from(value.as_slice()))
+        // `Bytes::from` adopts the Vec allocation; the handle is unique here, so
+        // `BytesMut::from(Bytes)` converts back without copying.
+        Self(BytesMut::from(Bytes::from(value)))
     }
 
     /// Borrow the initialized contents.
@@ -194,10 +199,22 @@ mod test_audit {
     }
 
     #[test]
-    fn from_vec_copies_and_clears() {
+    fn from_vec_adopts_the_allocation_and_clears_it_on_drop() {
         let _guard = lock();
-        let value = SensitiveBytes::from_vec(vec![0x22; 24]);
+        reset();
+        let input = vec![0x22; 24];
+        let allocation = input.as_ptr();
+        let value = SensitiveBytes::from_vec(input);
         assert_eq!(value.len(), 24);
+        assert_eq!(
+            value.as_slice().as_ptr(),
+            allocation,
+            "from_vec must adopt the Vec allocation instead of copying it"
+        );
+        drop(value);
+        let (with_content, left_content) = counts();
+        assert_eq!(with_content, 1, "adopted content must reach the audit drop");
+        assert_eq!(left_content, 0, "adopted content must be cleared on drop");
     }
 
     #[test]

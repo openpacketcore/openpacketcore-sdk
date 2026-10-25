@@ -83,10 +83,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Zeroizing<Vec<u8>>` hand-off the IKEv2 protocol-key import requires. Received
   payload/Pdu types no longer clone or compare implicitly, and `Debug` stays
   length/structure-only. Content clearing is proven by safe drop-audit unit
-  tests on the shared `SensitiveBytes` carrier (all secret copies now use it),
-  and allocation-counter integration tests prove the decode, error and drop
-  paths retain no allocation, with positive controls for `Vec` and
-  `bytes::Bytes` retention. Refs #1262.
+  tests on the shared `SensitiveBytes` carrier, which now owns the raw receive
+  copy, the SCTP inbound payload and the extracted id-SecurityKey octets
+  (`SensitiveBytes::from_vec` adopts an owned vector's allocation without an
+  intermediate copy); the explicit IKEv2 hand-off copy remains
+  `Zeroizing<Vec<u8>>`. Allocation-counter integration tests prove the decode,
+  error and drop paths retain no allocation, with positive controls for `Vec`
+  and `bytes::Bytes` retention. Refs #1262.
 - `opc-persist`: a configuration-consensus leader-routed call is now bounded by
   this replica's own leader view. Once the engine has observed a successor for
   a lost leader, an unanswered forwarded mutation or linearizable read barrier
