@@ -31,8 +31,8 @@ use opc_consensus::{
     ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
     DurableOpenraftDomain, EnsureLinearizableOutcome, EnsureLinearizableSupervisor,
     LinearizableReadBarrier, LinearizableReadBarrierError, LinearizableReadLease,
-    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES,
-    DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE,
+    DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -256,6 +256,19 @@ enum ForwardMutationReply {
 enum ForwardMutationRejection {
     CommandTooLarge,
     InvalidCommand,
+}
+
+/// Outcome of one leader-routed peer call that is bounded by this replica's
+/// own view of the current leader.
+enum RouteBoundedReply<Reply> {
+    /// The peer answered within the deadline and the reply decoded.
+    Reply(Reply),
+    /// The local engine named a successor before the peer answered. The call
+    /// was abandoned and may have been transmitted before the abandonment.
+    Retired { leader: ConsensusNodeId },
+    /// The local engine had already superseded the attempted route, so the
+    /// call was not transmitted.
+    Superseded { leader: ConsensusNodeId },
 }
 
 impl ForwardMutationRejection {
@@ -1545,8 +1558,13 @@ impl ConsensusConfigStore {
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         let mut preferred = None;
+        // A leader hint returned by a peer is fresher than this replica's
+        // metrics view; the pre-send supersession check only applies to routes
+        // this replica selected from its own view.
+        let mut preferred_from_hint = false;
         let mut ambiguity_seen = false;
         loop {
+            let from_hint = preferred.is_some() && preferred_from_hint;
             let leader = match preferred.take() {
                 Some(leader) => leader,
                 None => match self.wait_for_known_leader(deadline).await {
@@ -1576,15 +1594,30 @@ impl ConsensusConfigStore {
                 self.apply_on_local_leader(request.clone(), deadline).await
             } else {
                 match self
-                    .call_peer::<_, ForwardMutationReply>(
+                    .call_peer_on_route::<_, ForwardMutationReply>(
                         leader,
                         ConsensusRpcFamily::ForwardMutation,
                         &request,
                         deadline,
+                        !from_hint,
                     )
                     .await
                 {
-                    Ok(reply) => reply,
+                    Ok(RouteBoundedReply::Reply(reply)) => reply,
+                    Ok(RouteBoundedReply::Superseded { leader: observed }) => {
+                        preferred = Some(observed);
+                        preferred_from_hint = false;
+                        continue;
+                    }
+                    Ok(RouteBoundedReply::Retired { leader: observed }) => {
+                        // The forwarded call may have reached the lost leader
+                        // before the route was abandoned, so its outcome is
+                        // ambiguous even though a retry is attempted.
+                        ambiguity_seen = true;
+                        preferred = Some(observed);
+                        preferred_from_hint = false;
+                        continue;
+                    }
                     Err(_) => {
                         ambiguity_seen = true;
                         if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
@@ -1609,6 +1642,7 @@ impl ConsensusConfigStore {
                     preferred = next.filter(|candidate| {
                         *candidate != leader && self.inner.members.contains(candidate)
                     });
+                    preferred_from_hint = preferred.is_some();
                     if preferred.is_none() {
                         if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
                             if ambiguity_seen {
@@ -1771,6 +1805,48 @@ impl ConsensusConfigStore {
         }
     }
 
+    /// Resolve the authenticated transport for one consensus peer target.
+    fn peer_for(&self, target: ConsensusNodeId) -> Result<Arc<dyn ConsensusPeer>, PersistError> {
+        self.inner
+            .voter_profile
+            .as_ref()
+            .map(|profile| profile.transport.peer(target))
+            .or_else(|| {
+                self.inner
+                    .peers
+                    .get(&target)
+                    .filter(|peer| peer.node_id() == target)
+                    .cloned()
+            })
+            .ok_or_else(consensus_unavailable)
+    }
+
+    /// Encode one protocol-family request into an authenticated wire request.
+    fn peer_wire<Req>(
+        &self,
+        family: ConsensusRpcFamily,
+        request: &Req,
+    ) -> Result<ConsensusWireRequest, PersistError>
+    where
+        Req: Serialize + ?Sized,
+    {
+        let payload = encode_config_wire(request).map_err(|_| consensus_unavailable())?;
+        ConsensusWireRequest::try_new(
+            self.inner.identity,
+            self.inner.local_node_id,
+            family,
+            payload,
+        )
+        .map_err(|_| consensus_unavailable())
+    }
+
+    /// One exact leader-routed peer call bounded by the complete operation
+    /// deadline.
+    ///
+    /// This is the unbounded-route variant used by engine-owned handoff and
+    /// member-repair protocols, whose destination is an exact target rather
+    /// than a rediscovered leader. Ordinary client mutations and linearizable
+    /// barriers use [`Self::call_peer_on_route`].
     async fn call_peer<Req, Resp>(
         &self,
         target: ConsensusNodeId,
@@ -1782,27 +1858,8 @@ impl ConsensusConfigStore {
         Req: Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
     {
-        let peer = self
-            .inner
-            .voter_profile
-            .as_ref()
-            .map(|profile| profile.transport.peer(target))
-            .or_else(|| {
-                self.inner
-                    .peers
-                    .get(&target)
-                    .filter(|peer| peer.node_id() == target)
-                    .cloned()
-            })
-            .ok_or_else(consensus_unavailable)?;
-        let payload = encode_config_wire(request).map_err(|_| consensus_unavailable())?;
-        let wire = ConsensusWireRequest::try_new(
-            self.inner.identity,
-            self.inner.local_node_id,
-            family,
-            payload,
-        )
-        .map_err(|_| consensus_unavailable())?;
+        let peer = self.peer_for(target)?;
+        let wire = self.peer_wire(family, request)?;
         let response = tokio::time::timeout_at(deadline, peer.call(wire))
             .await
             .map_err(|_| consensus_unavailable())?
@@ -1810,6 +1867,133 @@ impl ConsensusConfigStore {
         response.validate().map_err(|_| consensus_unavailable())?;
         decode_config_wire(&response.result.map_err(|_| consensus_unavailable())?)
             .map_err(|_| consensus_unavailable())
+    }
+
+    /// Current leader named by this replica's own engine, restricted to the
+    /// configured member set.
+    fn member_leader_view(&self) -> Option<ConsensusNodeId> {
+        let metrics = self.inner.raft.metrics();
+        map_watch_snapshot(&metrics, |current| current.current_leader)
+            .filter(|leader| self.inner.members.contains(leader))
+    }
+
+    /// Wait until this replica's engine names a different member leader and the
+    /// stale-leader route grace has elapsed.
+    ///
+    /// Returns the currently observed successor. Fails closed at `deadline`:
+    /// without an observed successor the caller keeps the existing complete
+    /// operation bound and its ambiguity classification instead of hanging for
+    /// longer. A successful peer answer inside the grace interval wins because
+    /// the caller's `select` observes it before this future resolves.
+    async fn wait_for_stale_leader_route_retirement(
+        &self,
+        attempted_leader: ConsensusNodeId,
+        deadline: tokio::time::Instant,
+    ) -> Result<ConsensusNodeId, PersistError> {
+        let mut metrics = self.inner.raft.metrics();
+        // Absolute grace deadline and the successor it was armed for. Ordinary
+        // metrics churn (replication progress, applied index, term) must not
+        // re-arm the grace; only an actual `current_leader` change does.
+        let mut armed: Option<(ConsensusNodeId, tokio::time::Instant)> = None;
+        loop {
+            let successor =
+                map_watch_snapshot(&metrics, |current| current.current_leader).filter(|leader| {
+                    *leader != attempted_leader && self.inner.members.contains(leader)
+                });
+            let Some(successor) = successor else {
+                armed = None;
+                match tokio::time::timeout_at(deadline, metrics.changed()).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) | Err(_) => return Err(consensus_unavailable()),
+                }
+            };
+            let grace_deadline = match armed {
+                Some((observed, grace_deadline)) if observed == successor => grace_deadline,
+                _ => {
+                    let grace_deadline = tokio::time::Instant::now()
+                        .checked_add(DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE)
+                        .map_or(deadline, |grace| grace.min(deadline));
+                    armed = Some((successor, grace_deadline));
+                    grace_deadline
+                }
+            };
+            let now = tokio::time::Instant::now();
+            if now >= grace_deadline {
+                if now >= deadline {
+                    return Err(consensus_unavailable());
+                }
+                // Keep the absolute grace absolute: re-read the leader view and
+                // retire only if the successor is still named after the grace.
+                let still_successor =
+                    map_watch_snapshot(&metrics, |current| current.current_leader).filter(
+                        |leader| *leader != attempted_leader && self.inner.members.contains(leader),
+                    );
+                if let Some(leader) = still_successor {
+                    return Ok(leader);
+                }
+                armed = None;
+                continue;
+            }
+            // Wake on any metrics update so an actual leader change is seen
+            // promptly, but keep the absolute grace across unrelated churn.
+            match tokio::time::timeout_at(grace_deadline, metrics.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(consensus_unavailable()),
+                // Grace elapsed; the loop head decides whether to retire.
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// One leader-routed peer call whose lifetime is bounded by this replica's
+    /// own leader view.
+    ///
+    /// The call is not transmitted when the local engine has already superseded
+    /// the route. Once the engine names a successor, an unanswered call is
+    /// abandoned after [`DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE`] instead of
+    /// occupying the complete operation deadline. `allow_pre_send_supersede` is
+    /// false for a route taken from a peer's fresher leader hint.
+    async fn call_peer_on_route<Req, Resp>(
+        &self,
+        target: ConsensusNodeId,
+        family: ConsensusRpcFamily,
+        request: &Req,
+        deadline: tokio::time::Instant,
+        allow_pre_send_supersede: bool,
+    ) -> Result<RouteBoundedReply<Resp>, PersistError>
+    where
+        Req: Serialize + ?Sized,
+        Resp: serde::de::DeserializeOwned,
+    {
+        if allow_pre_send_supersede {
+            if let Some(observed) = self
+                .member_leader_view()
+                .filter(|observed| *observed != target)
+            {
+                return Ok(RouteBoundedReply::Superseded { leader: observed });
+            }
+        }
+        let peer = self.peer_for(target)?;
+        let wire = self.peer_wire(family, request)?;
+        let call = async {
+            let response = tokio::time::timeout_at(deadline, peer.call(wire))
+                .await
+                .map_err(|_| consensus_unavailable())?
+                .map_err(|_| consensus_unavailable())?;
+            response.validate().map_err(|_| consensus_unavailable())?;
+            decode_config_wire(&response.result.map_err(|_| consensus_unavailable())?)
+                .map_err(|_| consensus_unavailable())
+        };
+        tokio::pin!(call);
+        let retirement = self.wait_for_stale_leader_route_retirement(target, deadline);
+        tokio::pin!(retirement);
+        tokio::select! {
+            biased;
+            reply = &mut call => reply.map(RouteBoundedReply::Reply),
+            observed = &mut retirement => {
+                observed.map(|leader| RouteBoundedReply::Retired { leader })
+            }
+        }
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
@@ -1857,7 +2041,9 @@ impl ConsensusConfigStore {
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         let mut preferred = None;
+        let mut preferred_from_hint = false;
         loop {
+            let from_hint = preferred.is_some() && preferred_from_hint;
             let leader = match preferred.take() {
                 Some(leader) => leader,
                 None => self.wait_for_known_leader(deadline).await?,
@@ -1866,7 +2052,7 @@ impl ConsensusConfigStore {
                 self.local_read_barrier(deadline).await
             } else {
                 match self
-                    .call_peer::<_, ReadBarrierReply>(
+                    .call_peer_on_route::<_, ReadBarrierReply>(
                         leader,
                         ConsensusRpcFamily::ReadBarrier,
                         &ReadBarrierRequest {
@@ -1875,10 +2061,17 @@ impl ConsensusConfigStore {
                             budget: ForwardedBudget::from_deadline(deadline)?,
                         },
                         deadline,
+                        !from_hint,
                     )
                     .await
                 {
-                    Ok(reply) => reply,
+                    Ok(RouteBoundedReply::Reply(reply)) => reply,
+                    Ok(RouteBoundedReply::Superseded { leader: observed })
+                    | Ok(RouteBoundedReply::Retired { leader: observed }) => {
+                        preferred = Some(observed);
+                        preferred_from_hint = false;
+                        continue;
+                    }
                     Err(_) => {
                         self.wait_for_route_refresh(leader, deadline).await?;
                         continue;
@@ -1901,6 +2094,7 @@ impl ConsensusConfigStore {
                     preferred = next.filter(|candidate| {
                         *candidate != leader && self.inner.members.contains(candidate)
                     });
+                    preferred_from_hint = preferred.is_some();
                     if preferred.is_none() {
                         self.wait_for_route_refresh(leader, deadline).await?;
                     }
