@@ -595,3 +595,6 @@ async fn resolving_leader_snapshot_does_not_wait_for_the_prepare_it_must_resolve
     pending.await.unwrap().unwrap();
     assert!(engine.closed.lock().unwrap().is_empty());
 }
+
+#[path = "voter_slot_admission/deadlines.rs"]
+mod deadline_tests;

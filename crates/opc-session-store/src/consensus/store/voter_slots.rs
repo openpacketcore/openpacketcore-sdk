@@ -111,7 +111,7 @@ struct IncomingSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-enum ControlRequest {
+pub(super) enum ControlRequest {
     LossProbe {
         target: SessionConsensusNodeId,
         request_digest: [u8; 32],
@@ -140,7 +140,7 @@ pub(super) enum ControlReply {
 }
 
 impl SessionVoterProfile {
-    async fn control(
+    pub(super) async fn control(
         &self,
         store: &ConsensusSessionStore,
         request: ControlRequest,
@@ -314,7 +314,7 @@ impl SessionVoterProfile {
             && table == *state.table()
     }
 
-    async fn wait_candidate_ack(
+    pub(super) async fn wait_candidate_ack(
         &self,
         raft: &SessionRaft,
         local: SessionConsensusNodeId,
