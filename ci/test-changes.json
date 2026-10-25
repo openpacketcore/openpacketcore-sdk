@@ -340,6 +340,12 @@
       "kind": "assertions-decreased",
       "reason": "Remove the redundant admitted assertion after the bounded receipt loop already requires that same captured status to be admitted before it can exit. A missing admission still fails within the original 30-second bound, now naming the last store, receipt and status. Exact receipt-index, leader and readiness assertions remain; no timeout, poll interval or production behavior changes.",
       "issue": 1407
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_rejects_wrong_instances_and_invalid_nested_shapes",
+      "kind": "assertions-decreased",
+      "reason": "The four PCO rejection assertions moved to positive retention/ignore coverage for issue #1441 in new tests (issue payloads, request/response retention, nonzero instances, builder round-trip, framing). The negative test keeps its AMBR, bearer-context, instance-shape and malformed-cause assertions; only the PCO-specific local-helper assertions were removed because that behaviour intentionally stopped being a rejection.",
+      "issue": 1441
     }
   ]
 }
