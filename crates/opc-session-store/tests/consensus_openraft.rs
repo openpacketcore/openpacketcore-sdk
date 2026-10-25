@@ -7,6 +7,9 @@ mod election_progress;
 #[path = "consensus_openraft/late_acquire.rs"]
 mod late_acquire;
 
+#[path = "consensus_openraft/late_result.rs"]
+mod late_result;
+
 #[path = "consensus_openraft/stepdown.rs"]
 mod stepdown;
 
@@ -4852,61 +4855,81 @@ async fn fenced_transition_renew_rejects_absent_or_expired_records_without_effec
 
 #[tokio::test]
 async fn fenced_transition_expired_lease_is_rejected_at_committed_admission() {
-    let cluster = TestCluster::start().await;
-    let (leader, _, _) = cluster.observed_leader();
-    let source = (leader + 1) % MEMBER_COUNT;
-    let store = &cluster.stores[source];
-    let key = session_key(b"fenced-transition-expired-admission");
-    let observation = store
-        .observe_fenced_transition(&key)
-        .await
-        .expect("observe transition key");
-    let request_owner = owner("fenced-transition-owner");
-    let (create, original) = fenced_acquire_create_request(
-        key.clone(),
-        request_owner.clone(),
-        observation.current_fence(),
-        [0x41; 16],
-        Duration::from_millis(50),
-        b"sealed-fenced-transition-expiry",
-    );
-    let created = store
-        .fenced_transition(create)
-        .await
-        .expect("commit short-lived transition");
-    let expiry_request = FencedTransitionRequest::new(
-        FencedTransitionRequestId::from_bytes([0x42; 16]),
-        FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(30))
-            .expect("build expired renewal"),
-        FencedTransitionMutation::delete(Generation::new(1)),
-    )
-    .expect("build expiry transition");
-    cluster.delay_calls(source, Duration::from_millis(200));
-    let renewal = store.fenced_transition(expiry_request);
-    tokio::pin!(renewal);
-    assert!(
-        futures_util::poll!(&mut renewal).is_pending(),
-        "the renewal is admitted before the runtime stall"
-    );
-    std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
-    let result = renewal.await;
-    cluster.stop_delaying_calls(source);
-    assert!(
-        matches!(result, Err(StoreError::LeaseExpired)),
-        "a lease expired before committed admission cannot mutate the record"
-    );
-    assert!(
-        matches!(store.get(&key).await, Ok(Some(record)) if record == original),
-        "expired admission leaves the stored record unchanged"
-    );
-    let after_expiry = store
-        .observe_fenced_transition(&key)
-        .await
-        .expect("observe after expired admission");
-    assert!(
-        after_expiry.current_fence() == created.lease().fence(),
-        "expired admission does not mint another fence"
-    );
+    let clock = Arc::new(MutableTestClock::new(
+        opc_types::Timestamp::from_offset_datetime(
+            time::OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("test timestamp"),
+        ),
+    ));
+    let cluster = TestCluster::start_with_clock(clock.clone()).await;
+    late_result::with_paused_protocol_time(async {
+        let (leader, _, _) = cluster.observed_leader();
+        let source = (leader + 1) % MEMBER_COUNT;
+        let store = &cluster.stores[source];
+        let key = session_key(b"fenced-transition-expired-admission");
+        let observation = store
+            .observe_fenced_transition(&key)
+            .await
+            .expect("observe transition key");
+        let request_owner = owner("fenced-transition-owner");
+        let (create, original) = fenced_acquire_create_request(
+            key.clone(),
+            request_owner.clone(),
+            observation.current_fence(),
+            [0x41; 16],
+            Duration::from_millis(50),
+            b"sealed-fenced-transition-expiry",
+        );
+        let created = store
+            .fenced_transition(create)
+            .await
+            .expect("commit short-lived transition");
+        let expiry_request = FencedTransitionRequest::new(
+            FencedTransitionRequestId::from_bytes([0x42; 16]),
+            FencedTransitionLease::renew(created.lease().clone(), Duration::from_secs(30))
+                .expect("build expired renewal"),
+            FencedTransitionMutation::delete(Generation::new(1)),
+        )
+        .expect("build expiry transition");
+        // Admission checks lease time only when the command applies. Select the
+        // exact expired boundary without spending the operation's protocol budget.
+        clock.set(created.lease().expires_at());
+        let renewal = store.fenced_transition(expiry_request.clone());
+        tokio::pin!(renewal);
+        assert!(
+            futures_util::poll!(&mut renewal).is_pending(),
+            "the renewal is admitted before the runtime stall"
+        );
+        std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+        let result = renewal.await;
+        assert!(
+            matches!(result, Err(StoreError::LeaseExpired)),
+            "a lease expired before committed admission cannot mutate the record: {result:?}"
+        );
+        let recorded = store
+            .fenced_transition_status(&expiry_request)
+            .await
+            .expect("read committed expiry receipt");
+        assert!(
+            matches!(recorded,
+                FencedTransitionStatus::Recorded(result)
+                    if result.as_ref() == &Err(StoreError::LeaseExpired)
+            ),
+            "the expired renewal is rejected by committed admission"
+        );
+        assert!(
+            matches!(store.get(&key).await, Ok(Some(record)) if record == original),
+            "expired admission leaves the stored record unchanged"
+        );
+        let after_expiry = store
+            .observe_fenced_transition(&key)
+            .await
+            .expect("observe after expired admission");
+        assert!(
+            after_expiry.current_fence() == created.lease().fence(),
+            "expired admission does not mint another fence"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -7248,34 +7271,43 @@ async fn committed_write_with_a_late_forward_result_is_typed_ambiguous_and_appli
 
         if response_was_delayed {
             assert_eq!(result, Err(StoreError::CasIdempotencyOutcomeUnavailable));
-            let read = cluster.stores[source].get(&key);
-            tokio::pin!(read);
-            assert!(
-                futures_util::poll!(&mut read).is_pending(),
-                "the read queues its logical-time request before the runtime stall"
-            );
-            std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
-            let committed = read.await.expect("linearizable read after late result");
-            assert_eq!(committed, Some(expected));
-            let after = cluster.stores[source]
-                .max_replication_sequence()
-                .await
-                .expect("replication head after late result");
-            assert_eq!(after, before + 1);
+            // The late-result timeout above still runs on advancing time.
+            // These are functional postconditions, including a read whose
+            // logical-time supervisor runs on this same runtime. Freeze that
+            // clock too, so host scheduling cannot expire its queued request.
+            late_result::with_paused_protocol_time(async {
+                let read = cluster.stores[source].get(&key);
+                tokio::pin!(read);
+                assert!(
+                    futures_util::poll!(&mut read).is_pending(),
+                    "the read queues its logical-time request before the runtime stall"
+                );
+                // Reproduce a descheduled runtime while that admitted request
+                // waits. This must not consume functional protocol time.
+                std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+                let committed = read.await.expect("linearizable read after late result");
+                assert_eq!(committed, Some(expected));
+                let after = cluster.stores[source]
+                    .max_replication_sequence()
+                    .await
+                    .expect("replication head after late result");
+                assert_eq!(after, before + 1);
 
-            let logs = replication_logs(&cluster).await;
-            assert!(logs.windows(2).all(|pair| pair[0] == pair[1]));
-            let matching_events = logs[0]
-                .iter()
-                .filter(|entry| {
-                    matches!(
-                        &entry.op,
-                        ReplicationOp::CompareAndSet { key: event_key, .. }
-                            if event_key == &key
-                    )
-                })
-                .count();
-            assert_eq!(matching_events, 1);
+                let logs = replication_logs(&cluster).await;
+                assert!(logs.windows(2).all(|pair| pair[0] == pair[1]));
+                let matching_events = logs[0]
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            &entry.op,
+                            ReplicationOp::CompareAndSet { key: event_key, .. }
+                                if event_key == &key
+                        )
+                    })
+                    .count();
+                assert_eq!(matching_events, 1);
+            })
+            .await;
             return;
         }
 

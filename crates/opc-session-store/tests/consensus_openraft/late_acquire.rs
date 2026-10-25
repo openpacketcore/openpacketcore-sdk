@@ -42,6 +42,7 @@ struct AcquireArrivalCapture {
     hold_before_handling: AtomicBool,
     captured: StdMutex<Option<(SessionConsensusNodeId, SessionConsensusWireRequest)>>,
     captures: AtomicUsize,
+    arrived: tokio::sync::Notify,
 }
 
 impl fmt::Debug for AcquireArrivalCapture {
@@ -62,6 +63,7 @@ impl AcquireArrivalCapture {
             hold_before_handling: AtomicBool::new(hold_before_handling),
             captured: StdMutex::new(None),
             captures: AtomicUsize::new(0),
+            arrived: tokio::sync::Notify::new(),
         }
     }
 
@@ -103,6 +105,7 @@ impl SessionConsensusRpcHandler for AcquireArrivalCapture {
                 }
             }
             self.captures.fetch_add(1, Ordering::SeqCst);
+            self.arrived.notify_one();
             if self.hold_before_handling.load(Ordering::SeqCst) {
                 // Capture actual arrival before invoking the receiver. The
                 // sender's timeout drops this pending future; delivery below
@@ -130,92 +133,134 @@ fn capture_follower_acquire(
     (leader, follower, capture)
 }
 
+async fn expire_captured_acquire<F>(capture: Arc<AcquireArrivalCapture>, call: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    // This call is held before the receiver starts any work. Give its deadline
+    // a clock paused from runtime creation, aligned with the timer driver's
+    // millisecond ticks; pausing a running clock can leave an exact deadline
+    // between ticks. Functional readbacks keep their existing supervisor clock.
+    formation_clock::controlled_clock::run(async move {
+        let started = tokio::time::Instant::now();
+        tokio::pin!(call);
+        tokio::select! {
+            biased;
+            _ = call.as_mut() => panic!("held acquire completed before actual arrival was observed"),
+            () = capture.arrived.notified() => {}
+        }
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        // Expire the real caller only after its actual envelope has arrived.
+        // Host scheduling must not decide whether the request reached the peer.
+        tokio::time::advance(OPERATION_TIMEOUT - Duration::from_millis(1)).await;
+        assert!(futures_util::poll!(call.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let result = call.await;
+        assert_eq!(started.elapsed(), OPERATION_TIMEOUT);
+        result
+    })
+    .await
+}
+
 #[tokio::test]
 async fn delayed_distinct_acquire_can_supersede_acknowledged_same_owner_replacement() {
     let cluster = TestCluster::start().await;
-    let key = session_key(b"delayed-distinct-acquire-diagnostic");
-    let owner = owner("delayed-distinct-acquire-owner");
-    let ttl = Duration::from_secs(3600);
-    let (leader, follower, capture) = capture_follower_acquire(&cluster, key.clone(), true);
+    late_result::with_paused_protocol_time(async {
+        let key = session_key(b"delayed-distinct-acquire-diagnostic");
+        let owner = owner("delayed-distinct-acquire-owner");
+        let ttl = Duration::from_secs(3600);
+        let (leader, follower, capture) = capture_follower_acquire(&cluster, key.clone(), true);
 
-    let first = tokio::time::timeout(
-        RECOVERY_TIMEOUT,
-        cluster.stores[follower].acquire(&key, owner.clone(), ttl),
-    )
-    .await
-    .expect("original caller reaches its own bounded outcome");
-    assert!(
-        matches!(first, Err(LeaseError::OperationOutcomeUnavailable)),
-        "held real acquire must have a typed indeterminate result"
-    );
-    assert!(capture.captures.load(Ordering::SeqCst) > 0);
-    assert_eq!(cluster.observed_leader().0, leader);
-
-    let replacement = cluster.stores[leader]
-        .acquire(&key, owner, ttl)
+        let first_store = cluster.stores[follower].clone();
+        let first_key = key.clone();
+        let first_owner = owner.clone();
+        let first = expire_captured_acquire(capture.clone(), async move {
+            tokio::time::timeout(
+                RECOVERY_TIMEOUT,
+                first_store.acquire(&first_key, first_owner, ttl),
+            )
+            .await
+        })
         .await
-        .expect("distinct same-owner replacement is acknowledged");
-    let before = cluster.stores[leader].observe_fenced_transition(&key);
-    tokio::pin!(before);
-    assert!(
-        futures_util::poll!(&mut before).is_pending(),
-        "the fence observation is admitted before the runtime stall"
-    );
-    std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
-    let before = before.await.expect("read fence before old arrival");
-    assert_eq!(before.current_fence(), replacement.fence());
+        .expect("original caller reaches its own bounded outcome");
+        assert!(
+            matches!(first, Err(LeaseError::OperationOutcomeUnavailable)),
+            "held real acquire must have a typed indeterminate result"
+        );
+        assert!(capture.captures.load(Ordering::SeqCst) > 0);
+        assert_eq!(cluster.observed_leader().0, leader);
 
-    let response = capture.deliver_original().await;
-    assert!(
-        response.result.is_ok(),
-        "real receiver accepts held envelope"
-    );
-    let after = cluster.stores[leader]
-        .observe_fenced_transition(&key)
-        .await
-        .expect("read fence after old arrival");
-    assert!(after.current_fence().get() > replacement.fence().get());
-    assert!(
-        matches!(
-            cluster.stores[leader].renew(&replacement, ttl).await,
-            Err(LeaseError::StaleFence)
-        ),
-        "late distinct acquire invalidates B; this is a cause witness, not a repair"
-    );
+        let replacement = cluster.stores[leader]
+            .acquire(&key, owner, ttl)
+            .await
+            .expect("distinct same-owner replacement is acknowledged");
+        let before = cluster.stores[leader].observe_fenced_transition(&key);
+        tokio::pin!(before);
+        assert!(
+            futures_util::poll!(&mut before).is_pending(),
+            "the fence observation is admitted before the runtime stall"
+        );
+        std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+        let before = before.await.expect("read fence before old arrival");
+        assert_eq!(before.current_fence(), replacement.fence());
+
+        let response = capture.deliver_original().await;
+        assert!(
+            response.result.is_ok(),
+            "real receiver accepts held envelope"
+        );
+        let after = cluster.stores[leader]
+            .observe_fenced_transition(&key)
+            .await
+            .expect("read fence after old arrival");
+        assert!(after.current_fence().get() > replacement.fence().get());
+        assert!(
+            matches!(
+                cluster.stores[leader].renew(&replacement, ttl).await,
+                Err(LeaseError::StaleFence)
+            ),
+            "late distinct acquire invalidates B; this is a cause witness, not a repair"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn replay_of_already_committed_acquire_does_not_supersede_later_replacement() {
     let cluster = TestCluster::start().await;
-    let key = session_key(b"committed-acquire-replay-control");
-    let owner = owner("committed-acquire-replay-owner");
-    let ttl = Duration::from_secs(3600);
-    let (leader, follower, capture) = capture_follower_acquire(&cluster, key.clone(), false);
-    let first = cluster.stores[follower]
-        .acquire(&key, owner.clone(), ttl)
-        .await
-        .expect("original acquire commits before replacement");
-    assert!(capture.captures.load(Ordering::SeqCst) > 0);
-    let replacement = cluster.stores[leader]
-        .acquire(&key, owner, ttl)
-        .await
-        .expect("later replacement commits");
-    assert!(replacement.fence().get() > first.fence().get());
-    let response = capture.deliver_original().await;
-    assert!(
-        response.result.is_ok(),
-        "same-ID replay reaches real receiver"
-    );
-    let after = cluster.stores[leader]
-        .observe_fenced_transition(&key)
-        .await
-        .expect("read durable fence after replay");
-    assert_eq!(after.current_fence(), replacement.fence());
-    let renewed = cluster.stores[leader]
-        .renew(&replacement, ttl)
-        .await
-        .expect("same-ID replay leaves replacement current");
-    assert_eq!(renewed.fence(), replacement.fence());
+    late_result::with_paused_protocol_time(async {
+        let key = session_key(b"committed-acquire-replay-control");
+        let owner = owner("committed-acquire-replay-owner");
+        let ttl = Duration::from_secs(3600);
+        let (leader, follower, capture) = capture_follower_acquire(&cluster, key.clone(), false);
+        let first = cluster.stores[follower]
+            .acquire(&key, owner.clone(), ttl)
+            .await
+            .expect("original acquire commits before replacement");
+        assert!(capture.captures.load(Ordering::SeqCst) > 0);
+        let replacement = cluster.stores[leader]
+            .acquire(&key, owner, ttl)
+            .await
+            .expect("later replacement commits");
+        assert!(replacement.fence().get() > first.fence().get());
+        let response = capture.deliver_original().await;
+        assert!(
+            response.result.is_ok(),
+            "same-ID replay reaches real receiver"
+        );
+        let after = cluster.stores[leader]
+            .observe_fenced_transition(&key)
+            .await
+            .expect("read durable fence after replay");
+        assert_eq!(after.current_fence(), replacement.fence());
+        let renewed = cluster.stores[leader]
+            .renew(&replacement, ttl)
+            .await
+            .expect("same-ID replay leaves replacement current");
+        assert_eq!(renewed.fence(), replacement.fence());
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -228,120 +273,129 @@ async fn explicit_consumer_retry_keeps_unknown_acquire_identity_across_late_deli
         SessionConsumerResponse, SessionConsumerTenantNfScope, SessionQuorumConsumer,
     };
     let cluster = TestCluster::start().await;
-    let key = session_key(b"explicit-acquire-retry-control");
-    let owner = owner("explicit-acquire-retry-owner");
-    let ttl = Duration::from_secs(3600);
-    let (leader, follower, capture) = capture_follower_acquire(&cluster, key.clone(), true);
-    let identity =
-        "spiffe://test.example/tenant/lease-recovery/ns/test/sa/consumer/nf/smf/instance/one";
-    let grant = SessionConsumerAuthorizationGrant::try_new(
-        opc_types::SpiffeId::new(identity).expect("synthetic consumer identity"),
-        [SessionConsumerTenantNfScope::new(
-            key.tenant.clone(),
-            key.nf_kind.clone(),
-        )],
-    )
-    .expect("exact synthetic grant");
-    let manifest = cluster.stores[follower]
-        .consumer_authorization_manifest([grant])
-        .await
-        .expect("store-issued fixture authority");
-    let authorization = manifest
-        .authorize(&SessionConsumerIdentity::new(identity).expect("identity"))
-        .expect("trusted fixture caller authorization");
-    let scope = manifest.scope();
-    let first_id = SessionConsumerRequestId::new();
-    let first = SessionConsumerRequest::new(
-        scope,
-        first_id,
-        SessionConsumerOperation::AcquireLease {
-            key: key.clone(),
-            owner: owner.clone(),
-            ttl,
-        },
-    );
-    assert!(matches!(
-        cluster.stores[follower]
-            .consumer_service()
-            .execute(&authorization, first.clone())
+    late_result::with_paused_protocol_time(async {
+        let key = session_key(b"explicit-acquire-retry-control");
+        let owner = owner("explicit-acquire-retry-owner");
+        let ttl = Duration::from_secs(3600);
+        let (leader, follower, capture) = capture_follower_acquire(&cluster, key.clone(), true);
+        let identity =
+            "spiffe://test.example/tenant/lease-recovery/ns/test/sa/consumer/nf/smf/instance/one";
+        let grant = SessionConsumerAuthorizationGrant::try_new(
+            opc_types::SpiffeId::new(identity).expect("synthetic consumer identity"),
+            [SessionConsumerTenantNfScope::new(
+                key.tenant.clone(),
+                key.nf_kind.clone(),
+            )],
+        )
+        .expect("exact synthetic grant");
+        let manifest = cluster.stores[follower]
+            .consumer_authorization_manifest([grant])
+            .await
+            .expect("store-issued fixture authority");
+        let authorization = manifest
+            .authorize(&SessionConsumerIdentity::new(identity).expect("identity"))
+            .expect("trusted fixture caller authorization");
+        let scope = manifest.scope();
+        let first_id = SessionConsumerRequestId::new();
+        let first = SessionConsumerRequest::new(
+            scope,
+            first_id,
+            SessionConsumerOperation::AcquireLease {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl,
+            },
+        );
+        let first_store = cluster.stores[follower].clone();
+        let first_authorization = authorization.clone();
+        let first_attempt = first.clone();
+        assert!(matches!(
+            expire_captured_acquire(capture.clone(), async move {
+                first_store
+                    .consumer_service()
+                    .execute(&first_authorization, first_attempt)
+                    .await
+            })
             .await,
-        SessionConsumerResponse::OutcomeUnknown(_)
-    ));
-    assert!(capture.captures.load(Ordering::SeqCst) > 0);
-    let retained = SessionConsumerLeaseMutationRequest::new(
-        first_id,
-        SessionConsumerLeaseMutationOperation::Acquire {
-            key: key.clone(),
-            owner: owner.clone(),
-            ttl,
-        },
-    );
-    let status = SessionConsumerRequest::new(
-        scope,
-        first_id,
-        SessionConsumerOperation::LeaseMutationStatus {
-            request: Box::new(retained),
-        },
-    );
-    assert!(matches!(
-        cluster.stores[leader]
+            SessionConsumerResponse::OutcomeUnknown(_)
+        ));
+        assert!(capture.captures.load(Ordering::SeqCst) > 0);
+        let retained = SessionConsumerLeaseMutationRequest::new(
+            first_id,
+            SessionConsumerLeaseMutationOperation::Acquire {
+                key: key.clone(),
+                owner: owner.clone(),
+                ttl,
+            },
+        );
+        let status = SessionConsumerRequest::new(
+            scope,
+            first_id,
+            SessionConsumerOperation::LeaseMutationStatus {
+                request: Box::new(retained),
+            },
+        );
+        assert!(matches!(
+            cluster.stores[leader]
+                .consumer_service()
+                .execute(&authorization, status.clone())
+                .await,
+            SessionConsumerResponse::LeaseMutationStatus(Ok(
+                SessionConsumerLeaseMutationStatus::NotFound
+            ))
+        ));
+        // NotFound did not retire A. Explicitly retry that exact A at the live
+        // leader, with its original complete public identity/body/scope binding.
+        let first_lease = match cluster.stores[leader]
             .consumer_service()
-            .execute(&authorization, status.clone())
-            .await,
-        SessionConsumerResponse::LeaseMutationStatus(Ok(
-            SessionConsumerLeaseMutationStatus::NotFound
-        ))
-    ));
-    // NotFound did not retire A. Explicitly retry that exact A at the live
-    // leader, with its original complete public identity/body/scope binding.
-    let first_lease = match cluster.stores[leader]
-        .consumer_service()
-        .execute(&authorization, first)
-        .await
-    {
-        SessionConsumerResponse::AcquireLease(Ok(lease)) => lease,
-        _ => panic!("exact A must resolve before a successor can be admitted"),
-    };
-    match cluster.stores[leader]
-        .consumer_service()
-        .execute(&authorization, status)
-        .await
-    {
-        SessionConsumerResponse::LeaseMutationStatus(Ok(
-            SessionConsumerLeaseMutationStatus::Recorded(result),
-        )) => {
-            assert!(matches!(*result,
+            .execute(&authorization, first)
+            .await
+        {
+            SessionConsumerResponse::AcquireLease(Ok(lease)) => lease,
+            _ => panic!("exact A must resolve before a successor can be admitted"),
+        };
+        match cluster.stores[leader]
+            .consumer_service()
+            .execute(&authorization, status)
+            .await
+        {
+            SessionConsumerResponse::LeaseMutationStatus(Ok(
+                SessionConsumerLeaseMutationStatus::Recorded(result),
+            )) => {
+                assert!(matches!(*result,
                 Ok(SessionConsumerLeaseMutationResult::Acquire(ref lease))
                     if lease == &first_lease));
+            }
+            _ => panic!("A must have an authoritative exact receipt"),
         }
-        _ => panic!("A must have an authoritative exact receipt"),
-    }
-    let second = SessionConsumerRequest::new(
-        scope,
-        SessionConsumerRequestId::new(),
-        SessionConsumerOperation::AcquireLease {
-            key: key.clone(),
-            owner,
-            ttl,
-        },
-    );
-    let second_lease = match cluster.stores[leader]
-        .consumer_service()
-        .execute(&authorization, second)
-        .await
-    {
-        SessionConsumerResponse::AcquireLease(Ok(lease)) => lease,
-        _ => panic!("B succeeds only after A is known"),
-    };
-    assert!(second_lease.fence().get() > first_lease.fence().get());
-    assert!(capture.deliver_original().await.result.is_ok());
-    let observed = cluster.stores[leader]
-        .observe_fenced_transition(&key)
-        .await
-        .expect("fence readback");
-    assert_eq!(observed.current_fence(), second_lease.fence());
-    cluster.stores[leader]
-        .renew(&second_lease, ttl)
-        .await
-        .expect("late A cannot fence B");
+        let second = SessionConsumerRequest::new(
+            scope,
+            SessionConsumerRequestId::new(),
+            SessionConsumerOperation::AcquireLease {
+                key: key.clone(),
+                owner,
+                ttl,
+            },
+        );
+        let second_lease = match cluster.stores[leader]
+            .consumer_service()
+            .execute(&authorization, second)
+            .await
+        {
+            SessionConsumerResponse::AcquireLease(Ok(lease)) => lease,
+            _ => panic!("B succeeds only after A is known"),
+        };
+        assert!(second_lease.fence().get() > first_lease.fence().get());
+        assert!(capture.deliver_original().await.result.is_ok());
+        let observed = cluster.stores[leader]
+            .observe_fenced_transition(&key)
+            .await
+            .expect("fence readback");
+        assert_eq!(observed.current_fence(), second_lease.fence());
+        cluster.stores[leader]
+            .renew(&second_lease, ttl)
+            .await
+            .expect("late A cannot fence B");
+    })
+    .await;
 }
