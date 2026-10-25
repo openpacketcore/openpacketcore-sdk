@@ -49,6 +49,40 @@ impl NativeDelta<'_> {
                 self.response(index, Err(StoreError::CasIdempotencyConflict))
             });
         }
+        // Bounded ordinary-receipt retention. The rule activates only from a
+        // committed application sequence far beyond every below-bound fixture,
+        // so a store that never approaches the old cap keeps the original
+        // behavior byte-identically. Once active, a command whose committed
+        // submission time is outside the retained logical-time window cannot
+        // be an in-window retry: its exact outcome was retired, so answer with
+        // a typed outcome-unavailable result instead of executing it again.
+        let retention = super::retention::ordinary_receipt_retention();
+        if retention.active(self.frontiers.sequence)
+            && retention.retry_outside_retention(command.logical_time, now)
+        {
+            let error = if matches!(intent, SessionMutationIntent::CompareAndSet(_)) {
+                StoreError::CasIdempotencyOutcomeUnavailable
+            } else {
+                StoreError::BackendOperationOutcomeUnavailable
+            };
+            return Ok(self.clock_response(now, index, error));
+        }
+        // Last-resort retention capacity. The bound is enforced on every apply
+        // while the rule is active, including mid-delta: refuse whenever the
+        // resident map is at or above the bound, even when expired rows are
+        // reclaimable at the next publication. Reclamation happens only at
+        // publication, so "reclaimable exists" is not permission to grow the
+        // current delta; a committed delta has no RPC cap and a window-crossing
+        // batch must not bypass the bound. Refuse before evaluating the command
+        // (no effect, no binding) with a retryable typed answer; the next
+        // publication's committed-clock retirement reclaims the window.
+        if retention.active(self.frontiers.sequence) && self.receipt_count_at_capacity(retention)? {
+            return Ok(self.clock_response(
+                now,
+                index,
+                StoreError::BackendUnavailable("native ordinary receipt retention capacity".into()),
+            ));
+        }
         let sequence = self
             .frontiers
             .sequence
@@ -118,6 +152,24 @@ impl NativeDelta<'_> {
         );
         self.compact_one_v1(now)?;
         Ok(response)
+    }
+
+    /// Whether the resident ordinary-receipt collections have reached the
+    /// bounded admission capacity. This deliberately does not consult
+    /// expiration: retired rows leave the map only at publication, and a
+    /// committed delta has no RPC cap, so a batch must not be able to grow past
+    /// the bound by observing reclaimable-but-not-yet-reclaimed base rows.
+    fn receipt_count_at_capacity(
+        &self,
+        retention: super::retention::OrdinaryReceiptRetention,
+    ) -> io::Result<bool> {
+        let resident = self
+            .base
+            .generic_receipts
+            .len()
+            .checked_add(self.generic_receipts.len())
+            .ok_or_else(|| invalid("native ordinary receipt count overflow"))?;
+        Ok(resident >= retention.capacity())
     }
 }
 

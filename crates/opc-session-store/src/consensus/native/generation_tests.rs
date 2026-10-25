@@ -1134,3 +1134,142 @@ fn native_notification_retention_relocates_sparse_rows_after_delta_append() {
     );
     storage.business.validate_full_business_rows().unwrap();
 }
+
+fn exact_generic_receipts(storage: &NativeStorage) -> Vec<(SessionConsensusRequestId, Vec<u8>)> {
+    let mut rows: Vec<_> = storage
+        .business
+        .generic_receipts
+        .iter()
+        .map(|(id, row)| (*id, serde_json::to_vec(&**row).unwrap()))
+        .collect();
+    rows.sort_unstable_by_key(|(id, _)| *id.as_bytes());
+    rows
+}
+
+/// Bounded ordinary-receipt retirement survives the real durable codecs: the
+/// base generation stores only the retained map, delta frames encode the
+/// retirement removals, catalog replay retires the identical prefix, and a
+/// full image round-trips the same retained map with no persisted field.
+#[test]
+fn native_ordinary_receipt_retention_survives_generation_and_image_round_trips() {
+    let _retention =
+        crate::consensus::native::retention::tests_support::override_ordinary_receipt_retention_for_test(
+            1, 10,
+        );
+    let (mut storage, _, _) = fixture();
+    for second in [1u8, 21, 41] {
+        let index = storage.business.applied().unwrap().index + 1;
+        apply(&mut storage, &[clock(index, time(second))]);
+    }
+    assert_eq!(storage.business.generic_receipts.len(), 1);
+    let retained = exact_generic_receipts(&storage);
+    let maximum = crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("retained-receipts.opc");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let base = PreparedBase::prepare(
+        &storage,
+        crate::consensus::native::generation::BaseParameters {
+            binding: ROOT,
+            file_epoch: 4,
+            checkpoint_epoch: 11,
+            operation_sequence: 18,
+            cut_binding: [0xE3; 32],
+            block_bytes: BLOCK,
+            maximum,
+        },
+        &|| Ok(()),
+    )
+    .unwrap();
+    let identity = base.write_to(&mut output, &|| Ok(())).unwrap();
+    output.sync_all().unwrap();
+    drop(output);
+    drop(base);
+    let (mut owner, catalog) = Catalog::open(
+        &path,
+        identity,
+        maximum,
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
+        [0xE3; 32],
+        &|| Ok(()),
+    )
+    .unwrap();
+    let restored = catalog.into_storage(&|| Ok(())).unwrap();
+    assert_eq!(exact_generic_receipts(&restored), retained);
+    assert_eq!(
+        Version::capture(&restored)
+            .unwrap()
+            .context_digest()
+            .unwrap(),
+        Version::capture(&storage)
+            .unwrap()
+            .context_digest()
+            .unwrap()
+    );
+
+    let mut image = Vec::new();
+    storage.write_image(&mut image, ROOT, 18).unwrap();
+    let cold =
+        NativeStorage::read_image(&mut image.as_slice(), ROOT, 18, storage.business.identity)
+            .unwrap();
+    assert_eq!(exact_generic_receipts(&cold), retained);
+    cold.business.validate_full_business_rows().unwrap();
+
+    // A delta that retires one retained outcome and binds another encodes the
+    // removal frame; the reopened catalog must rebuild the same map.
+    let version = Version::capture(&storage).unwrap();
+    storage.begin_changes().unwrap();
+    for second in [61u8, 81] {
+        let index = storage.business.applied().unwrap().index + 1;
+        apply(&mut storage, &[clock(index, time(second))]);
+    }
+    let retained = exact_generic_receipts(&storage);
+    assert_eq!(retained.len(), 1);
+    let delta = PreparedDelta::prepare(
+        owner.current(),
+        &version,
+        12,
+        21,
+        [0xE4; 32],
+        storage.take_changes().unwrap(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert!(delta.header.changed[2] >= 1);
+    delta.append(&mut owner, &|| Ok(())).unwrap();
+    let selected = owner.current().identity();
+    let (_, catalog) = Catalog::open(
+        &path,
+        selected,
+        maximum,
+        crate::consensus::native::generation::CatalogScope {
+            identity: storage.business.identity,
+            members: &storage.business.members,
+            roster_root: storage.business.roster_root.clone(),
+        },
+        [0xE4; 32],
+        &|| Ok(()),
+    )
+    .unwrap();
+    let restored = catalog.into_storage(&|| Ok(())).unwrap();
+    assert_eq!(exact_generic_receipts(&restored), retained);
+    assert_eq!(
+        Version::capture(&restored)
+            .unwrap()
+            .context_digest()
+            .unwrap(),
+        Version::capture(&storage)
+            .unwrap()
+            .context_digest()
+            .unwrap()
+    );
+    restored.business.validate_full_business_rows().unwrap();
+}

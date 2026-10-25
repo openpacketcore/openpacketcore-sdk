@@ -19,13 +19,22 @@
 //! Families adopt the primitive by deriving the floor from their committed
 //! sequence, retiring the front prefix on publication, validating
 //! `stored == retained_count` and rendering a typed stale-cursor answer for
-//! below-floor readers. Ordinary receipt and key retention can adopt the same
-//! exact helper without a new format change.
+//! below-floor readers. Key retention can adopt the same exact helper without a
+//! new format change.
+//!
+//! Ordinary command receipts are a keyed map rather than an append-only vector,
+//! so they use [`OrdinaryReceiptRetention`]: the same committed-state principle
+//! with a committed application-sequence activation point and a committed
+//! logical-time window. Below activation nothing is retired (byte-identical
+//! behavior); once active, an exact retry outside the window receives the typed
+//! outcome-unavailable answer instead of re-execution, and a bounded capacity
+//! backstop protects the fixed image admission cap.
 //!
 //! The sequence zero case is deliberate: nothing is retired before the first
 //! row, so a fresh store and every existing below-bound state keep floor zero
 //! and byte-identical behavior.
 
+use super::Timestamp;
 use std::io;
 
 /// Production notification backlog retained for watch replay.
@@ -132,6 +141,109 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// Committed application sequence after which ordinary-command receipt
+/// retention becomes active.
+///
+/// Below this committed sequence every ordinary receipt is retained exactly as
+/// before this rule existed, so existing stores and every below-bound fixture
+/// stay byte-identical. Once active, the rule below is a pure function of
+/// committed state: no wall clock, local observer, acknowledgement or delivery
+/// tracker participates.
+pub(crate) const ORDINARY_RECEIPT_RETENTION_ACTIVE_AFTER: u64 = 65_536;
+
+/// Committed logical-time window during which a retired ordinary-command
+/// outcome may still be requested by an exact retry.
+///
+/// A retry replays the original command bytes, so `command.logical_time` is
+/// the submission time that was committed with the receipt. A retry whose
+/// committed submission time is at or before `frontiers.logical_time - window`
+/// (the boundary is inclusive) is outside retention and receives a typed
+/// outcome-unavailable answer instead of being executed again.
+pub(crate) const ORDINARY_RECEIPT_RETENTION_WINDOW_SECONDS: i64 = 120;
+
+/// Hard retained-receipt admission bound before the fail-closed capacity
+/// answer. Kept below [`super::validation::MAX_ITEMS`] so new bindings cannot
+/// grow the receipt map to the fixed image admission cap.
+///
+/// The bound is enforced on every ordinary apply while the rule is active,
+/// including mid-delta: a command is refused whenever the resident map is at or
+/// above this bound, even when expired rows are reclaimable at the next
+/// publication. Reclamation happens only at publication, so "reclaimable
+/// exists" is not permission to grow the current delta; a committed delta has
+/// no RPC cap, and a window-crossing batch must not be able to bypass the
+/// bound. A rejected command may still advance the committed logical clock
+/// (the pre-existing deterministic `clock_response` behavior), but it never
+/// binds a receipt.
+pub(crate) const MAX_RETAINED_ORDINARY_RECEIPTS: usize = 1_044_480;
+
+/// Ordinary-command receipt retention rule, derived only from committed state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OrdinaryReceiptRetention {
+    active_after: u64,
+    window_seconds: i64,
+    capacity: usize,
+}
+
+impl OrdinaryReceiptRetention {
+    const fn new(active_after: u64, window_seconds: i64, capacity: usize) -> Self {
+        Self {
+            active_after,
+            window_seconds,
+            capacity,
+        }
+    }
+
+    /// Whether retirement and the typed placeholder answer are active at this
+    /// committed application sequence.
+    pub(super) const fn active(self, sequence: u64) -> bool {
+        sequence > self.active_after
+    }
+
+    /// First committed logical time whose receipts are outside retention.
+    /// `None` means the committed clock is too close to its representable
+    /// minimum for any receipt to have expired yet.
+    pub(super) fn expired_before(self, now: Timestamp) -> Option<Timestamp> {
+        now.add_seconds(-self.window_seconds)
+    }
+
+    /// Whether a receipt carrying this committed response logical time is
+    /// outside the retained window.
+    pub(super) fn expired(self, response_time: Option<Timestamp>, now: Timestamp) -> bool {
+        response_time.is_some_and(|time| {
+            self.expired_before(now)
+                .is_some_and(|horizon| time <= horizon)
+        })
+    }
+
+    /// Whether an exact retry of a commit whose submission logical time is
+    /// `command_time` is outside retention at committed time `now`.
+    pub(super) fn retry_outside_retention(self, command_time: Timestamp, now: Timestamp) -> bool {
+        self.expired_before(now)
+            .is_some_and(|horizon| command_time <= horizon)
+    }
+
+    pub(super) const fn capacity(self) -> usize {
+        self.capacity
+    }
+}
+
+/// Production ordinary-receipt retention, with a test-only override so the
+/// reduced-window regressions exercise the same production paths without
+/// publishing 65,536 commands.
+pub(super) fn ordinary_receipt_retention() -> OrdinaryReceiptRetention {
+    #[cfg(test)]
+    if let Some((active_after, window_seconds, capacity)) =
+        tests_support::ordinary_receipt_override()
+    {
+        return OrdinaryReceiptRetention::new(active_after, window_seconds, capacity);
+    }
+    OrdinaryReceiptRetention::new(
+        ORDINARY_RECEIPT_RETENTION_ACTIVE_AFTER,
+        ORDINARY_RECEIPT_RETENTION_WINDOW_SECONDS,
+        MAX_RETAINED_ORDINARY_RECEIPTS,
+    )
+}
+
 /// Notification family retention, with a test-only override so the same
 /// production code paths can exercise a floor above zero without publishing
 /// 65,536 notifying mutations.
@@ -204,6 +316,54 @@ pub(crate) mod tests_support {
 
     pub(super) fn retained_override() -> Option<u64> {
         RETAINED.with(Cell::get)
+    }
+
+    thread_local! {
+        // Ordinary-receipt active-sequence threshold, logical-time window and
+        // admission capacity.
+        static ORDINARY_RECEIPT: Cell<Option<(u64, i64, usize)>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct OrdinaryReceiptOverride {
+        previous: Option<(u64, i64, usize)>,
+    }
+
+    impl Drop for OrdinaryReceiptOverride {
+        fn drop(&mut self) {
+            ORDINARY_RECEIPT.with(|value| value.set(self.previous));
+        }
+    }
+
+    /// Run this thread's ordinary-receipt retention at a reduced activation
+    /// sequence and window. The guard restores the production rule on drop so
+    /// a panic cannot leak the reduced rule into later assertions.
+    pub(crate) fn override_ordinary_receipt_retention_for_test(
+        active_after: u64,
+        window_seconds: i64,
+    ) -> OrdinaryReceiptOverride {
+        override_ordinary_receipt_retention_with_capacity_for_test(
+            active_after,
+            window_seconds,
+            super::MAX_RETAINED_ORDINARY_RECEIPTS,
+        )
+    }
+
+    /// Reduced rule including the admission capacity, so a regression can drive
+    /// the capacity answer without publishing a million receipts.
+    pub(crate) fn override_ordinary_receipt_retention_with_capacity_for_test(
+        active_after: u64,
+        window_seconds: i64,
+        capacity: usize,
+    ) -> OrdinaryReceiptOverride {
+        assert!(window_seconds > 0, "a test receipt window must be positive");
+        assert!(capacity > 0, "a test receipt capacity must be positive");
+        let previous = ORDINARY_RECEIPT
+            .with(|value| value.replace(Some((active_after, window_seconds, capacity))));
+        OrdinaryReceiptOverride { previous }
+    }
+
+    pub(super) fn ordinary_receipt_override() -> Option<(u64, i64, usize)> {
+        ORDINARY_RECEIPT.with(Cell::get)
     }
 }
 

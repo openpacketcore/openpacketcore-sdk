@@ -93,6 +93,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gtpu_control_port_kernel_owned`, no second socket is ever bound, and
   removal, replacement, adoption or a descriptor generation change retires
   old receive capabilities and plans. Refs #1084.
+- `opc-session-store`: native ordinary command outcomes now use a bounded
+  committed-state retention rule instead of accumulating for the life of the
+  store. The rule stays inert below committed application sequence 65,536
+  (byte-identical behavior); once active, receipts whose committed response
+  logical time is at or before `frontiers.logical_time - 120 seconds`
+  (inclusive boundary) are retired on publication. Exact in-window retries
+  replay the original outcome; out-of-window retries receive the typed
+  `BackendOperationOutcomeUnavailable`/`CasIdempotencyOutcomeUnavailable`
+  answer and are never executed again. A retryable typed capacity refusal is
+  returned for every new binding while the resident receipt map is at or above
+  its capacity bound, including mid-delta, so new bindings cannot grow the map
+  to the 1,048,576-row `MAX_ITEMS` admission cap; refusals are effect-free,
+  binding-free and may advance the committed logical clock. The rule derives
+  only from the already-persisted committed application sequence and logical
+  time, so every voter retires identically and no new persisted field or
+  format boundary is added; generation catalog base/delta replay, full images,
+  the portable SQL projection and the prepared SQL base carry the retained
+  map. A past-million-command qualification job, voter/snapshot-install parity
+  and crash-cut coverage remain the final follow-up (#1251). Refs #1251.
+
 - `opc-session-store`: native notification rows now use bounded rolling
   retention instead of accumulating for the life of the store. The newest
   65,536 notifications remain resident; that 65,536 is a row-count bound, not a
