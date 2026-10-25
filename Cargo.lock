@@ -3089,6 +3089,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-linux-clock-sys"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "opc-linux-gtpu-sys"
 version = "0.2.0"
 dependencies = [
@@ -3790,6 +3797,7 @@ dependencies = [
  "opc-identity",
  "opc-ipsec-xfrm",
  "opc-key",
+ "opc-linux-clock-sys",
  "opc-persist",
  "opc-redaction",
  "opc-session-store",

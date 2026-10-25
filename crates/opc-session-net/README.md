@@ -95,6 +95,56 @@ The native full ReadIndex barrier retains its existing FIFO admission, described
 in RFC 024. It still needs class arbitration before end-to-end isolation under
 arbitrary read pressure can be claimed.
 
+### Authentication-time source
+
+`PlatformAuthenticationTimeSource` is the supported production
+`AuthenticationTimeSource` for RFC 026 authentication freshness. It performs one
+read-only `clock_adjtime(CLOCK_REALTIME)` query (`modes == 0`) through the
+narrow `opc-linux-clock-sys` UAPI boundary and reports the kernel's maximum
+realtime error as the symmetric uncertainty of one observation. Install it once
+per process with the deployment's fixed budget (the budget is never widened on
+retry):
+
+```rust
+use opc_session_net::scope::{IntervalClock, PlatformAuthenticationTimeSource};
+use std::sync::Arc;
+use std::time::Duration;
+
+let source = Arc::new(PlatformAuthenticationTimeSource::new());
+let clock = IntervalClock::new(source, Duration::from_millis(100))?;
+```
+
+Platform contract:
+
+- Linux only. Other platforms compile, but every read returns the typed
+  retryable `AuthenticationTimeError`; there is no wall-clock fallback.
+- The read is unprivileged and never changes the clock. A seccomp filter, LSM
+  policy or hardened container runtime that refuses `clock_adjtime` makes
+  authentication time unavailable (retryable, no authority).
+- The kernel's `timex.maxerror` is only meaningful while a synchronization
+  daemon (chrony/ntpd) maintains it. A node with no daemon usually reports
+  `STA_UNSYNC` or the boot-default multi-second bound; both fail closed. The
+  default source maximum is 1 s
+  (`PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY`) and can be fixed lower or
+  higher with `with_maximum_uncertainty` at startup.
+- Containers share the host-global kernel clock and synchronization state; the
+  state is not namespaced per container.
+- A zero, negative, oversized or unreadable kernel bound is refused rather than
+  turned into a wider trusted interval.
+
+Operators see one fixed, value-free `tracing` warning on target
+`opc_session_net::scope::auth_time` with a closed `reason` (`unsupported_platform`,
+`io_unavailable`, `permission_denied`, `not_synchronized`, `zero_error_bound`,
+`invalid_error_bound`, `uncertainty_exceeded`, `generation_exhausted`) for each
+refusal, plus the existing typed `AuthTimeUnavailable` result in the
+authentication path. Alarm on those warnings and on the node's time-daemon
+health; do not increase the uncertainty budget to silence them. The
+synchronization generation starts at 1 on the first accepted synchronized
+observation and increments after synchronization is re-established; wall-clock
+steps without a resynchronization are handled by `IntervalClock`'s existing
+recovery policy (three consistent observations at least one second apart over at
+least three seconds) under the same fixed budget.
+
 Authentication time can refuse an attempt; it never expires ownership or stops
 installed forwarding. Voluntary shutdown must first finish the application's
 emergency-session drain, then call `prepare_close` and deliver its exact Close.
