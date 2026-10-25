@@ -31097,7 +31097,8 @@ fn is_deterministic_intent_rejection(error: &StoreError) -> bool {
         | StoreError::PayloadTooLarge { .. }
         | StoreError::FencedTransitionRequestExpired
         | StoreError::FencedTransitionVoided
-        | StoreError::FencedTransitionStorageExhausted => true,
+        | StoreError::FencedTransitionStorageExhausted
+        | StoreError::KeyCapacityExhausted => true,
         StoreError::CapabilityNotSupported(_)
         | StoreError::CasIdempotencyConflict
         | StoreError::CasIdempotencyOutcomeUnavailable

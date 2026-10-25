@@ -163,6 +163,57 @@ fn roster_durable_bindings(storage: &NativeStorage) -> usize {
 }
 
 #[test]
+fn native_key_capacity_batch_boundary_refuses_without_mutation() {
+    let signed = crate::consensus::types::roster_v2_persistence_fixture();
+    let mut storage = configured(&signed);
+    // One existing committed key from the fixture; allow exactly one more.
+    let _limit =
+        crate::consensus::native::retention::tests_support::KeyCapacityLimitOverride::new(2);
+    let owner = signed.authority.owner().clone();
+    let key_a = {
+        let mut key = signed.authority.key().clone();
+        key.stable_id = bytes::Bytes::from_static(b"key-capacity-a")
+            .try_into()
+            .expect("stable ID");
+        key
+    };
+    let key_b = {
+        let mut key = signed.authority.key().clone();
+        key.stable_id = bytes::Bytes::from_static(b"key-capacity-b")
+            .try_into()
+            .expect("stable ID");
+        key
+    };
+    let acquire = |index: u64, key: crate::model::SessionKey| {
+        entry(
+            &signed,
+            index,
+            SessionConsensusRequestId::from_bytes([0xB7; 16]),
+            SessionMutationIntent::AcquireLease {
+                key,
+                owner: owner.clone(),
+                ttl: std::time::Duration::from_secs(60),
+            },
+        )
+    };
+    let applied = apply(&mut storage, &[acquire(1, key_a), acquire(2, key_b)]);
+    assert!(matches!(
+        applied.responses[0].result,
+        Ok(SessionMutationOutcome::Lease(_))
+    ));
+    assert_eq!(
+        applied.responses[1].result,
+        Err(StoreError::KeyCapacityExhausted),
+        "the second batch key must hit the typed deterministic capacity refusal"
+    );
+    assert_eq!(
+        storage.business.keys.len(),
+        2,
+        "a refused capacity admission cannot mutate the key map"
+    );
+}
+
+#[test]
 fn roster_only_advance_logical_time_reclaims_retention_before_the_next_admission() {
     // The roster-maintenance lane exists because Q1/Q2 commands must never fold
     // retention work into their frozen mutation width. This is the exact

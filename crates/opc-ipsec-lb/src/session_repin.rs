@@ -3987,6 +3987,10 @@ fn map_store_error(error: StoreError) -> IpsecLbError {
             "session_repin.key",
             "session re-pin journal key was rejected",
         ),
+        StoreError::KeyCapacityExhausted => IpsecLbError::invalid_config(
+            "session_repin.capacity",
+            "native key capacity exhausted; bounded key retention is required",
+        ),
         StoreError::CasIdempotencyConflict => IpsecLbError::invalid_config(
             "session_repin.idempotency",
             "session re-pin journal mutation identity was reused",

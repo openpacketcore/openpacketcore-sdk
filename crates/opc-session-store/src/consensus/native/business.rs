@@ -278,5 +278,6 @@ pub(super) fn deterministic(error: &StoreError) -> bool {
             | StoreError::PayloadTooLarge { .. }
             | StoreError::FencedTransitionRequestExpired
             | StoreError::FencedTransitionStorageExhausted
+            | StoreError::KeyCapacityExhausted
     )
 }

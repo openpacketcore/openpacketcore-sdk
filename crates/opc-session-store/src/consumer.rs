@@ -2393,6 +2393,7 @@ impl From<StoreError> for SessionConsumerStoreError {
             StoreError::FencedTransitionHistoryFull
             | StoreError::FencedTransitionRetentionExhausted
             | StoreError::FencedTransitionStorageExhausted
+            | StoreError::KeyCapacityExhausted
             // These V2-only errors are unreachable through revision 3's V1
             // dispatch. Keep the frozen V1 family closed if a faulty backend
             // nevertheless leaks one across that boundary; revision 5 maps

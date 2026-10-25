@@ -1885,6 +1885,12 @@ impl<'a> TryFrom<&'a StoreError> for WireStoreErrorRef<'a> {
             | StoreError::FencedTransitionStorageExhausted => {
                 Self::CapabilityNotSupported("unknown_capability")
             }
+            // Legacy protocol v5 has no native key-capacity variant. Preserve
+            // a deterministic no-effect refusal in the frozen closed family
+            // instead of masking it as transient backend unavailability.
+            StoreError::KeyCapacityExhausted => {
+                Self::CapabilityNotSupported("native_key_capacity_exhausted")
+            }
             // Legacy protocol v5 has no protected-roster reservation error.
             // Preserve the no-effect conflict semantics without revealing
             // whether a protected roster exists for the named key.
