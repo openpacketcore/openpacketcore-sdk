@@ -631,6 +631,22 @@ jobs:
             --nocapture --test-threads=1 2>&1 | tee "${RUNNER_TEMP}/sctp-dual-stack.log"
           grep -Fq 'test result: ok. 1 passed; 0 failed;' "${RUNNER_TEMP}/sctp-dual-stack.log"
 
+      - name: Require queued SCTP delivery before shutdown
+        run: |
+          set -euo pipefail
+          shutdown_binary="$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .profile.test == true
+              and .target.name == "opc_sctp" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one SCTP test binary") end
+          ' "${RUNNER_TEMP}/sctp-progress-build.jsonl")"
+          sudo unshare -n -- bash -euxo pipefail -c '
+            ip link set lo up
+            exec "$@"
+          ' sctp-shutdown "${shutdown_binary}" --ignored --exact \
+            tests::loopback_recv_diameter_payload_surfaces_close_after_shutdown \
+            --nocapture --test-threads=1 2>&1 | tee "${RUNNER_TEMP}/sctp-queued-close.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/sctp-queued-close.log"
+
       - name: Require SCTP-AUTH preference, readback and key lifecycle
         run: |
           set -euo pipefail

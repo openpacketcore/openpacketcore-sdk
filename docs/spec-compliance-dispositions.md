@@ -61,3 +61,38 @@ Witnesses: [safe authentication boundary](../crates/opc-sctp/src/lib.rs),
 [RFC 4895 §§3.3, 6.1](https://www.rfc-editor.org/rfc/rfc4895.html#section-3.3),
 [RFC 6458 §§8.1.17, 8.2.4](https://www.rfc-editor.org/rfc/rfc6458.html#section-8.1.17), and
 [Linux endpoint/association readback](https://github.com/torvalds/linux/blob/v6.8/net/sctp/socket.c).
+
+## SCTP work list #1351: remaining lifecycle claims
+
+- RFC 6083 section 4.6 leaves renegotiation use to the upper layer. It does not
+  require automatic HelloRequest handling or uninterrupted writes. The existing
+  explicit rekey profile retains the section 4.7 drain/key barriers; its native
+  multistream rekey and packet-capture proofs pass. The Diameter facade continues
+  to use bounded connection retirement instead of offering renegotiation.
+- RFC 6525 sections 6.3.1 and 7 distinguish event subscription from enabling
+  reconfiguration. Reset requests are disabled by default and require explicit
+  application enablement. The documented N2 owner observes lifecycle events;
+  it does not advertise a reset/add-stream API. Enabling extensions merely
+  because their events are observed is not required. RFC 6083 section 4.8,
+  also cited by the issue, concerns shared keys rather than stream resets.
+- RFC 6458 section 4.1.7 specifies that SHUT_RDWR initiates SCTP shutdown.
+  The expanded native close regression verifies all eight queued 1 KiB
+  responses reach the peer before Closed, for both descriptor drop and the
+  explicit local terminal-close handle. The required SCTP CI job runs this
+  proof explicitly. This is loopback delivery evidence, not a guarantee that
+  a peer or network failure cannot interrupt an SCTP shutdown.
+
+Wire ABORT remains open. The legacy `abort` handle closes local I/O using
+SHUT_RDWR and must not be presented as a wire-ABORT API. An uncommitted
+SCTP_ABORT-send prototype returned EINVAL on the native one-to-one association
+and was removed. Linux explicitly rejects that flag for its TCP-style SCTP
+sockets; a correct abort path must coordinate physical descriptor closure
+and abortive linger without replacing an owned descriptor while registered.
+RFC 6733 section 2.1 also requires wire abort when Diameter framing cannot be
+recovered. This remaining requirement is not waived by the graceful-close proof.
+
+Witnesses: [native close regression](../crates/opc-sctp/src/lib.rs),
+[RFC 6083 sections 4.6–4.8](https://www.rfc-editor.org/rfc/rfc6083.html#section-4.6),
+[RFC 6525 section 6.3.1](https://www.rfc-editor.org/rfc/rfc6525.html#section-6.3.1),
+[RFC 6458 section 4.1.7](https://www.rfc-editor.org/rfc/rfc6458.html#section-4.1.7), and
+[Linux one-to-one flag check and linger-based close](https://github.com/torvalds/linux/blob/v6.8/net/sctp/socket.c).

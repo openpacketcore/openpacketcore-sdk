@@ -3116,7 +3116,8 @@ pub struct SctpAssociationAbortHandle {
 }
 
 impl SctpAssociationAbortHandle {
-    /// Abort both directions of the association immediately.
+    /// Close both local directions immediately and initiate SCTP shutdown.
+    /// This legacy terminal-close operation does not promise a wire ABORT.
     pub fn abort(&self) {
         self.imp.abort();
     }
@@ -8528,7 +8529,7 @@ mod tests {
         server_addr: SocketAddr,
     ) -> (SctpEndpoint, DiameterSctpAssociation, SctpAssociation) {
         let server = SctpEndpoint::bind(SctpEndpointConfig::one_to_one(server_addr)).unwrap();
-        let client = DiameterSctpPeer::new_unprotected(server_addr)
+        let client = DiameterSctpPeer::new_unprotected(server.local_addresses().unwrap()[0])
             .connect_association()
             .await
             .unwrap();
@@ -8743,5 +8744,40 @@ mod tests {
             DiameterSctpError::SctpRecv(SctpError::Closed)
         ));
         assert_eq!(error.as_str(), "diameter_sctp_recv_error");
+
+        // Both close(2) and SHUT_RDWR preserve queued sends before SHUTDOWN.
+        for explicit_shutdown in [false, true] {
+            let (_server, client, accepted) =
+                diameter_loopback("127.0.0.1:0".parse().unwrap()).await;
+            for value in 0..8_u8 {
+                accepted
+                    .send(OutboundMessage::ordered(
+                        Bytes::from(vec![value; 1024]),
+                        0,
+                        DIAMETER_SCTP_PPID,
+                    ))
+                    .await
+                    .expect("queue final response");
+            }
+            if explicit_shutdown {
+                accepted.abort_handle().abort();
+                assert!(!accepted.health().socket_open);
+            }
+            drop(accepted);
+            for value in 0..8_u8 {
+                let payload =
+                    tokio::time::timeout(Duration::from_secs(5), client.recv_diameter_payload())
+                        .await
+                        .expect("bounded queued delivery")
+                        .expect("queued response survives close");
+                assert_eq!(payload, Bytes::from(vec![value; 1024]));
+            }
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), client.recv_diameter_payload())
+                    .await
+                    .expect("bounded shutdown"),
+                Err(DiameterSctpError::SctpRecv(SctpError::Closed))
+            ));
+        }
     }
 }
