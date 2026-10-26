@@ -119,6 +119,7 @@ mod linux {
                     ms_address: IpAddr::from([192, 0, 2, ordinal]),
                     peer_address: "198.51.100.10".parse()?,
                     link_ifindex: attachment.ifindex,
+                    downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
                     downlink_source_port_policy: GtpuSourcePortPolicy::Exact(2152),
                     gtp_version: GtpVersion::V1,
                     bearer_mark: None,

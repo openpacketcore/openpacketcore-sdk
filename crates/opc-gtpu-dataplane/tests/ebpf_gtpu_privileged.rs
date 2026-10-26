@@ -66,6 +66,15 @@ mod backend_packet_too_big_ipv6;
 mod backend_reassembly;
 #[path = "ebpf_gtpu_privileged/measured_diagnostics.rs"]
 mod measured_diagnostics;
+#[path = "ebpf_gtpu_privileged/multihoming.rs"]
+mod multihoming;
+#[tokio::test]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_multihoming_is_opt_in_and_survives_restart(
+) -> Result<(), Box<dyn std::error::Error>> {
+    multihoming::exercise_multihoming().await
+}
+
 #[path = "ebpf_gtpu_privileged/n3_end_marker.rs"]
 mod n3_end_marker;
 #[path = "ebpf_gtpu_privileged/n3_fixed_flow.rs"]
@@ -2967,6 +2976,7 @@ fn session_context(link_ifindex: u32) -> GtpPdpContext {
         ms_address: IpAddr::V4(UE_PAA),
         peer_address: IpAddr::V4(PGW_IP),
         link_ifindex,
+        downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: GtpuSourcePortPolicy::Exact(GTPU_PORT),
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
@@ -3028,6 +3038,7 @@ fn grouped_entry(
             ms_address: inner,
             peer_address: peer_outer,
             link_ifindex,
+            downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Exact(GTPU_PORT),
             gtp_version: GtpVersion::V1,
             bearer_mark: None,

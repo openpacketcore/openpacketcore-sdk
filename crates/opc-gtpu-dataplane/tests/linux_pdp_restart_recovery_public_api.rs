@@ -84,6 +84,7 @@ fn linux_pdp_restart_recovery_request_is_redaction_safe() {
             ms_address: "10.23.0.2".parse().unwrap(),
             peer_address: "192.0.2.10".parse().unwrap(),
             link_ifindex: 7,
+            downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: opc_gtpu_dataplane::GtpuSourcePortPolicy::Any,
             gtp_version: opc_gtpu_dataplane::GtpVersion::V1,
             bearer_mark: None,

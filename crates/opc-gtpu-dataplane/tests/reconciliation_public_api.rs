@@ -72,6 +72,7 @@ fn context() -> GtpPdpContext {
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
         peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         link_ifindex: 7,
+        downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,

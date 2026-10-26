@@ -572,6 +572,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-gtpu-dataplane`: initialize the new
+  `GtpPdpContext::downlink_peer_source_policy` field with
+  `GtpuPeerSourcePolicy::BackendDefault` to preserve existing backend behavior.
+  `TeidAndLocal` enables eBPF multi-homing while retaining other packet and
+  ownership checks. Grouped/N3 entries expose `with_peer_source_policy`.
+  The opt-in has versioned, persistent encodings; default bytes stay unchanged.
+  Linux GTP rejects the explicit policy because netlink cannot retain it. (#1347)
+
 - `opc-proto-gtpv2c`: ARP pre-emption permission booleans now follow the
   enabled-zero PCI/PVI wire convention. Priority level 1 remains highest;
   `cmp_priority` compares that rank independently of permission flags. Remove

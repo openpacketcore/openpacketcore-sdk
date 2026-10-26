@@ -2455,6 +2455,11 @@ fn validate_device(device: &GtpDevice) -> Result<(), GtpuError> {
 }
 
 fn validate_pdp_context(context: &GtpPdpContext) -> Result<(), GtpuError> {
+    if context.downlink_peer_source_policy != crate::GtpuPeerSourcePolicy::BackendDefault {
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "downlink_peer_source_policy",
+        });
+    }
     if context.bearer_mark.is_some() {
         return Err(GtpuError::UnsupportedFeature {
             feature: "per_bearer_marking",
@@ -2924,6 +2929,7 @@ fn parse_pdp_context_response(
         ms_address,
         peer_address,
         link_ifindex,
+        downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
@@ -4032,6 +4038,7 @@ mod tests {
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 42,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -4419,6 +4426,18 @@ mod tests {
             encode_install_pdp_context(&baseline).unwrap(),
             baseline_bytes
         );
+    }
+
+    #[test]
+    fn kernel_backend_rejects_unretained_multihoming_policy_before_mutation() {
+        let mut context = pdp_context();
+        context.downlink_peer_source_policy = crate::GtpuPeerSourcePolicy::TeidAndLocal;
+        assert!(matches!(
+            validate_pdp_context(&context),
+            Err(GtpuError::UnsupportedFeature {
+                feature: "downlink_peer_source_policy"
+            })
+        ));
     }
 
     #[test]

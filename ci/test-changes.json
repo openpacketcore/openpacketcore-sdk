@@ -1088,6 +1088,12 @@
       "kind": "disabled",
       "reason": "New privileged kernel-GTP test requires an isolated network namespace and CAP_NET_ADMIN. The privileged workflow runs the complete ignored harness. Actual loopback receive verifies the wildcard socket preserves the original destination in the response source and Peer Address IE.",
       "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_multihoming_is_opt_in_and_survives_restart",
+      "kind": "disabled",
+      "reason": "New privileged packet proof requires CAP_BPF/CAP_NET_ADMIN and an isolated network namespace. Executed in the compliance Linux VM: strict alternate-source rejection, opt-in delivery before and after backend restart, and rejection of wrong local address, UDP port, TEID and inner PAA. The complete ignored harness runs in privileged CI; host tests cover codecs, ownership and reassembly parity.",
+      "issue": 1347
     }
   ]
 }

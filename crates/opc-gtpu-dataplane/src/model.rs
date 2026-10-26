@@ -9,7 +9,7 @@ use std::pin::Pin;
 
 use opc_gtpu_ebpf_common::GtpuEndpointAddress;
 pub use opc_gtpu_ebpf_common::{
-    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuReassemblyBounds,
+    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuPeerSourcePolicy, GtpuReassemblyBounds,
     GtpuSessionDeviceId, GtpuSessionGroupId, GtpuSessionPaa, GtpuSourcePortPolicy,
     GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
 };
@@ -4671,6 +4671,7 @@ pub struct GtpuDownlinkEndpoint {
     local_address: IpAddr,
     ingress_ifindex: u32,
     source_port_policy: GtpuSourcePortPolicy,
+    peer_source_policy: GtpuPeerSourcePolicy,
 }
 
 impl GtpuDownlinkEndpoint {
@@ -4697,10 +4698,24 @@ impl GtpuDownlinkEndpoint {
             local_address,
             ingress_ifindex,
             source_port_policy,
+            peer_source_policy: GtpuPeerSourcePolicy::BackendDefault,
         })
     }
 
-    /// Return the authorized outer peer address.
+    /// Select the explicit inbound peer-address policy.
+    #[must_use]
+    pub const fn with_peer_source_policy(mut self, policy: GtpuPeerSourcePolicy) -> Self {
+        self.peer_source_policy = policy;
+        self
+    }
+
+    /// Return the retained inbound peer-address policy.
+    #[must_use]
+    pub const fn peer_source_policy(&self) -> GtpuPeerSourcePolicy {
+        self.peer_source_policy
+    }
+
+    /// Return the configured outer peer address.
     #[must_use]
     pub const fn peer_address(&self) -> IpAddr {
         self.peer_address
@@ -4877,7 +4892,7 @@ impl GtpuDownlinkInnerMtu {
     }
 }
 
-/// GTP-U PDP context programmed into the Linux `gtp` kernel module.
+/// GTP-U PDP context installed by the selected dataplane backend.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct GtpPdpContext {
     /// Incoming/local S2b-U/N3 TEID. Always nonzero.
@@ -4894,6 +4909,13 @@ pub struct GtpPdpContext {
     pub peer_address: IpAddr,
     /// GTP netdevice ifindex.
     pub link_ifindex: u32,
+    /// Inbound outer-source policy, independent of the outgoing peer address.
+    ///
+    /// `BackendDefault` preserves eBPF's exact peer check and Linux GTP's native
+    /// behavior. `TeidAndLocal` explicitly enables eBPF multi-homing; it keeps
+    /// TEID, local endpoint, ingress attachment, source-port and inner-PAA
+    /// checks. Linux GTP rejects this opt-in instead of losing it on readback.
+    pub downlink_peer_source_policy: GtpuPeerSourcePolicy,
     /// Explicit UDP source-port authorization for inbound GTP-U G-PDUs.
     ///
     /// Use [`GtpuSourcePortPolicy::Any`] for peers that select dynamic source
@@ -5099,6 +5121,7 @@ impl GtpuSessionEntry {
                 ms_address: inner_address,
                 peer_address: intent.received_uplink().destination(),
                 link_ifindex,
+                downlink_peer_source_policy: GtpuPeerSourcePolicy::BackendDefault,
                 downlink_source_port_policy,
                 gtp_version: GtpVersion::V1,
                 bearer_mark: intent.flow().mark(),
@@ -5110,6 +5133,13 @@ impl GtpuSessionEntry {
         )?;
         entry.n3_qfi = Some(intent.flow().qfi());
         Ok(entry)
+    }
+
+    /// Select an inbound peer-address policy without changing outgoing routing.
+    #[must_use]
+    pub const fn with_peer_source_policy(mut self, policy: GtpuPeerSourcePolicy) -> Self {
+        self.context.downlink_peer_source_policy = policy;
+        self
     }
 
     /// Exact fixed-flow N3 QFI; `None` means ordinary GTP-U without PSC enforcement.
@@ -5152,6 +5182,7 @@ impl GtpuSessionEntry {
             self.context.egress_dscp,
         )
         .ok()
+        .map(|entry| entry.with_peer_source_policy(self.context.downlink_peer_source_policy))
     }
 
     /// Complete existing PDP-context policy.
@@ -5924,6 +5955,8 @@ pub enum PdpContextMismatchField {
     BearerMark,
     /// Optional fixed outer DSCP.
     EgressDscp,
+    /// Inbound GTP-U peer-address policy.
+    DownlinkPeerSourcePolicy,
     /// Inbound GTP-U source-port policy.
     DownlinkSourcePortPolicy,
     /// Uplink GTP-U source-port selection policy.
@@ -6700,6 +6733,9 @@ pub(crate) fn pdp_context_mismatches(
     if existing.egress_dscp != desired.egress_dscp {
         fields.push(PdpContextMismatchField::EgressDscp);
     }
+    if existing.downlink_peer_source_policy != desired.downlink_peer_source_policy {
+        fields.push(PdpContextMismatchField::DownlinkPeerSourcePolicy);
+    }
     if existing.downlink_source_port_policy != desired.downlink_source_port_policy {
         fields.push(PdpContextMismatchField::DownlinkSourcePortPolicy);
     }
@@ -7057,6 +7093,7 @@ mod tests {
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Exact(21_152),
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
@@ -7141,6 +7178,7 @@ mod tests {
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Exact(21_152),
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(GtpBearerMark::new(0x3456_789a).unwrap()),
@@ -7208,6 +7246,7 @@ mod tests {
         existing.link_ifindex = 8;
         existing.bearer_mark = None;
         existing.egress_dscp = None;
+        existing.downlink_peer_source_policy = GtpuPeerSourcePolicy::TeidAndLocal;
         existing.downlink_source_port_policy = GtpuSourcePortPolicy::Any;
         existing.uplink_source_port_policy = GtpuUplinkSourcePortPolicy::LegacyServicePort;
 
@@ -7226,6 +7265,7 @@ mod tests {
                 PdpContextMismatchField::LinkIfindex,
                 PdpContextMismatchField::BearerMark,
                 PdpContextMismatchField::EgressDscp,
+                PdpContextMismatchField::DownlinkPeerSourcePolicy,
                 PdpContextMismatchField::DownlinkSourcePortPolicy,
                 PdpContextMismatchField::UplinkSourcePortPolicy,
             ]
@@ -7335,6 +7375,7 @@ mod tests {
             ms_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 9,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,

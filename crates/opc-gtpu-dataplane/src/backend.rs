@@ -1495,6 +1495,7 @@ mod tests {
             ms_address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             peer_address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2)),
             link_ifindex: 7,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
             gtp_version: crate::GtpVersion::V1,
             bearer_mark: None,
