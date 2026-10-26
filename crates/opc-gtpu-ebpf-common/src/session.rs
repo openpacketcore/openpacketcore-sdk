@@ -3049,6 +3049,27 @@ mod tests {
     }
 
     #[test]
+    fn peer_teid_zero_round_trips_grouped_entries() {
+        // TS 29.281 section 5.1: zero is valid only for a peer-assigned TEID.
+        for mut entry in [
+            v4_entry(),
+            v6_entry(),
+            v4_entry().with_n3_qfi(0).unwrap(),
+            v6_entry().with_n3_qfi(63).unwrap(),
+        ] {
+            entry.peer_teid = [0; 4];
+            assert_eq!(GtpuSessionEntry::decode(&entry.encode()), Some(entry));
+            let record = match entry.inner_family() {
+                GtpuSessionIpFamily::Ipv4 => active(9, Some(entry), None),
+                GtpuSessionIpFamily::Ipv6 => active(9, None, Some(entry)),
+            };
+            assert!(GtpuSessionAuthorityWireView::decode(&record.encode()).is_some());
+            entry.local_teid = [0; 4];
+            assert!(GtpuSessionEntry::decode(&entry.encode()).is_none());
+        }
+    }
+
+    #[test]
     fn dual_candidate_index_round_trips_and_generation_overflow_fails_closed() {
         let base = candidate(7, v4_entry());
         let desired = candidate(8, v4_entry());
@@ -3442,6 +3463,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.downlink_inner_mtu(), Some(mtu));
+    }
+
+    mod legacy_v6 {
+        include!("session_legacy_v6.rs");
+    }
+
+    #[test]
+    fn mtu_format_is_rejected_by_the_frozen_v6_entry_reader() {
+        for entry in [v4_entry(), v6_entry(), v6_entry().with_n3_qfi(0).unwrap()] {
+            let wire = entry.encode();
+            assert!(legacy_v6::entry_wire_is_canonical(
+                &wire,
+                entry.inner_family()
+            ));
+            assert_eq!(GtpuSessionEntry::decode(&wire), Some(entry));
+            let mut unversioned_mtu = wire;
+            unversioned_mtu[73..75].copy_from_slice(&0x8514_u16.to_be_bytes());
+            assert!(!legacy_v6::entry_wire_is_canonical(
+                &unversioned_mtu,
+                entry.inner_family()
+            ));
+            assert!(GtpuSessionEntry::decode(&unversioned_mtu).is_none());
+        }
+        let current = v6_entry()
+            .with_downlink_inner_mtu(DownlinkInnerMtu::in_tunnel_packet_too_big(1_300).unwrap());
+        assert_eq!(current.encode()[0], 3);
+        assert_eq!(GtpuSessionEntry::decode(&current.encode()), Some(current));
+        assert!(!legacy_v6::entry_wire_is_canonical(
+            &current.encode(),
+            current.inner_family()
+        ));
+    }
+
+    #[test]
+    fn inner_mtu_wire_refuses_unsupported_profiles() {
+        let mtu = DownlinkInnerMtu::in_tunnel_packet_too_big(1_300).unwrap();
+        let valid = v6_entry().with_downlink_inner_mtu(mtu);
+        assert_eq!(GtpuSessionEntry::decode(&valid.encode()), Some(valid));
+        let mut outer_v6 = valid;
+        outer_v6.peer_outer_address = v4_entry().peer_outer_address;
+        outer_v6.local_outer_address = v4_entry().local_outer_address;
+        let mut selected_port = valid;
+        selected_port.uplink_source_port_policy = GtpuUplinkSourcePortPolicy::Selected(40_000);
+        for entry in [
+            v4_entry().with_downlink_inner_mtu(mtu),
+            valid.with_n3_qfi(7).unwrap(),
+            outer_v6,
+            selected_port,
+            v6_entry().with_downlink_inner_mtu(DownlinkInnerMtu::fragment_inner(1_300).unwrap()),
+            v6_entry().with_downlink_inner_mtu(
+                DownlinkInnerMtu::in_tunnel_packet_too_big(1_279).unwrap(),
+            ),
+        ] {
+            assert!(
+                GtpuSessionEntry::decode(&entry.encode()).is_none(),
+                "{entry:?}"
+            );
+            let record = match entry.inner_family() {
+                GtpuSessionIpFamily::Ipv4 => active(9, Some(entry), None),
+                GtpuSessionIpFamily::Ipv6 => active(9, None, Some(entry)),
+            };
+            assert!(GtpuSessionAuthorityWireView::decode(&record.encode()).is_none());
+        }
     }
 
     #[test]

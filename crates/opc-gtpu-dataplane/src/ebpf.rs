@@ -52812,6 +52812,52 @@ mod aya_runtime {
                     info.verified_instruction_count()
                 );
             }
+            // The real loader must refuse a retained v6 marker before any
+            // attachment can interpret the IPv6 MTU entry format as v6 state.
+            let config = GtpuSessionDeviceConfig::new(
+                opc_gtpu_ebpf_common::GtpuSessionDeviceId::new([0x42; 16]).unwrap(),
+                7,
+                Some([192, 0, 2, 1]),
+                None,
+            )
+            .unwrap();
+            AyaGtpuRuntime::grouped_config_write_verified(&mut ebpf, config.encode()).unwrap();
+            for (marker, current) in [
+                (*b"OPC-GROUP-IP-v6\0", false),
+                (*b"OPC-GROUP-IP-v7\0", true),
+            ] {
+                {
+                    let mut schema = Array::<_, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(
+                        ebpf.map_mut(MAP_SESSION_SCHEMA).unwrap(),
+                    )
+                    .unwrap();
+                    schema.set(0, marker, 0).unwrap();
+                }
+                let observed =
+                    AyaGtpuRuntime::grouped_schema_preflight(&pin_dir, BearerSchemaState::PmtuV5);
+                if current {
+                    assert!(
+                        matches!(observed, Ok(GroupedSchemaState::Retained { config: actual }) if actual == config)
+                    );
+                } else {
+                    assert!(matches!(
+                        observed,
+                        Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_grouped_schema"
+                        })
+                    ));
+                }
+                assert_eq!(
+                    AyaGtpuRuntime::grouped_schema_read(&ebpf).unwrap(),
+                    marker,
+                    "preflight must not rewrite retained schema state"
+                );
+                assert_eq!(
+                    AyaGtpuRuntime::grouped_config_read(&ebpf).unwrap(),
+                    config.encode()
+                );
+            }
+            println!("OPC_GTPU_RETAINED_GROUPED_SCHEMA_V6_REFUSAL_PROVEN");
             drop(ebpf);
             fs::remove_dir_all(&pin_dir).expect("remove live tag proof pins");
             println!("OPC_GTPU_TAG_PROOF_PROVEN");
@@ -57226,6 +57272,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod control_port_recovery;
     mod grouped_bearer_transition;
+    #[cfg(target_os = "linux")]
+    mod ipv6_packet_too_big;
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
     mod ordinary_ipv6;

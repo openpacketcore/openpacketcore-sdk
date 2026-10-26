@@ -2860,6 +2860,45 @@ mod tests {
     }
 
     #[test]
+    fn peer_teid_zero_authorizes_default_and_marked_uplink() {
+        // TS 29.281 section 5.1 requires accepting a peer-assigned zero TEID.
+        let mut legacy_peer = far();
+        legacy_peer.o_teid = [0; 4];
+        let binding = ipv4_binding(GtpuSourcePortPolicy::Any);
+        assert!(default_bearer_graph_is_valid(
+            1_u32.to_be_bytes(),
+            DownlinkPdr {
+                ue_ip: [10, 45, 0, 2]
+            },
+            legacy_peer,
+            binding,
+            legacy_peer.local_ip,
+            7,
+        ));
+        let mut owner = canonical_owner(MarkedBearerOwnerPhase::Active);
+        owner.uplink_far.o_teid = [0; 4];
+        assert!(owner.is_valid());
+        assert!(owner.authorizes_uplink(&owner.uplink_far, owner.egress_dscp_wire()));
+        assert!(marked_owner_wire_authorizes_uplink(
+            &owner.encode(),
+            &owner.uplink_far,
+            owner.egress_dscp_wire(),
+        ));
+        let encap = build_uplink_encap(&legacy_peer, 28).unwrap();
+        assert_eq!(&encap[32..36], &[0; 4]);
+        assert!(!default_bearer_graph_is_valid(
+            [0; 4],
+            DownlinkPdr {
+                ue_ip: [10, 45, 0, 2]
+            },
+            legacy_peer,
+            binding,
+            legacy_peer.local_ip,
+            7,
+        ));
+    }
+
+    #[test]
     fn default_bearer_graph_validation_rejects_noncanonical_session_identity() {
         let local_ip = [192, 0, 2, 1];
         let pdr = DownlinkPdr {

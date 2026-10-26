@@ -4671,6 +4671,30 @@ mod tests {
     }
 
     #[test]
+    fn peer_teid_zero_is_valid_and_preserved_in_kernel_readback() {
+        let mut context = pdp_context();
+        context.peer_teid = PeerTeid::ZERO;
+        assert!(validate_pdp_context(&context).is_ok());
+        let selector = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+        );
+        assert_eq!(
+            parse_pdp_context_response(&pdp_response(&context, true), &selector, 31).unwrap(),
+            context,
+        );
+        let body = encode_install_pdp_context(&context).unwrap();
+        let attributes = &body[GENERIC_NETLINK_HEADER_LEN..];
+        assert_eq!(
+            attr_payload(attributes, GTPA_O_TEI),
+            Some(&0_u32.to_ne_bytes()[..])
+        );
+        assert_eq!(
+            attr_payload(attributes, GTPA_I_TEI),
+            Some(&context.local_teid.get().to_ne_bytes()[..])
+        );
+    }
+
+    #[test]
     fn pdp_readback_pins_zero_peer_teid_typed_refusal() {
         let selector_context = pdp_context();
         let selector = PdpContextSelector::LocalTeid(
@@ -6035,6 +6059,30 @@ mod tests {
                 if conflict.occupied() == crate::PdpContextSelectorOccupancy::LocalTeid
         ));
         assert!(local_conflict_transport
+            .requests()
+            .iter()
+            .all(|request| request.operation != "install_pdp_context"));
+    }
+
+    #[tokio::test]
+    async fn peer_teid_zero_resident_is_a_conflict_without_install_effects() {
+        let desired = pdp_context();
+        let mut resident = desired.clone();
+        resident.peer_teid = PeerTeid::ZERO;
+        let transport = CapturingTransport::new();
+        push_family_lookup(&transport);
+        for _ in 0..4 {
+            push_present(&transport, &resident);
+        }
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+        assert!(matches!(
+            backend
+                .install_pdp_context_classified(desired)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Conflict(_)
+        ));
+        assert!(transport
             .requests()
             .iter()
             .all(|request| request.operation != "install_pdp_context"));
