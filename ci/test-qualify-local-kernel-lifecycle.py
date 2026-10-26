@@ -681,7 +681,7 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(job=name, proof=check):
                     self.assertEqual([line.strip() for line in job.splitlines()].count(check),
                                      1 if name == "privileged-gtpu" else 0)
-        for name, minutes in [("privileged-gtpu", 30), ("privileged-gtpu-regressions", 45),
+        for name, minutes in [("privileged-gtpu", 45), ("privileged-gtpu-regressions", 45),
                               ("privileged-gtpu-resets", 20)]:
             self.assertIn(f"timeout-minutes: {minutes}\n", native[name])
             self.assertIn("runs-on: ubuntu-latest\n", native[name])
@@ -806,7 +806,7 @@ class WorkflowTests(unittest.TestCase):
         host = jobs["rust-local-kernel-lifecycle"]
         legacy = workflow_jobs("gtpu-privileged.yml")["privileged-gtpu"]
         self.assertNotIn("qualify-local-kernel-lifecycle.py", legacy)
-        self.assertIn("timeout-minutes: 30\n", legacy)
+        self.assertIn("timeout-minutes: 45\n", legacy)
         self.assertIn("runs-on: ubuntu-latest\n", host)
         self.assertLessEqual(int(re.search(r"timeout-minutes: (\d+)", host)[1]), 45)
         self.assertNotRegex(host, r"(?m)^    (needs|if):")
