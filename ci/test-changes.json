@@ -563,6 +563,30 @@
       "kind": "clock-source-changed",
       "reason": "Run the consumer on the shared controlled clock while voters, disk I/O and the delayed observer retain real time. Keep the 250 ms physical attempt, three-second caller deadline and all ordering, exactly-once, replay and conflict assertions. A 300 ms origin-reply hold fails before the clock change. The existing prepared_cas_three_voter_receipt_converges_after_real_commit_and_lost_response retains real-time physical-attempt expiry and durable receipt recovery.",
       "issue": 1147
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::client::tests::terminal_watch_sequence_is_delivered_once_without_reconnect",
+      "kind": "assertions-decreased",
+      "reason": "Restore main's complete 250 ms reconnect observation in crates/opc-session-net/src/client.rs. The removed expectation bounded the backlog's EOF race with 30 seconds; EOF did not prove that no later reconnect occurred. The restored accept timeout bounds the server itself. Keep the terminal entry, sequence, stream-end and single-connection assertions. The two terminal_observer controls require detection of a later accepted connection after EOF and distinguish Watch from Capabilities requests. Historical issue #842 remains open.",
+      "issue": 842
+    },
+    {
+      "test": "rust:crates/opc-session-net::test=persistent_consumer_protocol::partial_active_watch_frames_expire_and_release_the_isolated_slot",
+      "kind": "assertions-decreased",
+      "reason": "Restore main's bounded admission-release wait in crates/opc-session-net/tests/persistent_consumer_protocol.rs. The backlog added a stream-end poll and assumed that end published watch_active == 0. Both main and backlog refuse this unsupported unscoped Watch before reaching those checks, so that ordering was never validated. Keep the original SHORT_ACTIVE_FRAME_WAIT bound, failure-result assertion and requirement that watch_active reaches zero. Preserve the existing ignore and leave issue #1189 open until the supported protocol or fixture is addressed.",
+      "issue": 1189
+    },
+    {
+      "test": "rust:crates/opc-session-net::test=persistent_consumer_protocol::quiet_authenticated_watch_remains_admitted_until_the_peer_closes",
+      "kind": "assertions-decreased",
+      "reason": "Restore main's bounded admission-release wait in crates/opc-session-net/tests/persistent_consumer_protocol.rs. Remove the backlog's unconditional second next() after the first may have returned None on an unfused stream, and its unvalidated assumption that stream end publishes watch_active == 0. Keep the original SHORT_ACTIVE_FRAME_WAIT bound, peer-close result check and requirement that watch_active reaches zero. Both revisions fail earlier at unsupported unscoped Watch; preserve the existing ignore and leave issue #1189 open.",
+      "issue": 1189
+    },
+    {
+      "test": "rust:crates/opc-session-net::test=stateless_quorum_consumer::prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once",
+      "kind": "assertions-decreased",
+      "reason": "Extract the body into prepared_cas_binding_reply_loss_case in crates/opc-session-net/tests/stateless_quorum_consumer.rs, moving the fleet through the controlled-clock closure. All original assertions and calls to application_sequences, quiesce, voter_authority, wait_for_observed_leader and withhold_next_forward_mutation_reply remain; their helper bodies are unchanged. Static receiver resolution loses their eight setup/cleanup expectations after fleet is rebound, while two clock assertions are added (116 -> 110). Cargo disables automatic integration targets and includes this file in the library; its actual lib=lib target also resolves the shared clock helper and grows 116 -> 117. No runtime coverage is removed.",
+      "issue": 1147
     }
   ]
 }
