@@ -1609,6 +1609,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   neighbour/route state, including failed diagnostic reads. Packet counts and
   measurement deadlines are unchanged. (#1188)
 
+- `opc-session-store`: run functional lease and late-CAS readback observations
+  with their logical-time supervisors on controlled clocks. Preserve the
+  original timeout, fencing and exactly-once assertions, reproduce stalled
+  runtimes, and verify the exact acquire deadline and rejection of expired
+  queued reads. (#1308, #1211)
+
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 
 - `opc-session-store`: keep async SQLite worker deadlines on the caller's

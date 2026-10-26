@@ -539,6 +539,13 @@
       "replacements": [
         "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::lifecycle_tests::retained_store_owner_refuses_reopen_until_its_release"
       ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=consensus_openraft::snapshot_preparation_progress_is_event_driven_not_total_runtime_bounded",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-store::test=consensus_openraft::snapshot_preparation_progress_keeps_the_original_aggregate_bound",
+      "reason": "Replace the unbounded-preparation model with the original 300-second aggregate contract while issue 1164 remains unresolved. The replacement proves that continuous five-second progress cannot extend the deadline, a one-second completion retains its value, and a stalled batch also expires at 300 seconds; it fails before the bound-restoring fix. The real compacted-successor snapshot test retains both 4,300-command batches, completion-count and published-progress assertions, snapshot/purge recovery and full restart checks. No runtime bound is raised.",
+      "issue": 1164
     }
   ]
 }
