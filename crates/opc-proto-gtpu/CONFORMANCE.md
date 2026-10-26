@@ -85,9 +85,13 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   structurally validated PDU Session Container where permitted for 5GS
   forwarding. Container semantics remain exposed through the shared extension
   model rather than duplicated in the control codec.
-- **IE invariants**: ascending type order, exact TV/TLV lengths,
-  mandatory/singleton cardinality, configured IE/message bounds, unknown TLV
-  preserve/drop/reject policy, and fail-closed unknown TV behavior. Canonical
+- **IE receiver rules** (TS 29.281 §9.1, TS 29.060 §§11.1.9–11.1.12):
+  ascending type order, complete TV/TLV framing, mandatory presence and configured
+  IE/message bounds remain enforced. Known unexpected IEs are skipped, including
+  GTP-C TV elements whose lengths are defined in TS 29.060 Table 37. First
+  occurrences win regardless of `DuplicateIePolicy`; Private Extensions may repeat.
+  Unknown TLVs are opaque under `Preserve`, skipped under both `Drop` and `Reject`.
+  Unknown TVs still fail because their boundary cannot be determined. Canonical
   encoding checks the model IE count and exact final datagram/u16 length before
   allocating or writing its serialized IE payload.
 - **Validated conversion boundary**: `GtpuControlMessage::from_message`
@@ -111,7 +115,7 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   optional unknown headers retain their relative order. Generic raw-preserving
   encoding continues to retain the accepted bytes exactly.
 - **Explicit exclusion**: Tunnel Status (§7.3.3 and §8.7) is not implemented
-  by this codec slice and is rejected as a known procedure-inapplicable IE.
+  by this codec slice; its IE is skipped when received on another procedure.
 
 ---
 

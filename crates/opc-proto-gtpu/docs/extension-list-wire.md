@@ -13,17 +13,17 @@ IE-specific layout. Peer Address and Private Extension still use their
 two-octet lengths. Public Rust models are unchanged.
 
 The corrected typed decoder accepts counts 0 through 255 and retains
-singleton, nonzero-type, duplicate-type, ordering, framing, message/IE cap
+first-singleton, nonzero-type, duplicate-type, ordering, framing, message/IE cap
 and output-cap checks. It does not admit an alternate legacy two-octet
 format. The generic raw-preserving `GtpuMessage` codec remains unchanged;
 it can still expose opaque payload bytes without validating this procedure.
 
 `tests/fixtures/extension_list.py` independently constructs wire bytes
 without importing SDK code. Its checked-in TSV contains **2,555 cases:
-512 admissions and 2,043 refusals**, SHA-256
-`4854529c8a0aa37cd8aed7074955f199975b8fc509ddb27671bd4c65fa0a714e`.
+768 admissions and 1,787 refusals**, SHA-256
+`1e94edc56d9db342337f9cb06f0b7d50b6f48efa234da3e405cee5c668e01e58`.
 It spans every count, coexistence with a two-octet Private Extension TLV,
-wrong counts, zero/duplicate types, duplicate lists, tails, truncation and
+wrong counts, zero/duplicate types, first-wins duplicate lists, tails, truncation and
 the former wide-length encoding. Separate send/receive tests fail on the
 original codec. Existing control fixtures and both fuzz seed directories
 use the corrected layout. The pinned N3IWF fixture catalog is unchanged.
@@ -38,3 +38,7 @@ establish live-peer interoperability, a control socket, packet forwarding,
 peer admission, rate policy or End Marker lifecycle ordering. Those
 remaining contracts stay tracked in #341 and #790. The PR records its
 public base/head/tree, guard-removal evidence and full qualification.
+
+Receiver correction #1521 applies TS 29.060 §11.1.12 (via TS 29.281 §9.1):
+the 256 duplicate-list cases now admit the first list and canonical encoding
+omits the later occurrence. Duplicate values inside a single list still fail.

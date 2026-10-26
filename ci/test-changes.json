@@ -361,6 +361,34 @@
       "renamed_to": "rust:crates/opc-proto-nas::test=nas_optional_elements::half_octet_duplicates_preserve_the_first_wire_value_for_both_receiver_policies",
       "reason": "Correct receiver expectations per TS 24.501 7.6.3 and TS 24.007 11.4.2: first duplicate wins and extra octets are ignored; retain minimum-length, raw preservation and per-table assertions.",
       "issue": 1255
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::unknown_tlv_policy_preserves_drops_or_rejects_without_exposing_value",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::unknown_tlv_policy_preserves_or_skips_without_exposing_value",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_timestamp_and_supported_type_list_fail_at_datagram_offsets",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_timestamp_and_supported_type_list_use_first_occurrence",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::unexpected_ie_offset_is_datagram_relative",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::unexpected_ie_is_skipped",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_and_wrong_procedure_ie_fail_closed",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_fails_and_wrong_procedure_ie_is_skipped",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
     }
   ]
 }
