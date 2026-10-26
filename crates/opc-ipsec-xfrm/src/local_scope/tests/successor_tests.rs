@@ -60,6 +60,13 @@ fn exercise(case: Case, native: bool) {
                 .await
                 .unwrap();
             traffic::prepare_loopback();
+            // Reset closes every egress hook. Exercise packets only after the
+            // ordinary activation-bound opening has removed that containment.
+            let opening = lifecycle
+                .open(&reset, grant(&authority, &quorum, 140).await)
+                .await
+                .unwrap();
+            opening.recheck().unwrap();
             match case {
                 Case::Inbound | Case::Outbound => {
                     overlap(
@@ -93,6 +100,7 @@ fn exercise(case: Case, native: bool) {
             }
             assert!(backend.local_namespace_empty().await.unwrap());
             assert_eq!(backend.scoped_test_retained().await, 0);
+            opening.recheck().unwrap();
             authority.close_execution().await;
             quorum.close().await;
         });
