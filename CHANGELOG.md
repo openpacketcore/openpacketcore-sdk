@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- GTP-U adds typed Tunnel Status, its SPOC information element, and a separate
+  dataplane `TunnelStatus` classification. Exhaustive matches must handle the
+  new variants; unsupported consumers should ignore the message. (#1530)
+
 - `opc-proto-gtpu`: network control receive always skips unexpected IEs,
   uses the first singleton occurrence, and treats unknown TLV `Reject` as
   `Drop`, as required by TS 29.060 11.1.9–11.1.12. Framing, ordering and

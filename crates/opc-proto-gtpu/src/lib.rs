@@ -28,10 +28,11 @@ pub use control::{
     GtpuControlCodecError, GtpuControlCodecErrorCode, GtpuControlMessage, GtpuEchoRequest,
     GtpuEchoResponse, GtpuEndMarker, GtpuErrorIndication, GtpuExtensionHeaderTypeList,
     GtpuPeerAddress, GtpuPrivateExtension, GtpuRecovery, GtpuRecoveryTimeStamp,
-    GtpuSupportedExtensionHeadersNotification, GtpuTunnelEndpointId, GtpuUnknownControlIe,
-    GTPU_MESSAGE_ECHO_REQUEST, GTPU_MESSAGE_ECHO_RESPONSE, GTPU_MESSAGE_END_MARKER,
-    GTPU_MESSAGE_ERROR_INDICATION, GTPU_MESSAGE_G_PDU,
-    GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
+    GtpuSupportedExtensionHeadersNotification, GtpuTunnelEndpointId, GtpuTunnelStatus,
+    GtpuTunnelStatusInformation, GtpuUnknownControlIe, GTPU_MESSAGE_ECHO_REQUEST,
+    GTPU_MESSAGE_ECHO_RESPONSE, GTPU_MESSAGE_END_MARKER, GTPU_MESSAGE_ERROR_INDICATION,
+    GTPU_MESSAGE_G_PDU, GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
+    GTPU_MESSAGE_TUNNEL_STATUS,
 };
 
 fn validation_strictness(level: ValidationLevel) -> u8 {

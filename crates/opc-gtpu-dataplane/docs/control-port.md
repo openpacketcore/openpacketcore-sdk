@@ -10,11 +10,15 @@ or reassembled user packets.
 Each non-cloneable `GtpuControlDatagram` retains exact received bytes,
 length, peer/local tuple and kernel ingress provenance. It reports typed
 control, structurally complete G-PDU, unsupported required extension,
-unmodelled message, or malformed input. G-PDU framing alone grants no
+`TunnelStatus`, unmodelled message, or malformed input. G-PDU framing alone grants no
 decapsulation authority: installed-selector and current-generation checks
 remain in the existing consumer. Unknown optional extension bytes remain
 in the original datagram. Required unknown extensions cannot enter its
 G-PDU classification.
+
+A valid Tunnel Status carries no response authority. Ignore it if charging pause
+is unsupported or its TEID has no context (TS 29.281 §7.3.3); applying SPOC or
+forwarding upstream requires the consumer's admitted tunnel and charging state.
 
 | Response plan | Transport and wire behavior |
 | --- | --- |
@@ -110,10 +114,10 @@ Validation uses independently authored packet literals, all 65,536 source
 ports at four sequence boundaries, all 255 nonterminal extension types,
 all 256 received Recovery values, malformed framing and explicit byte/ratio
 boundaries. The independent standard-library Python generator
-`tests/fixtures/control_port.py` produces 1,204 receive/response records:
-283 controls, 129 G-PDUs, 127 required-extension events, 250 unmodelled
-messages and 415 malformed inputs. TSV SHA-256:
-`7b474796a8318ec926f931a86c98f535bd207545a01a6ecaa9be7c38698da783`.
+`tests/fixtures/control_port.py` produces 1,206 receive/response records:
+283 controls, 129 G-PDUs, 127 required-extension events, 249 unmodelled
+messages, two Tunnel Status events and 416 malformed inputs. TSV SHA-256:
+`9ad4fdf871bbd382c4204554f3db85089daf2806646477bbede5e24ef6403664`.
 CI checks byte-exact regeneration. A separate private-network-namespace UDP peer checks actual
 reply bytes/tuples, the single queue, truncation, foreign and replaced socket
 plans, and interface-rename refusal. It does not attach a tc program or GTP

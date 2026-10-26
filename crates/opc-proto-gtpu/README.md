@@ -9,7 +9,7 @@ Release 18. It is aimed at safe decode/encode of user-plane GTPv1-U packets,
 including optional fields, extension-header chains, and the 5G PDU Session
 Container extension. It also provides typed path/tunnel-management codecs for
 Echo Request/Response, Error Indication, Supported Extension Headers
-Notification, and End Marker.
+Notification, Tunnel Status, and End Marker.
 
 It does not implement GTPv0, GTP-C, tunnel lifecycle, UDP sockets, packet
 scheduling, or user-plane forwarding policy.
@@ -154,7 +154,7 @@ independent corpus and compatibility limits are recorded in
 - Received Recovery counter values and the sequence fields of Error Indication
   and Supported Extension Headers Notification are intentionally ignored as
   TS 29.281 directs; canonical encoding emits zero for those fields.
-- Signalling IE ordering, mandatory/singleton cardinality, IPv4/IPv6 peer
+- Signalling IE ordering, mandatory presence and first-singleton selection, IPv4/IPv6 peer
   address lengths, extension-list uniqueness (with an empty list permitted by
   TS 29.281 §8.5), configured message/IE bounds,
   and procedure header flags/TEIDs fail closed.
@@ -178,7 +178,12 @@ independent corpus and compatibility limits are recorded in
   because their comprehension bits are optional. G-PDU-only types, including
   the PDU Set Information Container, fail with
   `gtpu_control_unexpected_extension` on typed signalling procedures.
-- Tunnel Status (§7.3.3 and §8.7) is outside this codec slice.
+- Tunnel Status (§7.3.3 and §8.7) exposes the tunnel TEID and mandatory SPOC
+  information. Consumers ignore it when unsupported or no tunnel exists; charging
+  and upstream-forwarding decisions remain with the admitted tunnel owner.
+- Unexpected IEs are skipped. Repeated singleton IEs use the first value, and
+  unknown TLVs are preserved or skipped (`Reject` behaves as `Drop`) per
+  TS 29.060 §§11.1.9–11.1.12. Ignored IEs still consume the decode limits.
 - TEID/address/private values are available through explicit accessors for
   protocol work, but typed `Debug`/errors redact them.
 

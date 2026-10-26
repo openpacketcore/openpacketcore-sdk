@@ -263,6 +263,8 @@ impl GtpuControlResponseBudget {
 pub enum GtpuControlDatagramKind {
     /// One of the existing typed control messages, fully decoded.
     Control,
+    /// Valid Tunnel Status; ignore if charging pause is unsupported or the tunnel is unknown.
+    TunnelStatus,
     /// A structurally complete G-PDU with no unsupported required extension.
     Gpdu,
     /// A required extension cannot be understood by an endpoint.
@@ -352,8 +354,12 @@ impl GtpuControlDatagram {
         } else {
             match GtpuControlMessage::from_message(&message, ctx) {
                 Ok(control) => {
+                    result.kind = if matches!(control, GtpuControlMessage::TunnelStatus(_)) {
+                        GtpuControlDatagramKind::TunnelStatus
+                    } else {
+                        GtpuControlDatagramKind::Control
+                    };
                     result.control = Some(control);
-                    result.kind = GtpuControlDatagramKind::Control;
                 }
                 Err(error)
                     if matches!(
@@ -700,6 +706,26 @@ mod tests {
     }
 
     #[test]
+    fn control_tunnel_status_is_ignorable_without_reply_authority() {
+        let wire = [0x30, 253, 0, 4, 0, 0, 0x10, 1, 230, 0, 1, 1];
+        let event = receive(&wire, 49152);
+        assert_eq!(event.kind(), GtpuControlDatagramKind::TunnelStatus);
+        assert!(matches!(
+            event.control,
+            Some(GtpuControlMessage::TunnelStatus(_))
+        ));
+        assert!(receive(&wire, 49152).echo_response(budget()).is_err());
+        assert!(receive(&wire, 49152)
+            .unknown_tunnel_error(budget())
+            .is_err());
+        let missing = [0x30, 253, 0, 0, 0, 0, 0x10, 1];
+        assert_eq!(
+            receive(&missing, 49152).kind(),
+            GtpuControlDatagramKind::Malformed
+        );
+    }
+
+    #[test]
     fn control_malformed_lengths_and_procedures_never_plan_a_response() {
         for length in 0..ECHO.len() {
             let event = receive(&ECHO[..length], 49152);
@@ -883,6 +909,7 @@ mod tests {
             let event = receive(&wire, 49152);
             let kind = match fields[1] {
                 "C" => GtpuControlDatagramKind::Control,
+                "T" => GtpuControlDatagramKind::TunnelStatus,
                 "G" => GtpuControlDatagramKind::Gpdu,
                 "R" => GtpuControlDatagramKind::UnsupportedRequiredExtension,
                 "U" => GtpuControlDatagramKind::Unmodelled,
@@ -908,6 +935,6 @@ mod tests {
             }
             count += 1;
         }
-        assert_eq!(count, 1204);
+        assert_eq!(count, 1206);
     }
 }
