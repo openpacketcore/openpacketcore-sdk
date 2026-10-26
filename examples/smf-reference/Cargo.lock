@@ -571,6 +571,7 @@ dependencies = [
  "hybrid-array",
  "num-traits",
  "rand_core 0.10.1",
+ "serdect",
  "subtle",
  "zeroize",
 ]
@@ -1738,6 +1739,7 @@ dependencies = [
 name = "opc-tls"
 version = "0.2.0"
 dependencies = [
+ "crypto-bigint",
  "opc-identity",
  "opc-redaction",
  "opc-types",
