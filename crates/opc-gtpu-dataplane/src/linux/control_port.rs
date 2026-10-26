@@ -158,6 +158,8 @@ pub(super) fn open(
         socket_cookie,
         identity,
         active: AtomicBool::new(true),
+        #[cfg(test)]
+        after_receive: Mutex::new(None),
     });
     if let Some(previous) = ports.insert(device.ifindex, Arc::clone(&slot)) {
         previous.active.store(false, Ordering::SeqCst);
@@ -450,6 +452,10 @@ impl GtpuControlPort for LinuxControlPort {
         let Some(datagram) = self.try_receive_datagram(maximum_bytes)? else {
             return Ok(None);
         };
+        #[cfg(test)]
+        if let Some(hook) = self.slot.after_receive.lock().unwrap().clone() {
+            hook();
+        }
         let event = crate::control_port::downlink_event(datagram);
         let GtpuDownlinkEvent::UnknownTunnel(datagram) = event else {
             return Ok(Some(event));

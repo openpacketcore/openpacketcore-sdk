@@ -313,6 +313,64 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         assert!(port.try_receive_downlink(4096)?.is_none());
     }
 
+    // A context in the other inner-family table still owns this TEID. The
+    // driver declines the mismatched inner packet, but it must not cause an
+    // Error Indication that would tear down the live IPv4 bearer.
+    let context = GtpPdpContext {
+        local_teid: Teid::new(0xdead_beef).ok_or("nonzero TEID")?,
+        peer_teid: PeerTeid::new(0x2000_0001),
+        ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
+        peer_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        link_ifindex: device.ifindex,
+        downlink_source_port_policy: opc_gtpu_dataplane::GtpuSourcePortPolicy::Any,
+        gtp_version: GtpVersion::V1,
+        bearer_mark: None,
+        egress_dscp: None,
+        uplink_source_port_policy:
+            opc_gtpu_dataplane::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+        downlink_inner_mtu: None,
+    };
+    backend.install_pdp_context(context.clone()).await?;
+    let mut inner_ipv6 = [0_u8; 40];
+    inner_ipv6[0] = 0x60;
+    inner_ipv6[6] = 59;
+    inner_ipv6[7] = 64;
+    inner_ipv6[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+    inner_ipv6[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+    let mut cross_family = vec![0x30, 0xff, 0, 40];
+    cross_family.extend_from_slice(&context.local_teid.get().to_be_bytes());
+    cross_family.extend_from_slice(&inner_ipv6);
+    peer.send_to(&cross_family, (Ipv4Addr::LOCALHOST, GTPU_PORT))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let event = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cross-family G-PDU did not arrive"
+        );
+        match port.try_receive_downlink(4096)? {
+            Some(event) => break event,
+            None => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    };
+    assert!(
+        matches!(
+            event,
+            GtpuDownlinkEvent::Dropped(opc_gtpu_dataplane::GtpuDownlinkDrop::DestinationMismatch)
+        ),
+        "live IPv4 TEID must not become UnknownTunnel: {event:?}"
+    );
+    assert_eq!(
+        backend
+            .read_pdp_context(PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&context).ok_or("canonical selector")?
+            ))
+            .await?,
+        PdpContextReadback::Present(context.clone())
+    );
+    assert!(port.try_receive_downlink(4096)?.is_none());
+    backend
+        .remove_pdp_context(RemovePdpContextRequest::from_context(&context))
+        .await?;
     backend.remove_device(&device).await?;
     Ok(())
 }

@@ -99,6 +99,8 @@ struct ControlSlot {
     socket_cookie: Option<u64>,
     identity: Arc<()>,
     active: AtomicBool,
+    #[cfg(test)]
+    after_receive: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Production Linux kernel GTP-U dataplane backend.
@@ -3417,6 +3419,9 @@ mod tests {
     /// future exactly at the admitted-mutation point.
     enum QueuedResponse {
         Immediate(TransportResponse),
+        Inspect(
+            Box<dyn FnOnce(LinuxGtpuDataplaneBackendConfig, &[u8]) -> TransportResponse + Send>,
+        ),
         #[cfg(target_os = "linux")]
         Latched {
             latch: Arc<ResponseLatch>,
@@ -3549,6 +3554,9 @@ mod tests {
             match self {
                 QueuedResponse::Immediate(_) => {
                     f.write_str("QueuedResponse::Immediate(<netlink-response>)")
+                }
+                QueuedResponse::Inspect(_) => {
+                    f.write_str("QueuedResponse::Inspect(<netlink-response>)")
                 }
                 #[cfg(target_os = "linux")]
                 QueuedResponse::Latched { .. } => {
@@ -3765,7 +3773,7 @@ mod tests {
             operation: &'static str,
             request: &[u8],
             expected_sequence: u32,
-            _config: LinuxGtpuDataplaneBackendConfig,
+            config: LinuxGtpuDataplaneBackendConfig,
         ) -> Result<Option<Vec<u8>>, GtpuError> {
             self.requests
                 .lock()
@@ -3783,6 +3791,7 @@ mod tests {
                 .pop_front();
             match queued {
                 Some(QueuedResponse::Immediate(response)) => response,
+                Some(QueuedResponse::Inspect(inspect)) => inspect(config, request),
                 #[cfg(target_os = "linux")]
                 Some(QueuedResponse::Latched { latch, response }) => {
                     // Hold the (blocking-pool) caller here until the test
@@ -9225,5 +9234,10 @@ mod tests {
     fn parses_cap_net_admin_from_proc_status_shape() {
         let mask = 1_u64 << CAP_NET_ADMIN;
         assert_ne!(mask, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    mod control_port_regressions {
+        include!("linux/control_port_tests.rs");
     }
 }
