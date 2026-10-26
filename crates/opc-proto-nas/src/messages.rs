@@ -621,7 +621,8 @@ pub struct OptionalIe {
     /// Original information-element identifier octet, including the low-nibble
     /// value for type-1 IEs. Their lookup and duplicate key is `iei & 0xF0`.
     pub iei: u8,
-    /// Value bytes excluding IEI and length octets.
+    /// Value bytes excluding IEI and length octets and, for known elements,
+    /// any extension beyond the supported table length. `raw` retains extensions.
     ///
     /// For type-1 half-octet IEs this is empty because the value is part of
     /// the same octet as the IEI.
@@ -668,10 +669,6 @@ fn unknown_optional_ie_format(iei: u8) -> OptionalIeFormat {
 
 fn rejects_unknown_optional_ie(ctx: DecodeContext) -> bool {
     matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject)
-        || matches!(
-            ctx.validation_level,
-            ValidationLevel::Strict | ValidationLevel::ProcedureAware
-        )
 }
 
 fn decode_optional_ies(
@@ -751,10 +748,16 @@ fn decode_optional_ies(
             return Err(DecodeError::new(DecodeErrorCode::Truncated, offset)
                 .with_spec_ref(message_spec_ref(section)));
         }
+        // TS 24.501 §7.6.3: only the first occurrence has semantic effect.
+        if duplicate {
+            rest = &rest[total..];
+            offset += total;
+            continue;
+        }
         if matches!(
             ctx.validation_level,
             ValidationLevel::Strict | ValidationLevel::ProcedureAware
-        ) && descriptor.is_some_and(|ie| !(ie.min_len..=ie.max_len).contains(&total))
+        ) && descriptor.is_some_and(|ie| total < ie.min_len)
         {
             return Err(DecodeError::new(
                 DecodeErrorCode::InvalidLength {
@@ -766,27 +769,16 @@ fn decode_optional_ies(
         }
         let ie = OptionalIe {
             iei,
-            value: Bytes::copy_from_slice(&rest[header_len..total]),
+            // TS 24.007 §11.4.2: ignore extra octets in an extensible IE.
+            value: Bytes::copy_from_slice(
+                &rest[header_len..descriptor.map_or(total, |ie| total.min(ie.max_len))],
+            ),
             raw: Bytes::copy_from_slice(&rest[..total]),
         };
         rest = &rest[total..];
         offset += total;
         if descriptor.is_none() && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Drop) {
             continue;
-        }
-        if duplicate {
-            match ctx.duplicate_ie_policy {
-                DuplicateIePolicy::First => continue,
-                DuplicateIePolicy::Last => {
-                    if let Some(position) = out
-                        .iter()
-                        .position(|existing| optional_ie_key(existing.iei) == duplicate_key)
-                    {
-                        out.remove(position);
-                    }
-                }
-                DuplicateIePolicy::Reject => unreachable!("duplicate reject handled before parse"),
-            }
         }
         seen[usize::from(duplicate_key)] = true;
         out.push(ie);
@@ -1368,7 +1360,7 @@ mod tests {
             validation_level: ValidationLevel::Strict,
             ..DecodeContext::default()
         };
-        assert!(decode_optional_ies(unknown_type4_guess, strict_preserve, message_type).is_err());
+        assert!(decode_optional_ies(unknown_type4_guess, strict_preserve, message_type).is_ok());
     }
 
     #[test]
@@ -1390,7 +1382,7 @@ mod tests {
         };
         let (_, last_ies) = decode_optional_ies(duplicate, last, message_type).unwrap();
         assert_eq!(last_ies.len(), 1);
-        assert_eq!(&last_ies[0].value[..], &[0xBB]);
+        assert_eq!(&last_ies[0].value[..], &[0xAA]);
 
         let reject = DecodeContext {
             duplicate_ie_policy: DuplicateIePolicy::Reject,

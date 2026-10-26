@@ -915,6 +915,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-proto-nas`: apply first-occurrence selection to all optional-element
+  tables; accept framed extensions and non-critical unknown IEs at all
+  validation levels unless an explicit rejection policy is selected. Preserve
+  raw table-driven extensions while exposing the known value prefix, and trim
+  excess authentication value/padding bytes consistently. (#1255)
+
 - `opc-proto-nas`: interpret unused received registration type 0 as initial
   registration and retain its raw octet for forwarding. Accept all defined
   algorithm identifiers in the codec while the crypto providers continue to
