@@ -67,3 +67,29 @@ The cited PFCP `src/runtime.rs` does not exist. The
 retransmission, and node lifecycle. Responding to a Heartbeat Request is not
 an association supervision state machine. No timeout-state-machine repair is
 claimed; implementing such a supervisor remains separate runtime work.
+
+## 5GS interworking work list #1357
+
+NGAP GTP transport addresses now preserve the 160-bit combined form through
+uplink/downlink endpoints and nested Setup/Modify transfers. IPv4 occupies the
+first 32 bits and IPv6 the remaining 128 bits, as specified by
+[TS 38.414 §5.3](https://www.etsi.org/deliver/etsi_ts/138400_138499/138414/18.00.00_60/ts_138414v180000p.pdf)
+and referenced by
+[TS 38.413 §9.3.2.4](https://www.etsi.org/deliver/etsi_ts/138400_138499/138413/18.02.00_60/ts_138413v180200p.pdf).
+The address getter now returns an enum retaining both families. Selecting a
+reachable, authorized endpoint remains the caller's decision.
+
+The reported MOBIKE file does not exist. The actual `nwu::mobike` receiver
+already accepts IPv6-only outer paths. Its existing
+`nat_prohibition_binds_both_addresses_and_ports_for_ipv4_and_ipv6` test performs
+an authenticated UPDATE and COOKIE2 exchange over two IPv6 endpoints, verifies
+the resulting migration path, and rejects altered addresses/ports. It passes
+without a production change.
+
+The IPv4 condition in `ConfigurationReply::new` applies to the requested
+**inner** configuration family, not the outer MOBIKE path. The N3IWF reply rule
+in [TS 24.502 V18.5.0, page 53](https://www.etsi.org/deliver/etsi_ts/124500_124599/124502/18.05.00_60/ts_124502v180500p.pdf)
+conditions MOBIKE advertisement on the initial IPv4 configuration attribute.
+The existing configuration-family matrix tests that rule. Removing it would
+change the NWu profile rather than fix IPv6 outer transport. Neither test
+claims live-peer or kernel migration qualification.
