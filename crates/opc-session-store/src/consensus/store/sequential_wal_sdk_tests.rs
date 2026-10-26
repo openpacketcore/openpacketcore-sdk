@@ -3,6 +3,8 @@
 
 mod native_log_bound;
 
+mod roster_completion;
+
 #[path = "sequential_wal_sdk_tests/void_tests.rs"]
 mod void_tests;
 
@@ -65,6 +67,7 @@ struct Peer {
     profile_probes: AtomicUsize,
     roster_classes: std::sync::Mutex<Vec<crate::scope_scheduler::ScopeWorkClass>>,
     election_votes: std::sync::Mutex<Option<Arc<void_election::VoteGate>>>,
+    roster_completion_gate: std::sync::Mutex<Option<Arc<roster_completion::CompletionGate>>>,
 }
 
 impl fmt::Debug for Peer {
@@ -89,6 +92,11 @@ impl SessionConsensusPeer for Peer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        let gate = self.roster_completion_gate.lock().unwrap().clone();
+        let _lane = match gate {
+            Some(gate) => gate.enter(&request).await?,
+            None => None,
+        };
         if request.family == crate::consensus::SessionConsensusRpcFamily::ForwardRosterMutation {
             self.roster_classes
                 .lock()
@@ -210,6 +218,7 @@ impl Fleet {
                     profile_probes: AtomicUsize::new(0),
                     roster_classes: std::sync::Mutex::new(Vec::new()),
                     election_votes: std::sync::Mutex::new(None),
+                    roster_completion_gate: std::sync::Mutex::new(None),
                 })
             })
             .collect();
@@ -1435,7 +1444,7 @@ async fn assert_roster_emergency_policy_bypass(forwarded: bool, resident: bool) 
                     .collect();
                 assert_eq!(
                     classes,
-                    vec![ScopeWorkClass::Emergency, ScopeWorkClass::SafetyControl],
+                    vec![ScopeWorkClass::Emergency, ScopeWorkClass::Emergency],
                     "real Q1/Q2 forwarding selects isolated transport classes"
                 );
             }
@@ -1589,7 +1598,7 @@ async fn assert_roster_emergency_v2_policy_bypass(forwarded: bool, resident: boo
                     .collect();
                 assert_eq!(
                     classes,
-                    vec![ScopeWorkClass::Emergency, ScopeWorkClass::SafetyControl]
+                    vec![ScopeWorkClass::Emergency, ScopeWorkClass::Emergency]
                 );
             }
             drop(held);

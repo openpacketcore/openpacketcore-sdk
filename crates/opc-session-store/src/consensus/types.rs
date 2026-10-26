@@ -228,7 +228,7 @@ pub(crate) use tests::{
     roster_v2_aborted_persistence_fixture_for_history,
     roster_v2_aborted_single_member_persistence_fixture_for_history,
     roster_v2_fresh_wal_persistence_fixture, roster_v2_persistence_fixture_for_class,
-    roster_v2_persistence_fixture_for_store,
+    roster_v2_persistence_fixture_for_store, roster_v2_persistence_fixture_for_store_request,
 };
 
 /// Bind the exact voter scope to the immutable protected-roster profile.
@@ -3654,9 +3654,28 @@ pub(crate) mod tests {
         epoch: u64,
         class: crate::fenced_mutation_roster::AdmissionClass,
     ) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_store_request(
+            identity,
+            scope,
+            epoch,
+            class,
+            Phase::Established,
+            [0x91; 16],
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn roster_v2_persistence_fixture_for_store_request(
+        identity: SessionConsensusIdentity,
+        scope: Scope,
+        epoch: u64,
+        class: crate::fenced_mutation_roster::AdmissionClass,
+        phase: Phase,
+        roster_id: [u8; 16],
+    ) -> RosterV2PersistenceFixture {
         roster_v2_persistence_fixture_with_scope(RosterV2FixtureInput {
-            phase: Phase::Established,
-            roster_id: [0x91; 16],
+            phase,
+            roster_id,
             epoch,
             fence: FenceToken::new(1),
             credential_id: 1,

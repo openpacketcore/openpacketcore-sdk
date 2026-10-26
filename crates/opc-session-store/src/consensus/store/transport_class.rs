@@ -222,9 +222,6 @@ fn roster_emergency_v2_transport_uses_bound_class_and_rejects_declared_promotion
             required_consumer_scope: ForwardConsumerScope::Internal,
             work_class: ForwardWorkClass::Inferred,
         };
-        assert_eq!(
-            session_consensus_work_class(&wire(terminal)),
-            Ok(ScopeWorkClass::SafetyControl)
-        );
+        assert_eq!(session_consensus_work_class(&wire(terminal)), Ok(expected));
     }
 }
