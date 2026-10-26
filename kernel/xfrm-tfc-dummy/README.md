@@ -80,7 +80,9 @@ python3 ci/qualify-esp-tfc.py \
 The script verifies the source digest, applies the patch without fuzz,
 compiles a small kernel, and boots a diskless QEMU guest with no external
 network or host filesystem mounts. The guest builds fresh network namespaces
-for each test. Netfilter is enabled: the IPv6 ESP-in-UDP transport reinjection
+for each test and requires at least two online CPUs. The x86 profile enables
+ACPI for CPU enumeration and poweroff. Netfilter is enabled: the IPv6
+ESP-in-UDP transport reinjection
 path differs when it is compiled out. `--prepare-only` exports the same
 kernel/initramfs for a separate native virtualization host; it does not claim
 a runtime result. `build.json` records source, patch, compiler, configuration,
