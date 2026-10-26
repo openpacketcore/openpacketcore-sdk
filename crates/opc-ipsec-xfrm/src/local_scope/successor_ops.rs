@@ -648,7 +648,7 @@ impl SuccessorKernel for NativeSuccessorKernel<'_> {
     fn local(&self) -> Result<(), XfrmError> {
         #[cfg(test)]
         if let Some(TestFault::HoldSuccessorSa(hold) | TestFault::HoldSuccessorSelection(hold)) =
-            self.fault
+            self.fault.as_ref()
         {
             if hold.reached.load(Ordering::Acquire) && !hold.resume.load(Ordering::Acquire) {
                 return Err(uncertain());
