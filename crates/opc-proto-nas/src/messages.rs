@@ -47,6 +47,12 @@ pub enum RegistrationType {
     PeriodicRegistrationUpdating = 0x03,
     /// Emergency registration (100).
     EmergencyRegistration = 0x04,
+    /// SNPN onboarding registration (101).
+    SnpnOnboardingRegistration = 0x05,
+    /// Disaster roaming mobility registration updating (110).
+    DisasterRoamingMobilityRegistrationUpdating = 0x06,
+    /// Disaster roaming initial registration (111).
+    DisasterRoamingInitialRegistration = 0x07,
 }
 
 impl RegistrationType {
@@ -57,6 +63,9 @@ impl RegistrationType {
             0x02 => Self::MobilityRegistrationUpdating,
             0x03 => Self::PeriodicRegistrationUpdating,
             0x04 => Self::EmergencyRegistration,
+            0x05 => Self::SnpnOnboardingRegistration,
+            0x06 => Self::DisasterRoamingMobilityRegistrationUpdating,
+            0x07 => Self::DisasterRoamingInitialRegistration,
             _ => return None,
         })
     }
@@ -793,7 +802,7 @@ fn decode_optional_ies(
 /// (two-octet length + value). All remaining bytes are optional IEs.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegistrationRequest {
-    /// 5GS registration type.
+    /// 5GS registration type; unused received values mean initial registration.
     pub registration_type: RegistrationType,
     /// Follow-on request pending bit (bit 4 of the first body octet).
     pub follow_on_request: bool,
@@ -838,17 +847,9 @@ impl RegistrationRequest {
         }
 
         let raw_first_octet = input[0];
-        let registration_type =
-            RegistrationType::from_u8(raw_first_octet & 0x07).ok_or_else(|| {
-                DecodeError::new(
-                    DecodeErrorCode::InvalidEnumValue {
-                        field: "5gs_registration_type",
-                        value: u64::from(raw_first_octet & 0x07),
-                    },
-                    0,
-                )
-                .with_spec_ref(message_spec_ref("9.11.3.7"))
-            })?;
+        // TS 24.501 §9.11.3.7 requires the network to interpret unused values as initial.
+        let registration_type = RegistrationType::from_u8(raw_first_octet & 0x07)
+            .unwrap_or(RegistrationType::InitialRegistration);
         let follow_on_request = (raw_first_octet & 0x08) != 0;
         let ng_ksi = NasKeySetIdentifier {
             value: (raw_first_octet >> 4) & 0x07,
@@ -1120,7 +1121,15 @@ pub fn decode_mm_message_body(
             | MmMessageType::DeregistrationAcceptUeOriginating
             | MmMessageType::DeregistrationRequestUeTerminated
             | MmMessageType::DeregistrationAcceptUeTerminated
-            | MmMessageType::ControlPlaneServiceRequest,
+            | MmMessageType::ControlPlaneServiceRequest
+            | MmMessageType::NetworkSliceSpecificAuthenticationCommand
+            | MmMessageType::NetworkSliceSpecificAuthenticationComplete
+            | MmMessageType::NetworkSliceSpecificAuthenticationResult
+            | MmMessageType::RelayKeyRequest
+            | MmMessageType::RelayKeyAccept
+            | MmMessageType::RelayKeyReject
+            | MmMessageType::RelayAuthenticationRequest
+            | MmMessageType::RelayAuthenticationResponse,
         )
         | None => MmMessageBody::Unknown(raw_body(body)),
     })
@@ -1185,7 +1194,13 @@ pub fn decode_sm_message_body(
             SmMessageBody::PduSessionReleaseComplete(raw_body(body))
         }
         Some(SmMessageType::Status5gsm) => SmMessageBody::Status5gsm(raw_body(body)),
-        None => SmMessageBody::Unknown(raw_body(body)),
+        Some(
+            SmMessageType::ServiceLevelAuthenticationCommand
+            | SmMessageType::ServiceLevelAuthenticationComplete
+            | SmMessageType::RemoteUeReport
+            | SmMessageType::RemoteUeReportResponse,
+        )
+        | None => SmMessageBody::Unknown(raw_body(body)),
     })
 }
 

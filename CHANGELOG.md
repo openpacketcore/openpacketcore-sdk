@@ -517,6 +517,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address flags and encoder fields while preserving the required tolerance
   for unknown trailing extension octets. (#1512, #1513, #1514)
 
+- `opc-proto-nas`: interpret unused received registration type 0 as initial
+  registration and retain its raw octet for forwarding. Accept all defined
+  algorithm identifiers in the codec while the crypto providers continue to
+  reject unimplemented algorithms. (#1515, #1526)
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a
@@ -787,6 +792,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ipv6_prefix_length` for an explicit IPv6 prefix length. `CauseValue` adds
   named acceptance and rejection variants; exhaustive matches must handle
   them. See the crate's conformance migration notes. (#1512, #1513)
+
+- `opc-proto-nas`: add the defined SNPN/disaster-roaming registration types,
+  NIA/NEA identifiers 4–7, and twelve NSSAA/relay/service-level-authentication/
+  remote-UE message names. Exhaustive matches must handle the new variants.
+  Naming algorithms does not make them available for cryptography. (#1515,
+  #1526, #1527)
 
 ### Added
 
