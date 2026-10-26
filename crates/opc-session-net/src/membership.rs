@@ -1477,7 +1477,8 @@ mod tests {
         let changed_retained = manifest_with_descriptors(2, changed_retained_descriptors.clone());
         let changed_retained_request = SessionTopologyTransitionRequest::try_new(
             SessionTopologyTransitionId::from_bytes([30; 16]),
-            changed_retained.consensus_identity().cluster_id(),
+            SessionConsensusClusterId::for_installation("membership-test", [0x5a; 32])
+                .expect("test installation"),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             changed_retained_descriptors,
@@ -1538,7 +1539,8 @@ mod tests {
         );
         let request = SessionTopologyTransitionRequest::try_new(
             SessionTopologyTransitionId::from_bytes([41; 16]),
-            successor.consensus_identity().cluster_id(),
+            SessionConsensusClusterId::for_installation("different-membership-cluster", [0x5a; 32])
+                .expect("different installation"),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             (1..=5).map(descriptor).collect(),
@@ -1660,7 +1662,8 @@ mod tests {
         let successor = manifest_with_descriptors(2, desired.clone());
         let request = SessionTopologyTransitionRequest::try_new(
             SessionTopologyTransitionId::from_bytes([42; 16]),
-            successor.consensus_identity().cluster_id(),
+            SessionConsensusClusterId::for_installation("membership-test", [0x5a; 32])
+                .expect("test installation"),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             desired,
@@ -1797,7 +1800,8 @@ mod tests {
             .expect("stage successor");
         let same_id_different_digest = SessionTopologyTransitionRequest::try_new(
             first,
-            pending.consensus_identity().cluster_id(),
+            SessionConsensusClusterId::for_installation("membership-test", [0x5a; 32])
+                .expect("test installation"),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             (1..=5).map(descriptor).collect(),
