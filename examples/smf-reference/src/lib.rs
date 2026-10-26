@@ -664,11 +664,15 @@ fn association_release_response(seq: u32) -> Result<OwnedMessage, SmfError> {
             message_priority: None,
             spare_octet: 0,
         },
-        ies: vec![InformationElement::from_typed(&TypedIe::NodeId(NodeId {
-            node_id_type: NodeIdType::Fqdn, value: b"ref".to_vec(),
-        }))?, InformationElement::from_typed(&TypedIe::Cause(Cause {
-            value: CauseValue::RequestAccepted,
-        }))?],
+        ies: vec![
+            InformationElement::from_typed(&TypedIe::NodeId(NodeId {
+                node_id_type: NodeIdType::Fqdn,
+                value: b"ref".to_vec(),
+            }))?,
+            InformationElement::from_typed(&TypedIe::Cause(Cause {
+                value: CauseValue::RequestAccepted,
+            }))?,
+        ],
     })
 }
 
