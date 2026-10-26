@@ -15415,3 +15415,95 @@ async fn cleanup_only_recovery_removes_stale_ordinary_ipv6_contexts(
     drop(net);
     Ok(())
 }
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_peer_teid_zero_is_transmitted_for_both_inner_families(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    let result = async {
+        let receiver = in_netns(&net.pgw_ns, || {
+            UdpSocket::bind((PGW_IP, GTPU_PORT)).unwrap()
+        });
+        for ipv6 in [false, true] {
+            let mut context = session_context(device.ifindex);
+            context.peer_teid = PeerTeid::ZERO;
+            if ipv6 {
+                context.ms_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 0));
+            }
+            backend.install_pdp_context(context.clone()).await?;
+            let selector = PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+            );
+            assert_eq!(
+                backend.read_pdp_context(selector.clone()).await?,
+                PdpContextReadback::Present(context.clone())
+            );
+            let source = if ipv6 {
+                IpAddr::V6(UE_PAA_IPV6)
+            } else {
+                IpAddr::V4(UE_PAA)
+            };
+            let destination = if ipv6 {
+                IpAddr::V6(REMOTE_HOST_IPV6)
+            } else {
+                IpAddr::V4(REMOTE_HOST)
+            };
+            let sender = in_netns(&net.ue_ns, move || {
+                UdpSocket::bind((source, 5_000)).unwrap()
+            });
+            let mut buffer = [0_u8; 2048];
+            let payload = b"peer-assigned-zero-teid";
+            let (length, from) = send_until_received(
+                || {
+                    sender.send_to(payload, (destination, 53)).unwrap();
+                },
+                &receiver,
+                &mut buffer,
+            )
+            .expect("peer-zero uplink must reach the peer");
+            assert_eq!(from, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+            assert_eq!(&buffer[..2], &[0x30, 0xff]);
+            assert_eq!(
+                &buffer[4..8],
+                &[0; 4],
+                "the actual tc G-PDU must preserve peer zero"
+            );
+            assert_eq!(
+                usize::from(u16::from_be_bytes([buffer[2], buffer[3]])),
+                length - 8
+            );
+            assert_eq!(buffer[8] >> 4, if ipv6 { 6 } else { 4 });
+            assert!(buffer[..length].ends_with(payload));
+            assert_eq!(
+                backend.remove_pdp_context_exact(context).await?,
+                PdpContextRemovalOutcome::Removed
+            );
+            assert_eq!(
+                backend.read_pdp_context(selector).await?,
+                PdpContextReadback::Absent
+            );
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    let cleanup = backend.remove_device(&device).await;
+    result?;
+    cleanup?;
+    println!("OPC_GTPU_PEER_TEID_ZERO_NATIVE_PROVEN");
+    Ok(())
+}

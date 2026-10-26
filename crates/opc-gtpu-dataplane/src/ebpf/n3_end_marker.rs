@@ -92,7 +92,7 @@ impl EbpfGtpuDataplaneBackend {
 
 fn end_marker_targets(
     group: &GtpuSessionGroup,
-) -> Result<std::collections::BTreeSet<(Ipv4Addr, Ipv4Addr, crate::Teid)>, GtpuError> {
+) -> Result<std::collections::BTreeSet<(Ipv4Addr, Ipv4Addr, crate::PeerTeid)>, GtpuError> {
     group
         .entries()
         .iter()
@@ -117,16 +117,45 @@ fn end_marker_targets(
                     feature: "n3_end_marker_selected_source_port",
                 });
             }
-            // The eBPF userspace adapter refuses the TS 29.281 section 5.1
-            // all-zero peer TEID until the committed datapath object is
-            // rebuilt with zero-peer-TEID support (#1461), so a grouped
-            // context installed here cannot carry one. Fail closed instead of
-            // widening this nullable type.
-            let peer_teid =
-                crate::Teid::new(context.peer_teid.get()).ok_or(GtpuError::UnsupportedFeature {
-                    feature: "n3_end_marker_peer_teid_zero",
-                })?;
-            Ok((local, peer, peer_teid))
+            Ok((local, peer, context.peer_teid))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_teid_zero_is_retained_in_n3_end_marker_targets() {
+        let local = Ipv4Addr::new(192, 0, 2, 1);
+        let peer = Ipv4Addr::new(192, 0, 2, 10);
+        let context = crate::GtpPdpContext {
+            local_teid: crate::Teid::new(7).unwrap(),
+            peer_teid: crate::PeerTeid::ZERO,
+            ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
+            peer_address: IpAddr::V4(peer),
+            link_ifindex: 7,
+            downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
+            gtp_version: crate::GtpVersion::V1,
+            bearer_mark: None,
+            egress_dscp: None,
+            uplink_source_port_policy: crate::GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            downlink_inner_mtu: None,
+        };
+        let entry = crate::GtpuSessionEntry::new(context, IpAddr::V4(local))
+            .unwrap()
+            .restore_n3_qfi(0)
+            .unwrap();
+        let group = GtpuSessionGroup::new(
+            crate::GtpuSessionGroupId::new([0x41; 16]).unwrap(),
+            crate::GtpuSessionDeviceId::new([0x42; 16]).unwrap(),
+            vec![entry],
+        )
+        .unwrap();
+        let targets = end_marker_targets(&group).unwrap();
+        assert_eq!(targets.len(), 1);
+        let (actual_local, actual_peer, teid) = targets.into_iter().next().unwrap();
+        assert_eq!((actual_local, actual_peer, teid.get()), (local, peer, 0));
+    }
 }

@@ -159,7 +159,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refs #1248.
 - `opc-gtpu-dataplane`: ordinary inner-IPv6 PDP contexts can now opt into
   in-tunnel RFC 4443 Packet Too Big. The family-tagged entry gains a versioned
-  opt-in downlink inner MTU profile (entry versions 3/4, the 2-byte field at
+  opt-in downlink inner MTU profile (entry version 3, the 2-byte field at
   bytes 73..74, byte 75 reserved); tc's
   family-tagged decapsulation steers an over-MTU inner IPv6 packet to the
   existing packet-too-big hand-off queue, and the consumer sends exactly one
@@ -168,7 +168,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never-answer-before-token order as the IPv4 opt-in. The IPv4
   fragment-inner default remains refused for IPv6
   (`downlink_inner_mtu_inner_ipv6_fragmentation`), and the IPv6 MTU must be at
-  least 1,280. Refusal is explicit rather than installing without enforcement.
+  least 1,280. The profile requires IPv4 outer endpoints and the legacy
+  UDP/2152 uplink source port; grouped and N3 APIs refuse it. The consumer
+  validates default-bearer authority and suppresses errors and Redirects
+  behind extension headers before consuming a rate-limit token. Refusal is
+  explicit rather than installing without enforcement.
   Refs #1007.
 
 - `opc-session-net`: an issuer can now deliver one authenticated, typed boot
@@ -450,15 +454,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and typed outcomes are listed under "Added". Refs #1018.
 
 - `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
-  TS 29.281 section 5.1 all-zero value is now representable and installable on
-  the model and mock-software paths, and the N3 software G-PDU encoder emits
-  the TEID field as zero for it. Locally allocated/received/map-key TEIDs
-  remain strictly nonzero (`Teid::new(0)` still returns `None`), with Debug
-  redaction unchanged. The Linux kernel-GTP netlink path cannot install
-  `GTPA_O_TEI = 0` in this release and returns the stable typed
-  `GtpuError::UnsupportedFeature { feature: "peer_teid_zero" }` on install and
-  readback; the eBPF userspace adapter returns the same typed refusal until its
-  committed datapath object is rebuilt with zero-peer-TEID support. Refs #1346.
+  TS 29.281 section 5.1 all-zero value is now installable on Linux kernel-GTP
+  and eBPF. Readback, reconciliation and retained-owner recovery preserve it,
+  and the rebuilt tc datapath and software G-PDU/End Marker encoders transmit
+  the peer TEID as zero. Locally allocated/received/map-key TEIDs remain
+  strictly nonzero (`Teid::new(0)` still returns `None`), with Debug redaction
+  unchanged. Before downgrading to an SDK without zero-peer support, remove zero-peer contexts or perform a fresh installation. Refs #1346.
 
 - `opc-proto-gtpv2c`: accept unknown extension octets after the required
   Bearer QoS prefix while retaining 40-bit rate bounds and QoS validation.
@@ -536,13 +537,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned
-  opt-in downlink inner MTU profiles (versions 3 and 4, the 2-byte field at
+  opt-in downlink inner MTU profile (version 3, the 2-byte field at
   bytes 73..74, byte 75 reserved); the
   entry still occupies 80 bytes, but an old decoder rejects the new profile as
   non-canonical. A retained version-6 graph is therefore refused and needs a
   fresh attachment, and downgrading to an SDK that predates version 7 likewise
-  refuses the newer marker. No in-place migration is provided; drain or
-  re-create the attachment in either direction. Refs #1007.
+  refuses the newer marker. Crossing schema generations requires a fresh
+  installation; no in-place migration is provided. Refs #1007.
 
 - `opc-proto-ngap`: `Pdu`, `PduKind`, `Message` and borrowed `ProtocolIe`
   no longer implement cloning or equality over opaque key-bearing bytes.
@@ -583,7 +584,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public peer/outgoing-TEID type that admits the TS 29.281 section 5.1 all-zero
   value; `Teid` remains the strictly nonzero local/received TEID type and its
   `new(0) -> None` contract is unchanged. `ReceivedN3UplinkTnl::new` and
-  `ReceivedN3UplinkTnl::teid` now use `PeerTeid`. Construct peer values with
+  `ReceivedN3UplinkTnl::teid` now use `PeerTeid`. Its constructor accepts
+  either `PeerTeid` or an existing nonzero `Teid`. Construct peer values with
   `PeerTeid::new`, `PeerTeid::ZERO`, or `PeerTeid::from(teid)`; `Teid` remains
   for `local_teid` and every selector/map key. Downstream code that assigned a
   `Teid` to `peer_teid` must convert or construct a `PeerTeid`. Refs #1346.

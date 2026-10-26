@@ -719,6 +719,33 @@
       "renamed_to": "rust:crates/opc-persist::test=consensus_openraft::member_repair::repair_transfer_verifies_once_within_the_original_attempt_deadline",
       "reason": "Rename the repair regression to describe the retained original attempt deadline after removal of the attempt-budget extension. The 2 MiB aggregate, single verification, multi-chunk transfer, repaired-head checks and every timeout remain unchanged.",
       "issue": 1339
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::model::tests::zero_peer_teid_has_a_stable_typed_unsupported_refusal",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::model::tests::zero_peer_teid_does_not_relax_the_local_teid_domain",
+      "reason": "TS 29.281 section 5.1 and issue #1346 require accepting peer-assigned zero. Replace the obsolete unsupported-feature expectation with peer-domain boundary checks while preserving strict zero rejection and upper-bound coverage for local TEIDs. Installed backend, retained-record and native wire regressions separately prove zero-peer support.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::linux::tests::pdp_readback_pins_zero_peer_teid_typed_refusal",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::linux::tests::pdp_readback_preserves_the_full_peer_teid_domain",
+      "reason": "Linux GTPA_O_TEI supports the peer-assigned zero required by TS 29.281 section 5.1. Replace the incorrect refusal assertion with exact readback equality for peer TEIDs zero, one and u32::MAX. Local receive keys remain nonzero; separate tests retain malformed-input and selector-conflict checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_zero_peer_teid_is_refused_with_the_stable_typed_label",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::grouped_peer_teids_survive_reconcile_readback_and_restart",
+      "reason": "Replace the incorrect peer-zero refusal with the TS 29.281 section 5.1 supported behavior: reconcile a dual-family group through its protected selector authority, require exact active readback, restart the backend and read it back again. The same lifecycle runs for zero and nonzero peer TEIDs, preserving the existing nonzero path and exact authority checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_peer_teid_zero_is_transmitted_for_both_inner_families",
+      "kind": "disabled",
+      "reason": "New native tc regression requires CAP_BPF/CAP_NET_ADMIN and private network/bpffs namespaces, so it uses the existing privileged suite's ordinary-test ignore. The full privileged suite explicitly executes it and proves zero-peer G-PDU transmission for both inner families. No existing test or assertion is removed or disabled.",
+      "issue": 1346
     }
   ]
 }

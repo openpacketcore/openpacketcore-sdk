@@ -191,25 +191,6 @@ impl fmt::Display for PeerTeid {
     }
 }
 
-/// Stable `UnsupportedFeature` label for backends that cannot install a
-/// zero peer TEID in this release.
-pub(crate) const PEER_TEID_ZERO_UNSUPPORTED_FEATURE: &str = "peer_teid_zero";
-
-/// Refuse a peer TEID that the calling backend cannot install yet.
-///
-/// TS 29.281 section 5.1 admits the all-zero peer TEID; backends whose datapath
-/// or kernel interface cannot carry it must fail with a stable typed refusal
-/// instead of accepting a context that would not forward.
-pub(crate) fn reject_unsupported_zero_peer_teid(peer: PeerTeid) -> Result<(), crate::GtpuError> {
-    if peer.is_zero() {
-        Err(crate::GtpuError::UnsupportedFeature {
-            feature: PEER_TEID_ZERO_UNSUPPORTED_FEATURE,
-        })
-    } else {
-        Ok(())
-    }
-}
-
 /// Non-zero Linux packet mark selecting one bearer that shares a UE PAA.
 ///
 /// The eBPF backend owns the complete 32-bit mark: the default inbound Child
@@ -4904,9 +4885,8 @@ pub struct GtpPdpContext {
     /// Outgoing peer PGW/UPF TEID.
     ///
     /// TS 29.281 section 5.1 backward compatibility admits the reserved
-    /// all-zero peer TEID; outgoing G-PDUs then carry TEID zero. A zero value
-    /// is not accepted by the Linux kernel-GTP netlink backend or the eBPF
-    /// userspace adapter (see their `peer_teid_zero` unsupported refusals).
+    /// all-zero peer TEID; outgoing G-PDUs then carry TEID zero. This does not
+    /// relax the nonzero local TEID used for receive lookup and ownership.
     pub peer_teid: PeerTeid,
     /// MS/UE packet-data-network address.
     pub ms_address: IpAddr,
@@ -5063,8 +5043,8 @@ impl GtpuSessionEntry {
             || context.peer_address.is_unspecified()
             || local_outer_address.is_unspecified()
             || context.link_ifindex == 0
-            // The grouped entry ABI carries no downlink inner MTU; refuse it
-            // rather than silently dropping enforcement.
+            // The MTU family-entry profile belongs to the ordinary IPv6 API;
+            // grouped policy is unsupported and must not be silently dropped.
             || context.downlink_inner_mtu.is_some()
         {
             return Err(GtpuSessionModelError::InvalidContext);
@@ -7122,15 +7102,12 @@ mod tests {
     }
 
     #[test]
-    fn zero_peer_teid_has_a_stable_typed_unsupported_refusal() {
-        assert!(reject_unsupported_zero_peer_teid(PeerTeid::new(1)).is_ok());
-        let error = reject_unsupported_zero_peer_teid(PeerTeid::ZERO).unwrap_err();
-        assert!(matches!(
-            error,
-            crate::GtpuError::UnsupportedFeature {
-                feature: "peer_teid_zero"
-            }
-        ));
+    fn zero_peer_teid_does_not_relax_the_local_teid_domain() {
+        assert_eq!(PeerTeid::new(0), PeerTeid::ZERO);
+        assert_eq!(PeerTeid::new(u32::MAX).get(), u32::MAX);
+        assert!(Teid::new(0).is_none());
+        assert_eq!(Teid::new(1).unwrap().get(), 1);
+        assert_eq!(Teid::new(u32::MAX).unwrap().get(), u32::MAX);
     }
 
     #[test]

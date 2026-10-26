@@ -854,11 +854,11 @@ marker advances to `OPC-GROUP-IP-v7`; a retained version-6 graph is refused
 and needs a fresh attachment before it can carry the field. Entries without
 the field keep their byte-exact older profiles and read back with `None`.
 
-**Refusals and capability.** The IPv4 in-tunnel Packet Too Big opt-in
+**Refusals and capability.** The in-tunnel Packet Too Big opt-in
 requires the legacy service-port uplink policy; the default fragmentation
 sends nothing uplink and accepts either. Grouped entries refuse both policies.
 An ordinary inner-IPv6 context accepts only the opt-in, with an MTU of at
-least 1,280, and refuses the fragment-inner default with
+least 1,280 and IPv4 outer endpoints, and refuses the fragment-inner default with
 `downlink_inner_mtu_inner_ipv6_fragmentation`. The eBPF probe reports
 `downlink_inner_mtu_enforcement`. `Available` covers the datapath only:
 fragments are produced, and errors sent, only while the application drains
@@ -1233,23 +1233,33 @@ the consumer sends exactly one in-tunnel RFC 4443 Packet Too Big:
   unencapsulated.
 - **Quote.** As much of the invoking packet as fits in the minimum IPv6 MTU:
   1,232 octets after the outer IPv6 and ICMPv6 headers.
-- **Never answered** (RFC 4443 section 2.4), checked before any rate-limit
-  token is taken: an unspecified or multicast source; a multicast
-  destination; an ICMPv6 error (type below 128); a non-initial fragment.
-  Informational ICMPv6 messages, such as Echo, are answered.
+- **Never answered** (RFC 4443 section 2.4(e)), checked before any rate-limit
+  token is taken: an unspecified, multicast, loopback or known subnet-router
+  anycast source; an ICMPv6 error (type below 128) or Redirect (type 137),
+  including behind extension headers. A multicast or subnet-router anycast
+  destination is also refused because this proxy uses it as the error's
+  source, which must be unicast (RFC 4443 section 2.2).
+  The subnet-router anycast address has a zero interface
+  identifier (RFC 4291 section 2.6.1). Other informational ICMPv6 messages,
+  such as Echo, are answered.
 - **Header validation.** A truncated or inconsistent invoking IPv6 packet is
-  silently discarded and counted as unsendable.
+  silently discarded and counted as unsendable. The bounded extension walk
+  also conservatively refuses unresolved chains, repeated Fragment headers
+  and non-initial fragments, whose upper-layer contents cannot be classified.
 - **Bearer and rate limit.** The error rides the subscriber's default-bearer
   uplink tunnel as the IPv4 opt-in does, with the same per-session token
   bucket, 255-second eviction grace and never-answer-before-token order. If
   the entry is a dedicated bearer, its own PAA's default-bearer entry is used;
-  without one nothing is sent.
+  without one nothing is sent. Both entries must authorize UDP source port
+  2152, and the resolved default must authorize its exact uplink key. A zero
+  peer TEID remains valid; a selected source port or N3 profile is refused.
 
-The MTU profile is shared with grouped records and the protected selector
-ledger, so the grouped schema marker advances to `OPC-GROUP-IP-v7`. A
-retained version-6 graph is refused and needs a fresh attachment; downgrading
-to an older SDK likewise refuses the newer marker, so drain or re-create the
-attachment in either direction.
+The ordinary IPv6 path shares the family-tagged wire layout with grouped
+records and the protected selector ledger, so the grouped schema marker
+advances to `OPC-GROUP-IP-v7`. The grouped API still refuses MTU policies and
+rejects retained records it cannot represent without losing that policy.
+A retained version-6 graph and an older reader's attempt to open version 7
+are refused; crossing schema generations requires a fresh installation.
 
 The native lane `ebpf_gtpu_downlink_ipv6_packet_too_big_is_signalled_in_tunnel`
 gives one well-formed RFC 4443 error with the exact quote and checksum, no
