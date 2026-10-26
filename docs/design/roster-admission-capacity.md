@@ -26,10 +26,29 @@ one retirement command spans admission epochs up to the existing 1,024-row
 bound. Each partition receives one floor/cursor action. Its floor advances only
 when no binding survives through the greatest selected epoch; otherwise both
 floor and cursor remain unchanged. Both engines check the activated policy
-before maintenance writes. When membership cutover clears a profile's
-certificate while preserving its history, SQLite defers maintenance until
-reactivation and lets unrelated apply proceed. Present incompatible policies
-still fail before maintenance writes. Retirement creates no tombstones, so both
+before maintenance writes. SQLite makes a separate readiness decision for each
+profile, after checking the exact layout and before either profile writes:
+
+| Profile state | Maintenance decision |
+| --- | --- |
+| Malformed layout or namespace | Return the existing validation error. |
+| No rows and no namespace | Nothing to maintain. |
+| Current-scope roster certificate with the compiled policy, in a settled scope | Maintain this profile. |
+| Foreign roster-policy digest or stale certificate scope | Reject before any maintenance write. |
+| Missing certificate, current-scope generic fenced-transition certificate, inactive layout, or pending/unsettled scope | Defer this profile successfully without changing its rows. |
+
+Both certificates are checked before either ready profile mutates rows or the
+shared witness. Thus a deferred profile cannot hide a foreign policy in the
+other profile. A membership cutover may clear a certificate while retaining
+history; unrelated committed apply and logical-time advances still succeed.
+Reclaim selects only ready profiles, with the existing retention and batch
+bounds. Retirement keeps the global terminal order across both profiles and
+stops at any deferred binding, including a tombstone. Its floor checks still
+count every surviving binding in both profiles, so a ready profile advances
+only where the shared floors and terminal horizon permit. Deferred history is
+never authorized by a fabricated certificate.
+
+Retirement creates no tombstones, so both
 phases progress under continuous arrivals. The leader runs at most two bounded commands
 per maintenance tick,
 without changing the retention boundary or either phase's batch limit.

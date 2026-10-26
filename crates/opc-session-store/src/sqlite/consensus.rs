@@ -11750,6 +11750,18 @@ fn protected_roster_read_record_sync(
     protected_roster_hydrate_record_projection_sync(identity, binding, row).map(Some)
 }
 
+/// Validated maintenance readiness for each independent roster profile.
+#[derive(Clone, Copy)]
+struct ProtectedRosterMaintenanceProfiles {
+    v1: bool,
+    v2: bool,
+}
+
+impl ProtectedRosterMaintenanceProfiles {
+    #[cfg(test)]
+    const ALL: Self = Self { v1: true, v2: true };
+}
+
 /// Decode only the exact oldest due reclaim prefix chosen by the indexed
 /// `(terminalized_at, binding)` order. Restart and snapshot validation stream
 /// their rows, while an ordinary clock tick still must never deserialize the
@@ -11780,6 +11792,7 @@ fn protected_roster_due_reclaim_records_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     maintenance: ConsensusMaintenanceTimestamp,
+    profiles: ProtectedRosterMaintenanceProfiles,
 ) -> Result<Vec<ProtectedRosterMixedRecord>, ProtectedRosterApplyError> {
     let cutoff = maintenance
         .as_nanos()
@@ -11788,8 +11801,9 @@ fn protected_roster_due_reclaim_records_sync(
         .ok_or(ProtectedRosterApplyError::Corrupt)?;
     let v2_present = protected_roster_v2_namespace_is_present_sync(conn)
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
-    let query = if v2_present {
-        "SELECT profile, binding FROM ( \
+    let query = match (profiles.v1, profiles.v2 && v2_present) {
+        (true, true) => {
+            "SELECT profile, binding FROM ( \
              SELECT 1 AS profile, binding, terminalized_at \
              FROM consensus_protected_roster_rows \
              WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
@@ -11798,11 +11812,20 @@ fn protected_roster_due_reclaim_records_sync(
              FROM consensus_protected_roster_v2_admissions \
              WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
          ) ORDER BY terminalized_at ASC, binding ASC, profile ASC LIMIT ?2"
-    } else {
-        "SELECT 1 AS profile, binding \
+        }
+        (true, false) => {
+            "SELECT 1 AS profile, binding \
          FROM consensus_protected_roster_rows \
          WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
          ORDER BY terminalized_at ASC, binding ASC LIMIT ?2"
+        }
+        (false, true) => {
+            "SELECT 2 AS profile, binding \
+         FROM consensus_protected_roster_v2_admissions \
+         WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
+         ORDER BY terminalized_at ASC, binding ASC LIMIT ?2"
+        }
+        (false, false) => return Ok(Vec::new()),
     };
     let mut statement = conn
         .prepare(query)
@@ -11866,6 +11889,7 @@ fn protected_roster_due_reclaim_records_sync(
 fn protected_roster_due_reclaim_order_sync(
     conn: &Connection,
     maintenance: ConsensusMaintenanceTimestamp,
+    profiles: ProtectedRosterMaintenanceProfiles,
 ) -> Result<Vec<(i128, RequestBindingKey, ProductionRosterProfileTag)>, ProtectedRosterApplyError> {
     let cutoff = maintenance
         .as_nanos()
@@ -11874,8 +11898,9 @@ fn protected_roster_due_reclaim_order_sync(
         .ok_or(ProtectedRosterApplyError::Corrupt)?;
     let v2_present = protected_roster_v2_namespace_is_present_sync(conn)
         .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
-    let query = if v2_present {
-        "SELECT profile, binding, terminalized_at FROM ( \
+    let query = match (profiles.v1, profiles.v2 && v2_present) {
+        (true, true) => {
+            "SELECT profile, binding, terminalized_at FROM ( \
              SELECT 1 AS profile, binding, terminalized_at \
              FROM consensus_protected_roster_rows \
              WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
@@ -11884,11 +11909,20 @@ fn protected_roster_due_reclaim_order_sync(
              FROM consensus_protected_roster_v2_admissions \
              WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
          ) ORDER BY terminalized_at ASC, binding ASC, profile ASC LIMIT ?2"
-    } else {
-        "SELECT 1 AS profile, binding, terminalized_at \
+        }
+        (true, false) => {
+            "SELECT 1 AS profile, binding, terminalized_at \
          FROM consensus_protected_roster_rows \
          WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
          ORDER BY terminalized_at ASC, binding ASC LIMIT ?2"
+        }
+        (false, true) => {
+            "SELECT 2 AS profile, binding, terminalized_at \
+         FROM consensus_protected_roster_v2_admissions \
+         WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 \
+         ORDER BY terminalized_at ASC, binding ASC LIMIT ?2"
+        }
+        (false, false) => return Ok(Vec::new()),
     };
     let mut statement = conn
         .prepare(query)
@@ -15554,10 +15588,25 @@ fn protected_roster_replace_v2_reclaim_sync(
         .ok_or(ProtectedRosterApplyError::Corrupt)
 }
 
+#[cfg(test)]
 fn reclaim_protected_rosters_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
     logical_time: Timestamp,
+) -> Result<(), StoreError> {
+    reclaim_protected_rosters_for_profiles_sync(
+        conn,
+        identity,
+        logical_time,
+        ProtectedRosterMaintenanceProfiles::ALL,
+    )
+}
+
+fn reclaim_protected_rosters_for_profiles_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    logical_time: Timestamp,
+    profiles: ProtectedRosterMaintenanceProfiles,
 ) -> Result<(), StoreError> {
     let maintenance = ConsensusMaintenanceTimestamp::from_consensus_timestamp(logical_time)
         .map_err(|_| {
@@ -15573,8 +15622,8 @@ fn reclaim_protected_rosters_sync(
     let witness = witness.ok_or_else(|| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })?;
-    let records =
-        protected_roster_due_reclaim_records_sync(conn, identity, maintenance).map_err(|_| {
+    let records = protected_roster_due_reclaim_records_sync(conn, identity, maintenance, profiles)
+        .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
     if records.is_empty() {
@@ -15681,8 +15730,8 @@ fn reclaim_protected_rosters_sync(
             }
         }
     }
-    let reproved_order =
-        protected_roster_due_reclaim_order_sync(conn, maintenance).map_err(|_| {
+    let reproved_order = protected_roster_due_reclaim_order_sync(conn, maintenance, profiles)
+        .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
     let expected_order = prepared
@@ -15719,15 +15768,28 @@ fn reclaim_protected_rosters_sync(
     })
 }
 
+#[cfg(test)]
+fn retire_protected_rosters_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+) -> Result<bool, StoreError> {
+    retire_protected_rosters_for_profiles_sync(
+        conn,
+        identity,
+        ProtectedRosterMaintenanceProfiles::ALL,
+    )
+}
+
 /// Retire one deterministic partition/epoch tombstone prefix.  This is a
 /// separate turn from the 24-hour payload reclaim: the latter preserves the
 /// stable admission child, while this path can remove that child only after
 /// the exact epoch is irreversibly closed by its floor CAS. A later reuse of
 /// the same roster nonce is therefore a new binding only at a higher history
 /// epoch; it is not a claim of permanent global nonce uniqueness.
-fn retire_protected_rosters_sync(
+fn retire_protected_rosters_for_profiles_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
+    profiles: ProtectedRosterMaintenanceProfiles,
 ) -> Result<bool, StoreError> {
     let witness = protected_roster_read_witness_sync(conn, identity)
         .map_err(|_| {
@@ -15778,7 +15840,19 @@ fn retire_protected_rosters_sync(
         let state: i64 = row.get(3).map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-        if state != protected_roster_snapshot_state_code(ReservationState::Tombstone) {
+        let ready = match profile {
+            1 => profiles.v1,
+            2 => profiles.v2,
+            _ => {
+                return Err(StoreError::BackendUnavailable(
+                    "protected roster maintenance unavailable".into(),
+                ))
+            }
+        };
+        // The global terminal horizon must not cross an inactive predecessor,
+        // even when that predecessor is already a tombstone. Keep all profiles
+        // in this ordered query and in the shared survivor checks below.
+        if !ready || state != protected_roster_snapshot_state_code(ReservationState::Tombstone) {
             break;
         }
         let bytes: Vec<u8> = row.get(1).map_err(|_| {
@@ -16101,22 +16175,23 @@ fn maintain_due_protected_roster_reclaim_sync(
         // predicate over nonnegative timestamps. This remains a true no-op.
         return Ok(false);
     };
-    let v2_present = protected_roster_v2_namespace_is_present_sync(conn).map_err(|_| {
+    let v2_layout = protected_roster_v2_layout_in_sync(conn, false).map_err(|_| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })?;
-    let due_reclaim: bool = conn
+    let v2_present = v2_layout != ProtectedRosterV2Layout::Absent;
+    let (v1_due_reclaim, v2_due_reclaim): (bool, bool) = conn
         .query_row(
             if v2_present {
                 "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
                  WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1) \
-                 OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions \
+                 , EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions \
                  WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1)"
             } else {
                 "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
-                 WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1)"
+                 WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1), 0"
             },
             [cutoff.to_be_bytes().as_slice()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
@@ -16135,7 +16210,7 @@ fn maintain_due_protected_roster_reclaim_sync(
         .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-    if !due_reclaim && !due_retirement {
+    if !v1_due_reclaim && !v2_due_reclaim && !due_retirement {
         return Ok(false);
     }
 
@@ -16153,11 +16228,10 @@ fn maintain_due_protected_roster_reclaim_sync(
     let scope = read_membership_scope_sync(conn, identity).map_err(|_| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })?;
-    // V2-only activation also creates the shared V1-format floor/witness
-    // tables. Check V1's policy when its row namespace contributes and V2's
-    // independently whenever its namespace exists. Cutover clears current
-    // certificates while retaining history, so an inactive profile defers
-    // the whole turn. Still reject any present foreign policy before writes.
+    // Each exact namespace receives its own maintain/defer decision. A
+    // deferred profile writes nothing, including during a pending cutover.
+    // Decode and reject every present foreign/stale certificate before either
+    // profile can mutate the shared witness or its own rows.
     let v1_rows: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows LIMIT 1)",
@@ -16167,64 +16241,89 @@ fn maintain_due_protected_roster_reclaim_sync(
         .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-    let activation_ready = (|| -> io::Result<bool> {
-        let mut ready = true;
-        if v1_rows {
-            if fenced_transition_receipt_ledger_layout_sync(conn)?
+    let profiles = (|| -> io::Result<ProtectedRosterMaintenanceProfiles> {
+        if v1_rows
+            && fenced_transition_receipt_ledger_layout_sync(conn)?
                 != FencedTransitionReceiptLedgerLayout::Activated
-            {
-                return Err(invalid_data(
-                    "protected roster maintenance policy is invalid",
-                ));
-            }
-            if read_fenced_transition_activation_certificate_sync(conn, identity, false)?.is_none()
-            {
-                ready = false;
-            } else if !protected_roster_profile_activation_matches_scope_sync(
-                conn,
-                identity,
-                scope.current_identity,
-                &scope.current_members,
-            )? {
-                return Err(invalid_data(
-                    "protected roster maintenance policy is invalid",
-                ));
-            }
+        {
+            return Err(invalid_data(
+                "protected roster maintenance policy is invalid",
+            ));
         }
-        if v2_present {
-            if read_protected_roster_v2_activation_certificate_in_sync(conn, identity, false)?
-                .is_none()
-            {
-                validate_protected_roster_v2_activation_certificate_in_sync(conn, identity, false)?;
-                ready = false;
-            } else if !protected_roster_profile_v2_activation_matches_scope_sync(
-                conn,
-                identity,
-                scope.current_identity,
-                &scope.current_members,
-            )? {
-                return Err(invalid_data(
-                    "protected roster maintenance policy is invalid",
-                ));
+        let settled = scope.pending.is_none()
+            && scope.application_authority_epoch == scope.current_identity.configuration_epoch()
+            && scope.application_authority_members == scope.current_members;
+        let v1 = match read_fenced_transition_activation_certificate_sync(conn, identity, false)? {
+            None => false,
+            Some((certificate_scope, digest)) => {
+                if certificate_scope != scope.current_identity {
+                    return Err(invalid_data(
+                        "protected roster maintenance policy is invalid",
+                    ));
+                }
+                if digest
+                    == protected_roster_profile_voter_set_digest(
+                        scope.current_identity,
+                        &scope.current_members,
+                    )
+                {
+                    settled
+                } else if digest
+                    == fenced_transition_voter_set_digest(
+                        scope.current_identity,
+                        &scope.current_members,
+                    )
+                {
+                    // Generic fenced-transition activation carries no roster
+                    // policy, so it cannot authorize roster maintenance.
+                    false
+                } else {
+                    return Err(invalid_data(
+                        "protected roster maintenance policy is invalid",
+                    ));
+                }
             }
-        }
-        Ok(ready)
+        };
+        let v2 = match v2_layout {
+            ProtectedRosterV2Layout::Absent | ProtectedRosterV2Layout::Inactive => false,
+            ProtectedRosterV2Layout::Activated => {
+                let (certificate_scope, voter_digest, profile_digest) =
+                    read_protected_roster_v2_activation_certificate_in_sync(conn, identity, false)?
+                        .ok_or_else(|| {
+                            invalid_data("protected roster maintenance policy is invalid")
+                        })?;
+                if certificate_scope != scope.current_identity
+                    || voter_digest
+                        != protected_roster_profile_v2_voter_set_digest(
+                            scope.current_identity,
+                            &scope.current_members,
+                        )
+                    || profile_digest != crate::fenced_mutation_roster::Profile::v2().digest()
+                {
+                    return Err(invalid_data(
+                        "protected roster maintenance policy is invalid",
+                    ));
+                }
+                settled
+            }
+        };
+        Ok(ProtectedRosterMaintenanceProfiles { v1, v2 })
     })()
     .map_err(|_| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })?;
-    if !activation_ready {
+    if !profiles.v1 && !profiles.v2 {
         return Ok(false);
     }
     // Drain an eligible terminal prefix before reclaiming newer rows. The
     // retirement planner returns false when an older retained row blocks it;
     // reclaim then keeps its original retention predicate and batch bound.
     // A retirement turn cannot create tombstones, so reclaim also progresses.
-    if due_retirement && retire_protected_rosters_sync(conn, identity)? {
+    if due_retirement && retire_protected_rosters_for_profiles_sync(conn, identity, profiles)? {
         return Ok(true);
     }
-    if due_reclaim {
-        reclaim_protected_rosters_sync(conn, identity, logical_time)?;
+    if (profiles.v1 && v1_due_reclaim) || (profiles.v2 && v2_due_reclaim) {
+        reclaim_protected_rosters_for_profiles_sync(conn, identity, logical_time, profiles)?;
         return Ok(true);
     }
     Ok(false)
@@ -55388,9 +55487,13 @@ mod tests {
             let witness = protected_roster_read_witness_sync(&conn, fixture_identity)
                 .expect("read V2 reclaim witness")
                 .expect("V2 reclaim witness exists");
-            let records =
-                protected_roster_due_reclaim_records_sync(&conn, fixture_identity, maintenance)
-                    .expect("hydrate exact due V2 reclaim prefix");
+            let records = protected_roster_due_reclaim_records_sync(
+                &conn,
+                fixture_identity,
+                maintenance,
+                ProtectedRosterMaintenanceProfiles::ALL,
+            )
+            .expect("hydrate exact due V2 reclaim prefix");
             assert_eq!(records.len(), 1, "one V2 retained row is exactly due");
             let selections = records
                 .iter()
