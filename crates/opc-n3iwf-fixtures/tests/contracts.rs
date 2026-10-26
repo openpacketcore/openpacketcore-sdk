@@ -281,11 +281,11 @@ fn installed_child_sa_evidence_inventory_is_complete_and_grants_no_authority() {
         );
         assert_eq!(
             manifest.context["public_sdk"]["head"],
-            "1c7012e6667a29f27d1100f3492dff5cc2c05d34"
+            "0f3e31e8eb12a2025dcec5401af2b8b261b91505"
         );
         assert_eq!(
             manifest.context["public_sdk"]["tree"],
-            "1de2e42f567031052e26322d0f581b87993180b2"
+            "a43ca86ba753649c4e2d14659b7738ec2ceb6fdd"
         );
         let family = manifest.context["source_vector"]["case"]
             .as_str()
