@@ -4107,7 +4107,9 @@ const MAX_DEDICATED_EBI_VALUES: usize = 15;
 // cardinality. It retains the full procedure-table shape while applying
 // explicit S2b applicability where the profile assigns an exact endpoint role;
 // typed projections enforce required presence, interface type, value semantics,
-// and correlation.
+// and correlation. Create Bearer user-plane F-TEIDs use only the S2b-U
+// instances; Update Bearer PCO and SGW-only load/overload IEs are discarded
+// under clause 7.7.9 before value decoding and singleton bookkeeping.
 //
 // Top-level rules come from TS 29.274 R18 Tables 7.1.1-1, 7.1.2-1,
 // 7.2.1-1, 7.2.2-1, 7.2.3-1, 7.2.4-1, 7.2.7-1, 7.2.8-1,
@@ -4511,7 +4513,7 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         direction: MessageDirection::Request,
         scope: ReceiveIeScope::TopLevel,
         ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
-        instances: &[0, 2],
+        instances: &[0],
         max_occurrences: ONE,
     },
     ReceiveIeRule {
@@ -4521,14 +4523,6 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
         instances: &[1],
         max_occurrences: MAX_APN_LOAD_CONTROL_ENTRIES,
-    },
-    ReceiveIeRule {
-        procedure: Procedure::CreateBearer,
-        direction: MessageDirection::Request,
-        scope: ReceiveIeScope::TopLevel,
-        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
-        instances: &[1],
-        max_occurrences: ONE,
     },
     ReceiveIeRule {
         procedure: Procedure::CreateBearer,
@@ -4574,12 +4568,7 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         procedure: Procedure::UpdateSession,
         direction: MessageDirection::Request,
         scope: ReceiveIeScope::TopLevel,
-        ie_types: &[
-            IE_TYPE_PCO,
-            IE_TYPE_AMBR,
-            IE_TYPE_INDICATION,
-            IE_TYPE_F_TEID,
-        ],
+        ie_types: &[IE_TYPE_AMBR, IE_TYPE_INDICATION, IE_TYPE_F_TEID],
         instances: &[0],
         max_occurrences: ONE,
     },
@@ -4596,7 +4585,7 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         direction: MessageDirection::Request,
         scope: ReceiveIeScope::TopLevel,
         ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
-        instances: &[0, 2],
+        instances: &[0],
         max_occurrences: ONE,
     },
     ReceiveIeRule {
@@ -4606,14 +4595,6 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
         instances: &[1],
         max_occurrences: MAX_APN_LOAD_CONTROL_ENTRIES,
-    },
-    ReceiveIeRule {
-        procedure: Procedure::UpdateSession,
-        direction: MessageDirection::Request,
-        scope: ReceiveIeScope::TopLevel,
-        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
-        instances: &[1],
-        max_occurrences: ONE,
     },
     ReceiveIeRule {
         procedure: Procedure::UpdateSession,
@@ -4635,12 +4616,7 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         procedure: Procedure::UpdateSession,
         direction: MessageDirection::Response,
         scope: ReceiveIeScope::TopLevel,
-        ie_types: &[
-            IE_TYPE_CAUSE,
-            IE_TYPE_PCO,
-            IE_TYPE_RECOVERY,
-            IE_TYPE_INDICATION,
-        ],
+        ie_types: &[IE_TYPE_CAUSE, IE_TYPE_RECOVERY, IE_TYPE_INDICATION],
         instances: &[0],
         max_occurrences: ONE,
     },
@@ -4702,7 +4678,7 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         direction: MessageDirection::Request,
         scope: ReceiveIeScope::TopLevel,
         ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
-        instances: &[0, 2],
+        instances: &[0],
         max_occurrences: ONE,
     },
     ReceiveIeRule {
@@ -4712,14 +4688,6 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         ie_types: &[IE_TYPE_LOAD_CONTROL_INFORMATION],
         instances: &[1],
         max_occurrences: MAX_APN_LOAD_CONTROL_ENTRIES,
-    },
-    ReceiveIeRule {
-        procedure: Procedure::DeleteBearer,
-        direction: MessageDirection::Request,
-        scope: ReceiveIeScope::TopLevel,
-        ie_types: &[IE_TYPE_OVERLOAD_CONTROL_INFORMATION],
-        instances: &[1],
-        max_occurrences: ONE,
     },
     ReceiveIeRule {
         procedure: Procedure::DeleteBearer,
@@ -4857,7 +4825,7 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         direction: MessageDirection::Request,
         scope: ReceiveIeScope::BearerContext(0),
         ie_types: &[IE_TYPE_F_TEID],
-        instances: &[0, 1, 2, 3, 4, 5],
+        instances: &[4],
         max_occurrences: ONE,
     },
     ReceiveIeRule {
@@ -4873,7 +4841,7 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         direction: MessageDirection::Response,
         scope: ReceiveIeScope::BearerContext(0),
         ie_types: &[IE_TYPE_F_TEID],
-        instances: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        instances: &[8, 9],
         max_occurrences: ONE,
     },
     ReceiveIeRule {
@@ -4884,7 +4852,6 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
             IE_TYPE_EBI,
             IE_TYPE_BEARER_TFT,
             IE_TYPE_BEARER_QOS,
-            IE_TYPE_PCO,
             IE_TYPE_APCO,
         ],
         instances: &[0],
@@ -4894,16 +4861,8 @@ const RECEIVE_IE_RULES: &[ReceiveIeRule] = &[
         procedure: Procedure::UpdateSession,
         direction: MessageDirection::Response,
         scope: ReceiveIeScope::BearerContext(0),
-        ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE, IE_TYPE_PCO],
+        ie_types: &[IE_TYPE_EBI, IE_TYPE_CAUSE],
         instances: &[0],
-        max_occurrences: ONE,
-    },
-    ReceiveIeRule {
-        procedure: Procedure::UpdateSession,
-        direction: MessageDirection::Response,
-        scope: ReceiveIeScope::BearerContext(0),
-        ie_types: &[IE_TYPE_F_TEID],
-        instances: &[0, 1],
         max_occurrences: ONE,
     },
     ReceiveIeRule {
@@ -6073,7 +6032,11 @@ mod tests {
                     IE_TYPE_F_TEID,
                     instance,
                 ),
-                ReceiveIeDisposition::AllowedKnown
+                if instance == 4 {
+                    ReceiveIeDisposition::AllowedKnown
+                } else {
+                    ReceiveIeDisposition::DiscardKnown
+                }
             );
         }
         assert_eq!(
@@ -6095,7 +6058,11 @@ mod tests {
                     IE_TYPE_F_TEID,
                     instance,
                 ),
-                ReceiveIeDisposition::AllowedKnown
+                if matches!(instance, 8 | 9) {
+                    ReceiveIeDisposition::AllowedKnown
+                } else {
+                    ReceiveIeDisposition::DiscardKnown
+                }
             );
         }
         assert_eq!(
