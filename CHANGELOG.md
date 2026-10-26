@@ -263,6 +263,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Size both received-artifact sync budgets from the bounded descriptor length,
   preserving finite metadata admission and storage-worker ownership. Refs #1339.
 
+- `opc-amf-lite`: await startup phase and readiness events within the existing
+  five-second product deadline. Timeout diagnostics capture the pre-shutdown
+  phase, readiness and closed session-store gate status/reason; controlled
+  regressions exercise the actual startup completion boundary. Refs #1195.
+
+- `opc-session-net`: isolate prepared-CAS reply-loss tests from host scheduling
+  while retaining real voter/storage work, the original attempt/caller budgets
+  and exactly-once assertions. Restore the terminal-watch reconnect observation
+  window and the original admission waits in unsupported global-Watch fixtures.
+  Historical connection attribution and the scoped Watch protocol remain open.
+  Refs #1147, #842, #1189.
+
+- `opc-persist`: checkpoint writes, provision and reopen retain a completed,
+  validated storage result when their observer resumes after the deadline.
+  Unfinished or unverified work remains bounded and indeterminate. The maximum
+  payload/minimum storage regression waits for actual blocking I/O with a scoped
+  test clock; deadline regressions preserve the original budgets and recovery
+  assertions without real-time sleeps. Refs #1336.
+
 - `opc-session-store` and `opc-persist`: retain the `Unplanned` shutdown reason
   when an unplanned request races admission fencing or preparation completion.
   Already published reports remain unchanged. (#1376)

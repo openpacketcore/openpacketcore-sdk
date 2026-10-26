@@ -324,6 +324,7 @@ struct AmfLiteState {
     version: ConfigVersion,
     health: HealthModel,
     active_nrf_registration: bool,
+    session_store_reason: Option<opc_session_store::DurableReadinessState>,
 }
 
 struct SystemAmfClock;
@@ -438,6 +439,7 @@ impl AmfLite {
             version: ConfigVersion::INITIAL,
             health,
             active_nrf_registration: false,
+            session_store_reason: None,
         }));
 
         let state_notify = Arc::new(Notify::new());
@@ -557,16 +559,35 @@ impl AmfLite {
     async fn complete_startup(&self, timeout: Duration) -> Result<(), RuntimeError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            let phase_changed = self._phase_notify.notified();
+            let state_changed = self.state_notify.notified();
+            tokio::pin!(phase_changed, state_changed);
+            phase_changed.as_mut().enable();
+            state_changed.as_mut().enable();
             let phase = self.runtime.phase().await;
             let readiness = self.runtime.readiness().await;
             if phase == RuntimePhase::Ready && matches!(readiness, Readiness::Ready) {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
+                let (status, reason) = {
+                    let state = self.state.read().await;
+                    let status = state
+                        .health
+                        .gates
+                        .get(&opc_runtime::GateName::new(known_gates::SESSION_STORE))
+                        .map_or(GateStatus::Unknown, |gate| gate.status);
+                    (status, state.session_store_reason)
+                };
+                let error = startup_timeout_error(timeout, phase, readiness, status, reason);
                 self.runtime.shutdown().await;
-                return Err(startup_timeout_error(timeout, phase, readiness));
+                return Err(error);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::select! {
+                _ = phase_changed => {}
+                _ = state_changed => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
         }
 
         {
@@ -929,6 +950,7 @@ async fn spawn_session_store_readiness(
                         {
                             let mut st = state.write().await;
                             st.health.set_backends_reachable(is_ready);
+                            st.session_store_reason = Some(report.state());
                             st.health.set_gate(
                                 HealthGate::new(
                                     known_gates::SESSION_STORE,
@@ -942,8 +964,8 @@ async fn spawn_session_store_readiness(
                                 .with_message(reason_code),
                             );
                         }
-                        state_notify.notify_waiters();
                         supervisor.set_task_ready(&task_name, is_ready).await;
+                        state_notify.notify_waiters();
 
                         tokio::select! {
                             _ = shutdown.shutdown_acknowledged() => return Ok(()),
@@ -1074,9 +1096,12 @@ fn startup_timeout_error(
     timeout: Duration,
     phase: RuntimePhase,
     readiness: Readiness,
+    status: GateStatus,
+    reason: Option<opc_session_store::DurableReadinessState>,
 ) -> RuntimeError {
+    let reason = reason.map_or("unprobed", |reason| reason.reason_code());
     RuntimeError::Supervisor(format!(
-        "AMF-lite startup timeout after {} ms (phase={phase:?}, readiness={readiness:?})",
+        "AMF-lite startup timeout after {} ms (phase={phase:?}, readiness={readiness:?}, session_store={status:?}, reason={reason})",
         timeout.as_millis()
     ))
 }
@@ -1114,6 +1139,7 @@ mod tests {
             version: ConfigVersion::INITIAL,
             health,
             active_nrf_registration: false,
+            session_store_reason: None,
         }));
         let state_notify = Arc::new(Notify::new());
         let session_cluster = ConsensusTestCluster::start(1).await;
@@ -1180,6 +1206,7 @@ mod tests {
             version: ConfigVersion::INITIAL,
             health,
             active_nrf_registration: false,
+            session_store_reason: None,
         }));
         let state_notify = Arc::new(Notify::new());
 
@@ -1314,6 +1341,8 @@ mod tests {
             Duration::from_secs(5),
             RuntimePhase::ServiceBind,
             Readiness::NotReady,
+            GateStatus::Failing,
+            Some(opc_session_store::DurableReadinessState::NoQuorum),
         );
         let text = error.to_string();
         assert!(text.contains("5000 ms"), "report the expired product bound");
@@ -1325,6 +1354,282 @@ mod tests {
             text.contains("readiness=NotReady"),
             "report the last observed readiness"
         );
+        assert!(text.contains("session_store=Failing"));
+        assert!(text.contains("reason=no_quorum"));
         assert!(text.len() < 256, "keep the diagnostic bounded");
+    }
+
+    struct StartupFixture {
+        amf: AmfLite,
+        cluster: ConsensusTestCluster,
+    }
+
+    impl StartupFixture {
+        async fn set_gate(&self, reason: Option<opc_session_store::DurableReadinessState>) {
+            let ready = reason == Some(opc_session_store::DurableReadinessState::Ready);
+            let status = match reason {
+                None => GateStatus::Unknown,
+                Some(_) if ready => GateStatus::Passing,
+                Some(_) => GateStatus::Failing,
+            };
+            {
+                let mut state = self.amf.state.write().await;
+                state.session_store_reason = reason;
+                state.health.set_backends_reachable(ready);
+                state.health.set_gate(
+                    HealthGate::new(known_gates::SESSION_STORE, GateImpact::BlocksReadiness)
+                        .with_status(status)
+                        .with_message("synthetic-private-health-value"),
+                );
+            }
+            self.amf
+                .runtime
+                .supervisor()
+                .set_task_ready(&TaskName::new(SESSION_STORE_READINESS_TASK), ready)
+                .await;
+            self.amf.state_notify.notify_waiters();
+        }
+
+        async fn observe_ready_phase(&self) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let changed = self.amf._phase_notify.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if self.amf.runtime.phase().await == RuntimePhase::Ready {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("the original startup deadline bounds readiness promotion");
+        }
+
+        async fn finish(self) {
+            tokio::time::resume();
+            self.amf.runtime.shutdown().await;
+            drop(self.amf);
+            self.cluster.shutdown().await;
+        }
+    }
+
+    async fn startup_fixture() -> StartupFixture {
+        let cluster = ConsensusTestCluster::start(1).await;
+        let alarms = SharedAlarmManager::default();
+        let config_bus = ConfigBus::restore_or_new_with_alarm_manager_dev_only(
+            AmfConfig::default(),
+            Arc::new(InMemoryManagedDatastore::new()),
+            alarms.clone(),
+        )
+        .await
+        .expect("startup fixture config");
+        let kms_provider = Arc::new(KmsKeyProvider::new(
+            "http://127.0.0.1:1".to_string(),
+            None,
+            Duration::from_secs(2),
+        ));
+        let session_store = EncryptingSessionBackend::new(
+            Arc::new(cluster.store(0)),
+            kms_provider.clone(),
+            "startup-fixture",
+        );
+        let phase_notify = Arc::new(Notify::new());
+        let observer = phase_notify.clone();
+        let mut profile = RuntimeProfile::conformance("amf-startup-fixture");
+        profile.shutdown_grace = Duration::from_millis(50);
+        profile.drain_timeout = Duration::from_millis(200);
+        let runtime = Builder::new(profile)
+            .with_phase_observer(move |_| observer.notify_waiters())
+            .try_with_init(|supervisor, shutdown| {
+                Box::pin(async move {
+                    let task_name = TaskName::new(SESSION_STORE_READINESS_TASK);
+                    supervisor
+                        .register(
+                            task_name.clone(),
+                            TaskKind::BackgroundSync,
+                            Criticality::Fatal,
+                            RestartPolicy::no_restart(),
+                        )
+                        .await?;
+                    supervisor.set_readiness_gated(&task_name, true).await;
+                    supervisor
+                        .spawn(
+                            task_name,
+                            TaskKind::BackgroundSync,
+                            Criticality::Fatal,
+                            RestartPolicy::no_restart(),
+                            move || {
+                                let shutdown = shutdown.clone();
+                                Box::pin(async move {
+                                    shutdown.shutdown_acknowledged().await;
+                                    Ok(())
+                                })
+                            },
+                        )
+                        .await?;
+                    Ok(())
+                })
+            })
+            .build()
+            .await
+            .expect("startup fixture runtime");
+        let mut health = HealthModel::new();
+        health.set_startup_in_progress("synthetic-private-startup-value");
+        health.set_config_applied(true);
+        health.set_gate(
+            HealthGate::new(known_gates::SESSION_STORE, GateImpact::BlocksReadiness)
+                .with_status(GateStatus::Unknown)
+                .with_message("synthetic-private-health-value"),
+        );
+        let amf = AmfLite {
+            runtime,
+            config_bus,
+            session_store,
+            alarms,
+            kms_provider,
+            clock: Arc::new(SystemAmfClock),
+            state: Arc::new(RwLock::new(AmfLiteState {
+                config: AmfConfig {
+                    hostname: "synthetic-private-hostname".to_string(),
+                    ..AmfConfig::default()
+                },
+                version: ConfigVersion::INITIAL,
+                health,
+                active_nrf_registration: false,
+                session_store_reason: None,
+            })),
+            state_notify: Arc::new(Notify::new()),
+            _phase_notify: phase_notify,
+            _admin_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        StartupFixture { amf, cluster }
+    }
+
+    async fn assert_startup_observes_ready_event(already_reached_ready: bool) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let fixture = startup_fixture().await;
+        if already_reached_ready {
+            fixture
+                .set_gate(Some(opc_session_store::DurableReadinessState::Ready))
+                .await;
+            fixture.observe_ready_phase().await;
+            fixture
+                .set_gate(Some(opc_session_store::DurableReadinessState::NoQuorum))
+                .await;
+        }
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut waiting = Box::pin(fixture.amf.complete_startup(Duration::from_secs(5)));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await
+        );
+        fixture
+            .set_gate(Some(opc_session_store::DurableReadinessState::Ready))
+            .await;
+        fixture.observe_ready_phase().await;
+        let result = std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx))).await;
+        let elapsed = started.elapsed();
+        drop(waiting);
+        fixture.finish().await;
+        eprintln!("startup readiness event: already_ready={already_reached_ready}, result={result:?}, elapsed={elapsed:?}");
+        assert!(
+            matches!(result, Poll::Ready(Ok(()))),
+            "readiness publication must complete startup without a polling delay: {result:?}"
+        );
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn startup_completion_observes_the_ready_phase_event() {
+        assert_startup_observes_ready_event(false).await;
+    }
+
+    #[tokio::test]
+    async fn startup_completion_observes_a_gate_event_after_ready() {
+        assert_startup_observes_ready_event(true).await;
+    }
+
+    async fn assert_startup_timeout_reports_gate(
+        reason: Option<opc_session_store::DurableReadinessState>,
+        expected_status: &str,
+        expected_reason: &str,
+    ) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let fixture = startup_fixture().await;
+        fixture.set_gate(reason).await;
+        tokio::time::pause();
+        let timeout = Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+        let mut waiting = Box::pin(fixture.amf.complete_startup(timeout));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await
+        );
+        tokio::time::advance(timeout - Duration::from_millis(1)).await;
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(started.elapsed(), timeout);
+        // Publish the still-closed gate at the exact deadline. This observes
+        // the expiry condition without depending on timer-wheel rounding.
+        fixture.set_gate(reason).await;
+        let result = std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx))).await;
+        let shutdown_at_deadline = fixture.amf.runtime.shutdown_token().is_shutdown_requested();
+        let error = match result {
+            Poll::Ready(result) => {
+                drop(waiting);
+                result.expect_err("unfinished startup must time out")
+            }
+            Poll::Pending => waiting.await.expect_err("unfinished startup must time out"),
+        };
+        let message = error.to_string();
+        fixture.finish().await;
+        eprintln!(
+            "startup expiry: shutdown_at_deadline={shutdown_at_deadline}, diagnostic={message}"
+        );
+        assert!(
+            shutdown_at_deadline,
+            "the original five-second deadline must initiate shutdown"
+        );
+        assert!(message.contains("5000 ms"), "{message}");
+        assert!(message.contains("phase=PeerWarmup"), "{message}");
+        assert!(message.contains("readiness=NotReady"), "{message}");
+        assert!(message.contains(expected_status), "{message}");
+        assert!(message.contains(expected_reason), "{message}");
+        assert!(message.len() < 256, "{message}");
+        assert!(!message.contains("synthetic-private"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn startup_completion_timeout_reports_an_unprobed_gate() {
+        assert_startup_timeout_reports_gate(None, "session_store=Unknown", "reason=unprobed").await;
+    }
+
+    #[tokio::test]
+    async fn startup_completion_timeout_reports_the_failed_gate_reason() {
+        assert_startup_timeout_reports_gate(
+            Some(opc_session_store::DurableReadinessState::NoQuorum),
+            "session_store=Failing",
+            "reason=no_quorum",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn startup_completion_accepts_an_already_ready_condition() {
+        let fixture = startup_fixture().await;
+        fixture
+            .set_gate(Some(opc_session_store::DurableReadinessState::Ready))
+            .await;
+        fixture.observe_ready_phase().await;
+        tokio::time::pause();
+        let result = fixture.amf.complete_startup(Duration::ZERO).await;
+        fixture.finish().await;
+        result.expect("an already ready runtime needs no additional event");
     }
 }
