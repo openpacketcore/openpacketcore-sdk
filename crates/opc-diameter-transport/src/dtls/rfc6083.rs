@@ -1073,7 +1073,7 @@ impl Connection {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) async fn wait_for_carrier_terminal_for_test(&self) {
         self.close
             .terminal_changes_for_test()

@@ -261,7 +261,7 @@ pub(crate) trait SctpTransportClose: Send + Sync {
     /// Whether the sealed carrier has observed a terminal transition.
     fn is_closed(&self) -> bool;
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn terminal_changes_for_test(&self) -> tokio::sync::watch::Receiver<()>;
 }
 
@@ -554,6 +554,7 @@ impl SctpTransportClose for InMemoryClose {
         self.shared.closed.load(Ordering::Acquire)
     }
 
+    #[cfg(target_os = "linux")]
     fn terminal_changes_for_test(&self) -> tokio::sync::watch::Receiver<()> {
         self.shared.terminal_changed.subscribe()
     }
@@ -1006,7 +1007,7 @@ impl SctpTransportClose for KernelSctpClose {
         self.terminal.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn terminal_changes_for_test(&self) -> tokio::sync::watch::Receiver<()> {
         self.terminal_changed.subscribe()
     }
