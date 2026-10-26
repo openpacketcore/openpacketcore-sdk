@@ -1,9 +1,5 @@
 use super::*;
-
-// The signed terminal fixture contains no native adapter dependency. Reuse
-// the same canonical V1 evidence for this SQLite lifecycle on every platform.
-#[path = "../../../consensus/native/roster/v1_fixture.rs"]
-mod v1_fixture;
+use crate::consensus::v1_fixture;
 
 fn command(
     storage: SessionConsensusIdentity,
@@ -35,7 +31,7 @@ fn command(
     }
 }
 
-fn apply(
+fn apply_cutover_entries(
     conn: &Connection,
     backend: &SqliteSessionBackend,
     identity: SessionConsensusIdentity,
@@ -187,7 +183,7 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
         if let EntryPayload::Normal(command) = &mut completion.payload {
             command.request_id = terminal.request_id().unwrap();
         }
-        let applied = apply(
+        let applied = apply_cutover_entries(
             &conn,
             &backend,
             storage,
@@ -230,7 +226,7 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
         &successor,
     )
     .expect("stage valid successor scope");
-    apply(
+    apply_cutover_entries(
         &conn,
         &backend,
         storage,
@@ -250,7 +246,7 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
     );
     fence_application_authority_sync(&conn, storage, transition_id, transition_digest)
         .expect("fence predecessor before the membership cutover");
-    apply(
+    apply_cutover_entries(
         &conn,
         &backend,
         storage,
@@ -344,7 +340,7 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
     };
     for intent in intents {
         let is_write = matches!(intent, SessionMutationIntent::AcquireLease { .. });
-        let applied = apply(
+        let applied = apply_cutover_entries(
             &conn,
             &backend,
             storage,
@@ -405,7 +401,7 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
         );
         SessionMutationIntent::AdvanceLogicalTime
     };
-    let activated = apply(
+    let activated = apply_cutover_entries(
         &conn,
         &backend,
         storage,
@@ -421,7 +417,7 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
         "activation resumes bounded reclaim"
     );
     next += 1;
-    let retired = apply(
+    let retired = apply_cutover_entries(
         &conn,
         &backend,
         storage,

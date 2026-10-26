@@ -12,8 +12,7 @@ mod publication;
 mod row;
 pub(in crate::consensus::native) mod store;
 #[cfg(test)]
-#[path = "roster/v1_fixture.rs"]
-pub(crate) mod v1_fixture;
+pub(crate) use crate::consensus::v1_fixture;
 pub(in crate::consensus::native) use commands::validate_activation;
 pub(in crate::consensus::native) use commands::validate_witness;
 pub(crate) use index::Index;
