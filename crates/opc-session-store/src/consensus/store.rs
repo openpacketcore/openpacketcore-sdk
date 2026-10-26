@@ -23133,8 +23133,25 @@ mod membership_tests {
         store: &ConsensusSessionStore,
         start: Timestamp,
         saturation: Option<(&[ConsensusSessionStore], bool)>,
-        sequence: u8,
+        sequence: u16,
     ) {
+        seed_roster_retained_case_with_members(
+            store,
+            start,
+            saturation,
+            sequence,
+            FRESH_ROSTER_MEMBERS,
+        )
+        .await;
+    }
+
+    async fn seed_roster_retained_case_with_members(
+        store: &ConsensusSessionStore,
+        start: Timestamp,
+        saturation: Option<(&[ConsensusSessionStore], bool)>,
+        sequence: u16,
+        member_count: usize,
+    ) -> u64 {
         let identity = store.current_scope().expect("roster scope").0;
         let root = roster_ingress_test_root();
         let key = SessionKey {
@@ -23218,12 +23235,12 @@ mod membership_tests {
                 RosterId::from_bytes({
                     let mut id = [0x51; 16];
                     if sequence > 0 {
-                        id[15] = sequence;
+                        id[14..].copy_from_slice(&sequence.to_be_bytes());
                     }
                     id
                 })
                 .expect("roster ID"),
-                (0..FRESH_ROSTER_MEMBERS)
+                (0..member_count)
                     .map(|ordinal| {
                         Member::new(
                             ordinal as u8,
@@ -23268,7 +23285,9 @@ mod membership_tests {
         let issuer = RosterIngressTestIssuer::new(
             identity,
             Timestamp::from_str("2024-12-31T23:59:59Z").expect("certificate start"),
-            Timestamp::from_str("2025-01-01T00:00:30Z").expect("certificate expiry"),
+            start
+                .add_seconds(30)
+                .expect("certificate expiry after this signed terminal"),
         );
         let peer_identity_commitment =
             session_consumer_identity_commitment(authorization.identity());
@@ -23277,7 +23296,7 @@ mod membership_tests {
         let admission_request_id = SessionConsumerRequestId::from_bytes({
             let mut id = [0x55; 16];
             if sequence > 0 {
-                id[15] = sequence;
+                id[14..].copy_from_slice(&sequence.to_be_bytes());
             }
             id
         });
@@ -23407,7 +23426,7 @@ mod membership_tests {
         let terminal_request_id = SessionConsumerRequestId::from_bytes({
             let mut id = [0x56; 16];
             if sequence > 0 {
-                id[15] = sequence;
+                id[14..].copy_from_slice(&sequence.to_be_bytes());
             }
             id
         });
@@ -23478,6 +23497,7 @@ mod membership_tests {
         assert_eq!(occupancy.occupancy_valid, 1);
         assert_eq!(occupancy.live_reservations, 0);
         assert_eq!(occupancy.retained_reservations, u64::from(sequence) + 1);
+        binding.history_epoch()
     }
 
     pub(super) async fn assert_roster_maintenance_without_ordinary_traffic(
@@ -23573,6 +23593,82 @@ mod membership_tests {
             "due rows are reclaimed during steady arrivals"
         );
         assert!(retired_during_arrivals, "signed history must retire while rows continuously become due: retained={}, tombstones={}", snapshot.retained_reservations, snapshot.tombstone_reservations);
+    }
+
+    pub(super) async fn assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second(
+        store: &ConsensusSessionStore,
+        clock: &MutableClock,
+        start: Timestamp,
+    ) {
+        const RATE: u16 = 10;
+        const SECONDS: u16 = 180;
+        const ROWS: u16 = RATE * SECONDS;
+        // Four tick buckets permit scheduler jitter, but cannot hide the
+        // eight-row-per-second growth caused by one-epoch retirement.
+        const STEADY_BOUND: u64 = RATE as u64 * 4;
+        let at = |millis: i64| {
+            Timestamp::from_offset_datetime(
+                *start.as_offset_datetime() + time::Duration::milliseconds(millis),
+            )
+        };
+        let mut previous_epoch = 0;
+        for sequence in 0..ROWS {
+            let terminal_time = at((i64::from(sequence) + 1) * 100);
+            clock.set(terminal_time);
+            // One real member keeps the workload about roster history; all
+            // Q1/Q2 ingress, provider, executor and replicated apply checks run.
+            let epoch =
+                seed_roster_retained_case_with_members(store, terminal_time, None, sequence, 1)
+                    .await;
+            assert!(
+                epoch > previous_epoch,
+                "every admission owns its distinct Raft-log history epoch"
+            );
+            previous_epoch = epoch;
+            if (sequence + 1) % 300 == 0 {
+                eprintln!(
+                    "roster sustained seed: {}/{ROWS}, last_epoch={epoch}",
+                    sequence + 1
+                );
+            }
+        }
+        let before = store.protected_roster_diagnostic_snapshot();
+        assert_eq!(before.retained_reservations, u64::from(ROWS));
+        let first_log = store.inner.raft.metrics().borrow().last_log_index.unwrap();
+        let mut peak_due = 0;
+        let mut peak_tombstones = 0;
+        // This is three minutes of real maintenance-lane time. No unrelated
+        // mutations can donate extra turns; only signed history becomes due.
+        for second in 1..=SECONDS {
+            clock.set(at(86_400_000 + i64::from(second) * 1000));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let snapshot = store.protected_roster_diagnostic_snapshot();
+            assert_eq!(snapshot.occupancy_valid, 1);
+            assert_eq!(snapshot.live_reservations, 0);
+            let reclaimed = u64::from(ROWS) - snapshot.retained_reservations;
+            let due = u64::from(second * RATE);
+            assert!(
+                reclaimed <= due,
+                "young rows remain retained until their exact boundary"
+            );
+            let backlog = due - reclaimed;
+            peak_due = peak_due.max(backlog);
+            peak_tombstones = peak_tombstones.max(snapshot.tombstone_reservations);
+            if second % 30 == 0 {
+                eprintln!("roster sustained load: second={second}, due={due}, backlog={backlog}, tombstones={}", snapshot.tombstone_reservations);
+            }
+        }
+        let after = store.protected_roster_diagnostic_snapshot();
+        let commands = store.inner.raft.metrics().borrow().last_log_index.unwrap() - first_log;
+        let reclaimed = u64::from(ROWS) - after.retained_reservations;
+        let retired = reclaimed - after.tombstone_reservations;
+        assert!(
+            reclaimed + retired <= commands * crate::fenced_mutation_roster::RECLAIM_BATCH as u64,
+            "the lane retains the existing per-command row bound"
+        );
+        assert!(peak_due <= STEADY_BOUND && peak_tombstones <= STEADY_BOUND,
+            "ten due rows/second must stay bounded through {SECONDS}s: peak_due={peak_due}, peak_tombstones={peak_tombstones}, bound={STEADY_BOUND}, final_due={}, final_tombstones={}, commands={commands}",
+            after.retained_reservations, after.tombstone_reservations);
     }
 
     #[tokio::test]

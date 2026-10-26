@@ -614,14 +614,15 @@ mod tests {
         async fn propose(&self) -> Option<RosterMaintenanceOutcome> {
             // Model sixteen history completions at half-second intervals
             // become eligible exactly 24 hours later, at the same rate. Model
-            // both backends' existing reclaim-first, one-action command seam.
+            // one bounded phase per command and one unique admission epoch
+            // per partition, including the conservative one-epoch retire cap.
             let due = (self.start.elapsed().as_millis() / 500).min(16) as u64;
             let mut state = self.state.lock().unwrap();
             state.2 += 1;
-            if state.0 < due {
+            if state.1 < state.0 {
+                state.1 += 1;
+            } else if state.0 < due {
                 state.0 = due;
-            } else if state.1 < state.0 {
-                state.1 = state.0;
             } else {
                 return Some(RosterMaintenanceOutcome::Idle);
             }

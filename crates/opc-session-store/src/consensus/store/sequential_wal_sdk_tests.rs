@@ -1651,3 +1651,47 @@ async fn assert_signed_roster_steady_retirement(native: bool) {
     fleet.close().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second() {
+    assert_signed_roster_sustained_retirement(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_maintenance_native_keeps_up_with_ten_due_rows_per_second() {
+    assert_signed_roster_sustained_retirement(true).await;
+}
+
+async fn assert_signed_roster_sustained_retirement(native: bool) {
+    use super::membership_tests::{
+        assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second, roster_ingress_test_root,
+        MutableClock,
+    };
+    use std::str::FromStr;
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let start = opc_types::Timestamp::from_str("2025-01-01T00:00:00Z").unwrap();
+    let clock = Arc::new(MutableClock::new(start));
+    let mut fleet = Fleet::new_roster_production(
+        "roster-sustained-maintenance",
+        native,
+        roster_ingress_test_root(),
+    );
+    fleet.clock = Some(clock.clone());
+    fleet.open().await;
+    let result = AssertUnwindSafe(async {
+        let leader = fleet
+            .stores
+            .iter()
+            .find(|store| {
+                store.inner.raft.metrics().borrow().current_leader
+                    == Some(store.inner.local_node_id)
+            })
+            .unwrap();
+        assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second(leader, &clock, start)
+            .await;
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
