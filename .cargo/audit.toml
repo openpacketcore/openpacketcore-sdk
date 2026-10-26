@@ -31,8 +31,10 @@
 # A crypto-bigint 0.5.5 copy remains only in the audited vendored DTLS fork
 # (dimpl 0.7.2 -> p256/p384 0.13 -> elliptic-curve 0.13.8) consumed by
 # opc-diameter-transport; no 0.5.x fix exists and the fork's rust-crypto backend
-# has not migrated. This is an explicit, scoped risk acceptance: exploiting
-# it needs a local timing oracle against the DTLS certificate ECDSA path.
-# Upgrading the fork's RustCrypto stack is tracked as follow-up.
+# has not migrated. It serves DTLS key agreement and certificate signing.
+# Observable timing leakage depends on the algorithm, compiler and target;
+# remote exploitability has not been ruled out. Upgrading the fork's RustCrypto
+# stack is tracked as follow-up. The security workflow checks every tracked
+# lockfile and confines this ID-wide ignore to that exact version and path.
 # Mirror of deny.toml — keep the two in sync.
 ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0235", "RUSTSEC-2026-0386", "RUSTSEC-2026-0387"]
