@@ -1046,6 +1046,20 @@ impl State {
             .into());
         }
 
+        let requested =
+            select_certificate_request_sig_algs(server.client_signature_algorithms.as_ref());
+        let requested = if requested.is_empty() {
+            SignatureAndHashAlgorithm::supported().as_slice()
+        } else {
+            requested.as_slice()
+        };
+        if !requested.contains(&signature_algorithm) {
+            return Err(Error::SecurityError(
+                crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm,
+            )
+            .into());
+        }
+
         // Create temp DigitallySigned for verification
         let temp_signed = crate::dtls12::message::DigitallySigned {
             algorithm: signature_algorithm,
@@ -1398,8 +1412,7 @@ fn handshake_create_server_key_exchange(
     let key_exchange_algorithm = cipher_suite.as_key_exchange_algorithm();
     debug!("Using key exchange algorithm: {:?}", key_exchange_algorithm);
 
-    // Use hash part from selected algorithm
-    let hash_alg = algorithm.hash;
+    let hash_alg = algorithm.hash_algorithm();
 
     match key_exchange_algorithm {
         KeyExchangeAlgorithm::EECDH => {
@@ -1433,7 +1446,7 @@ fn handshake_create_server_key_exchange(
             trace!("SKE signature hash: {:?}", hash_alg);
             engine
                 .crypto_context
-                .sign_data(&signed_data, hash_alg, &mut signature)
+                .sign_data(&signed_data, algorithm, &mut signature)
                 .map_err(Error::CryptoError)?;
 
             // unwrap: safe because init_ecdh_server() above sets key_exchange = Some(...).
@@ -1468,9 +1481,7 @@ fn handshake_serialize_certificate_request(
     body: &mut Buf,
     sig_algs: &SignatureAndHashAlgorithmVec,
 ) -> Result<(), Error> {
-    // Only advertise ECDSA_SIGN (the only supported client cert type)
-    let mut cert_types = CertificateTypeVec::new();
-    cert_types.push(ClientCertificateType::ECDSA_SIGN);
+    let cert_types = CertificateTypeVec::from(*ClientCertificateType::supported());
 
     // If intersection is empty (e.g., client didn't advertise), fall back to our supported set
     // Build the selected list with the capacity expected by CertificateRequest
@@ -1531,10 +1542,11 @@ fn select_ske_signature_algorithm(
             if !supported_hashes.contains(h) {
                 continue;
             }
-            if let Some(chosen) = list
-                .iter()
-                .find(|alg| alg.signature == our_sig && alg.hash == *h)
-            {
+            if let Some(chosen) = SignatureAndHashAlgorithm::supported().iter().find(|alg| {
+                list.contains(alg)
+                    && alg.signature_algorithm() == our_sig
+                    && alg.hash_algorithm() == *h
+            }) {
                 return Some(*chosen);
             }
         }
@@ -1958,7 +1970,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_request_does_not_select_rsa_signatures() {
+    fn certificate_request_selects_rsa_and_ecdsa_signatures() {
         let mut client = SignatureAndHashAlgorithmVec::new();
         client.push(SignatureAndHashAlgorithm::new(
             HashAlgorithm::SHA256,
@@ -1971,13 +1983,14 @@ mod tests {
 
         let selected = select_certificate_request_sig_algs(Some(&client));
 
-        assert_eq!(selected.len(), 1);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[1], client[1]);
         assert_eq!(selected[0].signature, SignatureAlgorithm::ECDSA);
         assert_eq!(selected[0].hash, HashAlgorithm::SHA256);
     }
 
     #[test]
-    fn certificate_request_rejects_rsa_only_signatures() {
+    fn certificate_request_accepts_rsa_only_signatures() {
         let mut client = SignatureAndHashAlgorithmVec::new();
         client.push(SignatureAndHashAlgorithm::new(
             HashAlgorithm::SHA256,
@@ -1986,7 +1999,35 @@ mod tests {
 
         let selected = select_certificate_request_sig_algs(Some(&client));
 
-        assert!(selected.is_empty());
+        assert_eq!(selected, client);
+    }
+
+    #[test]
+    fn certificate_verify_must_use_a_requested_scheme() {
+        let config = Arc::new(Config::builder().build().unwrap());
+        let mut server = Server::new_psk(config, Instant::now());
+        server.client_certificates.push(vec![0x01].to_buf());
+        let mut offered = SignatureAndHashAlgorithmVec::new();
+        offered.push(SignatureAndHashAlgorithm::new(
+            HashAlgorithm::SHA256,
+            SignatureAlgorithm::ECDSA,
+        ));
+        server.client_signature_algorithms = Some(offered);
+        server
+            .engine
+            .parse_packet(&epoch0_handshake_packet(
+                MessageType::CertificateVerify,
+                0,
+                &[4, 1, 0, 1, 0],
+            ))
+            .unwrap();
+        let result = State::AwaitCertificateVerify.await_certificate_verify(&mut server);
+        assert!(matches!(
+            result,
+            Err(InternalError::Fatal(Error::SecurityError(
+                crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm
+            )))
+        ));
     }
 
     #[test]

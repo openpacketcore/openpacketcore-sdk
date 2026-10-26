@@ -173,13 +173,30 @@ fn identity_state_with_validity_and_trust(
     not_before: time::OffsetDateTime,
     not_after: time::OffsetDateTime,
 ) -> IdentityState {
+    identity_state_with_key(
+        spiffe_id,
+        ca,
+        trusted_certificates,
+        not_before,
+        not_after,
+        rcgen::KeyPair::generate().expect("generate leaf key"),
+    )
+}
+
+fn identity_state_with_key(
+    spiffe_id: &str,
+    ca: &TestCa,
+    trusted_certificates: Vec<CertificateDer<'static>>,
+    not_before: time::OffsetDateTime,
+    not_after: time::OffsetDateTime,
+    key: rcgen::KeyPair,
+) -> IdentityState {
     let mut parameters = rcgen::CertificateParams::default();
     parameters.subject_alt_names.push(rcgen::SanType::URI(
         rcgen::string::Ia5String::try_from(spiffe_id).expect("valid SPIFFE URI"),
     ));
     parameters.not_before = not_before;
     parameters.not_after = not_after;
-    let key = rcgen::KeyPair::generate().expect("generate leaf key");
     let certificate = parameters.signed_by(&key, ca).expect("sign test leaf");
     let mut bundles = TrustBundleSet::new();
     bundles.insert(TrustBundle {
@@ -216,6 +233,77 @@ pub(crate) fn dtls_material() -> TestMaterial {
         _server_source: server_source,
         client_controller,
         server_controller,
+    }
+}
+
+fn rsa_dtls_material() -> TestMaterial {
+    let ca = test_ca();
+    let now = time::OffsetDateTime::now_utc();
+    let state = |id| {
+        let der = PrivatePkcs8KeyDer::from(
+            include_bytes!("../../opc-proto-ikev2/tests/data/rsa2048_pkcs8.der").as_slice(),
+        );
+        let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&der, &rcgen::PKCS_RSA_SHA256)
+            .expect("synthetic RSA leaf");
+        identity_state_with_key(
+            id,
+            &ca,
+            vec![ca.der().clone()],
+            now - time::Duration::minutes(1),
+            now + time::Duration::hours(1),
+            key,
+        )
+    };
+    let (client_source, client_rx) = watch::channel(Some(state(CLIENT_ID)));
+    let (_server_source, server_rx) = watch::channel(Some(state(SERVER_ID)));
+    TestMaterial {
+        client_source,
+        _server_source,
+        client_controller: material_controller(&client_rx, CLIENT_ID),
+        server_controller: material_controller(&server_rx, SERVER_ID),
+        _ca: ca,
+    }
+}
+
+#[tokio::test]
+async fn rsa_leaf_suites_carry_diameter_with_bound_identity_and_sctp_auth() {
+    for cipher in [
+        DtlsSctpCipher::EcdheRsaAes128GcmSha256,
+        DtlsSctpCipher::EcdheRsaAes256GcmSha384,
+    ] {
+        let material = rsa_dtls_material();
+        let policy = DtlsSctpPolicy::default()
+            .with_allowed_ciphers(&[cipher])
+            .unwrap();
+        let (mut client, mut server, log) = establish_pair(&material, policy, policy)
+            .await
+            .expect("RSA leaf handshake");
+        assert_eq!(client.evidence().cipher(), cipher);
+        assert_eq!(server.evidence().cipher(), cipher);
+        assert_rfc6083_auth_epoch_boundary(&log);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        negotiate_capabilities(&mut client, &mut server, deadline).await;
+        let request = application_request();
+        let (sent, received) = tokio::join!(
+            client.send_message(&request, deadline),
+            server.receive_message(deadline)
+        );
+        assert!(sent.unwrap().is_protected());
+        assert_eq!(received.unwrap().0, request);
+        let (sent, received) = tokio::join!(
+            server.send_message(&request, deadline),
+            client.receive_message(deadline)
+        );
+        assert!(sent.unwrap().is_protected());
+        assert_eq!(received.unwrap().0, request);
+        assert_wire_records_only_ppid47(&log);
+        let (closed, peer) = tokio::join!(client.close(deadline), server.receive_message(deadline));
+        closed.expect("RSA protected reciprocal close");
+        assert!(peer.is_err());
+        let ecdsa_only = DtlsSctpPolicy::default()
+            .with_allowed_ciphers(&[DtlsSctpCipher::Aes128GcmSha256])
+            .unwrap();
+        assert!(establish_pair(&material, policy, ecdsa_only).await.is_err());
     }
 }
 
@@ -636,6 +724,17 @@ async fn explicit_close_fails_instead_of_discarding_preceding_application_data()
 #[tokio::test]
 #[ignore = "requires Linux kernel SCTP-AUTH and sender-dry support"]
 async fn kernel_loopback_completes_real_rfc6083_handshake_and_reciprocal_close() {
+    for cipher in [
+        None,
+        Some(DtlsSctpCipher::EcdheRsaAes128GcmSha256),
+        Some(DtlsSctpCipher::EcdheRsaAes256GcmSha384),
+    ] {
+        kernel_rfc6083_handshake(cipher).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn kernel_rfc6083_handshake(cipher: Option<DtlsSctpCipher>) {
     let authentication = opc_sctp::SctpAuthenticationConfig::data();
     let mut server_config =
         opc_sctp::SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().expect("loopback address"));
@@ -663,9 +762,19 @@ async fn kernel_loopback_completes_real_rfc6083_handshake_and_reciprocal_close()
     let server_io = crate::KernelSctpMessageIo::new(server_association, 64)
         .expect("bind server kernel adapter");
 
-    let material = dtls_material();
-    let acceptor = acceptor(&material, expected(CLIENT_ID), DtlsSctpPolicy::default());
-    let connector = connector(&material, expected(SERVER_ID), DtlsSctpPolicy::default());
+    let material = if cipher.is_some() {
+        rsa_dtls_material()
+    } else {
+        dtls_material()
+    };
+    let policy = match cipher {
+        Some(cipher) => DtlsSctpPolicy::default()
+            .with_allowed_ciphers(&[cipher])
+            .unwrap(),
+        None => DtlsSctpPolicy::default(),
+    };
+    let acceptor = acceptor(&material, expected(CLIENT_ID), policy);
+    let connector = connector(&material, expected(SERVER_ID), policy);
     let deadline = Instant::now() + Duration::from_secs(15);
     let server = tokio::spawn(async move {
         acceptor
@@ -688,6 +797,10 @@ async fn kernel_loopback_completes_real_rfc6083_handshake_and_reciprocal_close()
         .await
         .expect("join kernel acceptor")
         .expect("complete server RFC 6083 handshake");
+    if let Some(cipher) = cipher {
+        assert_eq!(client.evidence().cipher(), cipher);
+        assert_eq!(server.evidence().cipher(), cipher);
+    }
     negotiate_capabilities(&mut client, &mut server, deadline).await;
     let request = application_request();
     let (sent, received) = tokio::join!(

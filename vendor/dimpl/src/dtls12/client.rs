@@ -67,7 +67,7 @@ pub struct Client {
     defragment_buffer: Buf,
 
     /// Whether we requested a CertificateVerify
-    certificate_verify: bool,
+    certificate_verify: Option<SignatureAndHashAlgorithm>,
 
     /// Captured session hash for Extended Master Secret (RFC 7627)
     /// This is captured after ServerHelloDone to include the correct handshake messages
@@ -131,7 +131,7 @@ impl Client {
             server_random: None,
             server_certificates: Vec::with_capacity(3),
             defragment_buffer: Buf::new(),
-            certificate_verify: false,
+            certificate_verify: None,
             captured_session_hash: None,
             last_now: now,
             local_events: VecDeque::new(),
@@ -195,7 +195,7 @@ impl Client {
             server_random: None,
             server_certificates: Vec::with_capacity(3),
             defragment_buffer: Buf::new(),
-            certificate_verify: false,
+            certificate_verify: None,
             captured_session_hash: None,
             last_now: now,
             local_events: VecDeque::new(),
@@ -240,7 +240,7 @@ impl Client {
         self.cookie = None;
         self.server_random = None;
         self.server_certificates.clear();
-        self.certificate_verify = false;
+        self.certificate_verify = None;
         self.state = State::SendClientHello;
         Ok(())
     }
@@ -811,12 +811,12 @@ impl State {
 
         // Ensure the signature algorithm is compatible with the cipher suite
         if let Some(expected_sig) = cipher_suite.signature_algorithm()
-            && signature_algorithm.signature != expected_sig
+            && signature_algorithm.signature_algorithm() != expected_sig
         {
             return Err(
                 Error::CryptoError(crate::CryptoError::SignatureAlgorithmMismatch {
                     expected: expected_sig,
-                    actual: signature_algorithm.signature,
+                    actual: signature_algorithm.signature_algorithm(),
                 })
                 .into(),
             );
@@ -934,31 +934,32 @@ impl State {
             return Err(InternalError::handshake_body_type_mismatch());
         };
 
-        // Check that the hash algorithm that is default fo the PrivateKey in use
-        // is one of the supported by the CertificateRequest
-        // unwrap: CertificateRequest only received for certificate-based suites
-        let hash_algorithm = client
-            .engine
-            .crypto_context()
-            .private_key_default_hash_algorithm()
-            .ok_or(Error::CryptoError(
-                crate::CryptoError::NoPrivateKeyConfigured,
-            ))?;
-
-        if !cr.supports_hash_algorithm(hash_algorithm) {
-            return Err(Error::CertificateError(
-                crate::CertificateError::UnsupportedHashAlgorithm(hash_algorithm),
+        let context = client.engine.crypto_context();
+        let cert_type = match context.signature_algorithm() {
+            Some(crate::types::SignatureAlgorithm::RSA) => {
+                crate::dtls12::message::ClientCertificateType::RSA_SIGN
+            }
+            Some(crate::types::SignatureAlgorithm::ECDSA) => {
+                crate::dtls12::message::ClientCertificateType::ECDSA_SIGN
+            }
+            _ => return Err(Error::CryptoError(crate::CryptoError::NoPrivateKeyConfigured).into()),
+        };
+        if !cr.certificate_types.contains(&cert_type) {
+            return Err(Error::SecurityError(
+                crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm,
             )
             .into());
         }
-
-        debug!(
-            "Server supports CertificateVerify hash algorithm: {:?}",
-            hash_algorithm
-        );
-
-        debug!("Received CertificateRequest; enabling client authentication path");
-        client.certificate_verify = true;
+        let algorithm = SignatureAndHashAlgorithm::supported()
+            .iter()
+            .copied()
+            .find(|alg| {
+                cr.supported_signature_algorithms.contains(alg) && context.supports_signature(*alg)
+            })
+            .ok_or(Error::SecurityError(
+                crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm,
+            ))?;
+        client.certificate_verify = Some(algorithm);
 
         Ok(Self::AwaitServerHelloDone)
     }
@@ -988,7 +989,8 @@ impl State {
             return Ok(Self::SendClientKeyExchange);
         }
 
-        if client.engine.config().require_server_certificate_request() && !client.certificate_verify
+        if client.engine.config().require_server_certificate_request()
+            && client.certificate_verify.is_none()
         {
             return Err(Error::SecurityError(
                 crate::SecurityError::ServerDidNotRequestClientCertificate,
@@ -1009,7 +1011,7 @@ impl State {
             client.local_events.push_back(LocalEvent::PeerCert);
         }
 
-        if client.certificate_verify {
+        if client.certificate_verify.is_some() {
             Ok(Self::SendCertificate)
         } else {
             Ok(Self::SendClientKeyExchange)
@@ -1034,7 +1036,7 @@ impl State {
         trace!("Sending ClientKeyExchange");
 
         // Start/restart flight timer only if this flight did not start with Certificate
-        if !client.certificate_verify {
+        if client.certificate_verify.is_none() {
             client.engine.flight_begin(5);
         }
 
@@ -1058,7 +1060,7 @@ impl State {
         client.engine.transcript_hash(suite_hash, &mut buf);
         client.captured_session_hash = Some(buf);
 
-        if client.certificate_verify {
+        if client.certificate_verify.is_some() {
             Ok(Self::SendCertificateVerify)
         } else {
             Ok(Self::SendChangeCipherSpec)
@@ -1068,11 +1070,15 @@ impl State {
     fn send_certificate_verify(self, client: &mut Client) -> Result<Self, InternalError> {
         debug!("Sending CertificateVerify");
 
+        let algorithm = client.certificate_verify.ok_or(Error::SecurityError(
+            crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm,
+        ))?;
         // Send the certificate verify message
-        client.engine.create_handshake(
-            MessageType::CertificateVerify,
-            handshake_create_certificate_verify,
-        )?;
+        client
+            .engine
+            .create_handshake(MessageType::CertificateVerify, |body, engine| {
+                handshake_create_certificate_verify(body, engine, algorithm)
+            })?;
 
         Ok(Self::SendChangeCipherSpec)
     }
@@ -1528,41 +1534,18 @@ fn handshake_create_client_key_exchange(body: &mut Buf, engine: &mut Engine) -> 
     Ok(())
 }
 
-fn handshake_create_certificate_verify(body: &mut Buf, engine: &mut Engine) -> Result<(), Error> {
-    // The hash algorithm to use is the default for the private key type, not
-    // the one negotiated to use with the selected cipher suite. I.e.
-    // if we negotiate ECDHE_ECDSA_AES256_GCM_SHA384, we are gogin to use
-    // SHA384 for the signature of the main crypto, but not for CertificateVerify
-    // where a private key using P256 curve means we use SHA256.
-    // unwrap: CertificateVerify only sent for certificate-based suites
-    let hash_alg = engine
-        .crypto_context()
-        .private_key_default_hash_algorithm()
-        .ok_or(Error::CryptoError(
-            crate::CryptoError::NoPrivateKeyConfigured,
-        ))?;
-    debug!("Using hash algorithm for signature: {:?}", hash_alg);
-
-    // Get the signature algorithm type
-    // unwrap: CertificateVerify only sent for certificate-based suites
-    let sig_alg = engine
-        .crypto_context()
-        .signature_algorithm()
-        .ok_or(Error::CryptoError(
-            crate::CryptoError::NoPrivateKeyConfigured,
-        ))?;
-    debug!("Using signature algorithm: {:?}", sig_alg);
-
-    // Create the signature algorithm
-    let algorithm = SignatureAndHashAlgorithm::new(hash_alg, sig_alg);
-
+fn handshake_create_certificate_verify(
+    body: &mut Buf,
+    engine: &mut Engine,
+    algorithm: SignatureAndHashAlgorithm,
+) -> Result<(), Error> {
     let mut signature = engine.pop_buffer();
 
     // Sign all handshake messages
     let handshake_data = &engine.transcript;
     engine
         .crypto_context
-        .sign_data(handshake_data, hash_alg, &mut signature)
+        .sign_data(handshake_data, algorithm, &mut signature)
         .map_err(Error::CryptoError)?;
 
     debug!("Generated signature size: {} bytes", signature.len());
@@ -1763,6 +1746,56 @@ mod tests {
             err,
             crate::InternalError::Fatal(Error::CertificateError(_))
         ));
+    }
+
+    #[test]
+    fn certificate_request_requires_the_full_signature_and_certificate_type() {
+        for (cert_type, scheme, accepted) in [
+            (64, 0x0403_u16, true),
+            (1, 0x0403, false),
+            (64, 0x0401, false),
+            (64, 0x0203, false),
+        ] {
+            let config = Arc::new(Config::builder().build().unwrap());
+            let group =
+                openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1).unwrap();
+            let ec = openssl::ec::EcKey::generate(&group).unwrap();
+            let key = openssl::pkey::PKey::from_ec_key(ec).unwrap();
+            let private_key = config
+                .crypto_provider()
+                .key_provider
+                .load_private_key(&key.private_key_to_pkcs8().unwrap())
+                .unwrap();
+            let auth = AuthMode::Certificate {
+                certificates: vec![vec![1]],
+                private_key,
+            };
+            let mut client = Client::new_with_engine(Engine::new(config, auth), Instant::now());
+            let mut body = vec![1, cert_type, 0, 2];
+            body.extend_from_slice(&scheme.to_be_bytes());
+            body.extend_from_slice(&[0, 0]);
+            client
+                .engine
+                .parse_packet(&epoch0_handshake_packet(
+                    MessageType::CertificateRequest,
+                    0,
+                    &body,
+                ))
+                .unwrap();
+            let result = State::AwaitCertificateRequest.await_certificate_request(&mut client);
+            if accepted {
+                assert!(matches!(result, Ok(State::AwaitServerHelloDone)));
+                assert_eq!(client.certificate_verify.unwrap().as_u16(), scheme);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(InternalError::Fatal(Error::SecurityError(
+                        crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm
+                    )))
+                ));
+                assert_eq!(client.certificate_verify, None);
+            }
+        }
     }
 
     #[test]

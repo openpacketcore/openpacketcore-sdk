@@ -165,11 +165,11 @@ impl Cipher for ChaCha20Poly1305Cipher {
 
 /// TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 cipher suite.
 #[derive(Debug)]
-struct Aes128GcmSha256;
+struct Aes128GcmSha256(Dtls12CipherSuite);
 
 impl SupportedDtls12CipherSuite for Aes128GcmSha256 {
     fn suite(&self) -> Dtls12CipherSuite {
-        Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+        self.0
     }
 
     fn hash_algorithm(&self) -> HashAlgorithm {
@@ -195,11 +195,11 @@ impl SupportedDtls12CipherSuite for Aes128GcmSha256 {
 
 /// TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 cipher suite.
 #[derive(Debug)]
-struct Aes256GcmSha384;
+struct Aes256GcmSha384(Dtls12CipherSuite);
 
 impl SupportedDtls12CipherSuite for Aes256GcmSha384 {
     fn suite(&self) -> Dtls12CipherSuite {
-        Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
+        self.0
     }
 
     fn hash_algorithm(&self) -> HashAlgorithm {
@@ -286,8 +286,14 @@ impl SupportedDtls12CipherSuite for PskAes128Ccm8 {
 }
 
 /// Static instances of supported DTLS 1.2 cipher suites.
-static AES_128_GCM_SHA256: Aes128GcmSha256 = Aes128GcmSha256;
-static AES_256_GCM_SHA384: Aes256GcmSha384 = Aes256GcmSha384;
+static AES_128_GCM_SHA256: Aes128GcmSha256 =
+    Aes128GcmSha256(Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256);
+static RSA_AES_128_GCM_SHA256: Aes128GcmSha256 =
+    Aes128GcmSha256(Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256);
+static AES_256_GCM_SHA384: Aes256GcmSha384 =
+    Aes256GcmSha384(Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384);
+static RSA_AES_256_GCM_SHA384: Aes256GcmSha384 =
+    Aes256GcmSha384(Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384);
 static CHACHA20_POLY1305_SHA256: ChaCha20Poly1305Sha256 = ChaCha20Poly1305Sha256;
 static PSK_AES_128_CCM_8: PskAes128Ccm8 = PskAes128Ccm8;
 
@@ -296,6 +302,8 @@ pub(super) static ALL_CIPHER_SUITES: &[&dyn SupportedDtls12CipherSuite] = &[
     &AES_128_GCM_SHA256,
     &AES_256_GCM_SHA384,
     &CHACHA20_POLY1305_SHA256,
+    &RSA_AES_128_GCM_SHA256,
+    &RSA_AES_256_GCM_SHA384,
     &PSK_AES_128_CCM_8,
 ];
 

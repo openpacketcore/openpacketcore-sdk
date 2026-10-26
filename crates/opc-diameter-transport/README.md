@@ -100,13 +100,17 @@ for the exact crash cut, credential handling and remaining limits.
   ordered stream zero and retain its head-of-line blocking tradeoff. The
   generic RFC 6083 API retains its explicitly configured ordered-stream policy.
 - The DTLS engine is the audited workspace-vendored `dimpl` fork, compiled
-  only with its pure-Rust `rust-crypto` provider. The transport selects that
+  with its `rust-crypto` provider (RustCrypto EC/record operations and ring
+  RSA signatures). The transport selects that
   provider explicitly, so a process-global `dimpl` default installed by
   unrelated code cannot replace its crypto authority. Its RFC 6083 profile
   is DTLS-1.2-only, disables datagram replay filtering and flight
   retransmission in favor of reliable SCTP, and admits the typed
-  ECDHE-ECDSA AES-GCM and ChaCha20-Poly1305 suites reported in connection
-  evidence.
+  ECDHE-ECDSA AES-GCM and ChaCha20-Poly1305 suites by default. RSA leaf
+  certificates can use `EcdheRsaAes128GcmSha256` or `EcdheRsaAes256GcmSha384`
+  through `with_allowed_ciphers`; RSA-PSS-RSAE is preferred over PKCS#1,
+  with SHA-256/384 only. Connection evidence records the negotiated suite.
+  The separate `NdsAfEcdsa` certificate profile remains ECDSA-only.
 - Complete peer certificate chains are bounded, checked for leaf-to-root
   order, validated with rustls-webpki against trust anchors scoped to the
   expected SPIFFE trust domain, and required to contain the exact configured

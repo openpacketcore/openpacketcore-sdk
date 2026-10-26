@@ -39,7 +39,15 @@ impl OsslDtlsImpl {
         cert: OsslDtlsCert,
         groups_list: Option<&str>,
     ) -> Result<Self, CryptoError> {
-        let context = dtls_create_ctx_with_groups(&cert, groups_list)?;
+        Self::new_with_algorithms(cert, groups_list, None)
+    }
+
+    pub fn new_with_algorithms(
+        cert: OsslDtlsCert,
+        groups_list: Option<&str>,
+        sigalgs: Option<&str>,
+    ) -> Result<Self, CryptoError> {
+        let context = dtls_create_ctx_with_algorithms(&cert, groups_list, sigalgs)?;
         let ssl = dtls_ssl_create(&context)?;
         Ok(OsslDtlsImpl {
             _cert: cert,
@@ -148,6 +156,14 @@ pub fn dtls_create_ctx_with_groups(
     cert: &OsslDtlsCert,
     groups_list: Option<&str>,
 ) -> Result<SslContext, CryptoError> {
+    dtls_create_ctx_with_algorithms(cert, groups_list, None)
+}
+
+fn dtls_create_ctx_with_algorithms(
+    cert: &OsslDtlsCert,
+    groups_list: Option<&str>,
+    sigalgs: Option<&str>,
+) -> Result<SslContext, CryptoError> {
     // TODO: Technically we want to disallow DTLS < 1.2, but that requires
     // us to use this commented out unsafe. We depend on browsers disallowing
     // it instead.
@@ -155,6 +171,9 @@ pub fn dtls_create_ctx_with_groups(
     let mut ctx = SslContextBuilder::new(SslMethod::dtls())?;
 
     ctx.set_cipher_list(DTLS_CIPHERS)?;
+    if let Some(sigalgs) = sigalgs {
+        ctx.set_sigalgs_list(sigalgs)?;
+    }
     if let Some(groups) = groups_list {
         ctx.set_groups_list(groups)?;
     }

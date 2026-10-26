@@ -181,7 +181,7 @@ impl DiameterTlsPolicy {
     ///
     /// The supplied `opc-tls` config must also enable `with_compat_mode(true)`.
     /// TLS 1.3 remains preferred. Static RSA, CBC and obsolete versions are not
-    /// admitted. This subset does not include the TS 33.210 DHE-RSA suite.
+    /// admitted. DHE uses the RFC 7919 FFDHE4096/2048 groups.
     pub const fn tls12_compatibility(frame_limits: DiameterFrameLimits) -> Self {
         Self {
             version: DiameterTlsVersion::Tls12,

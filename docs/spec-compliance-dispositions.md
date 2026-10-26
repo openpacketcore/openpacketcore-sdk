@@ -92,7 +92,18 @@ signature/PRF/record algorithms and constant-time `crypto-bigint` arithmetic
 with fixed 512-bit ephemeral exponents. Named safe-prime public-key checks
 follow [RFC 7919 §§5.1–5.2](https://www.rfc-editor.org/rfc/rfc7919.html#section-5.1);
 custom groups and sub-2048-bit groups are unsupported. This software path
-makes no validated-module claim. DTLS cipher findings keep #1353 open.
+makes no validated-module claim.
+
+DTLS 1.2 now also admits ECDHE-RSA AES-128/256-GCM through the typed
+cipher allowlist; the existing ECDSA defaults remain unchanged. Both built-in
+vendored providers use ring for RSA-PSS-RSAE and PKCS#1 SHA-256/384 operations.
+CertificateRequest and CertificateVerify must agree on the complete signature
+scheme and certificate type. The independent OpenSSL regression covers both
+roles with each RSA suite and all four signature schemes; frozen signatures
+also test exact scheme binding and corruption rejection. DTLS DHE remains
+pending, so #1353 is still partial. The optional `NdsAfEcdsa` certificate
+constraint remains limited to ECDSA; RSA cipher support does not claim full
+TS 33.310 certificate-profile conformance.
 
 ## Diameter runtime work list #1358
 

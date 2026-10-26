@@ -8,8 +8,8 @@
 //! evidence prevent a caller from skipping or replaying either transition.
 //!
 //! The RFC 6083 profile is DTLS 1.2 only. It uses the audited, workspace-vendored
-//! `dimpl` fork with its explicitly selected pure-Rust `rust-crypto` provider
-//! and admits only typed ECDHE-ECDSA AEAD suites. An unrelated process-global
+//! `dimpl` fork with its explicitly selected `rust-crypto` provider with ring RSA signatures
+//! and admits only typed ECDHE-ECDSA/RSA AEAD suites. An unrelated process-global
 //! `dimpl` provider cannot replace that authority. The profile disables DTLS
 //! record replay filtering and flight retransmission because reliable
 //! SCTP owns those properties. Each DTLS record occupies one SCTP user message
@@ -1510,13 +1510,13 @@ impl fmt::Debug for DiameterDtlsSctpTransport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DtlsSctpVersion {
-    /// DTLS 1.2 (RFC 6347) with ECDHE-ECDSA AEAD suites.
+    /// DTLS 1.2 (RFC 6347) with ECDHE-ECDSA/RSA AEAD suites.
     Dtls12,
 }
 
 /// Cipher-suite evidence names admitted by this transport.
 ///
-/// RFC 6083 DTLS 1.2 negotiates these as ECDHE-ECDSA AEAD suites.
+/// RFC 6083 DTLS 1.2 negotiates these as ECDHE-ECDSA/RSA AEAD suites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DtlsSctpCipher {
@@ -1526,13 +1526,19 @@ pub enum DtlsSctpCipher {
     Aes256GcmSha384,
     /// `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (`0xCCA9`).
     Chacha20Poly1305Sha256,
+    /// `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` (`0xC02F`).
+    EcdheRsaAes128GcmSha256,
+    /// `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` (`0xC030`).
+    EcdheRsaAes256GcmSha384,
 }
 
 impl DtlsSctpCipher {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 5] = [
         Self::Aes128GcmSha256,
         Self::Aes256GcmSha384,
         Self::Chacha20Poly1305Sha256,
+        Self::EcdheRsaAes128GcmSha256,
+        Self::EcdheRsaAes256GcmSha384,
     ];
 
     const fn index(self) -> usize {
@@ -1540,11 +1546,19 @@ impl DtlsSctpCipher {
             Self::Aes128GcmSha256 => 0,
             Self::Aes256GcmSha384 => 1,
             Self::Chacha20Poly1305Sha256 => 2,
+            Self::EcdheRsaAes128GcmSha256 => 3,
+            Self::EcdheRsaAes256GcmSha384 => 4,
         }
     }
 
     const fn dtls12_suite(self) -> dimpl::crypto::Dtls12CipherSuite {
         match self {
+            Self::EcdheRsaAes128GcmSha256 => {
+                dimpl::crypto::Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
+            }
+            Self::EcdheRsaAes256GcmSha384 => {
+                dimpl::crypto::Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384
+            }
             Self::Aes128GcmSha256 => {
                 dimpl::crypto::Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
             }
@@ -1579,13 +1593,14 @@ pub const MAX_DTLS_SCTP_MESSAGE_BYTES: usize = DiameterFrameLimits::RFC6083.max_
 /// Typed DTLS/SCTP protocol, cipher, frame, and age policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DtlsSctpPolicy {
-    allowed_ciphers: [bool; 3],
+    allowed_ciphers: [bool; 5],
     frame_limits: DiameterFrameLimits,
     maximum_connection_age: Duration,
 }
 
 impl DtlsSctpPolicy {
-    /// RFC 6083 DTLS 1.2 policy with modern ECDHE-ECDSA AEAD suites.
+    /// RFC 6083 DTLS 1.2 policy defaulting to ECDHE-ECDSA AEAD suites.
+    /// RSA certificate suites can be enabled with `with_allowed_ciphers`.
     ///
     /// DTLS 1.3 is deliberately not exposed as ready: its exporter secret is
     /// not available until the server Finished, while RFC 6083 requires the
@@ -1598,7 +1613,7 @@ impl DtlsSctpPolicy {
             return Err(DiameterTlsPolicyError::FrameLimitExceedsDtlsRecordBudget);
         }
         Ok(Self {
-            allowed_ciphers: [true; 3],
+            allowed_ciphers: [true, true, true, false, false],
             frame_limits,
             maximum_connection_age: Duration::from_secs(60 * 60),
         })
@@ -1619,7 +1634,7 @@ impl DtlsSctpPolicy {
         if allowed.is_empty() {
             return Err(DiameterTlsPolicyError::EmptyCipherSet);
         }
-        self.allowed_ciphers = [false; 3];
+        self.allowed_ciphers = [false; 5];
         for cipher in allowed {
             self.allowed_ciphers[cipher.index()] = true;
         }
@@ -1693,7 +1708,7 @@ impl DtlsSctpPolicy {
 impl Default for DtlsSctpPolicy {
     fn default() -> Self {
         Self {
-            allowed_ciphers: [true; 3],
+            allowed_ciphers: [true, true, true, false, false],
             frame_limits: DiameterFrameLimits::RFC6083,
             maximum_connection_age: Duration::from_secs(60 * 60),
         }
@@ -4748,6 +4763,17 @@ mod tests {
             .expect("cipher policy");
         assert!(policy.allows_cipher(DtlsSctpCipher::Aes256GcmSha384));
         assert!(!policy.allows_cipher(DtlsSctpCipher::Aes128GcmSha256));
+        for chosen in DtlsSctpCipher::ALL {
+            let policy = DtlsSctpPolicy::default()
+                .with_allowed_ciphers(&[chosen])
+                .unwrap();
+            for candidate in DtlsSctpCipher::ALL {
+                assert_eq!(policy.allows_cipher(candidate), candidate == chosen);
+            }
+            let config = policy.engine_config().unwrap();
+            let suites: Vec<_> = config.dtls12_cipher_suites().map(|s| s.suite()).collect();
+            assert_eq!(suites, [chosen.dtls12_suite()]);
+        }
     }
 
     #[test]
@@ -4755,7 +4781,11 @@ mod tests {
         let policy = DtlsSctpPolicy::default();
         assert_eq!(
             policy.allowed_ciphers().collect::<Vec<_>>(),
-            DtlsSctpCipher::ALL
+            [
+                DtlsSctpCipher::Aes128GcmSha256,
+                DtlsSctpCipher::Aes256GcmSha384,
+                DtlsSctpCipher::Chacha20Poly1305Sha256
+            ]
         );
         assert_eq!(
             DtlsSctpPolicy::dtls13(policy.frame_limits()),
@@ -4774,10 +4804,7 @@ mod tests {
         let config = DtlsSctpPolicy::default()
             .engine_config()
             .expect("Diameter binds the audited RustCrypto provider explicitly");
-        assert_eq!(
-            config.dtls12_cipher_suites().count(),
-            DtlsSctpCipher::ALL.len()
-        );
+        assert_eq!(config.dtls12_cipher_suites().count(), 3);
         assert_eq!(config.dtls13_cipher_suites().count(), 0);
     }
 

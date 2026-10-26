@@ -1,7 +1,8 @@
 //! RustCrypto cryptographic provider implementation for dimpl.
 //!
-//! This module provides a pure Rust cryptographic backend for dimpl using
-//! crates from the [RustCrypto](https://github.com/RustCrypto) organization.
+//! This module provides a cryptographic backend for dimpl using
+//! crates from the [RustCrypto](https://github.com/RustCrypto) organization,
+//! plus ring for DTLS 1.2 RSA signatures.
 //!
 //! # Feature Flag
 //!
@@ -51,13 +52,15 @@ use super::CryptoProvider;
 /// Get the default RustCrypto-based crypto provider.
 ///
 /// This provider implements all cryptographic operations required for DTLS 1.2
-/// using pure Rust crates from the RustCrypto organization.
+/// using RustCrypto for EC/record operations and ring for RSA signatures.
 ///
 /// # Supported Cipher Suites
 ///
 /// - `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (0xC02B)
 /// - `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` (0xC02C)
 /// - `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (0xCCA9)
+/// - `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` (0xC02F)
+/// - `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` (0xC030)
 ///
 /// # Supported Key Exchange Groups
 ///
@@ -69,6 +72,7 @@ use super::CryptoProvider;
 ///
 /// - ECDSA with P-256 and SHA-256
 /// - ECDSA with P-384 and SHA-384
+/// - DTLS 1.2 RSA-PSS-RSAE and RSA-PKCS#1 with SHA-256/384 (ring)
 ///
 /// # Supported Hash Algorithms
 ///

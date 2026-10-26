@@ -304,6 +304,16 @@ impl CryptoProvider {
                     VALIDATION_P384_SHA384_SIG,
                     VALIDATION_TEST_DATA,
                 ),
+                (HashAlgorithm::SHA256, SignatureAlgorithm::RSA) => (
+                    include_bytes!("rsa_cert.der").as_slice(),
+                    include_bytes!("rsa_sha256.sig").as_slice(),
+                    VALIDATION_TEST_DATA,
+                ),
+                (HashAlgorithm::SHA384, SignatureAlgorithm::RSA) => (
+                    include_bytes!("rsa_cert.der").as_slice(),
+                    include_bytes!("rsa_sha384.sig").as_slice(),
+                    VALIDATION_TEST_DATA,
+                ),
                 _ => {
                     return Err(provider_error(
                         CryptoProviderValidationError::NoSignatureValidationVector {
@@ -324,6 +334,28 @@ impl CryptoProvider {
                         source: e,
                     })
                 })?;
+            if sig_alg == SignatureAlgorithm::RSA {
+                let (scheme, pss) = match hash_alg {
+                    HashAlgorithm::SHA256 => (
+                        crate::types::SignatureScheme::RSA_PSS_RSAE_SHA256,
+                        include_bytes!("rsa_pss_sha256.sig").as_slice(),
+                    ),
+                    HashAlgorithm::SHA384 => (
+                        crate::types::SignatureScheme::RSA_PSS_RSAE_SHA384,
+                        include_bytes!("rsa_pss_sha384.sig").as_slice(),
+                    ),
+                    _ => unreachable!("RSA suite hash validated above"),
+                };
+                self.signature_verification
+                    .verify_with_scheme(cert_der, test_data, pss, scheme)
+                    .map_err(|source| {
+                        provider_error(CryptoProviderValidationError::SignatureVerificationFailed {
+                            hash: hash_alg,
+                            signature: sig_alg,
+                            source,
+                        })
+                    })?;
+            }
         }
 
         Ok(())
@@ -579,14 +611,16 @@ struct Dtls12Parameters {
 
 fn dtls12_parameters(suite: Dtls12CipherSuite) -> Option<Dtls12Parameters> {
     match suite {
-        Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256 => Some(Dtls12Parameters {
+        Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+        | Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256 => Some(Dtls12Parameters {
             hash: HashAlgorithm::SHA256,
             key_lengths: (0, 16, 4),
             explicit_nonce_len: 8,
             tag_len: 16,
             min_protected_fragment_len: 24,
         }),
-        Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384 => Some(Dtls12Parameters {
+        Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
+        | Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384 => Some(Dtls12Parameters {
             hash: HashAlgorithm::SHA384,
             key_lengths: (0, 32, 4),
             explicit_nonce_len: 8,
@@ -621,10 +655,12 @@ struct Dtls12AeadTestVector {
 
 fn dtls12_aead_test_vector(suite: Dtls12CipherSuite) -> Option<Dtls12AeadTestVector> {
     let dtls13_suite = match suite {
-        Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256 => {
+        Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+        | Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256 => {
             Some(Dtls13CipherSuite::AES_128_GCM_SHA256)
         }
-        Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384 => {
+        Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
+        | Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384 => {
             Some(Dtls13CipherSuite::AES_256_GCM_SHA384)
         }
         Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 => {
@@ -981,7 +1017,7 @@ mod tests_aws_lc_rs {
         let count = provider.supported_cipher_suites().count();
         // ECDHE: AES-128, AES-256, ChaCha20
         // PSK: CCM-8
-        assert_eq!(count, 4);
+        assert_eq!(count, 6);
     }
 
     #[test]
@@ -1041,7 +1077,7 @@ mod tests_rust_crypto {
         let count = provider.supported_cipher_suites().count();
         // ECDHE: AES-128, AES-256, ChaCha20
         // PSK: CCM-8
-        assert_eq!(count, 4);
+        assert_eq!(count, 6);
     }
 
     #[test]

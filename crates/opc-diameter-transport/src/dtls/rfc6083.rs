@@ -193,7 +193,7 @@ impl Policy {
         self
     }
 
-    /// Restrict the existing ECDHE-ECDSA AEAD cipher allowlist.
+    /// Restrict the ECDHE-ECDSA/RSA AEAD cipher allowlist.
     pub fn with_allowed_ciphers(mut self, allowed: &[Cipher]) -> Result<Self, Error> {
         self.shared = self
             .shared
