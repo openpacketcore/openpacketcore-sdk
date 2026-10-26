@@ -15769,7 +15769,6 @@ fn retire_protected_rosters_sync(
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
     let mut selected = Vec::new();
-    let mut selected_floor_epochs = BTreeMap::new();
     while let Some(row) = rows.next().map_err(|_| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })? {
@@ -15791,22 +15790,6 @@ fn retire_protected_rosters_sync(
         .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-        let floor_key = ProductionFloorKey::from_binding(binding).map_err(|_| {
-            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
-        })?;
-        // Retirement advances one shared floor/cursor CAS per `(tenant,
-        // scope)` partition.  Once the terminal prefix reaches a different
-        // epoch in a partition already selected this turn, stop at that
-        // prefix boundary: skipping it would advance the global terminal
-        // witness past undeleted evidence, while selecting it would produce
-        // competing stale CAS actions for the same floor key.
-        if !protected_roster_retirement_accepts_floor_epoch(
-            &mut selected_floor_epochs,
-            floor_key,
-            binding.history_epoch(),
-        ) {
-            break;
-        }
         let record = match profile {
             1 => ProtectedRosterMixedRecord::V1(Box::new(
                 protected_roster_read_record_sync(conn, identity, binding)
@@ -15850,72 +15833,52 @@ fn retire_protected_rosters_sync(
     if selected.is_empty() {
         return Ok(false);
     }
-    let mut partition_rows = BTreeMap::<(ProductionFloorKey, u64), usize>::new();
+    let mut partition_rows = BTreeMap::new();
     for record in &selected {
         let binding = match record {
             ProtectedRosterMixedRecord::V1(record) => record.binding(),
             ProtectedRosterMixedRecord::V2(record) => record.binding(),
         };
-        *partition_rows
-            .entry((
-                ProductionFloorKey::from_binding(binding).map_err(|_| {
-                    StoreError::BackendUnavailable(
-                        "protected roster maintenance unavailable".into(),
-                    )
-                })?,
-                binding.history_epoch(),
-            ))
-            .or_default() += 1;
+        protected_roster_retirement_include_floor_epoch(
+            &mut partition_rows,
+            ProductionFloorKey::from_binding(binding).map_err(|_| {
+                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+            })?,
+            binding.history_epoch(),
+        );
     }
     let mut partitions = Vec::with_capacity(partition_rows.len());
-    for ((key, epoch), selected_count) in partition_rows {
-        // The floor is shared by both physical profile tables.  An older
-        // binding prevents only the final floor advance/release; it does not
-        // prevent deletion of this terminal-prefix row while a no-op floor
-        // CAS preserves the lower binding's restart proof.
-        let lower_exists: bool = conn
-            .query_row(
-                if v2_present {
-                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
-                     WHERE partition=?1 AND history_epoch<?2) \
-                     OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions \
-                     WHERE partition=?1 AND history_epoch<?2)"
-                } else {
-                    "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
-                     WHERE partition=?1 AND history_epoch<?2)"
-                },
-                params![
-                    key.as_bytes().as_slice(),
-                    checked_positive_i64(epoch).map_err(|_| StoreError::BackendUnavailable(
-                        "protected roster maintenance unavailable".into(),
-                    ))?,
-                ],
-                |row| row.get(0),
-            )
-            .map_err(|_| {
-                StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
-            })?;
+    for (key, (epoch, selected_count)) in partition_rows {
+        // The shared floor can advance only if every binding through the
+        // greatest selected epoch is deleted. Count at most the selected
+        // rows plus one survivor, across both profiles and all row states.
         let total: i64 = conn.query_row(
             if v2_present {
-                "SELECT (SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE partition=?1 AND history_epoch=?2) + \
-                 (SELECT COUNT(*) FROM consensus_protected_roster_v2_admissions WHERE partition=?1 AND history_epoch=?2)"
+                "SELECT COUNT(*) FROM ( \
+                 SELECT binding FROM consensus_protected_roster_rows WHERE partition=?1 AND history_epoch<=?2 \
+                 UNION ALL \
+                 SELECT binding FROM consensus_protected_roster_v2_admissions WHERE partition=?1 AND history_epoch<=?2 \
+                 LIMIT ?3)"
             } else {
-                "SELECT COUNT(*) FROM consensus_protected_roster_rows \
-                 WHERE partition=?1 AND history_epoch=?2"
+                "SELECT COUNT(*) FROM (SELECT binding FROM consensus_protected_roster_rows \
+                 WHERE partition=?1 AND history_epoch<=?2 LIMIT ?3)"
             },
-            params![key.as_bytes().as_slice(), checked_positive_i64(epoch).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?],
+            params![
+                key.as_bytes().as_slice(),
+                checked_positive_i64(epoch).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?,
+                i64::try_from(selected_count + 1).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?,
+            ],
             |row| row.get(0),
         ).map_err(|_| StoreError::BackendUnavailable("protected roster maintenance unavailable".into()))?;
-        // A terminal-sequence prefix may encounter a later history epoch
-        // before an older one from the same shared floor partition.  It is
-        // safe (and required for liveness) to retire that prefix row while
-        // preserving the shared floor/cursor.  Only the final target-epoch
-        // page may advance or release the floor, and that is forbidden while
-        // an older epoch survives in either profile namespace.
-        let final_batch = usize::try_from(total).map_err(|_| {
+        let total = usize::try_from(total).map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
-        })? == selected_count
-            && !lower_exists;
+        })?;
+        if total < selected_count {
+            return Err(StoreError::BackendUnavailable(
+                "protected roster maintenance unavailable".into(),
+            ));
+        }
+        let final_batch = total == selected_count;
         // A final target-epoch page can release its floor only when no binding
         // in either complete profile namespace remains at a higher epoch.
         // The layout gate above makes format-four V1's V2 contribution exactly
@@ -16081,18 +16044,14 @@ fn retire_protected_rosters_sync(
     Ok(true)
 }
 
-fn protected_roster_retirement_accepts_floor_epoch(
-    selected: &mut BTreeMap<ProductionFloorKey, u64>,
+fn protected_roster_retirement_include_floor_epoch(
+    selected: &mut BTreeMap<ProductionFloorKey, (u64, usize)>,
     floor_key: ProductionFloorKey,
     history_epoch: u64,
-) -> bool {
-    match selected.get(&floor_key) {
-        Some(selected_epoch) => *selected_epoch == history_epoch,
-        None => {
-            selected.insert(floor_key, history_epoch);
-            true
-        }
-    }
+) {
+    let (epoch, count) = selected.entry(floor_key).or_default();
+    *epoch = (*epoch).max(history_epoch);
+    *count += 1;
 }
 
 /// Run at most one protected-roster maintenance turn as part of an already
@@ -16187,6 +16146,45 @@ fn maintain_due_protected_roster_reclaim_sync(
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })? != ProtectedRosterLayout::Activated
     {
+        return Err(StoreError::BackendUnavailable(
+            "protected roster maintenance unavailable".into(),
+        ));
+    }
+    let scope = read_membership_scope_sync(conn, identity).map_err(|_| {
+        StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+    })?;
+    // V2-only activation also creates the shared V1-format floor/witness
+    // tables. Require V1's certificate when its row namespace contributes,
+    // and independently require V2's certificate whenever V2 is activated.
+    let v1_rows: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+        })?;
+    let activation_matches = (|| -> io::Result<bool> {
+        Ok((!v1_rows
+            || protected_roster_profile_activation_matches_scope_sync(
+                conn,
+                identity,
+                scope.current_identity,
+                &scope.current_members,
+            )?)
+            && (!v2_present
+                || protected_roster_profile_v2_activation_matches_scope_sync(
+                    conn,
+                    identity,
+                    scope.current_identity,
+                    &scope.current_members,
+                )?))
+    })()
+    .map_err(|_| {
+        StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
+    })?;
+    if !activation_matches {
         return Err(StoreError::BackendUnavailable(
             "protected roster maintenance unavailable".into(),
         ));
@@ -55656,51 +55654,36 @@ mod tests {
     }
 
     #[test]
-    fn protected_roster_retirement_batches_one_epoch_per_floor_without_collapsing_same_epoch_rows()
-    {
+    fn protected_roster_retirement_folds_all_selected_epochs_into_one_floor_action() {
         let first = retirement_fixture_retained(0x79, 1, 7, timestamp(10));
         let same_epoch = retirement_fixture_retained(0x79, 2, 7, timestamp(11));
         let next_epoch = retirement_fixture_retained(0x79, 3, 8, timestamp(12));
         let other_floor = retirement_fixture_retained(0x7a, 1, 8, timestamp(13));
-        let floor = ProductionFloorKey::from_binding(first.binding()).expect("first floor key");
-        assert_eq!(
-            floor,
-            ProductionFloorKey::from_binding(same_epoch.binding()).expect("same-epoch floor key"),
-        );
-        assert_eq!(
-            floor,
-            ProductionFloorKey::from_binding(next_epoch.binding()).expect("next-epoch floor key"),
-        );
-
+        let floor = ProductionFloorKey::from_binding(first.binding()).unwrap();
         let mut selected = BTreeMap::new();
-        assert!(protected_roster_retirement_accepts_floor_epoch(
-            &mut selected,
-            floor,
-            first.binding().history_epoch(),
-        ));
-        assert!(
-            protected_roster_retirement_accepts_floor_epoch(
+        // Terminal order need not match admission order. Preserve every row
+        // count while folding the greatest epoch into one shared floor action.
+        for record in [&next_epoch, &first, &same_epoch, &other_floor] {
+            protected_roster_retirement_include_floor_epoch(
                 &mut selected,
-                floor,
-                same_epoch.binding().history_epoch(),
-            ),
-            "rows from the same floor and epoch remain in one bounded retirement turn",
+                ProductionFloorKey::from_binding(record.binding()).unwrap(),
+                record.binding().history_epoch(),
+            );
+        }
+        assert_eq!(
+            ProductionFloorKey::from_binding(same_epoch.binding()).unwrap(),
+            floor
         );
-        assert!(
-            !protected_roster_retirement_accepts_floor_epoch(
-                &mut selected,
-                floor,
-                next_epoch.binding().history_epoch(),
-            ),
-            "a second epoch for one shared floor must end the selected prefix",
+        assert_eq!(
+            ProductionFloorKey::from_binding(next_epoch.binding()).unwrap(),
+            floor
         );
-        assert!(protected_roster_retirement_accepts_floor_epoch(
-            &mut selected,
-            ProductionFloorKey::from_binding(other_floor.binding()).expect("other floor key"),
-            other_floor.binding().history_epoch(),
-        ));
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected.get(&floor), Some(&7));
+        assert_eq!(selected[&floor], (8, 3));
+        assert_eq!(
+            selected[&ProductionFloorKey::from_binding(other_floor.binding()).unwrap()],
+            (8, 1)
+        );
     }
 
     #[test]

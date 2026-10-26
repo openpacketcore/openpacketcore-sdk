@@ -316,6 +316,7 @@ impl NativeDelta<'_> {
             return Ok(());
         }
         check()?;
+        validate_activation(self.base.identity, &self.base.members, &self.frontiers)?;
         let mut store = Store::for_command(self, check)?;
         if store.maintain_due(now)? {
             let (ledger, changes, keys, revision) = store.finish_with_changes()?;

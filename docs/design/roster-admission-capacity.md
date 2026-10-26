@@ -22,8 +22,13 @@ The minimal change retains the current 24-hour recovery-evidence policy.
 It ceases to imply a fixed number of completions in that interval. Existing
 bounded maintenance releases retained bytes and the final partition metadata.
 An eligible oldest tombstone prefix is retired before newer rows are reclaimed;
-retirement creates no tombstones, so both phases progress under continuous
-arrivals. The leader runs at most two bounded commands per maintenance tick,
+one retirement command spans admission epochs up to the existing 1,024-row
+bound. Each partition receives one floor/cursor action. Its floor advances only
+when no binding survives through the greatest selected epoch; otherwise both
+floor and cursor remain unchanged. Both engines check the activated policy
+before maintenance writes. Retirement creates no tombstones, so both phases
+progress under continuous arrivals. The leader runs at most two bounded commands
+per maintenance tick,
 without changing the retention boundary or either phase's batch limit.
 An owned local-leader lane observes the existing ordered reclaim and terminal
 indexes and proposes `AdvanceLogicalTime` only when a bounded turn is eligible.

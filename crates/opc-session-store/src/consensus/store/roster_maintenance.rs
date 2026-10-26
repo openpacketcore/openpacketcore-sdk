@@ -615,12 +615,13 @@ mod tests {
             // Model sixteen history completions at half-second intervals
             // become eligible exactly 24 hours later, at the same rate. Model
             // one bounded phase per command and one unique admission epoch
-            // per partition, including the conservative one-epoch retire cap.
+            // per row. Retirement now spans epochs within the same partition.
             let due = (self.start.elapsed().as_millis() / 500).min(16) as u64;
             let mut state = self.state.lock().unwrap();
             state.2 += 1;
             if state.1 < state.0 {
-                state.1 += 1;
+                state.1 +=
+                    (state.0 - state.1).min(crate::fenced_mutation_roster::RECLAIM_BATCH as u64);
             } else if state.0 < due {
                 state.0 = due;
             } else {

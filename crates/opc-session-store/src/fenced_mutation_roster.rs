@@ -506,7 +506,8 @@ const CAPACITY_POLICY_DESCRIPTOR: &[u8] = concat!(
     "completion=class-bound-signed-terminal-body-and-frame,ordinary-normal-metered,emergency-quota-exempt-emergency-lane,no-new-admission-slot\n",
     "local=emergency-bypasses-authority-and-provider-shares,terminal-reads-have-no-count-quota\n",
     "retention=preserve-terminal-recovery-evidence,oldest-bounded-maintenance\n",
-    "maintenance=eligible-oldest-tombstone-prefix-before-new-reclaim,one-bounded-phase-per-command\n"
+    "maintenance=eligible-oldest-tombstone-prefix-before-new-reclaim,one-bounded-phase-per-command\n",
+    "retirement=multi-epoch-terminal-prefix,one-floor-cursor-action-per-partition,advance-only-without-surviving-bindings-through-target,activation-policy-checked-before-maintenance\n"
 )
 .as_bytes();
 
@@ -9828,6 +9829,25 @@ mod tests {
     }
 
     #[test]
+    fn roster_multi_epoch_retirement_requires_matching_activation_policy() {
+        let previous = Profile {
+            schema: SCHEMA_V2,
+            consumer_revision: CONSUMER_REVISION_V2,
+            digest: [
+                0x12, 0x6e, 0x5f, 0xbf, 0xa2, 0xdc, 0x32, 0xa0, 0x91, 0x9e, 0x59, 0x58, 0x54, 0x13,
+                0xbe, 0x8d, 0xc2, 0x64, 0xe4, 0xda, 0xdc, 0x25, 0x84, 0xbb, 0xb5, 0x1c, 0xa5, 0x57,
+                0x7e, 0x71, 0x6c, 0x16,
+            ],
+        };
+        assert!(
+            previous.validate().is_err(),
+            "one-epoch retirement cannot authorize this build"
+        );
+        assert!(CAPACITY_POLICY_DESCRIPTOR.split(|byte| *byte == b'\n').any(|line|
+            line == b"retirement=multi-epoch-terminal-prefix,one-floor-cursor-action-per-partition,advance-only-without-surviving-bindings-through-target,activation-policy-checked-before-maintenance"));
+    }
+
+    #[test]
     fn roster_completion_class_requires_matching_activation_policy() {
         let previous = Profile {
             schema: SCHEMA_V2,
@@ -9878,9 +9898,9 @@ mod tests {
         assert_eq!(
             profile_v2_digest(),
             [
-                0x12, 0x6e, 0x5f, 0xbf, 0xa2, 0xdc, 0x32, 0xa0, 0x91, 0x9e, 0x59, 0x58, 0x54, 0x13,
-                0xbe, 0x8d, 0xc2, 0x64, 0xe4, 0xda, 0xdc, 0x25, 0x84, 0xbb, 0xb5, 0x1c, 0xa5, 0x57,
-                0x7e, 0x71, 0x6c, 0x16,
+                0xa1, 0x5a, 0x31, 0x1c, 0x3f, 0xab, 0xd4, 0x2d, 0xae, 0xa4, 0xbf, 0x90, 0x0e, 0x5c,
+                0xf3, 0x04, 0xcf, 0x20, 0x62, 0xad, 0xdd, 0x84, 0xe5, 0x50, 0x17, 0x92, 0x3e, 0x4e,
+                0xb2, 0x9c, 0x19, 0xf5,
             ]
         );
         assert_eq!(profile_v2_descriptor(), PROFILE_DESCRIPTOR_V2);
@@ -10149,9 +10169,9 @@ mod tests {
         assert_eq!(
             v2.digest().expect("V2 ingress preimage"),
             [
-                0x02, 0x56, 0xbc, 0x98, 0x15, 0xf1, 0xf4, 0x5e, 0x5f, 0x85, 0xfa, 0xfa, 0x75, 0x5c,
-                0xec, 0x8e, 0xfb, 0x6d, 0xe1, 0x27, 0x56, 0xbb, 0x2a, 0x68, 0x9f, 0x0c, 0xf7, 0x83,
-                0xf2, 0x1c, 0xe5, 0x5b,
+                0x34, 0xc5, 0xa8, 0x56, 0x33, 0x0f, 0x91, 0x89, 0xb8, 0xcb, 0xaa, 0xe7, 0x71, 0x9f,
+                0xc4, 0xa1, 0x10, 0xeb, 0x52, 0xe7, 0xd1, 0xa0, 0xdc, 0x73, 0x94, 0x51, 0xea, 0x32,
+                0x7a, 0x85, 0x86, 0x22,
             ],
             "literal V2 digest golden freezes the capacity-and-retirement-bound /4 preimage"
         );

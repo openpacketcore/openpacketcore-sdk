@@ -3491,6 +3491,91 @@ mod production_tests {
     }
 
     #[test]
+    fn mixed_terminal_retirement_folds_out_of_order_epochs_and_consumes_older_cursor() {
+        let profile = profile();
+        let admitted = |id| {
+            admission_for_authority_in_scope(
+                "tenant",
+                id,
+                OwnerId::new("owner").unwrap(),
+                FenceToken::new(1),
+                Generation::new(1),
+                [10; 32],
+            )
+        };
+        let v2 = compact_v2_terminal(&absent_predecessor_admission(145), profile);
+        let higher = compact_v1_terminal(&admitted(146), 3, profile);
+        let lower = compact_v1_terminal(&admitted(148), 2, profile);
+        let floor = IrreversibleHistoryFloor::initial(v2.binding()).unwrap();
+        let key = ProductionFloorKey::from_floor(floor).unwrap();
+        let cursor = ProductionRetirementCursor::initial(key, 1).unwrap();
+        let counters = counters_with_retirement_cursor(
+            counters_with_production_floor(
+                counters_with_production_record(
+                    counters_with_production_record(
+                        counters_with_production_record_v2(zero_counters(), &v2, profile).unwrap(),
+                        &higher,
+                        profile,
+                    )
+                    .unwrap(),
+                    &lower,
+                    profile,
+                )
+                .unwrap(),
+                floor,
+            )
+            .unwrap(),
+            &cursor,
+        )
+        .unwrap();
+        let witness = GlobalChargeWitness::v1(0, 0, counters);
+        let selected = [
+            ProductionMixedTerminalRetirementSelection::V2(&v2),
+            ProductionMixedTerminalRetirementSelection::V1(&higher),
+            ProductionMixedTerminalRetirementSelection::V1(&lower),
+        ];
+        let partition = |target, final_batch, empty| {
+            ProductionMixedTerminalRetirementPartition::new_with_partition_empty_after(
+                floor,
+                Some(cursor.clone()),
+                target,
+                final_batch,
+                empty,
+            )
+            .unwrap()
+        };
+        let prepare = |partitions: &[ProductionMixedTerminalRetirementPartition]| {
+            prepare_production_mixed_terminal_retirement(
+                &selected,
+                partitions,
+                witness,
+                GlobalChargeBudget::v1(u64::MAX),
+                profile,
+            )
+        };
+        let partial = prepare(&[partition(3, false, false)]).unwrap();
+        assert_eq!(partial.floor_actions().len(), 1);
+        assert_eq!(
+            partial.floor_actions()[0].floor().replacement(),
+            Some(floor)
+        );
+        assert_eq!(
+            partial.floor_actions()[0].cursor().replacement(),
+            Some(&cursor)
+        );
+        let final_page = prepare(&[partition(3, true, true)]).unwrap();
+        assert_eq!(final_page.rows().len(), 3);
+        assert_eq!(final_page.floor_actions().len(), 1);
+        assert_eq!(final_page.floor_actions()[0].floor().replacement(), None);
+        assert_eq!(final_page.floor_actions()[0].cursor().replacement(), None);
+        assert_eq!(final_page.next_witness().roster.durable_epoch_bindings(), 0);
+        assert_eq!(final_page.next_witness().roster.retirement_cursor_count, 0);
+        assert!(prepare(&[partition(2, true, true)]).is_err());
+        assert!(prepare(&[partition(3, true, true), partition(3, true, true)]).is_err());
+        assert!(prepare(&[]).is_err());
+    }
+
+    #[test]
     fn mixed_terminal_retirement_global_prefix_never_installs_a_partition_cursor() {
         let profile = profile();
         let records = (1..=(RECLAIM_BATCH + 1))
@@ -6711,8 +6796,8 @@ pub(crate) struct ProductionMixedTerminalRetirementPartition {
 impl ProductionMixedTerminalRetirementPartition {
     /// Build a partition retirement action with the adapter's exact
     /// cross-profile partition-empty proof. An empty-partition assertion is
-    /// meaningful only after the final target-epoch page; it releases the
-    /// floor instead of preserving it at the retired epoch.
+    /// meaningful only after all bindings through the target epoch are selected;
+    /// it releases the floor instead of preserving it at the retired epoch.
     pub(crate) fn new_with_partition_empty_after(
         floor: IrreversibleHistoryFloor,
         cursor: Option<ProductionRetirementCursor>,
@@ -6726,7 +6811,7 @@ impl ProductionMixedTerminalRetirementPartition {
         }
         if let Some(cursor) = cursor.as_ref() {
             cursor.validate_for_floor(floor)?;
-            if cursor.target_epoch() != target_epoch {
+            if cursor.target_epoch() > target_epoch {
                 return Err(ReservationError::FloorAdvance);
             }
         }
@@ -6742,7 +6827,7 @@ impl ProductionMixedTerminalRetirementPartition {
 
 /// Exact partition range that SQLite must re-prove along with the global
 /// terminal-sequence prefix. On a final page, the adapter must also prove no
-/// retained or tombstone row from either profile remains at `target_epoch`.
+/// binding in any state from either profile remains through `target_epoch`.
 #[derive(Clone)]
 pub(crate) struct ProductionMixedTerminalRetirementPartitionGuard;
 

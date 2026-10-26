@@ -241,25 +241,32 @@ impl ProductionMixedTerminalRetirementStream {
         let mut covered = BTreeMap::new();
         for partition in partitions {
             let key = ProductionFloorKey::from_floor(partition.floor)?;
-            if covered.insert((key, partition.target_epoch), ()).is_some() {
+            if covered.insert(key, ()).is_some() {
                 return Err(ReservationError::Duplicate);
             }
             let mut bindings = self
                 .selected
                 .iter()
                 .filter_map(|(_, binding, _)| {
-                    (ProductionFloorKey::from_binding(*binding).ok() == Some(key)
-                        && binding.history_epoch() == partition.target_epoch)
+                    (ProductionFloorKey::from_binding(*binding).ok() == Some(key))
                         .then_some(*binding)
                 })
                 .collect::<Vec<_>>();
             bindings.sort_unstable();
-            if bindings.is_empty() || bindings.windows(2).any(|pair| pair[0] >= pair[1]) {
+            if bindings.last().map(|binding| binding.history_epoch())
+                != Some(partition.target_epoch)
+                || bindings.windows(2).any(|pair| pair[0] >= pair[1])
+            {
                 return Err(ReservationError::FloorAdvance);
             }
             if let Some(cursor) = partition.cursor.as_ref() {
                 cursor.validate_for_floor(partition.floor)?;
-                if cursor.target_epoch() != partition.target_epoch {
+                if cursor.target_epoch() > partition.target_epoch
+                    || bindings.iter().any(|binding| {
+                        binding.history_epoch() < cursor.target_epoch()
+                            || cursor.last_deleted().is_some_and(|last| *binding <= last)
+                    })
+                {
                     return Err(ReservationError::FloorAdvance);
                 }
             }
@@ -296,7 +303,7 @@ impl ProductionMixedTerminalRetirementStream {
             } else {
                 // A global terminal prefix cannot manufacture or advance a
                 // binding-order cursor. Preserve any existing cursor until
-                // the final target-epoch page consumes it.
+                // a page consumes every remaining binding through its target.
                 (
                     ProductionFloorCas {
                         key,
@@ -315,7 +322,7 @@ impl ProductionMixedTerminalRetirementStream {
         }
         for (_, binding, _) in &self.selected {
             let key = ProductionFloorKey::from_binding(*binding)?;
-            if !covered.contains_key(&(key, binding.history_epoch())) {
+            if !covered.contains_key(&key) {
                 return Err(ReservationError::FloorAdvance);
             }
         }

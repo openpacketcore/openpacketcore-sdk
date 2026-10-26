@@ -456,6 +456,10 @@ fn native_roster_indexes_preserve_alias_rejection_and_bounded_mixed_history_pref
     assert_eq!(last.history_epoch(), 9);
     assert_eq!(index.epoch_count(partition, 1), 1026);
     assert_eq!(index.epoch_count(partition, 9), 1);
+    assert_eq!(index.partition_count_through(partition, 9, 1025), 1025);
+    assert_eq!(index.partition_count_through(partition, 1, 1027), 1026);
+    assert_eq!(index.partition_count_through(partition, 9, 1028), 1027);
+    assert_eq!(index.partition_count_through(partition, 0, 1025), 0);
     assert_eq!(
         index
             .partition_prefix(partition, 1, Some(make(1023, 1, State::Retained).binding))

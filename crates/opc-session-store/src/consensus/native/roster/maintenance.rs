@@ -42,7 +42,6 @@ fn retirement_selection(
     witness: GlobalChargeWitness,
 ) -> io::Result<Vec<(u64, RequestBindingKey, ProductionRosterProfileTag)>> {
     let mut selected = Vec::new();
-    let mut epochs = BTreeMap::new();
     for (sequence, binding, state) in ledger
         .index
         .terminal_prefix(witness.retired_terminal_sequence())?
@@ -50,14 +49,6 @@ fn retirement_selection(
         if state != State::Tombstone {
             break;
         }
-        let key = ProductionFloorKey::from_binding(binding).map_err(corrupt)?;
-        if epochs
-            .get(&key)
-            .is_some_and(|epoch| *epoch != binding.history_epoch())
-        {
-            break;
-        }
-        epochs.insert(key, binding.history_epoch());
         let row = ledger
             .rows
             .get(&binding)
@@ -77,29 +68,31 @@ fn retirement_partitions(
     ledger: &Ledger,
     selected: &[(u64, RequestBindingKey, ProductionRosterProfileTag)],
 ) -> io::Result<Vec<ProductionMixedTerminalRetirementPartition>> {
-    let mut counts = BTreeMap::<(ProductionFloorKey, u64), usize>::new();
+    let mut counts = BTreeMap::<ProductionFloorKey, (u64, usize)>::new();
     for (_, binding, _) in selected {
-        *counts
-            .entry((
-                ProductionFloorKey::from_binding(*binding).map_err(corrupt)?,
-                binding.history_epoch(),
-            ))
-            .or_default() += 1;
+        let (epoch, count) = counts
+            .entry(ProductionFloorKey::from_binding(*binding).map_err(corrupt)?)
+            .or_default();
+        *epoch = (*epoch).max(binding.history_epoch());
+        *count += 1;
     }
     counts
         .into_iter()
-        .map(|((key, epoch), count)| {
-            let (first, last) = ledger
+        .map(|(key, (epoch, count))| {
+            let (_, last) = ledger
                 .index
                 .partition_bounds(key)
                 .ok_or_else(|| invalid("native roster retirement partition absent"))?;
-            let total = ledger.index.epoch_count(key, epoch);
+            // At most this bounded selection plus one survivor is inspected.
+            // A surviving lower binding, from either profile or any state,
+            // keeps the floor and cursor unchanged.
+            let total = ledger.index.partition_count_through(key, epoch, count + 1);
             if count > total {
                 return Err(invalid(
                     "native roster retirement count exceeds its partition",
                 ));
             }
-            let final_batch = count == total && first.history_epoch() >= epoch;
+            let final_batch = count == total;
             let empty_after = final_batch && last.history_epoch() <= epoch;
             let partition = ledger
                 .partitions
