@@ -516,6 +516,7 @@ jobs:
           fi
           grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_MULTIHOMING_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' "${datapath_log}"
@@ -1412,6 +1413,7 @@ jobs:
           fi
           grep -Fq "test result: ok. ${expected_tests} passed; 0 failed;" "${datapath_log}"
           grep -Fq 'OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN' "${datapath_log}"
+          grep -Fq 'OPC_GTPU_MULTIHOMING_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_IPV4_LIVE_PROVEN' "${datapath_log}"
           grep -Fq 'OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:' "${datapath_log}"

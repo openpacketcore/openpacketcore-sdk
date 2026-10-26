@@ -162,6 +162,7 @@ pub(super) fn ordinary_ipv6_plan(
         context.downlink_source_port_policy,
         context.uplink_source_port_policy,
     )
+    .map(|entry| entry.with_peer_source_policy(context.downlink_peer_source_policy))
     .ok_or_else(|| {
         GtpuError::invalid_config(
             "pdp.uplink_source_port_policy",
@@ -183,6 +184,7 @@ fn context_from_entry(entry: EbpfSessionEntry, ifindex: u32) -> Option<GtpPdpCon
         ms_address: ip_address(entry.inner_paa().canonical_address()),
         peer_address: ip_address(entry.peer_outer_address()),
         link_ifindex: ifindex,
+        downlink_peer_source_policy: entry.peer_source_policy(),
         downlink_source_port_policy: entry.downlink_source_port_policy(),
         gtp_version: GtpVersion::V1,
         bearer_mark: if mark == 0 {

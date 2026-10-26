@@ -17,6 +17,11 @@ GTP-U encapsulation/classification helpers.
   endpoint identity plus explicit `Any`, exact, or inclusive-range UDP source
   authorization. `validate_ipv4_downlink_binding_wire` and the owner wire
   helpers provide allocation-free verifier-facing checks over map-owned bytes.
+- `GtpuPeerSourcePolicy` preserves the exact peer check by default and adds an
+  explicit TEID/local multi-homing policy. Opt-in bindings use version 2;
+  ordinary/N3 session entries use versions 3/4. Older versions retain exact
+  bytes and unsupported version/policy combinations are rejected. Policy bytes
+  participate in owner/commit equality and typed/borrowed checks agree.
 - `DownlinkBindingMismatch` defines the fixed invalid/family/peer/local/
   ingress/source-port counter cardinality; map names and indexes are shared by
   userspace and the tc object.
