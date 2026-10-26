@@ -112,7 +112,14 @@ pub struct ConsumerCheckpointOptions {
     max_payload_bytes: usize,
     max_storage_bytes: u64,
     timeout: Duration,
+    #[cfg(test)]
+    io_hook: Option<CheckpointIoHook>,
+    #[cfg(test)]
+    clock: Option<fn() -> Instant>,
 }
+
+#[cfg(test)]
+type CheckpointIoHook = Arc<dyn Fn(&Work, &'static str) + Send + Sync>;
 
 impl ConsumerCheckpointOptions {
     /// Configure an absolute, exclusively owned file and bounded operations.
@@ -147,6 +154,10 @@ impl ConsumerCheckpointOptions {
             max_payload_bytes,
             max_storage_bytes,
             timeout,
+            #[cfg(test)]
+            io_hook: None,
+            #[cfg(test)]
+            clock: None,
         })
     }
 }
@@ -249,22 +260,39 @@ struct EncodedRow {
 
 struct Work {
     deadline: Instant,
+    #[cfg(test)]
+    clock: Option<fn() -> Instant>,
     cancelled: AtomicBool,
     mutated: AtomicBool,
 }
 
 impl Work {
-    fn new(timeout: Duration) -> Result<Arc<Self>, ConsumerCheckpointError> {
+    fn new(options: &ConsumerCheckpointOptions) -> Result<Arc<Self>, ConsumerCheckpointError> {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = options.clock.map_or(now, |clock| clock());
         Ok(Arc::new(Self {
-            deadline: Instant::now()
-                .checked_add(timeout)
+            deadline: now
+                .checked_add(options.timeout)
                 .ok_or(ConsumerCheckpointError::InvalidRequest)?,
+            #[cfg(test)]
+            clock: options.clock,
             cancelled: AtomicBool::new(false),
             mutated: AtomicBool::new(false),
         }))
     }
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = self.clock {
+            return clock();
+        }
+        Instant::now()
+    }
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(self.now())
+    }
     fn check(&self) -> Result<(), ConsumerCheckpointError> {
-        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+        if self.cancelled.load(Ordering::Acquire) || self.now() >= self.deadline {
             Err(self.error(ConsumerCheckpointError::Limit))
         } else {
             Ok(())
@@ -513,7 +541,7 @@ impl ConsumerCheckpointStore {
             .map_err(|_| ConsumerCheckpointError::Limit)?;
         let connection = Arc::clone(&self.connection);
         let options = self.options.clone();
-        let work = Work::new(options.timeout)?;
+        let work = Work::new(&options)?;
         let task_work = Arc::clone(&work);
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -542,6 +570,10 @@ impl ConsumerCheckpointStore {
                     }
                     // WAL is truncated between writes; reserve worst-case DB and
                     // journal growth before allocating a replacement transaction.
+                    #[cfg(test)]
+                    if let Some(hook) = &options.io_hook {
+                        hook(&task_work, "before-mutation");
+                    }
                     task_work.mutation()?;
                     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
                         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
@@ -587,8 +619,16 @@ impl ConsumerCheckpointStore {
                     #[cfg(test)]
                     tests::crash_at("after-checkpoint");
                 }
+                #[cfg(test)]
+                if let Some(hook) = &options.io_hook {
+                    hook(&task_work, "before-readback");
+                }
                 let row = read_row(conn, &options)?;
                 check_storage_size(&options)?;
+                #[cfg(test)]
+                if let Some(hook) = &options.io_hook {
+                    hook(&task_work, "readback-complete");
+                }
                 if !committed {
                     // Read-only settlement retains its caller budget check.
                     task_work.check()?;
@@ -644,7 +684,7 @@ impl ConsumerCheckpointStore {
         provider: Arc<dyn KeyProvider>,
         provision: bool,
     ) -> Result<Self, ConsumerCheckpointError> {
-        let work = Work::new(options.timeout)?;
+        let work = Work::new(&options)?;
         let _cancel = CancelOnDrop(Arc::clone(&work));
         let result = async {
             let prepare_options = options.clone();
@@ -659,8 +699,8 @@ impl ConsumerCheckpointStore {
                     1,
                     metadata.clone(),
                 );
-                let envelope = crate::deadline::timeout(
-                    work.deadline,
+                let envelope = tokio::time::timeout(
+                    work.remaining(),
                     encrypt_envelope(provider.as_ref(), &aad, &[]),
                 )
                 .await
@@ -680,8 +720,8 @@ impl ConsumerCheckpointStore {
                     row.generation,
                     metadata.clone(),
                 );
-                let payload = crate::deadline::timeout(
-                    work.deadline,
+                let payload = tokio::time::timeout(
+                    work.remaining(),
                     decrypt_envelope(provider.as_ref(), &aad, &row.envelope),
                 )
                 .await
@@ -732,13 +772,13 @@ async fn run_open_io<T: Send + 'static>(
     let permit = IO_SLOTS
         .try_acquire()
         .map_err(|_| ConsumerCheckpointError::Limit)?;
-    let deadline = work.deadline;
+    let task_work = Arc::clone(&work);
     let mut task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        work.check()?;
-        operation(&work)
+        task_work.check()?;
+        operation(&task_work)
     });
-    crate::deadline::timeout(deadline, &mut task)
+    tokio::time::timeout(work.remaining(), &mut task)
         .await
         .map_err(|_| ConsumerCheckpointError::Indeterminate)?
         .map_err(|_| ConsumerCheckpointError::Indeterminate)?
@@ -977,6 +1017,10 @@ fn finish_open(
     .map_err(|_| ConsumerCheckpointError::Unavailable)?;
     conn.progress_handler(0, None::<fn() -> bool>)
         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
+    #[cfg(test)]
+    if let Some(hook) = &options.io_hook {
+        hook(work, "open-complete");
+    }
     work.check()?;
     Ok(BackendConnection::retained(conn, prepared.admission))
 }
