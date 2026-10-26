@@ -415,10 +415,13 @@ def serial_lib_command(name: str) -> list[str]:
 
 
 def lib_group_command(group: dict) -> list[str]:
-    if any(name in native_log_bound.TESTS for name in lib_group_names(group)):
-        return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", *SELECTION,
+    names = lib_group_names(group)
+    native = next((name for name in names if name in native_log_bound.TESTS), None)
+    if native is not None:
+        profile = native_log_bound.profile_env(native)
+        return ["env", *(f"{key}={value}" for key, value in profile.items()), *SELECTION,
                 "--lib", "--", "--test-threads=1", "--nocapture", "--exact",
-                *lib_group_names(group)]
+                *names]
     return SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_group_names(group)]
 
 
@@ -1095,7 +1098,9 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
             by_profile.setdefault(prefix, []).extend(lib_group_names(group))
         for prefix, names in by_profile.items():
             command = [*prefix, "--", "--list", "--exact", *names]
-            print(f"{shard}: compile/list {len(names)} library test(s) with {'O1' if 'CARGO_PROFILE_TEST_OPT_LEVEL=1' in prefix else 'ordinary'} profile", flush=True)
+            profile = next((f"O{arg.split('=', 1)[1]}" for arg in prefix
+                            if arg.startswith("CARGO_PROFILE_TEST_OPT_LEVEL=")), "ordinary")
+            print(f"{shard}: compile/list {len(names)} library test(s) with {profile} profile", flush=True)
             output = subprocess.run(
                 command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
             ).stdout

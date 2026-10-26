@@ -225,7 +225,9 @@ pub(crate) use tests::{
 };
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use tests::{
-    roster_v2_aborted_persistence_fixture_for_history, roster_v2_fresh_wal_persistence_fixture,
+    roster_v2_aborted_persistence_fixture_for_history,
+    roster_v2_aborted_single_member_persistence_fixture_for_history,
+    roster_v2_fresh_wal_persistence_fixture, roster_v2_persistence_fixture_for_class,
 };
 
 /// Bind the exact voter scope to the immutable protected-roster profile.
@@ -242,6 +244,8 @@ pub(crate) fn protected_roster_profile_voter_set_digest(
     hasher.update(PROTECTED_ROSTER_PROFILE_VOTER_SET_DIGEST_DOMAIN);
     hasher.update(fenced_transition_voter_set_digest(identity, voters));
     hasher.update(crate::fenced_mutation_roster::profile_digest());
+    hasher.update(crate::fenced_mutation_roster::capacity_policy_digest());
+    hasher.update(crate::fenced_mutation_roster_storage::retired_admission_witness_policy_digest());
     hasher.finalize().into()
 }
 
@@ -260,6 +264,7 @@ pub(crate) fn protected_roster_profile_v2_voter_set_digest(
     hasher.update(PROTECTED_ROSTER_PROFILE_V2_VOTER_SET_DIGEST_DOMAIN);
     hasher.update(fenced_transition_voter_set_digest(identity, voters));
     hasher.update(crate::fenced_mutation_roster::Profile::v2().digest());
+    hasher.update(crate::fenced_mutation_roster::capacity_policy_digest());
     hasher.finalize().into()
 }
 
@@ -3569,12 +3574,64 @@ pub(crate) mod tests {
         roster_v2_persistence_fixture_for_authority(phase, [0x91; 16], 3, FenceToken::new(1), 1)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn roster_v2_persistence_fixture_for_class(
+        phase: Phase,
+        class: crate::fenced_mutation_roster::AdmissionClass,
+    ) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_authority_and_class(
+            phase,
+            [0x91; 16],
+            1,
+            FenceToken::new(9),
+            10,
+            class,
+            FRESH_ROSTER_MEMBERS,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn roster_v2_aborted_single_member_persistence_fixture_for_history(
+        roster_id: [u8; 16],
+        epoch: u64,
+    ) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_authority_and_class(
+            Phase::Aborted,
+            roster_id,
+            epoch,
+            FenceToken::new(9),
+            10,
+            crate::fenced_mutation_roster::AdmissionClass::Ordinary,
+            1,
+        )
+    }
+
     fn roster_v2_persistence_fixture_for_authority(
         phase: Phase,
         roster_id: [u8; 16],
         epoch: u64,
         fence: FenceToken,
         credential_id: u64,
+    ) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_for_authority_and_class(
+            phase,
+            roster_id,
+            epoch,
+            fence,
+            credential_id,
+            crate::fenced_mutation_roster::AdmissionClass::Ordinary,
+            FRESH_ROSTER_MEMBERS,
+        )
+    }
+
+    fn roster_v2_persistence_fixture_for_authority_and_class(
+        phase: Phase,
+        roster_id: [u8; 16],
+        epoch: u64,
+        fence: FenceToken,
+        credential_id: u64,
+        class: crate::fenced_mutation_roster::AdmissionClass,
+        member_count: usize,
     ) -> RosterV2PersistenceFixture {
         let key = SessionKey {
             tenant: TenantId::from_static("v2-wire-tag-tenant"),
@@ -3611,7 +3668,7 @@ pub(crate) mod tests {
         let proposal = AdmissionProposal::new(
             Profile::v2(),
             RosterId::from_bytes(roster_id).expect("V2 roster ID"),
-            (0..FRESH_ROSTER_MEMBERS)
+            (0..member_count)
                 .map(|ordinal| {
                     Member::new(
                         ordinal as u8,
@@ -3637,7 +3694,8 @@ pub(crate) mod tests {
             fence,
             Generation::new(1),
         )
-        .expect("V2 admission");
+        .expect("V2 admission")
+        .with_admission_class(class);
         let authority = roster_digest_authority(&admission, credential_id, 1, 61);
         let root_key = SigningKey::from_bytes((&[0x96; 32]).into()).expect("V2 root key");
         let ingress_key = SigningKey::from_bytes((&[0x97; 32]).into()).expect("V2 ingress key");

@@ -424,6 +424,13 @@
       ]
     },
     {
+      "module": "consensus::native::generation::catalog::tests::roster_tests",
+      "shard": "roster-history",
+      "tests": [
+        "native_roster_completed_history_exceeds_old_capacity_and_cold_reopens"
+      ]
+    },
+    {
       "module": "consensus::native::lease_deferral_tests",
       "shard": "native-log-3",
       "tests": [

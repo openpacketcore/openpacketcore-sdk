@@ -645,6 +645,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error representation maps the new variant onto its retryable
   `BackendUnavailable` class, so no wire format changed. Downstream exhaustive
   matches must handle the new variant. Refs #1197.
+- `opc-session-store` and `opc-session-net`: protected-roster activation now
+  binds the admission capacity policy, and authenticated admissions distinguish
+  ordinary and emergency work. Crossing this storage boundary requires a fresh
+  installation; old activation authority and snapshots are refused.
+  Completed rosters no longer consume a fixed count quota. Ordinary admissions
+  wait on conclusive live or byte capacity pressure within their original
+  authority deadline; emergency admissions bypass those policy limits while
+  preserving exact accounting and authority checks. Terminal evidence retains
+  its existing 24-hour recovery policy. (#1307)
+- `opc-session-store`: protected-roster activation now requires a versioned
+  witness that retains the maximum original admission fence across V1/V2
+  terminal retirement. An absent V2 recovery above that maximum remains
+  conclusively missing after unrelated history retires; at or below it remains
+  inconclusive. Activation, cold reconstruction and snapshot replacement reject
+  missing, unsupported or regressed witness state. Crossing this stored-format
+  boundary requires a fresh installation. Automatic history-unavailable
+  discharge is not provided by this change. Refs #1306.
 
 - `opc-proto-diameter`: `DiameterRequestFailure` adds `RoutePolicy` and
   `DiameterRequestClassificationError` adds `RoutePolicyRequiresProxiableRequest`;

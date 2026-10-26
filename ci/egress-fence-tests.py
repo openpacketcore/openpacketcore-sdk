@@ -164,22 +164,23 @@ def serial_lib_command(name: str) -> dict:
 
 def native_log_bound_command(name: str) -> dict:
     command = serial_lib_command(name)
-    command["env"] = {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"}
+    command["env"] = native_log_bound.profile_env(name)
     return command
 
 
 def precheck_native_log_bound(commands: list[dict]) -> None:
-    """Prove each full-bound name resolves and stays enabled at test O1."""
+    """Prove each full-bound name resolves and stays enabled in its test profile."""
     for command in commands:
         name = command["name"]
         if name not in native_log_bound.TESTS:
             continue
         argv = [*command["argv"], "--list"]
         env = dict(os.environ, **command["env"])
+        profile = "O" + command["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"]
         if listing(capture(argv, env=env)) != [name]:
-            raise ValueError("full native log proof must resolve exactly once at O1: " + name)
+            raise ValueError(f"full native log proof must resolve exactly once at {profile}: " + name)
         if listing(capture([*argv, "--ignored"], env=env)):
-            raise ValueError("full native log proof must remain enabled at O1: " + name)
+            raise ValueError(f"full native log proof must remain enabled at {profile}: " + name)
 
 
 def plans(rows: list[dict], shard: int) -> list[dict]:

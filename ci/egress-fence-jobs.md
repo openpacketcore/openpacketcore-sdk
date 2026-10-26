@@ -14,8 +14,9 @@ workload blocks the same existing required check. Existing workloads retain thei
 45-minute limit. The full-bound leader proof on shard 4 has a 120-minute
 compilation/run budget; the Durable and Async proofs on shards 5 and 6 retain
 75 minutes. The eleven receipt-history proofs use that same 75-minute budget
-on dedicated shards 7 through 17. The decision and aggregate jobs retain their
-10-minute limits.
+on dedicated shards 7 through 17. Completed-roster history on shard 18 has 240
+minutes for its full signed history and cold reconstruction. The decision and
+aggregate jobs retain their 10-minute limits.
 
 ## Original step ownership
 
@@ -41,6 +42,7 @@ the split requires them; each privileged runner verifies its own cleanup.
 | Gate host sources: eight isolated O1 SQLite proofs | `host-proofs` |
 | Full-bound native leader, Durable and Async log proofs | `host-native-log-proofs (4, 5, 6)`, one proof per runner at O1 |
 | Full-bound lease-deferral receipt-history proofs | `host-native-log-proofs (7–17)`, one proof per runner at O1 |
+| 131,073 completed rosters and authenticated cold reopen | `host-native-log-proofs (18)`, one proof at O3 |
 | Gate every eBPF feature surface: pinned fmt and all four Clippy commands | `sources` |
 | Rebuild production and test-only objects: all four independent double builds and production byte comparison | `sources` |
 | Build and gate independent host oracles: all bin tests, build, Clippy and redaction check | `oracles` |
@@ -92,6 +94,10 @@ verify their ownership and exclusions. Million-entry inputs, three-cycle
 companions, assertions and test deadlines are preserved. See [CI sizing](README.md)
 for the hosted timing evidence behind the new job budgets.
 
+The completed-roster history proof has owner 18 and runs at O3 with debug
+assertions and overflow checks enabled. Its precheck uses that same profile;
+all 131,073 signed admissions and the cold reconstruction remain intact.
+
 Each ordinary shard runs the original Cargo package/feature selection with four test
 threads, adding `--tests` and exact-name exclusions for the other shards.
 Cargo retains its working-directory and environment setup. Newly added tests
@@ -101,8 +107,8 @@ general-CI real-time exclusion list.
 
 Each ordinary shard uploads `egress-fence-test-map-N`, containing
 `egress-fence-test-map.json`: revision, every harness test name, ignored status,
-owner (0–2 for ordinary shards, 3 for `host-proofs`, or 4–17 for full-bound
-proofs) and all eighteen plans. Each full-bound runner uploads its own exact
+owner (0–2 for ordinary shards, 3 for `host-proofs`, or 4–18 for full-bound
+proofs) and all nineteen plans. Each full-bound runner uploads its own exact
 command map. Console output names the current invocation; the artifacts retain
 the complete exclusion arguments without emitting a single oversized log line.
 Generate the same map locally without executing tests with:
@@ -183,3 +189,12 @@ roughly balanced test durations, not just balanced counts. They are not timing
 qualification: the hosted train must confirm all three ordinary shards and
 the proof job finish comfortably below 45 minutes. Test deadlines,
 optimization flags, assertions and ignored-test statuses are unchanged.
+
+The completed-roster history proof adds a separate native-persistence matrix
+entry, shard 18, with a 240-minute job budget. Core CI runs the same enabled
+proof in its `roster-history` shard. A local O1 pilot processed the first 4,096
+signed admissions and completions in 175.316 seconds; linear extrapolation
+alone is about 94 minutes before cold reconstruction and compilation. This
+pilot is a sizing estimate, not a completed full-history qualification. The
+131,073 count, signatures, retention clock and assertions are unchanged.
+Existing shard budgets and the 45-minute isolated proof job remain unchanged.

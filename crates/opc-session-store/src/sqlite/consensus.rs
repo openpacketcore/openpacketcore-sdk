@@ -11026,12 +11026,18 @@ fn ensure_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
 }
 
 fn activate_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
+    let identity = read_storage_identity_sync(conn)
+        .map_err(|_| invalid_data("protected roster storage identity is invalid"))?;
     match protected_roster_layout_in_sync(conn, false)? {
-        ProtectedRosterLayout::Activated => Ok(()),
+        ProtectedRosterLayout::Activated => {
+            initialize_protected_roster_witness_sync(conn, identity, false)
+        }
         ProtectedRosterLayout::Legacy => {
             Err(invalid_data("protected roster schema is not prepared"))
         }
         ProtectedRosterLayout::Prepared => {
+            let fresh =
+                protected_roster_v2_layout_in_sync(conn, false)? == ProtectedRosterV2Layout::Absent;
             let changed = void_profile::set_layout(
                 conn,
                 PROTECTED_ROSTER_DATABASE_FORMAT,
@@ -11045,8 +11051,25 @@ fn activate_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
                     "protected roster schema activation is invalid",
                 ));
             }
-            Ok(())
+            initialize_protected_roster_witness_sync(conn, identity, fresh)
         }
+    }
+}
+
+fn initialize_protected_roster_witness_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    fresh: bool,
+) -> io::Result<()> {
+    match protected_roster_read_witness_sync(conn, identity)
+        .map_err(|_| invalid_data("protected roster witness is invalid"))?
+    {
+        Some(_) => Ok(()),
+        None if fresh => {
+            protected_roster_write_witness_sync(conn, identity, GlobalChargeWitness::empty())
+                .map_err(|_| invalid_data("protected roster initial witness is unavailable"))
+        }
+        None => Err(invalid_data("protected roster witness is missing")),
     }
 }
 
@@ -11119,11 +11142,7 @@ fn protected_roster_reservation_error(error: ReservationError) -> ProtectedRoste
         ReservationError::LiveLimit => {
             ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::LiveFull)
         }
-        ReservationError::BindingLimit
-        | ReservationError::DurableBindingLimit
-        | ReservationError::FloorAdvance
-        | ReservationError::FloorLimit
-        | ReservationError::InvalidEpoch => {
+        ReservationError::FloorAdvance | ReservationError::InvalidEpoch => {
             ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::HistoryFull)
         }
         ReservationError::BusinessCas => ProtectedRosterCommandApplyError::rejected(
@@ -11160,11 +11179,7 @@ fn protected_roster_v2_admission_reservation_error(
         ReservationError::LiveLimit => {
             ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::LiveFull)
         }
-        ReservationError::BindingLimit
-        | ReservationError::DurableBindingLimit
-        | ReservationError::FloorAdvance
-        | ReservationError::FloorLimit
-        | ReservationError::InvalidEpoch => {
+        ReservationError::FloorAdvance | ReservationError::InvalidEpoch => {
             ProtectedRosterCommandApplyError::rejected(ConsensusRosterRejection::HistoryFull)
         }
         ReservationError::BusinessCas
@@ -11942,6 +11957,14 @@ fn validate_protected_roster_state_sync(
         return Err(ProtectedRosterApplyError::Corrupt);
     }
     let witness = protected_roster_read_witness_sync(conn, identity)?;
+    if witness.is_none()
+        && (v2_present
+            || protected_roster_layout_in_sync(conn, attached)
+                .map_err(|_| ProtectedRosterApplyError::Corrupt)?
+                == ProtectedRosterLayout::Activated)
+    {
+        return Err(ProtectedRosterApplyError::Corrupt);
+    }
     let accounting_witness = witness.unwrap_or_else(GlobalChargeWitness::empty);
     let mut validator =
         ProductionSnapshotStreamValidator::new(application_sequence, applied_raft_log_index);
@@ -17081,7 +17104,10 @@ fn activate_protected_roster_profile_v2_scope_sync(
     // roster certificate. V1 traffic still remains gated by its separate
     // certificate and cannot use this Prepared namespace.
     ensure_protected_roster_schema_sync(conn)?;
-    if protected_roster_v2_layout_in_sync(conn, false)? == ProtectedRosterV2Layout::Absent {
+    let previous_layout = protected_roster_v2_layout_in_sync(conn, false)?;
+    let fresh = previous_layout == ProtectedRosterV2Layout::Absent
+        && protected_roster_layout_in_sync(conn, false)? == ProtectedRosterLayout::Prepared;
+    if previous_layout == ProtectedRosterV2Layout::Absent {
         conn.execute_batch(PROTECTED_ROSTER_V2_SCHEMA)
             .map_err(db_error)?;
         let changed = void_profile::set_layout(
@@ -17104,6 +17130,7 @@ fn activate_protected_roster_profile_v2_scope_sync(
             "protected roster V2 activation schema is invalid",
         ));
     }
+    initialize_protected_roster_witness_sync(conn, storage_identity, fresh)?;
     let voter_digest = protected_roster_profile_v2_voter_set_digest(scope_identity, voters);
     conn.execute(
         "INSERT INTO consensus_protected_roster_v2_activation (singleton, storage_configuration_epoch, scope_configuration_id, scope_configuration_epoch, voter_set_digest, profile_digest) VALUES (1, ?1, ?2, ?3, ?4, ?5) ON CONFLICT(singleton) DO UPDATE SET storage_configuration_epoch=excluded.storage_configuration_epoch, scope_configuration_id=excluded.scope_configuration_id, scope_configuration_epoch=excluded.scope_configuration_epoch, voter_set_digest=excluded.voter_set_digest, profile_digest=excluded.profile_digest",
@@ -38056,7 +38083,14 @@ fn protected_roster_v2_snapshot_incoming_closure_covers_tombstone(
     local_witness.configuration_epoch == incoming_witness.configuration_epoch
         && incoming_witness.witness.retired_terminal_sequence()
             >= local_witness.witness.retired_terminal_sequence()
+        && incoming_witness.witness.highest_retired_admission_fence()
+            >= local_witness.witness.highest_retired_admission_fence()
         && sequence <= incoming_witness.witness.retired_terminal_sequence()
+        && record.tombstone().ok().flatten().is_some_and(|tombstone| {
+            tombstone.original_admission_fence().is_ok_and(|fence| {
+                fence <= incoming_witness.witness.highest_retired_admission_fence()
+            })
+        })
 }
 
 /// V2 follows the same Live → Retained → Tombstone timeline as V1.  Its
@@ -38339,7 +38373,9 @@ fn validate_attached_snapshot_protected_roster_floors_and_cursors(
         (Some(local_witness), Some(incoming_witness))
             if local_witness.configuration_epoch == incoming_witness.configuration_epoch
                 && incoming_witness.witness.retired_terminal_sequence()
-                    >= local_witness.witness.retired_terminal_sequence() => {}
+                    >= local_witness.witness.retired_terminal_sequence()
+                && incoming_witness.witness.highest_retired_admission_fence()
+                    >= local_witness.witness.highest_retired_admission_fence() => {}
         (None, None | Some(_)) if protected_roster_snapshot_local_side_tables_are_empty(conn)? => {}
         _ => return Err(protected_roster_snapshot_monotonicity_error()),
     }
@@ -38562,13 +38598,24 @@ fn validate_attached_snapshot_preserves_protected_roster_sync(
         let local_state = local_row.state;
         let local_terminal_sequence = local_row.terminal_sequence;
         let Some((incoming_binding, incoming_row)) = incoming_row else {
-            let _local_record = protected_roster_snapshot_decode_row(binding, local_row)?;
+            let local_record = protected_roster_snapshot_decode_row(binding, local_row)?;
             let retired = local_terminal_sequence
                 .and_then(|sequence| u64::try_from(sequence).ok())
                 .zip(incoming_retired_terminal_sequence)
                 .is_some_and(|(sequence, retired)| sequence <= retired);
             if local_state == protected_roster_snapshot_state_code(ReservationState::Tombstone)
                 && retired
+                && local_record
+                    .tombstone()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|tombstone| {
+                        tombstone.original_admission_fence().is_ok_and(|fence| {
+                            incoming_witness.as_ref().is_some_and(|witness| {
+                                fence <= witness.witness.highest_retired_admission_fence()
+                            })
+                        })
+                    })
             {
                 continue;
             }
@@ -41132,6 +41179,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod descriptor_locks;
     mod lease_deferral;
+    mod retired_admission;
     #[path = "scope_authority.rs"]
     mod scope_authority_tests;
     #[path = "scope_batch.rs"]
@@ -46428,10 +46476,7 @@ mod tests {
     fn protected_roster_q2_reservation_failures_are_never_capacity_rejections() {
         // Q1 retains its public admission-time mapping.
         for error in [
-            ReservationError::BindingLimit,
-            ReservationError::DurableBindingLimit,
             ReservationError::FloorAdvance,
-            ReservationError::FloorLimit,
             ReservationError::InvalidEpoch,
         ] {
             assert!(matches!(
@@ -46446,10 +46491,7 @@ mod tests {
         for error in [
             ReservationError::BudgetExceeded,
             ReservationError::LiveLimit,
-            ReservationError::BindingLimit,
-            ReservationError::DurableBindingLimit,
             ReservationError::FloorAdvance,
-            ReservationError::FloorLimit,
             ReservationError::InvalidEpoch,
         ] {
             assert!(matches!(
@@ -46487,11 +46529,8 @@ mod tests {
             ReservationError::CanonicalEncoding,
             ReservationError::StateShape,
             ReservationError::FloorAdvance,
-            ReservationError::FloorLimit,
             ReservationError::BusinessCas,
             ReservationError::LiveLimit,
-            ReservationError::BindingLimit,
-            ReservationError::DurableBindingLimit,
             ReservationError::Duplicate,
             ReservationError::Unknown,
             ReservationError::InvalidState,
@@ -48217,6 +48256,7 @@ mod tests {
             reserved_roster_auxiliary_charge_bytes: u64,
             roster: Counters,
             retired_terminal_sequence: u64,
+            highest_retired_admission_fence: u64,
         }
 
         postcard::from_bytes::<Witness>(&witness.to_canonical_bytes().expect("canonical witness"))
@@ -48322,7 +48362,7 @@ mod tests {
         )
         .expect("empty incoming roster counters");
         let witness = GlobalChargeWitness::v1(0, 0, empty)
-            .retired_through_terminal_sequence_for_test(retired_terminal_sequence)
+            .retired_through_terminal_sequence_for_test(retired_terminal_sequence, 1)
             .expect("incoming closure witness");
         protected_roster_write_witness_sync(&conn, identity(), witness)
             .expect("persist incoming closure witness");
@@ -49495,7 +49535,7 @@ mod tests {
 
         let future_closure = retained
             .next_witness()
-            .retired_through_terminal_sequence_for_test(2)
+            .retired_through_terminal_sequence_for_test(2, 1)
             .expect("future closure fixture");
         protected_roster_write_witness_sync(&conn, identity(), future_closure)
             .expect("persist future closure fixture");

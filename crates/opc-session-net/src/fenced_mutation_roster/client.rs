@@ -10,9 +10,9 @@
 
 use super::{
     canonical::{
-        AbsentAdmissionProposal, Admission, AdmissionProposal, Error as RosterError,
-        EstablishedPublicationCall, Member, Phase, Profile, RosterId, Scope, INITIAL_GENERATION,
-        MAX_MEMBERS,
+        AbsentAdmissionProposal, Admission, AdmissionClass, AdmissionProposal,
+        Error as RosterError, EstablishedPublicationCall, Member, Phase, Profile, RosterId, Scope,
+        INITIAL_GENERATION, MAX_MEMBERS,
     },
     diagnostics::{Counter, FencedMutationRosterDiagnostics, RosterDiagnostics},
     runtime::{
@@ -189,6 +189,7 @@ pub struct AdmissionInput {
     lease: LeaseGuard,
     expected_generation: Generation,
     proposal: AdmissionProposal,
+    admission_class: AdmissionClass,
     state: AdmissionInputState,
 }
 
@@ -234,6 +235,21 @@ impl AdmissionInput {
         Self::new_for_profile(lease, expected_generation, proposal)
     }
 
+    /// Construct an admission with a class fixed before its first attempt.
+    ///
+    /// The trusted consumer owns emergency classification. The class becomes
+    /// part of the authenticated immutable request and cannot change on retry.
+    pub fn new_with_class(
+        lease: LeaseGuard,
+        expected_generation: Generation,
+        proposal: AdmissionProposal,
+        class: AdmissionClass,
+    ) -> Result<Self, ClientError> {
+        let mut input = Self::new(lease, expected_generation, proposal)?;
+        input.admission_class = class;
+        Ok(input)
+    }
+
     /// Construct an absent-predecessor admission with the SDK-fixed initial
     /// generation. Callers cannot select a different creation generation.
     fn new_absent(lease: LeaseGuard, proposal: AdmissionProposal) -> Result<Self, ClientError> {
@@ -259,6 +275,7 @@ impl AdmissionInput {
             lease,
             expected_generation,
             proposal,
+            admission_class: AdmissionClass::Ordinary,
             state: AdmissionInputState::Fresh,
         })
     }
@@ -266,6 +283,11 @@ impl AdmissionInput {
     /// Return the stable roster identity retained across every phase.
     pub const fn roster_id(&self) -> RosterId {
         self.proposal.roster_id()
+    }
+
+    /// Return the class fixed before the first admission attempt.
+    pub const fn admission_class(&self) -> AdmissionClass {
+        self.admission_class
     }
 
     /// Return the immutable public proposal.
@@ -317,7 +339,8 @@ impl AdmissionInput {
             self.lease.owner().clone(),
             self.lease.fence(),
             self.expected_generation,
-        )?;
+        )?
+        .with_admission_class(self.admission_class);
         RegistrationRequest::new_with_lease_metadata(
             admission,
             self.lease.owner().clone(),
@@ -1537,6 +1560,20 @@ impl FencedMutationRosterClient {
         Ok(input)
     }
 
+    /// Prepare an immutable present-predecessor admission in the selected class.
+    /// Emergency classification is the trusted consumer's responsibility.
+    pub fn prepare_with_class(
+        &self,
+        lease: LeaseGuard,
+        expected_generation: Generation,
+        proposal: AdmissionProposal,
+        class: AdmissionClass,
+    ) -> Result<AdmissionInput, ClientError> {
+        let mut input = self.prepare(lease, expected_generation, proposal)?;
+        input.admission_class = class;
+        Ok(input)
+    }
+
     /// Prepare a V2 exact-absence admission at the fixed generation-one
     /// creation point without exposing a caller-selected generation.
     pub fn prepare_absent(
@@ -1552,12 +1589,27 @@ impl FencedMutationRosterClient {
         Ok(input)
     }
 
+    /// Prepare an immutable absent-predecessor admission in the selected class.
+    /// Emergency classification is the trusted consumer's responsibility.
+    pub fn prepare_absent_with_class(
+        &self,
+        lease: LeaseGuard,
+        proposal: AbsentAdmissionProposal,
+        class: AdmissionClass,
+    ) -> Result<AdmissionInput, ClientError> {
+        let mut input = self.prepare_absent(lease, proposal)?;
+        input.admission_class = class;
+        Ok(input)
+    }
+
     /// Perform the one immutable admission mutation.
     /// The input becomes recovery-only before this method awaits. Only a
     /// conclusive `NotTransmitted` permits the identical admission to retry;
     /// cancellation and every ambiguous result require profile-specific
     /// [`Self::recover`] or [`Self::recover_absent`] readback. A retry is
-    /// counted only for that direct, transport-proven transition.
+    /// counted only for that direct, transport-proven transition. Conclusive
+    /// ordinary-capacity responses are retried internally with identical bytes,
+    /// within the original lease; they never restore the public input to fresh.
     pub async fn admit(&self, input: &mut AdmissionInput) -> Result<AdmissionOutcome, ClientError> {
         if input.proposal.profile() != self.profile {
             return Err(ClientError::InvalidInput);

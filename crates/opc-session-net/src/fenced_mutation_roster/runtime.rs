@@ -67,13 +67,14 @@ use std::{
 use tokio::sync::Mutex as AsyncMutex;
 
 const PROVIDER_EFFECT_DEADLINE: Duration = Duration::from_secs(30);
+const ADMISSION_CAPACITY_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 /// One process-wide provider gate can never exceed the durable live-roster cap.
 const MAX_PROVIDER_IN_FLIGHT: usize = super::canonical::MAX_LIVE_ROSTERS;
 /// Authority entries are durable-operation capabilities, not concurrent
-/// provider work. Bound their independent ledger by the profile's aggregate
-/// live-plus-retained population so terminal-but-unexpired capabilities cannot
-/// consume the 1,024 provider-work allowance.
-const MAX_LOCAL_AUTHORITY_ENTRIES: usize = super::canonical::MAX_RESERVED_AND_RETAINED;
+/// provider work. The ordinary share bounds currently held, unexpired local
+/// capabilities, independently of cumulative completed history. Emergency
+/// capabilities bypass this policy limit while retaining exact accounting.
+const MAX_LOCAL_AUTHORITY_ENTRIES: usize = 131_072;
 /// The local authority ledger must never serialize unrelated tenant/scope
 /// provider effects behind one process-wide lock. Keep this aligned with the
 /// fixed provider-work scheduler shard count.
@@ -784,6 +785,19 @@ enum LocalAuthorityCheck {
     RevokedOrExpired,
 }
 
+fn checked_increment(count: &AtomicUsize) -> Result<(), ExecutorError> {
+    let mut current = count.load(Ordering::Acquire);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or(ExecutorError::AuthorityRejected)?;
+        match count.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Ok(()),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 impl LocalAuthorityRegistry {
     pub(crate) fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
@@ -817,9 +831,7 @@ impl LocalAuthorityRegistry {
                 Err(ExecutorError::AuthorityRejected)
             };
         }
-        if !self.reserve_entry() {
-            return Err(ExecutorError::ExecutorBusy);
-        }
+        self.reserve_entry_for_class(request.admission().admission_class())?;
         let incarnation = Arc::new(LocalAuthorityIncarnation);
         entries.insert(
             key,
@@ -906,9 +918,7 @@ impl LocalAuthorityRegistry {
                 incarnation: Arc::clone(&entry.incarnation),
             });
         }
-        if !self.reserve_entry() {
-            return Err(ExecutorError::ExecutorBusy);
-        }
+        self.reserve_entry_for_class(admission.admission_class())?;
         let incarnation = Arc::new(LocalAuthorityIncarnation);
         entries.insert(
             key,
@@ -983,9 +993,7 @@ impl LocalAuthorityRegistry {
                 }
             }
         }
-        if !self.reserve_entry() {
-            return Err(ExecutorError::ExecutorBusy);
-        }
+        self.reserve_entry_for_class(admission.admission_class())?;
         let incarnation = Arc::new(LocalAuthorityIncarnation);
         entries.insert(
             key,
@@ -1088,23 +1096,13 @@ impl LocalAuthorityRegistry {
             entry.readers = entry
                 .readers
                 .checked_add(1)
-                .ok_or(ExecutorError::ExecutorBusy)?;
+                .ok_or(ExecutorError::AuthorityRejected)?;
         } else {
-            let mut count = self.inner.terminal_read_count.load(Ordering::Acquire);
-            loop {
-                if count >= MAX_PROVIDER_IN_FLIGHT {
-                    return Err(ExecutorError::ExecutorBusy);
-                }
-                match self.inner.terminal_read_count.compare_exchange_weak(
-                    count,
-                    count + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(current) => count = current,
-                }
-            }
+            // Readback must obtain the authenticated admission before its
+            // class is known. These caller-owned guards have no policy quota;
+            // they disappear on completion/cancellation and retain exact
+            // stale-result exclusion for both ordinary and emergency work.
+            checked_increment(&self.inner.terminal_read_count)?;
             reads.insert(
                 identity.clone(),
                 TerminalReadEntry {
@@ -1326,6 +1324,21 @@ impl LocalAuthorityRegistry {
         usize::from(key.key_digest[0] ^ key.admission_commitment[0]) & (LOCAL_AUTHORITY_SHARDS - 1)
     }
 
+    fn reserve_entry_for_class(
+        &self,
+        class: super::canonical::AdmissionClass,
+    ) -> Result<(), ExecutorError> {
+        if class == super::canonical::AdmissionClass::Emergency {
+            // The durable admission class, not a local queue hint, selects
+            // bypass. Preserve exact occupancy even above the ordinary share.
+            checked_increment(&self.inner.entry_count)
+        } else if self.reserve_entry() {
+            Ok(())
+        } else {
+            Err(ExecutorError::ExecutorBusy)
+        }
+    }
+
     fn reserve_entry(&self) -> bool {
         if self.try_reserve_entry() {
             return true;
@@ -1342,9 +1355,10 @@ impl LocalAuthorityRegistry {
     fn try_reserve_entry(&self) -> bool {
         let mut count = self.inner.entry_count.load(Ordering::Acquire);
         loop {
-            let Some(next) = (count < MAX_LOCAL_AUTHORITY_ENTRIES).then_some(count + 1) else {
+            if count >= MAX_LOCAL_AUTHORITY_ENTRIES {
                 return false;
-            };
+            }
+            let next = count + 1;
             match self.inner.entry_count.compare_exchange_weak(
                 count,
                 next,
@@ -3196,6 +3210,7 @@ impl CommittedTerminal {
             current_registration,
             roster_id: admission.roster_id(),
             admission_commitment: admission.body_commitment(),
+            admission_class: admission.admission_class(),
             terminal_body_commitment: self.record.body_commitment(),
             receipt_commitment: self.receipt_commitment,
             logical_owner: admission.logical_owner().clone(),
@@ -3313,6 +3328,7 @@ pub(crate) struct PublicationAuthority {
     current_registration: BackendRegistration,
     roster_id: RosterId,
     admission_commitment: [u8; 32],
+    admission_class: super::canonical::AdmissionClass,
     terminal_body_commitment: [u8; 32],
     receipt_commitment: [u8; 32],
     logical_owner: OwnerId,
@@ -3324,6 +3340,10 @@ pub(crate) struct PublicationAuthority {
 }
 
 impl PublicationAuthority {
+    pub(crate) const fn admission_class(&self) -> super::canonical::AdmissionClass {
+        self.admission_class
+    }
+
     pub(crate) const fn current_registration(&self) -> BackendRegistration {
         self.current_registration
     }
@@ -3362,6 +3382,7 @@ impl PublicationAuthority {
                 != current_registration.terminal_slot_id()
             || self.roster_id != admission.roster_id()
             || self.admission_commitment != admission.body_commitment()
+            || self.admission_class != admission.admission_class()
             || self.terminal_body_commitment != terminal_body_commitment
             || self.receipt_commitment != receipt_commitment
             || self.logical_owner != *admission.logical_owner()
@@ -4098,8 +4119,61 @@ where
         )
     }
 
-    /// Register an immutable admission and receive one opaque authenticated capability.
+    /// Register an immutable admission, waiting for conclusive capacity pressure
+    /// within its original authority. The caller owns this future; no detached
+    /// work or shared wait queue can outlive it.
     pub(crate) async fn register(
+        &self,
+        request: RegistrationRequest,
+    ) -> Result<Registration, ExecutorError> {
+        let started = tokio::time::Instant::now();
+        let deadline = Duration::try_from(
+            *request.authority().expires_at().as_offset_datetime()
+                - *self.local_authority.now().as_offset_datetime(),
+        )
+        .ok()
+        .and_then(|remaining| started.checked_add(remaining));
+        let mut retrying_capacity = false;
+        loop {
+            // Preserve the original first-attempt authority and uncertainty
+            // decisions. Only a conclusive capacity response authorizes this
+            // wrapper to wait and retry within the original lease.
+            if retrying_capacity
+                && (!self.local_authority.current_at(request.authority())
+                    || deadline.is_none_or(|end| tokio::time::Instant::now() >= end))
+            {
+                return Err(ExecutorError::AuthorityRejected);
+            }
+            match self.register_once(request.clone()).await {
+                Err(
+                    ExecutorError::AdmissionLiveFull
+                    | ExecutorError::AdmissionAggregateBytesFull
+                    | ExecutorError::ExecutorBusy,
+                ) if request.admission().admission_class()
+                    == super::canonical::AdmissionClass::Ordinary =>
+                {
+                    // A conclusive capacity rejection has no admission state.
+                    // register_once has released its exact local reservation;
+                    // cancellation here therefore leaves no local allocation.
+                    // Every transmitted retry keeps the original immutable body
+                    // and lease. Transport ambiguity never reaches this arm.
+                    let deadline = deadline.ok_or(ExecutorError::AuthorityRejected)?;
+                    if !self.local_authority.current_at(request.authority()) {
+                        return Err(ExecutorError::AuthorityRejected);
+                    }
+                    retrying_capacity = true;
+                    let wake = tokio::time::Instant::now()
+                        .checked_add(ADMISSION_CAPACITY_RETRY_INTERVAL)
+                        .ok_or(ExecutorError::AuthorityRejected)?
+                        .min(deadline);
+                    tokio::time::sleep_until(wake).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn register_once(
         &self,
         request: RegistrationRequest,
     ) -> Result<Registration, ExecutorError> {
@@ -4970,10 +5044,10 @@ where
         // operation reads or writes consensus. The shared scheduler also caps
         // one exact tenant and scope below global capacity, leaving progress
         // capacity for an unrelated tenant.
-        let concurrency_permit = match self
-            .scheduler
-            .try_acquire(provider_scheduling_digest(registration.authority()))
-        {
+        let concurrency_permit = match self.scheduler.try_acquire_for_class(
+            provider_scheduling_digest(registration.authority()),
+            registration.admission().admission_class(),
+        ) {
             Ok(permit) => permit,
             Err(_) => {
                 self.diagnostics
@@ -8093,6 +8167,358 @@ mod production_runtime_cut_matrix_tests {
                 1
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_capacity_wait_backs_off_with_bounded_release_latency() {
+        use futures_util::poll;
+
+        for rejection in [
+            BackendRejection::LiveFull,
+            BackendRejection::AggregateBytesFull,
+        ] {
+            let request = request();
+            let provider = Arc::new(CutProvider::for_cut(Cut::BeforeAdmission));
+            let backend = Arc::new(CutBackend::default());
+            backend.state.lock().unwrap().admission_capacity_rejection = Some(rejection);
+            let executor = executor(
+                Arc::clone(&provider),
+                Arc::clone(&backend),
+                request.admission().scope(),
+            );
+            let mut waiting = Box::pin(executor.register(request.clone()));
+            assert!(poll!(&mut waiting).is_pending());
+            // Poll the real admission future at small deterministic intervals.
+            // A fixed 25 ms loop makes 81 proposals in this two-second window.
+            for _ in 0..400 {
+                tokio::time::advance(Duration::from_millis(5)).await;
+                assert!(poll!(&mut waiting).is_pending());
+            }
+            let attempts = backend.admission_calls();
+            assert!(
+                (4..=10).contains(&attempts.len()),
+                "sustained capacity pressure must back off, got {} proposals",
+                attempts.len()
+            );
+            assert!(
+                attempts.windows(2).all(|pair| pair[0] == pair[1]),
+                "every capacity retry preserves the exact immutable admission"
+            );
+            assert!(provider.calls.lock().unwrap().is_empty());
+            assert!(backend.state.lock().unwrap().admission.is_none());
+            assert_eq!(
+                executor
+                    .local_authority
+                    .inner
+                    .entry_count
+                    .load(Ordering::Acquire),
+                0
+            );
+            backend.state.lock().unwrap().admission_capacity_rejection = None;
+            let released = tokio::time::Instant::now();
+            let registered = waiting
+                .await
+                .expect("capacity release admits original request");
+            assert!(
+                released.elapsed() <= Duration::from_secs(1),
+                "backoff keeps a fixed release-latency ceiling"
+            );
+            assert_eq!(registered.admission(), request.admission());
+            assert!(provider.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_capacity_wait_cancellation_releases_the_local_reservation() {
+        use futures_util::poll;
+
+        let request = request();
+        let provider = Arc::new(CutProvider::for_cut(Cut::BeforeAdmission));
+        let backend = Arc::new(CutBackend::default());
+        backend.state.lock().unwrap().admission_capacity_rejection =
+            Some(BackendRejection::LiveFull);
+        let executor = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let mut waiting = Box::pin(executor.register(request));
+        assert!(poll!(&mut waiting).is_pending());
+        assert_eq!(
+            executor
+                .local_authority
+                .inner
+                .entry_count
+                .load(Ordering::Acquire),
+            0
+        );
+        drop(waiting);
+        backend.state.lock().unwrap().admission_capacity_rejection = None;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(backend.admission_calls().len(), 1);
+        assert!(backend.state.lock().unwrap().admission.is_none());
+        assert!(provider.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            executor
+                .local_authority
+                .inner
+                .entry_count
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_capacity_wait_never_extends_the_original_lease() {
+        use futures_util::poll;
+
+        let request = request();
+        let provider = Arc::new(CutProvider::for_cut(Cut::BeforeAdmission));
+        let backend = Arc::new(CutBackend::default());
+        backend.state.lock().unwrap().admission_capacity_rejection =
+            Some(BackendRejection::AggregateBytesFull);
+        let executor = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let mut waiting = Box::pin(executor.register(request));
+        assert!(poll!(&mut waiting).is_pending());
+        // The original synthetic lease lasts less than 60 seconds. Even a
+        // capacity release at expiry must not dispatch another admission.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        backend.state.lock().unwrap().admission_capacity_rejection = None;
+        assert!(matches!(
+            waiting.await,
+            Err(ExecutorError::AuthorityRejected)
+        ));
+        assert_eq!(backend.admission_calls().len(), 1);
+        assert!(backend.state.lock().unwrap().admission.is_none());
+        assert!(provider.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            executor
+                .local_authority
+                .inner
+                .entry_count
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_capacity_retry_stops_on_transport_ambiguity() {
+        use futures_util::poll;
+
+        let request = request();
+        let provider = Arc::new(CutProvider::for_cut(Cut::BeforeAdmission));
+        let backend = Arc::new(CutBackend::default());
+        backend.state.lock().unwrap().admission_capacity_rejection =
+            Some(BackendRejection::AggregateBytesFull);
+        let executor = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        let mut waiting = Box::pin(executor.register(request.clone()));
+        assert!(poll!(&mut waiting).is_pending());
+        {
+            let mut state = backend.state.lock().unwrap();
+            state.admission_capacity_rejection = None;
+            state.next_admission_outcome_unknown = true;
+        }
+        assert!(matches!(
+            waiting.await,
+            Err(ExecutorError::AdmissionOutcomeUnknown)
+        ));
+        assert_eq!(backend.admission_calls().len(), 2);
+        assert_eq!(
+            executor
+                .local_authority
+                .inner
+                .entry_count
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(matches!(
+            executor.register(request).await,
+            Err(ExecutorError::RecoveryRequired)
+        ));
+        assert_eq!(backend.admission_calls().len(), 2);
+        assert!(provider.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_capacity_wait_does_not_retry_other_rejections() {
+        for (rejection, expected) in [
+            (
+                BackendRejection::BusinessKeyReserved,
+                ExecutorError::AdmissionBusinessKeyReserved,
+            ),
+            (
+                BackendRejection::HistoryFull,
+                ExecutorError::AdmissionHistoryFull,
+            ),
+        ] {
+            let request = request();
+            let provider = Arc::new(CutProvider::for_cut(Cut::BeforeAdmission));
+            let backend = Arc::new(CutBackend::default());
+            backend.state.lock().unwrap().admission_capacity_rejection = Some(rejection);
+            let executor = executor(
+                Arc::clone(&provider),
+                Arc::clone(&backend),
+                request.admission().scope(),
+            );
+            assert_eq!(executor.register(request).await.err(), Some(expected));
+            assert_eq!(backend.admission_calls().len(), 1);
+            assert!(provider.calls.lock().unwrap().is_empty());
+            assert_eq!(
+                executor
+                    .local_authority
+                    .inner
+                    .entry_count
+                    .load(Ordering::Acquire),
+                0
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_capacity_local_pressure_waits_before_transmission() {
+        use futures_util::poll;
+
+        let request = request();
+        let provider = Arc::new(CutProvider::for_cut(Cut::BeforeAdmission));
+        let backend = Arc::new(CutBackend::default());
+        let executor = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        executor
+            .local_authority
+            .inner
+            .entry_count
+            .store(MAX_LOCAL_AUTHORITY_ENTRIES, Ordering::Release);
+        let mut waiting = Box::pin(executor.register(request.clone()));
+        assert!(poll!(&mut waiting).is_pending());
+        assert!(backend.admission_calls().is_empty());
+        assert!(provider.calls.lock().unwrap().is_empty());
+        executor
+            .local_authority
+            .inner
+            .entry_count
+            .store(0, Ordering::Release);
+        assert_eq!(waiting.await.unwrap().admission(), request.admission());
+        assert_eq!(backend.admission_calls().len(), 1);
+        assert_eq!(
+            executor
+                .local_authority
+                .inner
+                .entry_count
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(provider.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn roster_capacity_emergency_terminal_read_survives_full_registry() {
+        use super::super::canonical::AdmissionClass;
+        let registry = LocalAuthorityRegistry::new(Arc::new(SystemClock));
+        let ordinary = request();
+        let mut held = Vec::new();
+        for value in 0..MAX_PROVIDER_IN_FLIGHT {
+            let mut identity = TerminalReadIdentity::for_admission(ordinary.admission());
+            identity.key_digest[..8].copy_from_slice(&(value as u64).to_be_bytes());
+            identity.original_owner = OwnerId::new(if value % 2 == 0 {
+                "client-a"
+            } else {
+                "client-b"
+            })
+            .unwrap();
+            held.push(registry.begin_terminal_read(identity).unwrap());
+        }
+        assert_eq!(
+            registry.inner.terminal_read_count.load(Ordering::Acquire),
+            MAX_PROVIDER_IN_FLIGHT
+        );
+        let emergency = ordinary
+            .admission()
+            .clone()
+            .with_admission_class(AdmissionClass::Emergency);
+        let read = registry.begin_terminal_read(TerminalReadIdentity::for_admission(&emergency));
+        assert!(
+            read.is_ok(),
+            "emergency recovery cannot fail on the ordinary read capacity: {:?}",
+            read.err()
+        );
+        let read = read.unwrap();
+        assert_eq!(
+            registry.inner.terminal_read_count.load(Ordering::Acquire),
+            MAX_PROVIDER_IN_FLIGHT + 1
+        );
+        assert!(read.install(false, || Ok(())).is_ok());
+        registry.mark_terminal(&emergency);
+        assert_eq!(
+            read.install(false, || Ok(())).err(),
+            Some(ExecutorError::AuthorityRejected)
+        );
+        assert!(read.install(true, || Ok(())).is_ok());
+        drop(read);
+        drop(held);
+        assert_eq!(
+            registry.inner.terminal_read_count.load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_capacity_emergency_bypasses_local_admission_pressure() {
+        use super::super::canonical::AdmissionClass;
+        use futures_util::poll;
+
+        let ordinary = request();
+        let request = RegistrationRequest::new_with_lease_metadata(
+            ordinary
+                .admission()
+                .clone()
+                .with_admission_class(AdmissionClass::Emergency),
+            ordinary.authority().owner().clone(),
+            ordinary.authority().fence(),
+            ordinary.authority().credential_id(),
+            ordinary.authority().generation(),
+            ordinary.authority().acquired_at(),
+            ordinary.authority().expires_at(),
+        )
+        .unwrap();
+        let provider = Arc::new(CutProvider::for_cut(Cut::BeforeAdmission));
+        let backend = Arc::new(CutBackend::default());
+        let executor = executor(
+            Arc::clone(&provider),
+            Arc::clone(&backend),
+            request.admission().scope(),
+        );
+        executor
+            .local_authority
+            .inner
+            .entry_count
+            .store(MAX_LOCAL_AUTHORITY_ENTRIES, Ordering::Release);
+        let mut admission = Box::pin(executor.register(request.clone()));
+        let result = poll!(&mut admission);
+        assert!(
+            matches!(result, std::task::Poll::Ready(Ok(_))),
+            "emergency admission must neither wait nor fail on local capacity: {result:?}"
+        );
+        assert_eq!(backend.admission_calls().len(), 1);
+        assert_eq!(
+            executor
+                .local_authority
+                .inner
+                .entry_count
+                .load(Ordering::Acquire),
+            MAX_LOCAL_AUTHORITY_ENTRIES + 1
+        );
+        assert!(provider.calls.lock().unwrap().is_empty());
     }
 
     fn compensation_executor(

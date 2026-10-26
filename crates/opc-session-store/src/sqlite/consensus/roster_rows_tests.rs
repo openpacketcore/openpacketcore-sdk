@@ -53,7 +53,8 @@ fn signed_v1_command_with_payloads(
         signed.authority.fence(),
         signed.authority.generation(),
     )
-    .unwrap();
+    .unwrap()
+    .with_admission_class(signed.admission.admission_class());
     let root_key = SigningKey::from_bytes((&[0x96; 32]).into()).unwrap();
     let ingress_key = SigningKey::from_bytes((&[0x97; 32]).into()).unwrap();
     let input = RosterIngressAttestationSigningInputV1 {

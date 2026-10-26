@@ -15,6 +15,7 @@ pub(in crate::consensus::native) mod store;
 #[path = "roster/v1_fixture.rs"]
 pub(crate) mod v1_fixture;
 pub(in crate::consensus::native) use commands::validate_activation;
+pub(in crate::consensus::native) use commands::validate_witness;
 pub(crate) use index::Index;
 pub(in crate::consensus::native) use publication::validate_candidate;
 pub(crate) use row::Row;
@@ -228,9 +229,6 @@ impl Ledger {
         let mut charges = ProductionSnapshotAccounting::empty();
         for (key, partition) in partitions {
             partition.validate(key)?;
-            if next.partitions.len() >= crate::fenced_mutation_roster::MAX_RESERVED_AND_RETAINED {
-                return Err(invalid("native roster floor count exceeds original bound"));
-            }
             charges
                 .replace(None, Some(partition.accounting()?))
                 .map_err(|_| invalid("native roster partition charge overflow"))?;
@@ -244,9 +242,6 @@ impl Ledger {
         }
         for row in rows {
             let row = row?;
-            if next.rows.len() >= crate::fenced_mutation_roster::MAX_RESERVED_AND_RETAINED {
-                return Err(invalid("native roster count exceeds original bound"));
-            }
             let hydrated = hydrate(&row)?;
             let partition = next.partition(row.binding)?;
             hydrated

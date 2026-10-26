@@ -5,7 +5,12 @@
 use super::*;
 
 fn empty_without_root(ledger: &Ledger) -> io::Result<()> {
-    if !ledger.rows.is_empty() || !ledger.partitions.is_empty() || ledger.witness.is_some() {
+    if !ledger.rows.is_empty()
+        || !ledger.partitions.is_empty()
+        || ledger
+            .witness
+            .is_some_and(|witness| witness != GlobalChargeWitness::empty())
+    {
         return Err(invalid(
             "native roster state lacks its configured trust root",
         ));
@@ -51,6 +56,7 @@ pub(in crate::consensus::native) fn validate_candidate(
     delta.roster_changes.require_base(&delta.base.roster)?;
     delta.roster_changes.require_current(&delta.roster)?;
     delta.roster_changes.validate(check)?;
+    commands::validate_witness(&delta.frontiers, delta.roster.witness)?;
     for (key, row) in &delta.keys {
         check()?;
         reserved_matches(key, row, &delta.roster)?;
@@ -205,6 +211,7 @@ impl NativeState {
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Ledger> {
         check()?;
+        commands::validate_witness(&self.frontiers, witness)?;
         let mut rows = rows.into_iter();
         let mut partitions = partitions.into_iter();
         let ledger = if let Some(root) = self.roster_root.as_deref() {
@@ -228,13 +235,17 @@ impl NativeState {
         } else {
             if rows.next().transpose()?.is_some()
                 || partitions.next().is_some()
-                || witness.is_some()
+                || witness.is_some_and(|witness| witness != GlobalChargeWitness::empty())
             {
                 return Err(invalid(
                     "native roster state lacks its configured trust root",
                 ));
             }
-            Ledger::empty()
+            // Activation has no signed rows and can precede root configuration.
+            // Preserve its explicit virgin witness in the admitted certificate.
+            let mut edit = Edit::new(&Ledger::empty(), 0, 0)?;
+            edit.witness = witness;
+            edit.finish()?.0
         };
         // Check both directions against the newly rebuilt index. An orphan
         // business flag cannot be admitted by merely supplying no roster row.

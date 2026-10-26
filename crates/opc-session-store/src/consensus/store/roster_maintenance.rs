@@ -346,6 +346,14 @@ mod tests {
     }
 
     #[test]
+    fn unknown_occupancy_requests_a_bounded_refresh() {
+        assert!(
+            roster_maintenance_pending(&ProtectedRosterConsensusDiagnosticSnapshot::default()),
+            "an unknown projection must be refreshed instead of treated as an empty ledger"
+        );
+    }
+
+    #[test]
     fn pending_trigger_requires_retained_or_tombstone_occupancy() {
         let mut snapshot = ProtectedRosterConsensusDiagnosticSnapshot::default();
         assert!(!roster_maintenance_pending(&snapshot));

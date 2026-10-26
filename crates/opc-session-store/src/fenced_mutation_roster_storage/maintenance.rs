@@ -31,7 +31,7 @@ impl ProductionMixedReclaimStream {
         budget: GlobalChargeBudget,
         profile: ChargeProfile,
     ) -> Result<Self, ReservationError> {
-        witness.admits(budget)?;
+        witness.validate_for(budget)?;
         Ok(Self {
             maintenance_time,
             witness,
@@ -115,7 +115,7 @@ impl ProductionMixedReclaimStream {
             return Err(ReservationError::SnapshotMismatch);
         }
         let next = self.witness.with_roster(self.counters);
-        next.admits(self.budget)?;
+        next.validate_for(self.budget)?;
         Ok(ReclaimClosure {
             previous: self.witness,
             next,
@@ -138,6 +138,7 @@ pub(crate) struct ProductionMixedTerminalRetirementStream {
     budget: GlobalChargeBudget,
     profile: ChargeProfile,
     counters: AggregateCounters,
+    highest_retired_admission_fence: u64,
     selected: Vec<(u64, RequestBindingKey, ProductionRosterProfileTag)>,
     seen_bindings: BTreeMap<RequestBindingKey, ()>,
 }
@@ -148,12 +149,13 @@ impl ProductionMixedTerminalRetirementStream {
         budget: GlobalChargeBudget,
         profile: ChargeProfile,
     ) -> Result<Self, ReservationError> {
-        witness.admits(budget)?;
+        witness.validate_for(budget)?;
         Ok(Self {
             witness,
             budget,
             profile,
             counters: witness.roster,
+            highest_retired_admission_fence: witness.highest_retired_admission_fence(),
             selected: Vec::new(),
             seen_bindings: BTreeMap::new(),
         })
@@ -172,7 +174,7 @@ impl ProductionMixedTerminalRetirementStream {
             .map_or(self.witness.retired_terminal_sequence(), |row| row.0);
         let profile = self.profile;
         let mut counters = self.counters;
-        let (row, order) = match selection {
+        let (row, order, original_fence) = match selection {
             ProductionMixedTerminalRetirementSelection::V1(record) => {
                 record.validate(profile)?;
                 let sequence = record
@@ -188,6 +190,7 @@ impl ProductionMixedTerminalRetirementStream {
                 (
                     ProductionMixedReclaimRow::DeleteV1(Box::new(record.clone())),
                     (sequence, record.binding(), ProductionRosterProfileTag::V1),
+                    record.tombstone()?,
                 )
             }
             ProductionMixedTerminalRetirementSelection::V2(record) => {
@@ -207,9 +210,16 @@ impl ProductionMixedTerminalRetirementStream {
                 (
                     ProductionMixedReclaimRow::DeleteV2(Box::new(record.clone())),
                     (sequence, record.binding(), ProductionRosterProfileTag::V2),
+                    record.tombstone()?,
                 )
             }
         };
+        let original_fence = original_fence
+            .ok_or(ReservationError::StateShape)?
+            .original_admission_fence()
+            .map_err(|_| ReservationError::SnapshotMismatch)?;
+        self.highest_retired_admission_fence =
+            self.highest_retired_admission_fence.max(original_fence);
         self.counters = counters;
         self.seen_bindings.insert(order.1, ());
         self.selected.push(order);
@@ -312,8 +322,9 @@ impl ProductionMixedTerminalRetirementStream {
         let next = self
             .witness
             .with_roster(counters)
+            .with_retired_admission_fence(self.highest_retired_admission_fence)?
             .retire_through_terminal_sequence(previous_sequence)?;
-        next.admits(self.budget)?;
+        next.validate_for(self.budget)?;
         Ok(RetirementClosure {
             floor_actions,
             previous: self.witness,

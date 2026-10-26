@@ -569,7 +569,18 @@ fn native_v2_successor_recovery_distinguishes_retired_history_from_missing() {
     ))
     .and_then(|request| request.bind_original_key(signed.authority.key().clone()))
     .unwrap();
-    let empty = Store::new(&successor_delta, &Ledger::empty(), &signed.root).unwrap();
+    let missing_witness = Store::new(&successor_delta, &Ledger::empty(), &signed.root).unwrap();
+    assert!(roster_reads::read_protected_roster_v2_recovery_sync(
+        &missing_witness,
+        signed.identity,
+        &recovery,
+        due,
+    )
+    .is_err());
+    let mut virgin = Edit::new(&Ledger::empty(), 0, 0).unwrap();
+    virgin.witness = Some(GlobalChargeWitness::empty());
+    let (virgin, _) = virgin.finish().unwrap();
+    let empty = Store::new(&successor_delta, &virgin, &signed.root).unwrap();
     assert!(matches!(
         roster_reads::read_protected_roster_v2_recovery_sync(
             &empty,

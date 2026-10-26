@@ -359,11 +359,12 @@ jobs:
   rust-native-log-proofs:
     name: Rust full-bound store proof (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The signed 131,073-roster proof includes complete cold reconstruction.
+    timeout-minutes: ${{ matrix.shard == 'roster-history' && 240 || 90 }}
     strategy:
       fail-fast: false
       matrix:
-        shard: [native-log-0, native-log-1, native-log-2, native-log-3, native-log-4, native-log-5, native-log-6, native-log-7, native-log-8, native-log-9, native-log-10, native-log-11, native-log-12, native-log-13]
+        shard: [native-log-0, native-log-1, native-log-2, native-log-3, native-log-4, native-log-5, native-log-6, native-log-7, native-log-8, native-log-9, native-log-10, native-log-11, native-log-12, native-log-13, roster-history]
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
