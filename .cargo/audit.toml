@@ -10,16 +10,27 @@
 # in deny.toml — keep the two in sync and drop both once `rsa` ships the
 # constant-time rewrite.
 #
-# Tokio 1.53.1 AsyncFd constructors violate I/O safety (RUSTSEC-2026-0386). The
-# three AsyncFd::new uses (opc-sctp, opc-session-store, opc-egress-fence) own
-# their descriptors exclusively and never replace/close them while registered;
+# OOB reads deserializing untrusted rkyv archives containing Rc/Arc
+# (RUSTSEC-2026-0235). rkyv 0.7.46 is only a lockfile entry: it is the optional,
+# never-enabled rkyv integration of rust_decimal, reached through the pinned
+# openraft fork's byte-unit dependency and never compiled into a workspace
+# artifact. No patched 0.7.x release exists. Remove once rust_decimal's rkyv
+# integration moves to a patched rkyv or the pinned openraft drops it.
+# Mirror of deny.toml — keep in sync.
+#
+# Tokio 1.53.1 AsyncFd constructors violate I/O safety (RUSTSEC-2026-0386).
+# The five production constructor sites in opc-sctp, opc-session-store and
+# opc-egress-fence own their descriptors exclusively and never replace/close
+# them while registered. The GTP-U readiness test borrows its descriptor and
+# retains the owning readiness handle for the entire AsyncFd registration;
 # migrating to AsyncFd::register needs `unsafe` outside the ADR 0017 sys-crate
 # allow-list, tracked as follow-up. Mirror of deny.toml — keep in sync.
 #
 # Timing variability in crypto-bigint operations intended to be constant-time.
-# The 0.7.x line is bumped to 0.7.6 (the advisory's fix). A crypto-bigint 0.5.5
-# copy remains only in the audited vendored DTLS fork (dimpl 0.7.2 -> p256/p384
-# 0.13 -> elliptic-curve 0.13.8) consumed by opc-diameter-transport; no 0.5.x
+# The 0.7.x line uses non-yanked 0.7.9, retaining the fix introduced in 0.7.6.
+# A crypto-bigint 0.5.5 copy remains only in the audited vendored DTLS fork
+# (dimpl 0.7.2 -> p256/p384 0.13 -> elliptic-curve 0.13.8) consumed by
+# opc-diameter-transport; no 0.5.x
 # fix exists and the fork's rust-crypto backend has not migrated. Explicit,
 # scoped risk acceptance: exploiting it needs a local timing oracle against the
 # DTLS certificate ECDSA path; upgrading the fork's RustCrypto stack is tracked

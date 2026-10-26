@@ -23,16 +23,19 @@ ignore = [
     # Mirror of .cargo/audit.toml — keep in sync.
     { id = "RUSTSEC-2026-0235", reason = "rkyv OOB read: never compiled (optional never-enabled rust_decimal feature); no patched 0.7.x release exists" },
     # AsyncFd constructors violate I/O safety (unsound; tokio 1.53.3 deprecates
-    # them for AsyncFd::register). The three workspace AsyncFd::new uses
-    # (opc-sctp, opc-session-store, opc-egress-fence) each take exclusive
-    # ownership of their descriptor and never replace or close it while
-    # registered, so the unsoundness is not reachable in these uses. Migrating
-    # to AsyncFd::register needs `unsafe` outside the ADR 0017 sys-crate
-    # allow-list, so it is tracked as follow-up (ADR route or sys-crate helper).
+    # them for AsyncFd::register). The five production constructor sites in
+    # opc-sctp, opc-session-store and opc-egress-fence take exclusive ownership
+    # of their descriptor and never replace or close it while registered.
+    # The GTP-U readiness test borrows its descriptor and retains the owning
+    # readiness handle for the entire AsyncFd registration, so the unsoundness
+    # is not reachable in these uses. Migrating to AsyncFd::register needs
+    # `unsafe` outside the ADR 0017 sys-crate allow-list, so it is tracked as
+    # follow-up (ADR route or sys-crate helper).
     # Mirror of .cargo/audit.toml — keep in sync.
-    { id = "RUSTSEC-2026-0386", reason = "tokio 1.53.1 AsyncFd I/O-safety: all three uses own their fd exclusively and never replace/close it while registered; unsafe migration blocked by ADR 0017 allow-list (follow-up)" },
+    { id = "RUSTSEC-2026-0386", reason = "tokio 1.53.1 AsyncFd I/O-safety: five production sites own their fd; the GTP-U test retains the borrowed fd's owner; no close/replace while registered; unsafe migration blocked by ADR 0017 allow-list (follow-up)" },
     # Timing variability in crypto-bigint operations intended to be
-    # constant-time. The 0.7.x line is bumped to 0.7.6 (the advisory's fix).
+    # constant-time. The 0.7.x line uses non-yanked 0.7.9, retaining the fix
+    # introduced in 0.7.6.
     # A crypto-bigint 0.5.5 copy remains only in the audited vendored DTLS fork
     # (dimpl 0.7.2 -> p256/p384 0.13 -> elliptic-curve 0.13.8) consumed by
     # opc-diameter-transport; no 0.5.x fix exists and the fork's rust-crypto
@@ -41,7 +44,7 @@ ignore = [
     # the DTLS certificate ECDSA path. Upgrading the vendored fork's RustCrypto
     # stack is tracked as follow-up work; do not extend this ignore to the 0.7.x
     # line. Mirror of .cargo/audit.toml — keep in sync.
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only in the vendored DTLS fork (dimpl); 0.7.6 applied elsewhere; no patched 0.5.x; local-timing risk acceptance pending fork crypto upgrade" },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only in the vendored DTLS fork (dimpl); non-yanked patched 0.7.9 applied elsewhere; no patched 0.5.x; local-timing risk acceptance pending fork crypto upgrade" },
 ]
 
 [licenses]
