@@ -59,6 +59,7 @@ fn pair(child: u64, incarnation: u64, selected: bool) -> ChildSaInstalledPairReq
         output_mark: None,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     };
     let mut outbound_sa = inbound_sa.clone();
     outbound_sa.id.destination = peer;

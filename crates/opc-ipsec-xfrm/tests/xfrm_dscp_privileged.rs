@@ -288,6 +288,7 @@ fn sa_parameters(
         output_mark: None,
         if_id: None,
         egress_dscp,
+        tfc_pad: None,
     }
 }
 

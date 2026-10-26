@@ -136,6 +136,7 @@ fn sa(spi: u32, mark: Option<XfrmLookupMark>, request_id: u32) -> SaParameters {
         output_mark: None,
         if_id: None,
         egress_dscp: None,
+        tfc_pad: None,
     }
 }
 
@@ -458,6 +459,33 @@ async fn wait_until_removed(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, XFRM, and a fresh network namespace"]
+async fn tfc_padding_install_and_readback_match_the_linux_kernel() -> Result<(), Box<dyn Error>> {
+    if env::var("OPC_XFRM_RUN_SA_KEY_SNAPSHOT_PRIVILEGED").as_deref() != Ok("1") {
+        return Err(
+            "set OPC_XFRM_RUN_SA_KEY_SNAPSHOT_PRIVILEGED=1 in a fresh privileged netns".into(),
+        );
+    }
+    let backend = LinuxXfrmBackend::new().bind_current_network_namespace()?;
+    let spi = 0x5156_0001;
+    for padding in [None, Some(512), Some(65_535)] {
+        let mut parameters = unmarked(spi);
+        parameters.tfc_pad = padding;
+        install(&backend, &parameters).await?;
+        let observed = backend
+            .query_sa(opc_ipsec_xfrm::QuerySaRequest::new(
+                parameters.id.destination,
+                IPPROTO_ESP,
+                spi,
+            ))
+            .await?;
+        assert_eq!(observed.tfc_pad, padding);
+        remove_unmarked(&backend, spi).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

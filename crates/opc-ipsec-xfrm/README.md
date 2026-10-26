@@ -1,5 +1,32 @@
 # opc-ipsec-xfrm
 
+## Traffic Flow Confidentiality padding
+
+`SaParameters::tfc_pad` configures Linux `XFRMA_TFCPAD` (attribute 22, native
+`u32`), and `SaState::tfc_pad` reports it on readback. Use `None` for no padding;
+`Some` accepts 1–65,535 bytes on ESP tunnel-mode SAs. Linux limits the effective
+padding to the path MTU. Invalid lengths, protocols, or modes fail before any
+netlink mutation. A zero readback value is canonicalized to absence.
+
+The caller must honor IKEv2's `ESP_TFC_PADDING_NOT_SUPPORTED` notification
+before enabling padding. The typed Child-SA mapper defaults to `None`.
+See [RFC 4303 §2.7](https://www.rfc-editor.org/rfc/rfc4303.html#section-2.7)
+and [RFC 7296 §3.10.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-3.10.1).
+
+Existing no-padding recovery fingerprints and binding IDs retain their exact
+bytes. With padding configured, the request fingerprint is HMAC-SHA256 under
+the existing proof key over `opc-xfrm-install-request-tfc-v2\0`, the 32-byte
+family-specific v1 fingerprint, and the padding length as a big-endian `u32`.
+The outbound SA identity similarly hashes
+`opc-xfrm-outbound-sa-binding-tfc-v2\0`, its v1 identity, and that length.
+Object and roster domains remain distinct. Changing or removing padding
+requires new authenticated intent; installed bindings also compare kernel
+readback. Existing records with `None` need no migration.
+
+This configures padding on real kernel-generated ESP packets. RFC 4303 §2.6
+dummy-packet generation with Next Header 59 is still a separate open item in
+#1344; no userspace generator sharing a live kernel SA's counters is supplied.
+
 Caller-selected traffic classes can use the immutable
 [`child_sa` selection contract](CHILD_SA_SELECTION.md) to name exact outbound
 SPIs, retain inbound identities during rekey overlap, and select one explicit

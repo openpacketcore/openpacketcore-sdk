@@ -2276,13 +2276,17 @@ fn map_canonical_encode_error(error: CanonicalEncodeError) -> XfrmObjectInstallD
     }
 }
 
-/// Compute the domain-separated keyed fingerprint of one complete install
-/// request.
+/// Compute the domain-separated keyed fingerprint of one install request.
 ///
-/// The encoding is length-prefixed and covers every field the backend would
-/// send, so two requests that differ anywhere produce different fingerprints.
-/// The `domain` argument keeps sibling record families separate even when a
-/// deployment configures the same key bytes for both.
+/// The encoding is length-prefixed and covers the fields the backend sends,
+/// so two requests that differ in an encoded field produce different
+/// fingerprints. The `domain` argument keeps sibling record families separate
+/// even when a deployment configures the same key bytes for both.
+///
+/// Requests without TFC retain their exact v1 fingerprint. Configured TFC
+/// uses a v2 domain over that family-specific fingerprint and the padding
+/// length. Existing records therefore require no migration, while changing
+/// or removing TFC cannot authenticate against the original request.
 ///
 /// # Errors
 ///
@@ -2363,7 +2367,16 @@ pub(crate) fn authenticate_install_request(
             mac_optional_u32(&mut mac, parameters.if_id);
         }
     }
-    Ok(*mac.finalize())
+    let base = mac.finalize();
+    if let XfrmObjectInstallRequest::Sa(sa) = request {
+        if let Some(padding) = sa.parameters.tfc_pad {
+            let mut extended = key.begin(b"opc-xfrm-install-request-tfc-v2\0");
+            extended.update(base.as_slice());
+            mac_u32(&mut extended, padding);
+            return Ok(*extended.finalize());
+        }
+    }
+    Ok(*base)
 }
 
 /// Absorb one length-prefixed byte string.
@@ -2955,6 +2968,7 @@ mod tests {
                 output_mark: None,
                 if_id: None,
                 egress_dscp: None,
+                tfc_pad: None,
             },
         })
     }
@@ -3041,6 +3055,51 @@ mod tests {
                 "{change}"
             );
         }
+    }
+
+    #[test]
+    fn tfc_padding_is_bound_by_object_and_roster_request_authentication() {
+        let proof_key = key(9);
+        let original = golden_sa_request();
+        let mut changed = original.clone();
+        let XfrmObjectInstallRequest::Sa(sa) = &mut changed else {
+            unreachable!()
+        };
+        sa.parameters.tfc_pad = Some(512);
+        let domains: [&[u8]; 2] = [
+            INSTALL_REQUEST_AUTH_DOMAIN,
+            b"opc-xfrm-roster-install-request-v1\0",
+        ];
+        let mut padded = Vec::new();
+        for domain in domains {
+            let base =
+                authenticate_install_request(proof_key.canonical_mac_key(), domain, &original)
+                    .unwrap();
+            let first =
+                authenticate_install_request(proof_key.canonical_mac_key(), domain, &changed)
+                    .unwrap();
+            assert_ne!(base, first);
+            let mut other = changed.clone();
+            let XfrmObjectInstallRequest::Sa(sa) = &mut other else {
+                unreachable!()
+            };
+            sa.parameters.tfc_pad = Some(1024);
+            assert_ne!(
+                first,
+                authenticate_install_request(proof_key.canonical_mac_key(), domain, &other)
+                    .unwrap()
+            );
+            padded.push(first);
+        }
+        assert_ne!(padded[0], padded[1]);
+        // Independently calculated with Python hmac over the pinned v1 tag.
+        assert_eq!(
+            padded[0],
+            [
+                246, 151, 171, 60, 237, 17, 96, 87, 128, 252, 64, 133, 99, 125, 70, 127, 110, 119,
+                188, 187, 28, 191, 93, 64, 92, 46, 167, 150, 61, 150, 104, 96,
+            ]
+        );
     }
 
     /// Byte-pinned canonical encodings for the object family.

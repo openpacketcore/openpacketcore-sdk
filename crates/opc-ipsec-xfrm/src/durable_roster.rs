@@ -641,6 +641,9 @@ impl fmt::Display for XfrmObjectRosterMemberId {
 }
 
 /// Independent keyed fingerprints of one member's kernel identity and request.
+///
+/// The shared request encoder preserves existing fingerprints without TFC
+/// and authenticates configured padding through a separate v2 domain.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct XfrmObjectRosterMemberFingerprints {
     pub(crate) deletion_identity: [u8; 32],
@@ -5043,6 +5046,7 @@ mod tests {
                 output_mark: None,
                 if_id: None,
                 egress_dscp: None,
+                tfc_pad: None,
             },
         })
     }

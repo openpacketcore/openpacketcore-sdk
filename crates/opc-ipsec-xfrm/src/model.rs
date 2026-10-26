@@ -828,6 +828,25 @@ pub struct SaParameters {
     /// `None` emits exactly the pre-DSCP XFRM netlink bytes and does not
     /// require the companion.
     pub egress_dscp: Option<DscpCodepoint>,
+    /// Optional Traffic Flow Confidentiality (TFC) padding target length in
+    /// bytes (`XFRMA_TFCPAD`, Linux UAPI attribute 22).
+    ///
+    /// Linux ESP output pads the protected packet to at least this length when
+    /// it is shorter, capped at the SA's path MTU. The kernel accepts the
+    /// attribute only for ESP SAs in tunnel mode and stores a nonzero length;
+    /// validation therefore rejects a zero value, a length above 65,535,
+    /// a non-ESP protocol, and a non-tunnel mode before any netlink mutation.
+    ///
+    /// `None` emits no attribute and keeps the pre-TFC request bytes exactly
+    /// unchanged. Because the kernel omits the attribute for an unset length,
+    /// an absent attribute and a zero value are the same kernel state and must
+    /// not become two spellings of one identity; use `None` for no padding.
+    ///
+    /// Durable request authentication and outbound bindings include this
+    /// value. `None` preserves existing record fingerprints and binding IDs.
+    /// Enable only when the peer supports TFC padding; IKEv2's
+    /// ESP_TFC_PADDING_NOT_SUPPORTED notification forbids its use.
+    pub tfc_pad: Option<u32>,
 }
 
 /// Parameters needed to install or update a Security Policy.
@@ -1302,6 +1321,13 @@ pub struct SaState {
     /// window, so this is a decoded observation rather than durable proof of
     /// the original SA request. [`Self::output_mark`] remains exact.
     pub egress_dscp: Option<DscpCodepoint>,
+    /// TFC padding target length in bytes read from `XFRMA_TFCPAD`, when the
+    /// kernel reports one.
+    ///
+    /// `None` when the kernel omits the attribute, which it does for a zero
+    /// TFC padding length. A zero-valued attribute is therefore reported as
+    /// absent so the two wire spellings are not distinct identities.
+    pub tfc_pad: Option<u32>,
 }
 
 /// Exact Linux selector snapshot used by single-SA relocation.

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-ipsec-xfrm`: `SaParameters` and `SaState` gain `tfc_pad: Option<u32>`
+  for Linux ESP tunnel padding. Initialize it to `None` to retain prior wire
+  bytes, recovery fingerprints, and binding IDs. Configured padding is bound
+  into authenticated recovery and kernel readback checks; it must be 1–65,535
+  bytes and permitted by the peer. (#1344)
+
 - `opc-peer-discovery`: DNS stale reuse is bounded (one day by default,
   configurable with `with_stale_limit`). Authoritative negatives and service
   withdrawals clear prior positive data; zero-TTL responses are not cached.

@@ -64,6 +64,7 @@ fn marked_sa_request() -> opc_ipsec_xfrm::ScopedXfrmRequest {
         output_mark: None,
         if_id: None,
         egress_dscp: Some(DscpCodepoint::new(46).unwrap()),
+        tfc_pad: None,
     };
     let policy = PolicyParameters {
         selector: sa.selector.clone(),

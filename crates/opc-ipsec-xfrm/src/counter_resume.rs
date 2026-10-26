@@ -1242,6 +1242,7 @@ mod tests {
             statistics: SaStatistics::default(),
             output_mark: None,
             egress_dscp: None,
+            tfc_pad: None,
         }
     }
 

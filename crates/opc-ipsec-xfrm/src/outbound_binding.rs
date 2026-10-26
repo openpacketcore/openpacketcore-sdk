@@ -24,6 +24,10 @@ const IPPROTO_ESP: u8 = 50;
 /// freshly validated through its namespace-bound actor. `from_bytes` exists so
 /// persisted plans can decode the correlation value; constructing or matching
 /// an ID alone cannot mint a binding.
+///
+/// Configured TFC padding participates in the binding identity. SAs without
+/// TFC retain their existing IDs; enabling, changing or removing padding
+/// changes the ID and requires a new validated binding.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutboundSaBindingId([u8; 32]);
 
@@ -460,6 +464,7 @@ fn template_matches_sa(template: &XfrmTemplate, sa: &SaParameters) -> bool {
         && template.mode == sa.mode
 }
 
+/// Versioned fingerprint of one outbound SA install identity.
 fn fingerprint_sa(parameters: &SaParameters) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"opc-xfrm-outbound-sa-binding-v1\0");
@@ -507,7 +512,16 @@ fn fingerprint_sa(parameters: &SaParameters) -> [u8; 32] {
         }
         None => digest.update([0]),
     }
-    digest.finalize().into()
+    let base = digest.finalize();
+    if let Some(padding) = parameters.tfc_pad {
+        let mut extended = Sha256::new();
+        extended.update(b"opc-xfrm-outbound-sa-binding-tfc-v2\0");
+        extended.update(base);
+        extended.update(padding.to_be_bytes());
+        extended.finalize().into()
+    } else {
+        base.into()
+    }
 }
 
 fn hash_bytes(digest: &mut Sha256, bytes: &[u8]) {
@@ -685,6 +699,7 @@ pub(crate) mod tests_support {
             output_mark: None,
             if_id: Some(19),
             egress_dscp: None,
+            tfc_pad: None,
         };
         let policy = PolicyParameters {
             selector,
@@ -854,6 +869,35 @@ mod tests {
             expected.fingerprint.sa,
             fingerprint_sa(&changed_identity.sa.parameters)
         );
+    }
+
+    #[test]
+    fn tfc_padding_changes_the_outbound_binding_identity() {
+        let request = outbound_request();
+        let original = fingerprint_sa(&request.sa.parameters);
+        assert_eq!(
+            original,
+            [
+                186, 59, 221, 178, 51, 83, 36, 151, 180, 225, 190, 38, 151, 196, 105, 240, 138,
+                112, 113, 243, 106, 240, 227, 142, 68, 135, 105, 132, 46, 110, 35, 169,
+            ]
+        );
+        let mut sa = request.sa.parameters;
+        sa.tfc_pad = Some(512);
+        let padded = fingerprint_sa(&sa);
+        assert_ne!(original, padded);
+        // Independently calculated with Python hashlib over the pinned v1 ID.
+        assert_eq!(
+            padded,
+            [
+                183, 23, 17, 211, 83, 219, 254, 4, 60, 151, 139, 232, 149, 246, 129, 141, 0, 219,
+                106, 36, 175, 162, 103, 79, 190, 209, 44, 204, 195, 223, 84, 123,
+            ]
+        );
+        sa.tfc_pad = Some(1024);
+        assert_ne!(padded, fingerprint_sa(&sa));
+        sa.tfc_pad = None;
+        assert_eq!(original, fingerprint_sa(&sa));
     }
 
     #[test]
