@@ -1018,10 +1018,19 @@ mod tests {
         epoch: u64,
         descriptors: Vec<QuorumReplicaDescriptor>,
     ) -> Arc<SessionReplicationManifest> {
+        manifest_in_installation(cluster, [0x5a; 32], epoch, descriptors)
+    }
+
+    fn manifest_in_installation(
+        cluster: &str,
+        installation_nonce: [u8; 32],
+        epoch: u64,
+        descriptors: Vec<QuorumReplicaDescriptor>,
+    ) -> Arc<SessionReplicationManifest> {
         Arc::new(
             SessionReplicationManifest::try_new_with_epoch(
                 SessionClusterId::new(cluster).expect("test cluster"),
-                [0x5a; 32],
+                installation_nonce,
                 SessionConfigurationGeneration::new("legacy-test").expect("test generation"),
                 SessionConfigurationEpoch::new(epoch).expect("test epoch"),
                 descriptors,
@@ -1038,7 +1047,8 @@ mod tests {
     ) -> SessionTopologyTransitionRequest {
         SessionTopologyTransitionRequest::try_new(
             transition_id,
-            SessionConsensusClusterId::new("membership-test").expect("test cluster"),
+            SessionConsensusClusterId::for_installation("membership-test", [0x5a; 32])
+                .expect("test installation"),
             SessionConfigurationEpoch::new(expected_epoch).expect("expected epoch"),
             SessionConfigurationEpoch::new(desired_epoch).expect("desired epoch"),
             members.iter().copied().map(descriptor).collect(),
@@ -1467,7 +1477,8 @@ mod tests {
         let changed_retained = manifest_with_descriptors(2, changed_retained_descriptors.clone());
         let changed_retained_request = SessionTopologyTransitionRequest::try_new(
             SessionTopologyTransitionId::from_bytes([30; 16]),
-            SessionConsensusClusterId::new("membership-test").expect("test cluster"),
+            SessionConsensusClusterId::for_installation("membership-test", [0x5a; 32])
+                .expect("test installation"),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             changed_retained_descriptors,
@@ -1528,8 +1539,8 @@ mod tests {
         );
         let request = SessionTopologyTransitionRequest::try_new(
             SessionTopologyTransitionId::from_bytes([41; 16]),
-            SessionConsensusClusterId::new("different-membership-cluster")
-                .expect("different cluster"),
+            SessionConsensusClusterId::for_installation("different-membership-cluster", [0x5a; 32])
+                .expect("different installation"),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             (1..=5).map(descriptor).collect(),
@@ -1546,6 +1557,64 @@ mod tests {
             admission.snapshot().await.pending_identity(),
             None,
             "a cluster-rebinding request must leave no staged admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_rejects_rebinding_the_current_listener_to_another_installation() {
+        let current = manifest(1, &[1, 2, 3]);
+        let successor = manifest(2, &[1, 2, 3, 4, 5]);
+        let reinstalled = manifest_in_installation(
+            "membership-test",
+            [0x6b; 32],
+            2,
+            (1..=5).map(descriptor).collect(),
+        );
+        let foreign_request = SessionTopologyTransitionRequest::try_new(
+            SessionTopologyTransitionId::from_bytes([43; 16]),
+            reinstalled.consensus_identity().cluster_id(),
+            SessionConfigurationEpoch::new(1).expect("expected epoch"),
+            SessionConfigurationEpoch::new(2).expect("desired epoch"),
+            (1..=5).map(descriptor).collect(),
+            Duration::from_secs(10),
+        )
+        .expect("request bound to the other installation");
+        let admission = SessionMembershipAdmission::new(Arc::clone(&current), replica_id(2));
+
+        assert_eq!(
+            admission
+                .stage_successor(&foreign_request, Arc::clone(&reinstalled))
+                .await,
+            Err(SessionMembershipAdmissionError::CurrentManifestMismatch)
+        );
+        assert_eq!(admission.snapshot().await.pending_identity(), None);
+        assert_eq!(
+            bootstrap(&admission, &reinstalled, 4, 2, Some(&spiffe(4)))
+                .await
+                .map(|_| ()),
+            Err(SessionConsensusPeerError::ScopeMismatch)
+        );
+        bootstrap(&admission, &current, 1, 2, Some(&spiffe(1)))
+            .await
+            .expect("current installation remains admitted after refusal");
+
+        let request = transition_request(
+            SessionTopologyTransitionId::from_bytes([44; 16]),
+            1,
+            2,
+            &[1, 2, 3, 4, 5],
+        );
+        assert_eq!(
+            admission.stage_successor(&request, successor).await,
+            Ok(SessionMembershipTransitionResult::Staged),
+            "the persisted installation nonce must still permit membership changes"
+        );
+        assert_eq!(
+            bootstrap(&admission, &reinstalled, 4, 2, Some(&spiffe(4)))
+                .await
+                .map(|_| ()),
+            Err(SessionConsensusPeerError::ScopeMismatch),
+            "staging the real successor must not admit another installation"
         );
     }
 
@@ -1593,7 +1662,8 @@ mod tests {
         let successor = manifest_with_descriptors(2, desired.clone());
         let request = SessionTopologyTransitionRequest::try_new(
             SessionTopologyTransitionId::from_bytes([42; 16]),
-            SessionConsensusClusterId::new("membership-test").expect("test cluster"),
+            SessionConsensusClusterId::for_installation("membership-test", [0x5a; 32])
+                .expect("test installation"),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             desired,
@@ -1730,7 +1800,8 @@ mod tests {
             .expect("stage successor");
         let same_id_different_digest = SessionTopologyTransitionRequest::try_new(
             first,
-            SessionConsensusClusterId::new("membership-test").expect("test cluster"),
+            SessionConsensusClusterId::for_installation("membership-test", [0x5a; 32])
+                .expect("test installation"),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             (1..=5).map(descriptor).collect(),
