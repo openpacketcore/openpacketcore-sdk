@@ -366,11 +366,88 @@
       "issue": 1188
     },
     {
-      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::control_port_recovery::rate_budget_retention_control_port_replacement_never_restores_a_burst",
+      "test": "rust:crates/opc-dataplane-observation::lib=lib::tests::retained_event_capacity_is_below_required_burst_and_refuses_excess",
       "kind": "removed",
-      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::control_port_recovery::rate_budget_retention_control_port_replacement_restarts_each_burst",
-      "reason": "Restore the public Packet Too Big setter contract: every explicit reconfiguration restarts a full burst. The renamed UDP regression checks each equal or larger configured burst, the following rate-limited packet, and exact signalled, rate-limited and capacity counters. The privileged IPv4 reference scenario and all its assertions remain unchanged.",
-      "issue": 1018
+      "reason": "Remove the assertion that the retained-event capacity must remain below the scale required by #720. Its real constructor-boundary checks are retained in rejects_zero_and_out_of_bounds_policy_values, strengthened to require the exact maximum getter and the typed maximum_retained_events_exceeds_bound error at maximum plus one. No production retention-bound coverage is removed.",
+      "issue": 720,
+      "replacements": [
+        "rust:crates/opc-dataplane-observation::lib=lib::tests::rejects_zero_and_out_of_bounds_policy_values"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::scale_evidence::attempt_capacity_predicate_fails_closed_at_the_exact_boundary",
+      "kind": "removed",
+      "reason": "Move the actual admission/renewal guard coverage into focused traffic_capacity tests. Preserve acceptance at zero and maximum minus one, and refusal at maximum and above maximum. Remove only the claim that the configured capacity must stay below the scalability requirement in #720.",
+      "issue": 720,
+      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_capacity::attempt_capacity_predicate_fails_closed_at_the_exact_boundary"
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::scale_evidence::baseline_scan_and_grouped_index_agree_below_capacity",
+      "kind": "removed",
+      "reason": "Delete the test-only loop/BTreeMap model and its arithmetic agreement assertions. It invokes no production event dispatcher and is not a traffic-proof or scale qualification. #720 remains open; actual attempt/drain boundary coverage is retained separately.",
+      "issue": 720,
+      "behavior_deleted": true,
+      "deleting_change": "This change deletes the test-only characterization/model in crates/opc-gtpu-dataplane/src/ebpf/tests/scale_evidence.rs; it does not delete a production scale implementation."
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::scale_evidence::current_limits_are_below_required_pool_scale",
+      "kind": "removed",
+      "reason": "Delete the placeholder contract that pins current insufficient capacities and asserts that they remain below #720 requirements. Those assertions pass on the deficient implementation and would reject the requested scaling fix. Production admission/drain guards and their meaningful boundary checks remain; no scale qualification is claimed.",
+      "issue": 720,
+      "behavior_deleted": true,
+      "deleting_change": "This change deletes the test-only characterization/model in crates/opc-gtpu-dataplane/src/ebpf/tests/scale_evidence.rs; it does not delete a production scale implementation."
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::scale_evidence::full_scan_work_dominates_group_indexed_work_at_required_scale",
+      "kind": "removed",
+      "reason": "Delete the synthetic multiplication-only work model. It never executes the production dispatcher or a proposed replacement, so its arithmetic comparisons cannot qualify #720. The model functions are removed and the actual scale implementation/qualification remains open.",
+      "issue": 720,
+      "behavior_deleted": true,
+      "deleting_change": "This change deletes the test-only characterization/model in crates/opc-gtpu-dataplane/src/ebpf/tests/scale_evidence.rs; it does not delete a production scale implementation."
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::scale_evidence::observation_drain_marks_the_exact_batch_boundary_overflowed",
+      "kind": "removed",
+      "reason": "Move the actual production drain-overflow predicate coverage into focused traffic_capacity tests. Retain zero, maximum minus one, exact maximum and above-maximum checks. Remove only fixed-deficiency comparisons between the current ring/drain capacities and the unimplemented #720 scale target.",
+      "issue": 720,
+      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_capacity::observation_drain_marks_the_exact_batch_boundary_overflowed"
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::scale_evidence::scale_benchmark_evidence_for_required_pool_is_bounded",
+      "kind": "removed",
+      "reason": "Delete the already-ignored benchmark of test-only loops and a BTreeMap model. It does not exercise the production observation ring, dispatcher or proof API, and reports no live proof. Its synthetic work/memory/time bounds are not production qualification; #720 still requires real implementation and measurement.",
+      "issue": 720,
+      "behavior_deleted": true,
+      "deleting_change": "This change deletes the test-only characterization/model in crates/opc-gtpu-dataplane/src/ebpf/tests/scale_evidence.rs; it does not delete a production scale implementation."
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::selector_namespace::tests::scale_evidence::selector_authority_caps_are_below_required_pool_scale",
+      "kind": "removed",
+      "reason": "Delete the placeholder assertion that permanent/live selector limits must retain their insufficient fixed values and stay below #720 requirements. It tests no selector admission or recovery behavior and would fail the requested capacity increase. Existing ledger capacity/admission/lifecycle tests remain; #720 is not claimed implemented.",
+      "issue": 720,
+      "behavior_deleted": true,
+      "deleting_change": "This change deletes crates/opc-gtpu-dataplane/src/selector_namespace/tests/scale_evidence.rs and its deficient-capacity characterization; production selector behavior remains."
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_capacity::attempt_capacity_predicate_fails_closed_at_the_exact_boundary",
+      "kind": "assertions-decreased",
+      "reason": "The moved test drops only the assert_evidence helper and its wrong-direction claim that the attempt limit must remain below #720 requirements. All four actual admission/renewal predicate boundary assertions remain and call the guard used by production.",
+      "issue": 720
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::traffic_capacity::observation_drain_marks_the_exact_batch_boundary_overflowed",
+      "kind": "assertions-decreased",
+      "reason": "The moved test drops only assert_evidence and fixed-deficiency comparisons between current capacity and #720 requirements. All four actual production drain-overflow boundary assertions remain; no overflow or fail-closed behavior is removed.",
+      "issue": 720
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel",
+      "kind": "assertions-decreased",
+      "reason": "Restore main’s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
+      "issue": 1018,
+      "replacements": [
+        "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::rate_budget_retention_preserves_lifetime_bound_across_limit_replacement"
+      ]
     }
   ]
 }
