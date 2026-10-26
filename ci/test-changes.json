@@ -539,6 +539,18 @@
       "replacements": [
         "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::lifecycle_tests::retained_store_owner_refuses_reopen_until_its_release"
       ]
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consumer_checkpoint::tests::maximum_payload_fits_the_minimum_accepted_storage_budget",
+      "kind": "clock-source-changed",
+      "reason": "Use a scoped controlled clock for the capacity property while waiting for actual SQLite I/O completion. Keep the original payload sizes, minimum storage budget, operation timeout, replacement sequence, reopen checks and assertions. Separate held-worker regressions verify deadline expiry before mutation and before readback, and the existing real-time cancellation test retains its bound.",
+      "issue": 1336
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consumer_checkpoint::tests::slow_post_commit_checkpoint_settlement_reports_known_success",
+      "kind": "clock-source-changed",
+      "reason": "Replace the real post-commit sleep with a held fully validated readback and controlled observer delay. Preserve the 200 ms budget, 400 ms delay, payload, generation and diagnostic assertions. Commit alone cannot authorize unbounded unfinished verification; committed_checkpoint_expiring_before_readback_requires_recovery covers that boundary, while the original real-time cancellation control remains unchanged.",
+      "issue": 1336
     }
   ]
 }

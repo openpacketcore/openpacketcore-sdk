@@ -555,12 +555,6 @@ impl ConsumerCheckpointStore {
                 conn.progress_handler(1000, Some(move || progress.check().is_err()))
                     .map_err(|_| ConsumerCheckpointError::Unavailable)?;
                 check_storage_size(&options)?;
-                // Set once a replacement transaction has durably committed.
-                // Deadline cancellation stops applying at that boundary: the
-                // write outcome is known and post-commit settlement (checkpoint
-                // and verification readback) may be slow without making the
-                // committed result ambiguous.
-                let mut committed = false;
                 if let Some((expected, verified_digest, row)) = update {
                     let current = read_row(conn, &options)?;
                     if current.generation != expected
@@ -602,18 +596,8 @@ impl ConsumerCheckpointStore {
                     tests::crash_at("before-commit");
                     tx.commit()
                         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
-                    committed = true;
                     #[cfg(test)]
                     tests::crash_at("after-commit");
-                    // The replacement is durably committed. Clear the deadline
-                    // progress handler so a slow post-commit checkpoint or
-                    // verification readback cannot abort a known outcome.
-                    conn.progress_handler(0, None::<fn() -> bool>)
-                        .map_err(|_| ConsumerCheckpointError::Unavailable)?;
-                    // Injected post-commit latency: a slow but successfully
-                    // committed write must still report success.
-                    #[cfg(all(test, unix))]
-                    tests::storage_latency(&options.path, "after-commit");
                     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
                         .map_err(|_| ConsumerCheckpointError::Unavailable)?;
                     #[cfg(test)]
@@ -623,16 +607,14 @@ impl ConsumerCheckpointStore {
                 if let Some(hook) = &options.io_hook {
                     hook(&task_work, "before-readback");
                 }
+                task_work.check()?;
                 let row = read_row(conn, &options)?;
                 check_storage_size(&options)?;
                 #[cfg(test)]
                 if let Some(hook) = &options.io_hook {
                     hook(&task_work, "readback-complete");
                 }
-                if !committed {
-                    // Read-only settlement retains its caller budget check.
-                    task_work.check()?;
-                }
+                // Preserve completed readback; settle still bounds an unfinished worker.
                 Ok(row)
             })();
             result.map_err(|error| {
@@ -656,14 +638,9 @@ impl ConsumerCheckpointStore {
             .as_mut()
             .ok_or(ConsumerCheckpointError::Conflict)?;
         let _cancel = CancelOnDrop(Arc::clone(&pending.work));
-        // The caller's operation budget is enforced inside the owned blocking
-        // operation (Work deadline plus SQLite progress handler). Settlement
-        // itself is observed to completion so a slow but durably committed
-        // write reports the outcome that is already known instead of losing it
-        // to an outer timeout. The task is self-bounded and already owns the
-        // storage lock; dropping that task here could not have released it.
-        let result = (&mut pending.task)
+        let result = tokio::time::timeout(self.options.timeout, &mut pending.task)
             .await
+            .map_err(|_| indeterminate(&self.options.path, "settle-deadline"))?
             .map_err(|_| indeterminate(&self.options.path, "settle-task-join"))?;
         self.pending = None;
         Ok(result)
@@ -1000,6 +977,7 @@ fn finish_open(
         #[cfg(test)]
         tests::crash_at("provision-complete");
     }
+    work.check()?;
     let read = read_row(&conn, options)?;
     if read.generation != initial.generation || read.envelope != initial.envelope {
         return Err(ConsumerCheckpointError::Rejected);
@@ -1021,7 +999,8 @@ fn finish_open(
     if let Some(hook) = &options.io_hook {
         hook(work, "open-complete");
     }
-    work.check()?;
+    // All readback and admission checks succeeded; retain that known result.
+    // run_open_io still bounds the caller's wait for unfinished validation.
     Ok(BackendConnection::retained(conn, prepared.admission))
 }
 

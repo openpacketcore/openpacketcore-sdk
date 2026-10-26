@@ -260,6 +260,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: checkpoint writes, provision and reopen retain a completed,
+  validated storage result when their observer resumes after the deadline.
+  Unfinished or unverified work remains bounded and indeterminate. The maximum
+  payload/minimum storage regression waits for actual blocking I/O with a scoped
+  test clock; deadline regressions preserve the original budgets and recovery
+  assertions without real-time sleeps. Refs #1336.
+
 - `opc-session-store` and `opc-persist`: retain the `Unplanned` shutdown reason
   when an unplanned request races admission fencing or preparation completion.
   Already published reports remain unchanged. (#1376)
