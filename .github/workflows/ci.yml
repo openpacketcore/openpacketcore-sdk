@@ -1014,7 +1014,9 @@ jobs:
   session-net-i686-tests:
     name: opc-session-net i686 (${{ matrix.slice }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The serial library slice takes about 29 minutes including a cold build;
+    # leave runner headroom without changing individual contract deadlines.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -1087,7 +1089,7 @@ jobs:
           case "${I686_SLICE}" in
             ordinary)
               # Keep the library binary separate from the integration binaries
-              # so neither ordinary shard approaches the 30-minute job limit.
+              # so ordinary slices retain independent build/test budgets.
               skips=()
               for timing_contract in "${timing_contracts[@]}"; do
                 skips+=(--skip "stateless_quorum_consumer::$timing_contract")
