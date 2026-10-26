@@ -173,8 +173,8 @@ impl RosterMaintenanceLane for ConsensusStoreRosterMaintenanceLane {
             tokio::select! {
                 biased;
                 _ = stop.changed() => return false,
-                changed = metrics.changed() => if changed.is_err() { return false; },
                 () = tokio::time::sleep_until(deadline) => return true,
+                changed = metrics.changed() => if changed.is_err() { return false; },
             }
             // Commit/heartbeat publications do not restart the fixed sleep or
             // cause another observation. Only leadership or term wakes early.
@@ -269,7 +269,7 @@ impl RosterMaintenanceTask {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
 impl RosterMaintenanceTask {
     pub(super) async fn is_finished_for_test(&self) -> bool {
         self.worker
@@ -473,7 +473,7 @@ mod tests {
         let observation = MockObservation::new(1, 0, None, false);
         let (alive, task) = spawn_mock(Arc::clone(&observation));
         // Drive 30 seconds of virtual time. The lane may propose at
-        // t=1,2,4,8,16 and then at most once per minute of back-off, never
+        // t=1,3,7,15,31 and then at most once per minute of back-off, never
         // once per tick.
         for _ in 0..30 {
             tokio::time::advance(ROSTER_MAINTENANCE_TICK).await;
