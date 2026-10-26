@@ -713,11 +713,14 @@ impl State {
         if cipher_suite.is_psk() {
             self.await_server_key_exchange_psk(client)
         } else {
-            self.await_server_key_exchange_ecdhe(client)
+            self.await_server_key_exchange_certificate(client)
         }
     }
 
-    fn await_server_key_exchange_ecdhe(self, client: &mut Client) -> Result<Self, InternalError> {
+    fn await_server_key_exchange_certificate(
+        self,
+        client: &mut Client,
+    ) -> Result<Self, InternalError> {
         let maybe = client.engine.next_handshake(
             MessageType::ServerKeyExchange,
             &mut client.defragment_buffer,
@@ -728,32 +731,42 @@ impl State {
             return Ok(self);
         };
 
-        // Extract all ranges/data we need before accessing buffer
-        let (signature_range, signature_algorithm, curve_type, named_group, public_key_range) = {
+        let (
+            signature_range,
+            signature_algorithm,
+            ec_group,
+            dh_params,
+            public_key_range,
+            parameters,
+        ) = {
             let Some(handshake) = maybe.as_ref() else {
                 return Ok(self);
             };
-            let Body::ServerKeyExchange(server_key_exchange) = &handshake.body else {
+            let Body::ServerKeyExchange(ske) = &handshake.body else {
                 return Err(InternalError::handshake_body_type_mismatch());
             };
-
-            let Some(d_signed) = server_key_exchange.signature() else {
-                // We do not support anonymous key exchange
+            let Some(signed) = ske.signature() else {
                 return Err(Error::UnexpectedMessage(
                     crate::UnexpectedMessageError::ServerKeyExchangeWithoutSignature,
                 )
                 .into());
             };
-
-            let signature_range = d_signed.signature_range.clone();
-            let signature_algorithm = d_signed.algorithm;
-
-            // Extract ECDH params ranges
-            let (curve_type, named_group, public_key_range) = match &server_key_exchange.params {
-                ServerKeyExchangeParams::Ecdh(ecdh) => (
-                    ecdh.curve_type,
-                    ecdh.named_group,
-                    ecdh.public_key_range.clone(),
+            let (ec_group, dh_params, public_key_range) = match &ske.params {
+                ServerKeyExchangeParams::Ecdh(ecdh) => {
+                    if ecdh.curve_type != super::message::CurveType::NamedCurve
+                        || ecdh.named_group.is_ffdhe()
+                    {
+                        return Err(Error::SecurityError(
+                            crate::SecurityError::NoCommonKeyExchangeGroup,
+                        )
+                        .into());
+                    }
+                    (Some(ecdh.named_group), None, ecdh.public_key_range.clone())
+                }
+                ServerKeyExchangeParams::Dhe(dh) => (
+                    None,
+                    Some((dh.prime_range.clone(), dh.generator_range.clone())),
+                    dh.public_key_range.clone(),
                 ),
                 ServerKeyExchangeParams::Psk(_) => {
                     return Err(Error::UnexpectedMessage(
@@ -762,13 +775,15 @@ impl State {
                     .into());
                 }
             };
-
+            let mut parameters = Buf::new();
+            ske.serialize(&client.defragment_buffer, &mut parameters, false);
             (
-                signature_range,
-                signature_algorithm,
-                curve_type,
-                named_group,
+                signed.signature_range.clone(),
+                signed.algorithm,
+                ec_group,
+                dh_params,
                 public_key_range,
+                parameters,
             )
         };
 
@@ -790,11 +805,7 @@ impl State {
         let mut signed_data = Buf::new();
         client_random.serialize(&mut signed_data);
         server_random.serialize(&mut signed_data);
-        // Manually serialize SKE params
-        signed_data.push(curve_type.as_u8());
-        signed_data.extend_from_slice(&named_group.as_u16().to_be_bytes());
-        signed_data.push(public_key_vec.len() as u8);
-        signed_data.extend_from_slice(public_key_vec);
+        signed_data.extend_from_slice(&parameters);
 
         let cipher_suite = client.engine.cipher_suite().ok_or(Error::InvalidState(
             crate::InvalidStateError::NoCipherSuiteSelected,
@@ -846,8 +857,27 @@ impl State {
             signature_algorithm
         );
 
-        // Process the server key exchange parameters
-        // We already have the curve and public key extracted
+        // RFC 7919: authenticate the exact DH parameters before selecting a group or exponentiating.
+        let named_group = if let Some((p, g)) = dh_params {
+            crate::crypto::ffdhe::group_for_parameters(
+                &client.defragment_buffer[p],
+                &client.defragment_buffer[g],
+            )
+        } else {
+            ec_group
+        };
+        let named_group = named_group
+            .filter(|group| {
+                group.is_ffdhe() == cipher_suite.has_dhe()
+                    && client
+                        .engine
+                        .config()
+                        .kx_groups()
+                        .any(|kx| kx.name() == *group)
+            })
+            .ok_or(Error::SecurityError(
+                crate::SecurityError::NoCommonKeyExchangeGroup,
+            ))?;
         let mut kx_buf = client.engine.pop_buffer();
         client
             .engine
@@ -1476,7 +1506,7 @@ fn handshake_create_client_key_exchange(body: &mut Buf, engine: &mut Engine) -> 
     debug!("Using key exchange algorithm: {:?}", key_exchange_algorithm);
 
     match key_exchange_algorithm {
-        KeyExchangeAlgorithm::EECDH => {
+        KeyExchangeAlgorithm::EECDH | KeyExchangeAlgorithm::DHE => {
             // Get group info before the mutable borrow
             let group_info = engine.crypto_context().get_key_exchange_group_info();
 
@@ -1498,7 +1528,11 @@ fn handshake_create_client_key_exchange(body: &mut Buf, engine: &mut Engine) -> 
                 .map_err(Error::CryptoError)?;
 
             trace!("Generated public key size: {} bytes", public_key.len());
-            ClientKeyExchange::serialize_from_bytes(public_key, body);
+            if key_exchange_algorithm == KeyExchangeAlgorithm::DHE {
+                ClientKeyExchange::serialize_dhe(public_key, body);
+            } else {
+                ClientKeyExchange::serialize_from_bytes(public_key, body);
+            }
         }
         KeyExchangeAlgorithm::PSK => {
             let identity = engine
@@ -1589,6 +1623,96 @@ mod tests {
     use super::*;
     use crate::PskResolver;
     use crate::dtls12::message::{ServerHello, SrtpProfileId};
+
+    #[test]
+    fn independently_signed_dhe_parameters_are_authenticated_then_policy_checked() {
+        use crate::crypto::NamedGroup;
+        use openssl::{
+            asn1::Asn1Time, hash::MessageDigest, pkey::PKey, rsa::Rsa, sign::Signer, x509::X509,
+        };
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut cert = X509::builder().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+        let cert = cert.build().to_der().unwrap();
+        let config = Arc::new(
+            Config::builder()
+                .dtls13_cipher_suites(&[])
+                .dtls12_cipher_suites(&[Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256])
+                .kx_groups(&[NamedGroup::FFDHE2048])
+                .build()
+                .unwrap(),
+        );
+        let p = crate::crypto::ffdhe::prime(NamedGroup::FFDHE2048).unwrap();
+        let p4096 = crate::crypto::ffdhe::prime(NamedGroup::FFDHE4096).unwrap();
+        for (prime, generator, public, corrupt, signature_error, public_error) in [
+            (&[23][..], &[2][..], &[4][..], true, true, false),
+            (&[23][..], &[2][..], &[4][..], false, false, false),
+            (p, &[3][..], &[4][..], false, false, false),
+            (p4096, &[2][..], &[4][..], false, false, false),
+            (p, &[2][..], &[1][..], false, false, true),
+            (p, &[2][..], p, false, false, true),
+        ] {
+            let auth = AuthMode::Certificate {
+                certificates: vec![vec![1]],
+                private_key: crate::dtls12::context::unavailable_signing_key(),
+            };
+            let mut client =
+                Client::new_with_engine(Engine::new(Arc::clone(&config), auth), Instant::now());
+            client
+                .engine
+                .set_cipher_suite(Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256)
+                .unwrap();
+            client.random = Some(Random { bytes: [1; 32] });
+            client.server_random = Some(Random { bytes: [2; 32] });
+            client.server_certificates.push(cert.as_slice().to_buf());
+            let mut body = Vec::new();
+            for value in [prime, generator, public] {
+                body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                body.extend_from_slice(value);
+            }
+            let mut signer = Signer::new(MessageDigest::sha256(), &key).unwrap();
+            signer.update(&[1; 32]).unwrap();
+            signer.update(&[2; 32]).unwrap();
+            signer.update(&body).unwrap();
+            let mut signature = signer.sign_to_vec().unwrap();
+            if corrupt {
+                signature[0] ^= 1;
+            }
+            body.extend_from_slice(&[4, 1]);
+            body.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+            body.extend_from_slice(&signature);
+            client
+                .engine
+                .parse_packet(&epoch0_handshake_packet(
+                    MessageType::ServerKeyExchange,
+                    0,
+                    &body,
+                ))
+                .unwrap();
+            let error = State::AwaitServerKeyExchange
+                .await_server_key_exchange(&mut client)
+                .unwrap_err();
+            let expected = if signature_error {
+                Error::CryptoError(crate::CryptoError::OperationFailed(
+                    crate::CryptoOperation::VerifySignature,
+                ))
+            } else if public_error {
+                Error::CryptoError(crate::CryptoError::InvalidPublicKey(NamedGroup::FFDHE2048))
+            } else {
+                Error::SecurityError(crate::SecurityError::NoCommonKeyExchangeGroup)
+            };
+            assert!(
+                matches!(error, InternalError::Fatal(ref e) if *e == expected),
+                "{error:?}, expected {expected:?}"
+            );
+        }
+    }
 
     #[test]
     fn sni_client_checks_independently_encrypted_server_hello_acknowledgement() {

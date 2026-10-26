@@ -86,7 +86,7 @@ mod tests {
         // Provided bytes: [0,10,0,29,0,23,0,24,1,0,1,1]
         // Meaning:
         // 0x000A -> list length = 10 bytes (5 groups)
-        // groups: 0x001D (X25519), 0x0017 (P-256), 0x0018 (P-384), 0x0100 (unknown), 0x0101 (unknown)
+        // groups: 0x001D (X25519), 0x0017 (P-256), 0x0018 (P-384), 0x0100 (FFDHE2048), 0x0101 (unknown)
         let bytes = [0, 10, 0, 29, 0, 23, 0, 24, 1, 0, 1, 1];
 
         let (rest, parsed) =
@@ -99,7 +99,8 @@ mod tests {
             &[
                 NamedGroup::X25519,
                 NamedGroup::Secp256r1,
-                NamedGroup::Secp384r1
+                NamedGroup::Secp384r1,
+                NamedGroup::FFDHE2048
             ]
         );
     }

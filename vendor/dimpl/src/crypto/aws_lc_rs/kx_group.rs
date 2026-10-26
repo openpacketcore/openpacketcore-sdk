@@ -137,8 +137,13 @@ static KX_GROUP_P256: P256 = P256;
 static KX_GROUP_P384: P384 = P384;
 
 /// All supported key exchange groups.
-pub(super) static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] =
-    &[&KX_GROUP_X25519, &KX_GROUP_P256, &KX_GROUP_P384];
+pub(super) static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
+    &KX_GROUP_X25519,
+    &KX_GROUP_P256,
+    &KX_GROUP_P384,
+    &crate::crypto::ffdhe::FFDHE4096,
+    &crate::crypto::ffdhe::FFDHE2048,
+];
 
 #[cfg(test)]
 mod tests {

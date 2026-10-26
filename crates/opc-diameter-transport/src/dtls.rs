@@ -1516,7 +1516,7 @@ pub enum DtlsSctpVersion {
 
 /// Cipher-suite evidence names admitted by this transport.
 ///
-/// RFC 6083 DTLS 1.2 negotiates these as ECDHE-ECDSA/RSA AEAD suites.
+/// RFC 6083 DTLS 1.2 negotiates these as ECDHE-ECDSA/RSA or DHE-RSA AEAD suites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DtlsSctpCipher {
@@ -1530,15 +1530,18 @@ pub enum DtlsSctpCipher {
     EcdheRsaAes128GcmSha256,
     /// `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` (`0xC030`).
     EcdheRsaAes256GcmSha384,
+    /// `TLS_DHE_RSA_WITH_AES_128_GCM_SHA256` (`0x009E`).
+    DheRsaAes128GcmSha256,
 }
 
 impl DtlsSctpCipher {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Aes128GcmSha256,
         Self::Aes256GcmSha384,
         Self::Chacha20Poly1305Sha256,
         Self::EcdheRsaAes128GcmSha256,
         Self::EcdheRsaAes256GcmSha384,
+        Self::DheRsaAes128GcmSha256,
     ];
 
     const fn index(self) -> usize {
@@ -1548,11 +1551,15 @@ impl DtlsSctpCipher {
             Self::Chacha20Poly1305Sha256 => 2,
             Self::EcdheRsaAes128GcmSha256 => 3,
             Self::EcdheRsaAes256GcmSha384 => 4,
+            Self::DheRsaAes128GcmSha256 => 5,
         }
     }
 
     const fn dtls12_suite(self) -> dimpl::crypto::Dtls12CipherSuite {
         match self {
+            Self::DheRsaAes128GcmSha256 => {
+                dimpl::crypto::Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256
+            }
             Self::EcdheRsaAes128GcmSha256 => {
                 dimpl::crypto::Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
             }
@@ -1593,7 +1600,7 @@ pub const MAX_DTLS_SCTP_MESSAGE_BYTES: usize = DiameterFrameLimits::RFC6083.max_
 /// Typed DTLS/SCTP protocol, cipher, frame, and age policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DtlsSctpPolicy {
-    allowed_ciphers: [bool; 5],
+    allowed_ciphers: [bool; 6],
     frame_limits: DiameterFrameLimits,
     maximum_connection_age: Duration,
 }
@@ -1613,7 +1620,7 @@ impl DtlsSctpPolicy {
             return Err(DiameterTlsPolicyError::FrameLimitExceedsDtlsRecordBudget);
         }
         Ok(Self {
-            allowed_ciphers: [true, true, true, false, false],
+            allowed_ciphers: [true, true, true, false, false, false],
             frame_limits,
             maximum_connection_age: Duration::from_secs(60 * 60),
         })
@@ -1634,7 +1641,7 @@ impl DtlsSctpPolicy {
         if allowed.is_empty() {
             return Err(DiameterTlsPolicyError::EmptyCipherSet);
         }
-        self.allowed_ciphers = [false; 5];
+        self.allowed_ciphers = [false; 6];
         for cipher in allowed {
             self.allowed_ciphers[cipher.index()] = true;
         }
@@ -1708,7 +1715,7 @@ impl DtlsSctpPolicy {
 impl Default for DtlsSctpPolicy {
     fn default() -> Self {
         Self {
-            allowed_ciphers: [true, true, true, false, false],
+            allowed_ciphers: [true, true, true, false, false, false],
             frame_limits: DiameterFrameLimits::RFC6083,
             maximum_connection_age: Duration::from_secs(60 * 60),
         }

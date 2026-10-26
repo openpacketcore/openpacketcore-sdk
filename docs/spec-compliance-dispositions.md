@@ -100,8 +100,15 @@ vendored providers use ring for RSA-PSS-RSAE and PKCS#1 SHA-256/384 operations.
 CertificateRequest and CertificateVerify must agree on the complete signature
 scheme and certificate type. The independent OpenSSL regression covers both
 roles with each RSA suite and all four signature schemes; frozen signatures
-also test exact scheme binding and corruption rejection. DTLS DHE remains
-pending, so #1353 is still partial. The optional `NdsAfEcdsa` certificate
+also test exact scheme binding and corruption rejection. DTLS 1.2 also supports
+DHE-RSA AES-128-GCM with FFDHE4096/2048. Signed DH parameters are verified
+before group selection and exponentiation; custom groups, invalid public values
+and groups excluded by local policy fail closed. Unsupported FFDHE offers cannot
+trigger the legacy no-extension fallback. Independent OpenSSL cases cover both
+roles and groups, while typed Diameter and native SCTP tests cover application
+data, SCTP-AUTH boundaries, rekey and reciprocal close. DTLS 1.3 retains its
+ECDHE-only group policy. This completes the three reported findings in #1353;
+peer review and final branch qualification remain required. The optional `NdsAfEcdsa` certificate
 constraint remains limited to ECDSA; RSA cipher support does not claim full
 TS 33.310 certificate-profile conformance.
 

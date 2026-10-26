@@ -16,7 +16,6 @@
 //! - **Async** (the crate is Sans‑IO and event‑loop agnostic)
 //! - **no_std** (at least not without allocation)
 //! - **Static RSA key transport**
-//! - **DHE**
 //!
 //! ## Version selection
 //!
@@ -35,6 +34,7 @@
 //!   - `ECDHE_ECDSA_CHACHA20_POLY1305_SHA256`
 //!   - `ECDHE_RSA_AES128_GCM_SHA256`
 //!   - `ECDHE_RSA_AES256_GCM_SHA384`
+//!   - `DHE_RSA_AES128_GCM_SHA256`
 //! - **PSK cipher suites (TLS 1.2 over DTLS)**
 //!   - `PSK_AES128_CCM_8`
 //! - **Cipher suites (TLS 1.3 over DTLS)**
@@ -43,7 +43,10 @@
 //!   - `TLS_CHACHA20_POLY1305_SHA256`
 //! - **AEAD**: AES‑GCM 128/256, ChaCha20‑Poly1305, and AES‑128‑CCM‑8
 //!   (no CBC/EtM modes).
-//! - **Key exchange**: ECDHE (P‑256/P‑384), X25519
+//! - **Key exchange**: ECDHE (P‑256/P‑384), X25519; DTLS 1.2 also
+//!   supports RFC 7919 FFDHE4096 (preferred) and FFDHE2048 using constant-time
+//!   `crypto-bigint` arithmetic with fresh 512-bit exponents. Custom DH groups
+//!   and DTLS 1.3 FFDHE are unsupported.
 //! - **Signatures**: ECDSA P‑256/P‑384; DTLS 1.2 also supports RSA-PSS-RSAE and
 //!   RSA-PKCS#1 with SHA‑256/384. Both built-in providers use ring for RSA,
 //!   with 2048–4096-bit signing keys and 2048–8192-bit verification keys.
@@ -1626,14 +1629,15 @@ mod test {
 
         let mut supported_groups = Vec::new();
         supported_groups
-            .extend_from_slice(&(NamedGroup::supported().len() as u16 * 2).to_be_bytes());
-        for group in NamedGroup::supported() {
+            .extend_from_slice(&(NamedGroup::supported_dtls13().len() as u16 * 2).to_be_bytes());
+        for group in NamedGroup::supported_dtls13() {
             supported_groups.extend_from_slice(&group.as_u16().to_be_bytes());
         }
 
         let mut key_share = Vec::new();
-        key_share.extend_from_slice(&(NamedGroup::supported().len() as u16 * 5).to_be_bytes());
-        for group in NamedGroup::supported() {
+        key_share
+            .extend_from_slice(&(NamedGroup::supported_dtls13().len() as u16 * 5).to_be_bytes());
+        for group in NamedGroup::supported_dtls13() {
             key_share.extend_from_slice(&group.as_u16().to_be_bytes());
             key_share.extend_from_slice(&1u16.to_be_bytes());
             key_share.push(0x42);

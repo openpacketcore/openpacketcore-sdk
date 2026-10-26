@@ -80,7 +80,7 @@ impl HybridClientHello {
         let random = Random::new(&mut rng);
 
         // Start ECDHE key exchange with the first supported group (filtered)
-        let group = config.kx_groups().next().ok_or(Error::CryptoError(
+        let group = config.dtls13_kx_groups().next().ok_or(Error::CryptoError(
             CryptoError::NoSupportedKeyExchangeGroups,
         ))?;
         let kx_buf = Buf::new();
@@ -138,7 +138,7 @@ impl HybridClientHello {
 
         // 2. supported_groups (filtered by config)
         let start = ext_buf.len();
-        let groups: ArrayVec<NamedGroup, 4> = config.kx_groups().map(|g| g.name()).collect();
+        let groups: ArrayVec<NamedGroup, 4> = config.dtls13_kx_groups().map(|g| g.name()).collect();
         let sg = SupportedGroupsExtension { groups };
         sg.serialize(&mut ext_buf);
         ext_entries.push((EXT_SUPPORTED_GROUPS, start, ext_buf.len()));

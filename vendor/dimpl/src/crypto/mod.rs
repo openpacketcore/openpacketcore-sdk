@@ -3,6 +3,7 @@
 use std::ops::Deref;
 
 // Internal module imports
+pub(crate) mod ffdhe;
 mod keying;
 
 // Provider traits and implementations

@@ -56,10 +56,13 @@ async fn coordinated_rekey_preserves_queued_streams_and_rotates_each_auth_bounda
     for cipher in DtlsSctpPolicy::default().allowed_ciphers().chain([
         DtlsSctpCipher::EcdheRsaAes128GcmSha256,
         DtlsSctpCipher::EcdheRsaAes256GcmSha384,
+        DtlsSctpCipher::DheRsaAes128GcmSha256,
     ]) {
         let material = if matches!(
             cipher,
-            DtlsSctpCipher::EcdheRsaAes128GcmSha256 | DtlsSctpCipher::EcdheRsaAes256GcmSha384
+            DtlsSctpCipher::EcdheRsaAes128GcmSha256
+                | DtlsSctpCipher::EcdheRsaAes256GcmSha384
+                | DtlsSctpCipher::DheRsaAes128GcmSha256
         ) {
             rsa_dtls_material()
         } else {
