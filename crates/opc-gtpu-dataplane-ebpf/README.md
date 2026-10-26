@@ -122,9 +122,10 @@ The crate exposes tc entry points, not a Rust library API:
 
 Map names, counter indexes, program names, and byte layouts are imported from
 `opc-gtpu-ebpf-common`. `GTPU_COUNTERS` is a sixteen-slot per-CPU map
-(`COUNTER_SLOTS`), of which eight carry a counter (`COUNTER_SLOTS_IN_USE`).
+(`COUNTER_SLOTS`), of which ten carry a counter (`COUNTER_SLOTS_IN_USE`).
 The seventh is `COUNTER_UL_REDIRECT_RESOLVED`, described under Status And
-Limits, and the eighth is `COUNTER_DL_MISSING_CONSUMER`. The other eight are
+Limits, and the eighth is `COUNTER_DL_MISSING_CONSUMER`. The ninth and tenth split
+FAR misses into passed and dropped outcomes. The other six are
 reserved and read zero, so that the next counter does not change the width
 of the pinned map: a pin graph retained from a build with another width is
 refused and needs a drained reprovision.

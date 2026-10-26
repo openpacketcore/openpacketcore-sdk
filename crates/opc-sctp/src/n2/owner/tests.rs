@@ -120,7 +120,7 @@ fn data() -> N2Inbound {
     super::super::UnprotectedN2Profile::new(3)
         .unwrap()
         .admit(crate::InboundMessage {
-            payload: opc_protocol::SensitiveBytes::from_slice(b"nas"),
+            payload: Bytes::from_static(b"nas"),
             stream_id: 3,
             ppid: crate::NGAP_PPID,
             order: crate::DeliveryOrder::Ordered,

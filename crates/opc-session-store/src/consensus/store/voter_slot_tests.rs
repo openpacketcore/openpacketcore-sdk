@@ -702,115 +702,6 @@ impl Fleet {
     }
 }
 
-/// The store's own unchanged opening deadline, reused as the bound for waiting
-/// through the typed transient reopen class. No new timeout value is added.
-fn transient_reopen_bound() -> Duration {
-    super::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT
-}
-const TRANSIENT_REOPEN_POLL: Duration = Duration::from_millis(50);
-
-fn is_transient_reopen_failure(error: &ConsensusSessionStoreOpenError) -> bool {
-    matches!(error, ConsensusSessionStoreOpenError::StorageUnavailable)
-}
-
-/// Wait through only the typed transient reopen class, bounded by the store's
-/// unchanged opening deadline. Any other refusal returns immediately, and a
-/// persistent transient failure is still returned as a typed refusal: it is
-/// never repaired, retried past the bound, skipped or converted to success.
-async fn reopen_with_transient_wait<F, Fut, T>(
-    bound: Duration,
-    mut open: F,
-) -> Result<T, ConsensusSessionStoreOpenError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, ConsensusSessionStoreOpenError>>,
-{
-    let deadline = tokio::time::Instant::now() + bound;
-    loop {
-        match open().await {
-            Ok(value) => return Ok(value),
-            Err(error) if is_transient_reopen_failure(&error) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(error);
-                }
-                tokio::time::sleep(TRANSIENT_REOPEN_POLL).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-/// Deterministic injected-transient regression: two consecutive transient
-/// reopen failures are waited through inside the bound and the third attempt
-/// succeeds. Pre-fix the reopening `.unwrap()` failed on the first attempt.
-#[tokio::test]
-async fn transient_reopen_failures_are_waited_through_within_the_opening_bound() {
-    let attempts = AtomicU64::new(0);
-    let reopened = reopen_with_transient_wait(Duration::from_secs(5), || {
-        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-        async move {
-            if attempt < 2 {
-                Err(ConsensusSessionStoreOpenError::StorageUnavailable)
-            } else {
-                Ok(7_u8)
-            }
-        }
-    })
-    .await
-    .expect("transient reopen failures are waited through");
-    assert_eq!(reopened, 7);
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        3,
-        "both injected transient failures are retried, not hidden"
-    );
-}
-
-/// Non-transient reopen refusals are never retried, and a persistent transient
-/// failure is returned as the original typed refusal once the bound expires.
-#[tokio::test]
-async fn non_transient_and_persistent_reopen_failures_remain_refusals() {
-    let attempts = AtomicU64::new(0);
-    let refusal = reopen_with_transient_wait(Duration::from_secs(5), || {
-        attempts.fetch_add(1, Ordering::SeqCst);
-        async move { Err::<u8, _>(ConsensusSessionStoreOpenError::DurableIdentityMismatch) }
-    })
-    .await;
-    assert!(matches!(
-        refusal,
-        Err(ConsensusSessionStoreOpenError::DurableIdentityMismatch)
-    ));
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        1,
-        "a non-transient refusal is never retried"
-    );
-
-    let attempts = AtomicU64::new(0);
-    let started = tokio::time::Instant::now();
-    let persistent = reopen_with_transient_wait(Duration::from_millis(150), || {
-        attempts.fetch_add(1, Ordering::SeqCst);
-        async move { Err::<u8, _>(ConsensusSessionStoreOpenError::StorageUnavailable) }
-    })
-    .await;
-    assert!(matches!(
-        persistent,
-        Err(ConsensusSessionStoreOpenError::StorageUnavailable)
-    ));
-    assert!(
-        attempts.load(Ordering::SeqCst) >= 2,
-        "waiting is bounded but retries the transient class at least once"
-    );
-    assert!(
-        started.elapsed() >= Duration::from_millis(150),
-        "the wait does not return before the unchanged bound"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the wait never exceeds its bound"
-    );
-}
-
 #[tokio::test]
 async fn pristine_voter_slot_pre_vote_is_authenticated_and_read_only() {
     use futures_util::FutureExt;
@@ -1097,35 +988,19 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
     let survivor = fleet.nodes.remove(1);
     fleet.network.disconnect_and_shutdown(&survivor).await;
     drop(survivor);
-    let directory = fleet.directories[1].path().to_path_buf();
-    // One injected transient reopen failure proves the real reopen path waits
-    // through the typed transient class deterministically instead of failing.
-    super::voter_slots::transient_open_test_hook::inject(1);
-    let survivor_topology = fleet.topology(2);
-    let survivor_genesis = fleet.genesis();
-    let survivor_snapshots = directory.join("snapshots");
-    let survivor_resolver = Arc::new(Resolver(fleet.network.clone()));
-    let survivor = reopen_with_transient_wait(transient_reopen_bound(), || {
-        let backend = SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap();
-        let topology = survivor_topology.clone();
-        let genesis = survivor_genesis.clone();
-        let snapshots = survivor_snapshots.clone();
-        let resolver = Arc::clone(&survivor_resolver);
-        async move {
-            ConsensusSessionStore::open_with_voter_slots_and_integrity(
-                topology,
-                genesis,
-                member(2, 1).identity.node_id(),
-                backend,
-                snapshots,
-                resolver,
-                super::super::SnapshotIntegrityPolicy::PortableVerified,
-            )
-            .await
-        }
-    })
+    let directory = fleet.directories[1].path();
+    let backend = SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap();
+    let survivor = ConsensusSessionStore::open_with_voter_slots_and_integrity(
+        fleet.topology(2),
+        fleet.genesis(),
+        member(2, 1).identity.node_id(),
+        backend,
+        directory.join("snapshots"),
+        Arc::new(Resolver(fleet.network.clone())),
+        super::super::SnapshotIntegrityPolicy::PortableVerified,
+    )
     .await
-    .unwrap_or_else(|error| panic!("survivor voter store reopen failed: {error:?}"));
+    .unwrap();
     fleet
         .network
         .handlers
@@ -1365,32 +1240,17 @@ async fn lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consen
         prepared.table().slots[2].member.key_digest,
         "snapshot installation and restart preserve the successor volume's own key"
     );
-    let reopen_topology = fleet.topology(3);
-    let reopen_table = prepared.table().clone();
-    let reopen_directory = directory.to_path_buf();
-    let reopen_snapshots = reopen_directory.join("snapshots");
-    let reopen_resolver = Arc::new(Resolver(fleet.network.clone()));
-    let reopened = reopen_with_transient_wait(transient_reopen_bound(), || {
-        let backend = SqliteSessionBackend::open(reopen_directory.join("session.sqlite")).unwrap();
-        let topology = reopen_topology.clone();
-        let table = reopen_table.clone();
-        let snapshots = reopen_snapshots.clone();
-        let resolver = Arc::clone(&reopen_resolver);
-        async move {
-            ConsensusSessionStore::open_with_voter_slots_and_integrity(
-                topology,
-                table,
-                member(3, 2).identity.node_id(),
-                backend,
-                snapshots,
-                resolver,
-                super::super::SnapshotIntegrityPolicy::PortableVerified,
-            )
-            .await
-        }
-    })
+    let reopened = ConsensusSessionStore::open_with_voter_slots_and_integrity(
+        fleet.topology(3),
+        prepared.table().clone(),
+        member(3, 2).identity.node_id(),
+        backend,
+        directory.join("snapshots"),
+        Arc::new(Resolver(fleet.network.clone())),
+        super::super::SnapshotIntegrityPolicy::PortableVerified,
+    )
     .await
-    .unwrap_or_else(|error| panic!("successor voter store reopen failed: {error:?}"));
+    .unwrap();
     assert_eq!(reopened.voter_slot_state().await.unwrap(), finished);
     assert!(reopened
         .inner

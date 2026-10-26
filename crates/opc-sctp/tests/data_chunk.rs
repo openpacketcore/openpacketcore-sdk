@@ -1,23 +1,11 @@
 //! Synthetic RFC 9260 DATA chunks exercise the public decoder and N2 boundary.
 
-use opc_protocol::SensitiveBytes;
+use bytes::Bytes;
 use opc_sctp::n2::{N2Error, N2Inbound, UnprotectedN2Profile};
 use opc_sctp::{
     DataChunk, DataChunkError, DataChunkFlags, DeliveryOrder, InboundMessage,
     PayloadProtocolIdentifier,
 };
-
-fn assert_same_message(left: &InboundMessage, right: &InboundMessage) {
-    assert_eq!(left.payload.as_slice(), right.payload.as_slice());
-    assert_eq!(left.stream_id, right.stream_id);
-    assert_eq!(left.ppid, right.ppid);
-    assert_eq!(left.order, right.order);
-    assert_eq!(left.assoc_id, right.assoc_id);
-    assert_eq!(left.notification, right.notification);
-    assert_eq!(left.event, right.event);
-    assert_eq!(left.truncated, right.truncated);
-    assert_eq!(left.control_truncated, right.control_truncated);
-}
 
 // Independently laid out network-order fields, five user octets (including a
 // zero), and three alignment octets. I/B/E are set; U is clear.
@@ -84,7 +72,7 @@ fn all_flag_combinations_preserve_iube_and_ignore_reserved_bits() {
             };
             assert_eq!(message.order, expected_order);
         } else {
-            assert!(matches!(result, Err(DataChunkError::Fragmented)));
+            assert_eq!(result.unwrap_err(), DataChunkError::Fragmented);
         }
     }
 }
@@ -240,12 +228,13 @@ fn decoding_and_fragment_refusal_allocate_nothing() {
                 Err(*expected)
             );
         }
-        assert!(matches!(
+        assert_eq!(
             DataChunk::decode(std::hint::black_box(&fragment))
                 .expect("fragment")
-                .into_inbound_message(0),
-            Err(DataChunkError::Fragmented)
-        ));
+                .into_inbound_message(0)
+                .unwrap_err(),
+            DataChunkError::Fragmented
+        );
     });
     assert_eq!(allocations.count_total, 0);
     assert_eq!(allocations.bytes_total, 0);
@@ -295,7 +284,7 @@ fn wire_and_kernel_metadata_use_identical_n2_admission() {
             .into_inbound_message(41)
             .expect("complete record");
         let kernel = InboundMessage {
-            payload: SensitiveBytes::from_slice(payload),
+            payload: Bytes::copy_from_slice(payload),
             stream_id: 0x1357,
             ppid: PayloadProtocolIdentifier::new(ppid),
             order: if flags & 4 != 0 {
@@ -309,7 +298,15 @@ fn wire_and_kernel_metadata_use_identical_n2_admission() {
             truncated: false,
             control_truncated: false,
         };
-        assert_same_message(&decoded, &kernel);
+        assert_eq!(decoded.payload, kernel.payload);
+        assert_eq!(decoded.stream_id, kernel.stream_id);
+        assert_eq!(decoded.ppid, kernel.ppid);
+        assert_eq!(decoded.order, kernel.order);
+        assert_eq!(decoded.assoc_id, kernel.assoc_id);
+        assert_eq!(decoded.notification, kernel.notification);
+        assert_eq!(decoded.event, kernel.event);
+        assert_eq!(decoded.truncated, kernel.truncated);
+        assert_eq!(decoded.control_truncated, kernel.control_truncated);
         for message in [decoded, kernel] {
             match (profile.admit(message), expected) {
                 (Ok(N2Inbound::Payload(admitted)), None) => {

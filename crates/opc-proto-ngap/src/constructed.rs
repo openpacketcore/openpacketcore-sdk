@@ -6,40 +6,7 @@
 //! deliberately avoids the generated encoder's inner-container alignment bug.
 
 use super::*;
-
-/// TS 38.413 id-SecurityKey value in the N3IWF InitialContextSetupRequest.
-pub(crate) const SECURITY_KEY_IE_ID: u16 = 94;
-
-/// Move retained security-key IE payloads into zeroizing buffers.
-///
-/// Entries whose open-type value was already extracted during the root-container
-/// walk (empty placeholder) are counted but not pushed again. Returns the number
-/// of retained key IEs so the caller can reconcile permissive duplicate
-/// handling. The typed value is replaced with an empty placeholder because the
-/// complete PDU is the sole owner of the real bytes.
-pub(crate) fn extract_security_key_ie_values<T, Id, Extract>(
-    entries: &mut [T],
-    id_of: Id,
-    mut extract: Extract,
-    out: &mut Vec<crate::SensitiveBytes>,
-) -> usize
-where
-    Id: Fn(&T) -> u16,
-    Extract: FnMut(&mut T) -> Vec<u8>,
-{
-    let mut retained = 0;
-    for entry in entries.iter_mut() {
-        if id_of(&*entry) != SECURITY_KEY_IE_ID {
-            continue;
-        }
-        retained += 1;
-        let value = extract(entry);
-        if !value.is_empty() {
-            out.push(crate::SensitiveBytes::from_vec(value));
-        }
-    }
-    retained
-}
+use zeroize::Zeroizing;
 
 /// One borrowed protocol IE with an already APER-encoded, opaque value.
 ///
@@ -47,7 +14,6 @@ where
 /// surrounding open-type length determinant. Construction validates container
 /// policy, not the nested value's semantics or mandatory/conditional presence.
 /// Formatting reveals only the identifier, criticality and value length.
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolIe<'a> {
     id: u16,
     criticality: Criticality,
@@ -119,7 +85,7 @@ macro_rules! message_types {
                 match self {
                     $(Self::$variant(value) => {
                         for ie in &value.protocol_ies.0 {
-                            visit(ie.id$(.$inner)?, ie.criticality as u8, ie.value.as_bytes())?;
+                            visit(ie.id, ie.criticality as u8, ie.value.as_bytes())?;
                         }
                         Ok(())
                     },)+
@@ -191,14 +157,13 @@ impl Pdu {
         if total > ctx.max_message_len {
             return Err(length_error(total, ctx.max_message_len));
         }
-        let mut body = Vec::with_capacity(body_len);
+        let mut body = Zeroizing::new(Vec::with_capacity(body_len));
         write_prefix(&mut body, ies.len());
         for ie in ies {
             write_ie(&mut body, ie.id, ie.criticality as u8, ie.value);
         }
         let (outcome, procedure_code, criticality, _) = message_type.metadata();
-        let (message, security_key_values) =
-            decode_message(outcome, procedure_code, criticality, &body, ctx)?;
+        let message = decode_message(outcome, procedure_code, criticality, &body, ctx)?;
         let kind = match outcome {
             Outcome::Initiating => PduKind::Initiating {
                 procedure_code,
@@ -216,11 +181,10 @@ impl Pdu {
                 message,
             },
         };
-        Ok(Self::from_parts(
-            crate::SensitiveBytes::new(),
-            security_key_values,
+        Ok(Self {
+            raw: SensitiveBytes::default(),
             kind,
-        ))
+        })
     }
 }
 
@@ -294,15 +258,7 @@ pub(super) fn checked_len(pdu: &Pdu, ctx: EncodeContext) -> Result<usize, Encode
     // Fixed, bounded bitset avoids allocating while calculating wire_len.
     let mut seen = [0u64; 1024];
     let mut body_len = 3;
-    let mut security_key_values = pdu.security_key_values().iter();
     message.visit_ies(|id, crit, value| {
-        let value = if id == SECURITY_KEY_IE_ID {
-            security_key_values
-                .next()
-                .map_or(value, |value| value.as_slice())
-        } else {
-            value
-        };
         profile.validate_send_ie(id, crit)?;
         let word = usize::from(id) / 64;
         let bit = 1u64 << (id % 64);
@@ -322,17 +278,9 @@ pub(super) fn encode(pdu: &Pdu, ctx: EncodeContext) -> Result<Vec<u8>, EncodeErr
     let total = checked_len(pdu, ctx)?;
     let (outcome, code, criticality, message) = parts(&pdu.kind);
     // The body is smaller than the fully validated complete output bound.
-    let mut body = Vec::with_capacity(total);
+    let mut body = Zeroizing::new(Vec::with_capacity(total));
     write_prefix(&mut body, message.ie_count());
-    let mut security_key_values = pdu.security_key_values().iter();
     message.visit_ies(|id, crit, value| {
-        let value = if id == SECURITY_KEY_IE_ID {
-            security_key_values
-                .next()
-                .map_or(value, |value| value.as_slice())
-        } else {
-            value
-        };
         write_ie(&mut body, id, crit, value);
         Ok(())
     })?;

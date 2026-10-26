@@ -22,7 +22,9 @@
 //! cumulative budget for an enclosing message. [`setup_fields`] documents its
 //! additional nested-list counts, depth requirements and root layout exception.
 
-use std::{borrow::Cow, fmt, net::IpAddr};
+use std::{fmt, net::IpAddr};
+
+use crate::sensitive::SensitiveValue;
 
 use opc_protocol::{
     DecodeContext, DecodeError, DecodeErrorCode, EncodeContext, EncodeError, EncodeErrorCode,
@@ -39,8 +41,8 @@ use crate::{
 /// An APER IE value whose buffer is cleared on drop and whose diagnostics are redacted.
 ///
 /// Borrow it through [`Self::as_bytes`] to construct a protocol IE. Copies made
-/// by the caller, generic PDU construction and wire output are caller-owned;
-/// clearing this buffer does not clear those copies.
+/// by the caller and final wire output are caller-owned. Generic PDU construction
+/// keeps its own copies under wiping custody.
 pub struct EncodedValue(Zeroizing<Vec<u8>>);
 
 impl EncodedValue {
@@ -211,13 +213,13 @@ impl AmfUeId {
 ///
 /// No NAS message, identity, security context or non-empty requirement is
 /// inferred from NGAP's unconstrained OCTET STRING.
-pub struct NasPdu<'a>(Cow<'a, [u8]>);
+pub struct NasPdu<'a>(SensitiveValue<'a>);
 redacted!(NasPdu<'_>);
 
 impl<'a> NasPdu<'a> {
     /// Borrow caller-owned NAS without copying or interpreting it.
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self(Cow::Borrowed(bytes))
+        Self(SensitiveValue::Borrowed(bytes))
     }
     /// Explicitly expose the opaque NAS to its consumer.
     pub fn as_bytes(&self) -> &[u8] {
@@ -246,7 +248,8 @@ impl<'a> NasPdu<'a> {
 ///
 /// This type does not derive keys, admit peers or import material into a key
 /// provider. It has no Clone, equality, hashing or serialization implementation.
-/// The owner must protect and clear the borrowed source and any wire copies.
+/// A key borrowed from an admitted PDU is protected by that PDU's wiping IE
+/// owner. Other borrowed sources and explicit wire copies are caller-owned.
 pub struct SecurityKey<'a>(&'a [u8; 32]);
 redacted!(SecurityKey<'_>);
 
@@ -268,15 +271,9 @@ impl<'a> SecurityKey<'a> {
     pub const fn expose_bytes(&self) -> &[u8; 32] {
         self.0
     }
-
-    /// Copy the key into a zeroizing owner for an authorized consumer.
-    ///
-    /// This is the explicit hand-off for callers that must outlive the
-    /// borrowed receive buffers, for example an IKEv2 protocol-key import that
-    /// requires `Zeroizing<Vec<u8>>`. The receive buffers remain zeroized on
-    /// their own drop; this copy is zeroized when the returned value is dropped.
-    #[must_use]
-    pub fn copy_into_zeroizing(&self) -> Zeroizing<Vec<u8>> {
+    /// Copy into wiping custody for an authorized key-provider handoff.
+    /// The borrowed source remains protected by its own owner until dropped.
+    pub fn to_zeroizing(&self) -> Zeroizing<Vec<u8>> {
         Zeroizing::new(self.0.to_vec())
     }
     /// Encode the aligned fixed BIT STRING into a buffer cleared on drop.
@@ -376,9 +373,11 @@ fn preflight_tai(input: &[u8]) -> Result<(), DecodeError> {
 
 /// N3IWF IP location, with an optional port and optional tracking area.
 ///
-/// IPv4 and IPv6 are admitted. Socket reachability, address assignment, port
-/// selection and whether TAI is required in a particular procedure are caller
-/// obligations. Formatting reveals none of these values.
+/// This location profile admits one IPv4 or IPv6 address. It rejects the
+/// 160-bit combined form; combined GTP transport endpoints are represented by
+/// [`resource_fields::TransportLayerAddress`]. Socket reachability, address
+/// assignment, port selection and required TAI presence are caller obligations.
+/// Formatting reveals none of these values.
 #[derive(Clone, PartialEq, Eq)]
 pub struct N3iwfLocation {
     address: IpAddr,

@@ -29,7 +29,7 @@ impl CommonNetworkInstance {
             return Err(invalid("trailing common network instance bytes"));
         }
         let (_, value) = aper::open_type(input)?;
-        Ok(Self(value.into_owned()))
+        Ok(Self(value.to_vec()))
     }
     /// Check the complete fragmented encoding length before allocation.
     pub fn encode(&self, ctx: EncodeContext) -> Result<EncodedValue, EncodeError> {

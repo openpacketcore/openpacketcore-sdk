@@ -380,9 +380,7 @@ fn ngap_security_key_placeholder_supplies_both_auth_known_answers() {
         })
         .expect("initial context request");
     let pdu = opc_proto_ngap::decode(wire, DecodeContext::default()).expect("NGAP request");
-    // The typed open-type placeholder is empty: the actual key octets are in
-    // the PDU's zeroizing custody and are obtained through the admitted N3IWF
-    // request, not by reading the generated Any copy.
+    // Both the typed view and N3IWF admission borrow the wiping IE owner.
     match &pdu.kind {
         opc_proto_ngap::PduKind::Initiating {
             message: opc_proto_ngap::Message::InitialContextSetupRequest(request),
@@ -395,7 +393,7 @@ fn ngap_security_key_placeholder_supplies_both_auth_known_answers() {
                 .filter(|ie| ie.id == 94)
                 .collect::<Vec<_>>();
             assert_eq!(keys.len(), 1);
-            assert!(keys[0].value.as_bytes().is_empty());
+            assert_eq!(keys[0].value.as_bytes(), &[0u8; 32]);
         }
         _ => panic!("wrong key-handoff message"),
     }

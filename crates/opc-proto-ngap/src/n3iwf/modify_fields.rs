@@ -5,7 +5,9 @@
 use super::qos_fields::{QosFlow, QosParameters};
 use super::release::Cause;
 use super::reset_fields::{encode_root, Sink};
-use super::resource_fields::{DownlinkTransport, NonGbrFlow, QosFlowId, UplinkTransport};
+use super::resource_fields::{
+    DownlinkTransport, NonGbrFlow, QosFlowId, TransportLayerAddress, UplinkTransport,
+};
 use super::resource_results::{cause_width, read_cause, unique};
 use super::session_lists::encode_list;
 use super::setup_fields::{Reader, Writer};
@@ -351,7 +353,7 @@ impl UplinkModifications {
             bits += 2;
             for address in [value.uplink.address(), value.downlink.address()] {
                 bits = (bits + 12).div_ceil(8) * 8;
-                bits += if address.is_ipv4() { 32 } else { 128 };
+                bits += usize::from(address.bit_len());
                 bits += 32;
             }
         }
@@ -367,8 +369,8 @@ impl UplinkModifications {
         writer.finish()
     }
     /// Require depth five. Validate all addresses, flags, counts, alignment and
-    /// exact framing before allocating the result vector. Only IPv4/IPv6 GTP
-    /// roots are qualified; dual-address bit strings and extensions fail.
+    /// exact framing before allocating the result vector. Single-family and
+    /// combined IPv4/IPv6 GTP roots are admitted; extensions fail.
     pub fn decode(input: &[u8], ctx: DecodeContext) -> Result<Self, DecodeError> {
         let count = scan_tunnels(input, ctx, |_| {})?;
         let mut values = Vec::with_capacity(count);
@@ -387,9 +389,9 @@ fn scan_tunnels(
     for _ in 0..count {
         reader.flags(2)?;
         let (address, teid) = read_transport(&mut reader)?;
-        let uplink = UplinkTransport::new(address, teid);
+        let uplink = UplinkTransport::with_address(address, teid);
         let (address, teid) = read_transport(&mut reader)?;
-        let downlink = DownlinkTransport::new(address, teid);
+        let downlink = DownlinkTransport::with_address(address, teid);
         emit(UplinkModification { uplink, downlink });
     }
     reader.finish()?;
@@ -397,29 +399,40 @@ fn scan_tunnels(
 }
 pub(super) fn write_transport(
     writer: &mut dyn Sink,
-    address: IpAddr,
+    address: TransportLayerAddress,
     teid: u32,
 ) -> Result<(), EncodeError> {
     writer.bits(0, 4)?;
-    writer.bits(if address.is_ipv4() { 31 } else { 127 }, 8)?;
+    writer.bits(address.bit_len() - 1, 8)?;
     writer.align();
     match address {
-        IpAddr::V4(value) => write_octets(writer, &value.octets())?,
-        IpAddr::V6(value) => write_octets(writer, &value.octets())?,
+        TransportLayerAddress::Ipv4(value) => write_octets(writer, &value.octets())?,
+        TransportLayerAddress::Ipv6(value) => write_octets(writer, &value.octets())?,
+        TransportLayerAddress::Ipv4v6 { ipv4, ipv6 } => {
+            // TS 38.414 5.3 fixes the order: IPv4 first, then IPv6.
+            write_octets(writer, &ipv4.octets())?;
+            write_octets(writer, &ipv6.octets())?;
+        }
     }
     write_octets(writer, &teid.to_be_bytes())
 }
-pub(super) fn read_transport(reader: &mut Reader<'_>) -> Result<(IpAddr, u32), DecodeError> {
+pub(super) fn read_transport(
+    reader: &mut Reader<'_>,
+) -> Result<(TransportLayerAddress, u32), DecodeError> {
     reader.flags(4)?;
     let bits = reader.bits(8)? + 1;
-    if !matches!(bits, 32 | 128) {
+    if !matches!(bits, 32 | 128 | 160) {
         return Err(unsupported());
     }
     reader.align()?;
-    let address = if bits == 32 {
-        IpAddr::V4(std::net::Ipv4Addr::from(read_octets::<4>(reader)?))
-    } else {
-        IpAddr::V6(std::net::Ipv6Addr::from(read_octets::<16>(reader)?))
+    let address = match bits {
+        32 => TransportLayerAddress::Ipv4(std::net::Ipv4Addr::from(read_octets::<4>(reader)?)),
+        128 => TransportLayerAddress::Ipv6(std::net::Ipv6Addr::from(read_octets::<16>(reader)?)),
+        160 => TransportLayerAddress::Ipv4v6 {
+            ipv4: std::net::Ipv4Addr::from(read_octets::<4>(reader)?),
+            ipv6: std::net::Ipv6Addr::from(read_octets::<16>(reader)?),
+        },
+        _ => return Err(unsupported()),
     };
     Ok((address, u32::from_be_bytes(read_octets(reader)?)))
 }

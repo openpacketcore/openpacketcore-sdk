@@ -78,7 +78,7 @@ fn identity_duplicates_select_distinct_values_and_reject_wrong_criticality() {
             };
             assert_identity_fields(&admitted.message, row, prefix);
             shared::reconstruct(&admitted.message, ctx, EncodeContext::default());
-            assert!(pdu.raw() == wire);
+            assert!(pdu.raw.as_ref() == wire);
         }
         duplicates += 1;
     }
@@ -158,7 +158,7 @@ fn identity_roots_enforce_exact_extents_capacity_depth_and_redaction() {
         let mut trailing = wire.clone();
         trailing.push(0);
         let (rest, prefix) = Pdu::decode(&trailing, context()).unwrap();
-        assert!(rest == [0] && prefix.raw() == wire);
+        assert!(rest == [0] && prefix.raw.as_ref() == wire);
         assert!(Pdu::decode_owned(Bytes::from(trailing), context()).is_err());
     }
     assert_eq!(checked, 220);

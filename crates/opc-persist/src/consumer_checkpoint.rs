@@ -867,6 +867,7 @@ fn prepare_files(
         parent,
         lock,
         database,
+        completion: None,
         identity,
     });
     admission.read_back()?;

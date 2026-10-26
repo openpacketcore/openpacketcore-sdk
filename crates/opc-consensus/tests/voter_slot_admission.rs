@@ -82,16 +82,7 @@ fn request(slot: u16, seed: u8) -> VoterReplacementRequest {
 struct Reader(Mutex<VoterSlotDurableState>);
 #[async_trait]
 impl VoterSlotStateReader for Reader {
-    async fn read_voter_slot_state(
-        &self,
-        _deadline: Instant,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
-        Ok(self.0.lock().unwrap().clone())
-    }
-
-    async fn read_voter_slot_state_now(
-        &self,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+    async fn read_voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError> {
         Ok(self.0.lock().unwrap().clone())
     }
 }
@@ -595,3 +586,6 @@ async fn resolving_leader_snapshot_does_not_wait_for_the_prepare_it_must_resolve
     pending.await.unwrap().unwrap();
     assert!(engine.closed.lock().unwrap().is_empty());
 }
+
+#[path = "voter_slot_admission/deadlines.rs"]
+mod deadline_tests;
