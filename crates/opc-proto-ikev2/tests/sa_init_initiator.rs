@@ -143,6 +143,47 @@ fn request_preserves_caller_preference_and_public_key_custody() {
 }
 
 #[test]
+fn modp_15_through_18_negotiate_exact_ke_and_derive_the_same_secret() {
+    support::ensure_ike_crypto();
+    for id in 15..=18 {
+        let group = Ikev2DhGroup::from_transform_id(id).unwrap();
+        let initiator = Ikev2EphemeralDhKey::generate(group).unwrap();
+        let responder = Ikev2EphemeralDhKey::generate(group).unwrap();
+        let mut offered = offer();
+        offered.proposals[0].transforms[2].transform_id = id;
+        let request =
+            build_ike_sa_init_request(SPI_I, &offered, &initiator, &[0x61; 32], &[]).unwrap();
+        let payloads = Ikev2SaInitResponsePayloads {
+            security_association: offered,
+            key_exchange: Ikev2KeyExchangePayloadBuild {
+                dh_group: id,
+                key_exchange_data: responder.public_value().to_vec(),
+            },
+            nonce: Ikev2NoncePayloadBuild {
+                nonce: vec![0x72; 32],
+            },
+            notifies: vec![],
+        };
+        let response = response(&request, &payloads);
+        let Ikev2SaInitResponse::Accepted(accepted) =
+            admit_ike_sa_init_response(&request, &response.as_borrowed(), DecodeContext::default())
+                .unwrap()
+        else {
+            panic!("supported MODP rejected")
+        };
+        assert_eq!(accepted.profile().dh_group(), group);
+        assert_eq!(accepted.key_exchange().len(), group.public_value_len());
+        assert!(
+            initiator.agree(accepted.key_exchange()).unwrap().as_slice()
+                == responder
+                    .agree(initiator.public_value())
+                    .unwrap()
+                    .as_slice()
+        );
+    }
+}
+
+#[test]
 fn request_rejects_invalid_offer_and_uses_strongest_prf_nonce_minimum() {
     let key = key();
     let mut offered = offer();

@@ -262,3 +262,54 @@ Sources: [TS 29.281 v18.4.0 §§4.3.0, 4.4.3.3](https://www.etsi.org/deliver/ets
 [shared binding](../crates/opc-gtpu-ebpf-common/src/lib.rs),
 [grouped wire authorizers](../crates/opc-gtpu-ebpf-common/src/session.rs), and
 [live packet proof](../crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged/multihoming.rs).
+
+## IKE cryptographic transforms #1352
+
+The executable software provider now implements MODP groups 15–18, RFC 4754
+ECDSA methods 9–11, P-521/SHA-512, RSA-PSS with SHA-256/384/512, and pure
+Ed25519. DH selection, exact peer-value bounds, SA_INIT exchange, IKE rekey,
+and single-export encrypted checkpoints all retain the new group widths.
+SHA-512 and Identity offers require actual provider admission. Existing
+proposal defaults and transcript/nonce authorization remain in force.
+
+Methods 9–11 carry fixed-width `r || s`; method 14 carries its algorithm
+identifier and DER ECDSA, PSS, or pure Ed25519 signature. The PSS parser
+accepts equivalent RFC 4055 SHA-2 encodings, including absent/NULL hash
+parameters and RFC 7427's explicit trailer field. Its supported profile
+requires matching SHA-2/MGF1 digests, digest-sized salt and trailer field 1.
+Malformed identifiers, wrong salt/MGF/hash, mismatched credentials, weak
+Ed25519 keys, non-canonical scalars and unbound hash offers are rejected.
+The original candidate's extra context wrapper inside the PSS MGF1
+identifier was invalid ASN.1 and has a dedicated refusal regression.
+
+Local PSS AUTH self-verification selects an exact signature scheme with
+`authorize_local_auth_self_verification_with_algorithm`; the previous
+hash-only API retains its PKCS#1 choice for RSA. RSA private operations
+remain behind `rsa-signing`, with the existing timing-advisory limitation.
+Public-key verification is always available. Ed25519 is supported; Ed448
+and prehashed Ed25519 are explicitly unsupported. Certificate extraction
+still supplies a verification key, not certificate-chain trust. Startup
+PKCS#8 inspection supports P-521/Ed25519 without granting signing authority.
+
+The baseline public transform/offer regressions failed before implementation.
+Published RFC 4754 vectors exercise all three raw ECDSA widths, and RFC 8032
+test 2 proves exact pure Ed25519 output. OpenSSL independently verifies these
+and the committed RSA-PSS positive/negative fixtures through a required CI
+step. MODP primes match RFC 3526 byte-for-byte; Python integer arithmetic and
+Node.js BigInt independently reproduce the fixed-exponent shared-secret
+digests. Tests cover default-build RSA signing refusal as well as enabled
+signing, checkpoint corruption/replay, provider admission and full exchanges.
+
+The change also updates IKE's `crypto-bigint` to 0.7.10 and `ctutils` to 0.4.6
+with matching standalone lockfiles. This does not resolve or ignore the
+separate older DTLS arithmetic and Tokio advisories.
+
+Witnesses: [signature boundary](../crates/opc-proto-ikev2/src/ike_auth_signature.rs),
+[DH boundary](../crates/opc-proto-ikev2/src/sa_init_crypto.rs),
+[fixture provenance](../crates/opc-proto-ikev2/tests/data/crypto_vectors.md),
+[independent OpenSSL gate](../scripts/check-ike-signature-vectors.py),
+[RFC 3526 §§4–7](https://www.rfc-editor.org/rfc/rfc3526.html#section-4),
+[RFC 4754 §§3, 8](https://www.rfc-editor.org/rfc/rfc4754.html#section-3),
+[RFC 7427 §3 and Appendix A.4](https://www.rfc-editor.org/rfc/rfc7427.html#section-3),
+[RFC 4055 §3.1](https://www.rfc-editor.org/rfc/rfc4055.html#section-3.1), and
+[RFC 8420 §2](https://www.rfc-editor.org/rfc/rfc8420.html#section-2).

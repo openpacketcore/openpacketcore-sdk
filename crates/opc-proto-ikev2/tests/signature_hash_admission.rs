@@ -30,6 +30,15 @@ fn restricted_admission_controls_local_offer_and_directional_candidates() {
         Ikev2SignatureHashLocalOffer::new(&[Ikev2SignatureHashAlgorithm::Sha2_384]),
         Err(Ikev2SignatureHashNegotiationError::UnsupportedLocalAlgorithm)
     );
+    for unadmitted in [
+        Ikev2SignatureHashAlgorithm::Sha2_512,
+        Ikev2SignatureHashAlgorithm::Identity,
+    ] {
+        assert_eq!(
+            Ikev2SignatureHashLocalOffer::new(&[unadmitted]),
+            Err(Ikev2SignatureHashNegotiationError::UnsupportedLocalAlgorithm)
+        );
+    }
 
     let (request, response) = support::signature_hash_exchange(
         Some(&[Ikev2SignatureHashAlgorithm::Sha2_256]),

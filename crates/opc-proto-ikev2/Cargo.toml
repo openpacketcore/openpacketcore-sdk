@@ -19,7 +19,7 @@ publish = false
 # outside the practical scope of RUSTSEC-2023-0071 (Marvin timing
 # sidechannel); RSA *verification* of peers is always available. Prefer
 # ECDSA (P-256/P-384) responder certificates.
-rsa-signing = []
+rsa-signing = ["rsa/getrandom"]
 testkit = []
 
 [dependencies]
@@ -28,7 +28,8 @@ aes = { workspace = true }
 aes-gcm = { workspace = true }
 bytes = { workspace = true }
 cbc = { workspace = true }
-crypto-bigint = { version = "0.7.5", features = ["getrandom", "zeroize"] }
+ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "alloc"] }
+crypto-bigint = { version = "0.7.10", features = ["getrandom", "zeroize"] }
 opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0" }
 opc-proto-eap = { path = "../opc-proto-eap", version = "0.2.0" }
 opc-protocol = { path = "../opc-protocol", version = "0.2.0" }
@@ -36,7 +37,7 @@ opc-proto-tft = { path = "../opc-proto-tft", version = "0.2.0" }
 opc-types = { path = "../opc-types", version = "0.2.0" }
 p256 = { version = "0.14.0", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
 p384 = { version = "0.14.0", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
-p521 = { version = "0.14.0", default-features = false, features = ["ecdh", "std"] }
+p521 = { version = "0.14.0", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std"] }
 rand = { workspace = true }
 rsa = { workspace = true }
 sha1 = { workspace = true }
@@ -49,6 +50,7 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 hmac = { workspace = true }
+rsa = { workspace = true, features = ["getrandom"] }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-key = { path = "../opc-key", version = "0.2.0" }
 opc-proto-ikev2 = { path = ".", version = "0.2.0", features = ["testkit"] }

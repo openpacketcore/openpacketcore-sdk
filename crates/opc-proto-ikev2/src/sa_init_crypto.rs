@@ -19,7 +19,7 @@ mod negotiation_policy_tests;
 
 use crypto_bigint::{
     modular::{FixedMontyForm, FixedMontyParams},
-    Odd, Random, U1024, U2048, U768,
+    Odd, Random, U1024, U2048, U3072, U4096, U6144, U768, U8192,
 };
 use opc_crypto_provider::{CryptoOperationErrorCode, IkeDhKeyPair};
 use p256::{
@@ -66,6 +66,10 @@ const INTEG_HMAC_SHA2_512_256: u16 = 14;
 const DH_MODP_768: u16 = 1;
 const DH_MODP_1024: u16 = 2;
 const DH_MODP_2048: u16 = 14;
+const DH_MODP_3072: u16 = 15;
+const DH_MODP_4096: u16 = 16;
+const DH_MODP_6144: u16 = 17;
+const DH_MODP_8192: u16 = 18;
 const DH_ECP_256: u16 = 19;
 const DH_ECP_384: u16 = 20;
 const DH_ECP_521: u16 = 21;
@@ -82,12 +86,20 @@ const AES_GCM_256_KEY_BITS: u16 = 256;
 const MODP_768_PUBLIC_VALUE_LEN: usize = 96;
 const MODP_1024_PUBLIC_VALUE_LEN: usize = 128;
 const MODP_2048_PUBLIC_VALUE_LEN: usize = 256;
+const MODP_3072_PUBLIC_VALUE_LEN: usize = 384;
+const MODP_4096_PUBLIC_VALUE_LEN: usize = 512;
+const MODP_6144_PUBLIC_VALUE_LEN: usize = 768;
+const MODP_8192_PUBLIC_VALUE_LEN: usize = 1024;
 const ECP_256_PUBLIC_VALUE_LEN: usize = 64;
 const ECP_384_PUBLIC_VALUE_LEN: usize = 96;
 const ECP_521_PUBLIC_VALUE_LEN: usize = 132;
 const MODP_768_SHARED_SECRET_LEN: usize = 96;
 const MODP_1024_SHARED_SECRET_LEN: usize = 128;
 const MODP_2048_SHARED_SECRET_LEN: usize = 256;
+const MODP_3072_SHARED_SECRET_LEN: usize = 384;
+const MODP_4096_SHARED_SECRET_LEN: usize = 512;
+const MODP_6144_SHARED_SECRET_LEN: usize = 768;
+const MODP_8192_SHARED_SECRET_LEN: usize = 1024;
 const ECP_256_SHARED_SECRET_LEN: usize = 32;
 const ECP_384_SHARED_SECRET_LEN: usize = 48;
 const ECP_521_SHARED_SECRET_LEN: usize = 66;
@@ -171,6 +183,131 @@ const MODP_2048_PRIME_HEX: &str = concat!(
     "15728E5A8AACAA68FFFFFFFFFFFFFFFF"
 );
 
+const MODP_3072_PRIME_HEX: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D",
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D",
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9",
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64",
+    "ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7",
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6B",
+    "F12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB31",
+    "43DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF",
+);
+
+const MODP_4096_PRIME_HEX: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D",
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D",
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9",
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64",
+    "ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7",
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6B",
+    "F12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB31",
+    "43DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D7",
+    "88719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA",
+    "2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6",
+    "287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED",
+    "1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA9",
+    "93B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199",
+    "FFFFFFFFFFFFFFFF",
+);
+
+const MODP_6144_PRIME_HEX: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D",
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D",
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9",
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64",
+    "ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7",
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6B",
+    "F12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB31",
+    "43DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D7",
+    "88719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA",
+    "2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6",
+    "287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED",
+    "1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA9",
+    "93B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934028492",
+    "36C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BD",
+    "F8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831",
+    "179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1B",
+    "DB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF",
+    "5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6",
+    "D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F3",
+    "23A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AA",
+    "CC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE328",
+    "06A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55C",
+    "DA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE",
+    "12BF2D5B0B7474D6E694F91E6DCC4024FFFFFFFFFFFFFFFF",
+);
+
+const MODP_8192_PRIME_HEX: &str = concat!(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D",
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D",
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9",
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64",
+    "ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7",
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6B",
+    "F12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB31",
+    "43DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D7",
+    "88719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA",
+    "2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6",
+    "287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED",
+    "1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA9",
+    "93B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934028492",
+    "36C3FAB4D27C7026C1D4DCB2602646DEC9751E763DBA37BD",
+    "F8FF9406AD9E530EE5DB382F413001AEB06A53ED9027D831",
+    "179727B0865A8918DA3EDBEBCF9B14ED44CE6CBACED4BB1B",
+    "DB7F1447E6CC254B332051512BD7AF426FB8F401378CD2BF",
+    "5983CA01C64B92ECF032EA15D1721D03F482D7CE6E74FEF6",
+    "D55E702F46980C82B5A84031900B1C9E59E7C97FBEC7E8F3",
+    "23A97A7E36CC88BE0F1D45B7FF585AC54BD407B22B4154AA",
+    "CC8F6D7EBF48E1D814CC5ED20F8037E0A79715EEF29BE328",
+    "06A1D58BB7C5DA76F550AA3D8A1FBFF0EB19CCB1A313D55C",
+    "DA56C9EC2EF29632387FE8D76E3C0468043E8F663F4860EE",
+    "12BF2D5B0B7474D6E694F91E6DBE115974A3926F12FEE5E4",
+    "38777CB6A932DF8CD8BEC4D073B931BA3BC832B68D9DD300",
+    "741FA7BF8AFC47ED2576F6936BA424663AAB639C5AE4F568",
+    "3423B4742BF1C978238F16CBE39D652DE3FDB8BEFC848AD9",
+    "22222E04A4037C0713EB57A81A23F0C73473FC646CEA306B",
+    "4BCBC8862F8385DDFA9D4B7FA2C087E879683303ED5BDD3A",
+    "062B3CF5B3A278A66D2A13F83F44F82DDF310EE074AB6A36",
+    "4597E899A0255DC164F31CC50846851DF9AB48195DED7EA1",
+    "B1D510BD7EE74D73FAF36BC31ECFA268359046F4EB879F92",
+    "4009438B481C6CD7889A002ED5EE382BC9190DA6FC026E47",
+    "9558E4475677E9AA9E3050E2765694DFC81F56E880B96E71",
+    "60C980DD98EDD3DFFFFFFFFFFFFFFFFF",
+);
+
 /// IKEv2 Diffie-Hellman groups supported by the SDK SA_INIT material helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ikev2DhGroup {
@@ -186,6 +323,18 @@ pub enum Ikev2DhGroup {
     Modp1024,
     /// 2048-bit MODP group, IKEv2 Transform ID 14.
     Modp2048,
+    /// 3072-bit MODP group, IKEv2 Transform ID 15 (RFC 3526 section 4).
+    ///
+    /// Preferred over the 768/1024/2048-bit groups when the peer offers it
+    /// alongside them; this is a caller-selected proposal alternative, not an
+    /// automatic policy.
+    Modp3072,
+    /// 4096-bit MODP group, IKEv2 Transform ID 16 (RFC 3526 section 5).
+    Modp4096,
+    /// 6144-bit MODP group, IKEv2 Transform ID 17 (RFC 3526 section 6).
+    Modp6144,
+    /// 8192-bit MODP group, IKEv2 Transform ID 18 (RFC 3526 section 7).
+    Modp8192,
     /// NIST P-256 ECP group, IKEv2 Transform ID 19.
     Ecp256,
     /// NIST P-384 ECP group, IKEv2 Transform ID 20.
@@ -206,6 +355,10 @@ impl Ikev2DhGroup {
             DH_MODP_768 => Ok(Self::Modp768),
             DH_MODP_1024 => Ok(Self::Modp1024),
             DH_MODP_2048 => Ok(Self::Modp2048),
+            DH_MODP_3072 => Ok(Self::Modp3072),
+            DH_MODP_4096 => Ok(Self::Modp4096),
+            DH_MODP_6144 => Ok(Self::Modp6144),
+            DH_MODP_8192 => Ok(Self::Modp8192),
             DH_ECP_256 => Ok(Self::Ecp256),
             DH_ECP_384 => Ok(Self::Ecp384),
             DH_ECP_521 => Ok(Self::Ecp521),
@@ -219,6 +372,10 @@ impl Ikev2DhGroup {
             Self::Modp768 => DH_MODP_768,
             Self::Modp1024 => DH_MODP_1024,
             Self::Modp2048 => DH_MODP_2048,
+            Self::Modp3072 => DH_MODP_3072,
+            Self::Modp4096 => DH_MODP_4096,
+            Self::Modp6144 => DH_MODP_6144,
+            Self::Modp8192 => DH_MODP_8192,
             Self::Ecp256 => DH_ECP_256,
             Self::Ecp384 => DH_ECP_384,
             Self::Ecp521 => DH_ECP_521,
@@ -231,6 +388,10 @@ impl Ikev2DhGroup {
             Self::Modp768 => "MODP-768",
             Self::Modp1024 => "MODP-1024",
             Self::Modp2048 => "MODP-2048",
+            Self::Modp3072 => "MODP-3072",
+            Self::Modp4096 => "MODP-4096",
+            Self::Modp6144 => "MODP-6144",
+            Self::Modp8192 => "MODP-8192",
             Self::Ecp256 => "ECP-256",
             Self::Ecp384 => "ECP-384",
             Self::Ecp521 => "ECP-521",
@@ -243,6 +404,10 @@ impl Ikev2DhGroup {
             Self::Modp768 => MODP_768_PUBLIC_VALUE_LEN,
             Self::Modp1024 => MODP_1024_PUBLIC_VALUE_LEN,
             Self::Modp2048 => MODP_2048_PUBLIC_VALUE_LEN,
+            Self::Modp3072 => MODP_3072_PUBLIC_VALUE_LEN,
+            Self::Modp4096 => MODP_4096_PUBLIC_VALUE_LEN,
+            Self::Modp6144 => MODP_6144_PUBLIC_VALUE_LEN,
+            Self::Modp8192 => MODP_8192_PUBLIC_VALUE_LEN,
             Self::Ecp256 => ECP_256_PUBLIC_VALUE_LEN,
             Self::Ecp384 => ECP_384_PUBLIC_VALUE_LEN,
             Self::Ecp521 => ECP_521_PUBLIC_VALUE_LEN,
@@ -258,6 +423,10 @@ impl Ikev2DhGroup {
             Self::Modp768 => MODP_768_SHARED_SECRET_LEN,
             Self::Modp1024 => MODP_1024_SHARED_SECRET_LEN,
             Self::Modp2048 => MODP_2048_SHARED_SECRET_LEN,
+            Self::Modp3072 => MODP_3072_SHARED_SECRET_LEN,
+            Self::Modp4096 => MODP_4096_SHARED_SECRET_LEN,
+            Self::Modp6144 => MODP_6144_SHARED_SECRET_LEN,
+            Self::Modp8192 => MODP_8192_SHARED_SECRET_LEN,
             Self::Ecp256 => ECP_256_SHARED_SECRET_LEN,
             Self::Ecp384 => ECP_384_SHARED_SECRET_LEN,
             Self::Ecp521 => ECP_521_SHARED_SECRET_LEN,
@@ -1304,10 +1473,18 @@ pub(crate) struct SoftwareEphemeralDhKey {
     secret: SoftwareEphemeralDhSecret,
 }
 
+// The RFC 3526 group 18 private exponent is 1024 octets inline while ECP
+// scalars are small. Boxing would move secret material onto a second heap
+// allocation; the private, zeroizing enum is kept inline deliberately.
+#[allow(clippy::large_enum_variant)]
 enum SoftwareEphemeralDhSecret {
     Modp768(Zeroizing<U768>),
     Modp1024(Zeroizing<U1024>),
     Modp2048(Zeroizing<U2048>),
+    Modp3072(Zeroizing<U3072>),
+    Modp4096(Zeroizing<U4096>),
+    Modp6144(Zeroizing<U6144>),
+    Modp8192(Zeroizing<U8192>),
     Ecp256(P256SecretKey),
     Ecp384(P384SecretKey),
     Ecp521(P521SecretKey),
@@ -1326,6 +1503,10 @@ impl SoftwareEphemeralDhKey {
             Ikev2DhGroup::Modp768 => generate_modp768_key(),
             Ikev2DhGroup::Modp1024 => generate_modp1024_key(),
             Ikev2DhGroup::Modp2048 => generate_modp2048_key(),
+            Ikev2DhGroup::Modp3072 => generate_modp3072_key(),
+            Ikev2DhGroup::Modp4096 => generate_modp4096_key(),
+            Ikev2DhGroup::Modp6144 => generate_modp6144_key(),
+            Ikev2DhGroup::Modp8192 => generate_modp8192_key(),
             Ikev2DhGroup::Ecp256 => {
                 let scalar = Zeroizing::new(
                     p256::NonZeroScalar::try_generate()
@@ -1394,6 +1575,18 @@ impl SoftwareEphemeralDhKey {
             }
             SoftwareEphemeralDhSecret::Modp2048(private) => {
                 agree_modp2048(private, peer_public_value)
+            }
+            SoftwareEphemeralDhSecret::Modp3072(private) => {
+                agree_modp3072(private, peer_public_value)
+            }
+            SoftwareEphemeralDhSecret::Modp4096(private) => {
+                agree_modp4096(private, peer_public_value)
+            }
+            SoftwareEphemeralDhSecret::Modp6144(private) => {
+                agree_modp6144(private, peer_public_value)
+            }
+            SoftwareEphemeralDhSecret::Modp8192(private) => {
+                agree_modp8192(private, peer_public_value)
             }
             SoftwareEphemeralDhSecret::Ecp256(secret) => agree_ecp256(secret, peer_public_value),
             SoftwareEphemeralDhSecret::Ecp384(secret) => agree_ecp384(secret, peer_public_value),
@@ -2509,6 +2702,50 @@ define_modp_group!(
     Modp2048,
     MODP_2048_PRIME_HEX
 );
+define_modp_group!(
+    generate_modp3072_key,
+    agree_modp3072,
+    modp3072_pow,
+    modp3072_prime,
+    validate_modp3072_public,
+    U3072,
+    Ikev2DhGroup::Modp3072,
+    Modp3072,
+    MODP_3072_PRIME_HEX
+);
+define_modp_group!(
+    generate_modp4096_key,
+    agree_modp4096,
+    modp4096_pow,
+    modp4096_prime,
+    validate_modp4096_public,
+    U4096,
+    Ikev2DhGroup::Modp4096,
+    Modp4096,
+    MODP_4096_PRIME_HEX
+);
+define_modp_group!(
+    generate_modp6144_key,
+    agree_modp6144,
+    modp6144_pow,
+    modp6144_prime,
+    validate_modp6144_public,
+    U6144,
+    Ikev2DhGroup::Modp6144,
+    Modp6144,
+    MODP_6144_PRIME_HEX
+);
+define_modp_group!(
+    generate_modp8192_key,
+    agree_modp8192,
+    modp8192_pow,
+    modp8192_prime,
+    validate_modp8192_public,
+    U8192,
+    Ikev2DhGroup::Modp8192,
+    Modp8192,
+    MODP_8192_PRIME_HEX
+);
 
 pub(crate) fn validate_peer_public_len(
     group: Ikev2DhGroup,
@@ -2549,6 +2786,30 @@ pub(crate) fn validate_dh_public_value(
         Ikev2DhGroup::Modp2048 => {
             validate_modp2048_public(
                 &U2048::from_be_slice(peer_public_value),
+                peer_public_value.len(),
+            )?;
+        }
+        Ikev2DhGroup::Modp3072 => {
+            validate_modp3072_public(
+                &U3072::from_be_slice(peer_public_value),
+                peer_public_value.len(),
+            )?;
+        }
+        Ikev2DhGroup::Modp4096 => {
+            validate_modp4096_public(
+                &U4096::from_be_slice(peer_public_value),
+                peer_public_value.len(),
+            )?;
+        }
+        Ikev2DhGroup::Modp6144 => {
+            validate_modp6144_public(
+                &U6144::from_be_slice(peer_public_value),
+                peer_public_value.len(),
+            )?;
+        }
+        Ikev2DhGroup::Modp8192 => {
+            validate_modp8192_public(
+                &U8192::from_be_slice(peer_public_value),
                 peer_public_value.len(),
             )?;
         }
@@ -2791,6 +3052,22 @@ mod tests {
         assert_eq!(
             must_ok(Ikev2DhGroup::from_transform_id(14)),
             Ikev2DhGroup::Modp2048
+        );
+        assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(15)),
+            Ikev2DhGroup::Modp3072
+        );
+        assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(16)),
+            Ikev2DhGroup::Modp4096
+        );
+        assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(17)),
+            Ikev2DhGroup::Modp6144
+        );
+        assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(18)),
+            Ikev2DhGroup::Modp8192
         );
         assert_eq!(
             must_ok(Ikev2DhGroup::from_transform_id(19)),
@@ -3259,6 +3536,10 @@ mod tests {
             Ikev2DhGroup::Modp768,
             Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
+            Ikev2DhGroup::Modp3072,
+            Ikev2DhGroup::Modp4096,
+            Ikev2DhGroup::Modp6144,
+            Ikev2DhGroup::Modp8192,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
             Ikev2DhGroup::Ecp521,
@@ -3282,6 +3563,10 @@ mod tests {
             Ikev2DhGroup::Modp768,
             Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
+            Ikev2DhGroup::Modp3072,
+            Ikev2DhGroup::Modp4096,
+            Ikev2DhGroup::Modp6144,
+            Ikev2DhGroup::Modp8192,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
             Ikev2DhGroup::Ecp521,
@@ -3306,7 +3591,7 @@ mod tests {
 
         // Synthetic exponents. A/B/shared outputs were reproduced with both
         // Python bigint and Node.js bigint implementations using the RFC 2409
-        // group 1/2 and RFC 3526 group 14 primes.
+        // group 1/2 and RFC 3526 group 14-18 primes.
         const X: &str = "123456789abcdef0fedcba98765432100123456789abcdef0fedcba987654321";
         const Y: &str = "fedcba98765432100123456789abcdef112233445566778899aabbccddeeff00";
 
@@ -3360,6 +3645,26 @@ mod tests {
             modp2048_pow,
             "df148e68b72c2f6baba85a92162761d75ad2964f1c4194980ace133f54e9145b"
         );
+        assert_group_vector!(
+            U3072,
+            modp3072_pow,
+            "56d083e0d41b34cca4d8dc24daca0cbfc8ac7c3d8425eb0ef1f4a9ecd7faefbd"
+        );
+        assert_group_vector!(
+            U4096,
+            modp4096_pow,
+            "4f52d96f075fc1579580f965c556559a28a3ad9afc0568cd7663ddaaac34f1af"
+        );
+        assert_group_vector!(
+            U6144,
+            modp6144_pow,
+            "54c7547fdf8efae65deaedc3307f67fffd2b7c59b63927c9a039a83f21b78877"
+        );
+        assert_group_vector!(
+            U8192,
+            modp8192_pow,
+            "6e9df5280b9ff84611eaf17977ba044c45b1c247f4145eaac2aeae4c0b2f7b87"
+        );
     }
 
     #[test]
@@ -3403,6 +3708,10 @@ mod tests {
         assert_group_boundaries!(Ikev2DhGroup::Modp768, U768, modp768_prime);
         assert_group_boundaries!(Ikev2DhGroup::Modp1024, U1024, modp1024_prime);
         assert_group_boundaries!(Ikev2DhGroup::Modp2048, U2048, modp2048_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp3072, U3072, modp3072_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp4096, U4096, modp4096_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp6144, U6144, modp6144_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp8192, U8192, modp8192_prime);
     }
 
     #[test]

@@ -130,6 +130,10 @@ fn checkpoint_module_child() {
         Ikev2DhGroup::Modp768,
         Ikev2DhGroup::Modp1024,
         Ikev2DhGroup::Modp2048,
+        Ikev2DhGroup::Modp3072,
+        Ikev2DhGroup::Modp4096,
+        Ikev2DhGroup::Modp6144,
+        Ikev2DhGroup::Modp8192,
         Ikev2DhGroup::Ecp256,
         Ikev2DhGroup::Ecp384,
         Ikev2DhGroup::Ecp521,
@@ -156,7 +160,7 @@ fn checkpoint_module_child() {
                     == peer.agree(&public).unwrap().as_slice()
             );
         }
-        assert_eq!(counts(&module), (6, 6));
+        assert_eq!(counts(&module), (10, 10));
         println!("CHECKPOINT_ADMISSION_COMPLETE");
         return;
     }

@@ -32,10 +32,11 @@ use opc_crypto_provider::{
 use p256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use rand::{rngs::SysRng, TryRng};
+use rsa::signature::Verifier as RsaVerifier;
 #[cfg(feature = "rsa-signing")]
 use rsa::{traits::PublicKeyParts, RsaPrivateKey};
 use sha1::{Digest as Sha1Digest, Sha1};
-use sha2::{Sha256, Sha384};
+use sha2::{Sha256, Sha384, Sha512};
 use zeroize::Zeroizing;
 
 #[cfg(feature = "rsa-signing")]
@@ -682,6 +683,10 @@ fn map_dh_group(group: IkeDhGroup) -> Result<Ikev2DhGroup, CryptoOperationError>
         IkeDhGroup::Modp768 => Ok(Ikev2DhGroup::Modp768),
         IkeDhGroup::Modp1024 => Ok(Ikev2DhGroup::Modp1024),
         IkeDhGroup::Modp2048 => Ok(Ikev2DhGroup::Modp2048),
+        IkeDhGroup::Modp3072 => Ok(Ikev2DhGroup::Modp3072),
+        IkeDhGroup::Modp4096 => Ok(Ikev2DhGroup::Modp4096),
+        IkeDhGroup::Modp6144 => Ok(Ikev2DhGroup::Modp6144),
+        IkeDhGroup::Modp8192 => Ok(Ikev2DhGroup::Modp8192),
         IkeDhGroup::Ecp256 => Ok(Ikev2DhGroup::Ecp256),
         IkeDhGroup::Ecp384 => Ok(Ikev2DhGroup::Ecp384),
         IkeDhGroup::Ecp521 => Ok(Ikev2DhGroup::Ecp521),
@@ -970,6 +975,10 @@ impl IkeDiffieHellmanOperations for Ikev2SoftwareCryptoOperations {
             IkeDhGroup::Modp768
                 | IkeDhGroup::Modp1024
                 | IkeDhGroup::Modp2048
+                | IkeDhGroup::Modp3072
+                | IkeDhGroup::Modp4096
+                | IkeDhGroup::Modp6144
+                | IkeDhGroup::Modp8192
                 | IkeDhGroup::Ecp256
                 | IkeDhGroup::Ecp384
                 | IkeDhGroup::Ecp521
@@ -1038,21 +1047,34 @@ impl IkeSignatureOperations for Ikev2SoftwareCryptoOperations {
     fn supports_signature_verification(&self, algorithm: IkeSignatureAlgorithm) -> bool {
         matches!(
             algorithm,
-            IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256
+            IkeSignatureAlgorithm::Ed25519
+                | IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256
                 | IkeSignatureAlgorithm::EcdsaP256Sha2_256
                 | IkeSignatureAlgorithm::EcdsaP384Sha2_256
                 | IkeSignatureAlgorithm::EcdsaP384Sha2_384
+                | IkeSignatureAlgorithm::EcdsaP521Sha2_512
+                | IkeSignatureAlgorithm::RsaPssSha2_256
+                | IkeSignatureAlgorithm::RsaPssSha2_384
+                | IkeSignatureAlgorithm::RsaPssSha2_512
         )
     }
 
     fn supports_signature_generation(&self, algorithm: IkeSignatureAlgorithm) -> bool {
         (cfg!(feature = "rsa-signing")
-            && matches!(algorithm, IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256))
+            && matches!(
+                algorithm,
+                IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256
+                    | IkeSignatureAlgorithm::RsaPssSha2_256
+                    | IkeSignatureAlgorithm::RsaPssSha2_384
+                    | IkeSignatureAlgorithm::RsaPssSha2_512
+            ))
             || matches!(
                 algorithm,
-                IkeSignatureAlgorithm::EcdsaP256Sha2_256
+                IkeSignatureAlgorithm::Ed25519
+                    | IkeSignatureAlgorithm::EcdsaP256Sha2_256
                     | IkeSignatureAlgorithm::EcdsaP384Sha2_256
                     | IkeSignatureAlgorithm::EcdsaP384Sha2_384
+                    | IkeSignatureAlgorithm::EcdsaP521Sha2_512
             )
     }
 
@@ -1062,6 +1084,15 @@ impl IkeSignatureOperations for Ikev2SoftwareCryptoOperations {
         pkcs8_der: &[u8],
     ) -> Result<Box<dyn IkeSigningKey>, CryptoOperationError> {
         match algorithm {
+            IkeSignatureAlgorithm::Ed25519 => {
+                let key = ed25519_dalek::SigningKey::from_pkcs8_der(pkcs8_der).map_err(|_| {
+                    CryptoOperationError::new(CryptoOperationErrorCode::InvalidSigningKey)
+                })?;
+                Ok(Box::new(SoftwareIkeSigningKey {
+                    algorithm,
+                    kind: SoftwareSigningKeyKind::Ed25519(Box::new(key)),
+                }))
+            }
             IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256 => {
                 #[cfg(feature = "rsa-signing")]
                 {
@@ -1079,6 +1110,34 @@ impl IkeSignatureOperations for Ikev2SoftwareCryptoOperations {
                     // Without the `rsa-signing` feature this build compiles no
                     // RSA private-key operation; fail closed instead of
                     // falling back to another code path.
+                    let _ = pkcs8_der;
+                    Err(unsupported_algorithm())
+                }
+            }
+            IkeSignatureAlgorithm::RsaPssSha2_256
+            | IkeSignatureAlgorithm::RsaPssSha2_384
+            | IkeSignatureAlgorithm::RsaPssSha2_512 => {
+                #[cfg(feature = "rsa-signing")]
+                {
+                    use rsa::pkcs8::DecodePrivateKey as RsaDecodePrivateKey;
+                    let private = RsaPrivateKey::from_pkcs8_der(pkcs8_der).map_err(|_| {
+                        CryptoOperationError::new(CryptoOperationErrorCode::InvalidSigningKey)
+                    })?;
+                    let kind = match algorithm {
+                        IkeSignatureAlgorithm::RsaPssSha2_256 => SoftwareSigningKeyKind::RsaPss256(
+                            Box::new(rsa::pss::SigningKey::new(private)),
+                        ),
+                        IkeSignatureAlgorithm::RsaPssSha2_384 => SoftwareSigningKeyKind::RsaPss384(
+                            Box::new(rsa::pss::SigningKey::new(private)),
+                        ),
+                        _ => SoftwareSigningKeyKind::RsaPss512(Box::new(
+                            rsa::pss::SigningKey::new(private),
+                        )),
+                    };
+                    Ok(Box::new(SoftwareIkeSigningKey { algorithm, kind }))
+                }
+                #[cfg(not(feature = "rsa-signing"))]
+                {
                     let _ = pkcs8_der;
                     Err(unsupported_algorithm())
                 }
@@ -1101,6 +1160,15 @@ impl IkeSignatureOperations for Ikev2SoftwareCryptoOperations {
                     kind: SoftwareSigningKeyKind::EcdsaP384(Box::new(key)),
                 }))
             }
+            IkeSignatureAlgorithm::EcdsaP521Sha2_512 => {
+                let key = p521::ecdsa::SigningKey::from_pkcs8_der(pkcs8_der).map_err(|_| {
+                    CryptoOperationError::new(CryptoOperationErrorCode::InvalidSigningKey)
+                })?;
+                Ok(Box::new(SoftwareIkeSigningKey {
+                    algorithm,
+                    kind: SoftwareSigningKeyKind::EcdsaP521(Box::new(key)),
+                }))
+            }
             _ => Err(unsupported_algorithm()),
         }
     }
@@ -1117,6 +1185,24 @@ impl IkeSignatureOperations for Ikev2SoftwareCryptoOperations {
                 CryptoOperationError::new(CryptoOperationErrorCode::InvalidVerificationKey)
             })?;
         match algorithm {
+            IkeSignatureAlgorithm::Ed25519 => match &public_key {
+                Ikev2SignaturePublicKey::Ed25519(public) => {
+                    let signature =
+                        ed25519_dalek::Signature::from_slice(signature).map_err(|_| {
+                            CryptoOperationError::new(
+                                CryptoOperationErrorCode::SignatureEncodingInvalid,
+                            )
+                        })?;
+                    public.verify_strict(message, &signature).map_err(|_| {
+                        CryptoOperationError::new(
+                            CryptoOperationErrorCode::SignatureVerificationFailed,
+                        )
+                    })
+                }
+                _ => Err(CryptoOperationError::new(
+                    CryptoOperationErrorCode::SignatureKeyMismatch,
+                )),
+            },
             IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256 => match &public_key {
                 Ikev2SignaturePublicKey::Rsa(public) => {
                     rsa_pkcs1v15_sha256_verify(public, message, signature).map_err(|_| {
@@ -1124,6 +1210,69 @@ impl IkeSignatureOperations for Ikev2SoftwareCryptoOperations {
                             CryptoOperationErrorCode::SignatureVerificationFailed,
                         )
                     })
+                }
+                _ => Err(CryptoOperationError::new(
+                    CryptoOperationErrorCode::SignatureKeyMismatch,
+                )),
+            },
+            IkeSignatureAlgorithm::RsaPssSha2_256 => match &public_key {
+                Ikev2SignaturePublicKey::Rsa(public) => {
+                    rsa::pss::VerifyingKey::<rsa::sha2::Sha256>::new((**public).clone())
+                        .verify(
+                            message,
+                            &rsa::pss::Signature::try_from(signature).map_err(|_| {
+                                CryptoOperationError::new(
+                                    CryptoOperationErrorCode::SignatureEncodingInvalid,
+                                )
+                            })?,
+                        )
+                        .map_err(|_| {
+                            CryptoOperationError::new(
+                                CryptoOperationErrorCode::SignatureVerificationFailed,
+                            )
+                        })
+                }
+                _ => Err(CryptoOperationError::new(
+                    CryptoOperationErrorCode::SignatureKeyMismatch,
+                )),
+            },
+            IkeSignatureAlgorithm::RsaPssSha2_384 => match &public_key {
+                Ikev2SignaturePublicKey::Rsa(public) => {
+                    rsa::pss::VerifyingKey::<rsa::sha2::Sha384>::new((**public).clone())
+                        .verify(
+                            message,
+                            &rsa::pss::Signature::try_from(signature).map_err(|_| {
+                                CryptoOperationError::new(
+                                    CryptoOperationErrorCode::SignatureEncodingInvalid,
+                                )
+                            })?,
+                        )
+                        .map_err(|_| {
+                            CryptoOperationError::new(
+                                CryptoOperationErrorCode::SignatureVerificationFailed,
+                            )
+                        })
+                }
+                _ => Err(CryptoOperationError::new(
+                    CryptoOperationErrorCode::SignatureKeyMismatch,
+                )),
+            },
+            IkeSignatureAlgorithm::RsaPssSha2_512 => match &public_key {
+                Ikev2SignaturePublicKey::Rsa(public) => {
+                    rsa::pss::VerifyingKey::<rsa::sha2::Sha512>::new((**public).clone())
+                        .verify(
+                            message,
+                            &rsa::pss::Signature::try_from(signature).map_err(|_| {
+                                CryptoOperationError::new(
+                                    CryptoOperationErrorCode::SignatureEncodingInvalid,
+                                )
+                            })?,
+                        )
+                        .map_err(|_| {
+                            CryptoOperationError::new(
+                                CryptoOperationErrorCode::SignatureVerificationFailed,
+                            )
+                        })
                 }
                 _ => Err(CryptoOperationError::new(
                     CryptoOperationErrorCode::SignatureKeyMismatch,
@@ -1165,6 +1314,24 @@ impl IkeSignatureOperations for Ikev2SoftwareCryptoOperations {
                     CryptoOperationErrorCode::SignatureKeyMismatch,
                 )),
             },
+            IkeSignatureAlgorithm::EcdsaP521Sha2_512 => match &public_key {
+                Ikev2SignaturePublicKey::EcdsaP521(public) => {
+                    let signature = p521::ecdsa::Signature::from_der(signature).map_err(|_| {
+                        CryptoOperationError::new(
+                            CryptoOperationErrorCode::SignatureEncodingInvalid,
+                        )
+                    })?;
+                    let digest = Sha512::digest(message);
+                    public.verify_prehash(&digest, &signature).map_err(|_| {
+                        CryptoOperationError::new(
+                            CryptoOperationErrorCode::SignatureVerificationFailed,
+                        )
+                    })
+                }
+                _ => Err(CryptoOperationError::new(
+                    CryptoOperationErrorCode::SignatureKeyMismatch,
+                )),
+            },
             IkeSignatureAlgorithm::EcdsaP384Sha2_256 => match &public_key {
                 Ikev2SignaturePublicKey::EcdsaP384(public) => {
                     let signature = p384::ecdsa::Signature::from_der(signature).map_err(|_| {
@@ -1189,10 +1356,18 @@ impl IkeSignatureOperations for Ikev2SoftwareCryptoOperations {
 }
 
 enum SoftwareSigningKeyKind {
+    Ed25519(Box<ed25519_dalek::SigningKey>),
     #[cfg(feature = "rsa-signing")]
     Rsa(Box<RsaPrivateKey>),
+    #[cfg(feature = "rsa-signing")]
+    RsaPss256(Box<rsa::pss::SigningKey<rsa::sha2::Sha256>>),
+    #[cfg(feature = "rsa-signing")]
+    RsaPss384(Box<rsa::pss::SigningKey<rsa::sha2::Sha384>>),
+    #[cfg(feature = "rsa-signing")]
+    RsaPss512(Box<rsa::pss::SigningKey<rsa::sha2::Sha512>>),
     EcdsaP256(Box<p256::ecdsa::SigningKey>),
     EcdsaP384(Box<p384::ecdsa::SigningKey>),
+    EcdsaP521(Box<p521::ecdsa::SigningKey>),
 }
 
 /// Opaque wrapper keeping the RustCrypto private-key types out of the
@@ -1211,17 +1386,57 @@ impl IkeSigningKey for SoftwareIkeSigningKey {
         match &self.kind {
             #[cfg(feature = "rsa-signing")]
             SoftwareSigningKeyKind::Rsa(private) => Some(private.size()),
-            SoftwareSigningKeyKind::EcdsaP256(_) | SoftwareSigningKeyKind::EcdsaP384(_) => None,
+            #[cfg(feature = "rsa-signing")]
+            SoftwareSigningKeyKind::RsaPss256(private) => Some((**private).as_ref().size()),
+            #[cfg(feature = "rsa-signing")]
+            SoftwareSigningKeyKind::RsaPss384(private) => Some((**private).as_ref().size()),
+            #[cfg(feature = "rsa-signing")]
+            SoftwareSigningKeyKind::RsaPss512(private) => Some((**private).as_ref().size()),
+            SoftwareSigningKeyKind::Ed25519(_)
+            | SoftwareSigningKeyKind::EcdsaP256(_)
+            | SoftwareSigningKeyKind::EcdsaP384(_)
+            | SoftwareSigningKeyKind::EcdsaP521(_) => None,
         }
     }
 
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, CryptoOperationError> {
         match &self.kind {
+            SoftwareSigningKeyKind::Ed25519(private) => {
+                use ed25519_dalek::Signer;
+                Ok(private.sign(message).to_bytes().to_vec())
+            }
             #[cfg(feature = "rsa-signing")]
             SoftwareSigningKeyKind::Rsa(private) => rsa_pkcs1v15_sha256_sign(private, message)
                 .map_err(|_| {
                     CryptoOperationError::new(CryptoOperationErrorCode::SignatureComputationFailed)
                 }),
+            #[cfg(feature = "rsa-signing")]
+            SoftwareSigningKeyKind::RsaPss256(private) => {
+                use rsa::signature::Signer as RsaSigner;
+                let signature: rsa::pss::Signature = private.try_sign(message).map_err(|_| {
+                    CryptoOperationError::new(CryptoOperationErrorCode::SignatureComputationFailed)
+                })?;
+                let bytes: Box<[u8]> = signature.into();
+                Ok(bytes.to_vec())
+            }
+            #[cfg(feature = "rsa-signing")]
+            SoftwareSigningKeyKind::RsaPss384(private) => {
+                use rsa::signature::Signer as RsaSigner;
+                let signature: rsa::pss::Signature = private.try_sign(message).map_err(|_| {
+                    CryptoOperationError::new(CryptoOperationErrorCode::SignatureComputationFailed)
+                })?;
+                let bytes: Box<[u8]> = signature.into();
+                Ok(bytes.to_vec())
+            }
+            #[cfg(feature = "rsa-signing")]
+            SoftwareSigningKeyKind::RsaPss512(private) => {
+                use rsa::signature::Signer as RsaSigner;
+                let signature: rsa::pss::Signature = private.try_sign(message).map_err(|_| {
+                    CryptoOperationError::new(CryptoOperationErrorCode::SignatureComputationFailed)
+                })?;
+                let bytes: Box<[u8]> = signature.into();
+                Ok(bytes.to_vec())
+            }
             SoftwareSigningKeyKind::EcdsaP256(private) => {
                 let digest = Sha256::digest(message);
                 let signature: p256::ecdsa::Signature =
@@ -1238,6 +1453,16 @@ impl IkeSigningKey for SoftwareIkeSigningKey {
                     _ => Sha384::digest(message).to_vec(),
                 };
                 let signature: p384::ecdsa::Signature =
+                    private.sign_prehash(&digest).map_err(|_| {
+                        CryptoOperationError::new(
+                            CryptoOperationErrorCode::SignatureComputationFailed,
+                        )
+                    })?;
+                Ok(signature.to_der().as_bytes().to_vec())
+            }
+            SoftwareSigningKeyKind::EcdsaP521(private) => {
+                let digest = Sha512::digest(message);
+                let signature: p521::ecdsa::Signature =
                     private.sign_prehash(&digest).map_err(|_| {
                         CryptoOperationError::new(
                             CryptoOperationErrorCode::SignatureComputationFailed,

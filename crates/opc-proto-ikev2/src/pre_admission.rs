@@ -26,7 +26,7 @@ const OID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.84
 
 /// Maximum accepted PKCS#8 DER length for pre-admission inspection.
 ///
-/// The supported unencrypted P-256 and P-384 values are much smaller than
+/// The supported unencrypted ECDSA and Ed25519 values are much smaller than
 /// this conservative bound. It is enforced before any ASN.1 or curve parser
 /// runs. PEM and encrypted PKCS#8 are intentionally outside this boundary.
 pub const IKEV2_PRE_ADMISSION_PKCS8_DER_MAX_LEN: usize = 4 * 1024;
@@ -214,8 +214,8 @@ impl fmt::Display for Ikev2SignatureKeyInspection {
 
 /// Inspect one bounded, exact PKCS#8 DER value without module admission.
 ///
-/// Only the SDK's currently supported IKEv2 ECDSA generation profiles are
-/// recognized: P-256/SHA-256 and P-384/SHA-384. The borrowed input is never
+/// The supported generation profiles are P-256/SHA-256, P-384/SHA-384,
+/// P-521/SHA-512, and pure Ed25519. The borrowed input is never
 /// formatted or copied into an ordinary buffer. The RustCrypto secret-key
 /// object zeroizes on drop, and the scalar used to derive its public point is
 /// held in a separate explicitly zeroizing owner. The returned value retains
@@ -247,6 +247,21 @@ pub fn inspect_ikev2_signature_key_pkcs8_der(
         }
     })?;
 
+    if private_key_info.algorithm.oid == ObjectIdentifier::new_unwrap("1.3.101.112") {
+        require_zeroize_on_drop::<ed25519_dalek::SigningKey>();
+        let secret = ed25519_dalek::SigningKey::try_from(private_key_info)
+            .map_err(|_| Ikev2PreAdmissionInspectionError::Pkcs8KeyMalformed)?;
+        let canonical_spki_der = secret
+            .verifying_key()
+            .to_public_key_der()
+            .map_err(|_| Ikev2PreAdmissionInspectionError::PublicIdentityEncodingFailed)?
+            .into_vec()
+            .into_boxed_slice();
+        return Ok(inspection(
+            IkeSignatureAlgorithm::Ed25519,
+            canonical_spki_der,
+        ));
+    }
     if private_key_info.algorithm.oid != OID_EC_PUBLIC_KEY {
         return Err(Ikev2PreAdmissionInspectionError::UnsupportedAlgorithm);
     }
@@ -259,6 +274,8 @@ pub fn inspect_ikev2_signature_key_pkcs8_der(
         inspect_p256(private_key_info)
     } else if curve_oid == p384::NistP384::OID {
         inspect_p384(private_key_info)
+    } else if curve_oid == p521::NistP521::OID {
+        inspect_p521(private_key_info)
     } else {
         Err(Ikev2PreAdmissionInspectionError::UnsupportedAlgorithm)
     }
@@ -311,6 +328,31 @@ fn inspect_p384(
 
     Ok(inspection(
         IkeSignatureAlgorithm::EcdsaP384Sha2_384,
+        canonical_spki_der,
+    ))
+}
+
+fn inspect_p521(
+    private_key_info: PrivateKeyInfoRef<'_>,
+) -> Result<Ikev2SignatureKeyInspection, Ikev2PreAdmissionInspectionError> {
+    require_zeroize_on_drop::<p521::SecretKey>();
+    require_zeroize::<p521::NonZeroScalar>();
+    let secret = p521::SecretKey::try_from(private_key_info)
+        .map_err(|_| Ikev2PreAdmissionInspectionError::Pkcs8KeyMalformed)?;
+    // See the P-256 path: the explicit owner wipes this otherwise-unowned
+    // scalar temporary.
+    let secret_scalar = Zeroizing::new(secret.to_nonzero_scalar());
+    let public = p521::PublicKey::from_secret_scalar(&secret_scalar);
+    let canonical_spki_der = public
+        .to_public_key_der()
+        .map_err(|_| Ikev2PreAdmissionInspectionError::PublicIdentityEncodingFailed)?
+        .into_vec()
+        .into_boxed_slice();
+    drop(secret_scalar);
+    drop(secret);
+
+    Ok(inspection(
+        IkeSignatureAlgorithm::EcdsaP521Sha2_512,
         canonical_spki_der,
     ))
 }

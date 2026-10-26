@@ -413,6 +413,14 @@ pub enum IkeDhGroup {
     Modp1024,
     /// 2048-bit MODP group (Transform ID 14).
     Modp2048,
+    /// 3072-bit MODP group (Transform ID 15, RFC 3526 section 4).
+    Modp3072,
+    /// 4096-bit MODP group (Transform ID 16, RFC 3526 section 5).
+    Modp4096,
+    /// 6144-bit MODP group (Transform ID 17, RFC 3526 section 6).
+    Modp6144,
+    /// 8192-bit MODP group (Transform ID 18, RFC 3526 section 7).
+    Modp8192,
     /// NIST P-256 ECP group (Transform ID 19).
     Ecp256,
     /// NIST P-384 ECP group (Transform ID 20).
@@ -429,6 +437,10 @@ impl IkeDhGroup {
             Self::Modp768 => 1,
             Self::Modp1024 => 2,
             Self::Modp2048 => 14,
+            Self::Modp3072 => 15,
+            Self::Modp4096 => 16,
+            Self::Modp6144 => 17,
+            Self::Modp8192 => 18,
             Self::Ecp256 => 19,
             Self::Ecp384 => 20,
             Self::Ecp521 => 21,
@@ -439,7 +451,7 @@ impl IkeDhGroup {
     ///
     /// Encoding: version byte `1`, big-endian two-byte group Transform ID, then
     /// a fixed-width big-endian MODP private exponent or ECP secret scalar.
-    /// MODP widths are 96/128/256 and ECP widths 32/48/66 octets. No module build
+    /// MODP widths are 96/128/256/384/512/768/1024 and ECP widths 32/48/66 octets. No module build
     /// identity, public value, nonce or envelope is embedded. These secret bytes
     /// must never appear in diagnostics or outside the enclosing row's custody.
     #[must_use]
@@ -453,6 +465,10 @@ impl IkeDhGroup {
             Self::Modp768 => "modp_768",
             Self::Modp1024 => "modp_1024",
             Self::Modp2048 => "modp_2048",
+            Self::Modp3072 => "modp_3072",
+            Self::Modp4096 => "modp_4096",
+            Self::Modp6144 => "modp_6144",
+            Self::Modp8192 => "modp_8192",
             Self::Ecp256 => "ecp_256",
             Self::Ecp384 => "ecp_384",
             Self::Ecp521 => "ecp_521",
@@ -466,6 +482,10 @@ impl IkeDhGroup {
             Self::Modp768 => 96,
             Self::Modp1024 => 128,
             Self::Modp2048 => 256,
+            Self::Modp3072 => 384,
+            Self::Modp4096 => 512,
+            Self::Modp6144 => 768,
+            Self::Modp8192 => 1024,
             Self::Ecp256 => 64,
             Self::Ecp384 => 96,
             Self::Ecp521 => 132,
@@ -479,6 +499,10 @@ impl IkeDhGroup {
             Self::Modp768 => 96,
             Self::Modp1024 => 128,
             Self::Modp2048 => 256,
+            Self::Modp3072 => 384,
+            Self::Modp4096 => 512,
+            Self::Modp6144 => 768,
+            Self::Modp8192 => 1024,
             Self::Ecp256 => 32,
             Self::Ecp384 => 48,
             Self::Ecp521 => 66,
@@ -497,24 +521,41 @@ impl fmt::Display for IkeDhGroup {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IkeSignatureAlgorithm {
+    /// Pure Ed25519 (RFC 8032), without external prehashing.
+    Ed25519,
     /// RSASSA-PKCS1-v1_5 with SHA-256.
     RsaPkcs1V15Sha2_256,
+    /// RSASSA-PSS with SHA-256 and MGF1-SHA-256 (RFC 7427).
+    RsaPssSha2_256,
+    /// RSASSA-PSS with SHA-384 and MGF1-SHA-384 (RFC 7427).
+    RsaPssSha2_384,
+    /// RSASSA-PSS with SHA-512 and MGF1-SHA-512 (RFC 7427).
+    RsaPssSha2_512,
     /// ECDSA over P-256 with SHA-256, DER-encoded `ECDSA-Sig-Value`.
     EcdsaP256Sha2_256,
     /// ECDSA over P-384 with SHA-256, DER-encoded `ECDSA-Sig-Value`.
     EcdsaP384Sha2_256,
     /// ECDSA over P-384 with SHA-384, DER-encoded `ECDSA-Sig-Value`.
     EcdsaP384Sha2_384,
+    /// ECDSA over P-521 with SHA-512, DER-encoded `ECDSA-Sig-Value`.
+    ///
+    /// RFC 4754 AUTH method 11 and RFC 7427 signature scheme.
+    EcdsaP521Sha2_512,
 }
 
 impl IkeSignatureAlgorithm {
     /// Stable machine-readable algorithm code.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Ed25519 => "ed25519",
             Self::RsaPkcs1V15Sha2_256 => "rsa_pkcs1_v1_5_sha2_256",
+            Self::RsaPssSha2_256 => "rsa_pss_sha2_256",
+            Self::RsaPssSha2_384 => "rsa_pss_sha2_384",
+            Self::RsaPssSha2_512 => "rsa_pss_sha2_512",
             Self::EcdsaP256Sha2_256 => "ecdsa_p256_sha2_256",
             Self::EcdsaP384Sha2_256 => "ecdsa_p384_sha2_256",
             Self::EcdsaP384Sha2_384 => "ecdsa_p384_sha2_384",
+            Self::EcdsaP521Sha2_512 => "ecdsa_p521_sha2_512",
         }
     }
 }
@@ -1172,6 +1213,10 @@ mod tests {
             (IkeDhGroup::Modp768, "modp_768", 96, 96),
             (IkeDhGroup::Modp1024, "modp_1024", 128, 128),
             (IkeDhGroup::Modp2048, "modp_2048", 256, 256),
+            (IkeDhGroup::Modp3072, "modp_3072", 384, 384),
+            (IkeDhGroup::Modp4096, "modp_4096", 512, 512),
+            (IkeDhGroup::Modp6144, "modp_6144", 768, 768),
+            (IkeDhGroup::Modp8192, "modp_8192", 1024, 1024),
             (IkeDhGroup::Ecp256, "ecp_256", 64, 32),
             (IkeDhGroup::Ecp384, "ecp_384", 96, 48),
             (IkeDhGroup::Ecp521, "ecp_521", 132, 66),
@@ -1182,6 +1227,18 @@ mod tests {
             assert_eq!(group.shared_secret_len(), secret_len);
         }
 
+        for (algorithm, name) in [
+            (IkeSignatureAlgorithm::Ed25519, "ed25519"),
+            (
+                IkeSignatureAlgorithm::EcdsaP521Sha2_512,
+                "ecdsa_p521_sha2_512",
+            ),
+            (IkeSignatureAlgorithm::RsaPssSha2_256, "rsa_pss_sha2_256"),
+            (IkeSignatureAlgorithm::RsaPssSha2_384, "rsa_pss_sha2_384"),
+            (IkeSignatureAlgorithm::RsaPssSha2_512, "rsa_pss_sha2_512"),
+        ] {
+            assert_eq!(algorithm.as_str(), name);
+        }
         assert_eq!(
             IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256.as_str(),
             "rsa_pkcs1_v1_5_sha2_256"

@@ -128,6 +128,8 @@ jobs:
           python3 scripts/check-n3iwf-fixture-contracts.py --check
       - name: Check independent NWu GRE reference vectors
         run: python3 crates/opc-proto-gre/tests/reference.py --check
+      - name: Check independent IKE signature vectors
+        run: python3 scripts/check-ike-signature-vectors.py
 
       - name: Check scope transport revision-2 reference vectors
         run: python3 docs/rfc/026-scope-transport-revision2-vectors.py --check

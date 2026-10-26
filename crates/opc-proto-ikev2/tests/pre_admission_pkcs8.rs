@@ -12,6 +12,34 @@ const P384_PKCS8_DER: &[u8] = include_bytes!("data/p384_pkcs8.der");
 const P384_SPKI_DER: &[u8] = include_bytes!("data/p384_spki.der");
 const RSA2048_PKCS8_DER: &[u8] = include_bytes!("data/rsa2048_pkcs8.der");
 
+#[test]
+fn p521_and_ed25519_inspection_returns_exact_public_metadata_without_admission() {
+    for (private, public, algorithm) in [
+        (
+            include_bytes!("data/p521_pkcs8.der").as_slice(),
+            include_bytes!("data/p521_spki.der").as_slice(),
+            IkeSignatureAlgorithm::EcdsaP521Sha2_512,
+        ),
+        (
+            include_bytes!("data/ed25519_pkcs8.der").as_slice(),
+            include_bytes!("data/ed25519_spki.der").as_slice(),
+            IkeSignatureAlgorithm::Ed25519,
+        ),
+    ] {
+        let inspection = inspect_ikev2_signature_key_pkcs8_der(private).unwrap();
+        assert_eq!(inspection.requirement().algorithm(), algorithm);
+        assert_eq!(inspection.public_key_identity().as_spki_der(), public);
+        let mut trailing = private.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            inspect_ikev2_signature_key_pkcs8_der(&trailing).unwrap_err(),
+            Ikev2PreAdmissionInspectionError::Pkcs8TrailingData
+        );
+        assert!(inspect_ikev2_signature_key_pkcs8_der(&private[..private.len() - 1]).is_err());
+        assert!(format!("{inspection:?}").len() < 256);
+    }
+}
+
 // These static key/SPKI/certificate fixtures predate this inspection boundary
 // (they entered in PR #72). Their key-to-SPKI and certificate-to-SPKI
 // relationships were independently rechecked with OpenSSL 3.2.6:

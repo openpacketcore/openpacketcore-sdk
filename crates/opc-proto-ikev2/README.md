@@ -824,7 +824,7 @@ This does not close #786 or establish external interoperability. See
   the admitted IKE hash operation. The result has redaction-safe `Debug`.
 - `pre_admission` performs one deliberately narrow configuration operation
   before the process module is installed: bounded, exact-DER inspection of
-  unencrypted ECDSA P-256/P-384 PKCS#8. It returns the exact typed
+  unencrypted ECDSA P-256/P-384/P-521 or Ed25519 PKCS#8. It returns the exact typed
   signature-generation requirement and deterministic public SPKI identity,
   and can require an exact match with a bounded DER leaf certificate. It
   retains no private-key handle and cannot sign. Its RustCrypto secret-key
@@ -1353,10 +1353,27 @@ The executable IKE-SA matrix is:
 | Mechanism | Transform IDs and sizes | Key/material contract |
 | --- | --- | --- |
 | PRF | HMAC-SHA1 (2, compatibility), HMAC-SHA2-256 (5), HMAC-SHA2-384 (6), HMAC-SHA2-512 (7) | 20, 32, 48, or 64 octets for each of `SK_d`, `SK_pi`, and `SK_pr` |
-| DH | MODP-768 (1, compatibility), MODP-1024 (2, compatibility), MODP-2048 (14), ECP-256 (19), ECP-384 (20), ECP-521 (21) | Exact public/shared widths: MODP 96/96, 128/128, 256/256; ECP public 64/96/132 and shared 32/48/66 octets |
+| DH | MODP-768 (1, compatibility), MODP-1024 (2, compatibility), MODP-2048/3072/4096/6144/8192 (14–18), ECP-256 (19), ECP-384 (20), ECP-521 (21) | Exact public/shared widths: MODP 96, 128, 256, 384, 512, 768 or 1024 octets for both public and shared values; ECP public 64/96/132 and shared 32/48/66 octets |
 | AES-GCM-16 | ENCR 20 with 128, 192, or 256-bit key; no INTEG | AES key plus four-octet salt; eight-octet explicit IV and 16-octet tag on the wire |
 | AES-CBC | ENCR 12 with 128, 192, or 256-bit key | Raw 16, 24, or 32-octet `SK_e*`; fresh 16-octet IV per newly sealed message |
 | Integrity | AUTH-HMAC-SHA1-96 (2, compatibility) or AUTH-HMAC-SHA2-256-128 (12), 384-192 (13), or 512-256 (14) | 20/32/48/64-octet `SK_a*`; 12/16/24/32-octet ICV |
+
+Signature AUTH supports RFC 4754 methods 9/10/11 with exact 64/96/132-byte
+`r || s` values. RFC 7427 method 14 supports ECDSA P-256/P-384/P-521,
+RSA-PSS with SHA-256/384/512 (MGF1 with the same hash and digest-sized salt),
+and RFC 8420 pure Ed25519. SHA-512 and Identity (5) are executable negotiated
+hashes only when an appropriate provider operation is admitted. Ed25519
+requires Identity authorization; externally prehashed input and Ed25519ph
+are not its IKE signature scheme. Ed448 remains unsupported and is rejected.
+The module never adds algorithms to a caller's proposal or local hash offer.
+
+For local RSA-PSS AUTH self-verification, use
+`authorize_local_auth_self_verification_with_algorithm` to bind the exact
+scheme; the existing hash-only helper retains its RSA PKCS#1 v1.5 selection.
+RSA verification is always available; RSA signing retains the opt-in
+`rsa-signing` feature and its documented timing-side-channel limitation.
+See [reference-vector provenance](tests/data/crypto_vectors.md) for independent
+OpenSSL and published RFC evidence.
 
 Every CBC key size may be paired with each supported integrity
 algorithm. `validate_executable()` is the explicit startup check, although all

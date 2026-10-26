@@ -8,15 +8,6 @@ fn invalid() -> Error {
     Error::new(Code::InvalidCheckpoint)
 }
 
-// crypto_bigint's EncodedUint exposes mutable bytes but has no Zeroize impl.
-// Cover both integer and curve encodings without leaving an unwiped temporary.
-struct SecretEncoding<T>(T);
-impl<T: AsMut<[u8]>> Zeroize for SecretEncoding<T> {
-    fn zeroize(&mut self) {
-        self.0.as_mut().zeroize();
-    }
-}
-
 impl SoftwareEphemeralDhKey {
     pub(crate) fn export_checkpoint(&self) -> Zeroizing<Vec<u8>> {
         let mut output = Zeroizing::new(Vec::with_capacity(3 + self.group.shared_secret_len()));
@@ -24,14 +15,18 @@ impl SoftwareEphemeralDhKey {
         output.extend_from_slice(&self.group.transform_id().to_be_bytes());
         macro_rules! append {
             ($value:expr) => {{
-                let bytes = Zeroizing::new(SecretEncoding($value));
-                output.extend_from_slice(bytes.0.as_ref());
+                let bytes = Zeroizing::new($value);
+                output.extend_from_slice(bytes.as_ref());
             }};
         }
         match &self.secret {
             SoftwareEphemeralDhSecret::Modp768(value) => append!(value.to_be_bytes()),
             SoftwareEphemeralDhSecret::Modp1024(value) => append!(value.to_be_bytes()),
             SoftwareEphemeralDhSecret::Modp2048(value) => append!(value.to_be_bytes()),
+            SoftwareEphemeralDhSecret::Modp3072(value) => append!(value.to_be_bytes()),
+            SoftwareEphemeralDhSecret::Modp4096(value) => append!(value.to_be_bytes()),
+            SoftwareEphemeralDhSecret::Modp6144(value) => append!(value.to_be_bytes()),
+            SoftwareEphemeralDhSecret::Modp8192(value) => append!(value.to_be_bytes()),
             SoftwareEphemeralDhSecret::Ecp256(value) => append!(value.to_bytes()),
             SoftwareEphemeralDhSecret::Ecp384(value) => append!(value.to_bytes()),
             SoftwareEphemeralDhSecret::Ecp521(value) => append!(value.to_bytes()),
@@ -87,6 +82,10 @@ impl SoftwareEphemeralDhKey {
             Ikev2DhGroup::Modp768 => modp!(U768, modp768_prime, modp768_pow, Modp768),
             Ikev2DhGroup::Modp1024 => modp!(U1024, modp1024_prime, modp1024_pow, Modp1024),
             Ikev2DhGroup::Modp2048 => modp!(U2048, modp2048_prime, modp2048_pow, Modp2048),
+            Ikev2DhGroup::Modp3072 => modp!(U3072, modp3072_prime, modp3072_pow, Modp3072),
+            Ikev2DhGroup::Modp4096 => modp!(U4096, modp4096_prime, modp4096_pow, Modp4096),
+            Ikev2DhGroup::Modp6144 => modp!(U6144, modp6144_prime, modp6144_pow, Modp6144),
+            Ikev2DhGroup::Modp8192 => modp!(U8192, modp8192_prime, modp8192_pow, Modp8192),
             Ikev2DhGroup::Ecp256 => ecp!(P256SecretKey, Ecp256),
             Ikev2DhGroup::Ecp384 => ecp!(P384SecretKey, Ecp384),
             Ikev2DhGroup::Ecp521 => ecp!(P521SecretKey, Ecp521),

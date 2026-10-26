@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-ikev2`: extend DH and signature enums for MODP 15–18, ECDSA
+  methods 9–11/P-521, RSA-PSS and Ed25519. Exhaustive caller matches must
+  account for the new variants. SHA-512 and Identity offers now execute
+  through admitted providers; checkpoints retain the new MODP widths.
+  Local RSA-PSS AUTH verification selects its exact algorithm with
+  `authorize_local_auth_self_verification_with_algorithm`. RSA signing
+  retains its existing opt-in feature. (#1352)
+
 - `opc-gtpu-dataplane`: initialize the new
   `GtpPdpContext::downlink_peer_source_policy` field with
   `GtpuPeerSourcePolicy::BackendDefault` to preserve existing backend behavior.
@@ -1027,6 +1035,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- IKE cryptography uses `crypto-bigint` 0.7.10 and `ctutils` 0.4.6,
+  including their constant-time fixes. All affected consumer/fuzz lockfiles
+  retain the patched versions. Older DTLS arithmetic and the Tokio advisory
+  remain separate remediation items; this does not waive either advisory.
 
 - `opc-proto-pfcp`: accept parameter-only/empty modifications, references to
   existing rules in modification deltas, source-interface-only PDIs and FO
