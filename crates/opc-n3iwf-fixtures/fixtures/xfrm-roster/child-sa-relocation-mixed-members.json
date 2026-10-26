@@ -4,15 +4,15 @@
   "context": {
     "source_vector": {
       "path": "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json",
-      "sha256": "76fee6c1a58eb38aa89ff39bf8fd4e0a29f8048e40a294abbef8639e9c9bbd97",
+      "sha256": "694cc9ebdbe0c7619fe63010716267b74983df1f9fa54236b765803a0f934bae",
       "case": "relocation-mixed-members"
     },
     "cases": 1024,
     "evidence_kind": "independent-obligation-projection",
     "public_sdk": {
       "base": "58acdfe9afc1cd0b5c7d2fc9a0d1f01bed4325d6",
-      "head": "1c7012e6667a29f27d1100f3492dff5cc2c05d34",
-      "tree": "1de2e42f567031052e26322d0f581b87993180b2"
+      "head": "0f3e31e8eb12a2025dcec5401af2b8b261b91505",
+      "tree": "a43ca86ba753649c4e2d14659b7738ec2ceb6fdd"
     },
     "execution_claim": false,
     "requires_separate_runtime_qualification": true,

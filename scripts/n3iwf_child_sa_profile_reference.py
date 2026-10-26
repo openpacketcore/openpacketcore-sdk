@@ -15,8 +15,8 @@ SOURCE = "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json"
 SCOPE = "installed-child-sa-evidence-reference"
 PREFIX = "opc.n3iwf.xfrm-roster.v1.child-sa-"
 SDK = dict(base="58acdfe9afc1cd0b5c7d2fc9a0d1f01bed4325d6",
-           head="1c7012e6667a29f27d1100f3492dff5cc2c05d34",
-           tree="1de2e42f567031052e26322d0f581b87993180b2")
+           head="0f3e31e8eb12a2025dcec5401af2b8b261b91505",
+           tree="a43ca86ba753649c4e2d14659b7738ec2ceb6fdd")
 NATIVE = "crates/opc-ipsec-xfrm/tests/xfrm_child_sa_roster_privileged.rs"
 INSTALLED = "crates/opc-ipsec-xfrm/src/linux/tests/installed_child_sa_tests.rs"
 GENERATION = "crates/opc-ipsec-xfrm/src/installed_child_sa.rs"
@@ -25,7 +25,7 @@ IKE = "crates/opc-proto-ikev2/tests/nwu_mobike.rs"
 LINUX = "crates/opc-ipsec-xfrm/src/linux/tests/child_sa_relocation_tests.rs"
 MODEL = "crates/opc-n3iwf-fixtures/oracles/child-sa-relocation.json"
 DIGESTS = {
-    NATIVE: "3f17f7d6e093efe2bffc20b0ca8088897ec257890e54dd423b6059a869146cb5",
+    NATIVE: "841c124fd31046ab6a26dab6a72a2c1fa6b0ec03c3c6047452c0cbf176f478ce",
     INSTALLED: "5ed23780ba18fde5ac5ce33d8cf1374d4b13f2ed3489fd35cb3b641536cb83d2",
     GENERATION: "96271504ffe32af5f174adda0568acc7b6f9e8819b07db36784d7ae00fbcd59d",
     MOBIKE: "15a65b8c1a62eb4247f907ab989fd20466bcd6fd057ea0e3dbc59a9c24531ec0",
