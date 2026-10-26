@@ -27,7 +27,16 @@ decisions or wall-clock fallbacks.
 The safe adapter validates both `maxerror` and `esterror` and takes their larger
 value. A conservative interval also includes precision, quantization, tolerance
 and measured sampling time, using `timex.time` from the same query. The fixed
-acceptance budget must never widen on retry. `is_synchronized()` rejects unknown
+acceptance budget must never widen on retry. Linux increases `maxerror` by
+0.5 ms per second between daemon updates. Size the fixed budget for root distance
+plus that growth over the longest actual update interval, plus about 1 ms for
+sampling/precision (or more for measured sampling spans). For example, root
+distance at most 50 ms and successful updates within 1,024 seconds need at least
+563 ms with a 1 ms sampling allowance; the safe adapter's example uses 600 ms.
+Chrony's default `maxpoll 10` allows that poll interval but does not guarantee
+successful updates during packet loss. See the
+[adapter's deployment guidance](../opc-session-net/README.md#authentication-time-source).
+`is_synchronized()` rejects unknown
 states, `TIME_OOP` (the repeating leap second), contradictory leap flags, kernel
 clock faults and broken PPS discipline; it does not validate an error budget.
 

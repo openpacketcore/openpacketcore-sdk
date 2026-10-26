@@ -272,6 +272,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-net`: preserve configured reconnect admission for the first
+  prepared-request warm flight, before shared prewarm permits and DNS. `FailOver`
+  immediately selects another voter when cooldown or existing setup prevents
+  admission; administrative prewarming keeps `Wait`. Authentication clock
+  examples now size the fixed budget for kernel error growth between daemon
+  updates. Refs #1248. Refs #1244.
+
 - `opc-persist`: release snapshot receipts when admission fails before engine
   dispatch, so an identical single-chunk retry or a restarted transfer can
   recover after transient contention. Dispatched work keeps its owned receipt.

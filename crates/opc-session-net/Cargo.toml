@@ -113,6 +113,7 @@ rustix = { version = "1.1.5", features = ["process", "fs"] }
 opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0", features = ["test-control"] }
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0", features = ["test-control"] }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }

@@ -14007,6 +14007,7 @@ impl PersistentSessionConsumerPool {
 
     fn begin_warm_lane(
         self: &Arc<Self>,
+        reconnect_policy: ReconnectCooldownPolicy,
     ) -> Result<
         Result<PersistentWarmLaneLeader, Arc<PersistentWarmLaneFlight>>,
         SessionConsumerClientError,
@@ -14020,7 +14021,7 @@ impl PersistentSessionConsumerPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = flight.as_ref() {
             if existing.result().is_none() {
-                if self.config.cooldown_admission == ReconnectCooldownPolicy::FailOver {
+                if reconnect_policy == ReconnectCooldownPolicy::FailOver {
                     return Err(self.reconnect_control.cooldown_error());
                 }
                 return Ok(Err(Arc::clone(existing)));
@@ -17117,14 +17118,46 @@ impl PersistentSessionConsumerClient {
         }
     }
 
+    async fn acquire_prewarm_permit(
+        &self,
+        deadline: tokio::time::Instant,
+        shutdown: &mut watch::Receiver<PersistentShutdownPhase>,
+        reconnect_policy: ReconnectCooldownPolicy,
+    ) -> Result<OwnedSemaphorePermit, SessionConsumerClientError> {
+        if reconnect_policy == ReconnectCooldownPolicy::FailOver {
+            // A sibling warm flight may hold this permit while resolving or
+            // connecting, before it owns a reconnect probe. Foreground callers
+            // must be able to select another voter without joining that work.
+            Arc::clone(&self.pool.prewarm)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    if self.pool.phase() != PersistentShutdownPhase::Running {
+                        SessionConsumerClientError::ShuttingDown
+                    } else {
+                        self.pool.reconnect_control.cooldown_error()
+                    }
+                })
+        } else {
+            self.acquire_warm_permit(&self.pool.prewarm, deadline, shutdown)
+                .await
+        }
+    }
+
     async fn establish_one_warm_request_lane(
         &self,
         deadline: tokio::time::Instant,
+        reconnect_policy: ReconnectCooldownPolicy,
     ) -> Result<(), SessionConsumerClientError> {
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, reconnect_policy)?;
         let mut shutdown = self.pool.shutdown_tx.subscribe();
         let _gate = self
-            .acquire_warm_permit(&self.pool.prewarm, deadline, &mut shutdown)
+            .acquire_prewarm_permit(deadline, &mut shutdown, reconnect_policy)
             .await?;
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, reconnect_policy)?;
         let _activity = self.pool.register_prewarm()?;
 
         // Bind a concrete resolver result into the proof before deciding
@@ -17220,13 +17253,14 @@ impl PersistentSessionConsumerClient {
             let connection = tokio::select! {
                 biased;
                 _ = wait_for_shutdown(&mut shutdown) => Err(SessionConsumerClientError::ShuttingDown),
-                result = self.pool.connect_with_physical_admission(
+                result = self.pool.connect_with_physical_admission_classified(
                     deadline,
                     None,
                     None,
                     true,
                     Some(target),
-                ) => result,
+                    reconnect_policy,
+                ) => result.map_err(ConsumerSetupError::into_client_error),
             };
             let connection = match connection {
                 Ok(connection) => connection,
@@ -17262,8 +17296,11 @@ impl PersistentSessionConsumerClient {
             .check_foreground_admission(&self.pool.client, self.pool.config.cooldown_admission)?;
         let mut shutdown = self.pool.shutdown_tx.subscribe();
         let _gate = self
-            .acquire_warm_permit(&self.pool.prewarm, deadline, &mut shutdown)
+            .acquire_prewarm_permit(deadline, &mut shutdown, self.pool.config.cooldown_admission)
             .await?;
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, self.pool.config.cooldown_admission)?;
         let _activity = self.pool.register_prewarm()?;
 
         let resolve = (self.pool.client.resolve)();
@@ -17353,6 +17390,18 @@ impl PersistentSessionConsumerClient {
         &self,
         caller_deadline: tokio::time::Instant,
     ) -> Result<(), SessionConsumerClientError> {
+        self.ensure_warm_request_capacity_with_policy(
+            caller_deadline,
+            self.pool.config.cooldown_admission,
+        )
+        .await
+    }
+
+    async fn ensure_warm_request_capacity_with_policy(
+        &self,
+        caller_deadline: tokio::time::Instant,
+        reconnect_policy: ReconnectCooldownPolicy,
+    ) -> Result<(), SessionConsumerClientError> {
         if self.pool.phase() != PersistentShutdownPhase::Running {
             return Err(SessionConsumerClientError::ShuttingDown);
         }
@@ -17373,8 +17422,14 @@ impl PersistentSessionConsumerClient {
         if deadline <= started {
             return Err(SessionConsumerClientError::Deadline);
         }
-        let result = match self.pool.begin_warm_lane()? {
-            Ok(leader) => leader.complete(self.establish_one_warm_request_lane(deadline).await),
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, reconnect_policy)?;
+        let result = match self.pool.begin_warm_lane(reconnect_policy)? {
+            Ok(leader) => leader.complete(
+                self.establish_one_warm_request_lane(deadline, reconnect_policy)
+                    .await,
+            ),
             Err(flight) => self.join_warm_request_lane(flight, deadline).await,
         };
         #[cfg(test)]
@@ -17422,6 +17477,9 @@ impl PersistentSessionConsumerClient {
         if deadline <= started {
             return Err(SessionConsumerClientError::Deadline);
         }
+        self.pool
+            .reconnect_control
+            .check_foreground_admission(&self.pool.client, self.pool.config.cooldown_admission)?;
         match self.pool.begin_retained_warm_lane()? {
             Ok(leader) => leader.complete(self.establish_one_retained_request_lane(deadline).await),
             Err(flight) => self.join_warm_request_lane(flight, deadline).await,
@@ -17488,7 +17546,8 @@ impl PersistentSessionConsumerClient {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.pool.config.setup_timeout)
             .ok_or(SessionConsumerClientError::Deadline)?;
-        self.ensure_warm_request_capacity_before(deadline).await
+        self.ensure_warm_request_capacity_with_policy(deadline, ReconnectCooldownPolicy::Wait)
+            .await
     }
 
     /// Return a conservative authenticated-idle-capacity snapshot.

@@ -90,6 +90,8 @@ pub use issuer::{
 };
 #[cfg(test)]
 mod issuer_tests;
+#[cfg(all(test, feature = "test-control", target_os = "linux"))]
+pub(crate) use issuer_tests::assert_admitted_liveness_refusal;
 
 mod evidence;
 pub use evidence::{

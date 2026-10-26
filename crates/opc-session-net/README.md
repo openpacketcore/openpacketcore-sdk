@@ -130,7 +130,23 @@ atomic `timex.time` supplies the instant. The symmetric error includes the large
 maximum/estimated error across both samples, precision, microsecond quantization,
 reported oscillator drift and the full sampling span. Status changes, backward
 progress or excessive progress within that pair are refused. Install one source
-per process with the deployment's fixed budget (never widened on retry):
+per process with the deployment's fixed budget (never widened on retry).
+
+Size that budget for the whole interval between daemon updates: Linux increases
+`maxerror` by **0.5 ms per second** until the next update. Allow at least
+**root distance + 0.5 ms × longest update interval in seconds + about 1 ms**
+for sampling, precision and quantization; allow more if measured sampling spans
+require it. Chrony's default `maxpoll 10` allows 1,024 seconds between polls,
+which alone adds 512 ms. The example below assumes root distance at most 50 ms,
+actual kernel updates no more than 1,024 seconds apart, and at most 1 ms of
+additional sampling error: 50 + 512 + 1 = 563 ms fits its fixed 600 ms budget.
+A poll setting alone does not guarantee successful updates during packet loss.
+For a 100 ms budget, a deployment could instead require `maxpoll 6` (64 seconds),
+actual updates within that interval, root distance at most 50 ms and the same
+sampling allowance. Verify these bounds at installation.
+See the [Linux error-growth implementation](https://github.com/torvalds/linux/blob/v6.12/kernel/time/ntp.c#L431-L436),
+its [frequency tolerance](https://github.com/torvalds/linux/blob/v6.12/include/linux/timex.h#L129),
+and [chrony's poll settings](https://chrony-project.org/doc/4.6/chrony.conf.html#maxpoll).
 
 ```rust
 use opc_session_net::scope::{IntervalClock, PlatformAuthenticationTimeSource};
@@ -138,7 +154,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 let source = Arc::new(PlatformAuthenticationTimeSource::new());
-let clock = IntervalClock::new(source, Duration::from_millis(100))?;
+// Fixed at installation for the update and root-distance bounds above.
+let clock = IntervalClock::new(source, Duration::from_millis(600))?;
 ```
 
 Platform contract:
@@ -166,7 +183,14 @@ Operators see one fixed, value-free `tracing` warning on target
 `io_unavailable`, `permission_denied`, `not_synchronized`, `invalid_observation`,
 `sampling_changed`, `invalid_error_bound`, `uncertainty_exceeded`,
 `generation_exhausted`) when the refusal reason changes, followed by one recovery
-event. Every refused call still returns the typed `AuthTimeUnavailable` in the
+event. Separately, `IntervalClock` emits
+`authentication clock exceeds its fixed uncertainty budget` on target
+`opc_session_net::scope::clock`, once on entering a budget refusal, then one
+recovery event when the reading fits again. This catches a reading accepted by
+the source's bound but exceeding the adapter's fixed budget. Periodic budget
+refusal while the daemon remains healthy means the install-time budget or update
+interval was sized incorrectly; investigate those deployment assumptions.
+Every refused call still returns the typed `AuthTimeUnavailable` in the
 authentication path. Alarm on those warnings and on the node's time-daemon
 health; do not increase the uncertainty budget to silence them. The
 synchronization generation starts at 1 on the first accepted synchronized

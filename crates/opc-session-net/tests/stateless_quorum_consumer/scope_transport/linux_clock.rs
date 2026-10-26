@@ -132,6 +132,30 @@ fn linux_time_native_authority_and_quiescence_survive_synchronization_loss() {
                     assert!(before.is_active());
                     assert_eq!(before.stamp(), Some(authority.stamp()));
                     let effect = process.enter_peer_control().await.unwrap();
+                    crate::scope::assert_admitted_liveness_refusal(
+                        process.clone(),
+                        opc_types::SpiffeId::new(worker.clone()).unwrap(),
+                        opc_types::SpiffeId::new(spiffe("scope-issuer")).unwrap(),
+                        client_tls(&pki, &spiffe("scope-issuer"), "scope-worker"),
+                        server_tls(&pki, &worker, "scope-issuer"),
+                    )
+                    .await;
+                    assert_eq!(
+                        client.current(Duration::from_secs(5)).await.unwrap(),
+                        before,
+                        "rejected liveness refusal preserves committed authority"
+                    );
+                    assert_eq!(
+                        client
+                            .outcome(&initial, Duration::from_secs(5))
+                            .await
+                            .unwrap(),
+                        receipt,
+                        "rejected liveness refusal preserves the exact admission receipt"
+                    );
+                    assert_eq!(initial.request().encode_canonical().unwrap(), original);
+                    assert!(closures.local.lock().unwrap().is_empty());
+                    assert!(closures.final_records.lock().unwrap().is_empty());
                     let first_generation = time.source.read().unwrap().synchronization_generation;
                     time.failed.store(true, Ordering::Release);
                     assert_eq!(

@@ -253,6 +253,14 @@ fn activated_issuer_preserves_failed_key_refresh_classes_then_recovers() {
     );
 }
 
+#[test]
+fn probe_internal_revalidation_preserves_each_platform_class_and_recovers() {
+    run_issuer(
+        Scenario::ProbeRevalidationFailures,
+        "scope::issuer_tests::probe_internal_revalidation_preserves_each_platform_class_and_recovers",
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scenario {
     Verify,
@@ -274,6 +282,7 @@ enum Scenario {
     RefusePlatformInvalid,
     RefusePrerequisite,
     RefreshCredentialFailures,
+    ProbeRevalidationFailures,
 }
 struct NoPredecessors;
 #[async_trait::async_trait]
@@ -374,6 +383,30 @@ fn run_issuer(scenario: Scenario, test_name: &str) {
             let error = issuer.probe(&enrollment, BootstrapProofMode::Candidate).await.err().expect("probe must refuse the platform observation");
             let expected = match scenario { Scenario::ProbePlatformInvalid => StartupError::PlatformInvalid, Scenario::ProbePlatformChanged => StartupError::PlatformChanged, _ => StartupError::Unavailable };
             assert_eq!(error, expected, "probe must preserve the platform failure class");
+            return;
+        }
+        if scenario==Scenario::ProbeRevalidationFailures {
+            for (platform, expected) in [
+                (PlatformError::Invalid, StartupError::PlatformInvalid),
+                (PlatformError::Changed, StartupError::PlatformChanged),
+                (PlatformError::Unavailable, StartupError::Unavailable),
+            ] {
+                api.reads.store(0, Ordering::Release);
+                *api.revalidate_error.lock().unwrap()=Some(platform);
+                let (verified, worker)=tokio::time::timeout(std::time::Duration::from_secs(5),async{tokio::join!(issuer.probe(&enrollment,BootstrapProofMode::Candidate),async {let (stream,_)=listener.accept().await.unwrap();responder.respond_once(stream).await})}).await.unwrap();
+                assert_eq!(verified.err(),Some(expected),"the second platform read inside probe preserves its class");
+                assert_eq!(api.reads.load(Ordering::Acquire),2,"the initial observation and authenticated proof precede revalidation");
+                drop(worker.unwrap());
+                assert!(process.enter_peer_control().await.is_err());
+                *api.revalidate_error.lock().unwrap()=None;
+                api.reads.store(0, Ordering::Release);
+                let (verified, worker)=tokio::time::timeout(std::time::Duration::from_secs(5),async{tokio::join!(issuer.probe(&enrollment,BootstrapProofMode::Candidate),async {let (stream,_)=listener.accept().await.unwrap();responder.respond_once(stream).await})}).await.unwrap();
+                let verified=verified.expect("reconciliation permits a fresh probe of the same boot");
+                assert_eq!(verified.proof().process_nonce(),process.boot().process_nonce());
+                assert_eq!(api.reads.load(Ordering::Acquire),2);
+                assert!(process.enter_peer_control().await.is_err(),"proof recovery confers no admission");
+                drop(worker.unwrap());
+            }
             return;
         }
         let probe_mode=if scenario==Scenario::RefuseOnLiveness {BootstrapProofMode::Liveness} else {BootstrapProofMode::Candidate};
@@ -635,3 +668,124 @@ fn run_issuer(scenario: Scenario, test_name: &str) {
 #[cfg(target_os = "linux")]
 #[path = "issuer_linux_clock_tests.rs"]
 mod linux_clock;
+
+// Exercise the actual startup boundary for a process admitted by the native
+// authority fixture, retaining its caller-owned effect throughout this call.
+#[cfg(all(feature = "test-control", target_os = "linux"))]
+pub(crate) async fn assert_admitted_liveness_refusal(
+    process: Arc<ScopeProcess>,
+    worker_identity: SpiffeId,
+    issuer_identity: SpiffeId,
+    client: opc_tls::AuthenticatedClientConfig,
+    server: opc_tls::AuthenticatedServerConfig,
+) {
+    drop(
+        process
+            .enter_peer_control()
+            .await
+            .expect("native worker is admitted"),
+    );
+    let key = SigningKey::from_slice(&[1; 32]).unwrap();
+    let point = key.verifying_key().to_sec1_point(false);
+    let jwks = serde_json::to_vec(&json!({"keys":[{"kty":"EC","crv":"P-256","alg":"ES256","kid":"one","x":URL_SAFE_NO_PAD.encode(&point.as_bytes()[1..33]),"y":URL_SAFE_NO_PAD.encode(&point.as_bytes()[33..])}]})).unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let claims = json!({"iss":"https://cluster.test","aud":["openpacketcore-scope-bootstrap"],"sub":"system:serviceaccount:test:worker","iat":now-60,"nbf":now-60,"exp":now+60,"kubernetes.io":{"namespace":"test","pod":{"name":"worker-0","uid":uuid::Uuid::from_bytes([3;16]).to_string()},"serviceaccount":{"name":"worker","uid":uuid::Uuid::from_bytes([6;16]).to_string()}}});
+    let input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","kid":"one"}"#),
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+    );
+    let signature: Signature = key.sign(input.as_bytes());
+    let token = format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes())).into_bytes();
+    let credentials = Arc::new(
+        BootstrapCredentialVerifier::activate(
+            "https://cluster.test".into(),
+            "https://cluster.test/openid/v1/jwks".into(),
+            Arc::new(Keys(jwks)),
+        )
+        .await
+        .unwrap(),
+    );
+    let policy = crate::scope::ScopePolicy::new(vec![crate::scope::PrincipalGrant::new(
+        issuer_identity.clone(),
+        crate::scope::ScopeRole::Controller,
+        vec![process.scope().clone()],
+    )
+    .unwrap()])
+    .unwrap();
+    let responder = BootProofResponder::new(
+        process.clone(),
+        issuer_identity.clone(),
+        policy,
+        Arc::new(Clock),
+        Arc::new(Token(token)),
+        server,
+        crate::scope::ProofBudgets::default(),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let enrollment = PodEnrollment::new(
+        process.scope().clone(),
+        "test".into(),
+        "worker-0".into(),
+        "worker".into(),
+        [6; 16],
+        "worker".into(),
+        [4; 16],
+        worker_identity,
+        address.port(),
+    )
+    .unwrap();
+    let reader = Arc::new(KubernetesBootReader::new(Arc::new(Api {
+        address: Mutex::new(Some(address)),
+        clock: Arc::new(IssuerClock(AtomicI64::new(0))),
+        expire_on_recheck: false,
+        reads: AtomicUsize::new(0),
+        observe_error: None,
+        revalidate_error: Mutex::new(None),
+        revalidate_container_id: Mutex::new(None),
+        revalidate_revision: Mutex::new(None),
+    })));
+    let issuer = BootstrapIssuerClient::new(
+        client,
+        Arc::new(Clock),
+        credentials,
+        reader,
+        crate::scope::ProofBudgets::default(),
+    )
+    .unwrap();
+    let (verified, worker) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            issuer.probe(&enrollment, BootstrapProofMode::Liveness),
+            async {
+                let (stream, _) = listener.accept().await.unwrap();
+                responder.respond_once(stream).await
+            }
+        )
+    })
+    .await
+    .unwrap();
+    let verified = verified.expect("admitted worker proves its live boot");
+    let _worker = worker.unwrap();
+    assert!(!verified.proof().is_candidate());
+    assert_eq!(
+        verified.proof().process_nonce(),
+        process.boot().process_nonce()
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    assert_eq!(
+        verified
+            .deliver_boot_refusal(super::BootRefusalReason::PrerequisiteRefused, deadline)
+            .await
+            .err(),
+        Some(StartupError::Invalid),
+        "candidate refusal cannot cross an admitted worker's liveness boundary",
+    );
+    drop(
+        process
+            .enter_peer_control()
+            .await
+            .expect("refusal cannot revoke admission"),
+    );
+}

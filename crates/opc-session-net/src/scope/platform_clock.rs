@@ -79,6 +79,18 @@ struct SourceState {
 /// increments it once. Loss entirely between observations cannot be detected.
 /// Unknown data and syscall errors never manufacture a recovered generation.
 /// Refusal and recovery change no ownership, accepted work or closure evidence.
+/// Linux adds 0.5 ms to the maximum error each second between daemon updates.
+/// At installation, allow at least root distance + 0.5 ms per second of the
+/// longest actual update interval + about 1 ms for sampling/precision (more if
+/// required by measured sampling spans). Chrony's default `maxpoll 10` permits
+/// 1,024 seconds between polls, adding 512 ms; successful updates may be farther
+/// apart during packet loss. The example assumes root distance at most 50 ms,
+/// actual updates within 1,024 seconds and sampling overhead at most 1 ms, so
+/// 563 ms fits a fixed 600 ms budget. A 100 ms budget instead needs shorter
+/// updates, for example `maxpoll 6` with successful updates within 64 seconds
+/// under the same root-distance and sampling limits.
+/// Periodic budget refusal with a healthy daemon calls for correcting these
+/// install-time assumptions; neither source nor adapter widens its budget.
 /// Install it once per process and keep it for the process lifetime:
 ///
 /// ```
@@ -89,8 +101,8 @@ struct SourceState {
 /// # use std::sync::Arc;
 /// # use std::time::Duration;
 /// let source = Arc::new(PlatformAuthenticationTimeSource::new());
-/// // The deployment fixes this budget; it is never widened on retry.
-/// let clock = IntervalClock::new(source, Duration::from_millis(100)).expect("fixed budget");
+/// // Fixed at installation for the root-distance and update bounds above.
+/// let clock = IntervalClock::new(source, Duration::from_millis(600)).expect("fixed budget");
 /// # let _ = &clock;
 /// # assert!(!PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY.is_zero());
 /// ```

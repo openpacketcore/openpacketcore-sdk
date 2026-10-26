@@ -313,6 +313,10 @@ async fn cooldown_failover_concurrent_delete_release_reach_healthy_voter_without
 
 #[tokio::test(start_paused = true)]
 async fn cooldown_failover_prepared_success_and_possible_write_receipt_only() {
+    prepared_success_and_possible_write_receipt_only().await;
+}
+
+async fn prepared_success_and_possible_write_receipt_only() {
     for mutation in [
         PublicProtectedFencedMutationBehavior::CommitAndReply,
         PublicProtectedFencedMutationBehavior::CommitThenLoseResponse,
@@ -645,7 +649,10 @@ async fn cooldown_failover_prepared_admission_precedes_pool_permits() {
 async fn cooldown_failover_prepared_admission_declines_pending_warm_setup() {
     let (client, _material) =
         cooled_client(ReconnectCooldownPolicy::FailOver, Duration::from_secs(2));
-    let Ok(Ok(leader)) = client.pool.begin_warm_lane() else {
+    let Ok(Ok(leader)) = client
+        .pool
+        .begin_warm_lane(ReconnectCooldownPolicy::FailOver)
+    else {
         panic!("first caller owns warm setup");
     };
     let before = tokio::time::Instant::now();
@@ -657,4 +664,423 @@ async fn cooldown_failover_prepared_admission_declines_pending_warm_setup() {
     ));
     assert_eq!(tokio::time::Instant::now(), before);
     drop(leader);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_failover_first_warm_leader_declines_before_flight_or_dns() {
+    let (client, _material) =
+        cooled_client(ReconnectCooldownPolicy::FailOver, Duration::from_secs(2));
+    let before = tokio::time::Instant::now();
+    assert!(client.pool.warm_lane.lock().unwrap().is_none());
+    assert!(matches!(
+        client
+            .ensure_warm_request_capacity_before(before + Duration::from_secs(1))
+            .now_or_never(),
+        Some(Err(SessionConsumerClientError::Cooldown { .. }))
+    ));
+    assert!(client.pool.warm_lane.lock().unwrap().is_none());
+    assert_eq!(client.diagnostics().await.resolve_attempts, 0);
+    assert_eq!(client.diagnostics().await.setup_attempts, 0);
+    assert_eq!(tokio::time::Instant::now(), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_failover_retained_setup_declines_a_warm_flight_parked_in_dns() {
+    let (mut client, _material) = stateless_test_client(SessionReauthenticationControl::new());
+    let resolves = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&resolves);
+    client.resolve = Arc::new(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    });
+    let client = PersistentSessionConsumerClient::try_from_stateless(
+        client,
+        PersistentSessionConsumerConfig::default()
+            .with_cooldown_admission(ReconnectCooldownPolicy::FailOver),
+    )
+    .unwrap();
+    let before = tokio::time::Instant::now();
+    let mut warm = Box::pin(client.ensure_warm_request_capacity());
+    assert!(futures_util::poll!(&mut warm).is_pending());
+    assert_eq!(resolves.load(Ordering::SeqCst), 1);
+    assert_eq!(client.pool.prewarm.available_permits(), 0);
+    assert!(client.pool.reconnect_control.gate.can_probe_now());
+    assert!(matches!(
+        client
+            .ensure_retained_request_lane_before(before + Duration::from_secs(1))
+            .now_or_never(),
+        Some(Err(SessionConsumerClientError::Cooldown { .. }))
+    ));
+    assert_eq!(resolves.load(Ordering::SeqCst), 1);
+    assert_eq!(tokio::time::Instant::now(), before);
+    drop(warm);
+    assert_eq!(client.pool.prewarm.available_permits(), 1);
+}
+
+async fn prepared_checkpoint_first_warm_leader(
+    acquire_lease: bool,
+    held_probe: bool,
+    policy: ReconnectCooldownPolicy,
+) {
+    let client_identity = material_spiffe("prepared-warm-client");
+    let identities = [
+        material_spiffe("prepared-warm-a"),
+        material_spiffe("prepared-warm-b"),
+        material_spiffe("prepared-warm-c"),
+    ];
+    let roster = test_consumer_roster_for(&identities);
+    let material = RotatableClientMaterial::new(client_identity.as_str());
+    let SessionConsumerOperation::CompareAndSet { op } =
+        unprotected_router_state_test_compare_and_set_request(scope())
+            .await
+            .operation()
+            .clone()
+    else {
+        panic!("CAS input");
+    };
+    let provider = Arc::new(MemoryKeyProvider::new());
+    provider
+        .insert_active_key(
+            KeyId::new("prepared-warm-key").unwrap(),
+            KeyPurpose::Session,
+            op.key.tenant.clone(),
+            Zeroizing::new([0x6b; AES_256_GCM_SIV_KEY_LEN]),
+        )
+        .unwrap();
+    let wrapper = Arc::new(EncryptingSessionBackend::new(
+        Arc::new(FakeSessionBackend::new()),
+        provider,
+        "prepared-warm",
+    ));
+    let grant = opc_session_store::SessionConsumerAuthorizationGrant::try_new(
+        client_identity,
+        [SessionConsumerTenantNfScope::new(
+            op.key.tenant.clone(),
+            op.key.nf_kind.clone(),
+        )],
+    )
+    .unwrap();
+    let calls: [Arc<AtomicUsize>; 3] = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+    let resolves: [Arc<AtomicUsize>; 3] = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+    let mut clients = Vec::new();
+    let mut servers = Vec::new();
+    for (index, identity) in identities.iter().enumerate() {
+        let authority = voter_authority_for_identity(&roster, identity);
+        let authorizer = SessionConsumerAuthorizer::try_new(
+            roster
+                .clone()
+                .authorization_manifest(authority.node_id(), [grant.clone()])
+                .unwrap(),
+        )
+        .unwrap();
+        let consumer: Arc<dyn SessionQuorumConsumer> = if acquire_lease {
+            Arc::new(HealthyPreparedLeaseConsumer {
+                lease: op.lease.clone(),
+                mutation_calls: calls[index].clone(),
+                status_calls: Arc::new(AtomicUsize::new(0)),
+            })
+        } else {
+            Arc::new(HealthyPreparedCasConsumer {
+                mutation_calls: calls[index].clone(),
+                status_calls: Arc::new(AtomicUsize::new(0)),
+            })
+        };
+        let (server, address) = SessionQuorumConsumerServer::new(
+            consumer,
+            material.trusted_server_config(identity.as_str()),
+            authorizer,
+        )
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+        servers.push(server);
+        let observed = resolves[index].clone();
+        let resolver: RemoteAddrResolver = Arc::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(address) })
+        });
+        let client = PersistentSessionConsumerClient::try_from_stateless(
+            StatelessSessionConsumerClient::new_with_resolver(
+                resolver,
+                rustls_pki_types::ServerName::IpAddress(address.ip().into()),
+                authority,
+                material.config(),
+            )
+            .with_connection_lifecycle(
+                ConnectionLifecyclePolicy::try_new(
+                    Duration::from_secs(60),
+                    Duration::from_secs(1),
+                    Duration::from_millis(500),
+                    Duration::from_secs(1),
+                    Duration::ZERO,
+                )
+                .unwrap(),
+            ),
+            PersistentSessionConsumerConfig {
+                reconnect_jitter: Duration::ZERO,
+                ..PersistentSessionConsumerConfig::default()
+            }
+            .with_cooldown_admission(policy),
+        )
+        .unwrap();
+        clients.push(client);
+    }
+    without_time(clients[1].ensure_warm_request_capacity())
+        .await
+        .unwrap();
+    let composite = SessionConsumerPreparedCheckpointBackend::persistent(wrapper, clients).unwrap();
+    let first = &composite.router.clients[0];
+    assert!(first.pool.warm_lane.lock().unwrap().is_none());
+    first.pool.reconnect_control.publish_connection_loss(
+        first.pool.client.reauthentication.generation(),
+        Some(first.pool.client.tls_config.material_status().epoch()),
+    );
+    assert_eq!(
+        first.pool.reconnect_control.gate.remaining_cooldown(),
+        Duration::from_millis(500)
+    );
+    let probe = if held_probe {
+        tokio::time::advance(Duration::from_millis(500)).await;
+        Some(
+            first
+                .pool
+                .reconnect_control
+                .acquire(
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    first.pool.client.reauthentication.generation(),
+                    first.pool.client.tls_config.material_status().epoch(),
+                )
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let before = tokio::time::Instant::now();
+    let budget = PreparedCheckpointBudget::new(
+        before + Duration::from_millis(100),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    if acquire_lease {
+        let mut prepared = composite
+            .prepare_acquire_with_id(
+                SessionConsumerRequestId::from_bytes([0xc1; 16]),
+                op.key.clone(),
+                op.new_record.owner.clone(),
+                Duration::from_secs(30),
+                budget,
+            )
+            .unwrap();
+        if policy == ReconnectCooldownPolicy::FailOver {
+            assert_eq!(
+                without_time(prepared.execute_once()).await,
+                Ok(op.lease.clone())
+            );
+        } else {
+            let mut execute = Box::pin(prepared.execute_once());
+            assert!(futures_util::poll!(&mut execute).is_pending());
+            assert_eq!(calls[1].load(Ordering::SeqCst), 0);
+            tokio::time::advance(Duration::from_millis(100)).await;
+            assert!(without_time(execute).await.is_err());
+        }
+    } else {
+        let mut prepared = without_time(composite.prepare_compare_and_set(
+            SessionConsumerRequestId::from_bytes([0xc2; 16]),
+            *op,
+            budget,
+        ))
+        .await
+        .unwrap();
+        if policy == ReconnectCooldownPolicy::FailOver {
+            assert_eq!(
+                without_time(prepared.execute_once()).await,
+                Ok(PreparedCompareAndSetOutcome::Applied)
+            );
+        } else {
+            let mut execute = Box::pin(prepared.execute_once());
+            assert!(futures_util::poll!(&mut execute).is_pending());
+            assert_eq!(calls[1].load(Ordering::SeqCst), 0);
+            tokio::time::advance(Duration::from_millis(100)).await;
+            assert!(without_time(execute).await.is_err());
+        }
+    }
+    if policy == ReconnectCooldownPolicy::FailOver {
+        assert_eq!(tokio::time::Instant::now(), before);
+        assert_eq!(
+            calls.each_ref().map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 1, 0]
+        );
+        assert_eq!(resolves[0].load(Ordering::SeqCst), 0);
+        assert_eq!(first.diagnostics().await.setup_attempts, 0);
+        assert!(first.pool.warm_lane.lock().unwrap().is_none());
+    } else {
+        assert_eq!(
+            calls.each_ref().map(|calls| calls.load(Ordering::SeqCst)),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before + Duration::from_millis(100)
+        );
+    }
+    drop(probe);
+    for client in composite.router.clients.iter() {
+        without_time(client.shutdown()).await;
+    }
+    for server in servers {
+        without_time(server.abort_and_wait()).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_failover_public_prepared_cas_skips_cold_leader_cooldown() {
+    prepared_checkpoint_first_warm_leader(false, false, ReconnectCooldownPolicy::FailOver).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_failover_public_prepared_lease_skips_cold_leader_cooldown() {
+    prepared_checkpoint_first_warm_leader(true, false, ReconnectCooldownPolicy::FailOver).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_failover_public_prepared_cas_skips_held_probe() {
+    prepared_checkpoint_first_warm_leader(false, true, ReconnectCooldownPolicy::FailOver).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_failover_public_prepared_lease_skips_held_probe() {
+    prepared_checkpoint_first_warm_leader(true, true, ReconnectCooldownPolicy::FailOver).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_failover_public_prepared_default_wait_keeps_original_deadline() {
+    prepared_checkpoint_first_warm_leader(false, false, ReconnectCooldownPolicy::Wait).await;
+    prepared_checkpoint_first_warm_leader(true, false, ReconnectCooldownPolicy::Wait).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_failover_administrative_warmup_keeps_wait_policy() {
+    let (client, _material) =
+        cooled_client(ReconnectCooldownPolicy::FailOver, Duration::from_secs(2));
+    let before = tokio::time::Instant::now();
+    assert!(client.prewarm().now_or_never().is_none());
+    assert!(client
+        .ensure_warm_request_capacity()
+        .now_or_never()
+        .is_none());
+    assert_eq!(tokio::time::Instant::now(), before);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_failover_attempt_spans_have_only_fixed_fields_across_lost_replies() {
+    use std::collections::{BTreeMap, BTreeSet};
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Default)]
+    struct Captured {
+        declared: BTreeSet<String>,
+        values: BTreeMap<String, String>,
+    }
+    impl tracing::field::Visit for Captured {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.values
+                .insert(field.name().into(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.values.insert(field.name().into(), value.into());
+        }
+    }
+    struct Attempts(Arc<StdMutex<BTreeMap<u64, Captured>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Attempts {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attributes.metadata().name() == "session_consumer_attempt" {
+                let mut captured = Captured {
+                    declared: attributes
+                        .metadata()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().to_owned())
+                        .collect(),
+                    ..Captured::default()
+                };
+                attributes.record(&mut captured);
+                self.0.lock().unwrap().insert(id.into_u64(), captured);
+            }
+        }
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(captured) = self.0.lock().unwrap().get_mut(&id.into_u64()) {
+                values.record(captured);
+            }
+        }
+    }
+    let attempts = Arc::new(StdMutex::new(BTreeMap::<u64, Captured>::new()));
+    let subscriber = tracing_subscriber::registry().with(Attempts(attempts.clone()));
+    let _default = tracing::subscriber::set_default(subscriber);
+    prepared_success_and_possible_write_receipt_only().await;
+    let attempts = attempts.lock().unwrap();
+    let expected: BTreeSet<String> = [
+        "operation",
+        "voter_ordinal",
+        "gate_micros",
+        "cooldown_micros",
+        "transmission",
+        "successor_ordinal",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert!(!attempts.is_empty());
+    for attempt in attempts.values() {
+        assert_eq!(attempt.declared, expected);
+        assert!(attempt.values.keys().all(|key| expected.contains(key)));
+    }
+    assert!(
+        attempts.values().any(|attempt| {
+            attempt
+                .values
+                .get("voter_ordinal")
+                .is_some_and(|v| v == "0")
+                && attempt
+                    .values
+                    .get("successor_ordinal")
+                    .is_some_and(|v| v == "1")
+                && attempt
+                    .values
+                    .get("transmission")
+                    .is_some_and(|v| v == "pre_write")
+                && attempt
+                    .values
+                    .get("cooldown_micros")
+                    .is_some_and(|v| v.parse::<u64>().unwrap() > 0)
+        }),
+        "cooled A is classified before write and records its successor"
+    );
+    assert!(
+        attempts.values().any(|attempt| {
+            attempt
+                .values
+                .get("voter_ordinal")
+                .is_some_and(|v| v == "1")
+                && attempt
+                    .values
+                    .get("transmission")
+                    .is_some_and(|v| v == "possibly_written")
+                && attempt
+                    .values
+                    .get("operation")
+                    .is_some_and(|v| v.contains("FencedTransition"))
+        }),
+        "B records the physical write, including a lost reply"
+    );
 }
