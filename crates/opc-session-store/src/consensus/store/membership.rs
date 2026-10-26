@@ -2235,6 +2235,7 @@ impl ConsensusSessionStore {
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),
+            roster_maintenance: OnceLock::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
