@@ -410,7 +410,7 @@ class PartitionTests(unittest.TestCase):
         commands = [c for shard in FENCE.SHARDS for c in FENCE.plans(fixture(), shard)]
         exact = [c for c in commands if c["name"] in FENCE.SPECIAL]
         self.assertEqual({c["name"] for c in exact}, set(FENCE.SPECIAL))
-        self.assertEqual(len(exact), 14)
+        self.assertEqual(len(exact), 16)
         self.assertEqual(FENCE.plans(fixture(), FENCE.PROOF_SHARD), exact)
         self.assertTrue(all(FENCE.owner(c["name"]) == FENCE.PROOF_SHARD for c in exact))
         for command in exact:
@@ -420,7 +420,11 @@ class PartitionTests(unittest.TestCase):
             self.assertIn("--all-features", argv)
             self.assertEqual(argv[-3:], ["--test-threads=1", "--exact", command["name"]])
             optimized = command["name"] in FENCE.OPTIMIZED_LIB
-            self.assertEqual(command["env"], {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"} if optimized else {})
+            profile = {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"} if optimized else {}
+            if command["name"] in FENCE.SUSTAINED_ROSTER_LIB:
+                profile.update(CARGO_PROFILE_TEST_DEBUG_ASSERTIONS="true",
+                               CARGO_PROFILE_TEST_OVERFLOW_CHECKS="true")
+            self.assertEqual(command["env"], profile)
             if command["name"] in FENCE.ISOLATED_INTEGRATION:
                 self.assertEqual(argv[argv.index("--test") + 1], "consensus_openraft")
             else:

@@ -100,6 +100,13 @@ QUIESCENT_VOID_LIB_TESTS = (
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
     "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap",
 )
+# These three-minute arrival-rate proofs measure signed production work. Keep
+# their literal load and backlog bounds in the checked O1 timing profile.
+QUIESCENT_ROSTER_LIB_MODULE = "consensus::store::sequential_wal_sdk_tests"
+QUIESCENT_ROSTER_LIB_TESTS = (
+    "roster_maintenance_native_keeps_up_with_ten_due_rows_per_second",
+    "roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second",
+)
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
@@ -107,6 +114,7 @@ QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
     QUIESCENT_SELECTOR_LIB_TEST,
     *QUIESCENT_VOID_LIB_TESTS,
+    *QUIESCENT_ROSTER_LIB_TESTS,
     "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -139,6 +147,7 @@ QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
 )
 OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {
+        *QUIESCENT_ROSTER_LIB_TESTS,
         "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
         "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -149,7 +158,7 @@ OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
 )
 if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
     raise RuntimeError("optimized timing tests must also be isolated timing tests")
-# Keep O1 confined to the protected-transition and snapshot/restart proofs.
+# Keep O1 confined to protected-transition, roster-rate and snapshot/restart proofs.
 # Its functional counterpart uses the same optimized execution, debug
 # assertions, and overflow checks as the separate 100 ms performance gate.
 # Match the IPsec/i686 lanes.
@@ -348,6 +357,8 @@ def qualified_quiescent_lib_test(name: str) -> str:
         return f"{QUIESCENT_SELECTOR_LIB_MODULE}::{name}"
     if name in QUIESCENT_VOID_LIB_TESTS:
         return f"{QUIESCENT_VOID_LIB_MODULE}::{name}"
+    if name in QUIESCENT_ROSTER_LIB_TESTS:
+        return f"{QUIESCENT_ROSTER_LIB_MODULE}::{name}"
     return f"{QUIESCENT_LIB_MODULE}::{name}"
 
 
@@ -358,6 +369,9 @@ def quiescent_lib_command(name: str) -> list[str]:
         if name in OPTIMIZED_QUIESCENT_LIB_TESTS
         else []
     )
+    if name in QUIESCENT_ROSTER_LIB_TESTS:
+        profile += ["CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                    "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"]
     return profile + SELECTION + [
         "--lib",
         "--",
