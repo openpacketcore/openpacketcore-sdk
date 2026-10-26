@@ -136,6 +136,7 @@ struct Fixture {
     attestor: Arc<dyn FencedMutationRosterExecutorAttestor>,
     trace: ReadTrace,
     primary: usize,
+    alternates: [usize; 2],
     // Release fixture isolation after transport/service owners have dropped.
     fleet: ThreeVoterConsumerFleet,
 }
@@ -152,6 +153,14 @@ impl Fixture {
         let client_spiffe = spiffe("publication-failover-client");
         let trace = Arc::new(Mutex::new(Vec::new()));
         let primary = 2;
+        // Installation identity can change which physical voter has the lower
+        // node ID. Assign fault roles from the authenticated voter identities.
+        let alternates = if fleet.voter_authority(0).node_id() < fleet.voter_authority(1).node_id()
+        {
+            [0, 1]
+        } else {
+            [1, 0]
+        };
         let mut servers = Vec::new();
         let mut addresses = Vec::new();
         let mut transports = Vec::new();
@@ -204,13 +213,17 @@ impl Fixture {
             attestor,
             trace,
             primary,
+            alternates,
         }
     }
 
     fn compose(&self) -> ProviderAdapter<PublicationProvider> {
-        // Caller order is deliberately different from canonical roster order.
-        self.compose_with_voters([1, 2, 0].map(|voter| self.pools[voter].clone()))
-            .expect("compose V2 publication adapter")
+        // Caller order deliberately reverses the canonical alternate order.
+        self.compose_with_voters(
+            [self.alternates[1], self.primary, self.alternates[0]]
+                .map(|voter| self.pools[voter].clone()),
+        )
+        .expect("compose V2 publication adapter")
     }
 
     fn compose_with_voters(
@@ -362,6 +375,7 @@ impl Fixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_failover_pre_and_post_reads_preserve_provider_calls() {
     let mut fixture = Fixture::start().await;
+    let [first, _] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     fixture.faults(2, (0..6).map(|_| ReadFault::Hold));
@@ -370,7 +384,7 @@ async fn publication_authority_failover_pre_and_post_reads_preserve_provider_cal
         .publish(&mut publication)
         .await
         .expect("alternate voter keeps publication available");
-    assert_eq!(fixture.take_trace(), [2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0]);
+    assert_eq!(fixture.take_trace(), [2, first].repeat(6));
     assert_eq!(fixture.publication_provider.counts(), [1, 1, 1, 0]);
     assert_eq!(
         fixture.fleet.application_sequences().await,
@@ -394,6 +408,7 @@ async fn publication_authority_failover_pre_and_post_reads_preserve_provider_cal
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_failover_survives_primary_listener_loss() {
     let mut fixture = Fixture::start().await;
+    let [first, _] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     let before = fixture.fleet.application_sequences().await;
@@ -406,7 +421,7 @@ async fn publication_authority_failover_survives_primary_listener_loss() {
         .publish(&mut publication)
         .await
         .expect("retained capsule publishes after original ingress disappears");
-    assert_eq!(fixture.take_trace(), [0; 6]);
+    assert_eq!(fixture.take_trace(), [first; 6]);
     assert_eq!(fixture.publication_provider.counts(), [1, 1, 1, 0]);
     assert_eq!(fixture.fleet.application_sequences().await, before);
     fixture.quiesce().await;
@@ -415,6 +430,7 @@ async fn publication_authority_failover_survives_primary_listener_loss() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_failover_fresh_postcheck_and_canonical_alternates() {
     let mut fixture = Fixture::start().await;
+    let [first, second] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     fixture.faults(2, [ReadFault::Pass, ReadFault::Hold]);
@@ -422,17 +438,17 @@ async fn publication_authority_failover_fresh_postcheck_and_canonical_alternates
         .publish_fresh_established(&mut publication)
         .await
         .expect("fresh postcheck failover");
-    assert_eq!(fixture.take_trace(), [2, 2, 0]);
+    assert_eq!(fixture.take_trace(), [2, 2, first]);
     assert_eq!(fixture.publication_provider.counts(), [0, 0, 0, 1]);
 
     let mut publication = fixture.establish(&adapter, 2).await;
     fixture.faults(2, (0..6).map(|_| ReadFault::Hold));
-    fixture.faults(0, (0..6).map(|_| ReadFault::Hold));
+    fixture.faults(first, (0..6).map(|_| ReadFault::Hold));
     adapter
         .publish(&mut publication)
         .await
         .expect("last fixed voter serves every barrier");
-    assert_eq!(fixture.take_trace(), [2, 0, 1].repeat(6));
+    assert_eq!(fixture.take_trace(), [2, first, second].repeat(6));
     assert_eq!(fixture.publication_provider.counts(), [1, 1, 1, 1]);
     fixture.quiesce().await;
 }
@@ -440,6 +456,7 @@ async fn publication_authority_failover_fresh_postcheck_and_canonical_alternates
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_failover_rejection_is_terminal_before_and_after_effect() {
     let mut fixture = Fixture::start().await;
+    let [first, _] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     fixture.faults(2, [ReadFault::Rejected]);
@@ -451,12 +468,12 @@ async fn publication_authority_failover_rejection_is_terminal_before_and_after_e
     assert_eq!(fixture.publication_provider.counts(), [0, 0, 0, 0]);
 
     fixture.faults(2, [ReadFault::Hold]);
-    fixture.faults(0, [ReadFault::Rejected]);
+    fixture.faults(first, [ReadFault::Rejected]);
     assert_eq!(
         adapter.publish(&mut publication).await,
         Err(PublicationError::AuthorityRejected)
     );
-    assert_eq!(fixture.take_trace(), [2, 0]);
+    assert_eq!(fixture.take_trace(), [2, first]);
     assert_eq!(fixture.publication_provider.counts(), [0, 0, 0, 0]);
 
     fixture.faults(2, [ReadFault::Pass, ReadFault::Rejected]);
@@ -479,12 +496,12 @@ async fn publication_authority_failover_rejection_is_terminal_before_and_after_e
 
     let mut publication = fixture.establish(&adapter, 2).await;
     fixture.faults(2, [ReadFault::Pass, ReadFault::Hold]);
-    fixture.faults(0, [ReadFault::Rejected]);
+    fixture.faults(first, [ReadFault::Rejected]);
     assert_eq!(
         adapter.publish_fresh_established(&mut publication).await,
         Err(PublicationError::RecoveryRequired)
     );
-    assert_eq!(fixture.take_trace(), [2, 2, 0]);
+    assert_eq!(fixture.take_trace(), [2, 2, first]);
     assert_eq!(fixture.publication_provider.counts(), [1, 0, 0, 2]);
     fixture.quiesce().await;
 }
@@ -492,6 +509,7 @@ async fn publication_authority_failover_rejection_is_terminal_before_and_after_e
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_failover_all_unavailable_retains_same_capsule() {
     let mut fixture = Fixture::start().await;
+    let [first, second] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     for voter in 0..3 {
@@ -501,7 +519,7 @@ async fn publication_authority_failover_all_unavailable_retains_same_capsule() {
         adapter.publish(&mut publication).await,
         Err(PublicationError::AuthorityUnavailable)
     );
-    assert_eq!(fixture.take_trace(), [2, 0, 1]);
+    assert_eq!(fixture.take_trace(), [2, first, second]);
     assert_eq!(fixture.publication_provider.counts(), [0, 0, 0, 0]);
     adapter
         .publish(&mut publication)
@@ -515,6 +533,7 @@ async fn publication_authority_failover_all_unavailable_retains_same_capsule() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_failover_cancellation_does_not_advance_or_replay() {
     let mut fixture = Fixture::start().await;
+    let [first, _] = fixture.alternates;
     let adapter = fixture.compose();
     for (nonce, postcheck) in [(1, false), (2, true)] {
         let mut publication = fixture.establish(&adapter, nonce).await;
@@ -523,11 +542,11 @@ async fn publication_authority_failover_cancellation_does_not_advance_or_replay(
         } else {
             fixture.faults(2, [ReadFault::Hold]);
         }
-        fixture.faults(0, [ReadFault::Hold]);
+        fixture.faults(first, [ReadFault::Hold]);
         let mut publish = Box::pin(adapter.publish_fresh_established(&mut publication));
         tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
-                _ = fixture.transports[0].publication_reads.entered.notified() => {}
+                _ = fixture.transports[first].publication_reads.entered.notified() => {}
                 result = &mut publish => panic!("alternate read must stay pending: {result:?}"),
             }
         })
@@ -536,7 +555,11 @@ async fn publication_authority_failover_cancellation_does_not_advance_or_replay(
         drop(publish);
         assert_eq!(
             fixture.take_trace(),
-            if postcheck { vec![2, 2, 0] } else { vec![2, 0] }
+            if postcheck {
+                vec![2, 2, first]
+            } else {
+                vec![2, first]
+            }
         );
         let fresh_calls = usize::from(postcheck);
         assert_eq!(
@@ -739,6 +762,7 @@ async fn publication_authority_failover_existing_constructor_remains_single_pool
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_review_stalled_primary_leaves_time_for_alternate() {
     let mut fixture = Fixture::start().await;
+    let [first, _] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     fixture.faults(2, [ReadFault::Hold]);
@@ -746,7 +770,7 @@ async fn publication_authority_review_stalled_primary_leaves_time_for_alternate(
         .publish(&mut publication)
         .await
         .expect("stalled primary leaves alternate a budget");
-    assert_eq!(fixture.take_trace(), [2, 0, 2, 2, 2, 2, 2]);
+    assert_eq!(fixture.take_trace(), [2, first, 2, 2, 2, 2, 2]);
     assert_eq!(fixture.publication_provider.counts(), [1, 1, 1, 0]);
     fixture.quiesce().await;
 }
@@ -754,27 +778,29 @@ async fn publication_authority_review_stalled_primary_leaves_time_for_alternate(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_review_shutdown_alternate_does_not_end_traversal() {
     let mut fixture = Fixture::start().await;
+    let [first, second] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     fixture.pools[2].shutdown().await;
-    fixture.pools[0].shutdown().await;
+    fixture.pools[first].shutdown().await;
     adapter
         .publish(&mut publication)
         .await
         .expect("third pool can still answer");
-    assert_eq!(fixture.take_trace(), [1; 6]);
+    assert_eq!(fixture.take_trace(), [second; 6]);
     assert_eq!(fixture.publication_provider.counts(), [1, 1, 1, 0]);
     let snapshots = adapter.publication_pool_diagnostics();
     assert_eq!(snapshots.len(), 3);
     assert_eq!(snapshots[0], adapter.diagnostics_with_pool().pool);
-    assert_eq!(snapshots[1], fixture.pools[0].diagnostics_without_io());
-    assert_eq!(snapshots[2], fixture.pools[1].diagnostics_without_io());
+    assert_eq!(snapshots[1], fixture.pools[first].diagnostics_without_io());
+    assert_eq!(snapshots[2], fixture.pools[second].diagnostics_without_io());
     fixture.quiesce().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_review_all_server_rejections_are_terminal() {
     let mut fixture = Fixture::start().await;
+    let [first, _] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     fixture.pools[2].shutdown().await;
@@ -785,7 +811,7 @@ async fn publication_authority_review_all_server_rejections_are_terminal() {
         SessionConsumerRejection::TopologyMismatch,
         SessionConsumerRejection::Unauthorized,
     ] {
-        fixture.faults(0, [ReadFault::ServerRejected(rejection)]);
+        fixture.faults(first, [ReadFault::ServerRejected(rejection)]);
         assert_eq!(
             adapter.publish(&mut publication).await,
             Err(if rejection == SessionConsumerRejection::Unavailable {
@@ -796,7 +822,7 @@ async fn publication_authority_review_all_server_rejections_are_terminal() {
         );
         assert_eq!(
             fixture.take_trace(),
-            [0],
+            [first],
             "no third voter after a server rejection"
         );
         assert_eq!(fixture.publication_provider.counts(), [0; 4]);
@@ -849,18 +875,20 @@ async fn publication_authority_server_unavailable_preserves_retry_class_and_post
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_hello_rejection_stops_before_healthy_alternate() {
     let mut fixture = Fixture::start().await;
-    // TLS authenticates exactly voter 0, but its Hello authorizer names voter 1.
+    let [first, second] = fixture.alternates;
+    // TLS authenticates the first alternate, but Hello names the second.
     // The real listener must return HelloRejected(TopologyMismatch), before
     // receiving any publication read and without a TLS authentication failure.
-    let authorizer = three_voter_authorizer(&fixture.fleet.stores[1], &fixture.client_spiffe).await;
+    let authorizer =
+        three_voter_authorizer(&fixture.fleet.stores[second], &fixture.client_spiffe).await;
     let signer = ProductionRosterAttestationIssuer::new(
-        fixture.fleet.consensus_identity(0),
+        fixture.fleet.consensus_identity(first),
         authorizer.scope(),
     );
-    let transport = fixture.transports[0].clone();
+    let transport = fixture.transports[first].clone();
     let (server, address) = SessionQuorumConsumerServer::new(
         transport.clone(),
-        fixture.pki.server_config(&three_voter_spiffe(0)),
+        fixture.pki.server_config(&three_voter_spiffe(first)),
         authorizer,
     )
     .with_roster_v2_ingress(transport, signer)
@@ -868,12 +896,12 @@ async fn publication_authority_hello_rejection_stops_before_healthy_alternate() 
     .await
     .expect("Hello rejection listener");
     let server = AbortConsumerServerOnDrop::new(server);
-    fixture.pools[0] = protected_roster_v2_persistent_client(
+    fixture.pools[first] = protected_roster_v2_persistent_client(
         &fixture.pki,
         address,
-        &three_voter_spiffe(0),
+        &three_voter_spiffe(first),
         &fixture.client_spiffe,
-        fixture.fleet.voter_authority(0),
+        fixture.fleet.voter_authority(first),
     );
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
@@ -886,11 +914,16 @@ async fn publication_authority_hello_rejection_stops_before_healthy_alternate() 
         fixture.take_trace().is_empty(),
         "no application read was dispatched"
     );
-    let failures = fixture.pools[0].diagnostics_without_io();
+    let failures = fixture.pools[first].diagnostics_without_io();
     assert_eq!(failures.hello_attempts, 1, "real Hello: {failures:?}");
     assert_eq!(failures.hello_failures, 1, "Hello rejection: {failures:?}");
     assert_eq!(failures.tls_failures, 0, "TLS completed: {failures:?}");
-    assert_eq!(fixture.pools[1].diagnostics_without_io().setup_attempts, 0);
+    assert_eq!(
+        fixture.pools[second]
+            .diagnostics_without_io()
+            .setup_attempts,
+        0
+    );
     assert_eq!(fixture.publication_provider.counts(), [0; 4]);
     server.abort_and_wait().await;
     fixture.quiesce().await;
@@ -899,14 +932,15 @@ async fn publication_authority_hello_rejection_stops_before_healthy_alternate() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_review_primary_recovers_during_alternate_read() {
     let mut fixture = Fixture::start().await;
+    let [first, _] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     fixture.faults(2, [ReadFault::Release]);
-    fixture.faults(0, [ReadFault::Release]);
+    fixture.faults(first, [ReadFault::Release]);
     let mut publish = Box::pin(adapter.publish(&mut publication));
     tokio::time::timeout(Duration::from_secs(10), async {
         tokio::select! {
-            _ = fixture.transports[0].publication_reads.entered.notified() => {}
+            _ = fixture.transports[first].publication_reads.entered.notified() => {}
             result = &mut publish => panic!("alternate should be waiting: {result:?}"),
         }
     })
@@ -928,9 +962,12 @@ async fn publication_authority_review_primary_recovers_during_alternate_read() {
         "late primary cannot satisfy alternate's barrier"
     );
     assert_eq!(fixture.publication_provider.counts(), [0; 4]);
-    fixture.transports[0].publication_reads.release.notify_one();
+    fixture.transports[first]
+        .publication_reads
+        .release
+        .notify_one();
     publish.await.expect("alternate completes the barrier");
-    assert_eq!(fixture.take_trace(), [2, 0, 2, 2, 2, 2, 2]);
+    assert_eq!(fixture.take_trace(), [2, first, 2, 2, 2, 2, 2]);
     assert_eq!(fixture.publication_provider.counts(), [1, 1, 1, 0]);
     fixture.quiesce().await;
 }
@@ -938,6 +975,7 @@ async fn publication_authority_review_primary_recovers_during_alternate_read() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_review_consensus_member_stopped() {
     let mut fixture = Fixture::start().await;
+    let [first, _] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     fixture.servers.remove(2).abort_and_wait().await;
@@ -955,7 +993,7 @@ async fn publication_authority_review_consensus_member_stopped() {
         .publish(&mut publication)
         .await
         .expect("two live consensus members serve publication");
-    assert_eq!(fixture.take_trace(), [0; 6]);
+    assert_eq!(fixture.take_trace(), [first; 6]);
     assert_eq!(fixture.publication_provider.counts(), [1, 1, 1, 0]);
     fixture.quiesce().await;
 }
@@ -981,19 +1019,20 @@ async fn publication_authority_review_retired_member_response_is_terminal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publication_authority_review_partitioned_alternate_cannot_serve_stale_current() {
     let mut fixture = Fixture::start().await;
+    let [first, second] = fixture.alternates;
     let adapter = fixture.compose();
     let mut publication = fixture.establish(&adapter, 1).await;
     fixture.pools[2].shutdown().await;
-    fixture.fleet.isolate(0).await;
+    fixture.fleet.isolate(first).await;
     fixture
         .fleet
-        .wait_for_admitted_quorum_leader(&[1, 2], 0)
+        .wait_for_admitted_quorum_leader(&[second, 2], 0)
         .await;
     adapter
         .publish(&mut publication)
         .await
         .expect("partitioned reader times out before healthy reader answers");
-    assert_eq!(fixture.take_trace(), [0, 1].repeat(6));
+    assert_eq!(fixture.take_trace(), [first, second].repeat(6));
     assert_eq!(fixture.publication_provider.counts(), [1, 1, 1, 0]);
     fixture.quiesce().await;
 }
@@ -1002,17 +1041,19 @@ async fn publication_authority_review_partitioned_alternate_cannot_serve_stale_c
 async fn publication_authority_review_tls_alpn_and_io_alternates_are_retryable() {
     for fault in ["tls", "alpn", "io"] {
         let mut fixture = Fixture::start().await;
+        let [first, second] = fixture.alternates;
         let mut extra_server = None;
         let wrong_pki = TestPki::new();
         let address = match fault {
             "alpn" => {
                 let authorizer =
-                    three_voter_authorizer(&fixture.fleet.stores[0], &fixture.client_spiffe).await;
-                let service = Arc::new(fixture.fleet.stores[0].consumer_service());
+                    three_voter_authorizer(&fixture.fleet.stores[first], &fixture.client_spiffe)
+                        .await;
+                let service = Arc::new(fixture.fleet.stores[first].consumer_service());
                 // This listener negotiates ordinary consumer ALPNs only.
                 let (server, address) = SessionQuorumConsumerServer::new(
                     service,
-                    fixture.pki.server_config(&three_voter_spiffe(0)),
+                    fixture.pki.server_config(&three_voter_spiffe(first)),
                     authorizer,
                 )
                 .listen("127.0.0.1:0".parse().expect("listener address"))
@@ -1022,18 +1063,18 @@ async fn publication_authority_review_tls_alpn_and_io_alternates_are_retryable()
                 address
             }
             "io" => "127.0.0.1:0".parse().expect("unreachable endpoint"),
-            _ => fixture.addresses[0],
+            _ => fixture.addresses[first],
         };
-        fixture.pools[0] = protected_roster_v2_persistent_client(
+        fixture.pools[first] = protected_roster_v2_persistent_client(
             if fault == "tls" {
                 &wrong_pki
             } else {
                 &fixture.pki
             },
             address,
-            &three_voter_spiffe(0),
+            &three_voter_spiffe(first),
             &fixture.client_spiffe,
-            fixture.fleet.voter_authority(0),
+            fixture.fleet.voter_authority(first),
         );
         let adapter = fixture.compose();
         let mut publication = fixture.establish(&adapter, 1).await;
@@ -1042,9 +1083,9 @@ async fn publication_authority_review_tls_alpn_and_io_alternates_are_retryable()
             .publish(&mut publication)
             .await
             .unwrap_or_else(|error| panic!("{fault} alternate must be skipped: {error:?}"));
-        assert_eq!(fixture.take_trace(), [1; 6]);
+        assert_eq!(fixture.take_trace(), [second; 6]);
         assert_eq!(fixture.publication_provider.counts(), [1, 1, 1, 0]);
-        let failures = fixture.pools[0].diagnostics_without_io();
+        let failures = fixture.pools[first].diagnostics_without_io();
         match fault {
             "tls" => assert!(
                 failures.authentication >= 6,
