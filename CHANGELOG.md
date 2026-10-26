@@ -22,31 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and loss-qualified same-group restore remain unimplemented; RFC 017 row
   017-1 is now `partial`. Refs #663.
 
-- `opc-persist`: retained-authority provisioning is now crash-resumable. A
-  fixed-size authenticated provisioning intent (`<database>.opc-retained.intent`).
-  It binds the exact topology, backing identity, key scope, audit-key
-  epoch/fingerprint and operation class (new authority or member repair), carries
-  fresh per-publication entropy, and is synced with its parent directory before
-  the first artifact mutation. Request identity for resume/conflict decisions is
-  that authenticated binding digest plus the operation class; the API carries no
-  caller request id, so two publications with the same binding/audit key/class
-  are the same request. A retry
-  of the same interrupted request either reconciles a committed admission
-  exactly once (returning the validated backend even when the original caller
-  never observed success) or removes its authenticated partial prefix under
-  the exclusive lifetime lock and runs one fresh attempt, so no caller marker
-  deletion, guessed cleanup or manual backing replacement is needed for an
-  interruption caused by that transaction. Conflicting requests, foreign data,
-  unverifiable records beside artifacts and established stores are never
-  adopted, overwritten or deleted; committed-store validation failure stays
-  `RecoveryRequired`/`Rejected`. Established database and admission-record
-  formats are unchanged, and cancellation/deadline outcomes remain
-  `AdmissionBound`/`Indeterminate` with same-request resumability, distinct
-  from `RetainedConfigOpenRetirement`. The deterministic crash matrix now
-  covers intent publication, lock/database/schema/binding/sync/record/intent
-  boundaries plus injected I/O faults, same-request resume,
-  conflicting-request refusal, lock-leak, partial-authority and
-  established-store-loss assertions. Refs #1114.
+- `opc-persist`: retained configuration provisioning publishes authenticated,
+  request-bound intent, a complete database and a completion witness using
+  atomic no-replacement links. Explicit resume finishes the same authorized
+  request after interruption without deleting or replacing existing artifacts;
+  ordinary reopen never initializes storage. Conflicting keys, requests and
+  unverifiable records are preserved and refused. Writer exclusion remains held
+  until SQLite and every extra database descriptor close. Subprocess crashes,
+  I/O faults, cancellation/join and public authority/member-repair resume paths
+  cover the lifecycle. Refs #1114.
 
 - `opc-gtpu-dataplane`: publish the RFC 016 external selector-adapter codec
   module `selector_adapter_codec`: versioned canonical namespace binding
@@ -251,6 +235,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store` and `opc-persist`: retain the `Unplanned` shutdown reason
+  when an unplanned request races admission fencing or preparation completion.
+  Already published reports remain unchanged. (#1376)
+
+- `opc-consensus`, `opc-session-store` and `opc-persist`: voter-slot request
+  reads retain the original deadline while waiting for strict publication.
+  Control replies read state and evidence from one durable cut; post-dispatch
+  expiry remains an unknown outcome. The public session `voter_slot_state()`
+  observer now waits for publication up to the store's operation timeout.
+  The reader trait retains its original method and adds a defaulted bounded
+  method. (#1205)
+
 - `opc-session-store`: native key-removal business-change journal (partial
   #1252, PR2a). `BusinessChanges` can now stage an exact-predecessor key
   retirement as one `after=None` change with the predecessor content stamp and
@@ -415,24 +411,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authoritative the backend keeps the typed `FencedTransitionHistoryFull`
   failure without mutating state. Refs #1257.
 
-- `opc-proto-ngap` / `opc-sctp` / `opc-protocol`: the N3IWF receive path no
-  longer leaves N3IWF security-key octets in uncleared SDK-owned heap buffers.
-  SCTP inbound payloads use a uniquely owned `SensitiveBytes` buffer zeroized on
-  drop; the NGAP raw receive copy uses the same carrier; and the id-SecurityKey
-  IE payload is moved out of the generated typed `Any` copy into the owning
-  PDU's zeroizing storage, with canonical encoding substituting the exact bytes
-  back. Every decode error after the key IE is parsed scrubs partial open-type
-  copies first. `SecurityKey::copy_into_zeroizing` provides the explicit
-  `Zeroizing<Vec<u8>>` hand-off the IKEv2 protocol-key import requires. Received
-  payload/Pdu types no longer clone or compare implicitly, and `Debug` stays
-  length/structure-only. Content clearing is proven by safe drop-audit unit
-  tests on the shared `SensitiveBytes` carrier, which now owns the raw receive
-  copy, the SCTP inbound payload and the extracted id-SecurityKey octets
-  (`SensitiveBytes::from_vec` adopts an owned vector's allocation without an
-  intermediate copy); the explicit IKEv2 hand-off copy remains
-  `Zeroizing<Vec<u8>>`. Allocation-counter integration tests prove the decode,
-  error and drop paths retain no allocation, with positive controls for `Vec`
-  and `bytes::Bytes` retention. Refs #1262.
+- `opc-proto-ngap` / `opc-sctp`: retain wiping custody of received security
+  material through SCTP accumulation and growth, the last payload reference,
+  raw PDU storage, each decoded IE, coalesced fragments and error/policy discards.
+  The typed SecurityKey value remains intact for admission and reconstruction.
+  `SecurityKey::to_zeroizing()` provides an explicit protected provider handoff.
+  Live drop observers check every owner before release, with and without keys;
+  allocation-counter tests additionally check for retained allocations. Valid
+  fragmented SEQUENCE extension bitmaps remain accepted without copying their
+  additions. Non-canonical short bitmap lengths are rejected. Refs #1262.
+
 - `opc-gtpu-dataplane`: one subscriber can no longer monopolize the shared
   inner-uplink IPv4 fragment-affinity table. Bucket selection is partitioned by
   the attachment interface index and the subscriber PAA, so a subscriber is
@@ -493,15 +481,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readback; the eBPF userspace adapter returns the same typed refusal until its
   committed datapath object is rebuilt with zero-peer-TEID support. Refs #1346.
 
-- `opc-proto-gtpv2c`: an S2b Update Bearer request or response carrying a
-  Protocol Configuration Options (PCO) IE no longer rejects the rest of the
-  procedure. PCO is not S2b-applicable (`CONFORMANCE.md`; TS 29.274 Tables
-  7.2.15/7.2.16), so it is handled as an unexpected IE under clause 7.7.9: the
-  procedure continues, the IE is retained byte-for-byte in the projection's
-  additional IEs, and the SDK never interprets it (a caller that re-encodes the
-  projected message will carry it). Malformed PCO and mandatory-field
-  validation are unchanged, and Create Bearer behaviour is unchanged.
-  Refs #1441.
+- `opc-proto-gtpv2c`: accept unknown extension octets after the required
+  Bearer QoS prefix while retaining 40-bit rate bounds and QoS validation.
+  Canonical encoding emits the known fields; raw-preserving message encoding
+  retains the extension. Refs #1356 (GTPv2-C item).
+
+- `opc-proto-gtpv2c`: S2b receive discards unexpected Update Bearer PCO,
+  non-S2b-U Create/Update Bearer F-TEIDs, and SGW-only Create/Update/Delete
+  Bearer control entries before typed decoding. Mandatory fields, TLIV framing,
+  strict sender validation and Create Bearer PCO compatibility are preserved.
+  Raw-preserving encoding retains the received bytes. Fixes #1441.
 
 - `opc-session-store`: a cancelled Dynamic-authority current-snapshot
   admission no longer releases publication exclusion, its namespace lease or
@@ -529,6 +518,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-persist`: the retained configuration admission encoding now includes a
+  permanent intent and completion witness. Crossing this format boundary
+  requires a fresh installation. The Linux filesystem must support `O_TMPFILE`,
+  atomic hard links, file/directory synchronization and `flock`; procfs is also
+  required. Use `begin_resume_config_authority` or
+  `begin_resume_config_member_repair` for interrupted binding-based requests.
+  Explicit request IDs use the transaction provision/resume/reopen APIs and
+  must be retained independently of the destination database. Refs #1114.
+
+- `opc-proto-gtpv2c`: correct ARP capability and vulnerability wire polarity.
+  The public booleans mean "may pre-empt" and "may be pre-empted"; `true` now
+  maps to a clear PCI/PVI bit, as TS 29.212 requires. Callers that compensated
+  for the old inversion must remove that compensation. Priority levels remain
+  literal 1..=15; `cmp_priority` compares importance with level 1 highest.
+  Fixes #1354.
+
 - `opc-session-net` (fresh-install boundary): session cluster identity, consensus
   node IDs and the configuration digest are installation-qualified. Every
   `SessionReplicationManifest` constructor now requires the persisted non-zero
@@ -554,24 +559,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses the newer marker. No in-place migration is provided; drain or
   re-create the attachment in either direction. Refs #1007.
 
-- `opc-sctp`: `InboundMessage.payload` is now `opc_protocol::SensitiveBytes`
-  (uniquely owned, zeroized on drop, `Debug` length-only, no `Clone`,
-  `PartialEq` or `Eq`); `InboundMessage` itself no longer derives
-  `Clone`/`PartialEq`/`Eq`. `N2Payload::payload()` returns `&SensitiveBytes` and
-  `N2Payload::into_payload()` returns `SensitiveBytes`;
-  `DiameterSctpPeer::inbound_payload` returns `&[u8]`. `OutboundMessage` now has
-  a redacted `Debug` implementation instead of a derived payload-printing one.
-  Callers that copied or compared received payloads must make the copy/compare
-  explicit. Refs #1262.
+- `opc-proto-ngap`: `Pdu`, `PduKind`, `Message` and borrowed `ProtocolIe`
+  no longer implement cloning or equality over opaque key-bearing bytes.
+  `Pdu.raw`, unknown message bodies and decoded IE values use redacted
+  `SensitiveBytes` owners that clear storage on drop. `messages` exposes owned
+  containers with uniform `u16` IE identifiers and `Criticality`, replacing the
+  generated containers. Use borrowed bytes and explicit reconstruction instead
+  of cloning. `opc-sctp::InboundMessage` likewise loses cloning and equality;
+  its payload retains the `Bytes` API with wiping ownership through N2 handoff
+  and the final shared reference. Outbound message diagnostics expose payload
+  length only. Refs #1262.
 
-- `opc-proto-ngap`: `Pdu.raw` is private; use `Pdu::raw()` (and
-  `Pdu::has_raw()`), with `Pdu::new(kind)` for constructed PDUs. `Pdu` no longer
-  derives `Clone`, `PartialEq` or `Eq`, and `Message`/`PduKind` no longer derive
-  `Clone`/`PartialEq`/`Eq` because received structures must not be duplicated or
-  compared implicitly. `Message::Unknown` carries `SensitiveBytes` instead of
-  `bytes::Bytes`. The id-SecurityKey IE appears as an empty typed placeholder;
-  admission reads the key from the PDU's zeroizing storage and canonical
-  encoding reproduces the original bytes. Refs #1262.
+- `opc-proto-ngap`: uplink/downlink transport `address()` now returns
+  `TransportLayerAddress`, preserving IPv4, IPv6 or both addresses from a
+  160-bit NGAP value. Existing `new(IpAddr, teid)` constructors remain; use
+  `with_address` for combined values and match the address variant before
+  selecting a destination. Setup and Modify tunnel codecs preserve both
+  families in TS 38.414 order, including nested additional tunnels. Refs #1357.
+
 - `opc-session-net`: `StartupError` adds `BootRefused(BootRefusalReason)` for an
   authenticated issuer refusal of one exact candidate boot attempt. It is
   distinct from retryable `Unavailable`/`AuthTimeUnavailable` results and grants
@@ -814,6 +819,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readback failure revokes every outstanding source, after which it reports
   `Unavailable` and never becomes readable again. Ports without backend-owned
   sockets keep the default `Unsupported` result. Refs #1021.
+
+- `opc-gtpu-dataplane`: expose IPv4 uplink FAR misses by passed and dropped
+  outcome, retaining `uplink_far_misses` as their sum. Reserved counter slots
+  preserve the map layout; forwarding behavior is unchanged. The public
+  `EbpfGtpuDatapathCounters` remains exhaustive: out-of-crate struct literals
+  and exhaustive destructurings must add `uplink_far_misses_passed` and
+  `uplink_far_misses_dropped`. When adopting a pre-split counter pin, the public
+  total starts from the new outcome slots; earlier raw-slot history cannot be
+  attributed to either outcome. (#1184)
 
 - `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
   verification time for certificate validity checks while preserving SPIFFE ID,
@@ -1566,6 +1580,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-gtpu-dataplane`: measured End Marker and redirect-delivery timeouts now
+  report redirect deltas, iteration, counters, tentative IPv6 addresses, and
+  neighbour/route state, including failed diagnostic reads. Packet counts and
+  measurement deadlines are unchanged. (#1188)
 
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 

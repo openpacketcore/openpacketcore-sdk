@@ -331,6 +331,8 @@ pub(crate) enum Point {
     BeforeNativeSnapshotRead,
     BeforeNativeSnapshotWriteback,
     BeforeNativePublicRead,
+    #[cfg(test)]
+    AfterNativeVoterRead,
     BeforeNativeGenerationAppend,
     AfterNativeGenerationCapture,
     AfterNativeGenerationAppend,

@@ -3,15 +3,12 @@
 //! `allocation_counter` observes counts/bytes, not freed contents. These tests
 //! prove the sensitive carrier and the N2 admission path retain no allocation,
 //! with positive controls for `Vec` and `bytes::Bytes` retention. Content
-//! clearing is asserted by the drop-audit unit tests in `opc_protocol`.
+//! clearing is asserted by the SCTP receive-owner drop-audit unit tests.
 
 use allocation_counter::measure;
 use bytes::Bytes;
-use opc_protocol::SensitiveBytes;
 use opc_sctp::n2::{N2Inbound, UnprotectedN2Profile};
-use opc_sctp::{
-    DeliveryOrder, InboundMessage, OutboundMessage, PayloadProtocolIdentifier, NGAP_PPID,
-};
+use opc_sctp::{DataChunk, InboundMessage, OutboundMessage, PayloadProtocolIdentifier, NGAP_PPID};
 
 const KEY: [u8; 32] = [
     0x5a, 0xa5, 0x3c, 0xc3, 0x69, 0x96, 0x0f, 0xf0, 0x17, 0x71, 0x2b, 0xb2, 0x4d, 0xd4, 0x8e, 0xe8,
@@ -19,17 +16,16 @@ const KEY: [u8; 32] = [
 ];
 
 fn keyed_inbound() -> InboundMessage {
-    InboundMessage {
-        payload: SensitiveBytes::from_slice(&KEY),
-        stream_id: 7,
-        ppid: PayloadProtocolIdentifier::new(NGAP_PPID.get()),
-        order: DeliveryOrder::Ordered,
-        assoc_id: 41,
-        notification: false,
-        event: None,
-        truncated: false,
-        control_truncated: false,
-    }
+    let mut chunk = [0u8; 48];
+    chunk[1] = 3; // Unfragmented DATA: B and E.
+    chunk[2..4].copy_from_slice(&48u16.to_be_bytes());
+    chunk[8..10].copy_from_slice(&7u16.to_be_bytes());
+    chunk[12..16].copy_from_slice(&NGAP_PPID.get().to_be_bytes());
+    chunk[16..].copy_from_slice(&KEY);
+    DataChunk::decode(&chunk)
+        .expect("synthetic DATA")
+        .into_inbound_message(41)
+        .expect("unfragmented DATA")
 }
 
 #[test]
@@ -84,7 +80,7 @@ fn sensitive_payload_and_outbound_debug_shape_retain_no_allocation() {
 
     let info = measure(|| {
         for _ in 0..8 {
-            drop(SensitiveBytes::from_slice(&KEY));
+            drop(keyed_inbound().payload);
         }
     });
     assert!(info.count_total > 0);

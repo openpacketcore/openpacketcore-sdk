@@ -455,6 +455,9 @@ pub const COUNTER_UL_ENCAP: u32 = 0;
 /// nonzero misses drop under the complete-mark ownership contract. The
 /// datapath's own re-emitted outer frames are excluded and counted under
 /// [`COUNTER_UL_REDIRECT_RESOLVED`] instead.
+/// Each miss also increments [`COUNTER_UL_FAR_MISS_PASSED`] or
+/// [`COUNTER_UL_FAR_MISS_DROPPED`]. A retained pre-split pin can contain earlier
+/// aggregate history here, which cannot be attributed to either outcome.
 pub const COUNTER_UL_FAR_MISS: u32 = 1;
 /// Counter index: downlink G-PDUs decapsulated.
 pub const COUNTER_DL_DECAP: u32 = 2;
@@ -523,12 +526,17 @@ pub const COUNTER_UL_REDIRECT_RESOLVED: u32 = 6;
 /// here: tc leaves it to the stack's own socket lookup, in a frame that the
 /// host does not answer (see [`PACKET_TYPE_MULTICAST`]).
 pub const COUNTER_DL_MISSING_CONSUMER: u32 = 7;
+/// Counter index: IPv4 FAR misses passed unencapsulated because the mark is zero.
+pub const COUNTER_UL_FAR_MISS_PASSED: u32 = 8;
+/// Counter index: IPv4 FAR misses or missing marked owners dropped because
+/// the full packet mark is nonzero. Other authorization failures are excluded.
+pub const COUNTER_UL_FAR_MISS_DROPPED: u32 = 9;
 /// Number of datapath counter slots that carry a counter.
 ///
 /// The slots from here up to [`COUNTER_SLOTS`] are reserved. No program
 /// writes them and they read zero, so a later counter can take the next one
 /// without changing the width of the pinned map.
-pub const COUNTER_SLOTS_IN_USE: u32 = 8;
+pub const COUNTER_SLOTS_IN_USE: u32 = 10;
 /// Number of slots in the pinned per-CPU datapath counter map.
 ///
 /// This is the map's `max_entries`, and part of the retained pin graph's ABI:
@@ -537,6 +545,19 @@ pub const COUNTER_SLOTS_IN_USE: u32 = 8;
 /// [`COUNTER_SLOTS_IN_USE`], so that adding a counter does not change it.
 pub const COUNTER_SLOTS: u32 = 16;
 const _: () = assert!(COUNTER_SLOTS_IN_USE <= COUNTER_SLOTS);
+
+/// Count one IPv4 FAR miss (or missing marked owner) by its forwarding outcome
+/// and in the compatibility total. The caller supplies the per-CPU increment;
+/// neither counter participates in the forwarding decision.
+#[inline(always)]
+pub fn count_uplink_far_miss(mark: u32, mut count: impl FnMut(u32)) {
+    count(COUNTER_UL_FAR_MISS);
+    count(if uplink_non_encapsulation_drops(mark) {
+        COUNTER_UL_FAR_MISS_DROPPED
+    } else {
+        COUNTER_UL_FAR_MISS_PASSED
+    });
+}
 
 /// Binding-drop counter index: no canonical binding exists for the PDR.
 pub const COUNTER_DL_BINDING_INVALID: u32 = 0;
@@ -2601,6 +2622,8 @@ mod tests {
             COUNTER_DL_DST_MISMATCH,
             COUNTER_UL_REDIRECT_RESOLVED,
             COUNTER_DL_MISSING_CONSUMER,
+            COUNTER_UL_FAR_MISS_PASSED,
+            COUNTER_UL_FAR_MISS_DROPPED,
         ];
         let mut seen = std::vec::Vec::new();
         for index in indices {
@@ -2623,6 +2646,25 @@ mod tests {
         // here. Changing it is a pin ABI change with the consequence
         // described above, and must be a deliberate edit of this test.
         assert_eq!(COUNTER_SLOTS, 16);
+    }
+
+    #[test]
+    fn uplink_far_miss_outcomes_keep_exact_counts_and_compatibility_sum() {
+        let mut counters = [0_u64; COUNTER_SLOTS as usize];
+        for (mark, passed, dropped) in [
+            (0, 1, 0),
+            (1, 1, 1),
+            (0x0001_0000, 1, 2),
+            (0, 2, 2),
+            (u32::MAX, 2, 3),
+        ] {
+            count_uplink_far_miss(mark, |index| counters[index as usize] += 1);
+            assert_eq!(counters[COUNTER_UL_FAR_MISS_PASSED as usize], passed);
+            assert_eq!(counters[COUNTER_UL_FAR_MISS_DROPPED as usize], dropped);
+            assert_eq!(counters[COUNTER_UL_FAR_MISS as usize], passed + dropped);
+            assert_eq!(counters[COUNTER_UL_ENCAP as usize], 0);
+            assert_eq!(counters[COUNTER_UL_REDIRECT_RESOLVED as usize], 0);
+        }
     }
 
     #[test]

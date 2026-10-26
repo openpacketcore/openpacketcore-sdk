@@ -310,11 +310,7 @@ impl Legs<'_> {
         let unanswered = after.no_ports - before.no_ports;
         if counted + unanswered != datagrams {
             self.violations.push(format!(
-                "{leg}: of {datagrams} datagram(s), tc dropped and counted {counted} and the host's socket lookup discarded {unanswered}; {}",
-                super::DatapathTimeoutDiagnostics::new("VRF hand-off disposal mismatch")
-                    .observe("missing-consumer drops", datagrams, counted)
-                    .observe("socket-lookup discards", datagrams, unanswered)
-                    .render()
+                "{leg}: of {datagrams} datagram(s), tc dropped and counted {counted} and the host's socket lookup discarded {unanswered}"
             ));
         }
         let after = Counters {

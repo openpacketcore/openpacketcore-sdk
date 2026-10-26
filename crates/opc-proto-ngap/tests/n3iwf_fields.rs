@@ -225,7 +225,7 @@ fn field_diagnostics_never_format_values() {
     let location = N3iwfLocation::new("192.0.2.1".parse().unwrap(), Some(4500), Some(tai.clone()));
     let key = SecurityKey::new(&key);
     let encoded = key.encode(encode_context()).unwrap();
-    let handoff = SecurityKey::new(&[0x53; 32]).copy_into_zeroizing();
+    let handoff = SecurityKey::new(&[0x53; 32]).to_zeroizing();
     assert_eq!(handoff.as_slice(), &[0x53; 32]);
     for text in [
         format!("{:?}", RanUeId::new(123456)),
@@ -292,7 +292,7 @@ fn published_uplink_message_constructs_from_typed_values() {
             decode_context(),
         )
         .unwrap();
-        assert!(pdu.raw().is_empty());
+        assert!(pdu.raw.is_empty());
         let expected = octets(row["wire_hex"].as_str().unwrap());
         assert!(encode(&pdu, encode_context()).unwrap() == expected);
     }

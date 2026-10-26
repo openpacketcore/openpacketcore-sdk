@@ -71,14 +71,17 @@ fn marker(teid: u32) -> Vec<u8> {
     wire
 }
 
-fn receive(socket: &UdpSocket) -> Vec<u8> {
+fn receive(
+    socket: &UdpSocket,
+    diagnostics: &measured_diagnostics::DatapathDiagnostics<'_>,
+) -> Vec<u8> {
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let mut wire = vec![0; 65536];
     let (len, peer) = socket
         .recv_from(&mut wire)
-        .expect("receive ordered N3 datagram");
+        .unwrap_or_else(|error| panic!("receive ordered N3 datagram: {error}\n{diagnostics}"));
     assert_eq!(peer, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
     wire.truncate(len);
     wire
@@ -144,6 +147,12 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(active_uplink.len(), 2);
         assert_eq!(active_downlink.len(), 2);
         let redirects_before = pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED);
+        let iteration = format!("shared_peer_tunnel={shared_peer_tunnel}");
+        let diagnostics = measured_diagnostics::DatapathDiagnostics {
+            pin_dir: &pin_dir,
+            redirects_before,
+            iteration: &iteration,
+        };
         let mut expected = Vec::new();
         for sequence in 0..3 {
             for (index, entry) in desired.entries().iter().enumerate() {
@@ -158,24 +167,33 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         while pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED) < redirects_before + 6 {
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "N3_END_MARKER_REDIRECTS before={redirects_before} current={}",
+                    pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED)
+                );
+                for arguments in [
+                    ["-6", "addr", "show", "dev", "s2bu"],
+                    ["-6", "neigh", "show", "dev", "s2bu"],
+                ] {
+                    let output = Command::new("timeout")
+                        .args(["--signal=KILL", "1s", "ip"])
+                        .args(arguments)
+                        .output()
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "inspect End Marker fixture IPv6 readiness: {error}\n{diagnostics}"
+                            )
+                        });
+                    eprintln!(
+                        "N3_END_MARKER_IPV6 {arguments:?}: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                }
+            }
             assert!(
                 Instant::now() < deadline,
-                "{}",
-                super::DatapathTimeoutDiagnostics::new(
-                    "six GPDU redirects must precede retirement"
-                )
-                .redirect_delta(
-                    i128::from(pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED))
-                        - i128::from(redirects_before)
-                        - 6
-                )
-                .shared_peer_iteration(usize::from(shared_peer_tunnel))
-                .observe(
-                    "redirect-resolved counter",
-                    redirects_before + 6,
-                    pinned_counter(&pin_dir, COUNTER_UL_REDIRECT_RESOLVED)
-                )
-                .render()
+                "six GPDU redirects must precede retirement\n{diagnostics}"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -206,11 +224,15 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         // Leave all six GPDUs queued at the independent peer until submission
         // completes, then prove the markers follow them in the received stream.
         // Cross-family GPDU order is not prescribed; the marker boundary is.
-        let mut observed = (0..6).map(|_| receive(&peer)).collect::<Vec<_>>();
+        let mut observed = (0..6)
+            .map(|_| receive(&peer, &diagnostics))
+            .collect::<Vec<_>>();
         expected.sort();
         observed.sort();
         assert_eq!(observed, expected);
-        let mut markers = (0..count).map(|_| receive(&peer)).collect::<Vec<_>>();
+        let mut markers = (0..count)
+            .map(|_| receive(&peer, &diagnostics))
+            .collect::<Vec<_>>();
         let mut expected_markers = desired
             .entries()
             .iter()
@@ -227,7 +249,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
             }
             assert!(
                 Instant::now() < deadline,
-                "managed receive queue lost the Echo Request"
+                "managed receive queue lost the Echo Request\n{diagnostics}"
             );
             std::thread::sleep(Duration::from_millis(5));
         };
@@ -372,7 +394,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         assert_eq!(repeated.datagram_count(), count);
         for _ in 0..count {
-            assert!(expected_markers.contains(&receive(&peer)));
+            assert!(expected_markers.contains(&receive(&peer, &diagnostics)));
         }
         drop(repeated);
         drop(namespace);

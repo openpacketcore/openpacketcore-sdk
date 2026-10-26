@@ -755,8 +755,9 @@ handoff preparation across clones. It cancels and joins outstanding preparation;
 already dispatched RPCs cannot be retracted. The retained report uses
 `PlannedShutdownFallback::Unplanned` for this route: preparation was suppressed,
 or an already in-flight preparation was cancelled (possibly after handoff RPCs
-were sent, so a successor may already be campaigning). A completed handoff
-result remains unchanged. The same bounded observation, retained engine
+were sent, so a successor may already be campaigning). An already published handoff
+result remains unchanged; a result racing the unplanned request is reported
+as `Unplanned`. The same bounded observation, retained engine
 and native storage drain, and close-proof/reopen checks apply. Surviving voters
 recover through ordinary elections; no operator cleanup is needed. Voluntary
 stops still require the consumer's emergency hold and planned handoff.

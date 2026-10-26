@@ -5,13 +5,14 @@
 //! allocation (leak) on the decode/drop and error paths, and that the counter
 //! does observe both `Vec` and `bytes::Bytes` retention (positive controls).
 //! Content clearing is proven by the safe drop-audit unit tests on
-//! `opc_protocol::SensitiveBytes`, which is the carrier for the raw receive
-//! copy, the extracted key octets and the SCTP payload.
+//! the NGAP and SCTP wiping owners, which observe raw, IE, fragmented and
+//! transport allocations before release. These counters additionally check leaks.
 
 use allocation_counter::measure;
 use bytes::Bytes;
+use opc_proto_ngap::SensitiveBytes;
 use opc_proto_ngap::{decode, encode, Criticality, MessageType, Pdu, ProtocolIe};
-use opc_protocol::{DecodeContext, EncodeContext, SensitiveBytes};
+use opc_protocol::{DecodeContext, EncodeContext};
 use zeroize::Zeroizing;
 
 const KEY_IE_ID: u16 = 94;
@@ -129,7 +130,7 @@ fn key_free_pdu_is_an_allocation_negative_control() {
 fn sensitive_bytes_drop_retains_no_allocation() {
     let info = measure(|| {
         for _ in 0..8 {
-            drop(SensitiveBytes::from_slice(&KEY));
+            drop(SensitiveBytes::new(KEY.to_vec()));
         }
     });
     assert!(info.count_total > 0);

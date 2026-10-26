@@ -7,7 +7,15 @@ replacement storage that must recover history from the existing authenticated
 quorum. Ordinary startup calls only reopen; it must never catch a reopen error
 and call either provisioning operation.
 
-This contract addresses SDK #800. It is not a production-qualification,
+Interrupted provisioning is resumed with the same independently authorized
+binding and key using `begin_resume_config_authority` or
+`begin_resume_config_member_repair`. Callers with a separately retained request
+identifier use `RetainedConfigProvisionRequest` and
+`begin_provision_config_transaction`, `begin_resume_config_provision`, and
+`begin_reopen_config_transaction`. A resume is an explicit continuation of the
+original provisioning authorization, never permission to replace lost authority.
+
+This contract addresses SDK #800 and #1114. It is not a production-qualification,
 whole-store rollback-freshness, or consumer-checkpoint claim (#798 and #799).
 The existing `open_with_audit_key` remains an explicitly create-or-open API for
 its existing consumers; it does not acquire this retained lifecycle guarantee.
@@ -20,6 +28,12 @@ admitted opaque backing and key-scope digests. Do not derive expected authority
 from the storage being reopened. Supply the approved `AuditKey`, an absolute
 path, a validation byte budget, an operation deadline and an explicit
 `RetainedConfigDurability` choice. There are no implicit defaults.
+
+For an explicitly identified request, retain `RetainedConfigProvisionRequest`
+outside the destination database. Ordinary startup uses
+`begin_reopen_config_transaction` with that same request; the binding-based
+`reopen_config_authority` does not open an explicitly identified transaction.
+Only an interrupted provisioning operation uses `begin_resume_config_provision`.
 
 `Durable` requires the SDK filesystem checks and reserved free space.
 `Ephemeral` remains an operator choice that waives durable-filesystem
@@ -74,33 +88,26 @@ progress, so snapshot size alone does not expire a healthy read.
 
 ## SDK-owned local state
 
-The SDK exclusively creates the database and its `.opc-retained` admission file.
+The SDK exclusively creates the database, its `.opc-retained` admission file,
+and its `.opc-retained-complete` completion file.
 The admission file is an authenticated, versioned, fixed-size record and the
 lifetime exclusive lock. The caller never writes, repairs or interprets it.
 It binds the configured scope and audit key epoch/fingerprint to the exact
-parent, admission-file and database identities, a random provisioning nonce,
-and the new-authority/member-repair disposition. Its matching database row is
-part of admission validation. Neither marker presence nor database absence is
+parent and admission-file identities, the provisioning request, and the
+new-authority/member-repair disposition. The authenticated database binding and
+completion file also name the exact database inode. Completion is published only
+after database publication, directory sync, and bounded admission validation.
+An existing completion record with a missing database refuses recovery rather
+than initializing new authority. Existing constructors derive a request identifier
+from the independently supplied binding and key; explicit request constructors
+accept a nonzero 32-byte identifier retained by the caller. Requests are scoped
+to the admitted destination, not a distributed uniqueness service. Neither marker presence nor database absence is
 permission to initialize authority.
 
-While a provisioning operation is in flight, the SDK also publishes one
-fixed-size authenticated provisioning intent beside those files
-(`<database>.opc-retained.intent`). It binds the same topology/backing/key-scope
-digest and audit key epoch/fingerprint as admission plus the operation class
-(new authority or member repair), carries fresh random entropy unique to that
-publication, and its file and parent directory are synced before the first
-artifact mutation. Consent is per publication, but request identity for
-resume/conflict decisions is the authenticated binding digest (topology,
-backing identity, key scope, audit-key epoch/fingerprint) plus the operation
-class: the caller API carries no request id, so two publications with the same
-binding, audit key and operation class are the same request even though their
-entropy differs. The intent is SDK-owned recovery metadata only: it is never
-admission authority, a capability, or permission to create or adopt a store,
-and the established database and admission-record formats are unchanged.
-
 The profile requires private regular files without hard-link aliases or
-symlink path components on a supported Unix filesystem. Atomic `create_new`
-reserves new files; SQLite read-write opening omits `CREATE` and uses
+symlink path components on a supported Linux filesystem. Unnamed temporary files
+and atomic no-replacement links publish complete files; SQLite read-write
+opening omits `CREATE` and uses
 `SQLITE_OPEN_NOFOLLOW`. The exclusive lock remains held by the SQLite
 connection, including detached bounded operations. File identity is checked
 again during admission and subsequent statement authorization. This is
@@ -109,8 +116,9 @@ domain, not isolation against a malicious same-UID process, root, or a hostile
 filesystem. External actors must not rename, relink or modify a live SQLite
 database or its journals.
 
-After the final SDK connection/operation owner finishes, its guard explicitly
-unlocks the admission file. Closing only its descriptor is insufficient:
+After the final SDK connection/operation owner finishes, all extra database
+descriptors close before its guard explicitly unlocks the admission file.
+Closing only the lock descriptor is insufficient:
 an unrelated preflight child can inherit the same open file description until
 exec. That inherited descriptor must neither extend a completed SDK admission
 nor release a later owner's lock when it closes. A failed lock acquisition
@@ -127,53 +135,25 @@ admitted binding, rather than transferring a sender's local storage identity.
 
 ## Provisioning interruption and reopening
 
-A provisioning operation publishes its authenticated intent before touching the
-backing, so a later retry of the *same* request can decide from evidence whether
-to finish or abort the interrupted prefix. It never guesses from marker presence
-alone.
-
-| Last completed boundary | Ordinary reopen | Same-request provisioning retry |
+| Last completed boundary | Ordinary reopen | Explicit same-request resume |
 | --- | --- | --- |
-| Intent published, nothing else | Reject missing storage without creating files. | Authenticated intent matches and no artifact exists: continue the same request. |
-| Admission file and/or database reserved, base/consensus schema, local binding, database sync | Reject incomplete state; preserve artifacts. | Authenticated intent matches: remove that partial prefix while holding the exclusive lock, then run one fresh admitted attempt. |
-| Complete authenticated admission record present | Validate the exact binding, schema and sealed history; reconcile a completed operation even if its original caller received no result. | Reconcile this committed request exactly once, retire the intent and return the validated backend. |
-| Intent missing but provisioning artifacts exist | Reject; never adopt or overwrite. | Refuse `AlreadyExists`; explicit recovery/replacement is still required for foreign or legacy partial state. |
-| Intent authentic but for a different authenticated binding or operation class, or unverifiable beside artifacts | Reject; never adopt, overwrite or delete. | Refuse without mutation; the conflicting request must be resolved explicitly. |
+| Unnamed intent file created, written or synchronized | Reject missing storage. | Start the same authorized request; unnamed files retire on exit. |
+| Authenticated intent published and directory synchronized | Reject missing database. | Build a complete database for this exact intent. |
+| Database/schema/binding built in memory or in an unnamed file | Reject missing database. | Rebuild automatically; no partial database is published. |
+| Complete synchronized database published without completion | Reject incomplete provisioning. | Re-sync publication, validate the database, and publish completion. |
+| Authenticated completion published | Validate the exact binding, schema and sealed history. | Re-sync publication and validate the same completed result. |
+| Completion remains but the database is missing | Reject established storage loss. | Reject established storage loss without initialization. |
 
-An interruption caused by this transaction therefore needs no caller-owned
-marker deletion, guessed cleanup or manual backing replacement: retrying the
-same request either completes it exactly once or removes its authenticated
-partial prefix and retries from clean state. A different authenticated binding
-or operation class, foreign data or an unverifiable record beside artifacts is
-never adopted or overwritten.
-Operator recovery remains required for foreign/legacy partial state and for a
-committed store whose authenticated content fails validation; established-store
-loss is never accepted as a provisioning side effect. Coherent whole-store
-rollback still needs the external authority check below.
-
-Recovery outcomes stay value-free and stable:
-- pre-effect rejection (`InvalidRequest`, `AlreadyExists`, `InUse`, or
-  `AdmissionBound` before intent publication) creates nothing and is retryable;
-- success returns one validated backend, including exactly-once reconciliation
-  of a request that committed before its caller observed the result;
-- a retry after an interrupted prefix returns success only after the
-  authenticated abort and the fresh admitted attempt, never a partially usable
-  authority;
-- `RecoveryRequired`/`Rejected` mean conflicting, foreign or unverifiable state
-  that the SDK must not touch.
-Cancellation or a deadline after a possible effect returns `AdmissionBound` or
-`Indeterminate` without a capability; the same request resumes on retry. This is
-distinct from `RetainedConfigOpenRetirement`, which reports opener/join
-retirement and is never rollback or authoritative readback.
-
-The deterministic lane injects process loss at intent publication, lock
-creation, database creation, base and consensus schema initialization, binding
-write, database and parent sync, admission-record write and sync, and intent
-retirement, plus injected I/O failure at each of those persistent steps. It
-proves same-request resume, conflicting-request refusal, no second writer, no
-leaked admission lock, no partially usable authority and no loss of an
-established store. It is process-restart evidence, not a power-loss
-qualification claim.
+Provisioning never overwrites partial or foreign artifacts. Each persistent
+artifact created by this protocol is authenticated resumable intent, a complete
+database, or authenticated completion. No marker deletion, backing replacement or operator cleanup
+is needed for an interruption of this transaction. The new admission encoding
+refuses the previous format; crossing this stored-format boundary requires a
+fresh installation. See the [publication protocol](../../docs/design/retained-config-provisioning.md)
+for ordering, bounds and filesystem assumptions.
+An earlier `.opc-retained.intent` also denies initialization and returns
+`RecoveryRequired`; it is never interpreted as permission to recover or replace
+another format.
 
 Reopening never initializes or migrates retained storage or invokes legacy
 recovery. It compares the complete base schema with an SDK-owned in-memory
@@ -256,6 +236,10 @@ a workload restart, retained volume identifier or fixed roster is insufficient.
 
 SQLite's [open flags](https://www.sqlite.org/c3ref/open.html) distinguish
 read-write opening from creation; its `EXCLUSIVE` open flag is not file
-reservation. The SDK uses filesystem `create_new` for that operation. SQLite's
+reservation. The SDK publishes complete unnamed files using atomic no-replacement links. SQLite's
 [file and journal integrity guidance](https://www.sqlite.org/howtocorrupt.html)
 also applies throughout the lifetime of the admitted storage.
+
+
+The Linux profile requires `O_TMPFILE` on the destination filesystem and procfs
+at `/proc/self/fd`, in addition to the stated lock and synchronization guarantees.

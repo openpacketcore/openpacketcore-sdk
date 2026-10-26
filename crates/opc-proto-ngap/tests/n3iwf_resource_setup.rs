@@ -379,28 +379,30 @@ fn conditional_presence_key_custody_and_constructor_guards_are_explicit() {
     let ResourceSetupMessage::InitialRequest(mut value) = admitted.message else {
         panic!("request");
     };
-    // The id-SecurityKey octets live in the PDU's zeroizing owner, not in the
-    // typed open-type view (whose placeholder is empty). The admitted key must
-    // therefore borrow the PDU's stored copy and match the independent fixture
-    // bytes exactly.
+    let PduKind::Initiating {
+        message: opc_proto_ngap::Message::InitialContextSetupRequest(raw),
+        ..
+    } = &pdu.kind
+    else {
+        panic!("request container");
+    };
+    let key = raw
+        .protocol_ies
+        .0
+        .iter()
+        .find(|v| v.id == 94)
+        .unwrap()
+        .value
+        .as_bytes();
     let reference_fields = fields(request, "fields");
-    let expected_key = field(&reference_fields, 94).expect("fixture key bytes");
-    assert_eq!(&value.key.expose_bytes()[..], expected_key);
-    match &pdu.kind {
-        PduKind::Initiating {
-            message: opc_proto_ngap::Message::InitialContextSetupRequest(raw),
-            ..
-        } => {
-            let placeholder = raw
-                .protocol_ies
-                .0
-                .iter()
-                .find(|v| v.id == 94)
-                .expect("key IE present");
-            assert!(placeholder.value.as_bytes().is_empty());
-        }
-        _ => panic!("request container"),
-    }
+    assert_eq!(
+        &value.key.expose_bytes()[..],
+        field(&reference_fields, 94).unwrap()
+    );
+    assert!(std::ptr::eq(
+        value.key.expose_bytes().as_ptr(),
+        key.as_ptr()
+    ));
     assert!(format!("{value:?}").contains("REDACTED"));
     value.aggregate_bit_rate = None;
     assert!(value.construct(masks(request), context()).is_err());

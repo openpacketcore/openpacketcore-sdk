@@ -69,7 +69,7 @@ fn independently_encoded_identity_and_reroute_fields_are_admitted() {
             };
             assert!(field_value(&pdu, id).unwrap() == octets(leaf));
         }
-        assert!(pdu.raw() == wire);
+        assert!(pdu.raw.as_ref() == wire);
         checked += 1;
     }
     assert_eq!(checked, 219);
@@ -126,7 +126,7 @@ fn independently_encoded_partial_slices_and_selected_nid_are_admitted() {
             );
             rejected += 1;
         }
-        assert!(pdu.raw() == wire);
+        assert!(pdu.raw.as_ref() == wire);
     }
     assert_eq!(accepted, 167);
     assert_eq!(rejected, 76);
@@ -199,7 +199,7 @@ fn slice_identity_duplicates_and_criticality_preserve_policy_then_validate_seman
                 }
                 shared::reconstruct(&admitted.message, ctx, EncodeContext::default());
             }
-            assert!(pdu.raw() == wire);
+            assert!(pdu.raw.as_ref() == wire);
         }
     }
     assert_eq!(duplicates, 7);
@@ -334,7 +334,7 @@ fn partial_slice_and_selected_nid_roots_reject_malformed_extent_padding_and_limi
         let mut tail = wire.clone();
         tail.push(0);
         let (rest, prefix) = Pdu::decode(&tail, context()).unwrap();
-        assert!(rest == [0] && prefix.raw() == wire);
+        assert!(rest == [0] && prefix.raw.as_ref() == wire);
         assert!(Pdu::decode_owned(Bytes::from(tail), context()).is_err());
     }
     assert_eq!(checked, 160);
@@ -529,7 +529,7 @@ fn independently_encoded_optional_fields_are_admitted() {
             }
             _ => panic!("optional field oracle outcome"),
         }
-        assert!(pdu.raw() == wire);
+        assert!(pdu.raw.as_ref() == wire);
         checked += 1;
     }
     assert!(checked == 56, "optional field oracle coverage changed");
@@ -548,7 +548,7 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
         count += 1;
         let expected = octets(row["wire_hex"].as_str().unwrap());
         let pdu = construct(row).construct(context()).unwrap();
-        assert!(pdu.raw().is_empty());
+        assert!(pdu.raw.is_empty());
         assert!(
             encode(&pdu, EncodeContext::default()).unwrap() == expected,
             "complete message differs from reference"
@@ -624,7 +624,7 @@ fn complete_constructed_and_received_messages_match_independent_reference() {
                 assert!(location.port() == Some(4500));
             }
         }
-        assert!(received.raw() == expected);
+        assert!(received.raw.as_ref() == expected);
     }
     assert_eq!(count, 452);
 }
@@ -644,7 +644,7 @@ fn every_missing_mandatory_field_fails_beyond_structural_decode() {
         let wire = octets(row["wire_hex"].as_str().unwrap());
         let pdu = decode(&wire, context()).unwrap();
         assert!(NasMessage::from_pdu(&pdu, context()).is_err());
-        assert!(pdu.raw() == wire);
+        assert!(pdu.raw.as_ref() == wire);
     }
     assert_eq!(count, 11);
 }
@@ -677,7 +677,7 @@ fn outer_duplicate_selection_and_unknown_policy_remain_authoritative() {
                             original
                         }
                 );
-                assert!(pdu.raw() == wire);
+                assert!(pdu.raw.as_ref() == wire);
             }
         }
         if let Some(crit) = row["unknown_criticality"].as_str() {
@@ -712,7 +712,7 @@ fn outer_duplicate_selection_and_unknown_policy_remain_authoritative() {
             let admitted = NasMessage::from_pdu(&dropped, ctx).unwrap();
             assert_eq!(admitted.ignored_ie_count, 0);
             assert!(admitted.notify_ie_ids.is_empty());
-            assert!(dropped.raw() == wire);
+            assert!(dropped.raw.as_ref() == wire);
         }
     }
 }
@@ -748,7 +748,7 @@ fn with_extra(base: &Pdu, id: u16, criticality: Criticality, value: &[u8]) -> Pd
                 .0
                 .iter()
                 .map(|ie| {
-                    ProtocolIe::new(ie.id.0, crit_of(ie.criticality as u8), ie.value.as_bytes())
+                    ProtocolIe::new(ie.id, crit_of(ie.criticality as u8), ie.value.as_bytes())
                 })
                 .collect(),
         ),
@@ -923,7 +923,7 @@ fn optional_singleton_selection_and_criticality_follow_the_generic_policy() {
                 }
                 _ => panic!("optional field oracle outcome"),
             }
-            assert!(pdu.raw() == wire);
+            assert!(pdu.raw.as_ref() == wire);
         }
     }
     assert_eq!(duplicate_cases, 3);
@@ -1022,7 +1022,7 @@ fn optional_nested_fields_reject_truncation_trailing_bytes_and_extensions() {
         // Borrowed decoding intentionally reports the following record. Owned
         // decoding is the complete-message boundary and must reject that tail.
         let (remainder, prefix) = Pdu::decode(&trailing, context()).unwrap();
-        assert!(remainder == [0] && prefix.raw() == wire);
+        assert!(remainder == [0] && prefix.raw.as_ref() == wire);
         assert!(Pdu::decode_owned(Bytes::from(trailing), context()).is_err());
     }
     assert_eq!(checked, 58);
@@ -1158,7 +1158,7 @@ fn optional_field_bounds_and_mutable_metadata_are_revalidated() {
         if let Some(name) = row["old_amf"].as_str().filter(|name| name.len() >= 4) {
             assert!(!text.contains(name), "NAS diagnostics revealed an AMF name");
         }
-        assert!(pdu.raw() == wire);
+        assert!(pdu.raw.as_ref() == wire);
     }
 }
 

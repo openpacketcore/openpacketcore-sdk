@@ -446,22 +446,23 @@ pub struct EbpfGtpuDatapathCounters {
     /// together on a healthy uplink, and the second stops while the first keeps
     /// rising when the outer destination becomes unreachable.
     pub uplink_encapsulated: u64,
-    /// Uplink packets for which no usable FAR was found.
-    ///
-    /// The datapath's own re-emitted outer frames are excluded. Their source
-    /// is the local S2b-U address rather than a UE PAA, so before the redirect
-    /// outcome was recognized this counter rose once per *successfully
-    /// delivered* uplink IPv4 packet and read a healthy uplink as session-state
-    /// corruption.
-    ///
-    /// That is the whole of the change. This is still a miss counter for every
-    /// mark-zero IPv4 frame leaving the S2b-U attachment whose source is not a
-    /// provisioned UE PAA, so locally originated traffic from that host still
-    /// lands here -- GTP-U echo and error indication among it, which the
-    /// re-entry check deliberately excludes from
-    /// [`Self::uplink_redirects_resolved`] by message type. A nonzero value is
-    /// a prompt to look, not by itself proof of session-state corruption.
+    /// Compatibility total of IPv4 FAR misses, equal to the saturating sum of
+    /// [`Self::uplink_far_misses_passed`] and [`Self::uplink_far_misses_dropped`].
+    /// The datapath's own re-emitted outer frames are excluded.
     pub uplink_far_misses: u64,
+    /// IPv4 FAR misses passed unencapsulated because the full packet mark is
+    /// zero, regardless of origin. Locally sent GTP-U Echo and Error Indication
+    /// datagrams can raise this counter during healthy operation.
+    pub uplink_far_misses_passed: u64,
+    /// IPv4 packets dropped for a missing nonzero-mark FAR or marked owner.
+    ///
+    /// This is not a count of every uplink drop. Grouped selector/graph failures,
+    /// malformed packets, reserved schema sources, invalid FAR/DSCP/commit/PDR/
+    /// binding state, mismatched or inactive marked owners, MTU rejection, and
+    /// encapsulation/redirect failures do not count here. The MTU counters report
+    /// their respective drops separately. A zero value does not prove that all
+    /// uplink packets forwarded successfully.
+    pub uplink_far_misses_dropped: u64,
     /// Downlink G-PDUs successfully decapsulated.
     pub downlink_decapsulated: u64,
     /// Downlink G-PDUs dropped because their TEID was unknown.
@@ -16291,8 +16292,8 @@ mod aya_runtime {
         COUNTER_DL_BINDING_PEER_MISMATCH, COUNTER_DL_BINDING_SOURCE_PORT_MISMATCH,
         COUNTER_DL_DECAP, COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED,
         COUNTER_DL_MISSING_CONSUMER, COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_UL_ENCAP,
-        COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT, COUNTER_UL_PMTU_CORRUPT,
-        COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
+        COUNTER_UL_FAR_MISS_DROPPED, COUNTER_UL_FAR_MISS_PASSED, COUNTER_UL_MTU_REJECT,
+        COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
         DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, GTPU_SESSION_CONFIG_KEY,
         GTPU_SESSION_CONFIG_VALUE_LEN, GTPU_SESSION_DOWNLINK_KEY_LEN, GTPU_SESSION_GROUP_ID_LEN,
         GTPU_SESSION_GROUP_REF_LEN, GTPU_SESSION_GROUP_VALUE_LEN, GTPU_SESSION_SCHEMA_MARKER_LEN,
@@ -49322,6 +49323,8 @@ mod aya_runtime {
                     .map_err(|error| map_error("ebpf_datapath_pmtu_counters", error))?;
                 Ok(values.iter().copied().fold(0_u64, u64::saturating_add))
             };
+            let uplink_far_misses_passed = aggregate(COUNTER_UL_FAR_MISS_PASSED)?;
+            let uplink_far_misses_dropped = aggregate(COUNTER_UL_FAR_MISS_DROPPED)?;
             let snapshot = EbpfGtpuDatapathSnapshot {
                 uplink_program_id: device.datapath_identity.uplink.program_id,
                 downlink_program_id: device.datapath_identity.downlink.program_id,
@@ -49333,7 +49336,10 @@ mod aya_runtime {
                 uplink_pmtu_counters_map_id: device.datapath_identity.pins.uplink_pmtu_counters,
                 counters: EbpfGtpuDatapathCounters {
                     uplink_encapsulated: aggregate(COUNTER_UL_ENCAP)?,
-                    uplink_far_misses: aggregate(COUNTER_UL_FAR_MISS)?,
+                    uplink_far_misses: uplink_far_misses_passed
+                        .saturating_add(uplink_far_misses_dropped),
+                    uplink_far_misses_passed,
+                    uplink_far_misses_dropped,
                     downlink_decapsulated: aggregate(COUNTER_DL_DECAP)?,
                     downlink_unknown_teid: aggregate(COUNTER_DL_UNKNOWN_TEID)?,
                     downlink_malformed: aggregate(COUNTER_DL_MALFORMED)?,
@@ -80350,6 +80356,8 @@ mod tests {
             counters: EbpfGtpuDatapathCounters {
                 uplink_encapsulated: 11,
                 uplink_far_misses: 12,
+                uplink_far_misses_passed: 5,
+                uplink_far_misses_dropped: 7,
                 downlink_decapsulated: 13,
                 downlink_unknown_teid: 14,
                 downlink_malformed: 15,

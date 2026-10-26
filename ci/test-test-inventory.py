@@ -6,6 +6,7 @@ from pathlib import Path
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -714,15 +715,19 @@ class SecretScanWorkflowTests(unittest.TestCase):
         self.unrelated = self.commit('unrelated', 'unrelated branch')
         self.git('checkout', '-q', 'main', repo=self.origin)
         self.git('clone', '-q', '--no-local', str(self.origin), str(self.repo), repo=self.origin)
-        self.program('gitleaks', '''import json, os, shlex, subprocess, sys
+        self.program('gitleaks', '''import json, os, re, shlex, subprocess, sys
 from pathlib import Path
 args = sys.argv[1:]
 opts = args[args.index('--log-opts') + 1] if '--log-opts' in args else '--all'
 history = subprocess.run(['git', 'rev-list', *shlex.split(opts)], capture_output=True, text=True)
-patches = subprocess.run(['git', 'log', '-p', '-U0', *shlex.split(opts)], capture_output=True, text=True)
+patches = subprocess.run(['git', 'log', '-p', '-U0', '--format=commit %H', *shlex.split(opts)],
+                         capture_output=True, text=True)
 record = dict(args=args, commits=history.stdout.splitlines(), ignore=Path('.gitleaksignore').read_text(),
               scan_marker=('SCOPE_FIXTURE_' + 'A' * 12) in patches.stdout)
-plain = bool(os.environ.get('NO_COLOR')) and not os.environ.get('FAKE_IGNORES_NO_COLOR')
+def setting(name, default=''):
+    prefix = 'MERGE_' if '--no-walk' in shlex.split(opts) else ''
+    return os.environ.get(prefix + name, os.environ.get(name, default))
+plain = bool(os.environ.get('NO_COLOR')) and not setting('FAKE_IGNORES_NO_COLOR')
 def line(level, text):
     # gitleaks 8.30.1 colours every log line unless NO_COLOR is not empty.
     if plain:
@@ -733,26 +738,48 @@ with Path(os.environ['SCAN_RECORD']).open('a') as output:
     output.write(json.dumps(record) + '\\n')
 if history.returncode or patches.returncode or patches.stderr:
     error = history.stderr or patches.stderr
-    level = os.environ.get('FAKE_GIT_LEVEL', 'ERR')
+    level = setting('FAKE_GIT_LEVEL', 'ERR')
     sys.stderr.write(line(level, '[git] ' + error.splitlines()[0]) + line(level, 'error="stderr is not empty"')
                      + line('INF', 'no leaks found'))
     sys.exit(0)
-merge_pass = '--merges' in ' '.join(args)
-count = 0 if merge_pass else int(os.environ.get('FAKE_FINDINGS', '3'))
-exit_code = 0 if merge_pass else int(os.environ.get('SCAN_EXIT', '0'))
-if 'SCOPE_FIXTURE_' + 'A' * 12 in patches.stdout:
-    count, exit_code = 1, 2
-    sys.stderr.write(line('WRN', 'leaks found: 1'))
-sys.stderr.write(os.environ.get('FAKE_SCAN_LOG', ''))
+count = int(setting('FAKE_FINDINGS', '3'))
+exit_code = int(setting('SCAN_EXIT', '0'))
+# Model the scanner's exact commit:file:rule:line ignore fingerprints. A merge
+# patch has its own commit identity, even when it copies an ignored side commit.
+ignored = set(record['ignore'].splitlines())
+marker_findings = []
+commit, path, new_line = '', '', 0
+for patch_line in patches.stdout.splitlines():
+    commit_header = re.fullmatch(r'commit ([0-9a-f]{40,64})', patch_line)
+    hunk_header = re.match(r'@@ -[0-9]+(?:,[0-9]+)? \\+([0-9]+)', patch_line)
+    if commit_header:
+        commit = commit_header[1]
+    elif patch_line.startswith('+++ b/'):
+        path = patch_line[6:]
+    elif hunk_header:
+        new_line = int(hunk_header[1])
+    elif patch_line.startswith('+'):
+        if 'SCOPE_FIXTURE_' + 'A' * 12 in patch_line:
+            fingerprint = f'{commit}:{path}:scope-fixture:{new_line}'
+            if fingerprint not in ignored:
+                marker_findings.append({'Fingerprint': fingerprint,
+                                        'Secret': 'fixture-value-must-not-be-published'})
+        new_line += 1
+    elif patch_line.startswith(' '):
+        new_line += 1
+if marker_findings:
+    count, exit_code = len(marker_findings), 2
+    sys.stderr.write(line('WRN', f'leaks found: {count}'))
+sys.stderr.write(setting('FAKE_SCAN_LOG'))
 if exit_code == 0:
     sys.stderr.write(line('INF', 'no leaks found'))
 if '--report-path' in args:
     report = Path(args[args.index('--report-path') + 1])
-    if os.environ.get('SCAN_REPORT') == 'invalid':
+    if setting('SCAN_REPORT') == 'invalid':
         report.write_text('not JSON')
-    elif os.environ.get('SCAN_REPORT') != 'missing':
-        report.write_text(json.dumps([{'Secret': 'fixture-value-must-not-be-published'}]
-                                    * count))
+    elif setting('SCAN_REPORT') != 'missing':
+        report.write_text(json.dumps(marker_findings or
+                                    [{'Secret': 'fixture-value-must-not-be-published'}] * count))
 sys.exit(exit_code)
 ''')
         self.program('gh', '''import json, os, sys
@@ -791,9 +818,7 @@ sys.exit(int(os.environ.get('GH_EXIT', '0')))
                                 cwd=self.repo, env={**self.env, **env}, capture_output=True, text=True, check=False)
         all_records = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
         self.last_records = all_records
-        records = [record for record in all_records
-                   if 'detect' not in record['args'] or '--merges' not in ' '.join(record['args'])]
-        return result, records
+        return result, all_records
 
     def scan_event(self, event, **env):
         return self.run_step(self.scan, **{'GITHUB_EVENT_NAME': event, 'GITHUB_SHA': self.base,
@@ -808,6 +833,153 @@ sys.exit(int(os.environ.get('GH_EXIT', '0')))
         self.git('fetch', '-q', 'origin', head)
         self.git('checkout', '-q', head)
         return head
+
+    def edited_merge_fixture(self):
+        self.git('checkout', '-qb', 'edited-side', self.base, repo=self.origin)
+        side = self.commit('side-file', 'clean side change')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('main-file', 'clean main change')
+        self.git('merge', '--no-ff', '--no-commit', side, repo=self.origin)
+        head = self.commit('merge-only-file', 'clean manual edit while merging')
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+        return head
+
+    def test_clean_merge_keeps_the_original_commit_ignore_fingerprint(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'pinned-side', self.base, repo=self.origin)
+        introduced = self.commit('pinned.txt', marker)
+        fingerprint = f'{introduced}:pinned.txt:scope-fixture:1'
+        side = self.commit('.gitleaksignore', f'base fingerprint\n{fingerprint}')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('main-file', 'clean main change')
+        self.git('-c', 'commit.gpgsign=false', 'merge', '--no-ff', '-qm', 'clean merge', side,
+                 repo=self.origin)
+        head = self.git('rev-parse', 'HEAD', repo=self.origin)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn(introduced, records[0]['commits'])
+                self.assertIn(fingerprint, records[0]['ignore'].splitlines())
+                self.assertEqual(self.output.read_text(), '')
+
+        # The exception remains exact: changing any fingerprint field exposes
+        # the original side-branch finding, without a second copy at the merge.
+        for wrong_pin in (f'{head}:pinned.txt:scope-fixture:1',
+                          f'{introduced}:different.txt:scope-fixture:1',
+                          f'{introduced}:pinned.txt:other-rule:1',
+                          f'{introduced}:pinned.txt:scope-fixture:2'):
+            with self.subTest(wrong_pin=wrong_pin):
+                (self.repo / '.gitleaksignore').write_text(wrong_pin + '\n')
+                result, records = self.scan_event('push', GITHUB_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
+                self.assertEqual(json.loads(self.scan_report.read_text())[0]['Fingerprint'], fingerprint)
+
+    def test_merge_scan_findings_errors_and_diagnostics_are_not_hidden(self):
+        head = self.edited_merge_fixture()
+        diagnostic = '0:00AM WRN merge scan diagnostic\n'
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            for status in (0, 1, 2, 7):
+                with self.subTest(event=event, status=status):
+                    result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head,
+                                                      MERGE_SCAN_EXIT=str(status),
+                                                      MERGE_FAKE_FINDINGS='5',
+                                                      MERGE_FAKE_SCAN_LOG=diagnostic)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    self.assertEqual(len(records), 2)
+                    self.assertEqual(records[1]['commits'], [head])
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertEqual(self.output.read_text(), 'findings=5\n' if status == 2 else '')
+
+    def test_merge_scan_rejects_logged_errors_colours_and_broken_reports(self):
+        head = self.edited_merge_fixture()
+        cases = (
+            ({'MERGE_FAKE_SCAN_LOG': '0:00AM ERR merge scan failed\n'}, 'scanner logged an error'),
+            ({'MERGE_FAKE_IGNORES_NO_COLOR': '1'}, 'scanner did not log'),
+            ({'MERGE_SCAN_EXIT': '2', 'MERGE_SCAN_REPORT': 'invalid'}, 'JSONDecodeError'),
+            ({'MERGE_SCAN_EXIT': '2', 'MERGE_SCAN_REPORT': 'missing'}, 'FileNotFoundError'),
+        )
+        for env, message in cases:
+            with self.subTest(env=env):
+                result, records = self.scan_event('push', GITHUB_SHA=head, **env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(len(records), 2)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertEqual(self.output.read_text(), '')
+
+    def test_merge_scan_error_after_ordinary_findings_stays_an_error(self):
+        head = self.edited_merge_fixture()
+        result, records = self.scan_event('push', GITHUB_SHA=head, SCAN_EXIT='2', FAKE_FINDINGS='3',
+                                          MERGE_SCAN_EXIT='7',
+                                          MERGE_FAKE_SCAN_LOG='0:00AM ERR merge scan failed\n')
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(len(records), 2)
+        self.assertIn('ERR merge scan failed', result.stderr)
+        self.assertEqual(self.output.read_text(), '')
+
+    def test_merge_classification_failure_is_never_clean(self):
+        head = self.edited_merge_fixture()
+        real_git = shutil.which('git')
+        self.assertIsNotNone(real_git)
+        self.program('git', f'''import os, sys
+if sys.argv[1:2] == ['merge-tree']:
+    sys.stderr.write('synthetic merge-tree failure\\n')
+    sys.exit(7)
+os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
+''')
+        result, records = self.scan_event('push', GITHUB_SHA=head)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(len(records), 1)
+        self.assertIn('Cannot classify merge', result.stdout)
+        self.assertIn('synthetic merge-tree failure', result.stderr)
+        self.assertEqual(self.output.read_text(), '')
+
+    def test_merge_classification_requires_a_tree_after_success(self):
+        head = self.edited_merge_fixture()
+        real_git = shutil.which('git')
+        self.assertIsNotNone(real_git)
+        for output in ('', 'not a tree\n'):
+            with self.subTest(output=output):
+                self.program('git', f'''import os, sys
+if sys.argv[1:2] == ['merge-tree']:
+    sys.stdout.write({output!r})
+    sys.exit(0)
+os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
+''')
+                result, records = self.scan_event('push', GITHUB_SHA=head)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn('Cannot classify merge', result.stdout)
+                self.assertEqual(self.output.read_text(), '')
+
+    def test_octopus_merge_only_text_is_scanned(self):
+        self.git('checkout', '-qb', 'octopus-a', self.base, repo=self.origin)
+        side_a = self.commit('side-a', 'clean first side')
+        self.git('checkout', '-qb', 'octopus-b', self.base, repo=self.origin)
+        side_b = self.commit('side-b', 'clean second side')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        main_edit = self.commit('main-file', 'clean main change')
+        self.git('merge', '--no-ff', '--no-commit', side_a, side_b, repo=self.origin)
+        head = self.commit('octopus-resolution', 'SCOPE_FIXTURE_' + 'A' * 12)
+        self.assertEqual(self.git('show', '-s', '--format=%P', head, repo=self.origin),
+                         f'{main_edit} {side_a} {side_b}')
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(len(records), 2)
+                self.assertEqual(records[1]['commits'], [head])
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
 
     def test_required_guard_runs_the_security_workflow_regressions(self):
         root = Path(__file__).resolve().parents[1]
@@ -867,28 +1039,32 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
         self.assertEqual(scan['ignore'], 'PR head fingerprint\n')
 
     def test_each_event_runs_a_merge_commit_diff_pass(self):
+        head = self.edited_merge_fixture()
         cases = (
-            ('pull_request', f'{self.base}..{self.head} --merges -m --first-parent'),
-            ('push', f'--full-history {self.base} --merges -m --first-parent'),
-            ('schedule', '--full-history --all --merges -m --first-parent'),
-            ('workflow_dispatch', '--full-history --all --merges -m --first-parent'),
+            ('pull_request', f'{self.base}..{head}'),
+            ('push', f'--full-history {head}'),
+            ('schedule', '--full-history --all'),
+            ('workflow_dispatch', '--full-history --all'),
         )
         for event, expected in cases:
             with self.subTest(event=event):
-                result, primary = self.scan_event(event)
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(len(primary), 1)
+                self.assertEqual(len(records), 2)
                 self.assertEqual(len(self.last_records), 2)
-                merge = [record for record in self.last_records
-                         if '--merges' in ' '.join(record['args'])]
+                self.assertEqual(records[0]['args'][-2:], ['--log-opts', expected])
+                merge = [record for record in records
+                         if '--diff-merges=first-parent' in record['args'][-1].split()]
                 self.assertEqual(len(merge), 1)
-                self.assertEqual(merge[0]['args'][-2:], ['--log-opts', expected])
-                self.assertIn(str(self.root / 'gitleaks-merge-report.json'), merge[0]['args'])
+                self.assertEqual(merge[0]['args'][-2:],
+                                 ['--log-opts', f'--diff-merges=first-parent --no-walk {head}'])
+                self.assertIn(str(self.root / 'gitleaks-merge-0.json'), merge[0]['args'])
+                self.assertNotIn('--first-parent', merge[0]['args'][-1].split())
+                self.assertNotIn('--merges', merge[0]['args'][-1].split())
 
     def test_merge_resolution_text_is_scanned(self):
-        # Text that exists only in a merge commit's resolution: the primary
-        # pass (ordinary git log patches) cannot see it; the merge-diff pass
-        # must. Before the second pass existed this scan exited 0.
+        # Text that exists only in a merge commit's resolution must be seen
+        # alongside ordinary patches in the aggregate report.
         self.git('checkout', '-qb', 'merge-side', 'main', repo=self.origin)
         side = self.commit('merge-side', 'clean side change')
         self.git('checkout', '-q', 'main', repo=self.origin)
@@ -904,12 +1080,13 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
         result, primary = self.scan_event('pull_request', PR_BASE_SHA=self.base, PR_HEAD_SHA=merge_head)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.output.read_text(), 'findings=1\n')
-        self.assertEqual(len(primary), 1)
+        self.assertEqual(len(primary), 2)
         self.assertEqual(set(primary[0]['commits']), {main_edit, side, merge_head})
-        self.assertFalse(primary[0]['scan_marker'],
+        patches = self.git('log', '-p', '-U0', f'{self.base}..{merge_head}')
+        self.assertFalse(('SCOPE_FIXTURE_' + 'A' * 12) in patches,
                          "ordinary git log patches must not see merge-only text")
         merge = [record for record in self.last_records
-                 if '--merges' in ' '.join(record['args'])]
+                 if '--diff-merges=first-parent' in record['args'][-1].split()]
         self.assertEqual(len(merge), 1)
         self.assertEqual(merge[0]['commits'], [merge_head])
         self.assertTrue(merge[0]['scan_marker'],
@@ -926,6 +1103,45 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                                         '--report-path', str(self.scan_report),
                                         '--log-opts', f'--full-history {self.base}'])
         self.assertEqual(set(scan['commits']), {self.first, self.base})
+
+    def test_nested_merge_resolution_only_findings_fail_every_scan(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'nested-side', self.base, repo=self.origin)
+        side = self.commit('base', 'side of inner conflict')
+        self.git('checkout', '-qb', 'nested-leaf', self.base, repo=self.origin)
+        leaf = self.commit('base', 'other side of inner conflict')
+        self.git('checkout', '-q', 'nested-side', repo=self.origin)
+        conflict = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', leaf],
+                                  cwd=self.origin, env=self.env, capture_output=True, text=True)
+        self.assertEqual(conflict.returncode, 1, conflict.stderr)
+        self.assertIn('CONFLICT (content)', conflict.stdout)
+        inner_merge = self.commit('base', marker)
+        for parent in (side, leaf):
+            self.assertNotIn(marker, self.git('show', f'{parent}:base', repo=self.origin))
+
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('base', 'main side of outer conflict')
+        conflict = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', inner_merge],
+                                  cwd=self.origin, env=self.env, capture_output=True, text=True)
+        self.assertEqual(conflict.returncode, 1, conflict.stderr)
+        self.assertIn('CONFLICT (content)', conflict.stdout)
+        head = self.commit('base', 'clean outer resolution')
+        self.assertNotIn(marker, self.git('show', f'{head}:base', repo=self.origin))
+        # Only main reaches the inner merge; no side ref can rescue --first-parent.
+        self.git('branch', '-D', 'nested-side', 'nested-leaf', repo=self.origin)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, primary = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(len(primary), 2)
+                self.assertIn(inner_merge, primary[0]['commits'])
+                self.assertIn(inner_merge, primary[1]['commits'])
+                patches = self.git('log', '-p', '-U0', f'{self.base}..{head}')
+                self.assertFalse(marker in patches)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
 
     def test_schedule_fetches_and_scans_all_refs_including_unopened_branches_and_tags(self):
         for event in ('schedule', 'workflow_dispatch'):
@@ -966,6 +1182,79 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
                     self.assertEqual(len(records), 1)
                     self.assertEqual(self.output.read_text(), 'findings=3\n' if exit_code == 2 else '')
                     self.assertIn(harmless_log, result.stderr)
+
+    def test_merge_resolution_only_findings_fail_every_scan(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'merge-side', self.base, repo=self.origin)
+        side = self.commit('base', 'side of conflict')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        first_parent = self.commit('base', 'main side of conflict')
+        merge = subprocess.run(['git', 'merge', '--no-ff', '--no-commit', side],
+                               cwd=self.origin, env=self.env, capture_output=True, text=True)
+        self.assertEqual(merge.returncode, 1, merge.stderr)
+        self.assertIn('CONFLICT (content)', merge.stdout)
+        head = self.commit('base', marker)
+        self.assertEqual(self.git('show', '-s', '--format=%P', head, repo=self.origin),
+                         f'{first_parent} {side}')
+        for parent in (first_parent, side):
+            self.assertNotIn(marker, self.git('show', f'{parent}:base', repo=self.origin))
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 2)
+                self.assertIn(head, records[0]['commits'])
+                self.assertEqual(records[1]['commits'], [head])
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
+                self.assertIn('WRN leaks found: 1', result.stderr)
+
+    def test_ordinary_and_merge_findings_share_one_report(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'merge-side', self.base, repo=self.origin)
+        side = self.commit('side-file', 'clean side change')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        ordinary = self.commit('ordinary-finding', marker)
+        self.git('merge', '--no-ff', '--no-commit', side, repo=self.origin)
+        head = self.commit('merge-only-finding', marker)
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 2)
+                self.assertIn(ordinary, records[0]['commits'])
+                self.assertIn(head, records[0]['commits'])
+                self.assertEqual(records[1]['commits'], [head])
+                self.assertEqual(self.output.read_text(), 'findings=2\n')
+                self.assertEqual(result.stderr.count('WRN leaks found: 1'), 2)
+                self.assertEqual(len(json.loads(self.scan_report.read_text())), 2)
+
+    def test_merged_side_branch_history_is_still_scanned(self):
+        marker = 'SCOPE_FIXTURE_' + 'A' * 12
+        self.git('checkout', '-qb', 'merge-side', self.base, repo=self.origin)
+        leaked = self.commit('side-file', marker)
+        side = self.commit('side-file', 'removed before merge')
+        self.git('checkout', '-q', 'main', repo=self.origin)
+        self.commit('main-file', 'main change')
+        self.git('-c', 'commit.gpgsign=false', 'merge', '--no-ff', '-qm', 'merge side', side,
+                 repo=self.origin)
+        head = self.git('rev-parse', 'HEAD', repo=self.origin)
+        self.assertNotIn(marker, self.git('show', f'{head}:side-file', repo=self.origin))
+        self.git('fetch', '-q', 'origin', head)
+        self.git('checkout', '-q', head)
+
+        for event in ('pull_request', 'push', 'schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                result, records = self.scan_event(event, GITHUB_SHA=head, PR_HEAD_SHA=head)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(records), 1)
+                self.assertIn(leaked, records[0]['commits'])
+                self.assertEqual(self.output.read_text(), 'findings=1\n')
 
     def test_git_failure_inside_the_scanner_is_never_a_clean_result(self):
         absent = '0' * 39 + '1'

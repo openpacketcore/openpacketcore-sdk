@@ -15,7 +15,6 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
 use bytes::Bytes;
-use opc_protocol::SensitiveBytes;
 use thiserror::Error;
 
 use crate::{
@@ -176,7 +175,7 @@ impl N2OutboundMessage {
 /// }
 /// ```
 pub struct N2Payload {
-    payload: SensitiveBytes,
+    payload: Bytes,
     stream_id: u16,
     assoc_id: i32,
 }
@@ -189,11 +188,8 @@ impl fmt::Debug for N2Payload {
 
 impl N2Payload {
     /// Borrow the admitted opaque NGAP bytes for the caller's codec.
-    ///
-    /// The returned buffer is uniquely owned by this record and is zeroized
-    /// when the record is dropped.
     #[must_use]
-    pub fn payload(&self) -> &SensitiveBytes {
+    pub fn payload(&self) -> &Bytes {
         &self.payload
     }
 
@@ -209,11 +205,11 @@ impl N2Payload {
         self.assoc_id
     }
 
-    /// Transfer the admitted payload to the caller.
-    ///
-    /// The caller now owns the zeroizing buffer; it clears itself on drop.
+    /// Transfer the admitted payload to the caller. Payloads from the live SCTP
+    /// adapter retain wiping custody through this handoff and any Bytes clones;
+    /// their allocation is cleared when its final reference is dropped.
     #[must_use]
-    pub fn into_payload(self) -> SensitiveBytes {
+    pub fn into_payload(self) -> Bytes {
         self.payload
     }
 }
