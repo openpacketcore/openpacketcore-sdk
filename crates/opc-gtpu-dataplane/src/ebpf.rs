@@ -3858,6 +3858,17 @@ const MAX_TRAFFIC_PROOF_ATTEMPTS: usize = 256;
 const MAX_TRAFFIC_PROOF_DRAIN_BATCH: usize = MAX_RETAINED_EVENTS;
 const TRAFFIC_OBSERVATION_SEQUENCE_WINDOW: u64 = MAX_RETAINED_EVENTS as u64;
 
+/// Shared admission and renewal guard for the bounded live-attempt table.
+const fn traffic_attempt_capacity_available(current: usize) -> bool {
+    current < MAX_TRAFFIC_PROOF_ATTEMPTS
+}
+
+/// A full drain batch must report overflow rather than silently truncate.
+#[cfg(any(target_os = "linux", test))]
+const fn traffic_observation_batch_full(record_count: usize, budget: usize) -> bool {
+    record_count >= budget
+}
+
 /// Bounded, attachment-wide replay detector for one production observation
 /// source incarnation.
 ///
@@ -13527,7 +13538,7 @@ impl EbpfGtpuDataplaneBackend {
                     operation: "ebpf_traffic_renewal_predecessor",
                 });
             }
-            if attempts.len() >= MAX_TRAFFIC_PROOF_ATTEMPTS {
+            if !traffic_attempt_capacity_available(attempts.len()) {
                 return Err(GtpuError::StateIndeterminate {
                     operation: "ebpf_traffic_capacity",
                 });
@@ -13634,7 +13645,8 @@ impl EbpfGtpuDataplaneBackend {
             });
         }
         let mut attempts = self.traffic_attempts()?;
-        if attempts.len() == MAX_TRAFFIC_PROOF_ATTEMPTS || attempts.contains_key(&attempt_id) {
+        if !traffic_attempt_capacity_available(attempts.len()) || attempts.contains_key(&attempt_id)
+        {
             return Err(GtpuError::StateIndeterminate {
                 operation: "ebpf_traffic_capacity",
             });
@@ -49215,7 +49227,9 @@ mod aya_runtime {
                 let mut records = Vec::with_capacity(budget);
                 let mut overflowed = false;
                 while let Some(item) = ring.next() {
-                    if item.len() != GTPU_TRAFFIC_OBSERVATION_EVENT_LEN || records.len() == budget {
+                    if item.len() != GTPU_TRAFFIC_OBSERVATION_EVENT_LEN
+                        || super::traffic_observation_batch_full(records.len(), budget)
+                    {
                         overflowed = true;
                     } else {
                         let mut record = [0_u8; GTPU_TRAFFIC_OBSERVATION_EVENT_LEN];
@@ -57218,6 +57232,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod reassembled_downlink;
     mod retained_namespace_boundary;
+    mod traffic_capacity;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
     #[cfg(target_os = "linux")]
