@@ -1494,6 +1494,24 @@ mod tests {
     }
 
     #[test]
+    fn link_local_scopes_survive_raw_and_packed_addresses() {
+        for scope in [1_u32, 17, u32::MAX] {
+            let address = SocketAddr::V6(SocketAddrV6::new(
+                "fe80::20".parse().unwrap(),
+                3868,
+                0,
+                scope,
+            ));
+            let (raw, length) = socket_addr_to_raw(&address);
+            assert_eq!(raw_to_socket_addr(&raw, length).unwrap(), address);
+            let packed = pack_socket_addresses(&[address]).unwrap();
+            assert_eq!(packed.len(), size_of::<libc::sockaddr_in6>());
+            assert_eq!(&packed[2..4], &3868_u16.to_be_bytes());
+            assert_eq!(&packed[24..28], &scope.to_ne_bytes());
+        }
+    }
+
+    #[test]
     fn packed_address_sets_are_contiguous_and_bounded() {
         let v4 = [
             "127.0.0.1:38412".parse().unwrap(),

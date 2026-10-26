@@ -91,3 +91,29 @@ conditions MOBIKE advertisement on the initial IPv4 configuration attribute.
 The existing configuration-family matrix tests that rule. Removing it would
 change the NWu profile rather than fix IPv6 outer transport. Neither test
 claims live-peer or kernel migration qualification.
+
+## IP foundations work list #1360
+
+| Finding | Verified behavior and disposition |
+| --- | --- |
+| IPCP DNS options | `opc-proto-gtpv2c::pco` already parses options 129/131, correlates Configure-Nak identifiers and requested options, and exposes primary/secondary DNS. All 56 PCO tests pass, including independent literal replies, unsolicited options, stale identifiers and unit-local malformed-input handling. |
+| Raw IPv4 checksum | Injection accepts validated packets rather than assembling a zero-checksum header. `Header::parse` calls `valid_ipv4_header`, which rejects an incorrect checksum; the fragmenter and ICMP builders compute new checksums. Linux raw `IP_HDRINCL` also fills the checksum. `whole_batch_is_validated_before_its_first_send` proves a corrupted fragment prevents any send. No missing checksum computation was reproduced. |
+| IPv6 fragment cache cleanup | The cited `model.rs` location has no fragment cache or timer. Outer reassembly belongs to the Linux kernel; the SDK does not own the reported IPv6 reassembly cache. Inner fragments are handled by the documented forwarding profile. No cache-expiry repair is claimed, and this disposition does not qualify full IPv6 outer reassembly. |
+| NAI SASLprep | RFC 7542 does not prescribe SASLprep in a Diameter AVP parser. It assigns normalization primarily to the edge with locale information and cautions AAA intermediaries against normalization. Preserve the received identity bytes; automatic parser rewriting could break exact EAP/User-Name correlation. |
+| DNS hostname syntax | Fixed in `b37d5cf84`: address queries validate RFC 1123 hostnames while SRV/S-NAPTR service-owner syntax remains separate. |
+| ICMP quote length | The IPv4 PTB builder already quotes the IPv4 header plus eight payload octets; `icmpv4_ptb_matches_rfc1191_layout_and_verifies_checksums` verifies the exact quote and both checksums. IPv6 uses its separate minimum-MTU quote rule. Moreover, RFC 1812 §4.3.2.3 recommends retaining more original IPv4 data within a 576-byte response; eight octets are not a universal maximum. |
+| IPv6 scope ID | The cited `opc-net-util` crate does not exist. The SCTP socket boundary already copies `scope_id` into native `sin6_scope_id` and restores it on readback. The new `link_local_scopes_survive_raw_and_packed_addresses` regression verifies three nonzero scope values, including `u32::MAX`, against literal packed offsets and native byte order. The 14 ordinary Linux sys-layer tests pass; no production change is needed. The session TCP helper passes the complete `SocketAddr` to Tokio. |
+
+Witnesses: [PCO tests](../crates/opc-proto-gtpv2c/tests/pco.rs),
+[injection validation](../crates/opc-gtpu-dataplane/src/injection.rs),
+[shared IPv4 header validator](../crates/opc-gtpu-dataplane/src/inner_fragment.rs),
+[reassembly ownership](../crates/opc-gtpu-dataplane/src/reassembly.rs),
+[ICMP builders/tests](../crates/opc-gtpu-dataplane/src/icmp.rs),
+[SCTP native address conversion/tests](../crates/opc-libsctp-sys/src/linux.rs),
+and [TCP connect helper](../crates/opc-session-net/src/scope/socket.rs).
+
+Standards: [RFC 1877](https://www.rfc-editor.org/rfc/rfc1877.html),
+[Linux raw socket checksum behavior](https://www.man7.org/linux/man-pages/man7/raw.7.html),
+[RFC 7542 §2.6](https://www.rfc-editor.org/rfc/rfc7542.html#section-2.6),
+[RFC 1812 §4.3.2.3](https://www.rfc-editor.org/rfc/rfc1812.html#section-4.3.2.3),
+and [RFC 4007 §6](https://www.rfc-editor.org/rfc/rfc4007.html#section-6).
