@@ -23,7 +23,7 @@ pub trait SimpleIe: Sized {
 // Cause (§8.2.1)
 // ---------------------------------------------------------------------------
 
-/// Cause values (TS 29.244 Table 8.2.1-1).
+/// Cause values (TS 29.244 V19.6.0 Table 8.2.1-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CauseValue {
@@ -31,38 +31,83 @@ pub enum CauseValue {
     Reserved = 0,
     /// Request accepted (success) (1).
     RequestAccepted = 1,
-    /// Request rejected (no reason) (64).
+    /// More usage report to send (2).
+    MoreUsageReportToSend = 2,
+    /// Request partially accepted (3).
+    RequestPartiallyAccepted = 3,
+    /// Request rejected (reason not specified) (64).
     RequestRejected = 64,
     /// Session context not found (65).
     SessionContextNotFound = 65,
-    /// Mandatory IE missing (72).
-    MandatoryIeMissing = 72,
-    /// Conditional IE missing (73).
-    ConditionalIeMissing = 73,
-    /// Invalid length (74).
-    InvalidLength = 74,
-    /// Mandatory IE incorrect (75).
-    MandatoryIeIncorrect = 75,
-    /// Invalid forwarding policy (76).
-    InvalidForwardingPolicy = 76,
-    /// Invalid F-TEID allocation option (77).
-    InvalidFTeidAllocationOption = 77,
-    /// No established PFCP association (78).
-    NoEstablishedPfcpAssociation = 78,
-    /// Rule creation/modification failure (79).
-    RuleCreationModificationFailure = 79,
-    /// PFCP entity in congestion (80).
-    PfcpEntityInCongestion = 80,
-    /// No resources available (81).
-    NoResourcesAvailable = 81,
-    /// Service not supported (82).
-    ServiceNotSupported = 82,
-    /// System failure (83).
-    SystemFailure = 83,
-    /// Redirection requested (84).
-    RedirectionRequested = 84,
-    /// Unknown value (any code not in the v1 registry).
+    /// Mandatory IE missing (66).
+    MandatoryIeMissing = 66,
+    /// Conditional IE missing (67).
+    ConditionalIeMissing = 67,
+    /// Invalid length (68).
+    InvalidLength = 68,
+    /// Mandatory IE incorrect (69).
+    MandatoryIeIncorrect = 69,
+    /// Invalid forwarding policy (70).
+    InvalidForwardingPolicy = 70,
+    /// Invalid F-TEID allocation option (71).
+    InvalidFTeidAllocationOption = 71,
+    /// No established PFCP association (72).
+    NoEstablishedPfcpAssociation = 72,
+    /// Rule creation/modification failure (73).
+    RuleCreationModificationFailure = 73,
+    /// PFCP entity in congestion (74).
+    PfcpEntityInCongestion = 74,
+    /// No resources available (75).
+    NoResourcesAvailable = 75,
+    /// Service not supported (76).
+    ServiceNotSupported = 76,
+    /// System failure (77).
+    SystemFailure = 77,
+    /// Redirection requested (78).
+    RedirectionRequested = 78,
+    /// All dynamic addresses are occupied (79).
+    AllDynamicAddressesOccupied = 79,
+    /// Unknown pre-defined rule (80).
+    UnknownPredefinedRule = 80,
+    /// Unknown application ID (81).
+    UnknownApplicationId = 81,
+    /// L2TP tunnel establishment failure (82).
+    L2tpTunnelEstablishmentFailure = 82,
+    /// L2TP session establishment failure (83).
+    L2tpSessionEstablishmentFailure = 83,
+    /// L2TP tunnel release (84).
+    L2tpTunnelRelease = 84,
+    /// L2TP session release (85).
+    L2tpSessionRelease = 85,
+    /// PFCP session restoration failure: requested resource unavailable (86).
+    PfcpSessionRestorationFailure = 86,
+    /// L2TP tunnel establishment failure: tunnel authentication (87).
+    L2tpTunnelAuthenticationFailure = 87,
+    /// L2TP session establishment failure: session authentication (88).
+    L2tpSessionAuthenticationFailure = 88,
+    /// L2TP tunnel establishment failure: LNS not reachable (89).
+    L2tpLnsNotReachable = 89,
+    /// PFD contents syntax error (90).
+    PfdContentsSyntaxError = 90,
+    /// PFD contents semantics error (91).
+    PfdContentsSemanticsError = 91,
+    /// PFD application ID unknown (92).
+    PfdApplicationIdUnknown = 92,
+    /// Unknown value, retained exactly for forwarding and classification.
     Unknown(u8),
+}
+
+impl CauseValue {
+    /// Whether this is an acceptance cause, including unrecognized values 1–63.
+    pub fn is_acceptance(self) -> bool {
+        matches!(u8::from(self), 1..=63)
+    }
+
+    /// Whether this is a rejection cause, including unrecognized values 64–255.
+    /// Reserved value zero is neither acceptance nor rejection.
+    pub fn is_rejection(self) -> bool {
+        u8::from(self) >= 64
+    }
 }
 
 impl From<u8> for CauseValue {
@@ -70,21 +115,37 @@ impl From<u8> for CauseValue {
         match value {
             0 => Self::Reserved,
             1 => Self::RequestAccepted,
+            2 => Self::MoreUsageReportToSend,
+            3 => Self::RequestPartiallyAccepted,
             64 => Self::RequestRejected,
             65 => Self::SessionContextNotFound,
-            72 => Self::MandatoryIeMissing,
-            73 => Self::ConditionalIeMissing,
-            74 => Self::InvalidLength,
-            75 => Self::MandatoryIeIncorrect,
-            76 => Self::InvalidForwardingPolicy,
-            77 => Self::InvalidFTeidAllocationOption,
-            78 => Self::NoEstablishedPfcpAssociation,
-            79 => Self::RuleCreationModificationFailure,
-            80 => Self::PfcpEntityInCongestion,
-            81 => Self::NoResourcesAvailable,
-            82 => Self::ServiceNotSupported,
-            83 => Self::SystemFailure,
-            84 => Self::RedirectionRequested,
+            66 => Self::MandatoryIeMissing,
+            67 => Self::ConditionalIeMissing,
+            68 => Self::InvalidLength,
+            69 => Self::MandatoryIeIncorrect,
+            70 => Self::InvalidForwardingPolicy,
+            71 => Self::InvalidFTeidAllocationOption,
+            72 => Self::NoEstablishedPfcpAssociation,
+            73 => Self::RuleCreationModificationFailure,
+            74 => Self::PfcpEntityInCongestion,
+            75 => Self::NoResourcesAvailable,
+            76 => Self::ServiceNotSupported,
+            77 => Self::SystemFailure,
+            78 => Self::RedirectionRequested,
+            79 => Self::AllDynamicAddressesOccupied,
+            80 => Self::UnknownPredefinedRule,
+            81 => Self::UnknownApplicationId,
+            82 => Self::L2tpTunnelEstablishmentFailure,
+            83 => Self::L2tpSessionEstablishmentFailure,
+            84 => Self::L2tpTunnelRelease,
+            85 => Self::L2tpSessionRelease,
+            86 => Self::PfcpSessionRestorationFailure,
+            87 => Self::L2tpTunnelAuthenticationFailure,
+            88 => Self::L2tpSessionAuthenticationFailure,
+            89 => Self::L2tpLnsNotReachable,
+            90 => Self::PfdContentsSyntaxError,
+            91 => Self::PfdContentsSemanticsError,
+            92 => Self::PfdApplicationIdUnknown,
             other => Self::Unknown(other),
         }
     }
@@ -95,21 +156,37 @@ impl From<CauseValue> for u8 {
         match value {
             CauseValue::Reserved => 0,
             CauseValue::RequestAccepted => 1,
+            CauseValue::MoreUsageReportToSend => 2,
+            CauseValue::RequestPartiallyAccepted => 3,
             CauseValue::RequestRejected => 64,
             CauseValue::SessionContextNotFound => 65,
-            CauseValue::MandatoryIeMissing => 72,
-            CauseValue::ConditionalIeMissing => 73,
-            CauseValue::InvalidLength => 74,
-            CauseValue::MandatoryIeIncorrect => 75,
-            CauseValue::InvalidForwardingPolicy => 76,
-            CauseValue::InvalidFTeidAllocationOption => 77,
-            CauseValue::NoEstablishedPfcpAssociation => 78,
-            CauseValue::RuleCreationModificationFailure => 79,
-            CauseValue::PfcpEntityInCongestion => 80,
-            CauseValue::NoResourcesAvailable => 81,
-            CauseValue::ServiceNotSupported => 82,
-            CauseValue::SystemFailure => 83,
-            CauseValue::RedirectionRequested => 84,
+            CauseValue::MandatoryIeMissing => 66,
+            CauseValue::ConditionalIeMissing => 67,
+            CauseValue::InvalidLength => 68,
+            CauseValue::MandatoryIeIncorrect => 69,
+            CauseValue::InvalidForwardingPolicy => 70,
+            CauseValue::InvalidFTeidAllocationOption => 71,
+            CauseValue::NoEstablishedPfcpAssociation => 72,
+            CauseValue::RuleCreationModificationFailure => 73,
+            CauseValue::PfcpEntityInCongestion => 74,
+            CauseValue::NoResourcesAvailable => 75,
+            CauseValue::ServiceNotSupported => 76,
+            CauseValue::SystemFailure => 77,
+            CauseValue::RedirectionRequested => 78,
+            CauseValue::AllDynamicAddressesOccupied => 79,
+            CauseValue::UnknownPredefinedRule => 80,
+            CauseValue::UnknownApplicationId => 81,
+            CauseValue::L2tpTunnelEstablishmentFailure => 82,
+            CauseValue::L2tpSessionEstablishmentFailure => 83,
+            CauseValue::L2tpTunnelRelease => 84,
+            CauseValue::L2tpSessionRelease => 85,
+            CauseValue::PfcpSessionRestorationFailure => 86,
+            CauseValue::L2tpTunnelAuthenticationFailure => 87,
+            CauseValue::L2tpSessionAuthenticationFailure => 88,
+            CauseValue::L2tpLnsNotReachable => 89,
+            CauseValue::PfdContentsSyntaxError => 90,
+            CauseValue::PfdContentsSemanticsError => 91,
+            CauseValue::PfdApplicationIdUnknown => 92,
             CauseValue::Unknown(v) => v,
         }
     }
@@ -345,22 +422,22 @@ impl SimpleIe for FSeid {
 }
 
 // ---------------------------------------------------------------------------
-// F-TEID (§8.2.5)
+// F-TEID (§8.2.3)
 // ---------------------------------------------------------------------------
 
 /// F-TEID IE (type 21).
 ///
-/// TS 29.244 §8.2.5:
+/// TS 29.244 §8.2.3:
 /// - octet 5: bit 1 V4, bit 2 V6, bit 3 CH (choose), bit 4 CHID, bits 8-5 spare (0)
 /// - octets 6-9: TEID/GRE Key if CH=0
-/// - IPv4 if V4
-/// - IPv6 if V6
+/// - IPv4 if V4 and CH=0
+/// - IPv6 if V6 and CH=0
 /// - CHID if CHID=1
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FTeid {
-    /// IPv4 address present.
+    /// IPv4 address present when CH=0; request IPv4 allocation when CH=1.
     pub v4: bool,
-    /// IPv6 address present.
+    /// IPv6 address present when CH=0; request IPv6 allocation when CH=1.
     pub v6: bool,
     /// CH flag (choose TEID).
     pub ch: bool,
@@ -368,9 +445,9 @@ pub struct FTeid {
     pub chid: bool,
     /// TEID/GRE Key (4 octets) if CH=0.
     pub teid: Option<u32>,
-    /// IPv4 address (4 octets) if V4.
+    /// IPv4 address (4 octets) if V4 and CH=0.
     pub ipv4: Option<[u8; 4]>,
-    /// IPv6 address (16 octets) if V6.
+    /// IPv6 address (16 octets) if V6 and CH=0.
     pub ipv6: Option<[u8; 16]>,
     /// Choose ID (1 octet) if CHID=1.
     pub choose_id: Option<u8>,
@@ -388,6 +465,16 @@ impl SimpleIe for FTeid {
         let v6 = (flags & 0x02) != 0; // bit 2
         let ch = (flags & 0x04) != 0; // bit 3
         let chid = (flags & 0x08) != 0; // bit 4
+
+        if (!v4 && !v6) || (chid && !ch) {
+            return Err(DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "invalid F-TEID flags",
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref));
+        }
 
         let mut pos = 1usize;
         let mut teid = None;
@@ -409,7 +496,7 @@ impl SimpleIe for FTeid {
         let mut ipv4 = None;
         let mut ipv6 = None;
 
-        if v4 {
+        if v4 && !ch {
             if value.len() < pos + 4 {
                 return Err(DecodeError::new(DecodeErrorCode::Truncated, offset + pos)
                     .with_spec_ref(spec_ref));
@@ -420,7 +507,7 @@ impl SimpleIe for FTeid {
             pos += 4;
         }
 
-        if v6 {
+        if v6 && !ch {
             if value.len() < pos + 16 {
                 return Err(DecodeError::new(DecodeErrorCode::Truncated, offset + pos)
                     .with_spec_ref(spec_ref));
@@ -438,11 +525,9 @@ impl SimpleIe for FTeid {
                     .with_spec_ref(spec_ref));
             }
             choose_id = Some(value[pos]);
-            // pos not needed beyond this point.
         }
 
-        let _ = pos;
-
+        // Extendable IEs ignore unknown trailing octets (TS 29.244 §8.1.2).
         Ok(Self {
             v4,
             v6,
@@ -456,6 +541,18 @@ impl SimpleIe for FTeid {
     }
 
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        if (!self.v4 && !self.v6)
+            || (self.chid && !self.ch)
+            || self.teid.is_some() == self.ch
+            || self.ipv4.is_some() != (self.v4 && !self.ch)
+            || self.ipv6.is_some() != (self.v6 && !self.ch)
+            || self.choose_id.is_some() != self.chid
+        {
+            return Err(EncodeError::new(opc_protocol::EncodeErrorCode::Structural {
+                reason: "F-TEID fields disagree with flags",
+            })
+            .with_spec_ref(SpecRef::new("3gpp", "TS29244", "8.2.3")));
+        }
         let mut flags: u8 = 0;
         if self.v4 {
             flags |= 0x01;
@@ -2103,8 +2200,13 @@ impl SimpleIe for NetworkInstance {
 /// UE IP Address IE (type 93).
 ///
 /// TS 29.244 §8.2.62:
-/// - octet 5: bit 1 V4, bit 2 V6, bit 3 S/D, bit 4 IPv4D, bit 5 IPv6D,
-///   bit 6 CHV4, bit 7 CHV6, bit 8 CH, bits 8-? spare
+/// - octet 5: bit 1 V6, bit 2 V4, bit 3 S/D, bit 4 IPv6D, bit 5 CHV4,
+///   bit 6 CHV6, bit 7 IP6PL, bit 8 spare.
+/// - IPv4, IPv6, IPv6 Prefix Delegation Bits, IPv6 Prefix Length, in that order.
+///
+/// Invalid flag combinations and truncated fields are rejected.
+/// The receiver ignores the spare bit and unknown trailing extension octets;
+/// the encoder emits only the known fields with the spare bit cleared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UeIpAddress {
     /// IPv4 address present.
@@ -2113,24 +2215,33 @@ pub struct UeIpAddress {
     pub v6: bool,
     /// Source/Destination flag.
     pub sd: bool,
-    /// IPv4D flag.
-    pub ipv4d: bool,
-    /// IPv6D flag.
+    /// IPv6 Prefix Delegation Bits field present.
     pub ipv6d: bool,
+    /// IPv6 Prefix Length field present.
+    pub ip6pl: bool,
     /// CHV4 flag.
     pub chv4: bool,
     /// CHV6 flag.
     pub chv6: bool,
-    /// CH flag.
-    pub ch: bool,
     /// IPv4 address (4 octets) if V4.
     pub ipv4: Option<[u8; 4]>,
     /// IPv6 address / prefix (16 octets) if V6.
     pub ipv6: Option<[u8; 16]>,
-    /// IPv4 prefix length (1 octet) if IPv4D.
-    pub ipv4_prefix_length: Option<u8>,
-    /// IPv6 prefix length (1 octet) if IPv6D.
+    /// IPv6 prefix delegation bits relative to /64 (1 octet) if IPv6D.
+    pub ipv6_prefix_delegation_bits: Option<u8>,
+    /// IPv6 prefix length (1 octet) if IP6PL.
     pub ipv6_prefix_length: Option<u8>,
+}
+
+impl UeIpAddress {
+    fn has_consistent_fields(&self) -> bool {
+        !(self.v4 && self.chv4 || self.v6 && self.chv6 || self.ipv6d && self.ip6pl)
+            && (!(self.ipv6d || self.ip6pl) || self.v6 || self.chv6)
+            && self.v4 == self.ipv4.is_some()
+            && self.v6 == self.ipv6.is_some()
+            && self.ipv6d == self.ipv6_prefix_delegation_bits.is_some()
+            && self.ip6pl == self.ipv6_prefix_length.is_some()
+    }
 }
 
 impl SimpleIe for UeIpAddress {
@@ -2141,19 +2252,18 @@ impl SimpleIe for UeIpAddress {
             );
         }
         let flags = value[0];
-        let v4 = (flags & 0x01) != 0;
-        let v6 = (flags & 0x02) != 0;
+        let v4 = (flags & 0x02) != 0;
+        let v6 = (flags & 0x01) != 0;
         let sd = (flags & 0x04) != 0;
-        let ipv4d = (flags & 0x08) != 0;
-        let ipv6d = (flags & 0x10) != 0;
-        let chv4 = (flags & 0x20) != 0;
-        let chv6 = (flags & 0x40) != 0;
-        let ch = (flags & 0x80) != 0;
+        let ipv6d = (flags & 0x08) != 0;
+        let ip6pl = (flags & 0x40) != 0;
+        let chv4 = (flags & 0x10) != 0;
+        let chv6 = (flags & 0x20) != 0;
 
         let mut pos = 1usize;
         let mut ipv4 = None;
         let mut ipv6 = None;
-        let mut ipv4_prefix_length = None;
+        let mut ipv6_prefix_delegation_bits = None;
         let mut ipv6_prefix_length = None;
 
         if v4 {
@@ -2178,67 +2288,77 @@ impl SimpleIe for UeIpAddress {
             pos += 16;
         }
 
-        if ipv4d {
+        if ipv6d {
             if value.len() < pos + 1 {
                 return Err(DecodeError::new(DecodeErrorCode::Truncated, offset + pos)
                     .with_spec_ref(spec_ref.clone()));
             }
-            ipv4_prefix_length = Some(value[pos]);
+            ipv6_prefix_delegation_bits = Some(value[pos]);
             pos += 1;
         }
 
-        if ipv6d {
+        if ip6pl {
             if value.len() < pos + 1 {
                 return Err(DecodeError::new(DecodeErrorCode::Truncated, offset + pos)
-                    .with_spec_ref(spec_ref));
+                    .with_spec_ref(spec_ref.clone()));
             }
             ipv6_prefix_length = Some(value[pos]);
-            // pos not needed beyond this point.
         }
 
-        let _ = pos;
-
-        Ok(Self {
+        // Extendable IEs ignore unknown trailing octets (TS 29.244 §8.1.2).
+        let address = Self {
             v4,
             v6,
             sd,
-            ipv4d,
             ipv6d,
+            ip6pl,
             chv4,
             chv6,
-            ch,
             ipv4,
             ipv6,
-            ipv4_prefix_length,
+            ipv6_prefix_delegation_bits,
             ipv6_prefix_length,
-        })
+        };
+        if !address.has_consistent_fields() {
+            return Err(DecodeError::new(
+                DecodeErrorCode::Structural {
+                    reason: "invalid UE IP Address flags",
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref));
+        }
+        Ok(address)
     }
 
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        if !self.has_consistent_fields() {
+            return Err(EncodeError::new(opc_protocol::EncodeErrorCode::Structural {
+                reason: "UE IP Address fields disagree with flags",
+            })
+            .with_spec_ref(SpecRef::new("3gpp", "TS29244", "8.2.62")));
+        }
         let mut flags: u8 = 0;
         if self.v4 {
-            flags |= 0x01;
+            flags |= 0x02;
         }
         if self.v6 {
-            flags |= 0x02;
+            flags |= 0x01;
         }
         if self.sd {
             flags |= 0x04;
         }
-        if self.ipv4d {
+        if self.ipv6d {
             flags |= 0x08;
         }
-        if self.ipv6d {
-            flags |= 0x10;
-        }
-        if self.chv4 {
-            flags |= 0x20;
-        }
-        if self.chv6 {
+        if self.ip6pl {
             flags |= 0x40;
         }
-        if self.ch {
-            flags |= 0x80;
+        if self.chv4 {
+            flags |= 0x10;
+        }
+        if self.chv6 {
+            flags |= 0x20;
         }
         dst.put_u8(flags);
         if let Some(ip) = self.ipv4 {
@@ -2247,7 +2367,7 @@ impl SimpleIe for UeIpAddress {
         if let Some(ip) = self.ipv6 {
             dst.put_slice(&ip);
         }
-        if let Some(pl) = self.ipv4_prefix_length {
+        if let Some(pl) = self.ipv6_prefix_delegation_bits {
             dst.put_u8(pl);
         }
         if let Some(pl) = self.ipv6_prefix_length {

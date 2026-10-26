@@ -340,6 +340,13 @@
       "kind": "assertions-decreased",
       "reason": "Remove the redundant admitted assertion after the bounded receipt loop already requires that same captured status to be admitted before it can exit. A missing admission still fails within the original 30-second bound, now naming the last store, receipt and status. Exact receipt-index, leader and readiness assertions remain; no timeout, poll interval or production behavior changes.",
       "issue": 1407
+    },
+    {
+      "test": "rust:crates/opc-proto-pfcp::lib=lib::ie::tests::test_ue_ip_address_v4_prefix_spec_bytes",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-pfcp::lib=lib::ie::tests::test_ue_ip_address_v6_delegation_spec_bytes",
+      "reason": "Correct the golden vector for TS 29.244 section 8.2.62: the IE defines IPv6 prefix delegation, not an IPv4 prefix-length field. Retain the flag, prefix-field and round-trip assertions using the normative IPv6 layout; independent IPv4, IPv6, dual-stack and allocation vectors are added separately.",
+      "issue": 1513
     }
   ]
 }

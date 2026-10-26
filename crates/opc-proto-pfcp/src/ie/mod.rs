@@ -209,7 +209,7 @@ impl TypedIe {
             19 => Self::Cause(simple::Cause::decode_value(
                 value,
                 offset,
-                spec_ref.clone(),
+                SpecRef::new("3gpp", "TS29244", "8.2.1"),
             )?),
             20 => Self::SourceInterface(simple::SourceInterface::decode_value(
                 value,
@@ -219,7 +219,7 @@ impl TypedIe {
             21 => Self::FTeid(simple::FTeid::decode_value(
                 value,
                 offset,
-                spec_ref.clone(),
+                SpecRef::new("3gpp", "TS29244", "8.2.3"),
             )?),
             22 => Self::NetworkInstance(simple::NetworkInstance::decode_value(
                 value,
@@ -276,7 +276,7 @@ impl TypedIe {
             93 => Self::UeIpAddress(simple::UeIpAddress::decode_value(
                 value,
                 offset,
-                spec_ref.clone(),
+                SpecRef::new("3gpp", "TS29244", "8.2.62"),
             )?),
             95 => Self::OuterHeaderRemoval(simple::OuterHeaderRemoval::decode_value(
                 value,

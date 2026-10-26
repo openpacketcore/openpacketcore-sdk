@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-pfcp`: correct the `UeIpAddress` wire model. Remove `ipv4d`,
+  `ipv4_prefix_length`, and `ch` from struct literals; use `ipv6d` with
+  `ipv6_prefix_delegation_bits` for delegation and `ip6pl` with
+  `ipv6_prefix_length` for an explicit IPv6 prefix length. `CauseValue` adds
+  named acceptance and rejection variants; exhaustive matches must handle
+  them. See the crate's conformance migration notes. (#1512, #1513)
+
 - `opc-proto-diameter`: `DiameterRequestFailure` adds `RoutePolicy` and
   `DiameterRequestClassificationError` adds `RoutePolicyRequiresProxiableRequest`;
   downstream exhaustive matches must handle the new variants.
@@ -901,6 +908,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-proto-pfcp`: align Cause codes, UE IP Address flags and IPv6 prefix
+  fields, and F-TEID CHOOSE encoding with TS 29.244. Reject inconsistent
+  address flags and encoder fields while preserving the required tolerance
+  for unknown trailing extension octets. (#1512, #1513, #1514)
+- `opc-proto-gtpu`: reject unsupported downlink BSSI/TTNBI fields from
+  TS 38.415 V19.1.0 instead of silently discarding them as PPI spare bits
+  and padding; update the independent N3 reference vectors. (#1520)
 
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 

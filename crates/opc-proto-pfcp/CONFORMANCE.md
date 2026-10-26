@@ -11,6 +11,38 @@ This document defines the conformance of the `opc-proto-pfcp` crate against
   `Production Profile v1` is a compatibility identifier for the N4 codec
   candidate below, not a current production approval
 
+The Cause registry and the F-TEID / UE IP Address wire layouts are checked
+against [TS 29.244 V19.6.0](https://www.etsi.org/deliver/etsi_ts/129200_129299/129244/19.06.00_60/ts_129244v190600p.pdf)
+Tables/Figures 8.2.1-1, 8.2.3-1, and 8.2.62-1. This adds named Cause values;
+it does not claim complete Release 19 procedure support.
+
+### Wire corrections and source migration (#1512–#1514)
+
+- Cause 66 is `MandatoryIeMissing`; cause 72 is
+  `NoEstablishedPfcpAssociation`. Named values cover 1–3 and 64–92.
+  Unknown values round-trip, and `is_acceptance` / `is_rejection` classify
+  the full 1–63 / 64–255 ranges; reserved zero belongs to neither.
+- F-TEID CHOOSE requests carry address-family flags and an optional CHOOSE ID,
+  with no TEID or address bytes. Both decode and encode reject CHID without
+  CH, missing address families, or fields inconsistent with their flags.
+- `UeIpAddress.v4` uses bit 2 and `v6` uses bit 1. Remove the old `ipv4d`,
+  `ipv4_prefix_length`, and `ch` fields from struct literals. IPv6 delegation
+  uses `ipv6d` and `ipv6_prefix_delegation_bits`; explicit IPv6 prefix lengths
+  use the new `ip6pl` flag and `ipv6_prefix_length`. CHV4/CHV6 use bits 5/6.
+  Bit 8 is ignored on receive and cleared on encode. Inconsistent allocation
+  flags, IPv6D with IP6PL, and truncated fields are rejected at all validation
+  levels. Encoders reject fields inconsistent with their flags.
+
+Both address IEs are **Extendable** in Table 8.1.2-1: §8.1.2 requires receivers
+to ignore unknown trailing octets. The exact-length rejection requested in
+#1513 would violate this rule. Typed decoding accepts these extensions and
+re-encodes the known fields; use `InformationElement` for byte-exact forwarding.
+
+The previous address layouts and shifted Cause values were incorrect wire
+encodings and are not supported as a compatibility mode. Downstream exhaustive
+matches on `CauseValue` must account for the added variants. Independent byte
+and malformed-input regressions are in `tests/spec_wire_regressions.rs`.
+
 ## Production Profile v1 — N4 Codec and Validation
 
 `opc-proto-pfcp` retains `Production Profile v1` as its public **codec and
@@ -152,10 +184,10 @@ arithmetic, truncation/overflow rejection, and negative tests.
 
 | IE | Type | Section | Notes |
 |:---|:---|:---|:---|
-| Cause | 19 | §8.2.1 | Value registry with `Unknown(u8)` fallback. |
+| Cause | 19 | §8.2.1 | V19.6.0 registry, `Unknown(u8)` fallback, acceptance/rejection classification. |
 | Node ID | 60 | §8.2.38 | IPv4/IPv6/FQDN; length validated per type. |
 | F-SEID | 57 | §8.2.40 | V4/V6 flags, SEID (8 octets), address order. |
-| F-TEID | 21 | §8.2.5 | V4/V6/CH/CHID flags, TEID, Choose ID. |
+| F-TEID | 21 | §8.2.3 | V4/V6/CH/CHID flags; CH omits TEID and addresses; conditional Choose ID. |
 | PDR ID | 56 | §8.2.36 | 2 octets. |
 | FAR ID | 108 | §8.2.50 | 4 octets. |
 | QER ID | 109 | §8.2.37 | 4 octets. |
@@ -165,7 +197,7 @@ arithmetic, truncation/overflow rejection, and negative tests.
 | Source Interface | 20 | §8.2.2 | 1 octet; spare nibble preserved. |
 | Destination Interface | 42 | §8.2.3 | 1 octet; spare nibble preserved. |
 | Network Instance | 22 | §8.2.4 | Variable-length DNN octet string. |
-| UE IP Address | 93 | §8.2.62 | V4/V6/SD/IPv4D/IPv6D/CHV4/CHV6/CH flags; prefix lengths. |
+| UE IP Address | 93 | §8.2.62 | V6/V4/SD/IPv6D/CHV4/CHV6/IP6PL flags; IPv6 delegation and prefix length. |
 | Outer Header Creation | 84 | §8.2.56 | 16-bit description (octet 5 = high byte); TEID iff GTP-U (octet 5 bits 1-2), UDP port iff non-GTP UDP (bits 3-4), addresses per bits 1/3/5 and 2/4/6; C-TAG/S-TAG. |
 | Outer Header Removal | 95 | §8.2.57 | 1 octet description. |
 | Recovery Time Stamp | 96 | §8.2.69 | 4 octets, NTP short-format seconds (RFC 5905, 1900 era), carried opaquely. |
@@ -195,7 +227,7 @@ arithmetic, truncation/overflow rejection, and negative tests.
 
 The typed layer canonicalizes on re-encode: spare flag bits that the spec
 requires to be zero are emitted as zero, and trailing octets beyond the
-fields this release knows (which §8.1.1 forward compatibility requires a
+fields this release knows (which §8.1.2 forward compatibility requires a
 receiver to ignore) are dropped rather than preserved. A typed decode →
 encode round-trip is therefore byte-exact for spec-canonical messages —
 which is what every fixture in the test suite asserts — but not for

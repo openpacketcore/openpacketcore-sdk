@@ -177,7 +177,7 @@ fn unknown_extension_header_reject_policy_fails_closed() {
 
 #[test]
 fn ppi_decode_uses_ts_38415_high_bits_and_ignores_spares() {
-    // TS 38.415 V18.2.0, figure 5.5.2.1-1: PPI occupies bits 7..5.
+    // TS 38.415 figure 5.5.2.1-1: PPI occupies bits 7..5; R19 uses bits 1..0.
     // Literal wire octets keep the oracle independent of the encoder.
     for (ppi, octet) in [
         (5, 0xa0),
@@ -196,7 +196,12 @@ fn ppi_decode_uses_ts_38415_high_bits_and_ignores_spares() {
                 content: &content,
                 next_ext_type: 0,
             };
-            let decoded = PduSessionContainer::decode(&extension).unwrap();
+            let result = PduSessionContainer::decode(&extension);
+            if spare & 0x03 != 0 {
+                assert!(result.is_err(), "unsupported R19 burst presence flags");
+                continue;
+            }
+            let decoded = result.unwrap();
             assert_eq!(decoded.ppi, Some(ppi), "wire PPI octet {:#04x}", content[2]);
             assert_eq!(decoded.qfi, 9);
             assert!(decoded.rqi);
