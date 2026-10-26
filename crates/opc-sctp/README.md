@@ -365,6 +365,19 @@ negotiate AUTH. FORWARD-TSN authentication is an explicit addition for a
 caller using partial reliability. Ordinary `bind` and `connect` remain
 unchanged and do not enable these requirements.
 
+`SctpAuthenticationConfig::data().with_sha256_preference()` requests HMAC IDs
+`[3, 1]`: SHA-256 first, followed by RFC 4895's mandatory SHA-1 fallback.
+Failure to configure or read back that exact order rejects setup. Without
+the option, kernel preference is retained. Local authenticated-chunk readback
+is checked before bind/connect and after association establishment, and is
+available through `SctpAssociation::local_authenticated_chunks()`.
+
+HMAC preference is verified on the endpoint before listen/connect. Linux
+`accept` creates a fresh endpoint whose `SCTP_HMAC_IDENT` reports defaults,
+not the established association's inherited list. It must not be used to
+infer or change that association's negotiation. Association-specific local
+and peer chunk requirements are still verified after acceptance.
+
 An RFC 6083 exporter result is admitted only through the exact-width helper:
 
 ```rust,no_run

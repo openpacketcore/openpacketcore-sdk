@@ -512,6 +512,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The public error stays `Unavailable`, and no failure class restores dispatch
   authority. Refs #1378.
 
+- `opc-sctp`: add explicit SHA-256-first SCTP-AUTH preference with the
+  mandatory SHA-1 fallback. Verify endpoint preference before association
+  setup and association-specific local chunk requirements after connect/accept.
+  Expose local chunk readback; retain ordinary/default transport behavior.
+  Linux accepted-socket HMAC defaults are not treated as negotiated policy.
+  (#1351)
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a

@@ -126,6 +126,18 @@ pub fn peer_authenticated_chunks(_fd: BorrowedFd<'_>, _assoc_id: i32) -> io::Res
     Err(unsupported())
 }
 
+pub fn set_hmac_identifiers(_fd: BorrowedFd<'_>, _identifiers: &[u16]) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub fn hmac_identifiers(_fd: BorrowedFd<'_>) -> io::Result<Vec<u16>> {
+    Err(unsupported())
+}
+
+pub fn local_authenticated_chunks(_fd: BorrowedFd<'_>, _assoc_id: i32) -> io::Result<Vec<u8>> {
+    Err(unsupported())
+}
+
 pub fn set_event(
     _fd: BorrowedFd<'_>,
     _assoc_id: i32,

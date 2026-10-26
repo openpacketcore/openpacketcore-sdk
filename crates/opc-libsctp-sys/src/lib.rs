@@ -381,6 +381,27 @@ pub fn peer_authenticated_chunks(fd: BorrowedFd<'_>, assoc_id: AssocId) -> io::R
     platform::peer_authenticated_chunks(fd, assoc_id)
 }
 
+/// Configure SCTP-AUTH HMAC preference before forming any association.
+///
+/// Supports SHA-1 (1) and SHA-256 (3), without duplicates. RFC 4895 requires
+/// SHA-1 in every list; the first identifier has highest preference.
+pub fn set_hmac_identifiers(fd: BorrowedFd<'_>, identifiers: &[u16]) -> io::Result<()> {
+    platform::set_hmac_identifiers(fd, identifiers)
+}
+
+/// Read back the endpoint's configured HMAC identifiers in preference order.
+///
+/// Read before connect/listen: an accepted Linux socket has a fresh endpoint,
+/// so this option does not prove the existing association's inherited list.
+pub fn hmac_identifiers(fd: BorrowedFd<'_>) -> io::Result<Vec<u16>> {
+    platform::hmac_identifiers(fd)
+}
+
+/// Read the chunk types that the local endpoint requires authenticated.
+pub fn local_authenticated_chunks(fd: BorrowedFd<'_>, assoc_id: AssocId) -> io::Result<Vec<u8>> {
+    platform::local_authenticated_chunks(fd, assoc_id)
+}
+
 /// Enable or disable one notification for a specific association.
 ///
 /// The association identifier is ignored for one-to-one sockets.

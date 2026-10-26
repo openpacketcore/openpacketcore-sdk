@@ -59,6 +59,11 @@ let fd = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne)?;
   exact Linux packed/aligned UAPI layouts. Unit tests assert every field offset,
   total size, alignment, option-update encoding, wildcard behavior, and
   redaction-safe peer-parameter `Debug` output.
+- `set_hmac_identifiers`/`hmac_identifiers` expose bounded, ordered SHA-1/SHA-256
+  preferences, with SHA-1 mandatory. `local_authenticated_chunks` and
+  `peer_authenticated_chunks` share exact count/length validation. HMAC
+  readback describes endpoint configuration; read it before listen/connect,
+  not as evidence of an accepted association's inherited negotiation.
 - SCTP-AUTH support is enabled before chunk requirements are configured and
   before an association forms. Key-option scratch buffers are zeroized, key
   identifiers retain their association scope, and callers can observe exact
