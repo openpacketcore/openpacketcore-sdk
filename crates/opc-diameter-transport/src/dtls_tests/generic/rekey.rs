@@ -53,8 +53,18 @@ async fn credential_withdrawal_interrupts_a_pending_rekey_in_both_roles() {
 
 #[tokio::test]
 async fn coordinated_rekey_preserves_queued_streams_and_rotates_each_auth_boundary() {
-    let material = dtls_material();
-    for cipher in DtlsSctpPolicy::default().allowed_ciphers() {
+    for cipher in DtlsSctpPolicy::default().allowed_ciphers().chain([
+        DtlsSctpCipher::EcdheRsaAes128GcmSha256,
+        DtlsSctpCipher::EcdheRsaAes256GcmSha384,
+    ]) {
+        let material = if matches!(
+            cipher,
+            DtlsSctpCipher::EcdheRsaAes128GcmSha256 | DtlsSctpCipher::EcdheRsaAes256GcmSha384
+        ) {
+            rsa_dtls_material()
+        } else {
+            dtls_material()
+        };
         let policy = Policy::ordered_streams(PayloadProtocol::Ngap, 4096, 16, 32)
             .expect("streams")
             .with_allowed_ciphers(&[cipher])

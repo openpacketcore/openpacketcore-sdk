@@ -113,6 +113,9 @@ pub(super) struct RustCryptoKeyProvider;
 
 impl KeyProvider for RustCryptoKeyProvider {
     fn load_private_key(&self, key_der: &[u8]) -> Result<Box<dyn SigningKeyTrait>, CryptoError> {
+        if let Some(key) = super::super::rsa::load_key(key_der) {
+            return Ok(key);
+        }
         // Try PKCS#8 DER format first (most common)
         if let Ok(key) = SigningKey::<NistP256>::from_pkcs8_der(key_der) {
             return Ok(Box::new(EcdsaSigningKey::P256(key)));
@@ -194,6 +197,21 @@ impl KeyProvider for RustCryptoKeyProvider {
 pub(super) struct RustCryptoSignatureVerifier;
 
 impl SignatureVerifier for RustCryptoSignatureVerifier {
+    fn verify_with_scheme(
+        &self,
+        cert: &[u8],
+        data: &[u8],
+        signature: &[u8],
+        scheme: crate::types::SignatureScheme,
+    ) -> Result<(), CryptoError> {
+        let alg = crate::dtls12::message::SignatureAndHashAlgorithm::from_u16(scheme.as_u16());
+        if alg.signature_algorithm() == SignatureAlgorithm::RSA {
+            super::super::rsa::verify(cert, data, signature, scheme)
+        } else {
+            self.verify_signature(cert, data, signature, alg.hash, alg.signature)
+        }
+    }
+
     fn verify_signature(
         &self,
         cert_der: &[u8],
@@ -202,6 +220,11 @@ impl SignatureVerifier for RustCryptoSignatureVerifier {
         hash_alg: HashAlgorithm,
         sig_alg: SignatureAlgorithm,
     ) -> Result<(), CryptoError> {
+        if sig_alg == SignatureAlgorithm::RSA {
+            let scheme =
+                crate::types::SignatureScheme::from_u16(((hash_alg.as_u8() as u16) << 8) | 1);
+            return super::super::rsa::verify(cert_der, data, signature, scheme);
+        }
         if sig_alg != SignatureAlgorithm::ECDSA {
             return Err(CryptoError::UnsupportedSignatureAlgorithm(sig_alg));
         }

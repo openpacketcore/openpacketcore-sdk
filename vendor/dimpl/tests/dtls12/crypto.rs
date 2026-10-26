@@ -12,6 +12,21 @@ use crate::ossl_helper::{DtlsCertOptions, DtlsEvent, DtlsPKeyType, OsslDtlsCert}
 const GROUPS_PREFER_X25519: &str = "X25519:P-256:P-384";
 const NAMED_GROUP_X25519: u16 = 0x001D;
 
+#[test]
+fn rsa_certificate_suites_interoperate_with_openssl_in_both_roles() {
+    for suite in [0xc02f, 0xc030].map(Dtls12CipherSuite::from_u16) {
+        for sigalgs in [
+            "rsa_pss_rsae_sha256",
+            "rsa_pss_rsae_sha384",
+            "rsa_pkcs1_sha256",
+            "rsa_pkcs1_sha384",
+        ] {
+            run_dimpl_client_vs_ossl_server_for_suite(suite, Some(sigalgs));
+            run_ossl_client_vs_dimpl_server_for_suite(suite, Some(sigalgs));
+        }
+    }
+}
+
 fn read_u24(bytes: &[u8]) -> usize {
     ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | (bytes[2] as usize)
 }
@@ -71,10 +86,10 @@ fn dtls12_all_cipher_suites() {
     for &suite in Dtls12CipherSuite::all().iter().filter(|s| !s.is_psk()) {
         eprintln!("Testing suite (dimpl client ↔️ ossl server): {:?}", suite);
 
-        run_dimpl_client_vs_ossl_server_for_suite(suite);
+        run_dimpl_client_vs_ossl_server_for_suite(suite, None);
 
         eprintln!("Testing suite (ossl client ↔️ dimpl server): {:?}", suite);
-        run_ossl_client_vs_dimpl_server_for_suite(suite);
+        run_ossl_client_vs_dimpl_server_for_suite(suite, None);
     }
 }
 
@@ -98,12 +113,14 @@ fn config_for_suite(suite: Dtls12CipherSuite) -> Arc<Config> {
     Arc::new(
         Config::builder()
             .with_crypto_provider(provider)
+            .require_client_certificate(true)
+            .require_server_certificate_request(true)
             .build()
             .expect("build config for single suite"),
     )
 }
 
-fn run_dimpl_client_vs_ossl_server_for_suite(suite: Dtls12CipherSuite) {
+fn run_dimpl_client_vs_ossl_server_for_suite(suite: Dtls12CipherSuite, sigalgs: Option<&str>) {
     // Generate certificates for both client and server matching the suite's signature algorithm
     let pkey_type = match suite.signature_algorithm() {
         Some(SignatureAlgorithm::ECDSA) => DtlsPKeyType::EcDsaP256,
@@ -122,9 +139,12 @@ fn run_dimpl_client_vs_ossl_server_for_suite(suite: Dtls12CipherSuite) {
     });
 
     // Create OpenSSL server impl
-    let mut server = server_cert
-        .new_dtls_impl_with_groups(GROUPS_PREFER_X25519)
-        .expect("Failed to create DTLS server");
+    let mut server = crate::ossl_helper::OsslDtlsImpl::new_with_algorithms(
+        server_cert,
+        Some(GROUPS_PREFER_X25519),
+        sigalgs,
+    )
+    .expect("Failed to create DTLS server");
     server.set_active(false);
 
     // Initialize dimpl client restricted to the single suite.
@@ -214,7 +234,7 @@ fn run_dimpl_client_vs_ossl_server_for_suite(suite: Dtls12CipherSuite) {
     );
 }
 
-fn run_ossl_client_vs_dimpl_server_for_suite(suite: Dtls12CipherSuite) {
+fn run_ossl_client_vs_dimpl_server_for_suite(suite: Dtls12CipherSuite, sigalgs: Option<&str>) {
     // Generate certificates for both ends
     let pkey_type = match suite.signature_algorithm() {
         Some(SignatureAlgorithm::ECDSA) => DtlsPKeyType::EcDsaP256,
@@ -232,9 +252,12 @@ fn run_ossl_client_vs_dimpl_server_for_suite(suite: Dtls12CipherSuite) {
     });
 
     // OpenSSL DTLS client
-    let mut ossl_client = client_cert
-        .new_dtls_impl_with_groups(GROUPS_PREFER_X25519)
-        .expect("Failed to create DTLS client");
+    let mut ossl_client = crate::ossl_helper::OsslDtlsImpl::new_with_algorithms(
+        client_cert,
+        Some(GROUPS_PREFER_X25519),
+        sigalgs,
+    )
+    .expect("Failed to create DTLS client");
     ossl_client.set_active(true);
 
     // dimpl server with single-suite config.

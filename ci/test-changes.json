@@ -966,6 +966,41 @@
       "kind": "disabled",
       "reason": "New native SCTP-AUTH test sends malformed authenticated Diameter frames through sequential and concurrent receivers. Required SCTP workflow runs it through qualify-sctp-close-wire.py and requires six actual ABORT associations plus separate graceful-close controls.",
       "issue": 1351
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::filters_unsupported_rsa_signature_algorithm",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to retains_supported_rsa_and_ecdsa_signature_algorithms for implemented DTLS RSA support. The parser and serializer now preserve modern RSA schemes. The separate unsupported-type test retains DSA and MD5 refusal.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::retains_supported_rsa_and_ecdsa_signature_algorithms"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::default_does_not_advertise_rsa",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to default_advertises_modern_rsa_and_ecdsa_schemes for implemented DTLS RSA support. The wire advertisement now includes only ECDSA and RSA-PSS/PKCS1 SHA-256/384; assertions retain the exact supported set and modern-hash restriction.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::default_advertises_modern_rsa_and_ecdsa_schemes"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::tests::rsa_signature_algorithms_are_recognized_but_not_supported",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to modern_rsa_signatures_are_supported_but_legacy_hashes_are_not for implemented DTLS RSA support. The former unsupported RSA capability is implemented; explicit SHA-1 and MD5 refusal replaces the obsolete RSA rejection.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::tests::modern_rsa_signatures_are_supported_but_legacy_hashes_are_not"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_does_not_select_rsa_signatures",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to certificate_request_selects_rsa_and_ecdsa_signatures for implemented DTLS RSA support. Exact intersection assertions now retain RSA and ECDSA; ECDSA selection assertions remain.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_selects_rsa_and_ecdsa_signatures"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_rejects_rsa_only_signatures",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to certificate_request_accepts_rsa_only_signatures for implemented DTLS RSA support. RSA-only modern offers now work. New CertificateRequest and CertificateVerify tests reject mismatched certificate types and unoffered schemes; independent OpenSSL handshakes exercise both roles with every supported RSA scheme.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_accepts_rsa_only_signatures"
     }
   ]
 }

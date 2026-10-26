@@ -101,7 +101,8 @@ mod tests {
 
         let (_, parsed) = SignatureAlgorithmsExtension::parse(&serialized).unwrap();
 
-        assert_eq!(parsed.supported_signature_algorithms.len(), 1);
+        assert_eq!(parsed.supported_signature_algorithms.len(), 2);
+        assert_eq!(parsed.supported_signature_algorithms, algorithms);
         assert_eq!(
             parsed.supported_signature_algorithms[0],
             SignatureAndHashAlgorithm::new(HashAlgorithm::SHA256, SignatureAlgorithm::ECDSA,)
@@ -109,14 +110,20 @@ mod tests {
     }
 
     #[test]
-    fn default_does_not_advertise_rsa() {
+    fn default_advertises_modern_rsa_and_ecdsa_schemes() {
         let extension = SignatureAlgorithmsExtension::default();
-
+        assert_eq!(
+            extension.supported_signature_algorithms.as_slice(),
+            SignatureAndHashAlgorithm::supported()
+        );
         assert!(
             extension
                 .supported_signature_algorithms
                 .iter()
-                .all(|algorithm| algorithm.signature != SignatureAlgorithm::RSA)
+                .all(|alg| matches!(
+                    alg.hash_algorithm(),
+                    HashAlgorithm::SHA256 | HashAlgorithm::SHA384
+                ))
         );
     }
 
