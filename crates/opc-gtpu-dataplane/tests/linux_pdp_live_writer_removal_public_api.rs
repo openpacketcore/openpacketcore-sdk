@@ -13,7 +13,7 @@ use opc_gtpu_dataplane::{
     GtpDevice, GtpPdpContext, GtpuCapability, GtpuDataplaneBackend, GtpuError,
     LinuxGtpuDataplaneBackend, PdpContextIndeterminateReason, PdpContextRemovalOutcome,
     PdpContextRepairReason, PdpDeviceIncarnation, PdpLiveWriterProof, PdpLiveWriterRemovalRequest,
-    PeerTeid,
+    Teid,
 };
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -114,7 +114,7 @@ async fn linux_live_writer_removal_request_is_redaction_safe() {
         PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap(),
         GtpPdpContext {
             local_teid: opc_gtpu_dataplane::Teid::new(0x1122_3344).unwrap(),
-            peer_teid: PeerTeid::new(0x5566_7788),
+            peer_teid: Teid::new(0x5566_7788).unwrap().into(),
             ms_address: "10.23.0.2".parse().unwrap(),
             peer_address: "192.0.2.10".parse().unwrap(),
             link_ifindex: 7,

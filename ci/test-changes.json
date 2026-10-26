@@ -618,7 +618,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel",
       "kind": "assertions-decreased",
-      "reason": "Restore main’s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
+      "reason": "Restore main\u2019s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
       "issue": 1018,
       "replacements": [
         "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::rate_budget_retention_preserves_lifetime_bound_across_limit_replacement"
@@ -1058,6 +1058,18 @@
       "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_fails_and_wrong_procedure_ie_is_skipped",
       "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
       "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::zero_peer_teid_is_installed_and_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed with its explicit opt-in in the compliance VM: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_zero_peer_teid_is_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed with its explicit opt-in in the compliance VM: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
     }
   ]
 }

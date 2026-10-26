@@ -4688,6 +4688,20 @@ mod tests {
     }
 
     #[test]
+    fn pdp_readback_accepts_zero_peer_teid() {
+        let selector_context = pdp_context();
+        let selector = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(&selector_context).unwrap(),
+        );
+        let mut zero_peer = selector_context;
+        zero_peer.peer_teid = PeerTeid::ZERO;
+        let received =
+            parse_pdp_context_response(&pdp_response(&zero_peer, true), &selector, 31).unwrap();
+        assert_eq!(received.peer_teid, PeerTeid::ZERO);
+        assert!(validate_pdp_context(&received).is_ok());
+    }
+
+    #[test]
     fn pdp_readback_preserves_the_full_peer_teid_domain() {
         for peer_teid in [0, 1, u32::MAX] {
             let mut context = pdp_context();

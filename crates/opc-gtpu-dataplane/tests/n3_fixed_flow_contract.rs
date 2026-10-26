@@ -4,15 +4,18 @@ use opc_gtpu_dataplane::n3::{
     ReceivedN3UplinkTnl,
 };
 use opc_gtpu_dataplane::{
-    GtpBearerMark, GtpuSessionEntry, GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, PeerTeid,
-    Teid,
+    GtpBearerMark, GtpuSessionEntry, GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, Teid,
 };
 use opc_gtpu_ebpf_common::{n3_downlink_psc_matches, n3_uplink_extension};
 
 fn intent(qfi: u8) -> N3ForwardingIntent {
     N3ForwardingIntent::new(
         N3ForwardingRole::N3iwf,
-        ReceivedN3UplinkTnl::new("192.0.2.10".parse().unwrap(), PeerTeid::new(0x55667788)).unwrap(),
+        ReceivedN3UplinkTnl::new(
+            "192.0.2.10".parse().unwrap(),
+            Teid::new(0x55667788).unwrap().into(),
+        )
+        .unwrap(),
         LocalN3DownlinkTnl::new("192.0.2.1".parse().unwrap(), Teid::new(0x11223344).unwrap())
             .unwrap(),
         N3FlowMarking::new(N3Qfi::new(qfi).unwrap(), GtpBearerMark::new(0x10203040)),
