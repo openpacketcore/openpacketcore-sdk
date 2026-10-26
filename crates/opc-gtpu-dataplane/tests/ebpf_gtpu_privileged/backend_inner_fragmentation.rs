@@ -504,6 +504,8 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         Ok(()),
         "a valid live update preserves lifetime history without re-registration"
     );
+    // Allow one token to refill independently of the following socket/XFRM setup.
+    std::thread::sleep(GtpuInnerFragmentRateLimit::default().refill_interval());
 
     // 5. A dedicated bearer through its real ESP Child SA: every fragment is
     //    injected with the bearer mark, leaves under the dedicated SPI, is

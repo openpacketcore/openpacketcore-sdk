@@ -1482,9 +1482,10 @@ impl GtpuDownlinkPacketTooBig {
 /// [`GtpuDownlinkCounters::packet_too_big_capacity_exhausted`] instead of
 /// evicting one. Reclamation requires both 255 seconds idle and a fully
 /// refilled bucket, preserving even limits whose refill takes longer than
-/// the datagram lifetime. Replacing the limit preserves tracked buckets and
-/// never restores a burst. A new attachment registration starts fresh
-/// budgets; this state does not survive restart or re-adoption.
+/// the datagram lifetime. Explicitly replacing the limit restarts every
+/// session's bucket full while retaining tracked identities and their eviction
+/// grace. A new attachment registration starts fresh budgets; this state does
+/// not survive restart or re-adoption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GtpuPacketTooBigRateLimit {
     burst: u32,
@@ -1680,8 +1681,8 @@ impl<T> SessionBuckets<T> {
         self.index.len()
     }
 
-    /// Apply a new token-bucket shape, keeping each tracked key's state and at
-    /// most its current tokens.
+    /// Apply a new token-bucket shape, keeping each tracked key's state and
+    /// tokens, including refill earned under the old shape, capped at the new burst.
     fn replace_limit(
         &mut self,
         burst: u32,
@@ -1691,14 +1692,15 @@ impl<T> SessionBuckets<T> {
         if (burst, refill_interval) == (self.burst, self.refill_interval) {
             return;
         }
-        self.burst = burst;
-        self.refill_interval = refill_interval;
         for entry in self.entries.iter_mut().flatten() {
+            entry.bucket.refill(self.burst, self.refill_interval, now);
             entry.bucket.tokens = entry.bucket.tokens.min(burst);
             // A faster replacement must not turn time accrued under the old
             // rate into an immediate extra burst.
             entry.bucket.last_refill = entry.bucket.last_refill.max(now);
         }
+        self.burst = burst;
+        self.refill_interval = refill_interval;
     }
 
     /// Detach `slot` from the LRU list.
@@ -1877,8 +1879,14 @@ impl PacketTooBigLimiter {
     }
 
     pub(crate) fn set_limit(&mut self, limit: GtpuPacketTooBigRateLimit, now: std::time::Instant) {
-        self.0
-            .replace_limit(limit.burst, limit.refill_interval, now);
+        // Explicit PTB reconfiguration starts each session with a full burst,
+        // including equal limits, while preserving the bounded tracking table.
+        self.0.burst = limit.burst;
+        self.0.refill_interval = limit.refill_interval;
+        for entry in self.0.entries.iter_mut().flatten() {
+            entry.bucket.tokens = limit.burst;
+            entry.bucket.last_refill = entry.bucket.last_refill.max(now);
+        }
     }
 
     /// Take one token from `session`'s bucket at `now`; other sessions are
@@ -3055,6 +3063,141 @@ mod tests {
             budget.admit(0_u32.to_be_bytes(), later, true),
             InnerFragmentAdmission::RateLimited
         );
+        assert_eq!(budget.buckets.tracked(), 4_096);
+    }
+
+    #[test]
+    fn rate_budget_replacement_packet_too_big_tightening_restarts_the_smaller_burst() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut limiter = PacketTooBigLimiter::new(
+            GtpuPacketTooBigRateLimit::new(2, Duration::from_secs(3_600)).unwrap(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                limiter.admit(UE.octets(), start),
+                PacketTooBigAdmission::Admitted
+            );
+        }
+        assert_eq!(
+            limiter.admit(UE.octets(), start),
+            PacketTooBigAdmission::RateLimited
+        );
+        limiter.set_limit(
+            GtpuPacketTooBigRateLimit::new(1, Duration::from_secs(3_600)).unwrap(),
+            start,
+        );
+        assert_eq!(
+            limiter.admit(UE.octets(), start),
+            PacketTooBigAdmission::Admitted
+        );
+        assert_eq!(
+            limiter.admit(UE.octets(), start),
+            PacketTooBigAdmission::RateLimited
+        );
+    }
+
+    #[test]
+    fn rate_budget_replacement_packet_too_big_keeps_earned_refill() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut limiter = PacketTooBigLimiter::default();
+        for _ in 0..16 {
+            assert_eq!(
+                limiter.admit(UE.octets(), start),
+                PacketTooBigAdmission::Admitted
+            );
+        }
+        assert_eq!(
+            limiter.admit(UE.octets(), start),
+            PacketTooBigAdmission::RateLimited
+        );
+        let replacement = start + Duration::from_secs(60);
+        limiter.set_limit(
+            GtpuPacketTooBigRateLimit::new(32, Duration::from_millis(10)).unwrap(),
+            replacement,
+        );
+        for _ in 0..16 {
+            assert_eq!(
+                limiter.admit(UE.octets(), replacement),
+                PacketTooBigAdmission::Admitted,
+                "admissions allowed by both limits must survive the replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_budget_replacement_fragmentation_keeps_earned_refill_and_sequence() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut budget = InnerFragmentBudget::default();
+        let mut last = None;
+        for _ in 0..64 {
+            last = require_fragmentation(budget.admit(UE.octets(), start, true));
+        }
+        assert_eq!(
+            budget.admit(UE.octets(), start, true),
+            InnerFragmentAdmission::RateLimited
+        );
+        let replacement = start + Duration::from_secs(10);
+        assert!(budget.set_limit(
+            GtpuInnerFragmentRateLimit::new(128, Duration::from_millis(4)).unwrap(),
+            replacement,
+        ));
+        for _ in 0..64 {
+            let next = require_fragmentation(budget.admit(UE.octets(), replacement, true));
+            assert_eq!(next, Some(last.unwrap().checked_add(1).unwrap_or(1)));
+            last = next;
+        }
+        assert_eq!(
+            budget.admit(UE.octets(), replacement, true),
+            InnerFragmentAdmission::RateLimited,
+            "a larger burst must not create tokens beyond the old limit's earned refill"
+        );
+    }
+
+    #[test]
+    fn rate_budget_replacement_does_not_freeze_refilled_packet_too_big_capacity() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut limiter = PacketTooBigLimiter::new(
+            GtpuPacketTooBigRateLimit::new(1, Duration::from_secs(3_600)).unwrap(),
+        );
+        for key in 0..4_096_u32 {
+            assert_eq!(
+                limiter.admit(key.to_be_bytes(), start),
+                PacketTooBigAdmission::Admitted
+            );
+        }
+        let replacement = start + Duration::from_secs(7_200);
+        limiter.set_limit(
+            GtpuPacketTooBigRateLimit::new(1, Duration::from_secs(1_800)).unwrap(),
+            replacement,
+        );
+        assert_eq!(
+            limiter.admit(4_096_u32.to_be_bytes(), replacement),
+            PacketTooBigAdmission::Admitted,
+            "an idle fully refilled key must remain evictable across replacement"
+        );
+        assert_eq!(limiter.0.tracked(), 4_096);
+    }
+
+    #[test]
+    fn rate_budget_replacement_does_not_freeze_refilled_fragment_capacity() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut budget = InnerFragmentBudget::new(
+            GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).unwrap(),
+        );
+        for key in 0..4_096_u32 {
+            require_fragmentation(budget.admit(key.to_be_bytes(), start, true));
+        }
+        let replacement = start + Duration::from_secs(7_200);
+        assert!(budget.set_limit(
+            GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(1_800)).unwrap(),
+            replacement,
+        ));
+        require_fragmentation(budget.admit(4_096_u32.to_be_bytes(), replacement, true));
         assert_eq!(budget.buckets.tracked(), 4_096);
     }
 

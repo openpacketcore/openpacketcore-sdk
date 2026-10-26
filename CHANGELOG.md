@@ -474,8 +474,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded tables fail closed with a new typed reason instead of resetting an
   active token bucket or Identification sequence, and eviction uses an O(1)
   LRU instead of a full-table scan. Reclamation also requires full token-bucket
-  refill, preserving slow limits. Live replacements retain tokens and never
-  apply a faster refill rate to elapsed time under the prior limit. A separate
+  refill, preserving slow limits. Fragmentation limit replacements retain
+  tokens, including refill earned under the old rate, without repricing elapsed
+  time. Explicit PTB limit replacement preserves its existing full-burst restart
+  contract while retaining the tracked sessions and their eviction grace. A separate
   bounded per-destination sliding count preserves the 65,535-admission ceiling
   across all valid limit replacements without re-registering. New value-free counters
   and typed outcomes are listed under "Added". Refs #1018.

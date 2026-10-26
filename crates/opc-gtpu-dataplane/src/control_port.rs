@@ -182,8 +182,8 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
 
     /// Replace the per-session in-tunnel Packet Too Big rate limit applied by
     /// this attachment registration (see [`crate::GtpuPacketTooBigRateLimit`]);
-    /// tracked sessions retain at most their current tokens. A replacement
-    /// grants no burst and cannot apply its refill rate to earlier elapsed time.
+    /// every session's bucket restarts full, including when the limit is
+    /// unchanged. Tracked identities and their eviction grace are retained.
     ///
     /// # Errors
     /// Returns [`GtpuControlPortError::Unsupported`] for ports without a

@@ -1172,10 +1172,10 @@ Destination Unreachable (Fragmentation Needed) error is sent:
   while the table holds only such sessions, a new session's error budget is
   refused fail closed (`CapacityExhausted`, counted in
   `packet_too_big_capacity_exhausted`). A session idle for at least 255
-  seconds may be evicted only after its bucket fully refills. Replacing the
-  limit keeps the tracked buckets and at most their current tokens; a faster
-  replacement does not apply to earlier elapsed time. A flood toward one PAA
-  therefore still exhausts only that session's budget. New registrations
+  seconds may be evicted only after its bucket fully refills. Explicitly
+  replacing the limit restarts every session's bucket full, including an equal
+  limit, while retaining tracked identities and their eviction grace. A flood
+  toward one PAA still exhausts only that session's budget. New registrations
   retain the documented residual of starting with fresh volatile budgets.
 - **Tradeoff.** The error's source is the subscriber's own address. The ePDG
   is routing, so RFC 1812 4.3.2.4 would have it use its own address, but the

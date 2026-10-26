@@ -151,7 +151,7 @@ fn receive<T>(mut poll: impl FnMut() -> Result<Option<T>, GtpuControlPortError>)
 }
 
 #[tokio::test]
-async fn rate_budget_retention_control_port_replacement_never_restores_a_burst() {
+async fn rate_budget_retention_control_port_replacement_restarts_each_burst() {
     let fixture = Fixture::new(false).await;
     let mut context = context();
     context.link_ifindex = fixture.device.ifindex;
@@ -195,10 +195,13 @@ async fn rate_budget_retention_control_port_replacement_never_restores_a_burst()
         crate::GtpuPacketTooBigRateLimit::new(16, Duration::from_secs(3_600)).unwrap(),
     ] {
         port.set_packet_too_big_rate_limit(replacement).unwrap();
+        for _ in 0..replacement.burst() {
+            assert_eq!(signal(), crate::GtpuPacketTooBigSignal::Sent);
+        }
         assert_eq!(signal(), crate::GtpuPacketTooBigSignal::RateLimited);
     }
     let counters = port.downlink_counters().unwrap();
-    assert_eq!(counters.packet_too_big_signalled, 1);
+    assert_eq!(counters.packet_too_big_signalled, 18);
     assert_eq!(counters.packet_too_big_rate_limited, 3);
     assert_eq!(counters.packet_too_big_capacity_exhausted, 0);
 }

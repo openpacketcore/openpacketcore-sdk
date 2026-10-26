@@ -158,7 +158,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     );
     let ipv4 = session_context(device.ifindex);
     let ipv6 = GtpPdpContext {
-        ms_address: IpAddr::V6(UE_PAA_IPV6),
+        ms_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x45, 0, 0, 0, 0, 0)),
         downlink_inner_mtu: Some(
             GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(SESSION_MTU)
                 .expect("canonical session MTU"),
