@@ -532,6 +532,25 @@ jobs:
           grep -Fq 'SA_KEY_SNAPSHOT_PROOF_OK' "${RUNNER_TEMP}/xfrm-sa-key-snapshot.log"
           grep -Eq '^test result: ok. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/xfrm-sa-key-snapshot.log"
 
+      - name: Run native TFC padding install and rekey readback proof
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/xfrm-target"
+          sudo env \
+            "PATH=${PATH}" \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}" \
+            "OPC_GTPU_RUN_PRIVILEGED=1" \
+            unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              cargo test --locked -p opc-ipsec-xfrm --features ikev2 --lib linux::tests::tfc_tests::native_tfc_install_readback_and_ignored_update_are_reported_exactly -- --exact --ignored --nocapture
+            ' 2>&1 | tee "${RUNNER_TEMP}/xfrm-tfc-padding.log"
+          grep -Fq 'TFC_PADDING_PROOF_OK' "${RUNNER_TEMP}/xfrm-tfc-padding.log"
+          grep -Eq '^test result: ok. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/xfrm-tfc-padding.log"
+
       - name: Run authenticated-only ESP pass and tamper-rejection proof
         run: |
           set -euo pipefail
