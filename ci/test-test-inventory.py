@@ -1446,6 +1446,41 @@ class LocalRevisionTests(unittest.TestCase):
         self.assertEqual(comparison_revisions(self.root, self.base), (self.base, self.head, 'explicit common ancestor'))
         self.assertEqual(comparison_revisions(self.root, self.base, self.head), (self.base, self.head, 'explicit common ancestor'))
 
+    def test_explicit_backlog_target_reports_removals_outside_main_history(self):
+        self.git('checkout', '--detach', self.base)
+        (self.root / 'README.md').write_text('Integration branch\n')
+        self.git('add', '.')
+        self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'backlog base')
+        backlog = self.git('rev-parse', 'HEAD')
+        self.git('update-ref', 'refs/remotes/origin/backlog', backlog)
+        (self.root / 'src/lib.rs').write_text('')
+        self.git('add', '.')
+        self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'remove backlog test')
+        head = self.git('rev-parse', 'HEAD')
+        for base in ('origin/backlog', 'refs/remotes/origin/backlog'):
+            with self.subTest(base=base), patch('sys.stdout', new=io.StringIO()) as output:
+                self.assertEqual(comparison_revisions(self.root, base, 'HEAD'),
+                                 (backlog, head, 'explicit backlog target'))
+                self.assertEqual(main(['--repo', str(self.root), '--base', base, '--head', 'HEAD']), 1)
+                self.assertIn('UNDECLARED removed', output.getvalue())
+        self.git('update-ref', 'refs/remotes/origin/feature', backlog)
+        for base, comparison_head in ((backlog, head), ('origin/feature', head), ('origin/backlog', None)):
+            with self.subTest(base=base, head=comparison_head), self.assertRaisesRegex(GuardError, 'ancestor of both HEAD'):
+                comparison_revisions(self.root, base, comparison_head)
+
+    def test_explicit_backlog_target_rejects_empty_or_unchecked_history(self):
+        self.git('update-ref', 'refs/remotes/origin/backlog', self.base)
+        for base in ('origin/backlog', 'refs/remotes/origin/backlog'):
+            with self.subTest(base=base), self.assertRaisesRegex(GuardError, 'refusing an empty comparison'):
+                comparison_revisions(self.root, base, self.base)
+            for head in (self.main, self.unrelated):
+                with self.subTest(base=base, head=head), self.assertRaisesRegex(GuardError, 'backlog base must be an ancestor of its head, and its head must be in the checked-out HEAD'):
+                    comparison_revisions(self.root, base, head)
+        for base in (self.main, self.unrelated):
+            self.git('update-ref', 'refs/remotes/origin/backlog', base)
+            with self.subTest(base=base), self.assertRaisesRegex(GuardError, 'backlog base must be an ancestor of its head, and its head must be in the checked-out HEAD'):
+                comparison_revisions(self.root, 'origin/backlog', 'HEAD')
+
     def test_identical_comparison_revisions_are_rejected_after_ref_resolution(self):
         for base, head in ((self.base, self.base), ('HEAD^', self.base), (self.base, 'HEAD^')):
             with self.subTest(base=base, head=head), patch('sys.stdout', new=io.StringIO()) as output, patch('sys.stderr', new=io.StringIO()) as error:
