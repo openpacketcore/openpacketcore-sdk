@@ -18,7 +18,11 @@ pub use readiness::{GtpuControlQueue, GtpuControlReadiness, GtpuDownlinkReadines
 
 #[cfg(any(test, target_os = "linux"))]
 use std::sync::Arc;
-use std::{fmt, net::SocketAddrV4, num::NonZeroU32};
+use std::{
+    fmt,
+    net::{SocketAddr, SocketAddrV4},
+    num::NonZeroU32,
+};
 
 use bytes::Bytes;
 use opc_proto_gtpu::{
@@ -64,6 +68,27 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
         &self,
         plan: GtpuControlSendPlan,
     ) -> Result<usize, GtpuControlPortError>;
+
+    /// Send a canonical Echo Request through this attachment's shared socket.
+    /// Both tuples use UDP/2152; `source` must be a concrete address bound to
+    /// this attachment. The caller owns peer admission, rate limits, sequence
+    /// allocation, retransmission and matching the received Echo Response.
+    /// TS 29.281 §7.2.1 limits new requests to one per path per 60 seconds;
+    /// retransmissions retain the same sequence. This port starts no timer.
+    /// Success reports kernel acceptance, not peer liveness.
+    ///
+    /// # Errors
+    /// Refuses invalid/foreign tuples, a retired binding, or a send failure.
+    /// Ports without this capability return `Unsupported`.
+    fn send_echo_request(
+        &self,
+        source: SocketAddr,
+        peer: SocketAddr,
+        sequence: u16,
+    ) -> Result<usize, GtpuControlPortError> {
+        let _ = (source, peer, sequence);
+        Err(GtpuControlPortError::Unsupported)
+    }
 
     /// Receive at most one datagram and process it against the backend's own
     /// authoritative forwarding state.
@@ -264,6 +289,26 @@ impl From<std::io::Error> for GtpuControlPortError {
     fn from(error: std::io::Error) -> Self {
         Self::Io { kind: error.kind() }
     }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn echo_request_bytes(
+    source: SocketAddrV4,
+    peer: SocketAddrV4,
+    sequence: u16,
+) -> Result<Bytes, GtpuControlPortError> {
+    for tuple in [source, peer] {
+        if tuple.port() != GTPU_PORT
+            || tuple.ip().is_unspecified()
+            || tuple.ip().is_multicast()
+            || tuple.ip().is_broadcast()
+        {
+            return Err(GtpuControlPortError::InvalidTuple);
+        }
+    }
+    GtpuControlMessage::EchoRequest(opc_proto_gtpu::GtpuEchoRequest::new(sequence))
+        .to_bytes(EncodeContext::default())
+        .map_err(|_| GtpuControlPortError::Encoding)
 }
 
 /// Explicit caller policy for one response, excluding IP/UDP headers.
@@ -723,6 +768,29 @@ mod tests {
     }
     fn budget() -> GtpuControlResponseBudget {
         GtpuControlResponseBudget::new(1024, 4).unwrap()
+    }
+
+    #[test]
+    fn outgoing_echo_validates_both_tuples_and_encodes_canonical_request() {
+        let source = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), GTPU_PORT);
+        let peer = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), GTPU_PORT);
+        assert_eq!(echo_request_bytes(source, peer, 0x1234).unwrap(), ECHO);
+        for invalid in [
+            SocketAddrV4::new(*source.ip(), 0),
+            SocketAddrV4::new(*source.ip(), 2153),
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, GTPU_PORT),
+            SocketAddrV4::new(Ipv4Addr::BROADCAST, GTPU_PORT),
+            SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), GTPU_PORT),
+        ] {
+            assert_eq!(
+                echo_request_bytes(invalid, peer, 1),
+                Err(GtpuControlPortError::InvalidTuple)
+            );
+            assert_eq!(
+                echo_request_bytes(source, invalid, 1),
+                Err(GtpuControlPortError::InvalidTuple)
+            );
+        }
     }
 
     #[test]

@@ -234,6 +234,26 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         let peer_ip = Ipv4Addr::new(127, 0, 0, 2);
         let peer = UdpSocket::bind((peer_ip, GTPU_PORT))?;
         peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let echo_source = (Ipv4Addr::LOCALHOST, GTPU_PORT).into();
+        let echo_peer = peer.local_addr()?;
+        let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x91, 0x73, 0, 0];
+        assert_eq!(
+            port.send_echo_request(echo_source, echo_peer, 0x9173)?,
+            echo.len()
+        );
+        let mut echo_bytes = [0_u8; 64];
+        let (length, from) = peer.recv_from(&mut echo_bytes)?;
+        assert_eq!(from, echo_source);
+        assert_eq!(&echo_bytes[..length], echo);
+        let echo_response = [0x32, 2, 0, 6, 0, 0, 0, 0, 0x91, 0x73, 0, 0, 14, 0];
+        peer.send_to(&echo_response, from)?;
+        let GtpuDownlinkEvent::Control(echo_event) =
+            receive_control_downlink(port.as_ref()).await?
+        else {
+            return Err("expected a solicited Echo Response".into());
+        };
+        assert_eq!(echo_event.bytes(), echo_response);
+        assert_eq!(echo_event.sequence_number(), Some(0x9173));
         let sender = UdpSocket::bind((peer_ip, 0))?;
         let source_port = sender.local_addr()?.port().to_be_bytes();
         let gpdu = [
@@ -293,6 +313,11 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
             opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
         );
         assert!(fresh.try_receive_datagram(4096)?.is_none());
+        assert_eq!(
+            port.send_echo_request(echo_source, echo_peer, 0x9173)
+                .unwrap_err(),
+            opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
+        );
         Ok::<_, Box<dyn std::error::Error>>(fresh)
     }
     .await;
@@ -301,6 +326,16 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
     cleanup?;
     assert_eq!(
         fresh.try_receive_datagram(4096).unwrap_err(),
+        opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
+    );
+    assert_eq!(
+        fresh
+            .send_echo_request(
+                (Ipv4Addr::LOCALHOST, GTPU_PORT).into(),
+                (Ipv4Addr::new(127, 0, 0, 2), GTPU_PORT).into(),
+                1
+            )
+            .unwrap_err(),
         opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
     );
     Ok(())

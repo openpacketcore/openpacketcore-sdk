@@ -41,6 +41,18 @@ An identically addressed replacement socket refuses the old plan. Success
 counts UDP payload bytes accepted by the local kernel; it does not prove
 peer receipt. There is no automatic reply, retry queue or timeout worker.
 
+`send_echo_request(source, peer, sequence)` sends a canonical Echo Request
+through that same attachment-owned socket. This profile uses UDP/2152 at both
+ends and requires a concrete source address belonging to the attachment;
+wildcard-bound Linux sockets pin the chosen local source with `IP_PKTINFO`.
+The operation retains the same lifetime and live-binding checks as responses.
+The caller owns admission, matching Echo Responses, sequence allocation and
+retransmission. TS 29.281 §7.2.1 limits new requests to one per path per 60
+seconds; retransmissions retain their sequence. Sending successfully proves
+kernel acceptance only. Native tests inspect independent wire literals through
+both Linux GTP and eBPF ports, receive the solicited response on the same queue,
+and verify that retired handles cannot originate more requests.
+
 Receive capacity is 8–65,507 bytes; truncation of either payload or control
 metadata is an error. Per-response policy is a positive byte cap and integer
 amplification cap of 1–16. The 16-fold ceiling and codec walk limits of 256
@@ -127,7 +139,7 @@ error; no reuse-port distribution is enabled.
 
 The port grants no tunnel installation, selector provenance, peer admission,
 or forwarding authority. Kernel/eBPF/mock parity, IPv6 typed responses,
-outgoing Echo requests, per-tunnel End Marker ordering and installed N3
+per-tunnel End Marker ordering and installed N3
 forwarding remain tracked by #341 and #790.
 Existing forwarding capabilities and checksum-offload control pass-through
 are unchanged.

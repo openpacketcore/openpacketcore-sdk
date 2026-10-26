@@ -14628,6 +14628,24 @@ async fn ebpf_gtpu_backend_control_port_fences_attachment_lifetime(
     expect_no_control_datagram(second.as_ref());
     assert_eq!(format!("{first:?}"), "EbpfGtpuControlPort(<redacted>)");
 
+    let service = in_netns(&net.pgw_ns, || {
+        UdpSocket::bind((PGW_IP, GTPU_PORT)).unwrap()
+    });
+    service.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let echo_source = (EPDG_S2BU_IP, GTPU_PORT).into();
+    let echo_peer = service.local_addr()?;
+    assert_eq!(
+        first.send_echo_request(echo_source, echo_peer, 0x9173)?,
+        echo.len()
+    );
+    let (length, source) = service.recv_from(&mut bytes)?;
+    assert_eq!(source, echo_source);
+    assert_eq!(&bytes[..length], echo);
+    service.send_to(&response, source)?;
+    let solicited = receive(second.as_ref());
+    assert_eq!(solicited.bytes(), response);
+    assert_eq!(solicited.sequence_number(), Some(0x9173));
+
     peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
     let old_plan = receive(first.as_ref()).echo_response(budget)?;
     peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
@@ -14686,6 +14704,12 @@ async fn ebpf_gtpu_backend_control_port_fences_attachment_lifetime(
     );
     assert_eq!(
         second.try_receive_datagram(2048).unwrap_err(),
+        GtpuControlPortError::Unavailable
+    );
+    assert_eq!(
+        first
+            .send_echo_request(echo_source, echo_peer, 0x9173)
+            .unwrap_err(),
         GtpuControlPortError::Unavailable
     );
     assert_eq!(
