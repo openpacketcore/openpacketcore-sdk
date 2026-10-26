@@ -8,6 +8,8 @@ pub(crate) mod child_read_wire;
 mod clock;
 mod notice;
 mod platform_clock;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use platform_clock::test_support as linux_clock_test_support;
 mod policy;
 mod pool;
 mod proof;
@@ -88,6 +90,8 @@ pub use issuer::{
 };
 #[cfg(test)]
 mod issuer_tests;
+#[cfg(all(test, feature = "test-control", target_os = "linux"))]
+pub(crate) use issuer_tests::assert_admitted_liveness_refusal;
 
 mod evidence;
 pub use evidence::{

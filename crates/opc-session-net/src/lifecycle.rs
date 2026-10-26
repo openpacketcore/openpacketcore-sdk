@@ -38,7 +38,7 @@ pub enum ReconnectCooldownPolicy {
     /// Wait for the coalesced cooldown edge, bounded by the caller deadline.
     #[default]
     Wait,
-    /// Fail over immediately with the remaining cooldown instead of waiting.
+    /// Fail over immediately when a cooldown or another probe prevents admission.
     FailOver,
 }
 /// Default per-peer spread applied when a material epoch changes.
@@ -368,7 +368,7 @@ impl ReconnectGate {
     ///
     /// `ReconnectCooldownPolicy::Wait` preserves the coalesced wait. Under
     /// `ReconnectCooldownPolicy::FailOver`, a caller that observes an active
-    /// cooldown returns [`ReconnectAdmission::Cooldown`] immediately without
+    /// cooldown or in-flight probe returns [`ReconnectAdmission::Cooldown`] without
     /// taking the serial admission or starting a probe, so a routing caller can
     /// select another peer. No caller applies an independent sleep or probe;
     /// the first caller at cooldown expiry still owns the single serialized
@@ -424,12 +424,26 @@ impl ReconnectGate {
                 return ReconnectAdmission::Cooldown { remaining };
             }
         }
-        let permit =
-            match tokio::time::timeout_at(deadline, Arc::clone(&self.serial).acquire_owned()).await
-            {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) | Err(_) => return ReconnectAdmission::Deadline,
-            };
+        let permit = match cooldown_policy {
+            ReconnectCooldownPolicy::FailOver => {
+                match Arc::clone(&self.serial).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        return ReconnectAdmission::Cooldown {
+                            remaining: self.remaining_cooldown(),
+                        };
+                    }
+                }
+            }
+            ReconnectCooldownPolicy::Wait => {
+                match tokio::time::timeout_at(deadline, Arc::clone(&self.serial).acquire_owned())
+                    .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) | Err(_) => return ReconnectAdmission::Deadline,
+                }
+            }
+        };
 
         loop {
             // Register before inspecting state so an epoch publication cannot
@@ -479,6 +493,21 @@ impl ReconnectGate {
             permit: Some(permit),
             finished: false,
         })
+    }
+
+    pub(crate) fn remaining_cooldown(&self) -> Duration {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_attempt_at
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or_default()
+    }
+
+    /// An observation for avoiding pre-probe work. Actual setup must still
+    /// acquire this gate; a positive observation never reserves a probe.
+    pub(crate) fn can_probe_now(&self) -> bool {
+        self.serial.available_permits() != 0 && self.remaining_cooldown().is_zero()
     }
 
     /// Publish one coalesced cooldown after a cached connection is proven
@@ -554,6 +583,7 @@ pub(crate) enum ReconnectAdmission {
     Admitted(ReconnectAttempt),
     Cooldown {
         /// Bounded remaining shared cooldown at the observation instant.
+        /// Zero means the probe permit is held without an active cooldown.
         remaining: Duration,
     },
     Superseded,

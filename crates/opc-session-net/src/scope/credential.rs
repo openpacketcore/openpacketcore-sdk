@@ -100,6 +100,7 @@ struct Jwk {
 struct Keys {
     values: BTreeMap<String, Key>,
     refreshed: Option<Instant>,
+    refresh_failure: Option<BootstrapCredentialError>,
 }
 
 /// Configured bootstrap credential verifier, activated before store admission.
@@ -218,6 +219,7 @@ impl BootstrapCredentialVerifier {
             keys: Mutex::new(Keys {
                 values: keys,
                 refreshed: None,
+                refresh_failure: None,
             }),
         })
     }
@@ -268,12 +270,26 @@ impl BootstrapCredentialVerifier {
                     .is_none_or(|last| now.duration_since(last) >= REFRESH_INTERVAL)
                 {
                     keys.refreshed = Some(now);
-                    keys.values = timeout(SOURCE_DEADLINE, read_keys(self.source.as_ref()))
+                    // A cancelled fetch still consumed the shared attempt. Until
+                    // the next refresh, absence of fresh keys is unavailable,
+                    // not evidence that the presented credential is invalid.
+                    keys.refresh_failure = Some(BootstrapCredentialError::Unavailable);
+                    match timeout(SOURCE_DEADLINE, read_keys(self.source.as_ref()))
                         .await
-                        .map_err(|_| BootstrapCredentialError::Unavailable)??;
+                        .unwrap_or(Err(BootstrapCredentialError::Unavailable))
+                    {
+                        Ok(values) => {
+                            keys.values = values;
+                            keys.refresh_failure = None;
+                        }
+                        Err(error) => {
+                            keys.refresh_failure = Some(error);
+                            return Err(error);
+                        }
+                    }
                     verify(&keys)?;
                 } else {
-                    return Err(error);
+                    return Err(keys.refresh_failure.unwrap_or(error));
                 }
             }
         }

@@ -55,7 +55,7 @@ evidence.
   verifies the boot key, scope role and predecessor closure; installed
   forwarding is excluded from closure. Controllers can submit succession, but
   only the authenticated successor's exact retry issues `CommittedScopeAuthority`.
-  Stable scopes use the existing name-derived cluster ID and survive voter
+  Stable scopes use the existing installation-qualified cluster ID and survive voter
   changes. Initial activation requires every voter; committed continuation
   carries it through cutover, restart and abort with quorum availability.
   Profile 4 remains unadvertised, with a provisional activation digest until

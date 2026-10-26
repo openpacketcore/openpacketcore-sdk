@@ -87,7 +87,7 @@ mutation/consumer ReadBarrier and operation default 10,000 ms, and listener
 idle/handler ceilings 30,000 ms. The 1,500 ms DNS/TCP/mTLS/bootstrap cold cap is
 contained inside the selected family deadline, never added to it.
 
-`DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (200 ms) bounds an outstanding
+`DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (one heartbeat, 2 s) bounds an outstanding
 leader-routed configuration-consensus call after this replica's own engine has
 named a successor for the attempted leader. The unanswered call is abandoned and
 re-offered through the observed successor, so a black-holed former leader cannot
@@ -98,7 +98,15 @@ and its typed ambiguous outcome still apply. A forwarded mutation that was
 transmitted and then abandoned is classified as possibly transmitted; retries
 reuse the same request identity so the state machine idempotency contract keeps
 the operation exactly-once. A route this replica has already superseded is not
-transmitted.
+transmitted. The first observed retirement deadline remains fixed across unknown
+or changing successor views. A peer redirect is selected under the local view
+at that time; that unchanged view cannot retire the redirected route.
+
+Openraft owns elections, votes and leader authority (ADR 0019). Engine-level
+quorum-loss and unplanned-failover improvements remain tracked by #1048 and
+#1037. `DURABLE_CONSENSUS_FAILOVER_PATIENCE` derives the combined election lease
+and route grace (10 s); it does not trigger an SDK election watchdog or promise
+an election completion bound.
 
 `DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS` fixes the ordinary proposal baseline
 at eight concurrent paths. The scope-aware session adapter adds five independent
@@ -170,17 +178,6 @@ pipelined writes, with outstanding writes and divergent survivor logs at the
 fault. They require fresh quorum authority, a new write and survivor
 reconciliation within 26 seconds, preserving acknowledged writes. These paused
 engine regressions do not qualify process scheduling or disk latency.
-The SDK configuration adapter additionally bounds the avoidable second
-unplanned-loss window without changing this profile: after one complete declared
-leader lease plus the existing stale-route grace of no authenticated leader
-contact, a follower requests an ordinary engine Pre-Vote round
-(`DURABLE_CONSENSUS_FAILOVER_PATIENCE`, polled at
-`DURABLE_CONSENSUS_FAILOVER_POLL_INTERVAL` and staggered by membership rank).
-Peer leader leases still deny the inquiry for a live leader, and the engine's
-normal persisted-vote election remains the only path to leadership, so no vote
-is fabricated. The conditional first-campaign bound derived from the fixed
-profile is documented in `docs/consensus-operator-runbook.md` §2.4.
-
 The `dangerous-test-hooks` feature exposes a scoped Tokio runtime adapter for
 these fixtures. Outside a script it uses Tokio's ordinary RNG, and production
 dependencies do not enable this feature. It uses the engine's existing rand 0.8

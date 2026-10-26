@@ -78,6 +78,7 @@ test-control = ["opc-session-store/test-control"]
 legacy-session-net-compat = []
 
 [dependencies]
+opc-linux-clock-sys = { path = "../opc-linux-clock-sys", version = "0.2.0" }
 opc-consensus = { path = "../opc-consensus", version = "0.2.0" }
 opc-redaction = { path = "../opc-redaction", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
@@ -105,7 +106,6 @@ zeroize = { workspace = true }
 ring = "0.17.14"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-opc-linux-clock-sys = { path = "../opc-linux-clock-sys", version = "0.2.0" }
 socket2 = { version = "0.6", features = ["all"] }
 rustix = { version = "1.1.5", features = ["process", "fs"] }
 
@@ -113,6 +113,7 @@ rustix = { version = "1.1.5", features = ["process", "fs"] }
 opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0", features = ["test-control"] }
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0", features = ["test-control"] }
 opc-crypto = { path = "../opc-crypto", version = "0.2.0" }
 opc-fs-verity-sys = { path = "../opc-fs-verity-sys", version = "0.2.0" }

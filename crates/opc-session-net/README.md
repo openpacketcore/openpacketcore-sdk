@@ -51,6 +51,12 @@ so when the record later catches up the issuer must refuse the retained key
 before staging anything and let the worker shut down and start a fresh boot.
 Only candidate startup sessions can carry a refusal; liveness sessions and
 already admitted workers keep their existing handling.
+The refusal must be the first and sole response, before any notice page.
+`StartupError::PlatformChanged` also covers opaque Pod resource-version changes:
+re-probe the same boot in that case. Only independently established changed boot
+facts that cannot reconcile the retained key justify `BootRefusalReason::PlatformChanged`.
+Prerequisite refusal is an explicit issuer decision to end an attempt; restarting
+a worker does not repair the issuer's discovery or key access.
 
 The issuer sends a bounded `IssuedTicketNotice` on the retained startup stream.
 Its generation and record reference are hints: `ScopeServer` independently reads
@@ -117,12 +123,30 @@ arbitrary read pressure can be claimed.
 ### Authentication-time source
 
 `PlatformAuthenticationTimeSource` is the supported production
-`AuthenticationTimeSource` for RFC 026 authentication freshness. It performs one
-read-only `clock_adjtime(CLOCK_REALTIME)` query (`modes == 0`) through the
-narrow `opc-linux-clock-sys` UAPI boundary and reports the kernel's maximum
-realtime error as the symmetric uncertainty of one observation. Install it once
-per process with the deployment's fixed budget (the budget is never widened on
-retry):
+`AuthenticationTimeSource` for RFC 026 authentication freshness. It brackets two
+read-only `clock_adjtime(CLOCK_REALTIME)` queries (`modes == 0`) with monotonic
+time through the narrow `opc-linux-clock-sys` UAPI boundary. The second query's
+atomic `timex.time` supplies the instant. The symmetric error includes the larger
+maximum/estimated error across both samples, precision, microsecond quantization,
+reported oscillator drift and the full sampling span. Status changes, backward
+progress or excessive progress within that pair are refused. Install one source
+per process with the deployment's fixed budget (never widened on retry).
+
+Size that budget for the whole interval between daemon updates: Linux increases
+`maxerror` by **0.5 ms per second** until the next update. Allow at least
+**root distance + 0.5 ms × longest update interval in seconds + about 1 ms**
+for sampling, precision and quantization; allow more if measured sampling spans
+require it. Chrony's default `maxpoll 10` allows 1,024 seconds between polls,
+which alone adds 512 ms. The example below assumes root distance at most 50 ms,
+actual kernel updates no more than 1,024 seconds apart, and at most 1 ms of
+additional sampling error: 50 + 512 + 1 = 563 ms fits its fixed 600 ms budget.
+A poll setting alone does not guarantee successful updates during packet loss.
+For a 100 ms budget, a deployment could instead require `maxpoll 6` (64 seconds),
+actual updates within that interval, root distance at most 50 ms and the same
+sampling allowance. Verify these bounds at installation.
+See the [Linux error-growth implementation](https://github.com/torvalds/linux/blob/v6.12/kernel/time/ntp.c#L431-L436),
+its [frequency tolerance](https://github.com/torvalds/linux/blob/v6.12/include/linux/timex.h#L129),
+and [chrony's poll settings](https://chrony-project.org/doc/4.6/chrony.conf.html#maxpoll).
 
 ```rust
 use opc_session_net::scope::{IntervalClock, PlatformAuthenticationTimeSource};
@@ -130,7 +154,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 let source = Arc::new(PlatformAuthenticationTimeSource::new());
-let clock = IntervalClock::new(source, Duration::from_millis(100))?;
+// Fixed at installation for the update and root-distance bounds above.
+let clock = IntervalClock::new(source, Duration::from_millis(600))?;
 ```
 
 Platform contract:
@@ -140,27 +165,40 @@ Platform contract:
 - The read is unprivileged and never changes the clock. A seccomp filter, LSM
   policy or hardened container runtime that refuses `clock_adjtime` makes
   authentication time unavailable (retryable, no authority).
-- The kernel's `timex.maxerror` is only meaningful while a synchronization
-  daemon (chrony/ntpd) maintains it. A node with no daemon usually reports
+- Kernel synchronization and error estimates require a node time daemon.
+  Chrony needs `rtcsync` to publish the kernel synchronization state. A node
+  with no daemon usually reports
   `STA_UNSYNC` or the boot-default multi-second bound; both fail closed. The
   default source maximum is 1 s
   (`PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY`) and can be fixed lower or
   higher with `with_maximum_uncertainty` at startup.
 - Containers share the host-global kernel clock and synchronization state; the
   state is not namespaced per container.
-- A zero, negative, oversized or unreadable kernel bound is refused rather than
-  turned into a wider trusted interval.
+- Zero/negative maximum bounds, negative estimates, unknown or faulted status,
+  an in-progress leap second (`TIME_OOP`), overflow and over-budget uncertainty
+  are refused. Pending/completed leap states remain usable if the pair is stable.
 
 Operators see one fixed, value-free `tracing` warning on target
 `opc_session_net::scope::auth_time` with a closed `reason` (`unsupported_platform`,
-`io_unavailable`, `permission_denied`, `not_synchronized`, `zero_error_bound`,
-`invalid_error_bound`, `uncertainty_exceeded`, `generation_exhausted`) for each
-refusal, plus the existing typed `AuthTimeUnavailable` result in the
+`io_unavailable`, `permission_denied`, `not_synchronized`, `invalid_observation`,
+`sampling_changed`, `invalid_error_bound`, `uncertainty_exceeded`,
+`generation_exhausted`) when the refusal reason changes, followed by one recovery
+event. Separately, `IntervalClock` emits
+`authentication clock exceeds its fixed uncertainty budget` on target
+`opc_session_net::scope::clock`, once on entering a budget refusal, then one
+recovery event when the reading fits again. This catches a reading accepted by
+the source's bound but exceeding the adapter's fixed budget. Periodic budget
+refusal while the daemon remains healthy means the install-time budget or update
+interval was sized incorrectly; investigate those deployment assumptions.
+Every refused call still returns the typed `AuthTimeUnavailable` in the
 authentication path. Alarm on those warnings and on the node's time-daemon
 health; do not increase the uncertainty budget to silence them. The
 synchronization generation starts at 1 on the first accepted synchronized
-observation and increments after synchronization is re-established; wall-clock
-steps without a resynchronization are handled by `IntervalClock`'s existing
+observation and increments once after observed synchronization loss followed by
+a healthy pair. Transient syscall errors or invalid data do not invent a new
+generation. Sampling and generation changes are serialized. Recovery is automatic
+and changes no committed authority, receipt or held effect. Wall-clock steps
+without observed synchronization loss are handled by `IntervalClock`'s existing
 recovery policy (three consistent observations at least one second apart over at
 least three seconds) under the same fixed budget.
 
@@ -887,15 +925,20 @@ reconnect-cooldown admission policy per client. The default
 `ReconnectCooldownPolicy::Wait` waits for the single coalesced cooldown edge (or
 the caller deadline) before one serialized probe, so single-peer callers are
 unchanged. `ReconnectCooldownPolicy::FailOver` is the explicit routed-consumer
-policy: a call that reaches a peer whose shared cooldown is active returns the
-typed pre-write `SessionConsumerClientError::Cooldown` immediately, carrying only
+policy: a call that reaches a peer whose shared cooldown is active or whose
+probe is already in flight returns the typed pre-write `SessionConsumerClientError::Cooldown` immediately, carrying only
 the bounded remaining cooldown and gate wait in milliseconds, so a routing loop
 can select another peer without waiting. No request byte was ever written, so
 the caller may route the unchanged request to another voter; once a byte may
 have been accepted, the existing exact-identity/status recovery applies
 unchanged. Both policies keep the same exponential backoff, the same single
 serialized probe at cooldown expiry, and never create caller-local sleeps or
-independent probes.
+independent probes. A zero remaining cooldown means another caller holds the
+probe. Admission happens before DNS and pool waits, including retained lanes;
+routed callers also decline to join a pending warm setup. Background maintenance
+retains the shared waiting policy. Debug spans named `session_consumer_attempt`
+contain only operation kind, canonical voter/successor ordinals, gate and
+cooldown microseconds, and `pre_write`/`possibly_written` classification.
 Each unused lane's effective expiry is the earlier of its local publication-based
 idle deadline and its own peer first-Call bound. The latter is measured from the
 monotonic HelloAck receive instant, less the complete measured Hello round trip

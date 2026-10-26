@@ -10,11 +10,27 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
+#[cfg(test)]
+pub(crate) mod test_io;
+
+/// Integrity of the bytes admitted through this descriptor, invalidated by writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedSnapshotEnvelope {
+    pub(crate) payload_length: u64,
+    pub(crate) checksum: [u8; 32],
+    pub(crate) total_length: u64,
+}
+
 /// Seekable snapshot staging file. Its path is never exposed in diagnostics.
 pub(crate) struct ConfigSnapshotFile {
     file: super::snapshot_io::SnapshotIo,
     path: PathBuf,
     cleanup_on_drop: bool,
+    verified: Option<VerifiedSnapshotEnvelope>,
+    #[cfg(test)]
+    read_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    read_released: bool,
 }
 
 impl ConfigSnapshotFile {
@@ -46,6 +62,11 @@ impl ConfigSnapshotFile {
                 file: super::snapshot_io::SnapshotIo::new(file, owner),
                 path,
                 cleanup_on_drop: true,
+                verified: None,
+                #[cfg(test)]
+                read_gate: None,
+                #[cfg(test)]
+                read_released: false,
             };
             #[cfg(unix)]
             std::fs::set_permissions(&staged.path, std::fs::Permissions::from_mode(0o600))?;
@@ -81,6 +102,11 @@ impl ConfigSnapshotFile {
             file: super::snapshot_io::SnapshotIo::new(file, owner),
             path,
             cleanup_on_drop: false,
+            verified: None,
+            #[cfg(test)]
+            read_gate: None,
+            #[cfg(test)]
+            read_released: false,
         })
     }
 
@@ -99,12 +125,30 @@ impl ConfigSnapshotFile {
         &self.path
     }
 
+    pub(crate) fn verified_envelope(&self) -> Option<VerifiedSnapshotEnvelope> {
+        self.verified
+    }
+
+    pub(crate) fn set_verified_envelope(&mut self, verified: VerifiedSnapshotEnvelope) {
+        self.verified = Some(verified);
+    }
+
+    pub(crate) fn invalidate_verified_envelope(&mut self) {
+        self.verified = None;
+    }
+
     /// Transfer cleanup responsibility to the snapshot installer.
     pub(crate) fn disarm_cleanup(&mut self) {
         self.cleanup_on_drop = false;
     }
 
+    pub(crate) async fn metadata(&mut self) -> io::Result<std::fs::Metadata> {
+        self.file.metadata().await
+    }
+
     pub(crate) async fn sync_all(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        test_io::step(&self.path, test_io::Phase::Sync).await;
         self.file.sync_all().await
     }
 }
@@ -158,7 +202,24 @@ impl AsyncRead for ConfigSnapshotFile {
         context: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.file).poll_read(context, buffer)
+        #[cfg(test)]
+        if buffer.remaining() >= 4096 {
+            use std::future::Future;
+            if self.read_gate.is_none() && !self.read_released {
+                self.read_gate = test_io::gate(&self.path, test_io::Phase::Read);
+            }
+            if let Some(gate) = self.read_gate.as_mut() {
+                let _ = std::task::ready!(Pin::new(gate).poll(context));
+                self.read_gate = None;
+                self.read_released = true;
+            }
+        }
+        let result = Pin::new(&mut self.file).poll_read(context, buffer);
+        #[cfg(test)]
+        if result.is_ready() {
+            self.read_released = false;
+        }
+        result
     }
 }
 
@@ -168,6 +229,7 @@ impl AsyncWrite for ConfigSnapshotFile {
         context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
+        self.verified = None;
         Pin::new(&mut self.file).poll_write(context, buffer)
     }
 
