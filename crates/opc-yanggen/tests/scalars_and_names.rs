@@ -1,6 +1,8 @@
 #[path = "scalars_and_names/cardinality.rs"]
 mod cardinality;
 mod common;
+#[path = "scalars_and_names/decimal.rs"]
+mod decimal;
 #[path = "scalars_and_names/regressions.rs"]
 mod regressions;
 
@@ -129,6 +131,8 @@ fn legacy_constructs_keep_every_generated_file_byte_identical() {
     // literals and native instance trees, plus #1272 bounded content projection.
     // Every complete generated file stays pinned.
     // All pins also include #1274 generated-lint repairs and shared statement formatting.
+    // #1363 pins follow byte-verified 63440381b baselines: exact decimal64 codecs/types
+    // and RFC 6243 trim semantics. All complete-file assertions remain.
     let expected: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/legacy_constructs_digests.json")).unwrap();
     let parsed = generation_input_from_yang_sources(

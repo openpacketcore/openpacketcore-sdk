@@ -421,7 +421,9 @@ fn leaf_type_tokens(t: &TypeRef) -> TokenStream {
         TypeRef::Uint32 => quote! { opc_mgmt_schema::LeafType::Uint32 },
         TypeRef::Uint64 => quote! { opc_mgmt_schema::LeafType::Uint64 },
         TypeRef::Int64 => quote! { opc_mgmt_schema::LeafType::Int64 },
-        TypeRef::Decimal64 => quote! { opc_mgmt_schema::LeafType::Decimal64 },
+        TypeRef::Decimal64 { fraction_digits } => {
+            quote! { opc_mgmt_schema::LeafType::Decimal64 { fraction_digits: #fraction_digits } }
+        }
         TypeRef::Empty => quote! { opc_mgmt_schema::LeafType::Empty },
         TypeRef::IdentityRef { base } => {
             quote! { opc_mgmt_schema::LeafType::IdentityRef { base: #base } }

@@ -675,7 +675,9 @@ pub fn emit_fixture_from_canonical(canonical: &CanonicalInput) -> String {
             Some(TypeRef::Uint16) => numeric_type_str("uint16", &node.numeric_range),
             Some(TypeRef::Uint32) => numeric_type_str("uint32", &node.numeric_range),
             Some(TypeRef::Int64) => numeric_type_str("int64", &node.numeric_range),
-            Some(TypeRef::Decimal64) => "decimal64".to_string(),
+            Some(TypeRef::Decimal64 { fraction_digits }) => {
+                format!("decimal64(fraction-digits={fraction_digits})")
+            }
             Some(TypeRef::Empty) => "empty".to_string(),
             Some(TypeRef::IdentityRef { base }) => format!("identityref(base={base})"),
             Some(TypeRef::LeafRef { target_path }) => format!("leafref(target={target_path})"),

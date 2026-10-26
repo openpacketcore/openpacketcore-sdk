@@ -696,10 +696,7 @@ fn leaf_list_value_key_expr(
         | Some(TypeRef::Uint32) => Ok(quote! { value.to_string() }),
         Some(TypeRef::Uint64) => Ok(quote! { value.0.to_string() }),
         Some(TypeRef::Int64) => Ok(quote! { value.0.to_string() }),
-        Some(TypeRef::Decimal64) => Ok(quote! {
-            let bits = if value.0 == 0.0 { 0_u64 } else { value.0.to_bits() };
-            bits.to_string()
-        }),
+        Some(TypeRef::Decimal64 { .. }) => Ok(quote! { value.to_string() }),
         Some(TypeRef::Empty) => Ok(quote! { String::new() }),
         Some(TypeRef::String | TypeRef::RestrictedString { .. })
         | Some(TypeRef::IdentityRef { .. })
@@ -1009,12 +1006,8 @@ fn parse_leaf_value_expr(
             let parsed = YangInt64(_v.trim().parse::<i64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?);
             #int64_range_check
         },
-        Some(TypeRef::Decimal64) => quote! {
-            let decimal = _v.trim().parse::<f64>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
-            if !decimal.is_finite() {
-                return Err(NetconfEditError::InvalidValue { path: #path });
-            }
-            let parsed = YangDecimal64(decimal);
+        Some(TypeRef::Decimal64 { fraction_digits }) => quote! {
+            let parsed = _v.parse::<YangDecimal64<#fraction_digits>>().map_err(|_| NetconfEditError::InvalidValue { path: #path })?;
         },
         Some(TypeRef::Empty) => quote! {
             if !_v.trim().is_empty() {
@@ -1156,7 +1149,7 @@ fn raw_type_internal(
         Some(TypeRef::Uint32) => quote! { u32 },
         Some(TypeRef::Uint64) => quote! { YangUint64 },
         Some(TypeRef::Int64) => quote! { YangInt64 },
-        Some(TypeRef::Decimal64) => quote! { YangDecimal64 },
+        Some(TypeRef::Decimal64 { fraction_digits }) => quote! { YangDecimal64<#fraction_digits> },
         Some(TypeRef::Empty) => quote! { YangEmpty },
         Some(TypeRef::IdentityRef { .. }) | Some(TypeRef::LeafRef { .. }) => quote! { String },
         Some(TypeRef::Custom { name }) => {

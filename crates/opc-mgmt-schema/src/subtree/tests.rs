@@ -40,7 +40,11 @@ static NODES: &[NodeMeta] = &[
         },
         DataClass::Public,
     ),
-    leaf("/m:decimal", LeafType::Decimal64, DataClass::Public),
+    leaf(
+        "/m:decimal",
+        LeafType::Decimal64 { fraction_digits: 2 },
+        DataClass::Public,
+    ),
     leaf("/m:empty", LeafType::Empty, DataClass::Public),
     leaf(
         "/m:enum",

@@ -145,7 +145,7 @@ fn create_proof_input() -> CanonicalInput {
             module: "proof".to_string(),
             kind: SchemaNodeKind::Leaf,
             config: true,
-            type_ref: Some(TypeRef::Decimal64),
+            type_ref: Some(TypeRef::Decimal64 { fraction_digits: 2 }),
             source: source.clone(),
             ..Default::default()
         },
@@ -512,7 +512,7 @@ fn test_production_proof_codegen() {
         let mut sys = System::default();
         sys.enabled = LeafPresence::Explicit(true);
         sys.empty_leaf = LeafPresence::Explicit(YangEmpty);
-        sys.decimal_leaf = LeafPresence::Explicit(YangDecimal64(3.14));
+        sys.decimal_leaf = LeafPresence::Explicit(YangDecimal64::from_scaled(314));
         sys.default_leaf = LeafPresence::Explicit(42);
 
         // Verify top-level is qualified and nested containers/lists are unqualified
@@ -533,7 +533,7 @@ fn test_production_proof_codegen() {
         let de_sys: System = serde_json::from_value(de_json).unwrap();
         assert_eq!(de_sys.enabled, LeafPresence::Explicit(true));
         assert_eq!(de_sys.empty_leaf, LeafPresence::Explicit(YangEmpty));
-        assert_eq!(de_sys.decimal_leaf, LeafPresence::Explicit(YangDecimal64(3.14)));
+        assert_eq!(de_sys.decimal_leaf, LeafPresence::Explicit(YangDecimal64::from_scaled(314)));
     }
 
     #[test]
@@ -892,39 +892,21 @@ fn test_production_proof_codegen() {
     fn test_rfc7951_serialization_adversarial() {
         use serde_json::json;
         
-        // 1. Floating-point precision edge cases
+        // Exact decimal64 boundaries replace the old non-YANG float domain.
         let mut sys = System::default();
-        let subnormal = 1e-40f64;
-        let large_float = 1e300f64;
-        
-        sys.decimal_leaf = LeafPresence::Explicit(YangDecimal64(subnormal));
-        let serialized = serde_json::to_value(&sys).unwrap();
-        assert_eq!(serialized.get("proof:decimal-leaf").unwrap(), &json!(subnormal.to_string()));
-        
-        sys.decimal_leaf = LeafPresence::Explicit(YangDecimal64(large_float));
-        let serialized = serde_json::to_value(&sys).unwrap();
-        assert_eq!(serialized.get("proof:decimal-leaf").unwrap(), &json!(large_float.to_string()));
-        
-        // Test extra float edge cases: NaN, Infinity, -Infinity, -0.0
-        let edge_cases = vec![
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            -0.0,
-        ];
-        for val in edge_cases {
-            sys.decimal_leaf = LeafPresence::Explicit(YangDecimal64(val));
-            let ser = serde_json::to_value(&sys).unwrap();
-            let val_str = ser.get("proof:decimal-leaf").unwrap().as_str().unwrap();
-            let parsed_val = val_str.parse::<f64>().unwrap();
-            assert_eq!(val, parsed_val);
+        for value in ["-92233720368547758.08", "92233720368547758.07", "900719925474099.21", "0.01"] {
+            sys.decimal_leaf = LeafPresence::Explicit(value.parse().unwrap());
+            let serialized = serde_json::to_value(&sys).unwrap();
+            assert_eq!(serialized.get("proof:decimal-leaf").unwrap(), &json!(value));
+            assert_eq!(serde_json::from_value::<System>(serialized).unwrap().decimal_leaf, sys.decimal_leaf);
         }
-        
-        // Test NaN
-        sys.decimal_leaf = LeafPresence::Explicit(YangDecimal64(f64::NAN));
-        let ser = serde_json::to_value(&sys).unwrap();
-        let val_str = ser.get("proof:decimal-leaf").unwrap().as_str().unwrap();
-        assert!(val_str.parse::<f64>().unwrap().is_nan());
-        
+        for invalid in ["1e-40", "1e300", "NaN", "inf", "-inf", "1.001", "92233720368547758.08"] {
+            assert!(invalid.parse::<YangDecimal64<2>>().is_err());
+            assert!(serde_json::from_value::<System>(json!({"proof:decimal-leaf": invalid})).is_err());
+        }
+        sys.decimal_leaf = LeafPresence::Explicit("-0.0".parse().unwrap());
+        assert_eq!(serde_json::to_value(&sys).unwrap()["proof:decimal-leaf"], json!("0.0"));
+
         // Let's test large numbers
         sys.config_leaf = LeafPresence::Explicit(u32::MAX);
         let serialized = serde_json::to_value(&sys).unwrap();
@@ -1187,7 +1169,7 @@ fn test_production_proof_codegen() {
         );
         assert_eq!(
             reg.leaf_type("/proof:system/proof:decimal-leaf"),
-            Some(LeafType::Decimal64)
+            Some(LeafType::Decimal64 { fraction_digits: 2 })
         );
         assert!(matches!(
             reg.leaf_type("/proof:system/proof:algo-type"),

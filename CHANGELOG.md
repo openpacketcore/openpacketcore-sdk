@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-yanggen`/`opc-mgmt-schema`: decimal64 carries mandatory `fraction_digits`
+  metadata and uses exact signed coefficients instead of floats. Generated
+  `YangDecimal64<F>` values are constructed with `"1.23".parse()` or
+  `YangDecimal64::<2>::from_scaled(123)`; `.scaled()` replaces float-field access.
+  Regenerate bindings and update `TypeRef::Decimal64`/`LeafType::Decimal64`
+  literals. `SubtreeScalar::Decimal` takes a validated `Decimal64` value.
+  Precision overflow, exponents, NaN, infinity and JSON numbers are rejected;
+  serialized decimals are canonical strings. Decimal list keys, leafrefs,
+  defaults and NETCONF edits preserve exact values. NETCONF `trim` omits values
+  equal to their defaults even when explicitly configured. (#1363)
+
 - `opc-yanggen`: `SchemaNode` retains optional `mandatory`, `min_elements`,
   and `max_elements` fields. Initialize them explicitly or use
   `..SchemaNode::default()` in Rust literals. Source ingestion rejects invalid

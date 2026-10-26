@@ -105,7 +105,10 @@ pub enum TypeRef {
     Int16,
     Int32,
     Int64,
-    Decimal64,
+    Decimal64 {
+        /// Required YANG scale, in the inclusive range 1..=18.
+        fraction_digits: u8,
+    },
     Empty,
     IdentityRef {
         base: String,

@@ -1,6 +1,24 @@
 use super::*;
 use crate::{DataClass, LeafType, ModelData, NodeMeta, OriginEntry};
 
+#[test]
+fn decimal_default_omission_compares_exact_values_without_lexical_aliasing() {
+    let scalar = SubtreeScalar::Decimal(crate::Decimal64::parse("900719925474099.21", 2).unwrap());
+    let budget = SubtreeBudget::new(4096, 0).unwrap();
+    assert!(scalar
+        .matches_default("+0900719925474099.210", &budget)
+        .unwrap());
+    assert!(!scalar
+        .matches_default("900719925474099.22", &budget)
+        .unwrap());
+    assert!(!scalar
+        .matches_default("900719925474099.211", &budget)
+        .unwrap());
+    assert_eq!(scalar.encode(&budget).unwrap(), "900719925474099.21");
+    let too_small = SubtreeBudget::new(1, 0).unwrap();
+    assert_eq!(scalar.encode(&too_small), Err(SubtreeError::TooBig));
+}
+
 struct Registry;
 impl SchemaRegistry for Registry {
     fn schema_digest(&self) -> &'static str {

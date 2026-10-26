@@ -29,6 +29,9 @@
 
 pub mod string_constraints;
 
+mod decimal64;
+pub use decimal64::{Decimal64, Decimal64Error, FixedDecimal64};
+
 mod netconf_data;
 pub use netconf_data::{
     merge_netconf_data, render_netconf_data, NetconfDataNode, NetconfInstanceBranch,
@@ -78,8 +81,11 @@ pub enum LeafType {
     Int32,
     /// `int64`
     Int64,
-    /// `decimal64` (generator-backed by `f64`; see opc-yanggen)
-    Decimal64,
+    /// Exact decimal64, with its declared YANG scale.
+    Decimal64 {
+        /// Required fraction-digits, in the inclusive range 1..=18.
+        fraction_digits: u8,
+    },
     /// `empty`
     Empty,
     /// `identityref`, with the base identity name.
