@@ -1795,36 +1795,42 @@ impl ThreeVoterConsumerFleet {
         excluded: usize,
         previous: SessionConsensusNodeId,
         previous_term: u64,
-        deadline: tokio::time::Instant,
+        watchdog: Duration,
     ) -> usize {
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                let survivors = (0..THREE_VOTER_COUNT)
-                    .filter(|index| *index != excluded)
-                    .collect::<Vec<_>>();
-                let statuses = survivors
-                    .iter()
-                    .map(|index| self.stores[*index].status())
-                    .collect::<Vec<_>>();
-                if let Some(leader) = statuses.first().and_then(|status| status.leader_id) {
-                    let term = statuses.first().expect("survivor status").term;
-                    if leader != previous
-                        && term > previous_term
-                        && statuses.iter().all(|status| {
-                            status.leader_id == Some(leader)
-                                && status.term == term
-                                && status.admitted
-                        })
-                    {
-                        return survivors
-                            .into_iter()
-                            .find(|index| self.stores[*index].status().node_id == leader)
-                            .expect("new leader is a survivor");
+        let survivors = (0..THREE_VOTER_COUNT)
+            .filter(|index| *index != excluded)
+            .collect::<Vec<_>>();
+        election_progress::wait(
+            watchdog,
+            previous_term,
+            async {
+                loop {
+                    let statuses = survivors
+                        .iter()
+                        .map(|index| self.stores[*index].status())
+                        .collect::<Vec<_>>();
+                    if let Some(leader) = statuses.first().and_then(|status| status.leader_id) {
+                        let term = statuses.first().expect("survivor status").term;
+                        if leader != previous
+                            && term > previous_term
+                            && statuses.iter().all(|status| {
+                                status.leader_id == Some(leader)
+                                    && status.term == term
+                                    && status.admitted
+                            })
+                        {
+                            return survivors
+                                .iter()
+                                .copied()
+                                .find(|index| self.stores[*index].status().node_id == leader)
+                                .expect("new leader is a survivor");
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(&survivors, term),
+        )
         .await
         .unwrap_or_else(|_| {
             let statuses = (0..THREE_VOTER_COUNT)
@@ -7617,9 +7623,19 @@ async fn persistent_three_voter_fenced_status_converges_after_response_loss_and_
     })
     .await
     .expect("old committed-leader lease drains within the recovery deadline");
-    let new_leader = fleet
-        .wait_for_new_leader(old_leader, old_leader_id, old_term, election_deadline)
-        .await;
+    // The controlled campaign and preceding lease drain keep their original
+    // shared absolute deadline.
+    let new_leader = tokio::time::timeout_at(
+        election_deadline,
+        fleet.wait_for_new_leader(
+            old_leader,
+            old_leader_id,
+            old_term,
+            THREE_VOTER_ELECTION_RECOVERY_TIMEOUT,
+        ),
+    )
+    .await
+    .expect("selected survivor elects within the original recovery deadline");
     assert_ne!(new_leader, old_leader, "leader changes after commit");
     for survivor in [initial_follower, other_survivor] {
         fleet.stores[survivor].set_automatic_election_for_test(true);

@@ -4,6 +4,8 @@ mod formation_clock;
 #[path = "support/election_progress.rs"]
 mod election_progress;
 
+use election_progress::wait as wait_for_survivor_election;
+
 #[path = "consensus_openraft/late_acquire.rs"]
 mod late_acquire;
 
@@ -71,8 +73,8 @@ use tempfile::TempDir;
 
 const MEMBER_COUNT: usize = 3;
 const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
-// Retain the profiled watchdog interval. Election acquisition renews it only
-// on a published higher term; randomized split retries have no fixed count.
+// Election acquisition renews this stall interval only on a higher term.
+// Response and post-election convergence checks retain fixed deadlines.
 const RECOVERY_TIMEOUT: Duration = Duration::from_millis(
     DURABLE_CONSENSUS_TIMING_PROFILE
         .election_timeout_max_millis
@@ -1480,20 +1482,6 @@ impl TestCluster {
             .max()
             .unwrap_or(0)
     }
-}
-
-async fn wait_for_survivor_election<T, F, N, P>(
-    watchdog: Duration,
-    _initial_term: u64,
-    operation: F,
-    _next_term: N,
-) -> Result<T, tokio::time::error::Elapsed>
-where
-    F: std::future::Future<Output = T>,
-    N: FnMut(u64) -> P,
-    P: std::future::Future<Output = u64>,
-{
-    tokio::time::timeout(watchdog, operation).await
 }
 
 #[tokio::test(start_paused = true)]

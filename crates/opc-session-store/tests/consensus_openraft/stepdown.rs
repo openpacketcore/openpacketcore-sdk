@@ -372,6 +372,7 @@ fn publication_observer_sees_callsites_first_used_without_a_subscriber() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"));
         return;
     }
 
