@@ -1471,7 +1471,7 @@ tracked shutdown owner through its transaction. Caller cancellation cannot
 release those resources early or replay the write. A successful commit signals
 the checkpoint lane even when its caller has stopped waiting; a rejected commit
 rolls back without signaling. Failures emit a diagnostic containing only the
-error kind, even if the caller has stopped waiting. The pinned Tokio 1.53.1 pool
+error kind, even if the caller has stopped waiting. The pinned Tokio 1.53.3 pool
 drains jobs already queued behind a busy blocking worker even after
 `shutdown_timeout` returns; those jobs retain their resources and admission until
 completion. A closed runtime rejects new dispatch without executing SQL and
@@ -1510,7 +1510,7 @@ instance. There is no destructor refund or blocking cleanup. Retiring all 64
 slots disables the handoff optimization and keeps writes inline. Independent
 progress therefore still depends on available runtime capacity.
 
-This retirement proof uses Tokio 1.53.1's FIFO blocking-pool dequeue order.
+This retirement proof uses Tokio 1.53.3's FIFO blocking-pool dequeue order.
 The SDK manifest requires that exact crates.io version for consuming applications,
 independently of this repository's lockfile, with the original runtime features.
 An upgrade or dependency source override requires revalidating the actual

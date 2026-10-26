@@ -1042,6 +1042,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Update Tokio to 1.53.3 for RUSTSEC-2026-0386. SCTP and timer registrations
+  consume owned descriptors through one narrow boundary that prevents replacing
+  them while registered. Boot-time timers transfer ownership without descriptor
+  duplication. The session-store runtime remains exactly pinned and retains its
+  queue, cancellation and shutdown ownership contracts. (#1532)
+
 - IKE's opt-in RSA private operations use randomized blinding for PKCS#1 v1.5
   and PSS. Wire algorithms and the existing RSA signing feature boundary are
   unchanged; this is hardening, not a resolution of the `rsa` timing advisory.

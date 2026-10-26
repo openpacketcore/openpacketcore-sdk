@@ -376,3 +376,39 @@ Witnesses: [safe authentication boundary](../crates/opc-sctp/src/lib.rs),
 [RFC 4895 §§3.3, 6.1](https://www.rfc-editor.org/rfc/rfc4895.html#section-3.3),
 [RFC 6458 §§8.1.17, 8.2.4](https://www.rfc-editor.org/rfc/rfc6458.html#section-8.1.17), and
 [Linux endpoint/association readback](https://github.com/torvalds/linux/blob/v6.8/net/sctp/socket.c).
+
+## Integration verification: Tokio descriptor ownership
+
+The branch updates every Tokio lock to 1.53.3 and keeps the storage consumer's
+exact version requirement. The deprecated `AsyncFd` constructors are replaced
+at all SCTP, boot-time clock and storage-backoff call sites. The new narrow
+`opc-tokio-fd-sys` boundary takes an `OwnedFd`, retains it through deregistration
+and exposes no mutable or owning access to the registration. Compile-fail
+checks reject raw integers, descriptor replacement and inner extraction.
+Boot-time timers transfer their existing descriptor without duplication and
+retain the existing counter validation and redacted errors.
+
+The blocking-pool queue still enqueues at the back and dequeues at the front.
+Compared with Tokio 1.53.1, 1.53.3's pool changes only lock release before
+rejecting a task after shutdown; the multi-thread worker source is unchanged.
+All 28 existing admitted-SQLite-write and authority-backoff tests pass on Linux,
+including queue bounds, closed owners, panic, cancellation, runtime shutdown,
+borrowed/current-thread execution and shared timer expiry. An initial compile
+exhausted the 6 GiB test VM before running; the unchanged selection passed with
+16 GiB. No test deadline or assertion was relaxed.
+
+The ordinary affected-crate selection passes 374 Linux tests, and native SCTP
+authentication (both namespace defaults), single-family multihoming and
+mixed-family multihoming pass explicitly. Host coverage passes the 116 portable
+SCTP tests and the four descriptor ownership/readiness checks. These results do
+not claim a macOS eBPF backend: its existing Aya dependency is Linux-only.
+
+Witnesses: [owned registration](../crates/opc-tokio-fd-sys/src/lib.rs),
+[storage handoff matrix](../crates/opc-session-store/src/consensus/storage.rs),
+[backoff tests](../crates/opc-session-store/src/sqlite/native.rs),
+[boot-time clock test](../crates/opc-egress-fence/src/linux_control.rs),
+[ADR amendment pending peer review](adr/0017-sctp-transport-ffi-boundary.md), and
+[the upstream advisory](https://rustsec.org/advisories/RUSTSEC-2026-0386.html).
+The full Linux workspace passes all-target/all-feature Clippy. The mechanical
+unsafe boundary, all committed lockfile metadata and test-shard coverage checks
+pass. The older DTLS arithmetic advisory remains separate tracked work.

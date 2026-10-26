@@ -23,6 +23,7 @@ opc-linux-gtpu-sys = { path = "../opc-linux-gtpu-sys", version = "0.2.0" }
 opc-linux-xfrm-sys = { path = "../opc-linux-xfrm-sys", version = "0.2.0" }
 opc-runtime = { path = "../opc-runtime", version = "0.2.0" }
 opc-session-store = { path = "../opc-session-store", version = "0.2.0" }
+opc-tokio-fd-sys = { path = "../opc-tokio-fd-sys", version = "0.2.0" }
 rand = { workspace = true }
 rustix = { version = "1", features = ["fs", "net", "time"] }
 sha2 = { workspace = true }

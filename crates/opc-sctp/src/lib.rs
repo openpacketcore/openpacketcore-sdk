@@ -55,9 +55,9 @@ use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd, OwnedFd};
+use opc_tokio_fd_sys::AsyncOwnedFd;
 #[cfg(target_os = "linux")]
-use tokio::io::unix::AsyncFd;
+use std::os::fd::{AsFd, OwnedFd};
 
 #[cfg(any(target_os = "linux", test))]
 const SCTP_RECV_CHUNK_BYTES: usize = 64 * 1024;
@@ -4005,7 +4005,7 @@ mod platform {
 
     #[derive(Debug)]
     struct SctpSocket {
-        fd: AsyncFd<OwnedFd>,
+        fd: AsyncOwnedFd,
         max_message_bytes: usize,
         recv_owner: ReceiveOwner,
         metrics: SctpMetrics,
@@ -4062,7 +4062,7 @@ mod platform {
                 .map_err(|source| multihoming_io_err("bind_addresses", source))?;
         }
         opc_libsctp_sys::listen(fd.as_fd(), 128).map_err(|source| io_err("listen", source))?;
-        let async_fd = AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
+        let async_fd = AsyncOwnedFd::new(fd).map_err(|source| io_err("async_fd", source))?;
         Ok(Endpoint {
             socket: Arc::new(SctpSocket {
                 fd: async_fd,
@@ -4193,7 +4193,7 @@ mod platform {
                         let peer_paths = SctpPathTracker::new(&peer_addrs);
                         peer_paths.initialize_primary_reachable(peer);
                         let async_fd =
-                            AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))?;
+                            AsyncOwnedFd::new(fd).map_err(|source| io_err("async_fd", source))?;
                         self.socket.metrics.record_accept();
                         let (auth_events, _auth_events_receiver) =
                             tokio::sync::broadcast::channel(16);
@@ -5115,8 +5115,8 @@ mod platform {
         });
     }
 
-    pub(super) fn register_async_fd(fd: OwnedFd) -> Result<AsyncFd<OwnedFd>, SctpError> {
-        AsyncFd::new(fd).map_err(|source| io_err("async_fd", source))
+    pub(super) fn register_async_fd(fd: OwnedFd) -> Result<AsyncOwnedFd, SctpError> {
+        AsyncOwnedFd::new(fd).map_err(|source| io_err("async_fd", source))
     }
 
     async fn wait_connected(

@@ -16,6 +16,7 @@ publish = false
 [dependencies]
 bytes = { workspace = true }
 opc-libsctp-sys = { path = "../opc-libsctp-sys", version = "0.2.0" }
+opc-tokio-fd-sys = { path = "../opc-tokio-fd-sys", version = "0.2.0" }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "time", "io-util", "sync"] }
 tracing = { workspace = true }

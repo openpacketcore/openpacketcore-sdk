@@ -68,6 +68,14 @@ impl BootTimeTimer {
     pub fn consume_expirations(&self) -> io::Result<u64> {
         read_timer_expirations(self.fd.as_raw_fd())
     }
+
+    pub fn into_owned_fd(self) -> io::Result<OwnedFd> {
+        Ok(self.fd)
+    }
+}
+
+pub fn consume_timer_expirations(fd: BorrowedFd<'_>) -> io::Result<u64> {
+    read_timer_expirations(fd.as_raw_fd())
 }
 
 #[repr(C)]
@@ -1829,6 +1837,14 @@ mod tests {
         let error = timer
             .consume_expirations()
             .expect_err("one-shot timer was consumed");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "boot_time_timer");
+
+        let descriptor = timer.as_raw_fd();
+        let owned = timer.into_owned_fd().expect("transfer timer ownership");
+        assert_eq!(owned.as_raw_fd(), descriptor, "transfer must not duplicate");
+        let error = crate::consume_timer_expirations(owned.as_fd())
+            .expect_err("transferred one-shot remains consumed");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(error.to_string(), "boot_time_timer");
 

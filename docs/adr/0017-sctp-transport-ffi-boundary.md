@@ -125,6 +125,18 @@ an SCTP-terminating CNF is in scope:
 6. SCTP is implemented per Option A behind this boundary, never as scattered
    `unsafe` and never as a userspace reimplementation without revisiting this
    ADR.
+7. **Owned Tokio registration amendment (compliance branch; review pending).**
+   RUSTSEC-2026-0386 replaces safe `AsyncFd` constructors with a caller-proven
+   lifetime contract. `opc-tokio-fd-sys` is the explicit Unix reactor exception:
+   it consumes only `OwnedFd`, registers it with Tokio, and exposes shared
+   readiness access. It cannot expose mutable or owning access to the inner
+   registration, accept raw descriptor integers, or substitute a borrowed
+   descriptor. Tokio deregisters before closing the owned descriptor. The same
+   mechanical allowlist and adjacent safety-comment requirements apply.
+   Compile-fail tests retain the ownership boundary; live socket and timer tests
+   exercise registration and drop on admitted platforms. This amendment adds
+   no protocol codec FFI and keeps unsafe code out of the three consumers
+   (`opc-sctp`, `opc-egress-fence`, and `opc-session-store`).
 
 ## Consequences
 
