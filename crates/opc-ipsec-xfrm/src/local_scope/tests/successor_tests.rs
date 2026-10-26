@@ -37,6 +37,7 @@ enum Case {
     Generations,
     Retry,
     Readback,
+    ExpiredGroup,
     Abandon,
     HoldSa,
     HoldPolicy,
@@ -85,6 +86,7 @@ fn exercise(case: Case, native: bool) {
                 Case::Generations => generations(&backend, &profile, &authority, &quorum).await,
                 Case::Retry => retry(&backend, &profile, &authority, &quorum).await,
                 Case::Readback => readback(&backend, &profile, &authority, &quorum).await,
+                Case::ExpiredGroup => expired_group(&backend, &profile, &authority, &quorum).await,
                 Case::Abandon => abandon(&backend, &profile, &authority, &quorum).await,
                 Case::HoldSa | Case::HoldPolicy => {
                     cancelled(
@@ -138,7 +140,11 @@ async fn overlap(
     let status = backend.scoped_successor_status(&old).await.unwrap();
     assert!(status.successor_sa_installed() && status.traffic_moved() && status.published());
     assert!(!status.predecessor_retired());
-    assert!(backend.read_scoped(&old).await.unwrap());
+    assert_eq!(
+        backend.read_scoped(&old).await.unwrap(),
+        direction == XfrmDirection::In
+    );
+    assert_sa_live(backend, &old_request).await;
     assert!(backend.read_scoped(&next).await.unwrap());
     let traffic = if direction == XfrmDirection::In {
         traffic.checkpoint(old_request.sa.id.spi);
@@ -209,10 +215,70 @@ async fn generations(
         assert!(counts.0 >= 1 && counts.1 >= 1);
         assert!(backend.read_scoped(&second).await.unwrap());
         if !retire_first {
-            assert!(backend.read_scoped(&first).await.unwrap());
+            assert!(!backend.read_scoped(&first).await.unwrap());
+            assert_sa_live(backend, &first_request).await;
             backend.remove_scoped(&first).await.unwrap();
         }
         backend.remove_scoped(&second).await.unwrap();
+    }
+}
+
+async fn assert_sa_live(backend: &NamespaceBoundLinuxXfrmBackend, request: &ScopedXfrmRequest) {
+    let observed = backend
+        .query_sa(QuerySaRequest {
+            destination: request.sa.id.destination,
+            spi: request.sa.id.spi,
+            protocol: request.sa.id.protocol,
+            mark: request.sa.mark,
+        })
+        .await
+        .unwrap();
+    assert_eq!(observed.id, request.sa.id);
+    assert_eq!(observed.request_id, request.sa.request_id);
+}
+
+async fn expired_group(
+    backend: &NamespaceBoundLinuxXfrmBackend,
+    profile: &LocalXfrmProfile,
+    authority: &TestAuthority,
+    quorum: &Quorum,
+) {
+    for (id, successor_first) in [(190, false), (194, true)] {
+        let old_request = request(id, XfrmDirection::Out);
+        let old = install(backend, profile, authority, quorum, id, old_request.clone()).await;
+        let next_request = candidate(&old_request, 1);
+        let next = backend
+            .install_scoped_successor(
+                profile,
+                grant(authority, quorum, id + 1).await,
+                &old,
+                next_request.clone(),
+            )
+            .await
+            .unwrap();
+        for request in [&old_request, &next_request] {
+            LinuxXfrmBackend::new()
+                .remove_sa(RemoveSaRequest {
+                    destination: request.sa.id.destination,
+                    spi: request.sa.id.spi,
+                    protocol: request.sa.id.protocol,
+                    mark: request.sa.mark,
+                })
+                .await
+                .unwrap();
+        }
+        let (first, last) = if successor_first {
+            (&next, &old)
+        } else {
+            (&old, &next)
+        };
+        backend.remove_scoped(first).await.unwrap();
+        assert!(first.is_retired());
+        assert!(!last.is_retired());
+        backend.remove_scoped(last).await.unwrap();
+        assert!(last.is_retired());
+        assert!(backend.local_namespace_empty().await.unwrap());
+        assert_eq!(backend.scoped_test_retained().await, 0);
     }
 }
 
@@ -544,6 +610,19 @@ fn native_scoped_successor_fresh_status() {
 #[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
 fn native_transport_scoped_successor_fresh_status() {
     exercise(Case::Readback, true);
+}
+
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_scoped_successor_expired_group_cleans_up_in_both_orders() {
+    exercise(Case::ExpiredGroup, false);
+}
+
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_scoped_successor_expired_group_cleans_up_in_both_orders() {
+    exercise(Case::ExpiredGroup, true);
 }
 
 #[test]

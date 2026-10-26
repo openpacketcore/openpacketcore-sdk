@@ -5156,6 +5156,29 @@ mod tests {
     }
 
     #[test]
+    fn tfc_roster_member_authentication_binds_padding_without_changing_deletion_identity() {
+        let root = TestRoot::new();
+        let store = store(&root);
+        let mut request = sample_install_request();
+        let disabled = store.fingerprints_for_request(&request).unwrap();
+        let XfrmObjectInstallRequest::Sa(sa) = &mut request else {
+            panic!("SA fixture")
+        };
+        sa.parameters.tfc_pad = Some(1280);
+        let first = store.fingerprints_for_request(&request).unwrap();
+        let XfrmObjectInstallRequest::Sa(sa) = &mut request else {
+            panic!("SA fixture")
+        };
+        sa.parameters.tfc_pad = Some(1400);
+        let second = store.fingerprints_for_request(&request).unwrap();
+        assert_eq!(disabled.deletion_identity, first.deletion_identity);
+        assert_eq!(disabled.deletion_identity, second.deletion_identity);
+        assert_ne!(disabled.install_request, first.install_request);
+        assert_ne!(disabled.install_request, second.install_request);
+        assert_ne!(first.install_request, second.install_request);
+    }
+
+    #[test]
     fn every_family_domain_separates_an_otherwise_identical_key() {
         // A deployment may configure the same 32 secret bytes for every
         // durable family, so the domain separator is the only thing keeping
