@@ -46,6 +46,28 @@ evidence of full endpoint conformance. No security fallback is introduced.
 With the earlier QoS fix and the reproduced TFT/TWAN behavior, all four #1356
 claims now have a fix or standards-backed disposition; peer review is pending.
 
+## PKI profiles in #1353
+
+`opc-identity` now exposes explicit general-PKI URI extraction and local
+certificate validation for client, server or both TLS roles. A single SPIFFE
+URI may coexist with service URIs; duplicate SPIFFE identities still fail.
+The selected trust-domain bundle, complete certificate path, validity and
+matching private key remain mandatory. This returns a local identity, not an
+`IdentityState`; SVID reload sources and `opc-tls` retain their strict profile.
+
+The strict SVID loader also now rejects a present EKU without both clientAuth
+and serverAuth. Previously it checked only the server role. The regression
+failed before correction; the role matrix and negative trust/key/time/SAN
+cases are in [pki_profiles.rs](../crates/opc-identity/tests/pki_profiles.rs).
+
+This separation follows the role-specific EKUs and service SANs in
+[TS 33.310 V18.8.0 Table 6.1.3c.3-1](https://www.etsi.org/deliver/etsi_ts/133300_133399/133310/18.08.00_60/ts_133310v180800p.pdf)
+and the single-URI and dual-EKU requirements in
+[X.509-SVID §§2 and 4.4](https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md).
+The general helper is not a complete NF certificate-profile validator or a
+replacement for peer authorization and revocation. The transport version and
+cipher-suite findings in #1353 remain separate work.
+
 ## Diameter runtime work list #1358
 
 The cited `src/apps/rfc7683.rs` and `src/routing.rs` do not exist in
