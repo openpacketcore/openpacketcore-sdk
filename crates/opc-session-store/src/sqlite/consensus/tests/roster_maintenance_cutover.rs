@@ -156,7 +156,7 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
     let due = now.add_seconds(24 * 60 * 60 + 1).unwrap();
     let mut next = 3;
     if v1 {
-        let admitted = crate::sqlite::consensus::roster_rows::tests::signed_v1_command(&signed);
+        let admitted = v1_fixture::signed_v1_command(&signed);
         let terminal = v1_fixture::terminal(
             &signed,
             &admitted,
