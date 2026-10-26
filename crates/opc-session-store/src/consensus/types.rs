@@ -3173,7 +3173,7 @@ pub(crate) mod tests {
         let mut certificate = RosterAttestationLeafCertificatePartsV1 {
             root_id: root.root_id(),
             role,
-            configuration_identity,
+            configuration_identity: identity,
             scope,
             subject_identity_commitment,
             leaf_epoch: 1,
@@ -3862,7 +3862,7 @@ pub(crate) mod tests {
         .expect("V2 terminal record");
         let input_for = |member: &Member| RosterProfileV2TerminalAttestationSigningInputV1 {
             profile: Profile::v2(),
-            configuration_identity,
+            configuration_identity: identity,
             certificate_subject_identity_commitment: [0xa3; 32],
             certificate_role: RosterAttestationCertificateRoleV1::Executor,
             admission_provenance_commitment: provenance
@@ -4220,7 +4220,7 @@ pub(crate) mod tests {
             ))),
             v2_digest_command(SessionMutationIntent::ActivateFencedTransitionV2 {
                 request: Box::new(request.clone()),
-                scope_identity,
+                scope_identity: identity,
                 voter_set_digest: [0xD4; 32],
                 profile_digest: [0xD5; 32],
             }),
@@ -4232,7 +4232,7 @@ pub(crate) mod tests {
             }),
             v2_digest_command(SessionMutationIntent::Authorized {
                 origin: SessionConsensusNodeId::new(9).expect("origin"),
-                authority_identity,
+                authority_identity: identity,
                 mutation: Box::new(SessionMutationIntent::FencedTransitionV2(Box::new(request))),
             }),
         ];
@@ -4298,16 +4298,16 @@ pub(crate) mod tests {
             ))),
             v2_digest_command(SessionMutationIntent::ActivateFencedTransitionV2 {
                 request: Box::new(request.clone()),
-                scope_identity,
+                scope_identity: identity,
                 voter_set_digest: [0xD4; 32],
                 profile_digest: [0xD5; 32],
             }),
             v2_digest_command(SessionMutationIntent::Authorized {
                 origin: SessionConsensusNodeId::new(9).expect("origin"),
-                authority_identity,
+                authority_identity: identity,
                 mutation: Box::new(SessionMutationIntent::ActivateFencedTransitionV2 {
                     request: Box::new(request),
-                    scope_identity,
+                    scope_identity: identity,
                     voter_set_digest: [0xD4; 32],
                     profile_digest: [0xD5; 32],
                 }),
@@ -4383,16 +4383,16 @@ pub(crate) mod tests {
             ))),
             v2_digest_command(SessionMutationIntent::ActivateFencedTransitionV2 {
                 request: Box::new(request.clone()),
-                scope_identity,
+                scope_identity: identity,
                 voter_set_digest: [0xD4; 32],
                 profile_digest: [0xD5; 32],
             }),
             v2_digest_command(SessionMutationIntent::Authorized {
                 origin: SessionConsensusNodeId::new(9).expect("origin"),
-                authority_identity,
+                authority_identity: identity,
                 mutation: Box::new(SessionMutationIntent::ActivateFencedTransitionV2 {
                     request: Box::new(request),
-                    scope_identity,
+                    scope_identity: identity,
                     voter_set_digest: [0xD4; 32],
                     profile_digest: [0xD5; 32],
                 }),
@@ -4435,7 +4435,7 @@ pub(crate) mod tests {
                 19,
                 SessionMutationIntent::ActivateFencedTransitionV2 {
                     request: Box::new(request.clone()),
-                    scope_identity,
+                    scope_identity: identity,
                     voter_set_digest: [0xD4; 32],
                     profile_digest: [0xD5; 32],
                 },
@@ -4590,14 +4590,14 @@ pub(crate) mod tests {
             SessionMutationIntent::PrepareTopologyTransition {
                 transition_id: [9; 16],
                 request_digest: [10; 32],
-                desired_identity,
+                desired_identity: identity,
                 desired_members: members.clone(),
                 desired_bindings: bindings.clone(),
             },
             LegacySessionMutationIntent684::PrepareTopologyTransition {
                 transition_id: [9; 16],
                 request_digest: [10; 32],
-                desired_identity,
+                desired_identity: identity,
                 desired_members: members,
                 desired_bindings: bindings,
             },
@@ -4650,12 +4650,12 @@ pub(crate) mod tests {
             "Authorized",
             SessionMutationIntent::Authorized {
                 origin: node,
-                authority_identity,
+                authority_identity: identity,
                 mutation: Box::new(SessionMutationIntent::AdvanceLogicalTime),
             },
             LegacySessionMutationIntent684::Authorized {
                 origin: node,
-                authority_identity,
+                authority_identity: identity,
                 mutation: Box::new(LegacySessionMutationIntent684::AdvanceLogicalTime),
             },
         );
@@ -4680,12 +4680,12 @@ pub(crate) mod tests {
             "ActivateFencedTransition",
             SessionMutationIntent::ActivateFencedTransition {
                 request: Box::new(fenced_request.clone()),
-                scope_identity,
+                scope_identity: identity,
                 voter_set_digest: [0x32; 32],
             },
             LegacySessionMutationIntent684::ActivateFencedTransition {
                 request: Box::new(fenced_request),
-                scope_identity,
+                scope_identity: identity,
                 voter_set_digest: [0x32; 32],
             },
         );
