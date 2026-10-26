@@ -181,7 +181,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing single-peer behaviour (wait for the one coalesced cooldown edge or
   the caller deadline). `ReconnectCooldownPolicy::FailOver` is the routed
   policy: a foreground call that reaches a peer whose shared reconnect cooldown
-  is active returns the bounded, value-free pre-write
+  is active or whose probe is already in flight returns the bounded, value-free pre-write
   `SessionConsumerClientError::Cooldown` immediately (remaining cooldown and
   gate wait in milliseconds) so the caller's routing loop can select another
   voter without waiting for this peer's recovery edge. No request byte is
@@ -189,7 +189,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another peer; once a byte may have been accepted the existing
   exact-identity/status recovery is unchanged. Both policies retain the shared
   exponential backoff, the single serialized probe at cooldown expiry, and the
-  existing deadlines, retry and authority rules. Refs #1248.
+  existing deadlines, retry and authority rules. Admission precedes DNS and
+  pool waits, and routed callers do not join another pending warm or retained
+  setup. Value-free physical-attempt spans record operation kind, canonical
+  voter/successor ordinals, gate time, cooldown and transmission classification.
+  `opc-session-store::SessionConsumerVoterAuthority::ordinal` exposes the
+  canonical roster position for those diagnostics without granting authority.
+  Refs #1248.
 - `opc-gtpu-dataplane`: ordinary inner-IPv6 PDP contexts can now opt into
   in-tunnel RFC 4443 Packet Too Big. The family-tagged entry gains a versioned
   opt-in downlink inner MTU profile (entry versions 3/4, the 2-byte field at

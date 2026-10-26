@@ -893,15 +893,20 @@ reconnect-cooldown admission policy per client. The default
 `ReconnectCooldownPolicy::Wait` waits for the single coalesced cooldown edge (or
 the caller deadline) before one serialized probe, so single-peer callers are
 unchanged. `ReconnectCooldownPolicy::FailOver` is the explicit routed-consumer
-policy: a call that reaches a peer whose shared cooldown is active returns the
-typed pre-write `SessionConsumerClientError::Cooldown` immediately, carrying only
+policy: a call that reaches a peer whose shared cooldown is active or whose
+probe is already in flight returns the typed pre-write `SessionConsumerClientError::Cooldown` immediately, carrying only
 the bounded remaining cooldown and gate wait in milliseconds, so a routing loop
 can select another peer without waiting. No request byte was ever written, so
 the caller may route the unchanged request to another voter; once a byte may
 have been accepted, the existing exact-identity/status recovery applies
 unchanged. Both policies keep the same exponential backoff, the same single
 serialized probe at cooldown expiry, and never create caller-local sleeps or
-independent probes.
+independent probes. A zero remaining cooldown means another caller holds the
+probe. Admission happens before DNS and pool waits, including retained lanes;
+routed callers also decline to join a pending warm setup. Background maintenance
+retains the shared waiting policy. Debug spans named `session_consumer_attempt`
+contain only operation kind, canonical voter/successor ordinals, gate and
+cooldown microseconds, and `pre_write`/`possibly_written` classification.
 Each unused lane's effective expiry is the earlier of its local publication-based
 idle deadline and its own peer first-Call bound. The latter is measured from the
 monotonic HelloAck receive instant, less the complete measured Hello round trip
