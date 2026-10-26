@@ -3399,6 +3399,7 @@ mod tests {
 
     use super::*;
     use crate::model::{PdpLiveWriterNamespaceIdentity, Teid, DEFAULT_PDP_HASHSIZE};
+    #[cfg(target_os = "linux")]
     use crate::DownlinkOuterProvenance;
     use crate::{
         PdpContextMismatchField, PdpContextSelectorOccupancy, PdpLiveWriterProof,
