@@ -232,7 +232,13 @@ def main():
             make = ["make", "-C", source, f"O={build}"]
             run(make + ["tinyconfig"], stdout=log, stderr=subprocess.STDOUT)
             features = COMMON + (
-                ("64BIT", "SERIAL_8250", "SERIAL_8250_CONSOLE", "CRYPTO_AES_NI_INTEL")
+                (
+                    "64BIT",
+                    "ACPI",
+                    "SERIAL_8250",
+                    "SERIAL_8250_CONSOLE",
+                    "CRYPTO_AES_NI_INTEL",
+                )
                 if machine == "x86_64"
                 else (
                     "SERIAL_AMBA_PL011",

@@ -129,6 +129,10 @@ jobs:
 
       - name: Install isolated kernel build and VM tooling
         run: |
+          # Reuse the SCTP job's HTTPS mirror; Azure HTTP stalls these downloads.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc pkg-config \
             cloud-image-utils qemu-system-x86 qemu-utils openssh-client patchelf

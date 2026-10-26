@@ -488,6 +488,9 @@ def main():
         "--transport-only", action="store_true", help="qualify the stock-kernel sender"
     )
     args = parser.parse_args()
+    cpus = len(os.sched_getaffinity(0))
+    assert cpus >= 2, "qualification requires two online CPUs"
+    print(f"kernel={os.uname().release} online_cpus={cpus}", flush=True)
     results = []
     for version in (4, 6):
         for mode in ("transport",) if args.transport_only else ("transport", "tunnel"):
