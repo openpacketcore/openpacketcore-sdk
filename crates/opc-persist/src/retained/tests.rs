@@ -827,11 +827,16 @@ fn resume_rejects_writable_authenticated_intent_without_mutation() {
     std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o666))
         .expect("writable intent permissions");
     let before = files(dir.path());
+    let lock_acquired = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&lock_acquired);
+    let mut admission = work();
+    admission.lock_hook = Some(Arc::new(move |_| observed.store(true, Ordering::Release)));
+    let admission = Arc::new(admission);
     let resumed = open_authority_sync(
         options(&path),
         key(),
         OpenIntent::ResumeAuthority,
-        &Arc::new(work()),
+        &admission,
     );
     assert!(
         matches!(resumed, Err(RetainedConfigError::Rejected)),
@@ -842,6 +847,10 @@ fn resume_rejects_writable_authenticated_intent_without_mutation() {
         files(dir.path()),
         "refused resume preserves every file"
     );
+    assert!(
+        !lock_acquired.load(Ordering::Acquire),
+        "writable intent must be rejected before admission lock acquisition"
+    );
 
     std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o600))
         .expect("private intent permissions");
@@ -850,9 +859,13 @@ fn resume_rejects_writable_authenticated_intent_without_mutation() {
             options(&path),
             key(),
             OpenIntent::ResumeAuthority,
-            &Arc::new(work()),
+            &admission,
         )
         .expect("the same authenticated intent resumes with private write permissions"),
+    );
+    assert!(
+        lock_acquired.load(Ordering::Acquire),
+        "the positive control observes admission lock acquisition"
     );
 }
 

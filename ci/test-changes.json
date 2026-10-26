@@ -414,7 +414,7 @@
     {
       "test": "rust:crates/opc-persist::lib=lib::retained::tests::remove_intent_file_refuses_foreign_file_types",
       "kind": "removed",
-      "reason": "Issue #1114 removes intent-unlink recovery. In crates/opc-persist/src/retained/tests.rs, resume_preserves_foreign_intent_file_types checks refusal and continued existence of the foreign regular file, symlink entry and target. resume_rejects_writable_authenticated_intent_without_mutation separately uses a valid authenticated intent with mode 0o666 to require Rejected and byte-identical files, then requires successful resume of the same intent after chmod 0o600. The latter discriminates the writable-intent guard from authentication failure.",
+      "reason": "Issue #1114 removes intent-unlink recovery. In crates/opc-persist/src/retained/tests.rs, resume_preserves_foreign_intent_file_types checks refusal and continued existence of the foreign regular file, symlink entry and target. resume_rejects_writable_authenticated_intent_without_mutation separately uses a valid authenticated intent with mode 0o666 to require Rejected and byte-identical files, then requires successful resume of the same intent after chmod 0o600. The latter also requires rejection before admission lock acquisition, so a later permission check cannot mask removal of the initial writable-intent guard; the positive control observes lock acquisition.",
       "issue": 1114,
       "replacements": [
         "rust:crates/opc-persist::lib=lib::retained::tests::resume_preserves_foreign_intent_file_types",
