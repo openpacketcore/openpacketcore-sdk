@@ -9,31 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `opc-gtpu-dataplane` / `opc-dataplane-observation`: add host-portable RED
-  scale-limit evidence for the #720 traffic-proof subsystem (tests only; no
-  production path, map, pin, object, ABI or proof-semantic change). The
-  evidence characterizes the current bounds against the required ePDG pool:
-  the pinned 65,536-byte ring holds 682 payload-only records (~630 usable once
-  the 8-byte BPF ring-buffer header per 96-byte event is included) vs a
-  40,000-event burst, `MAX_TRAFFIC_PROOF_ATTEMPTS` is 256 vs 10,000 simultaneous
-  attempts,
-  the drain/replay window and retained-event bound are 4,096, selector
-  authority is capped at 1,024 permanent / 512 live groups vs ~50,000
-  identities, and shared-event delivery is modeled as O(events × attempts)
-  rather than group-indexed O(events). The extracted admission predicate
-  unifies the previous renewal (`>=`) and admission (`==`) checks into `>=`;
-  that is equivalent for every reachable state because the in-memory attempts
-  map cannot exceed the cap. The testable capacity/batch predicates fail closed
-  at their exact boundaries, a deterministic baseline run below capacity
-  agrees with the group-indexed model, and an ignored release-mode
-  benchmark emits bounded count-only evidence with
-  `live_proof_claimed=false`. This **does not** meet #720 acceptance and adds
-  no live-proof claim; #720 remains partial. The remaining scope is the
-  recorded Option A owner decision: sharded pinned event-ring maps plus a
-  group/authority index (pin-count/marker/MAP_ABI/object rebuild with the
-  pinned toolchain and privileged CI lanes), selector-v2 capacity/durable
-  format changes, and release-mode 50k/10k/40k qualification. Refs #720.
-
 - `opc-gtpu-dataplane`: staged the RFC 017 mixed-selector-provenance codec and
   preflight slice (internal; no public API or backend behavior change). Added
   canonical `DrainQualificationCodecV1` (305 bytes) and `TransferEdgeCodecV1`
@@ -9281,7 +9256,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coverage verifies strategy fields are persisted correctly on a real
   API server.
 - `opc-proto-ngap` (experimental v0): NGAP (3GPP TS 38.413) codec built on
-  `rasn` per ADR 0013 Option A. NGAP-PDU framing for all three outcome
+  `rasn` per ADR 0013's native Rust ASN.1 strategy. NGAP-PDU framing for all
+  three outcome
   classes with outcome-aware dispatch, typed APER decoding of
   NGSetupRequest (field-level external `asn1c`/libngap fixture) and
   InitialUEMessage, and raw-preserving encode so decode->encode
