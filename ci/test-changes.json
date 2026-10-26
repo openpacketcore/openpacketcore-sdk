@@ -368,7 +368,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::forced_timeout_reports_datapath_state_fields",
       "kind": "removed",
-      "reason": "Issue #1188 replaces the synthetic DatapathTimeoutDiagnostics formatter with the actual measured failure-path renderer. In crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged/measured_diagnostics.rs, the two enabled forced-timeout tests check the original panic, redirect delta, both shared-peer iterations, live counter values, tentative addresses, IPv4/IPv6 neighbours/routes, command status/stderr and unavailable reads. The missing-consumer value and payload-marker exclusion assertions are retained there. Arbitrary expected/observed labels belong to the deleted synthetic formatter; the replacement reports the real six-GPDU assertion and current counters.",
+      "reason": "Issue #1188 replaces the shared DatapathTimeoutDiagnostics formatter with the measured redirect failure-path renderer. The two enabled tests in crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged/measured_diagnostics.rs retain panic context, both shared-peer iterations, redirect delta, counter values, tentative addresses, neighbours, routes and payload-marker exclusions, and add command failures and unavailable reads. The hand-off consumer, VRF hand-off and reassembly waits returned to main's messages because they are outside the redirect-diagnostics scope; their behavioral assertions remain.",
       "issue": 1188,
       "replacements": [
         "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::measured_diagnostics::tests::forced_timeout_reports_redirect_delta_iteration_and_datapath_state",
@@ -384,7 +384,7 @@
     {
       "test": "rust:crates/opc-persist::lib=lib::retained::tests::a_conflicting_provisioning_request_never_adopts_or_overwrites_authenticated_state",
       "kind": "assertions-decreased",
-      "reason": "In crates/opc-persist/src/retained/tests.rs, the successful preliminary reopen was removed from established_before because it could change SQLite headers after the preservation snapshot and before the rejected request. Its transitive helper assertions explain 47 -> 41. The same test still checks refusal and byte-for-byte preservation at every CRASH_STAGES boundary, then requires established-store reopen, authorized resume and final reopen. The positive-control reopen now occurs after the preservation assertion, and cannot silently suppress itself through is_ok().",
+      "reason": "In crates/opc-persist/src/retained/tests.rs, removing the preliminary established-store reopen avoids changing SQLite headers between the preservation snapshot and the rejected request, explaining 47 -> 41 transitive assertions. Refusal and byte-identical files remain checked at every CRASH_STAGES boundary, followed by unconditional established-store reopen, original-request resume and final reopen. Both conflicting and original requests now use ResumeAuthority: the former NewAuthority meant provision-or-resume, while the current Provision/NewAuthority refuses existing state. The separate process-loss test also checks byte preservation after a fresh request is refused.",
       "issue": 1114
     },
     {
@@ -414,10 +414,11 @@
     {
       "test": "rust:crates/opc-persist::lib=lib::retained::tests::remove_intent_file_refuses_foreign_file_types",
       "kind": "removed",
-      "reason": "Issue #1114 removes intent-unlink recovery. Replacement resume_preserves_foreign_intent_file_types in crates/opc-persist/src/retained/tests.rs exercises the public recovery path against the same writable regular-file and symlink cases, requires rejection, and verifies that both the foreign entry and symlink target remain unchanged.",
+      "reason": "Issue #1114 removes intent-unlink recovery. In crates/opc-persist/src/retained/tests.rs, resume_preserves_foreign_intent_file_types checks refusal and continued existence of the foreign regular file, symlink entry and target. resume_rejects_writable_authenticated_intent_without_mutation separately uses a valid authenticated intent with mode 0o666 to require Rejected and byte-identical files, then requires successful resume of the same intent after chmod 0o600. The latter discriminates the writable-intent guard from authentication failure.",
       "issue": 1114,
       "replacements": [
-        "rust:crates/opc-persist::lib=lib::retained::tests::resume_preserves_foreign_intent_file_types"
+        "rust:crates/opc-persist::lib=lib::retained::tests::resume_preserves_foreign_intent_file_types",
+        "rust:crates/opc-persist::lib=lib::retained::tests::resume_rejects_writable_authenticated_intent_without_mutation"
       ]
     },
     {
@@ -433,11 +434,9 @@
     {
       "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::create_bearer_retains_a_well_formed_nested_pco_like_update_bearer",
       "kind": "removed",
-      "reason": "Renamed to create_bearer_retains_a_well_formed_nested_pco in crates/opc-proto-gtpv2c/tests/dedicated_bearer.rs. The Create Bearer test body and retention assertions are unchanged; only its name/comment stop claiming that Update Bearer has the same receive grammar. TS 29.274 V19.6.0 tables 7.2.3/4 and 7.2.15/16 distinguish those procedures.",
+      "reason": "Pure rename to create_bearer_retains_a_well_formed_nested_pco in crates/opc-proto-gtpv2c/tests/dedicated_bearer.rs, preserving the body and assertions. The name/comment no longer imply that Update Bearer shares its PCO receive grammar. Create Bearer PCO remains the cross-interface compatibility surface retained for issue #585, not an S2b-table applicability claim; issue #1441 corrects Update Bearer PCO handling.",
       "issue": 1441,
-      "replacements": [
-        "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::create_bearer_retains_a_well_formed_nested_pco"
-      ]
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::create_bearer_retains_a_well_formed_nested_pco"
     },
     {
       "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_builders_round_trip_a_retained_pco",

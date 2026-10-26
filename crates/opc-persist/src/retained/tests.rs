@@ -366,6 +366,7 @@ fn process_loss_at_every_provisioning_boundary_never_authorizes_initialization()
             assert!(reopened.is_err(), "partial {stage}");
             assert_eq!(before, files(dir.path()), "rejected {stage}");
         }
+        let before_fresh = files(dir.path());
         assert!(open_authority_sync(
             options(&path),
             key(),
@@ -373,6 +374,11 @@ fn process_loss_at_every_provisioning_boundary_never_authorizes_initialization()
             &Arc::new(work())
         )
         .is_err());
+        assert_eq!(
+            before_fresh,
+            files(dir.path()),
+            "fresh request preserves {stage}"
+        );
     }
 }
 
@@ -808,6 +814,46 @@ fn durable_intent_publication_is_classified_as_a_mutation() {
             );
         }
     }
+}
+
+#[test]
+fn resume_rejects_writable_authenticated_intent_without_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("storage");
+    let path = dir.path().join("retained.sqlite");
+    crash_provision(&path, "intent_published");
+    let intent = lock_path(&path);
+    std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o666))
+        .expect("writable intent permissions");
+    let before = files(dir.path());
+    let resumed = open_authority_sync(
+        options(&path),
+        key(),
+        OpenIntent::ResumeAuthority,
+        &Arc::new(work()),
+    );
+    assert!(
+        matches!(resumed, Err(RetainedConfigError::Rejected)),
+        "a valid authenticated intent still requires private write permissions: {resumed:?}"
+    );
+    assert_eq!(
+        before,
+        files(dir.path()),
+        "refused resume preserves every file"
+    );
+
+    std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o600))
+        .expect("private intent permissions");
+    drop(
+        open_authority_sync(
+            options(&path),
+            key(),
+            OpenIntent::ResumeAuthority,
+            &Arc::new(work()),
+        )
+        .expect("the same authenticated intent resumes with private write permissions"),
+    );
 }
 
 #[test]
