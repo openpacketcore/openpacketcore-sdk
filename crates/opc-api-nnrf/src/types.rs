@@ -8,132 +8,196 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NfType {
     /// Wire value `NRF`.
+    #[serde(rename = "NRF")]
     Nrf,
     /// Wire value `UDM`.
+    #[serde(rename = "UDM")]
     Udm,
     /// Wire value `AMF`.
+    #[serde(rename = "AMF")]
     Amf,
     /// Wire value `SMF`.
+    #[serde(rename = "SMF")]
     Smf,
     /// Wire value `AUSF`.
+    #[serde(rename = "AUSF")]
     Ausf,
     /// Wire value `NEF`.
+    #[serde(rename = "NEF")]
     Nef,
     /// Wire value `PCF`.
+    #[serde(rename = "PCF")]
     Pcf,
     /// Wire value `SMSF`.
+    #[serde(rename = "SMSF")]
     Smsf,
     /// Wire value `NSSF`.
+    #[serde(rename = "NSSF")]
     Nssf,
     /// Wire value `UDR`.
+    #[serde(rename = "UDR")]
     Udr,
     /// Wire value `LMF`.
+    #[serde(rename = "LMF")]
     Lmf,
     /// Wire value `GMLC`.
+    #[serde(rename = "GMLC")]
     Gmlc,
     /// Wire value `5G_EIR`.
+    #[serde(rename = "5G_EIR")]
     FiveGEir,
     /// Wire value `SEPP`.
+    #[serde(rename = "SEPP")]
     Sepp,
     /// Wire value `UPF`.
+    #[serde(rename = "UPF")]
     Upf,
     /// Wire value `N3IWF`.
+    #[serde(rename = "N3IWF")]
     N3iwf,
     /// Wire value `AF`.
+    #[serde(rename = "AF")]
     Af,
     /// Wire value `UDSF`.
+    #[serde(rename = "UDSF")]
     Udsf,
     /// Wire value `BSF`.
+    #[serde(rename = "BSF")]
     Bsf,
     /// Wire value `CHF`.
+    #[serde(rename = "CHF")]
     Chf,
     /// Wire value `NWDAF`.
+    #[serde(rename = "NWDAF")]
     Nwdaf,
     /// Wire value `PCSCF`.
+    #[serde(rename = "PCSCF")]
     Pcscf,
     /// Wire value `CBCF`.
+    #[serde(rename = "CBCF")]
     Cbcf,
     /// Wire value `HSS`.
+    #[serde(rename = "HSS")]
     Hss,
     /// Wire value `UCMF`.
+    #[serde(rename = "UCMF")]
     Ucmf,
     /// Wire value `SOR_AF`.
+    #[serde(rename = "SOR_AF")]
     SorAf,
     /// Wire value `SPAF`.
+    #[serde(rename = "SPAF")]
     Spaf,
     /// Wire value `MME`.
+    #[serde(rename = "MME")]
     Mme,
     /// Wire value `SCSAS`.
+    #[serde(rename = "SCSAS")]
     Scsas,
     /// Wire value `SCEF`.
+    #[serde(rename = "SCEF")]
     Scef,
     /// Wire value `SCP`.
+    #[serde(rename = "SCP")]
     Scp,
     /// Wire value `NSSAAF`.
+    #[serde(rename = "NSSAAF")]
     Nssaaf,
     /// Wire value `ICSCF`.
+    #[serde(rename = "ICSCF")]
     Icscf,
     /// Wire value `SCSCF`.
+    #[serde(rename = "SCSCF")]
     Scscf,
     /// Wire value `DRA`.
+    #[serde(rename = "DRA")]
     Dra,
     /// Wire value `IMS_AS`.
+    #[serde(rename = "IMS_AS")]
     ImsAs,
     /// Wire value `AANF`.
+    #[serde(rename = "AANF")]
     Aanf,
     /// Wire value `5G_DDNMF`.
+    #[serde(rename = "5G_DDNMF")]
     FiveGDdnmf,
     /// Wire value `NSACF`.
+    #[serde(rename = "NSACF")]
     Nsacf,
     /// Wire value `MFAF`.
+    #[serde(rename = "MFAF")]
     Mfaf,
     /// Wire value `EASDF`.
+    #[serde(rename = "EASDF")]
     Easdf,
     /// Wire value `DCCF`.
+    #[serde(rename = "DCCF")]
     Dccf,
     /// Wire value `MB_SMF`.
+    #[serde(rename = "MB_SMF")]
     MbSmf,
     /// Wire value `TSCTSF`.
+    #[serde(rename = "TSCTSF")]
     Tsctsf,
     /// Wire value `ADRF`.
+    #[serde(rename = "ADRF")]
     Adrf,
     /// Wire value `GBA_BSF`.
+    #[serde(rename = "GBA_BSF")]
     GbaBsf,
     /// Wire value `CEF`.
+    #[serde(rename = "CEF")]
     Cef,
     /// Wire value `MB_UPF`.
+    #[serde(rename = "MB_UPF")]
     MbUpf,
     /// Wire value `NSWOF`.
+    #[serde(rename = "NSWOF")]
     Nswof,
     /// Wire value `PKMF`.
+    #[serde(rename = "PKMF")]
     Pkmf,
     /// Wire value `MNPF`.
+    #[serde(rename = "MNPF")]
     Mnpf,
     /// Wire value `SMS_GMSC`.
+    #[serde(rename = "SMS_GMSC")]
     SmsGmsc,
     /// Wire value `SMS_IWMSC`.
+    #[serde(rename = "SMS_IWMSC")]
     SmsIwmsc,
     /// Wire value `MBSF`.
+    #[serde(rename = "MBSF")]
     Mbsf,
     /// Wire value `MBSTF`.
+    #[serde(rename = "MBSTF")]
     Mbstf,
     /// Wire value `PANF`.
+    #[serde(rename = "PANF")]
     Panf,
     /// Wire value `IP_SM_GW`.
+    #[serde(rename = "IP_SM_GW")]
     IpSmGw,
     /// Wire value `SMS_ROUTER`.
+    #[serde(rename = "SMS_ROUTER")]
     SmsRouter,
     /// Wire value `DCSF`.
+    #[serde(rename = "DCSF")]
     Dcsf,
     /// Wire value `MRF`.
+    #[serde(rename = "MRF")]
     Mrf,
     /// Wire value `MRFP`.
+    #[serde(rename = "MRFP")]
     Mrfp,
     /// Wire value `MF`.
+    #[serde(rename = "MF")]
     Mf,
     /// Wire value `SLPKMF`.
+    #[serde(rename = "SLPKMF")]
     Slpkmf,
     /// Wire value `RH`.
+    #[serde(rename = "RH")]
     Rh,
     /// Forward-compatibility catch-all for values not in this release.
     #[serde(untagged)]
@@ -145,12 +209,16 @@ pub enum NfType {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NfStatus {
     /// Wire value `REGISTERED`.
+    #[serde(rename = "REGISTERED")]
     Registered,
     /// Wire value `SUSPENDED`.
+    #[serde(rename = "SUSPENDED")]
     Suspended,
     /// Wire value `UNDISCOVERABLE`.
+    #[serde(rename = "UNDISCOVERABLE")]
     Undiscoverable,
     /// Wire value `CANARY_RELEASE`.
+    #[serde(rename = "CANARY_RELEASE")]
     CanaryRelease,
     /// Forward-compatibility catch-all for values not in this release.
     #[serde(untagged)]
@@ -162,12 +230,16 @@ pub enum NfStatus {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NfServiceStatus {
     /// Wire value `REGISTERED`.
+    #[serde(rename = "REGISTERED")]
     Registered,
     /// Wire value `SUSPENDED`.
+    #[serde(rename = "SUSPENDED")]
     Suspended,
     /// Wire value `UNDISCOVERABLE`.
+    #[serde(rename = "UNDISCOVERABLE")]
     Undiscoverable,
     /// Wire value `CANARY_RELEASE`.
+    #[serde(rename = "CANARY_RELEASE")]
     CanaryRelease,
     /// Forward-compatibility catch-all for values not in this release.
     #[serde(untagged)]
@@ -180,12 +252,16 @@ pub enum NfServiceStatus {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NotificationEventType {
     /// Wire value `NF_REGISTERED`.
+    #[serde(rename = "NF_REGISTERED")]
     NfRegistered,
     /// Wire value `NF_DEREGISTERED`.
+    #[serde(rename = "NF_DEREGISTERED")]
     NfDeregistered,
     /// Wire value `NF_PROFILE_CHANGED`.
+    #[serde(rename = "NF_PROFILE_CHANGED")]
     NfProfileChanged,
     /// Wire value `SHARED_DATA_CHANGED`.
+    #[serde(rename = "SHARED_DATA_CHANGED")]
     SharedDataChanged,
     /// Forward-compatibility catch-all for values not in this release.
     #[serde(untagged)]
@@ -198,8 +274,10 @@ pub enum NotificationEventType {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ConditionEventType {
     /// Wire value `NF_ADDED`.
+    #[serde(rename = "NF_ADDED")]
     NfAdded,
     /// Wire value `NF_REMOVED`.
+    #[serde(rename = "NF_REMOVED")]
     NfRemoved,
     /// Forward-compatibility catch-all for values not in this release.
     #[serde(untagged)]
@@ -215,6 +293,7 @@ pub struct NfServiceVersion {
     /// Mandatory `apiVersionInUri` attribute per TS 29.510.
     pub api_version_in_uri: String,
     /// Optional `expiry` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expiry: Option<String>,
 }
 
@@ -224,12 +303,16 @@ pub struct NfServiceVersion {
 #[serde(rename_all = "camelCase")]
 pub struct IpEndPoint {
     /// Optional `ipv4Address` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ipv4_address: Option<String>,
     /// Optional `ipv6Address` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ipv6_address: Option<String>,
     /// Optional `port` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     /// Optional `transport` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
 }
 
@@ -238,6 +321,7 @@ pub struct IpEndPoint {
 #[serde(rename_all = "camelCase")]
 pub struct PlmnSnssai {
     /// Optional `nid` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nid: Option<String>,
     /// Mandatory `plmnId` attribute per TS 29.510.
     pub plmn_id: crate::serde_3gpp::NnrfPlmnId,
@@ -251,8 +335,10 @@ pub struct PlmnSnssai {
 #[serde(rename_all = "camelCase")]
 pub struct NotifCondition {
     /// Optional `monitoredAttributes` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub monitored_attributes: Option<Vec<String>>,
     /// Optional `unmonitoredAttributes` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unmonitored_attributes: Option<Vec<String>>,
 }
 
@@ -261,232 +347,328 @@ pub struct NotifCondition {
 #[serde(rename_all = "camelCase")]
 pub struct NfProfile {
     /// Optional `5gDdnmfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub _5g_ddnmf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of AanfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub aanf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of AdrfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub adrf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `allowedNfDomains` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_nf_domains: Option<Vec<String>>,
     /// Optional `allowedNfTypes` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_nf_types: Option<Vec<NfType>>,
     /// Optional `allowedNssais` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_nssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// Optional `allowedPlmns` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_plmns: Option<Vec<crate::serde_3gpp::NnrfPlmnId>>,
     /// A map (list of key-value pairs) where a valid JSON pointer Id serves as
     /// key
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_rule_set: Option<std::collections::HashMap<String, String>>,
     /// Optional `allowedSnpns` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_snpns: Option<Vec<String>>,
     /// Optional `amfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub amf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of AmfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub amf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `ausfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ausf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of AusfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ausf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `bsfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bsf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of BsfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bsf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `canaryRelease` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub canary_release: Option<bool>,
     /// Optional `capacity` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<u16>,
     /// Optional `chfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of ChfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `collocatedNfInstances` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub collocated_nf_instances: Option<Vec<String>>,
     /// Optional `customInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_info: Option<serde_json::Value>,
     /// Optional `dccfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dccf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of DcsfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dcsf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `defaultNotificationSubscriptions` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_notification_subscriptions: Option<Vec<String>>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of EasdfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub easdf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `exclusiveCanaryReleaseSelection` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exclusive_canary_release_selection: Option<bool>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key representing a type of locality
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ext_locality: Option<std::collections::HashMap<String, String>>,
     /// Optional `fqdn` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fqdn: Option<String>,
     /// Optional `gmlcInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gmlc_info: Option<serde_json::Value>,
     /// Optional `heartBeatTimer` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub heart_beat_timer: Option<i64>,
     /// Optional `hniList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hni_list: Option<Vec<String>>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of HssInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hss_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `interPlmnFqdn` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inter_plmn_fqdn: Option<String>,
     /// Optional `ipv4Addresses` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ipv4_addresses: Option<Vec<String>>,
     /// Optional `ipv6Addresses` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ipv6_addresses: Option<Vec<String>>,
     /// Optional `iwmscInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub iwmsc_info: Option<serde_json::Value>,
     /// Optional `lcHSupportInd` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lc_h_support_ind: Option<bool>,
     /// Optional `lmfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lmf_info: Option<serde_json::Value>,
     /// Optional `load` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<u8>,
     /// Optional `loadTimeStamp` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub load_time_stamp: Option<String>,
     /// Optional `locality` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub locality: Option<String>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of MbSmfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mb_smf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of MbUpfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mb_upf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of MfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `mfafInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mfaf_info: Option<serde_json::Value>,
     /// Optional `mnpfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mnpf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of MrfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mrf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of MrfpInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mrfp_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `nefInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nef_info: Option<serde_json::Value>,
     /// Mandatory `nfInstanceId` attribute per TS 29.510.
     pub nf_instance_id: opc_types::NfInstanceId,
     /// Optional `nfInstanceName` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nf_instance_name: Option<String>,
     /// Optional `nfProfileChangesInd` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nf_profile_changes_ind: Option<bool>,
     /// Optional `nfProfileChangesSupportInd` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nf_profile_changes_support_ind: Option<bool>,
     /// Optional `nfProfilePartialUpdateChangesSupportInd` attribute per TS
     /// 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nf_profile_partial_update_changes_support_ind: Option<bool>,
     /// A map (list of key-value pairs) where serviceInstanceId serves as key of
     /// NFService
-    pub nf_service_list: Option<std::collections::HashMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nf_service_list: Option<std::collections::HashMap<String, NfService>>,
     /// Optional `nfServicePersistence` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nf_service_persistence: Option<bool>,
     /// Optional `nfServices` attribute per TS 29.510.
-    pub nf_services: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nf_services: Option<Vec<NfService>>,
     /// Optional `nfSetIdList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nf_set_id_list: Option<Vec<String>>,
     /// A map (list of key-value pairs) where NfSetId serves as key of DateTime
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nf_set_recovery_time_list: Option<std::collections::HashMap<String, String>>,
     /// Mandatory `nfStatus` attribute per TS 29.510.
     pub nf_status: NfStatus,
     /// Mandatory `nfType` attribute per TS 29.510.
     pub nf_type: NfType,
     /// Optional `nrfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nrf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of NsacfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nsacf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `nsiList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nsi_list: Option<Vec<String>>,
     /// Optional `nssaafInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nssaaf_info: Option<serde_json::Value>,
     /// Optional `nwdafInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nwdaf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of NwdafInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nwdaf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `olcHSupportInd` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub olc_h_support_ind: Option<bool>,
     /// Optional `pcfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pcf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of PcfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pcf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of PcscfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pcscf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `perPlmnSnssaiList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub per_plmn_snssai_list: Option<Vec<PlmnSnssai>>,
     /// Optional `plmnList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub plmn_list: Option<Vec<crate::serde_3gpp::NnrfPlmnId>>,
     /// Optional `priority` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u16>,
     /// Optional `recoveryTime` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_time: Option<String>,
     /// Optional `sNssais` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub s_nssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// Optional `scpDomains` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scp_domains: Option<Vec<String>>,
     /// Optional `scpInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scp_info: Option<serde_json::Value>,
     /// Optional `selectionConditions` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_conditions: Option<String>,
     /// Optional `seppInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sepp_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where NfServiceSetId serves as key of
     /// DateTime
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub service_set_recovery_time_list: Option<std::collections::HashMap<String, String>>,
     /// Optional `servingScope` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub serving_scope: Option<Vec<String>>,
     /// Optional `sharedProfileDataId` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_profile_data_id: Option<String>,
     /// Optional `smfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub smf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of SmfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub smf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `smsfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub smsf_info: Option<serde_json::Value>,
     /// Optional `snpnList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub snpn_list: Option<Vec<String>>,
     /// The key of the map is the IANA-assigned SMI Network Management Private
     /// Enterprise Codes
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_vendor_specific_features: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Optional `trustAfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_af_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of TsctsfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tsctsf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `udmInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub udm_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of UdmInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub udm_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `udrInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub udr_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of UdrInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub udr_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `udsfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub udsf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of UdsfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub udsf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `upfInfo` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub upf_info: Option<serde_json::Value>,
     /// A map (list of key-value pairs) where a (unique) valid JSON string
     /// serves as key of UpfInfo
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub upf_info_list: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Optional `vendorId` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor_id: Option<u32>,
 }
 
@@ -496,82 +678,165 @@ pub struct NfProfile {
 #[serde(rename_all = "camelCase")]
 pub struct NfService {
     /// Optional `allowedNfDomains` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_nf_domains: Option<Vec<String>>,
     /// Optional `allowedNfTypes` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_nf_types: Option<Vec<NfType>>,
     /// Optional `allowedNssais` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_nssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// A map (list of key-value pairs) where NF Instance Id serves as key
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_operations_per_nf_instance: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Optional `allowedOperationsPerNfInstanceOverrides` attribute per TS
     /// 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_operations_per_nf_instance_overrides: Option<bool>,
     /// A map (list of key-value pairs) where NF Type serves as key
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_operations_per_nf_type: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Optional `allowedPlmns` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_plmns: Option<Vec<crate::serde_3gpp::NnrfPlmnId>>,
     /// A map (list of key-value pairs) where a valid JSON pointer Id serves as
     /// key
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_scopes_rule_set: Option<std::collections::HashMap<String, String>>,
     /// Optional `allowedSnpns` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_snpns: Option<Vec<String>>,
     /// Optional `apiPrefix` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_prefix: Option<String>,
     /// Optional `callbackUriPrefixList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_uri_prefix_list: Option<Vec<String>>,
     /// Optional `canaryRelease` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub canary_release: Option<bool>,
     /// Optional `capacity` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<u16>,
     /// Optional `defaultNotificationSubscriptions` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_notification_subscriptions: Option<Vec<String>>,
     /// Optional `exclusiveCanaryReleaseSelection` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exclusive_canary_release_selection: Option<bool>,
     /// Optional `fqdn` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fqdn: Option<String>,
     /// Optional `interPlmnFqdn` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inter_plmn_fqdn: Option<String>,
     /// Optional `ipEndPoints` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_end_points: Option<Vec<IpEndPoint>>,
     /// Optional `load` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<u8>,
     /// Optional `loadTimeStamp` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub load_time_stamp: Option<String>,
     /// Optional `nfServiceSetIdList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nf_service_set_id_list: Option<Vec<String>>,
     /// Mandatory `nfServiceStatus` attribute per TS 29.510.
     pub nf_service_status: NfServiceStatus,
     /// Optional `oauth2Required` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth2_required: Option<bool>,
     /// Optional `perPlmnOauth2ReqList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub per_plmn_oauth2_req_list: Option<String>,
     /// Optional `perPlmnSnssaiList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub per_plmn_snssai_list: Option<Vec<PlmnSnssai>>,
     /// Optional `priority` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<u16>,
     /// Optional `recoveryTime` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_time: Option<String>,
     /// Optional `sNssais` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub s_nssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// Mandatory `scheme` attribute per TS 29.510.
     pub scheme: String,
     /// Optional `selectionConditions` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_conditions: Option<String>,
     /// Mandatory `serviceInstanceId` attribute per TS 29.510.
     pub service_instance_id: String,
     /// Mandatory `serviceName` attribute per TS 29.510.
     pub service_name: String,
     /// Optional `sharedServiceDataId` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_service_data_id: Option<String>,
     /// Optional `supportedFeatures` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_features: Option<String>,
     /// A map (list of key-value pairs) where IANA-assigned SMI Network
     /// Management Private Enterprise Codes serves as key
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_vendor_specific_features: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Optional `vendorId` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor_id: Option<u32>,
     /// Mandatory `versions` attribute per TS 29.510.
     pub versions: Vec<NfServiceVersion>,
+}
+
+impl NfService {
+    /// Create an NF service with its mandatory TS 29.510 attributes.
+    pub fn new(
+        service_instance_id: String,
+        service_name: String,
+        versions: Vec<NfServiceVersion>,
+        scheme: String,
+        nf_service_status: NfServiceStatus,
+    ) -> Self {
+        Self {
+            allowed_nf_domains: None,
+            allowed_nf_types: None,
+            allowed_nssais: None,
+            allowed_operations_per_nf_instance: None,
+            allowed_operations_per_nf_instance_overrides: None,
+            allowed_operations_per_nf_type: None,
+            allowed_plmns: None,
+            allowed_scopes_rule_set: None,
+            allowed_snpns: None,
+            api_prefix: None,
+            callback_uri_prefix_list: None,
+            canary_release: None,
+            capacity: None,
+            default_notification_subscriptions: None,
+            exclusive_canary_release_selection: None,
+            fqdn: None,
+            inter_plmn_fqdn: None,
+            ip_end_points: None,
+            load: None,
+            load_time_stamp: None,
+            nf_service_set_id_list: None,
+            nf_service_status,
+            oauth2_required: None,
+            per_plmn_oauth2_req_list: None,
+            per_plmn_snssai_list: None,
+            priority: None,
+            recovery_time: None,
+            s_nssais: None,
+            scheme,
+            selection_conditions: None,
+            service_instance_id,
+            service_name,
+            shared_service_data_id: None,
+            supported_features: None,
+            supported_vendor_specific_features: None,
+            vendor_id: None,
+            versions,
+        }
+    }
 }
 
 /// Information of a subscription to notifications to NRF events, included
@@ -580,57 +845,79 @@ pub struct NfService {
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionData {
     /// Optional `completeProfileSubscription` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub complete_profile_subscription: Option<bool>,
     /// A map (list of key-value pairs) where the key of the map represents the
     /// relative priority, for the requester, of each locality description among
     /// the list of locality descriptions in this query parameter, encoded as
     /// "1" (highest priority"), "2", "3", …, "n" (lowest priority)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ext_preferred_locality: Option<std::collections::HashMap<String, Vec<serde_json::Value>>>,
     /// Optional `hnrfUri` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hnrf_uri: Option<String>,
     /// Mandatory `nfStatusNotificationUri` attribute per TS 29.510.
     pub nf_status_notification_uri: String,
     /// Optional `nid` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nid: Option<String>,
     /// Optional `notifCondition` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub notif_condition: Option<NotifCondition>,
     /// Optional `nrfSupportedFeatures` attribute per TS 29.510.
     pub nrf_supported_features: serde_json::Value,
     /// Optional `onboardingCapability` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub onboarding_capability: Option<bool>,
     /// Optional `plmnId` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub plmn_id: Option<crate::serde_3gpp::NnrfPlmnId>,
     /// Optional `preferredLocality` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_locality: Option<String>,
     /// Optional `reqNfFqdn` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub req_nf_fqdn: Option<String>,
     /// Optional `reqNfInstanceId` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub req_nf_instance_id: Option<opc_types::NfInstanceId>,
     /// Optional `reqNfType` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub req_nf_type: Option<NfType>,
     /// Optional `reqNotifEvents` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub req_notif_events: Option<Vec<NotificationEventType>>,
     /// Optional `reqPerPlmnSnssais` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub req_per_plmn_snssais: Option<Vec<PlmnSnssai>>,
     /// Optional `reqPlmnList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub req_plmn_list: Option<Vec<crate::serde_3gpp::NnrfPlmnId>>,
     /// Optional `reqSnpnList` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub req_snpn_list: Option<Vec<String>>,
     /// Optional `reqSnssais` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub req_snssais: Option<Vec<crate::serde_3gpp::NnrfSnssai>>,
     /// Optional `requesterFeatures` attribute per TS 29.510.
     pub requester_features: serde_json::Value,
     /// Optional `servingScope` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub serving_scope: Option<Vec<String>>,
     /// Optional `sharedDataIds` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_data_ids: Option<Vec<String>>,
     /// Optional `subscrCond` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subscr_cond: Option<serde_json::Value>,
     /// Optional `subscriptionId` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_id: Option<String>,
     /// Optional `targetHni` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_hni: Option<String>,
     /// Optional `validityTime` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub validity_time: Option<String>,
 }
 
@@ -639,8 +926,10 @@ pub struct SubscriptionData {
 #[serde(rename_all = "camelCase")]
 pub struct NotificationData {
     /// Optional `completeNfProfile` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub complete_nf_profile: Option<serde_json::Value>,
     /// Optional `conditionEvent` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub condition_event: Option<ConditionEventType>,
     /// Mandatory `event` attribute per TS 29.510.
     pub event: NotificationEventType,
@@ -649,9 +938,12 @@ pub struct NotificationData {
     /// Optional `nfProfile` attribute per TS 29.510.
     pub nf_profile: serde_json::Value,
     /// Optional `profileChanges` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_changes: Option<Vec<serde_json::Value>>,
     /// Optional `sharedDataChanges` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_data_changes: Option<Vec<serde_json::Value>>,
     /// Optional `subscriptionContext` attribute per TS 29.510.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_context: Option<serde_json::Value>,
 }

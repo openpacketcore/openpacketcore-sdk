@@ -614,7 +614,7 @@ fn is_b64token_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
 }
 
-fn parse_http_date(value: &str) -> Result<(), HeaderParseError> {
+pub(crate) fn parse_http_date(value: &str) -> Result<time::OffsetDateTime, HeaderParseError> {
     validate_visible_ascii(HEADER_RETRY_AFTER, value)?;
     if value.len() != 29 {
         return Err(HeaderParseError::InvalidValue {
@@ -653,10 +653,11 @@ fn parse_http_date(value: &str) -> Result<(), HeaderParseError> {
             header: HEADER_RETRY_AFTER,
             reason: "retry-after date must be a valid IMF-fixdate HTTP-date".into(),
         })?;
-    Time::from_hms(hour, minute, second).map_err(|_| HeaderParseError::InvalidValue {
-        header: HEADER_RETRY_AFTER,
-        reason: "retry-after date must be a valid IMF-fixdate HTTP-date".into(),
-    })?;
+    let time =
+        Time::from_hms(hour, minute, second).map_err(|_| HeaderParseError::InvalidValue {
+            header: HEADER_RETRY_AFTER,
+            reason: "retry-after date must be a valid IMF-fixdate HTTP-date".into(),
+        })?;
 
     if date.weekday() != weekday {
         return Err(HeaderParseError::InvalidValue {
@@ -665,7 +666,7 @@ fn parse_http_date(value: &str) -> Result<(), HeaderParseError> {
         });
     }
 
-    Ok(())
+    Ok(date.with_time(time).assume_utc())
 }
 
 fn parse_weekday(value: &str) -> Result<Weekday, HeaderParseError> {

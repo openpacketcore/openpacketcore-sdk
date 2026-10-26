@@ -1457,6 +1457,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-api-nnrf"
+version = "0.2.0"
+dependencies = [
+ "opc-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "opc-config-bus"
 version = "0.2.0"
 dependencies = [
@@ -1666,6 +1675,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "opc-api-nnrf",
  "opc-identity",
  "opc-redaction",
  "opc-runtime",

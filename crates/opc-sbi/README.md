@@ -92,3 +92,23 @@ cargo test -p opc-sbi
 cargo test -p opc-sbi --features testkit
 cargo test -p opc-sbi --features runtime-hooks
 ```
+
+## NRF wire compatibility
+
+Registration uses TS 29.510 NF type/status tokens, object-form PLMN/S-NSSAI
+identifiers, and typed service instances. Supply `NfService` metadata (instance
+ID, versions, scheme and status), not a vector of service-name strings. The
+`NnrfPlmnId`/`NnrfSnssai` wrappers accept existing SDK identifiers via `Into`.
+The timer field on registration/heartbeat responses is `heartBeatTimer`.
+
+`DiscoveryQuery::requester_nf_type` is mandatory and part of the cache key.
+The client sends both NF types, requester instance, `target-plmn-list`,
+`snssais`, and the comma-separated service-name filter. A malformed SearchResult
+is an error, not a negative discovery result.
+
+`DiscoveryResult::Found` and `NotFound` carry `valid_for`. HTTP discovery caps
+this by `validityPeriod`, Cache-Control max-age/no-cache/no-store, Age and Date.
+The local cache TTL remains an additional limit; server lifetime also caps
+stale-if-error. Fresh authoritative absence evicts a stale positive. A 404
+without explicit freshness is not stored. These are bounded discovery helpers,
+not a complete HTTP caching proxy or full NRF data model.

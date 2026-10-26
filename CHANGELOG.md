@@ -865,6 +865,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and counts only transport/5xx failures toward circuit opening. Message
   priorities 0–31 are accepted; the NSSF name is `nnssf-nsselection`. (#1362)
 
+- NRF registration/discovery now use standard JSON and query parameters.
+  `NfProfile` uses generated PLMN/S-NSSAI wrappers and `NfService` objects;
+  `DiscoveryQuery`/`CacheKey` require `requester_nf_type` and discovery results
+  carry `valid_for`. Server freshness caps stale reuse. Generated NRF models
+  omit absent optional fields and preserve digit-prefixed enum wire names.
+  See `opc-sbi/README.md` for migration details. (#1362)
+
 ### Added
 
 - `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported
