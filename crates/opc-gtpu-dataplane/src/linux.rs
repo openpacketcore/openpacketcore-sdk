@@ -1877,7 +1877,14 @@ impl GtpuSocketHandle {
 
     #[cfg(target_os = "linux")]
     fn linux_as_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        self._socket.as_ref().map(GtpuUdpSocket::as_fd)
+        #[cfg(not(opc_linux_gtpu_sys_force_unsupported))]
+        {
+            self._socket.as_ref().map(GtpuUdpSocket::as_fd)
+        }
+        #[cfg(opc_linux_gtpu_sys_force_unsupported)]
+        {
+            None
+        }
     }
 }
 
