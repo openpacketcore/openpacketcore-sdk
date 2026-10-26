@@ -177,9 +177,9 @@ overflow and a declared length exceeding its bound before allocation.
 `H(x)` is SHA-256. Domain literals are ASCII including **one trailing 00 byte**.
 An empty optional byte string is encoded with zero length, never omitted.
 
-`I` is the core's 32-byte name-derived consensus-cluster identity. Reinstalling
-with the same configured names does not change it. Installation-qualified
-identity is a separate breaking change tracked in SDK issue #1187. `W` is the
+`I` is the core's 32-byte installation-qualified consensus-cluster identity,
+derived from the configured name and persisted non-zero installation nonce.
+A fresh installation nonce changes it even when names are reused. `W` is the
 16-byte workload/Pod UUID, in RFC 9562 network byte order, not its textual UUID.
 `N` is a nonzero OS-random 16-byte process nonce. Request IDs use the same width
 and random/nonzero rule, independently. Do not derive either from wall time.

@@ -20,7 +20,8 @@ use crate::qualification::{
     qualification_traffic_schedule_sha256, QualificationConnectionLifecycleConfig,
     QualificationMember, QualificationNodeConfig, QualificationNodeReply, QualificationPeerRouting,
     QualificationProjectedMtlsConfig, QualificationReadinessCode, QualificationTransportConfig,
-    QUALIFICATION_NODE_SCHEMA_VERSION, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QUALIFICATION_INSTALLATION_NONCE, QUALIFICATION_NODE_SCHEMA_VERSION,
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
 };
 
 /// Stable Kubernetes name prefix for every deployed qualification member.
@@ -219,8 +220,11 @@ pub fn qualification_kubernetes_readiness_expectations(
     if !matches!(member_count, 3 | 5) {
         return Err(QualificationKubernetesManifestError::InvalidTopology);
     }
-    let cluster_id = ConsensusClusterId::new(QUALIFICATION_KUBERNETES_CLUSTER_ID)
-        .map_err(|_| QualificationKubernetesManifestError::InvalidNodeConfiguration)?;
+    let cluster_id = ConsensusClusterId::for_installation(
+        QUALIFICATION_KUBERNETES_CLUSTER_ID,
+        QUALIFICATION_INSTALLATION_NONCE,
+    )
+    .map_err(|_| QualificationKubernetesManifestError::InvalidNodeConfiguration)?;
     let voter_ids = (0..member_count)
         .map(|node_index| {
             derive_node_id(cluster_id, format!("node-{node_index}").as_bytes())

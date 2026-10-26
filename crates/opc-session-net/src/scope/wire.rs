@@ -189,7 +189,7 @@ impl fmt::Debug for ScopeBinding {
 }
 impl ScopeBinding {
     /// Derive routing bytes from the native scope's configured store identity.
-    /// The current native profile uses the name-derived consensus cluster ID.
+    /// The native profile uses the installation-qualified consensus cluster ID.
     pub fn from_scope(
         scope: &opc_session_store::scope_authority::ScopeId,
     ) -> Result<Self, WireError> {

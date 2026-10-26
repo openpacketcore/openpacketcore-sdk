@@ -514,9 +514,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The public error stays `Unavailable`, and no failure class restores dispatch
   authority. Refs #1378.
 
-### Breaking
+### Changed
 
-- `opc-session-net` (fresh-install boundary): session cluster identity, consensus
+- **Breaking — fresh install:** `opc-session-net` session cluster identity, consensus
   node IDs and the configuration digest are installation-qualified. Every
   `SessionReplicationManifest` constructor now requires the persisted non-zero
   32-byte installation nonce; the consensus cluster ID derives through
@@ -529,7 +529,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity/replacement errors instead of joining the new installation. No
   migration is provided; consumers must generate and persist the nonce with the
   immutable manifest at first install, and changing it on existing storage is a
-  fresh installation. Refs #1187.
+  fresh installation. `opc-consensus` now reports
+  `ConsensusIdentityError::InvalidInstallationNonce` for a zero nonce passed to
+  `ConsensusClusterId::for_installation`. Qualification node manifests and their
+  rendered readiness probes derive the same installation-qualified voter IDs.
+  Refs #1187.
+
+### Breaking
 
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned

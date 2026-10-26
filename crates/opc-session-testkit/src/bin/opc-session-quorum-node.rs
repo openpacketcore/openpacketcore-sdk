@@ -87,8 +87,9 @@ use opc_session_testkit::qualification::{
     QUALIFICATION_CONCURRENT_COLLECTOR_MAX_RECORDS, QUALIFICATION_CONCURRENT_RESTORE_MAX_PAGES,
     QUALIFICATION_CONCURRENT_STATE_TYPE_PREFIX, QUALIFICATION_CONCURRENT_WATCH_MAX_SUBSCRIPTIONS,
     QUALIFICATION_FAULT_MUTATION_SHUTDOWN_LEAD_MILLIS, QUALIFICATION_INBOUND_CONNECTION_SLOTS,
-    QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS, QUALIFICATION_MAX_CONFIG_BYTES,
-    QUALIFICATION_MAX_LEASE_HANDLES, QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
+    QUALIFICATION_INSTALLATION_NONCE, QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
+    QUALIFICATION_MAX_CONFIG_BYTES, QUALIFICATION_MAX_LEASE_HANDLES,
+    QUALIFICATION_OPERATION_TIMEOUT_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_INTERRUPTION_BUDGET_PER_NODE,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RECOVERY_MILLIS,
     QUALIFICATION_TRAFFIC_AVAILABILITY_RETRY_MILLIS,
@@ -1367,6 +1368,25 @@ struct QualificationConsumerTransport {
     reauthentication: SessionReauthenticationControl,
 }
 
+fn qualification_manifest(
+    config: &QualificationNodeConfig,
+    descriptors: Vec<QuorumReplicaDescriptor>,
+    bound_roster_root: Option<RosterAttestationTrustRootV1>,
+) -> Result<SessionReplicationManifest, NodeFailure> {
+    SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
+        SessionClusterId::new(config.cluster_id.clone()).map_err(|_| NodeFailure)?,
+        // The deterministic fixture and its probes share one installation.
+        // Production consumers persist their own installation nonce.
+        QUALIFICATION_INSTALLATION_NONCE,
+        SessionConfigurationGeneration::new(config.configuration_generation.clone())
+            .map_err(|_| NodeFailure)?,
+        SessionConfigurationEpoch::new(config.configuration_epoch).map_err(|_| NodeFailure)?,
+        descriptors,
+        bound_roster_root,
+    )
+    .map_err(|_| NodeFailure)
+}
+
 impl QualificationNode {
     async fn open(
         config: &QualificationNodeConfig,
@@ -1401,22 +1421,11 @@ impl QualificationNode {
         } else {
             Some(roster_attestation_root.clone())
         };
-        let manifest = Arc::new(
-            SessionReplicationManifest::try_new_with_epoch_and_roster_attestation_root(
-                SessionClusterId::new(config.cluster_id.clone()).map_err(|_| NodeFailure)?,
-                // Qualification campaigns model one fresh installation each;
-                // real consumers generate and persist their own non-zero
-                // installation nonce with the immutable manifest (#1187).
-                [0x5a; 32],
-                SessionConfigurationGeneration::new(config.configuration_generation.clone())
-                    .map_err(|_| NodeFailure)?,
-                SessionConfigurationEpoch::new(config.configuration_epoch)
-                    .map_err(|_| NodeFailure)?,
-                descriptors.clone(),
-                bound_roster_root.clone(),
-            )
-            .map_err(|_| NodeFailure)?,
-        );
+        let manifest = Arc::new(qualification_manifest(
+            config,
+            descriptors.clone(),
+            bound_roster_root.clone(),
+        )?);
         let local_replica = ReplicaId::new(config.members[config.node_index].replica_id.clone())
             .map_err(|_| NodeFailure)?;
         let local_binding = manifest
@@ -7123,6 +7132,97 @@ mod restore_scan_recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_readiness_accepts_the_runtime_installation_manifest() {
+        use opc_session_testkit::qualification_kubernetes::{
+            qualification_kubernetes_readiness_expectations,
+            render_qualification_kubernetes_manifest, QualificationKubernetesManifestConfig,
+        };
+        for member_count in [3, 5] {
+            let rendered =
+                render_qualification_kubernetes_manifest(&QualificationKubernetesManifestConfig {
+                    member_count,
+                    namespace: "session-qualification".into(),
+                    image: format!("registry.invalid/session-node@sha256:{}", "a".repeat(64)),
+                    trust_domain: "qualification.example.test".into(),
+                })
+                .unwrap();
+            let config_map = rendered["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["kind"] == "ConfigMap")
+                .unwrap();
+            let expectations =
+                qualification_kubernetes_readiness_expectations(member_count).unwrap();
+            for (node_index, expectation) in expectations.iter().enumerate() {
+                let config: QualificationNodeConfig = serde_json::from_str(
+                    config_map["data"][format!("node-{node_index}.json")]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                let descriptors = config
+                    .members
+                    .iter()
+                    .map(|member| {
+                        QuorumReplicaDescriptor::new(
+                            ReplicaId::new(member.replica_id.clone()).unwrap(),
+                            ReplicaEndpoint::new(
+                                member.endpoint_host.clone(),
+                                member.endpoint_port,
+                            )
+                            .unwrap(),
+                            ReplicaTlsIdentity::new(member.tls_identity.clone()).unwrap(),
+                            ReplicaFailureDomain::new(member.failure_domain.clone()).unwrap(),
+                            ReplicaBackingIdentity::new(member.backing_identity.clone()).unwrap(),
+                        )
+                    })
+                    .collect();
+                let manifest = Arc::new(
+                    qualification_manifest(
+                        &config,
+                        descriptors,
+                        Some(QualificationRosterIngressSigner::root().unwrap()),
+                    )
+                    .unwrap(),
+                );
+                let local_replica =
+                    ReplicaId::new(config.members[node_index].replica_id.clone()).unwrap();
+                let binding = manifest
+                    .bind_fixed_durable_quorum_local(local_replica.clone())
+                    .unwrap();
+                let node_id = binding.consensus_node_id(&local_replica).unwrap().get();
+                let mut voters = config
+                    .members
+                    .iter()
+                    .map(|member| {
+                        binding
+                            .consensus_node_id(&ReplicaId::new(member.replica_id.clone()).unwrap())
+                            .unwrap()
+                            .get()
+                    })
+                    .collect::<Vec<_>>();
+                voters.sort_unstable();
+                let reply = QualificationNodeReply::Readiness {
+                    ready: true,
+                    reason_code: QualificationReadinessCode::Ready,
+                    node_id,
+                    term: 1,
+                    leader_id: Some(voters[0]),
+                    configured_voters: member_count,
+                    configured_voter_ids: Some(voters),
+                    fresh_reachable_voters: member_count / 2 + 1,
+                    agreeing_voters: member_count / 2 + 1,
+                    required_quorum: member_count / 2 + 1,
+                    committed_index: Some(1),
+                    applied_index: Some(1),
+                };
+                assert!(expectation.accepts_ready_reply(&reply), "rendered readiness must accept the runtime manifest for {member_count} voters, node {node_index}");
+            }
+        }
+    }
     #[cfg(unix)]
     use std::io::Cursor;
     #[cfg(unix)]
