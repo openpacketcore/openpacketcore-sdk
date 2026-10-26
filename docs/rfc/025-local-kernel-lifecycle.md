@@ -413,40 +413,44 @@ enable generic deletion from a successful snapshot alone.
 A consumer rekeying one Child SA needs the old and the new SA side by side
 ([RFC 7296 §2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)): the
 old SA stays usable until the peer deletes it, while traffic moves to the new
-one. The scoped actor therefore offers exactly one successor operation for one
-live flow receipt:
+one. The scoped actor admits one pending successor transition per live flow;
+each published successor can later be rekeyed again:
 
 - The successor request keeps the predecessor's complete policy lookup identity
   (selector, direction, selector mark, interface ID), SA flow identity (outer
   selector, destination/protocol/source, lookup mark, interface ID, mode) and
-  packet presentation (output mark, fixed outer DSCP), plus the policy
-  priority/action and template selector/source/mode. Only its SA SPI and the
-  SA/policy request ID may differ; the actor refuses a different flow, a
-  different direction or a reused SPI/request ID with a typed
-  `StateMismatch`.
+  packet presentation (UDP encapsulation, output mark, fixed outer DSCP), plus
+  the policy priority/action and template selector/source/mode. Keys and
+  lifetimes may change, and every successor uses a fresh SPI. Outbound
+  successors use a distinct SA/policy request ID; inbound successors retain
+  it so both generations satisfy the same protective policy. A different
+  flow, direction or invalid SPI/request-ID relationship is a typed refusal.
 - A separate committed activation supplies the successor's own role use; one
   activation still grants one use per backend role. The actor admits the
   successor beside the predecessor's live reservation and keeps the unrelated
   request refusal on a live policy key.
-- The actor installs the successor SA, then repoints the single protective
-  policy to it through one `UPDPOLICY` update. No step removes the policy while
-  traffic could still select the flow, so there is no unprotected interval.
+- After installing the successor SA, the actor atomically repoints the
+  outbound policy through `UPDPOLICY`. The inbound policy remains unchanged.
+  No step removes protection while the flow can still be selected.
   Publication requires fresh exact successor SA and policy readback.
-- The predecessor SA and its receipt stay live and readable until the caller
-  calls `remove_scoped` on the predecessor. `read_scoped` reports `false` for a
-  superseded predecessor once traffic moved (its SA is no longer the published
-  forwarding target) while `scoped_successor_status` reports the milestones.
-  That retirement removes the predecessor SA only and never the policy the
-  successor now owns; it is refused unless the successor SA **and** policy are
-  both still live, so an expired successor never takes the predecessor with it.
-  Removing the successor is refused while its predecessor is still reserved,
-  and removes the successor SA before its policy.
-- Every step records progress before its first possible effect. A lost
-  acknowledgement, cancellation or panic resumes through readback (`undo`), and
-  an ambiguous policy readback retains both objects instead of guessing.
-  `scoped_successor_status` reports which of install, traffic move, publication
-  and predecessor retirement have completed so a caller that lost the reply
-  never has to infer them from an untrusted kernel state.
+- The predecessor SA remains retained until explicit retirement or kernel
+  expiry. `read_scoped` verifies the receipt's complete SA/policy intent: it
+  returns `false` for a superseded outbound receipt while the SA still exists,
+  and can return `true` for both inbound receipts sharing the same policy.
+  Retiring an unselected live member requires the selected SA and policy to
+  remain exact, then deletes only that member's SA. Abandoning the selected
+  member first restores another retained live generation. Already-expired
+  groups can release their receipts in either order. Only the final member
+  removes the shared policy, after confirming its SA is absent.
+- Every step records progress before its first possible effect. Lost
+  acknowledgement, cancellation or panic resumes through readback; observer
+  loss never reverses an observed traffic move. Exact retries recover the same
+  receipt without consuming another activation. A local fence or definitive
+  refusal authorizes undo of unpublished work, with protection restored before
+  candidate removal; ambiguous readback retains the objects for retry.
+  `scoped_successor_status` freshly reads installed/selected/retired state for
+  pending and published transitions. Publication records the actor's decision
+  independently of whether the caller received its reply.
 - Rekey-trigger ownership, peer signalling, Child-SA policy iteration and
   adoption decisions remain consumer policy; this primitive only executes the
   already-decided replacement.
