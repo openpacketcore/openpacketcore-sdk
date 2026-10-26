@@ -1482,6 +1482,56 @@ impl TestCluster {
     }
 }
 
+async fn wait_for_survivor_election<T, F, N, P>(
+    watchdog: Duration,
+    _initial_term: u64,
+    operation: F,
+    _next_term: N,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = T>,
+    N: FnMut(u64) -> P,
+    P: std::future::Future<Output = u64>,
+{
+    tokio::time::timeout(watchdog, operation).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn survivor_election_wait_accepts_higher_terms_past_each_original_envelope() {
+    for watchdog in [RECOVERY_TIMEOUT, SNAPSHOT_RECOVERY_TIMEOUT] {
+        let (published, terms) = tokio::sync::watch::channel(7);
+        let (done, completion) = tokio::sync::oneshot::channel();
+        let wait = wait_for_survivor_election(watchdog, 7, completion, |previous| {
+            let mut terms = terms.clone();
+            async move {
+                let next = *terms
+                    .wait_for(|term| *term > previous)
+                    .await
+                    .expect("term publication remains live");
+                next
+            }
+        });
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        for term in 8..=10 {
+            tokio::time::advance(watchdog - Duration::from_secs(1)).await;
+            published.send_replace(term);
+            assert!(
+                futures_util::poll!(wait.as_mut()).is_pending(),
+                "higher survivor terms must preserve acquisition beyond {watchdog:?}"
+            );
+        }
+        done.send(17)
+            .expect("acquisition still awaits its predicate");
+        assert_eq!(
+            wait.await
+                .expect("continued higher terms preserve the watchdog interval")
+                .expect("the full acquisition predicate completed"),
+            17
+        );
+    }
+}
+
 async fn next_election_term(stores: &[ConsensusSessionStore], term: u64) -> u64 {
     #[cfg(feature = "test-control")]
     {
@@ -5886,27 +5936,35 @@ async fn fenced_transition_leader_transfer_preserves_exact_replay_on_surviving_v
         .expect("all live voters apply the durable activation before failover");
 
     cluster.isolate(old_leader);
-    let recovery_deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
-    let (new_leader_id, new_term) = tokio::time::timeout_at(recovery_deadline, async {
-        loop {
-            let statuses = survivors
-                .iter()
-                .map(|index| cluster.stores[*index].status())
-                .collect::<Vec<_>>();
-            if let Some(candidate) = statuses.first().and_then(|status| status.leader_id) {
-                let term = statuses.first().expect("survivor status").term;
-                if candidate != old_leader_id
-                    && term > old_term
-                    && statuses
-                        .iter()
-                        .all(|status| status.leader_id == Some(candidate) && status.term == term)
-                {
-                    break (candidate, term);
+    let survivor_stores = survivors
+        .iter()
+        .map(|index| cluster.stores[*index].clone())
+        .collect::<Vec<_>>();
+    let (new_leader_id, new_term) = wait_for_survivor_election(
+        RECOVERY_TIMEOUT,
+        old_term,
+        async {
+            loop {
+                let statuses = survivors
+                    .iter()
+                    .map(|index| cluster.stores[*index].status())
+                    .collect::<Vec<_>>();
+                if let Some(candidate) = statuses.first().and_then(|status| status.leader_id) {
+                    let term = statuses.first().expect("survivor status").term;
+                    if candidate != old_leader_id
+                        && term > old_term
+                        && statuses.iter().all(|status| {
+                            status.leader_id == Some(candidate) && status.term == term
+                        })
+                    {
+                        break (candidate, term);
+                    }
                 }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(&survivor_stores, term),
+    )
     .await
     .expect("surviving voters elect a new leader");
     assert!(new_leader_id != old_leader_id && new_term > old_term);
@@ -6421,20 +6479,31 @@ async fn lagging_replica_installs_compacted_snapshot_without_losing_committed_st
         .local_applied_index()
         .expect("lagging node initial applied index");
     cluster.isolate(0);
-    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
-        loop {
-            let reports = futures_util::future::join_all(
-                cluster.stores[1..]
-                    .iter()
-                    .map(ConsensusSessionStore::probe_durable_readiness),
-            )
-            .await;
-            if reports.iter().all(DurableReadinessReport::is_ready) {
-                break;
+    let survivor_stores = &cluster.stores[1..];
+    let initial_term = survivor_stores
+        .iter()
+        .map(|store| store.status().term)
+        .max()
+        .expect("two snapshot survivors");
+    wait_for_survivor_election(
+        SNAPSHOT_RECOVERY_TIMEOUT,
+        initial_term,
+        async {
+            loop {
+                let reports = futures_util::future::join_all(
+                    cluster.stores[1..]
+                        .iter()
+                        .map(ConsensusSessionStore::probe_durable_readiness),
+                )
+                .await;
+                if reports.iter().all(DurableReadinessReport::is_ready) {
+                    break;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(survivor_stores, term),
+    )
     .await
     .expect("surviving majority elects a current leader");
 
@@ -6866,34 +6935,45 @@ async fn fenced_transition_snapshot_install_preserves_exact_replay_without_secon
         .local_applied_index()
         .expect("lagging leader initial applied index");
     cluster.isolate(lagging_leader);
-    tokio::time::timeout(SNAPSHOT_RECOVERY_TIMEOUT, async {
-        loop {
-            let reports = futures_util::future::join_all(
-                survivors
+    let survivor_stores = survivors
+        .iter()
+        .map(|index| cluster.stores[*index].clone())
+        .collect::<Vec<_>>();
+    wait_for_survivor_election(
+        SNAPSHOT_RECOVERY_TIMEOUT,
+        old_term,
+        async {
+            loop {
+                let reports = futures_util::future::join_all(
+                    survivors
+                        .iter()
+                        .map(|index| cluster.stores[*index].probe_durable_readiness()),
+                )
+                .await;
+                let statuses = survivors
                     .iter()
-                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
-            )
-            .await;
-            let statuses = survivors
-                .iter()
-                .map(|index| cluster.stores[*index].status())
-                .collect::<Vec<_>>();
-            if reports.iter().all(DurableReadinessReport::is_ready) {
-                if let Some(new_leader_id) = statuses.first().and_then(|status| status.leader_id) {
-                    let new_term = statuses.first().expect("survivor status").term;
-                    if new_leader_id != old_leader_id
-                        && new_term > old_term
-                        && statuses.iter().all(|status| {
-                            status.leader_id == Some(new_leader_id) && status.term == new_term
-                        })
+                    .map(|index| cluster.stores[*index].status())
+                    .collect::<Vec<_>>();
+                if reports.iter().all(DurableReadinessReport::is_ready) {
+                    if let Some(new_leader_id) =
+                        statuses.first().and_then(|status| status.leader_id)
                     {
-                        break;
+                        let new_term = statuses.first().expect("survivor status").term;
+                        if new_leader_id != old_leader_id
+                            && new_term > old_term
+                            && statuses.iter().all(|status| {
+                                status.leader_id == Some(new_leader_id) && status.term == new_term
+                            })
+                        {
+                            break;
+                        }
                     }
                 }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(&survivor_stores, term),
+    )
     .await
     .expect("surviving voters elect after the committed leader is lost");
 

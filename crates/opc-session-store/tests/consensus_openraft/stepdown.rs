@@ -541,35 +541,44 @@ async fn stepdown_scenario(publication_events: Arc<StdMutex<Option<Arc<Publicati
             path.set_enabled(true);
         }
     }
-    let (successor_id, successor_term) = tokio::time::timeout(RECOVERY_TIMEOUT, async {
-        loop {
-            let reports = futures_util::future::join_all(
-                survivors
+    let survivor_stores = survivors
+        .iter()
+        .map(|index| cluster.stores[*index].clone())
+        .collect::<Vec<_>>();
+    let (successor_id, successor_term) = wait_for_survivor_election(
+        RECOVERY_TIMEOUT,
+        term,
+        async {
+            loop {
+                let reports = futures_util::future::join_all(
+                    survivors
+                        .iter()
+                        .map(|index| cluster.stores[*index].probe_durable_readiness()),
+                )
+                .await;
+                let statuses = survivors
                     .iter()
-                    .map(|index| cluster.stores[*index].probe_durable_readiness()),
-            )
-            .await;
-            let statuses = survivors
-                .iter()
-                .map(|index| cluster.stores[*index].status())
-                .collect::<Vec<_>>();
-            if let Some(candidate) = statuses[0].leader_id {
-                let next_term = statuses[0].term;
-                if next_term > term
-                    && candidate != store.status().node_id
-                    && reports.iter().all(DurableReadinessReport::is_ready)
-                    && statuses.iter().all(|status| {
-                        status.leader_id == Some(candidate)
-                            && status.term == next_term
-                            && status.applied_index >= Some(tail)
-                    })
-                {
-                    break (candidate, next_term);
+                    .map(|index| cluster.stores[*index].status())
+                    .collect::<Vec<_>>();
+                if let Some(candidate) = statuses[0].leader_id {
+                    let next_term = statuses[0].term;
+                    if next_term > term
+                        && candidate != store.status().node_id
+                        && reports.iter().all(DurableReadinessReport::is_ready)
+                        && statuses.iter().all(|status| {
+                            status.leader_id == Some(candidate)
+                                && status.term == next_term
+                                && status.applied_index >= Some(tail)
+                        })
+                    {
+                        break (candidate, next_term);
+                    }
                 }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    })
+        },
+        |term| next_election_term(&survivor_stores, term),
+    )
     .await
     .expect("actual surviving majority elects and commits its higher term");
     let successor = survivors
