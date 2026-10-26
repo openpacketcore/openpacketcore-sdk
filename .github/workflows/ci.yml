@@ -964,6 +964,8 @@ jobs:
         include:
           - slice: ordinary
             cache_key: opc-session-net-i686
+          - slice: ordinary-authority
+            cache_key: opc-session-net-i686-authority
           - slice: ordinary-integration
             cache_key: opc-session-net-i686-integration
           - slice: contracts
@@ -1028,13 +1030,69 @@ jobs:
           )
           timing_contracts=("${ordinary_timing_contracts[@]}" "${optimized_timing_contracts[@]}")
           case "${I686_SLICE}" in
-            ordinary)
-              # Keep the library binary separate from the integration binaries
-              # so neither ordinary shard approaches the 30-minute job limit.
+            ordinary|ordinary-authority)
+              # Resolve the entire library before selecting either complement.
+              # The publication-authority module and durable crash matrix are
+              # independent of the other tests and retain their ordinary profile.
+              inventory=$(cargo test --locked \
+                -p opc-session-net \
+                --all-features \
+                --target i686-unknown-linux-gnu \
+                --quiet \
+                --lib \
+                -- --list --format=terse)
+              library_tests=()
+              authority_tests=()
+              declare -A library_names=() authority_names=() timing_names=()
+              while IFS= read -r line; do
+                if [[ "$line" == *": test" ]]; then
+                  test_name=${line%": test"}
+                  if [[ -z "$test_name" ]]; then
+                    echo "Empty i686 library test name" >&2
+                    exit 1
+                  fi
+                  if [[ -n "${library_names[$test_name]+present}" ]]; then
+                    echo "Duplicate i686 library test: $test_name" >&2
+                    exit 1
+                  fi
+                  library_tests+=("$test_name")
+                  library_names["$test_name"]=1
+                  case "$test_name" in
+                    stateless_quorum_consumer::publication_authority_failover::*|stateless_quorum_consumer::persistent_three_voter_protected_roster_durable_crash_cut_matrix)
+                      authority_tests+=("$test_name")
+                      authority_names["$test_name"]=1
+                      ;;
+                  esac
+                elif [[ -n "$line" && ! "$line" =~ ^[0-9]+\ tests?,\ [0-9]+\ benchmarks?$ ]]; then
+                  echo "Unexpected i686 library inventory line: $line" >&2
+                  exit 1
+                fi
+              done <<< "$inventory"
+              crash_matrix=stateless_quorum_consumer::persistent_three_voter_protected_roster_durable_crash_cut_matrix
+              if [[ -z "${library_names[$crash_matrix]+present}" ]] || (( ${#authority_tests[@]} < 2 )); then
+                echo "The i686 authority shard must resolve its module and durable crash matrix" >&2
+                exit 1
+              fi
               skips=()
               for timing_contract in "${timing_contracts[@]}"; do
-                skips+=(--skip "stateless_quorum_consumer::$timing_contract")
+                test_name="stateless_quorum_consumer::$timing_contract"
+                if [[ -z "${library_names[$test_name]+present}" || -n "${authority_names[$test_name]+present}" || -n "${timing_names[$test_name]+present}" ]]; then
+                  echo "Missing, duplicate or overlapping i686 timing contract: $test_name" >&2
+                  exit 1
+                fi
+                timing_names["$test_name"]=1
+                skips+=(--skip "$test_name")
               done
+              for test_name in "${library_tests[@]}"; do
+                if [[ -n "${timing_names[$test_name]+present}" ]]; then
+                  continue
+                fi
+                if [[ "$I686_SLICE" == ordinary && -n "${authority_names[$test_name]+present}" || "$I686_SLICE" == ordinary-authority && -z "${authority_names[$test_name]+present}" ]]; then
+                  skips+=(--skip "$test_name")
+                fi
+              done
+              printf 'i686 library partition: %s total, %s authority, %s contracts; slice=%s\n' \
+                "${#library_tests[@]}" "${#authority_tests[@]}" "${#timing_contracts[@]}" "$I686_SLICE"
               cargo test --locked \
                 -p opc-session-net \
                 --all-features \
@@ -1112,7 +1170,7 @@ jobs:
           cargo test --locked -p opc-sqlite-file-control-sys --all-features --target i686-unknown-linux-gnu --quiet -- --test-threads=4
 
   # Keep the existing required-check job key and display name stable while
-  # requiring both ordinary shards and the contracts slice to succeed.
+  # requiring both library shards, integrations and contracts to succeed.
   session-net-i686:
     name: opc-session-net i686
     if: always()
