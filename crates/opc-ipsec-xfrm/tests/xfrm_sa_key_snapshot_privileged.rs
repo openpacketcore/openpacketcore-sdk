@@ -485,6 +485,7 @@ async fn tfc_padding_install_and_readback_match_the_linux_kernel() -> Result<(),
         assert_eq!(observed.tfc_pad, padding);
         remove_unmarked(&backend, spi).await?;
     }
+    println!("TFC_PADDING_PROOF_OK");
     Ok(())
 }
 
