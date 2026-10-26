@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-sbi` offers explicit `SbiTokenProfile::NrfAccessToken` validation for
+  TS 29.510 UUID subjects and optional `nbf`, retaining signature, issuer,
+  audience, expiry, scope and transport-peer binding. JWT-SVID remains the
+  default. NRF mode never accepts mock-token bypasses. (#1362)
+
 - NRF registration/discovery now use standard JSON and query parameters.
   `NfProfile` uses generated PLMN/S-NSSAI wrappers and `NfService` objects;
   `DiscoveryQuery`/`CacheKey` require `requester_nf_type` and discovery results

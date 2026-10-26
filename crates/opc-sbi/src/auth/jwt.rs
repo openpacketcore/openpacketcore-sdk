@@ -1,9 +1,10 @@
-//! JWT-SVID validation and client token acquisition (RFC 007 §9.2–9.3).
+//! JWT-SVID/NRF token validation and client token acquisition (RFC 007 §9.2–9.3).
 //!
 //! Server side: `SbiJwtValidator` implements `SbiAuth` by verifying RS256
 //! JWT-SVIDs against a JWKS fetched through a `JwksResolver` and cached
 //! fail-closed in a `JwksCache`. Peer identity (tenant, NF type, instance)
-//! is derived from the SPIFFE ID in the token's `sub` claim.
+//! is derived from the SPIFFE subject for JWT-SVIDs; NRF UUID subjects must
+//! match the authenticated transport peer, which supplies tenant and NF type.
 //!
 //! Client side: `ClientTokenCache` caches tokens obtained from a
 //! `TokenProvider` per normalized scope set, refreshing shortly before
@@ -157,8 +158,8 @@ fn find_key_in_jwks(jwks: &Jwks, kid: &str) -> Option<DecodingKey> {
 pub struct SvidClaims {
     /// Issuer (`iss`); must equal the validator's expected issuer exactly.
     pub iss: String,
-    /// Subject (`sub`): the workload's SPIFFE ID. The validator parses
-    /// tenant, NF type, and NF instance ID out of its path segments.
+    /// Subject (`sub`): a SPIFFE ID in JWT-SVID mode or the consumer NF UUID
+    /// in NRF mode. NRF tenant/type come only from the authenticated peer.
     pub sub: String,
     /// Audience (`aud`); either a single string or an array of strings per
     /// RFC 7519 §4.1.3 — the expected audience must match or be contained.
@@ -167,7 +168,8 @@ pub struct SvidClaims {
     /// tokens past it are denied.
     pub exp: u64,
     /// Not-before (`nbf`) in seconds since the Unix epoch. Optional in the
-    /// struct, but the validator requires it and rejects tokens used early.
+    /// struct; mandatory only in JWT-SVID mode. Both profiles reject early use.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nbf: Option<u64>,
     /// OAuth2 scopes as a single **space-delimited** string (e.g.
     /// `"nnrf-disc nnrf-nfm"`); split into individual scopes after
@@ -175,13 +177,25 @@ pub struct SvidClaims {
     pub scope: Option<String>,
 }
 
-/// Production JWT-SVID Validator
+/// Explicit token identity profile; token contents cannot select the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SbiTokenProfile {
+    /// SPIFFE subject and mandatory not-before claim (the existing SDK profile).
+    #[default]
+    JwtSvid,
+    /// TS 29.510 6.3.5.2.4: NRF/consumer UUIDs and optional not-before.
+    /// The consumer UUID must match the authenticated transport peer.
+    NrfAccessToken,
+}
+
+/// RS256 SBI token validator with an explicit identity profile.
 pub struct SbiJwtValidator {
     jwks_cache: JwksCache,
     expected_aud: String,
     expected_iss: String,
     production_mode: bool,
     bypass_verification_in_dev: bool,
+    token_profile: SbiTokenProfile,
 }
 
 impl SbiJwtValidator {
@@ -192,7 +206,7 @@ impl SbiJwtValidator {
     /// `bypass_verification_in_dev` enables a dev/test-only shortcut: tokens
     /// prefixed `mock-token-` (as issued by the testkit `MockNrf`) are
     /// accepted without signature verification and yield a fixed mock AMF
-    /// peer. The bypass is **ignored whenever `production_mode` is true**,
+    /// peer. The bypass is **ignored in production and in NRF token mode**,
     /// so it cannot weaken a production deployment.
     pub fn new(
         resolver: Arc<dyn JwksResolver>,
@@ -208,7 +222,16 @@ impl SbiJwtValidator {
             expected_iss,
             production_mode,
             bypass_verification_in_dev,
+            token_profile: SbiTokenProfile::JwtSvid,
         }
+    }
+
+    /// Select the accepted token profile. NRF tokens always require a bound
+    /// transport NF instance/type, including outside production, because they
+    /// do not carry a tenant or NF type from which to construct a peer.
+    pub fn with_token_profile(mut self, profile: SbiTokenProfile) -> Self {
+        self.token_profile = profile;
+        self
     }
 }
 
@@ -223,6 +246,7 @@ impl SbiAuth for SbiJwtValidator {
         // 1. Unsafe dev/test bypass (never in Production mode)
         if !self.production_mode
             && self.bypass_verification_in_dev
+            && self.token_profile == SbiTokenProfile::JwtSvid
             && token.expose().starts_with("mock-token-")
         {
             // Return a mock context for testing
@@ -274,7 +298,9 @@ impl SbiAuth for SbiJwtValidator {
         validation.set_issuer(&[&self.expected_iss]);
         validation.validate_nbf = true;
         validation.required_spec_claims.insert("exp".to_string());
-        validation.required_spec_claims.insert("nbf".to_string());
+        if self.token_profile == SbiTokenProfile::JwtSvid {
+            validation.required_spec_claims.insert("nbf".to_string());
+        }
 
         let token_data =
             decode::<SvidClaims>(token.expose(), &decoding_key, &validation).map_err(|_| {
@@ -297,67 +323,114 @@ impl SbiAuth for SbiJwtValidator {
             });
         }
 
-        // 6. Parse SPIFFE ID from Subject claim
-        let spiffe = SpiffeId::new(&claims.sub).map_err(|_| SbiAuthError::Denied {
-            reason: "invalid spiffe id".to_string(),
-        })?;
-
-        let (tenant_str, nf_kind_str, instance_id_str) = parse_spiffe_id_segments(&spiffe)
-            .ok_or_else(|| SbiAuthError::Denied {
-                reason: "SPIFFE ID layout mismatch".into(),
-            })?;
-
-        let tenant = TenantId::new(tenant_str).map_err(|_| SbiAuthError::Denied {
-            reason: "invalid tenant".to_string(),
-        })?;
-        let nf_type = NfType::new(nf_kind_str).map_err(|_| SbiAuthError::Denied {
-            reason: "invalid nf_type".to_string(),
-        })?;
-        let nf_instance_id =
-            NfInstanceId::new(instance_id_str).map_err(|_| SbiAuthError::Denied {
-                reason: "invalid nf_instance_id".to_string(),
-            })?;
-
-        // 7. Bind the token's workload identity to the transport (mTLS) peer.
-        //    A JWT-SVID is a bearer credential: without this check any NF that
-        //    obtains a valid token minted for workload A could present it over
-        //    its own mTLS channel and be authorized as A (the confused-deputy /
-        //    token-replay case in RFC 007 §3.1). `request.peer` is the only
-        //    identity we know came from this connection, so the token's claimed
-        //    identity must match it.
-        match request.peer.nf_instance_id.as_ref() {
-            Some(peer_instance) => {
-                let bound = request.peer.tenant.as_str() == tenant.as_str()
-                    && request.peer.nf_type.as_ref().map(|t| t.as_str()) == Some(nf_type.as_str())
-                    && peer_instance.as_str() == nf_instance_id.as_str();
-                if !bound {
-                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_oauth_validation_total)
-                        .entry(("deny".to_string(), "token_binding_mismatch".to_string()))
-                        .and_modify(|c| *c += 1)
-                        .or_insert(1);
-                    return Err(SbiAuthError::TokenBindingMismatch);
+        let peer = match self.token_profile {
+            SbiTokenProfile::NrfAccessToken => {
+                let subject = nrf_uuid(&claims.sub).ok_or_else(|| SbiAuthError::Denied {
+                    reason: "invalid NRF token subject".into(),
+                })?;
+                if nrf_uuid(&claims.iss).is_none() {
+                    return Err(SbiAuthError::Denied {
+                        reason: "invalid NRF token issuer".into(),
+                    });
                 }
-            }
-            None => {
-                // No transport peer identity. In production the binding cannot
-                // be verified, so fail closed; in dev/test (no mTLS) allow it.
-                if self.production_mode {
-                    lock_or_recover(&opc_redaction::metrics::METRICS.sbi_oauth_validation_total)
-                        .entry(("deny".to_string(), "missing_peer_binding".to_string()))
-                        .and_modify(|c| *c += 1)
-                        .or_insert(1);
+                let scope = claims
+                    .scope
+                    .as_deref()
+                    .ok_or_else(|| SbiAuthError::Denied {
+                        reason: "missing NRF token scope".into(),
+                    })?;
+                if !scope.split(' ').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b':' | b'-'))
+                }) {
+                    return Err(SbiAuthError::Denied {
+                        reason: "invalid NRF token scope".into(),
+                    });
+                }
+                let bound_instance = request
+                    .peer
+                    .nf_instance_id
+                    .as_ref()
+                    .ok_or(SbiAuthError::MissingPeerBinding)?;
+                if request.peer.nf_type.is_none() {
                     return Err(SbiAuthError::MissingPeerBinding);
                 }
+                if nrf_uuid(bound_instance.as_str()) != Some(subject) {
+                    return Err(SbiAuthError::TokenBindingMismatch);
+                }
+                request.peer.clone()
             }
-        }
+            SbiTokenProfile::JwtSvid => {
+                // 6. Parse SPIFFE ID from Subject claim
+                let spiffe = SpiffeId::new(&claims.sub).map_err(|_| SbiAuthError::Denied {
+                    reason: "invalid spiffe id".to_string(),
+                })?;
 
-        let peer = SbiPeer {
-            spiffe: Some(spiffe),
-            nf_instance_id: Some(nf_instance_id),
-            nf_type: Some(nf_type),
-            tenant,
-            plmn: None,
-            snssai: None,
+                let (tenant_str, nf_kind_str, instance_id_str) = parse_spiffe_id_segments(&spiffe)
+                    .ok_or_else(|| SbiAuthError::Denied {
+                        reason: "SPIFFE ID layout mismatch".into(),
+                    })?;
+
+                let tenant = TenantId::new(tenant_str).map_err(|_| SbiAuthError::Denied {
+                    reason: "invalid tenant".to_string(),
+                })?;
+                let nf_type = NfType::new(nf_kind_str).map_err(|_| SbiAuthError::Denied {
+                    reason: "invalid nf_type".to_string(),
+                })?;
+                let nf_instance_id =
+                    NfInstanceId::new(instance_id_str).map_err(|_| SbiAuthError::Denied {
+                        reason: "invalid nf_instance_id".to_string(),
+                    })?;
+
+                // 7. Bind the token's workload identity to the transport (mTLS) peer.
+                //    A JWT-SVID is a bearer credential: without this check any NF that
+                //    obtains a valid token minted for workload A could present it over
+                //    its own mTLS channel and be authorized as A (the confused-deputy /
+                //    token-replay case in RFC 007 §3.1). `request.peer` is the only
+                //    identity we know came from this connection, so the token's claimed
+                //    identity must match it.
+                match request.peer.nf_instance_id.as_ref() {
+                    Some(peer_instance) => {
+                        let bound = request.peer.tenant.as_str() == tenant.as_str()
+                            && request.peer.nf_type.as_ref().map(|t| t.as_str())
+                                == Some(nf_type.as_str())
+                            && peer_instance.as_str() == nf_instance_id.as_str();
+                        if !bound {
+                            lock_or_recover(
+                                &opc_redaction::metrics::METRICS.sbi_oauth_validation_total,
+                            )
+                            .entry(("deny".to_string(), "token_binding_mismatch".to_string()))
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
+                            return Err(SbiAuthError::TokenBindingMismatch);
+                        }
+                    }
+                    None => {
+                        // No transport peer identity. In production the binding cannot
+                        // be verified, so fail closed; in dev/test (no mTLS) allow it.
+                        if self.production_mode {
+                            lock_or_recover(
+                                &opc_redaction::metrics::METRICS.sbi_oauth_validation_total,
+                            )
+                            .entry(("deny".to_string(), "missing_peer_binding".to_string()))
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
+                            return Err(SbiAuthError::MissingPeerBinding);
+                        }
+                    }
+                }
+
+                SbiPeer {
+                    spiffe: Some(spiffe),
+                    nf_instance_id: Some(nf_instance_id),
+                    nf_type: Some(nf_type),
+                    tenant,
+                    plmn: None,
+                    snssai: None,
+                }
+            }
         };
 
         let scopes: Vec<String> = claims
@@ -408,6 +481,13 @@ fn required_scope_for_path(path: &str) -> Option<&str> {
         .split('/')
         .next()
         .filter(|segment| !segment.is_empty())
+}
+
+fn nrf_uuid(value: &str) -> Option<uuid::Uuid> {
+    // The wire UUID format is hyphenated, not a UUID URN or compact hex string.
+    uuid::Uuid::parse_str(value)
+        .ok()
+        .filter(|_| value.len() == 36)
 }
 
 fn validate_audience(aud_value: &serde_json::Value, expected_aud: &str) -> bool {
