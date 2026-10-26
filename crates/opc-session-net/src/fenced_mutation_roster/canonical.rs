@@ -56,9 +56,9 @@ pub const MEMBER_OPERATION_ID_BYTES: usize = 16;
 pub const MAX_DESCRIPTOR_BYTES: usize = 16 << 10;
 /// Maximum byte length of provider status or conclusive evidence.
 pub const MAX_STATUS_BYTES: usize = 4 << 10;
-/// Maximum number of live admitted rosters.
+/// Ordinary live-admission policy limit; emergency admissions bypass it.
 pub const MAX_LIVE_ROSTERS: usize = opc_session_store::fenced_mutation_roster::MAX_LIVE_ROSTERS;
-/// Maximum combined number of live and retained terminal rosters.
+/// Historical V1 descriptor constant; no longer an admission or retention quota.
 pub const MAX_RESERVED_AND_RETAINED: usize =
     opc_session_store::fenced_mutation_roster::MAX_RESERVED_AND_RETAINED;
 /// Operational live-and-retained roster target committed by the profile.

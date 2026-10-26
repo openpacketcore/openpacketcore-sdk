@@ -643,7 +643,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installation; old activation authority and snapshots are refused.
   Completed rosters no longer consume a fixed count quota. Ordinary admissions
   wait on conclusive live or byte capacity pressure within their original
-  authority deadline; emergency admissions bypass those policy limits while
+  authority deadline (expiry reports `AuthorityRejected`); emergency admissions
+  bypass those policy limits while
   preserving exact accounting and authority checks. Terminal evidence retains
   its existing 24-hour recovery policy. (#1307)
 - `opc-session-store`: protected-roster activation now requires a versioned

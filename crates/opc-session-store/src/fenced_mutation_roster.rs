@@ -92,10 +92,10 @@ pub const RECLAIM_BATCH: usize = 1_024;
 ///
 /// Reclamation runs through the deterministic maintenance turn folded into
 /// ordinary logical-time commands. A bounded leader-owned lane proposes that
-/// existing ordinary intent when the published authenticated occupancy reports
-/// retained or tombstone reservations, so a store receiving only protected
+/// existing ordinary intent only when the authenticated indexes prove that
+/// reclaim or retirement is eligible, so a store receiving only protected
 /// roster commands still reclaims eligible retention at the exact boundary
-/// instead of waiting for unrelated traffic. This constant, the caps, the
+/// instead of waiting for unrelated traffic. This constant, the byte accounting,
 /// Q1/Q2 mutation width and the fencing/exactly-once contract are unchanged.
 pub const TERMINAL_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// Largest history epoch accepted by durable SQLite-backed implementations.

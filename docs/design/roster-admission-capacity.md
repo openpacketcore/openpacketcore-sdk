@@ -42,7 +42,12 @@ headroom in the shared ledger.
 Emergency work bypasses admission policy limits for live reservations,
 retained history and aggregate bytes, and any local admission-capacity limit
 on the same path, including local authority reservations and global/per-scope
-provider and publication scheduling. Ordinary work stops below physical capacity. A finite
+provider and publication scheduling. Consensus proposal and forwarding policy
+quotas are bypassed for authenticated emergency admission. Terminal completion
+uses its existing admission reservation and bypasses those quotas for both
+classes; its compact command uses the safety-control transport class, and all
+signature, binding and authority checks remain mandatory. Ordinary work stops
+below physical capacity. A finite
 emergency reserve alone is insufficient if exhausting it would cause another
 capacity refusal or wait; emergency admission must still use available
 physical resources. Capacity never becomes an emergency deadline, queue

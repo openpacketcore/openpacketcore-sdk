@@ -999,7 +999,7 @@ struct LocalProposalAuthority {
 /// freeze marker is used exclusively by the leader-owned V2 status ticket
 /// cohort and is set immediately before Openraft accepts the command.
 struct LocalProposalExecution {
-    proposal_permit: ScopeWorkPermit,
+    proposal_permit: Option<ScopeWorkPermit>,
     operation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     persistence_submission: Option<persistence_protocol::EngineAdmission>,
     cohort_freeze: Option<Arc<AtomicBool>>,
@@ -8771,41 +8771,47 @@ impl ConsensusSessionStore {
         {
             return reply;
         }
-        let proposal_reservation = match tokio::time::timeout_at(
-            deadline,
-            self.inner
-                .proposal_admission
-                .reserve_for(scheduling_key, scheduling_class),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => {
-                self.inner
-                    .diagnostics
-                    .proposal_permit_deadline
-                    .fetch_add(1, Ordering::Relaxed);
-                return ForwardMutationReply::Unavailable;
-            }
-        };
-        // Activation preflights can return an already committed certificate.
-        // Bound their resident state, but do not monopolize the control
-        // execution credit while awaiting a read/capability prerequisite.
-        let proposal_admission = if matches!(
-            &request.intent,
-            SessionMutationIntent::PreflightFencedTransitionCapability
-                | SessionMutationIntent::PreflightProtectedRosterProfile
-                | SessionMutationIntent::PreflightProtectedRosterProfileV2
-                | SessionMutationIntent::PreflightScopeProfile
-        ) {
-            ProposalAdmission::ActivationRead(proposal_reservation)
+        let proposal_admission = if request.bypasses_roster_policy_quota() {
+            // Policy admission is separate from the authority, topology and
+            // accepted-effect ownership retained by the common path below.
+            ProposalAdmission::UnmeteredRoster
         } else {
-            match self
-                .start_proposal_before(proposal_reservation, deadline)
-                .await
+            let proposal_reservation = match tokio::time::timeout_at(
+                deadline,
+                self.inner
+                    .proposal_admission
+                    .reserve_for(scheduling_key, scheduling_class),
+            )
+            .await
             {
-                Ok(permit) => ProposalAdmission::Running(permit),
-                Err(reply) => return reply,
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => {
+                    self.inner
+                        .diagnostics
+                        .proposal_permit_deadline
+                        .fetch_add(1, Ordering::Relaxed);
+                    return ForwardMutationReply::Unavailable;
+                }
+            };
+            // Activation preflights can return an already committed certificate.
+            // Bound their resident state, but do not monopolize the control
+            // execution credit while awaiting a read/capability prerequisite.
+            if matches!(
+                &request.intent,
+                SessionMutationIntent::PreflightFencedTransitionCapability
+                    | SessionMutationIntent::PreflightProtectedRosterProfile
+                    | SessionMutationIntent::PreflightProtectedRosterProfileV2
+                    | SessionMutationIntent::PreflightScopeProfile
+            ) {
+                ProposalAdmission::ActivationRead(proposal_reservation)
+            } else {
+                match self
+                    .start_proposal_before(proposal_reservation, deadline)
+                    .await
+                {
+                    Ok(permit) => ProposalAdmission::Running(permit),
+                    Err(reply) => return reply,
+                }
             }
         };
         let scope_traffic = scope_profile::is_scope_command(&request.intent);
@@ -9285,7 +9291,8 @@ impl ConsensusSessionStore {
         // its execution credit. Reacquire it afterwards; the existing exact
         // activation-scope and typed-admission checks below cover the wait.
         let (proposal_permit, operation_guard) = match proposal_admission {
-            ProposalAdmission::Running(permit) => (permit, operation_guard),
+            ProposalAdmission::UnmeteredRoster => (None, operation_guard),
+            ProposalAdmission::Running(permit) => (Some(permit), operation_guard),
             ProposalAdmission::ActivationRead(reservation) => {
                 let held_gate = operation_guard.is_some();
                 drop(operation_guard);
@@ -9309,7 +9316,7 @@ impl ConsensusSessionStore {
                 } else {
                     None
                 };
-                (permit, guard)
+                (Some(permit), guard)
             }
         };
         if matches!(
@@ -9943,7 +9950,7 @@ impl ConsensusSessionStore {
                 },
                 authority_time,
                 LocalProposalExecution {
-                    proposal_permit,
+                    proposal_permit: Some(proposal_permit),
                     operation_guard: Some(operation_guard),
                     persistence_submission: None,
                     cohort_freeze: None,
@@ -21528,7 +21535,7 @@ mod membership_tests {
                 },
                 store.inner.clock.now_utc(),
                 LocalProposalExecution {
-                    proposal_permit,
+                    proposal_permit: Some(proposal_permit),
                     operation_guard: Some(operation_guard),
                     persistence_submission: None,
                     cohort_freeze: None,
@@ -23457,6 +23464,15 @@ mod membership_tests {
                 })
             })
             .unwrap_or(store);
+        // A forwarded commit need not already be locally applied when its
+        // caller receives the leader's response. Observe the committed cut
+        // before asserting this fixture's exact published occupancy.
+        observer
+            .linearizable_barrier_before(
+                tokio::time::Instant::now() + observer.inner.operation_timeout,
+            )
+            .await
+            .expect("observe committed roster terminal");
         let occupancy = observer.protected_roster_diagnostic_snapshot();
         assert_eq!(occupancy.occupancy_valid, 1);
         assert_eq!(occupancy.live_reservations, 0);
@@ -26516,7 +26532,7 @@ mod membership_tests {
                 },
                 store.inner.clock.now_utc(),
                 LocalProposalExecution {
-                    proposal_permit,
+                    proposal_permit: Some(proposal_permit),
                     operation_guard: Some(operation_guard),
                     persistence_submission: None,
                     cohort_freeze: None,

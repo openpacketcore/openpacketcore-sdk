@@ -34,6 +34,8 @@ pub enum ClientError {
     /// A public input was malformed, out of bounds, or profile-incompatible.
     InvalidInput,
     /// The current lease or scope did not authorize the requested operation.
+    /// Includes expiry of the original authority deadline while waiting for
+    /// admission capacity.
     AuthorityRejected,
     /// Admission found no authoritative session record, or successor recovery
     /// verified a missing V2 admission before any terminal history retirement.
