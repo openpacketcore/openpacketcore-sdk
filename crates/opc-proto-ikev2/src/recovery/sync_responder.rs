@@ -82,6 +82,7 @@ impl<P: RecoveryProfile> Window<P> {
         pending: Option<&Pending>,
         pending_inbound: Option<&Ordinary<P>>,
     ) -> Result<Ikev2AdmittedSyncResponse<'_, P>, Error> {
+        self.fragments.ready()?;
         if self.quiescent {
             return Err(Error::CommitUncertain);
         }

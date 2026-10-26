@@ -30,16 +30,15 @@ struct Pending {
     wire: Bytes,
 }
 
-pub(super) struct ProbeState<P: RecoveryProfile> {
+pub(super) struct ProbeState {
     next_send: Option<u32>,
     pending: Option<Pending>,
     recovery_required: bool,
     pub(super) highest_request: Option<u32>,
-    pub(super) evidence: P::SyncEvidence,
 }
 
-impl<P: RecoveryProfile> ProbeState<P> {
-    pub(super) fn restored(record: &Record<P>) -> Self {
+impl ProbeState {
+    pub(super) fn restored<P: RecoveryProfile>(record: &Record<P>) -> Self {
         Self {
             recovery_required: record.liveness_limit.is_some()
                 && record
@@ -56,8 +55,11 @@ impl<P: RecoveryProfile> ProbeState<P> {
             pending: None,
             recovery_required: false,
             highest_request: None,
-            evidence: P::SyncEvidence::default(),
         }
+    }
+
+    pub(super) fn pending_id(&self) -> Option<u32> {
+        self.pending.as_ref().map(|pending| pending.id)
     }
 
     pub(super) fn ready(&self) -> Result<(), Error> {
@@ -181,7 +183,7 @@ impl<P: RecoveryProfile> Window<P> {
                 .header(Exchange::Informational, id, false),
             PayloadChain::new(PayloadType::NoNext, &[]),
         )?;
-        P::retain_sealed(&mut self.probe.evidence, &sealed)?;
+        P::retain_sealed(&mut self.packet_evidence, &sealed)?;
         self.probe.next_send = id.checked_add(1);
         self.probe.highest_request = Some(id);
         self.probe.pending = Some(Pending {
@@ -274,6 +276,8 @@ impl<P: RecoveryProfile> Window<P> {
 
     pub(super) fn adopt_send_floor(&mut self, synchronized: bool) {
         if synchronized {
+            self.fragments.cutover();
+            self.packet_evidence = P::SyncEvidence::default();
             self.probe = ProbeState::live(self.record.next_send);
         } else {
             self.probe.next_send = self

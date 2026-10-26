@@ -1,10 +1,8 @@
 use super::profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
 use std::{cell::RefCell, marker::PhantomData};
 
-use bytes::Bytes;
-
 use super::{
-    Ikev2AuthenticatedOrdinary as Request, Ikev2CommittedWindow as Window,
+    Ikev2AuthenticatedOrdinary as Request, Ikev2CommittedWindow as Window, Ikev2ProtectedMessage,
     Ikev2WindowError as Error,
 };
 use crate::canonical::{
@@ -24,9 +22,9 @@ enum ReceivePhase {
 pub(super) struct ReceiveState<P: RecoveryProfile = Gcm> {
     pub next: Option<u32>,
     phase: ReceivePhase,
-    pub pending: RefCell<Option<Bytes>>,
+    pub pending: RefCell<Option<Ikev2ProtectedMessage>>,
     replies: Option<Canonical<P>>,
-    last_empty: Option<(u32, Bytes)>,
+    last_empty: Option<(u32, Ikev2ProtectedMessage)>,
 }
 
 impl<P: RecoveryProfile> ReceiveState<P> {
@@ -44,6 +42,13 @@ impl<P: RecoveryProfile> ReceiveState<P> {
         self.next.is_some_and(|next| {
             id == next || (self.phase == ReceivePhase::Reconstructing && id > next)
         }) && self.last_empty.as_ref().is_none_or(|(last, _)| id > *last)
+    }
+
+    pub(super) fn cached_empty_request(&self, id: u32) -> Option<&Ikev2ProtectedMessage> {
+        self.last_empty
+            .as_ref()
+            .filter(|(last, _)| *last == id && self.pending.borrow().is_none())
+            .map(|(_, message)| message)
     }
 
     fn retire_before(&self, next: Option<u32>) -> Result<(), Error> {

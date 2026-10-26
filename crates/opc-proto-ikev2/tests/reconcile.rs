@@ -138,7 +138,13 @@ fn assert_next_iv(f: &mut Fixture, next: u64) {
         )
         .unwrap();
     assert_eq!(
-        &prepared.record().outbound().unwrap().request()[32..40],
+        &prepared
+            .record()
+            .outbound()
+            .unwrap()
+            .request()
+            .single_packet()
+            .unwrap()[32..40],
         &next.to_be_bytes()
     );
 }
@@ -265,8 +271,14 @@ fn inbound_readback_adopts_only_the_exact_landed_witness() {
                     Ok(Disposition::CachedResponse)
                 );
                 assert_eq!(
-                    window.replay_response(&request).unwrap().bytes(),
-                    readback.inbound().unwrap().response().unwrap()
+                    window.replay_response(&request).unwrap().bytes().unwrap(),
+                    readback
+                        .inbound()
+                        .unwrap()
+                        .response()
+                        .unwrap()
+                        .single_packet()
+                        .unwrap()
                 );
                 let bytes = window.reply_empty(&f.request(6)).unwrap().bytes().to_vec();
                 window
@@ -795,6 +807,7 @@ fn changed_same_generation_rollback_and_window_iv_floor_are_terminal() {
                     },
                     latest.outbound().cloned(),
                     latest.inbound().cloned(),
+                    None,
                     None,
                 )
                 .unwrap()

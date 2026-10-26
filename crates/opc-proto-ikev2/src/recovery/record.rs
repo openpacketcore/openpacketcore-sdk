@@ -4,7 +4,7 @@ use super::profile::{
     DirectionBinding, Ikev2CbcRecoveryProfile as Cbc, Ikev2GcmRecoveryProfile as Gcm,
     RecoveryProfile,
 };
-use super::{Ikev2SyncResponderRecord, Ikev2WindowError as Error};
+use super::{Ikev2ProtectedMessage, Ikev2SyncResponderRecord, Ikev2WindowError as Error};
 use crate::{
     Header, HeaderFlags, Ikev2AesGcmIvDomain, Ikev2ExchangeKind,
     Ikev2MessageIdSyncAgreement as Agreement, Ikev2MessageIdSyncMode as Mode,
@@ -139,8 +139,8 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowDomain<P> {
 /// They must be committed atomically with the window and applied idempotently.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Ikev2CommittedExchangeRecord {
-    pub(super) request: Bytes,
-    pub(super) response: Option<Bytes>,
+    pub(super) request: Ikev2ProtectedMessage,
+    pub(super) response: Option<Ikev2ProtectedMessage>,
     pub(super) outcome: Option<Bytes>,
 }
 
@@ -156,7 +156,24 @@ impl Ikev2CommittedExchangeRecord {
         response: Option<Bytes>,
         outcome: Option<Bytes>,
     ) -> Result<Self, Error> {
-        if request.is_empty() || response.is_some() != outcome.is_some() {
+        Self::from_persisted_messages(
+            Ikev2ProtectedMessage::from_persisted(vec![request])?,
+            response
+                .map(|packet| Ikev2ProtectedMessage::from_persisted(vec![packet]))
+                .transpose()?,
+            outcome,
+        )
+    }
+
+    /// Rebuild a complete request/response packet collection from the same record.
+    /// # Errors
+    /// Rejects an unpaired response/outcome; restore authenticates all packets.
+    pub fn from_persisted_messages(
+        request: Ikev2ProtectedMessage,
+        response: Option<Ikev2ProtectedMessage>,
+        outcome: Option<Bytes>,
+    ) -> Result<Self, Error> {
+        if response.is_some() != outcome.is_some() {
             return Err(Error::InvalidRecord);
         }
         Ok(Self {
@@ -167,12 +184,12 @@ impl Ikev2CommittedExchangeRecord {
     }
 
     /// Exact request bytes to persist, never an uncommitted transmit permission.
-    pub fn request(&self) -> &[u8] {
+    pub const fn request(&self) -> &Ikev2ProtectedMessage {
         &self.request
     }
     /// Exact response, present only together with the corresponding outcome.
-    pub fn response(&self) -> Option<&[u8]> {
-        self.response.as_deref()
+    pub const fn response(&self) -> Option<&Ikev2ProtectedMessage> {
+        self.response.as_ref()
     }
     /// Opaque durable outcome; reading historical state does not repeat an effect.
     pub fn outcome(&self) -> Option<&[u8]> {
@@ -229,6 +246,7 @@ pub struct Ikev2CommittedWindowRecord<P: RecoveryProfile = Gcm> {
     pub(super) inbound: Option<Ikev2CommittedExchangeRecord>,
     pub(super) sync: Option<Ikev2SyncResponderRecord<P>>,
     pub(super) recovery: Option<super::Ikev2SyncRecoveryRecord<P>>,
+    pub(super) fragmentation: Option<super::Ikev2FragmentationParameters>,
     pub(super) liveness_limit: Option<std::num::NonZeroU32>,
 }
 
@@ -253,6 +271,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
             sync: None,
             recovery: None,
             liveness_limit: None,
+            fragmentation: None,
         }
     }
 
@@ -266,8 +285,14 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
     /// must not become `None`. Legacy rows may migrate as disabled only when their
     /// schema predates local probe support. A positive bound requires a committed
     /// generation and causes cold restoration to enforce liveness recovery.
+    /// Restore `fragmentation` explicitly too; omitted negotiation metadata must
+    /// never become disabled. Rekey successors inherit their prior agreement.
     /// # Errors
     /// Rejects an incomplete inbound result or exhausted direction with no history.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Restore every atomic window field explicitly; missing feature metadata must not default."
+    )]
     pub fn from_persisted(
         domain: Ikev2CommittedWindowDomain<P>,
         generation: u64,
@@ -276,6 +301,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
         outbound: Option<Ikev2CommittedExchangeRecord>,
         inbound: Option<Ikev2CommittedExchangeRecord>,
         liveness_limit: Option<std::num::NonZeroU32>,
+        fragmentation: Option<super::Ikev2FragmentationParameters>,
     ) -> Result<Self, Error> {
         if inbound
             .as_ref()
@@ -297,13 +323,14 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
             sync: None,
             recovery: None,
             liveness_limit,
+            fragmentation,
         })
     }
 
     /// Rebuild the supported recovery profile with mandatory synchronization mode.
     ///
     /// Obtain every argument from one latest, fenced atomic record. The codec must
-    /// reject omitted mode, history, event-presence or liveness fields before calling this
+    /// reject omitted mode, history, event-presence, liveness or fragmentation fields before calling this
     /// function. In particular it must not synthesize `Base` or an absent event.
     /// This checks structural completeness and the immutable agreement binding;
     /// [`super::Ikev2CommittedWindow::restore`] must still authenticate cached
@@ -326,6 +353,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
         inbound: Option<Ikev2CommittedExchangeRecord>,
         synchronization: Ikev2PersistedProfileSync<P>,
         liveness_limit: Option<std::num::NonZeroU32>,
+        fragmentation: Option<super::Ikev2FragmentationParameters>,
     ) -> Result<Self, Error> {
         let record = Self::from_persisted(
             domain,
@@ -335,6 +363,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
             outbound,
             inbound,
             liveness_limit,
+            fragmentation,
         )?;
         let agreement = match &synchronization {
             Ikev2PersistedProfileSync::Base { agreement }
@@ -436,6 +465,11 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
     /// A codec must reject an omitted field, and must never reset it on restart.
     pub const fn liveness_limit(&self) -> Option<std::num::NonZeroU32> {
         self.liveness_limit
+    }
+    /// Mandatory negotiated fragmentation metadata from the same atomic SA record.
+    /// Codecs must reject an omitted field instead of silently disabling support.
+    pub const fn fragmentation(&self) -> Option<super::Ikev2FragmentationParameters> {
+        self.fragmentation
     }
     /// Committed peer receive floor, or exhausted. Empty replies advance only the
     /// runtime's [`super::Ikev2CommittedWindow::next_receive`] until ordinary inbound

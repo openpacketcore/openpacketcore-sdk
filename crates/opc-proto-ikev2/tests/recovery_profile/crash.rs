@@ -251,6 +251,9 @@ fn process_entry() {
     module::install();
     let provider = Provider::new();
     match stage.as_str() {
+        value if value.starts_with("fragments-") => {
+            super::fragmentation_tests::run_process(&root, value, &provider)
+        }
         value if value.starts_with("liveness-") => {
             super::liveness_tests::run_process(&root, value, &provider)
         }

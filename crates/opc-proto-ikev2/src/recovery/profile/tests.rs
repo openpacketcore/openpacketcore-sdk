@@ -157,6 +157,7 @@ fn cbc_storage_keeps_typed_sync_history_without_iv_evidence() {
             None,
             None,
             None,
+            None,
         )
         .unwrap()
         .with_sync_state(state)
@@ -255,12 +256,21 @@ fn cbc_storage_initiating_history_roundtrips_without_counter_interpretation() {
         Disposition::AwaitLocalSync,
     )
     .unwrap();
-    let record = Record::from_persisted(domain(direction), 1, Some(5), Some(6), None, None, None)
-        .unwrap()
-        .with_sync_state(state)
-        .unwrap()
-        .with_sync_recovery(recovery.clone())
-        .unwrap();
+    let record = Record::from_persisted(
+        domain(direction),
+        1,
+        Some(5),
+        Some(6),
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+    .with_sync_state(state)
+    .unwrap()
+    .with_sync_recovery(recovery.clone())
+    .unwrap();
     assert_eq!(record.sync_recovery(), Some(&recovery));
     assert_eq!(recovery.attempts(), std::slice::from_ref(&attempt));
     assert!(Recovery::<Cbc>::from_persisted_cbc(

@@ -417,7 +417,13 @@ fn empty_then_nonempty_repairs_the_floor_without_a_dpd_write() {
                 let committed = prepared.record().clone();
                 assert_eq!(committed.next_receive(), Some(6));
                 assert_eq!(
-                    &committed.inbound().unwrap().response().unwrap()[32..40],
+                    &committed
+                        .inbound()
+                        .unwrap()
+                        .response()
+                        .unwrap()
+                        .single_packet()
+                        .unwrap()[32..40],
                     &u64::from(current).to_be_bytes()
                 );
                 let token = prepared.commit_after_durable(&committed).unwrap();
@@ -432,8 +438,14 @@ fn empty_then_nonempty_repairs_the_floor_without_a_dpd_write() {
                     Ok(Disposition::CachedResponse)
                 );
                 assert_eq!(
-                    window.replay_response(&request).unwrap().bytes(),
-                    committed.inbound().unwrap().response().unwrap()
+                    window.replay_response(&request).unwrap().bytes().unwrap(),
+                    committed
+                        .inbound()
+                        .unwrap()
+                        .response()
+                        .unwrap()
+                        .single_packet()
+                        .unwrap()
                 );
                 assert_eq!(
                     window.reply_empty(&f.request(6)).unwrap().observation(),
@@ -542,8 +554,14 @@ fn reconstruction_ignores_older_replays_and_commits_the_first_nonempty_error_onc
         Ok(Disposition::CachedResponse)
     );
     assert_eq!(
-        restored.replay_response(&request).unwrap().bytes(),
-        committed.inbound().unwrap().response().unwrap()
+        restored.replay_response(&request).unwrap().bytes().unwrap(),
+        committed
+            .inbound()
+            .unwrap()
+            .response()
+            .unwrap()
+            .single_packet()
+            .unwrap()
     );
     window.delete();
 }
@@ -1100,7 +1118,8 @@ fn failed_record_rebuild_requires_the_explicit_epoch_teardown_hook() {
             Some(0),
             None,
             None,
-            None
+            None,
+            None,
         )
         .unwrap_err(),
         Error::InvalidRecord
@@ -1443,8 +1462,14 @@ fn newer_admitted_work_retires_an_ordinary_cached_reply_without_a_write() {
     let committed = prepared.record().clone();
     let _commit = prepared.commit_after_durable(&committed).unwrap();
     assert_eq!(
-        window.replay_response(&request).unwrap().bytes(),
-        committed.inbound().unwrap().response().unwrap()
+        window.replay_response(&request).unwrap().bytes().unwrap(),
+        committed
+            .inbound()
+            .unwrap()
+            .response()
+            .unwrap()
+            .single_packet()
+            .unwrap()
     );
     assert_eq!(
         window.request_disposition(&work(&f, 1)),

@@ -19,6 +19,7 @@ use crate::{
 
 impl<P: RecoveryProfile> Window<P> {
     fn sync_open(&self) -> Result<(), Error> {
+        self.fragments.ready()?;
         if self.quiescent {
             return Err(Error::CommitUncertain);
         }

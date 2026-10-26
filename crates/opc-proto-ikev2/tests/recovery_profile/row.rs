@@ -165,6 +165,7 @@ pub struct WindowImage {
     pub generation: u64,
     pub next_send: Option<u32>,
     pub next_receive: Option<u32>,
+    pub fragmentation: Option<opc_proto_ikev2::recovery::Ikev2FragmentationParameters>,
     pub liveness_limit: Option<std::num::NonZeroU32>,
     pub outbound: Option<Exchange>,
     pub inbound: Option<Exchange>,
@@ -206,6 +207,7 @@ macro_rules! capture {
             next_send: record.next_send(),
             next_receive: record.next_receive(),
             liveness_limit: record.liveness_limit(),
+            fragmentation: record.fragmentation(),
             outbound: record.outbound().cloned(),
             inbound: record.inbound().cloned(),
             sync: record.sync_state().map(|s| SyncImage {
@@ -281,12 +283,9 @@ impl Row {
             return Err(Error::Format);
         }
         if let Some(challenge) = &self.challenge {
-            if self
-                .window
-                .outbound
-                .as_ref()
-                .is_none_or(|entry| entry.request() != challenge.request)
-            {
+            if self.window.outbound.as_ref().is_none_or(|entry| {
+                entry.request().single_packet() != Ok(challenge.request.as_ref())
+            }) {
                 return Err(Error::Format);
             }
         }
@@ -359,6 +358,7 @@ impl Row {
                 next_send: Some(0),
                 next_receive: Some(0),
                 liveness_limit: None,
+                fragmentation: None,
                 outbound: None,
                 inbound: None,
                 sync: (mode == Mode::Negotiated).then_some(SyncImage {
@@ -434,6 +434,7 @@ impl Row {
             self.window.inbound.clone(),
             synchronization,
             self.window.liveness_limit,
+            self.window.fragmentation,
         )
         .map_err(|_| Error::Format)?;
         let retry = image
@@ -509,6 +510,7 @@ impl Row {
             self.window.inbound.clone(),
             synchronization,
             self.window.liveness_limit,
+            self.window.fragmentation,
         )
         .map_err(|_| Error::Format)?;
         Ok((record, epoch))
@@ -524,7 +526,8 @@ impl Row {
         update(&mut candidate);
         if candidate.challenge.as_ref().is_some_and(|challenge| {
             candidate.window.outbound.as_ref().is_none_or(|entry| {
-                entry.response().is_some() || entry.request() != challenge.request
+                entry.response().is_some()
+                    || entry.request().single_packet() != Ok(challenge.request.as_ref())
             })
         }) {
             candidate.challenge = None;

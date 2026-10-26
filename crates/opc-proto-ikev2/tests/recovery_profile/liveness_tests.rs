@@ -35,7 +35,7 @@ macro_rules! window {
     };
 }
 
-fn setup(row: &Row) -> (Provider, CasStore, EpochOwners, Command, Runtime) {
+pub(super) fn setup(row: &Row) -> (Provider, CasStore, EpochOwners, Command, Runtime) {
     let provider = Provider::new();
     let mut store = CasStore::new(7);
     let owners = EpochOwners::new(7);
@@ -136,7 +136,7 @@ fn complete(runtime: &mut Runtime, wire: &[u8]) -> Result<u32, Error> {
     })
 }
 
-fn recover(
+pub(super) fn recover(
     runtime: &mut Runtime,
     provider: &Provider,
     store: &mut CasStore,

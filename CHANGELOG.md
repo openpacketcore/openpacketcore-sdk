@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-ikev2` recovery supports negotiated RFC 7383 fragmentation. Exchange
+  records retain ordered `Ikev2ProtectedMessage` packet collections; callers
+  must persist and replay every `packets()` entry. Single-packet accessors now
+  return a `Result`. Persist the explicit `fragmentation` option when rebuilding
+  window records; the strict test consumer row format is version 3. Negotiated
+  consumers use `receive_peer_packet`, with bounded reassembly, scheduled expiry,
+  and authenticated fragment-1 response replay. (#1242)
+
 - `opc-libsctp-sys::AddressFamily` adds `Ipv6DualStack`; exhaustive matches
   must handle it. `opc-sctp` selects it for mixed IPv4/IPv6 static multihoming
   sets and preserves each set's port, wildcard and count limits. IPv4-mapped
