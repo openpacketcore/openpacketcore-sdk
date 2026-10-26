@@ -27882,6 +27882,9 @@ mod aya_runtime {
         ) -> Result<(u64, u64), GtpuError> {
             let stat = rustix::fs::statat(pin, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|error| GtpuError::io(operation, error.into()))?;
+            // Linux stat link counts differ in width between architectures.
+            #[allow(clippy::useless_conversion)]
+            let nlink = u64::from(stat.st_nlink);
             if !historical_25_pin_leaf_is_exact(
                 rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file(),
                 stat.st_uid,
@@ -27889,7 +27892,7 @@ mod aya_runtime {
                 rustix::process::geteuid().as_raw(),
                 rustix::process::getegid().as_raw(),
                 stat.st_mode,
-                stat.st_nlink,
+                nlink,
             ) {
                 return Err(state_indeterminate(operation));
             }

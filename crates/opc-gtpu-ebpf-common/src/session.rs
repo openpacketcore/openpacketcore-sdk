@@ -3743,6 +3743,32 @@ mod tests {
         .is_none());
     }
 
+    #[test]
+    fn zero_peer_teid_is_valid_in_typed_and_borrowed_group_authority() {
+        for mut bytes in [independent_v4_entry_bytes(), independent_v6_entry_bytes()] {
+            bytes[56..60].fill(0);
+            let entry = GtpuSessionEntry::decode(&bytes).expect("peer TEID zero is valid");
+            assert_eq!(entry.peer_teid(), [0; 4]);
+            assert_eq!(entry.encode(), bytes);
+            bytes[52..56].fill(0);
+            assert!(GtpuSessionEntry::decode(&bytes).is_none());
+        }
+        let mut entry = v4_entry();
+        entry.peer_teid = [0; 4];
+        let authority = active(3, Some(entry), None).encode();
+        let reference = GtpuSessionGroupRef::single(group_id(), candidate(3, entry)).encode();
+        let config = device_config().encode();
+        let selected = select_gtpu_session_entry_wire(
+            &authority,
+            &reference,
+            &config,
+            42,
+            GTPU_SESSION_IPV4_SLOT,
+        )
+        .expect("borrowed zero-peer entry");
+        assert_eq!(selected.peer_teid(), [0; 4]);
+    }
+
     fn independent_v4_entry_bytes() -> [u8; GTPU_SESSION_ENTRY_LEN] {
         let mut raw = [0_u8; GTPU_SESSION_ENTRY_LEN];
         raw[0] = ENTRY_FORMAT_VERSION;

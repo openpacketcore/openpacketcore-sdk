@@ -8924,6 +8924,55 @@ fn privileged_current_ebpf_graph_recovery_request(
 // PRIVILEGED_TEST_LOCK.
 #[allow(clippy::await_holding_lock)]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_zero_peer_teid_is_sent_on_the_wire() -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    let mut context = session_context(device.ifindex);
+    context.peer_teid = PeerTeid::ZERO;
+    backend.install_pdp_context(context.clone()).await?;
+    let selector = PdpContextSelector::LocalTeid(
+        PdpContextLocalTeidSelector::from_context(&context).ok_or("local selector")?,
+    );
+    assert_eq!(
+        backend.read_pdp_context(selector).await?,
+        PdpContextReadback::Present(context.clone())
+    );
+    let peer = in_netns(&net.pgw_ns, || UdpSocket::bind((PGW_IP, GTPU_PORT)))?;
+    let sender = in_netns(&net.ue_ns, || UdpSocket::bind((UE_PAA, 5000)))?;
+    let mut wire = [0_u8; 2048];
+    let (len, source) = send_until_received(
+        || {
+            let _ = sender.send_to(b"opc-zero-peer", (REMOTE_HOST, 53));
+        },
+        &peer,
+        &mut wire,
+    )
+    .ok_or("zero-peer uplink G-PDU did not reach the peer")?;
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(&wire[..2], &[0x30, 0xff]);
+    assert_eq!(&wire[4..8], &[0, 0, 0, 0]);
+    assert_eq!(usize::from(u16::from_be_bytes([wire[2], wire[3]])), len - 8);
+    assert!(wire[..len].ends_with(b"opc-zero-peer"));
+    backend
+        .remove_pdp_context(RemovePdpContextRequest::from_context(&context))
+        .await?;
+    backend.remove_device(&device).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_NET_ADMIN, CAP_BPF, bpffs, and isolated netns"]
 async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {

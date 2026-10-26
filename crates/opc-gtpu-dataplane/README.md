@@ -10,6 +10,11 @@ eBPF, mock, and unsupported backends, and keeps raw syscalls in
 The crate does not implement GTP-C, PFCP, namespace management, route steering,
 XFRM policy, deployment defaults, or traffic-readiness policy.
 
+`GtpPdpContext.peer_teid` and `ReceivedN3UplinkTnl` use `PeerTeid`, which
+accepts the peer-assigned zero value required by TS 29.281 section 5.1.
+Locally allocated TEIDs still use nonzero `Teid`. Convert an existing peer
+value with `PeerTeid::from(teid)` or construct it with `PeerTeid::new(raw)`.
+
 ## Experimental N3 packet and intent boundary
 
 The `n3` module keeps received uplink UPF TNL information separate from

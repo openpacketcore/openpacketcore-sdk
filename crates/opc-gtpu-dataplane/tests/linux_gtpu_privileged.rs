@@ -588,6 +588,74 @@ fn privileged_recovery_root() -> PathBuf {
     std::env::temp_dir().join(format!("opc-gtpu-627-priv-recovery-{}", std::process::id()))
 }
 
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn zero_peer_teid_is_installed_and_sent_on_the_wire() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert!(Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status()?
+        .success());
+    assert!(Command::new("ip")
+        .args(["addr", "add", "192.0.2.1/32", "dev", "lo"])
+        .status()?
+        .success());
+    let backend = LinuxGtpuDataplaneBackend::new();
+    let mut create = CreateGtpDeviceRequest::new("gtpzero");
+    create.bind_address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    create.bind_port = 32_153;
+    let device = backend.create_device(create).await?;
+    let mut context = privileged_recovery_context(&device)?;
+    context.peer_teid = PeerTeid::ZERO;
+    context.peer_address = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+    let result = async {
+        let peer = UdpSocket::bind((context.peer_address, GTPU_PORT))?;
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        backend.install_pdp_context(context.clone()).await?;
+        let selector = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(&context).ok_or("local selector")?,
+        );
+        assert_eq!(
+            backend.read_pdp_context(selector).await?,
+            PdpContextReadback::Present(context.clone())
+        );
+        assert!(Command::new("ip")
+            .args(["link", "set", &device.name, "up"])
+            .status()?
+            .success());
+        assert!(Command::new("ip")
+            .args([
+                "route",
+                "add",
+                "10.23.0.9/32",
+                "dev",
+                &device.name,
+                "src",
+                "192.0.2.1"
+            ])
+            .status()?
+            .success());
+        let sender = UdpSocket::bind((Ipv4Addr::new(192, 0, 2, 1), 0))?;
+        sender.send_to(b"opc-zero-peer", (context.ms_address, 5000))?;
+        let mut wire = [0_u8; 2048];
+        let (len, _) = peer.recv_from(&mut wire)?;
+        assert_eq!(&wire[..2], &[0x30, 0xff]);
+        assert_eq!(&wire[4..8], &[0, 0, 0, 0]);
+        assert_eq!(usize::from(u16::from_be_bytes([wire[2], wire[3]])), len - 8);
+        assert!(wire[..len].ends_with(b"opc-zero-peer"));
+        backend
+            .remove_pdp_context(RemovePdpContextRequest::from_context(&context))
+            .await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    let cleanup = backend.remove_device(&device).await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
 fn privileged_recovery_context(device: &GtpDevice) -> Result<GtpPdpContext, &'static str> {
     Ok(GtpPdpContext {
         local_teid: Teid::new(0x1400_0001).ok_or("local TEID must be nonzero")?,
