@@ -68,8 +68,11 @@ impl RecoveryProfile for Gcm {
         }
         Ok(())
     }
-    fn check_sync_evidence(record: &SyncRecord<Self>, epoch: &Self::Epoch) -> Result<(), Error> {
-        if epoch.exclusive_end() < record.minimum_send_iv_end() {
+    fn check_packet_evidence(
+        evidence: &Self::SyncEvidence,
+        epoch: &Self::Epoch,
+    ) -> Result<(), Error> {
+        if epoch.exclusive_end() < evidence.minimum_send_iv_end {
             return Err(Error::InvalidRecord);
         }
         Ok(())
@@ -93,6 +96,10 @@ impl RecoveryProfile for Gcm {
         let Some(sync) = &mut target.sync else {
             return Ok(());
         };
+        sync.packet_evidence.minimum_send_iv_end = sync
+            .packet_evidence
+            .minimum_send_iv_end
+            .max(source.probe.evidence.minimum_send_iv_end);
         let ordinary = source
             .record
             .outbound

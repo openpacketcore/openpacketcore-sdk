@@ -110,10 +110,12 @@ impl<P: RecoveryProfile> Window<P> {
         let pending = durable_pending.as_ref().or(pending);
         let opened = sync_packet::open_request(&self.record.domain, profile, keys, wire)?;
         let mut counters = Counters::new(
-            self.record.next_send.unwrap_or(u32::MAX),
+            // Preserve replay rejection before evaluating exhaustion, including a lost probe lead.
+            self.sync_send_floor().unwrap_or(u32::MAX),
             self.next_receive().unwrap_or(u32::MAX),
         );
-        counters.highest_local_request = state.highest_local_request;
+        counters.highest_local_request =
+            state.highest_local_request.max(self.probe.highest_request);
         counters.highest_peer_request = state
             .highest_peer_request
             .max(self.observed_peer_request.get());
@@ -278,6 +280,7 @@ impl<P: RecoveryProfile> Ikev2PreparedSyncResponse<'_, P> {
         self.window.witness = None;
         let disposition = self.record.sync.ok_or(Error::InvalidRecord)?.disposition;
         self.window.record = self.record;
+        self.window.adopt_send_floor(true);
         self.window.observed_peer_request.set(None);
         self.window.quiescent = false;
         self.window.adopt_receive_boundary()?;

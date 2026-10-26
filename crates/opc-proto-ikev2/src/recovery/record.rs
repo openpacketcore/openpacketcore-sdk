@@ -229,6 +229,7 @@ pub struct Ikev2CommittedWindowRecord<P: RecoveryProfile = Gcm> {
     pub(super) inbound: Option<Ikev2CommittedExchangeRecord>,
     pub(super) sync: Option<Ikev2SyncResponderRecord<P>>,
     pub(super) recovery: Option<super::Ikev2SyncRecoveryRecord<P>>,
+    pub(super) liveness_limit: Option<std::num::NonZeroU32>,
 }
 
 impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
@@ -251,6 +252,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
             inbound: None,
             sync: None,
             recovery: None,
+            liveness_limit: None,
         }
     }
 
@@ -260,6 +262,10 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
     /// authenticates every cached packet, correlates its response, checks floors
     /// and, for GCM, cross-checks locally sent IVs against its reservation record.
     /// CBC authenticates stored random-IV packets without counter interpretation.
+    /// Restore `liveness_limit` explicitly from the same record; an omitted field
+    /// must not become `None`. Legacy rows may migrate as disabled only when their
+    /// schema predates local probe support. A positive bound requires a committed
+    /// generation and causes cold restoration to enforce liveness recovery.
     /// # Errors
     /// Rejects an incomplete inbound result or exhausted direction with no history.
     pub fn from_persisted(
@@ -269,13 +275,15 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
         next_receive: Option<u32>,
         outbound: Option<Ikev2CommittedExchangeRecord>,
         inbound: Option<Ikev2CommittedExchangeRecord>,
+        liveness_limit: Option<std::num::NonZeroU32>,
     ) -> Result<Self, Error> {
         if inbound
             .as_ref()
             .is_some_and(|entry| entry.response.is_none())
             || (next_send.is_none() && outbound.is_none())
             || (next_receive.is_none() && inbound.is_none())
-            || (generation == 0 && (outbound.is_some() || inbound.is_some()))
+            || (generation == 0
+                && (outbound.is_some() || inbound.is_some() || liveness_limit.is_some()))
         {
             return Err(Error::InvalidRecord);
         }
@@ -288,13 +296,14 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
             inbound,
             sync: None,
             recovery: None,
+            liveness_limit,
         })
     }
 
     /// Rebuild the supported recovery profile with mandatory synchronization mode.
     ///
     /// Obtain every argument from one latest, fenced atomic record. The codec must
-    /// reject omitted mode, history or event-presence fields before calling this
+    /// reject omitted mode, history, event-presence or liveness fields before calling this
     /// function. In particular it must not synthesize `Base` or an absent event.
     /// This checks structural completeness and the immutable agreement binding;
     /// [`super::Ikev2CommittedWindow::restore`] must still authenticate cached
@@ -304,6 +313,10 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
     /// Rejects invalid ordinary fields, a foreign SA/original role, disagreement
     /// between the explicit mode and immutable agreement, inconsistent sync
     /// history, or missing event history after any local synchronization proposal.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit fields of one atomic persisted window"
+    )]
     pub fn from_profile_persisted(
         domain: Ikev2CommittedWindowDomain<P>,
         generation: u64,
@@ -312,6 +325,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
         outbound: Option<Ikev2CommittedExchangeRecord>,
         inbound: Option<Ikev2CommittedExchangeRecord>,
         synchronization: Ikev2PersistedProfileSync<P>,
+        liveness_limit: Option<std::num::NonZeroU32>,
     ) -> Result<Self, Error> {
         let record = Self::from_persisted(
             domain,
@@ -320,6 +334,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
             next_receive,
             outbound,
             inbound,
+            liveness_limit,
         )?;
         let agreement = match &synchronization {
             Ikev2PersistedProfileSync::Base { agreement }
@@ -416,6 +431,11 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
     /// Next unused local request ID, or exhausted. MAX is the final usable ID.
     pub const fn next_send(&self) -> Option<u32> {
         self.next_send
+    }
+    /// Mandatory persisted opt-in: `None` disables probes, `Some` bounds their unwritten lead.
+    /// A codec must reject an omitted field, and must never reset it on restart.
+    pub const fn liveness_limit(&self) -> Option<std::num::NonZeroU32> {
+        self.liveness_limit
     }
     /// Committed peer receive floor, or exhausted. Empty replies advance only the
     /// runtime's [`super::Ikev2CommittedWindow::next_receive`] until ordinary inbound

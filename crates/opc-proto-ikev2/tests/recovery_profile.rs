@@ -28,6 +28,8 @@ mod inputs;
 mod ke;
 #[path = "recovery_profile/lifecycle.rs"]
 mod lifecycle;
+#[path = "recovery_profile/liveness_tests.rs"]
+mod liveness_tests;
 #[path = "recovery_profile/module.rs"]
 mod module;
 #[path = "recovery_profile/peer.rs"]

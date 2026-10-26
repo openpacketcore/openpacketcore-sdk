@@ -40,6 +40,7 @@ fn negotiated_local_sync_requires_the_original_recovery_event() {
             state,
             recovery: None,
         },
+        None,
     );
     assert!(
         record.is_err(),
@@ -77,6 +78,7 @@ macro_rules! checked_metadata {
                 None,
                 None,
                 synchronization,
+                None,
             )
         };
         let base_record = rebuild(ProfileSync::Base { agreement: base }).unwrap();
@@ -167,7 +169,8 @@ macro_rules! checked_metadata {
                         agreement: negotiated,
                         state: state(negotiated, Some(1), disposition),
                         recovery: None,
-                    }
+                    },
+                    None
                 )
                 .unwrap_err(),
                 Error::InvalidRecord,
@@ -251,6 +254,7 @@ macro_rules! preserves_event {
                 state: sync,
                 recovery: Some(recovery.clone()),
             },
+            None,
         )
         .unwrap();
         assert_eq!(checked, *original);
@@ -302,6 +306,7 @@ fn checked_profile_preserves_real_pending_sync_event_in_each_cipher() {
                     .unwrap(),
                     recovery: None,
                 },
+                None,
             )
             .unwrap();
             f.window = Window::restore(seed.domain(), f.profile, &f.keys, &seed, &f.iv).unwrap();
@@ -349,6 +354,7 @@ fn checked_profile_preserves_real_pending_sync_event_in_each_cipher() {
                     .unwrap(),
                     recovery: None,
                 },
+                None,
             )
             .unwrap();
             let mut window =

@@ -44,7 +44,8 @@ composition guarantees merely by remaining callable.
 | Exchange classes | Final IKE_AUTH seeding/replay, CREATE_CHILD_SA and INFORMATIONAL. Handshake authentication precedes established-SA effects. |
 | Request windows | One outstanding ordinary request in each independent direction, for both original roles. Never send `SET_WINDOW_SIZE`. Zero is a valid ID where that direction's history permits it; `None` means exhaustion. |
 | Empty receive | Canonical policy and preflight, checked restore, then `enable_empty_replies`. CBC uses `preflight_cbc`; sync readiness does not qualify canonical replies. |
-| Base recovery | Restore committed history and reconstruct the lost empty prefix. No synthetic local liveness probe. |
+| Base recovery | Restore committed history and reconstruct the lost empty receive prefix. If local liveness was enabled, a cold restore without a pending ordinary request retires/re-establishes the epoch; it cannot safely reuse unwritten probe IDs. |
+| Local liveness | Commit a positive `liveness_limit` once, then use fresh empty INFORMATIONAL requests and exact retransmission without per-probe writes. Fold live send IDs into ordinary commits or explicit checkpoints. Pending probes block local ordinary requests, not the independent peer direction. |
 | Negotiated sync | Persist authenticated bilateral agreement; require `sync_readiness`, initiation and response handlers. Never assert `IPSEC_REPLAY_COUNTER_SYNC_SUPPORTED` (16421); ESP counter restoration is outside this profile. |
 | Persistence | Exact prior birth/generation CAS under the current RFC 022 execution stamp, with the SA, window, IV state and operation outcome committed atomically. |
 | Execution | One live window and allocator owner per immutable SA key epoch, including within one process. Positive authority is required to recover that cohort. |
@@ -338,7 +339,7 @@ replies immediately.
 
 ## Negotiated restart and terminal policy
 
-Use base reconstruction by default even when RFC 6311 was negotiated. Preserve
+Use base reconstruction by default when local liveness is disabled, even when RFC 6311 was negotiated. Preserve
 pending ordinary exchanges rather than making every restart abandon the peer's
 work. Resume an already committed unfinished sync event with its original budget.
 Otherwise consume one genuine, locally established recovery event only as a
@@ -347,8 +348,20 @@ traffic. A replay or unauthenticated packet cannot create/reset an event; a
 retransmission can reveal a stall only within the already established local
 recovery cause. Do not infer a new failover from peer silence.
 
+Local liveness opt-in adds a mandatory persisted `liveness_limit` field; the
+complete-row test codec is version 2 and rejects old or incomplete encodings.
+With that opt-in, cold restore conservatively blocks ordinary traffic unless
+a persisted pending ordinary request proves no subsequent probe could have
+escaped. Otherwise negotiated counter synchronization must cover the entire
+possible unwritten local lead, or the consumer retires and re-establishes the
+IKE/Child epoch. Re-enabling liveness cannot bypass the restart gate. After a
+probe's retransmission budget, abandonment likewise cannot skip its possibly
+undelivered request slot; a consumer declaring the peer dead retires its SAs.
+The SDK's negotiated recovery API does not reset the consumer's liveness budget.
+
 After ordinary work is resolved, a negotiated stalled SA uses sync; a base SA
-commits an IKE Delete through its independent send direction. Existing pending
+with an available send direction commits an IKE Delete. If lost local probes
+block that direction, retire the epoch locally instead. Existing pending
 outbound work first completes or reaches its original protocol failure path;
 never allocate a second slot. This is an automatic bounded path, not a wait for
 lifetime expiry. Valid negotiated peer-initiated sync must also be answered;

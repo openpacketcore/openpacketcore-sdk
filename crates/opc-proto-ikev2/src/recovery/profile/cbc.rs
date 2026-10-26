@@ -53,7 +53,7 @@ impl RecoveryProfile for Cbc {
     fn check_local_ordinary(_: &Ordinary<Self>, _: &Self::Epoch) -> Result<(), Error> {
         Ok(())
     }
-    fn check_sync_evidence(_: &SyncRecord<Self>, _: &Self::Epoch) -> Result<(), Error> {
+    fn check_packet_evidence(_: &Self::SyncEvidence, _: &Self::Epoch) -> Result<(), Error> {
         Ok(())
     }
     fn check_next_sync_attempt(

@@ -43,10 +43,12 @@ impl<P: RecoveryProfile> Window<P> {
     fn sync_counters(&self) -> Result<Counters, Error> {
         let state = self.record.sync_state().ok_or(Error::Drop)?;
         let mut counters = Counters::new(
-            self.record.next_send.ok_or(Error::SyncClosed)?,
+            self.sync_send_floor()?,
             self.next_receive().ok_or(Error::SyncClosed)?,
         );
-        counters.highest_local_request = state.highest_local_request();
+        counters.highest_local_request = state
+            .highest_local_request()
+            .max(self.probe.highest_request);
         counters.highest_peer_request = state
             .highest_peer_request()
             .max(self.observed_peer_request.get());
@@ -111,8 +113,8 @@ impl<P: RecoveryProfile> Window<P> {
         clock: Clock,
         pending_inbound: Option<&Ordinary<P>>,
     ) -> Result<Ikev2AdmittedSyncInitiation<'_, P>, Error> {
-        self.ready()?;
         self.sync_open()?;
+        self.sync_lifecycle_ready()?;
         if pending_inbound.is_some()
             || self.receive.pending.borrow().is_some()
             || self
@@ -430,6 +432,7 @@ impl<'a, P: RecoveryProfile> Ikev2AdmittedSyncInitiation<'a, P> {
         let sync = record.sync.as_mut().ok_or(Error::InvalidRecord)?;
         P::retain_sealed(&mut sync.packet_evidence, &request)?;
         sync.highest_local_proposal = Some(value.expected_send_req_message_id());
+        sync.highest_local_request = self.counters.highest_local_request;
         sync.highest_peer_request = self.counters.highest_peer_request;
         sync.disposition = Disposition::AwaitLocalSync;
         sync.validate(&record)?;
@@ -483,6 +486,7 @@ impl<P: RecoveryProfile> Ikev2PreparedSyncInitiation<'_, P> {
         let policy = self.record.sync_recovery().map(|record| record.policy());
         let check_clock = matches!(self.action, Ikev2SyncInitiatorAction::SendRequest(_));
         self.window.record = self.record;
+        self.window.adopt_send_floor(true);
         self.window.quiescent = false;
         self.window.observed_peer_request.set(None);
         self.window.sync_live = false;

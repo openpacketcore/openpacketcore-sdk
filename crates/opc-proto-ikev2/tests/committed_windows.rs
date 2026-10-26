@@ -317,6 +317,7 @@ fn sync_metadata_round_trips_and_ordinary_commits_retain_request_history() {
             record.next_receive(),
             record.outbound().cloned(),
             record.inbound().cloned(),
+            None,
         )
         .unwrap()
         .with_sync_state(rebuilt_state)
@@ -340,6 +341,7 @@ fn sync_metadata_round_trips_and_ordinary_commits_retain_request_history() {
             record.next_receive(),
             record.outbound().cloned(),
             record.inbound().cloned(),
+            None,
         )
         .unwrap()
         .with_sync_state(missing_history)
@@ -386,9 +388,16 @@ fn sync_metadata_refuses_foreign_agreements_and_impossible_history() {
             0,
         )
         .unwrap();
-        let record =
-            Record::from_persisted(fixture.domain.clone(), 1, Some(5), Some(5), None, None)
-                .unwrap();
+        let record = Record::from_persisted(
+            fixture.domain.clone(),
+            1,
+            Some(5),
+            Some(5),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(matches!(
             record.with_sync_state(state),
             Err(Error::InvalidRecord)
@@ -454,11 +463,18 @@ fn restoring_sync_disposition_keeps_ordinary_work_and_replay_blocked() {
             0,
         )
         .unwrap();
-        let record =
-            Record::from_persisted(fixture.domain.clone(), 1, Some(3), Some(4), None, None)
-                .unwrap()
-                .with_sync_state(state)
-                .unwrap();
+        let record = Record::from_persisted(
+            fixture.domain.clone(),
+            1,
+            Some(3),
+            Some(4),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_sync_state(state)
+        .unwrap();
         let mut window = fixture.restore(&record);
         assert!(matches!(window.replay_request(), Err(error) if error == expected));
         let peer = fixture.peer(4, false, Exchange::Informational, delete(), 100);
@@ -990,6 +1006,7 @@ fn restore_checks_both_key_domains_counters_and_exact_response_identity() {
         Some(0),
         record.outbound().cloned(),
         None,
+        None,
     )
     .unwrap();
     assert!(Window::restore(
@@ -1014,6 +1031,7 @@ fn restore_checks_both_key_domains_counters_and_exact_response_identity() {
         Some(0),
         Some(exchange),
         None,
+        None,
     )
     .unwrap();
     assert!(Window::restore(
@@ -1030,6 +1048,7 @@ fn restore_checks_both_key_domains_counters_and_exact_response_identity() {
         u64::MAX,
         Some(0),
         Some(0),
+        None,
         None,
         None,
     )
@@ -1093,6 +1112,7 @@ fn restore_requires_iv_high_water_above_every_locally_sent_cached_iv() {
                     Some(u32::from(inbound.is_some())),
                     outbound,
                     inbound,
+                    None,
                 )
                 .unwrap();
                 let highest = request_iv.into_iter().chain(response_iv).max().unwrap();

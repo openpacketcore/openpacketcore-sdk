@@ -446,12 +446,52 @@ never use a settled request as a liveness probe. `replay_request` returns `None`
 for settled exchanges, as specified in
 [RFC 030](../../docs/rfc/030-ike-recovery-profile.md). A live peer
 may have forgotten an old response, and replies to old bytes establish no fresh
-liveness. Without a pending request there is no artificial probe. This profile
-has no local empty-INFORMATIONAL liveness-check API: fresh empty requests are
-refused as durable work; `reply_empty` answers peer requests only. Use fresh
-authenticated inbound traffic or genuine new committed work, such as rekey,
-with its declared retry/liveness bound. Keepalives remain outside IKE windows;
-negotiation grants no fresh-DPD bypass or IV reservation for a probe.
+liveness. Fresh checks use the separate local empty-INFORMATIONAL API below.
+Keepalives remain outside IKE windows; negotiation alone grants no probe or IV
+reservation authority.
+
+### Local liveness probes
+
+Commit `prepare_liveness(NonZeroU32)` once to enable a bounded number of unwritten
+probe IDs. `send_empty_request` then seals one empty INFORMATIONAL at the live
+`next_send()` floor, without a window/store write. GCM consumes an allocation
+from an already committed reservation; CBC takes `()` and uses admitted random-IV
+encryption. A probe cannot initiate an IV reservation write. Retain the returned
+borrow and external send fence through transmission. `retransmit_empty_request`
+returns the same ID, IV and bytes; `complete_empty_request` accepts only the
+authenticated matching empty response. Local ordinary requests, including Delete
+and rekey, wait for the probe slot; independent peer requests can proceed.
+
+The consumer owns the inactivity decision across the IKE SA **and all Child SAs**,
+exponential retransmission backoff and the original timeout budget
+([RFC 7296 §2.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.4),
+3GPP TS 24.302 §7.4.1A). Unauthenticated traffic and NAT keepalives do not count.
+An unanswered probe can be abandoned, but `LivenessRecoveryRequired` then blocks
+ordinary traffic: the peer may never have received that request. If the consumer
+concludes the peer is dead, it retires the IKE SA and its Children. Abandonment
+does not permit another probe to restart that failure budget.
+
+Each ordinary commit folds the volatile send floor. When the unwritten bound is
+reached, `LivenessCheckpointRequired` requires a deliberate checkpoint using
+`prepare_liveness`, or genuine ordinary work. Folding may retire a settled outbound
+packet cache that is no longer adjacent to the send floor; consumer outcomes must
+already be durable and idempotent. Unsettled ordinary requests are never discarded.
+MAX is reserved for ordinary work, and exhausted IDs never wrap.
+
+Persist `liveness_limit()` explicitly alongside every other window field. Both
+persisted-record constructors require the new argument; readers must reject an
+omitted field. The test consumer uses strict row-format version 2. A cold restore
+with liveness enabled requires negotiated RFC 6311 synchronization to at least
+`durable_next_send + liveness_limit`, or retirement/re-establishment of the SA.
+This prevents an old authenticated empty response from completing a new probe
+that reused its ID. A persisted pending ordinary request is the safe exception:
+the single-slot rule proves no later probe could have escaped before its durable
+completion. In-process `reconcile` instead retains the live probe and send floor;
+only an adopted sync cutover retires them. Base fallback has no counter-sync path.
+
+The [peer-model tests](tests/recovery_profile/liveness_tests.rs) exercise both
+roles, all 51 GCM/CBC profiles and both sync modes, including write fault cuts,
+restart, peer-initiated sync and ordinary work during a pending probe.
 
 ### Zero-write empty requests and restart reconstruction
 
@@ -519,10 +559,8 @@ or synchronization cutover committed in the current runtime. These observations
 never authorize endpoint, key, bearer, lifetime or application-outcome changes.
 Settled replay is not a liveness check. An idle peer's DPD after restart remains
 `Uncertain` until a nonempty exchange or sync boundary commits, so a consumer
-cannot require `Fresh` from DPD alone to recover liveness. A §2.4 liveness probe
-would require a genuinely new INFORMATIONAL request; this recovery profile does
-not provide such a local probe. Its consumer must bound outgoing-only failure
-detection through genuine new committed requests and protocol lifetime policy.
+cannot require `Fresh` from peer DPD alone to recover liveness. The local probe API
+above provides fresh requests after its durable opt-in and any required recovery.
 The recovery extension is SDK policy justified by the trusted durable history;
 RFC 7296 does not specify crash reconstruction. Its relevant protocol rules are
 [§1.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-1.4) (empty

@@ -149,11 +149,18 @@ fn cbc_storage_keeps_typed_sync_history_without_iv_evidence() {
         let record = Record::initial(domain, 1, 1)
             .with_sync_state(state)
             .unwrap();
-        let restored =
-            Record::from_persisted(record.domain().clone(), 0, Some(1), Some(1), None, None)
-                .unwrap()
-                .with_sync_state(state)
-                .unwrap();
+        let restored = Record::from_persisted(
+            record.domain().clone(),
+            0,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_sync_state(state)
+        .unwrap();
         assert_eq!(record, restored);
         assert_eq!(record.sync_state().unwrap().agreement(), agreement);
         assert_eq!(record.domain().send.direction(), direction);
@@ -248,7 +255,7 @@ fn cbc_storage_initiating_history_roundtrips_without_counter_interpretation() {
         Disposition::AwaitLocalSync,
     )
     .unwrap();
-    let record = Record::from_persisted(domain(direction), 1, Some(5), Some(6), None, None)
+    let record = Record::from_persisted(domain(direction), 1, Some(5), Some(6), None, None, None)
         .unwrap()
         .with_sync_state(state)
         .unwrap()

@@ -22,6 +22,40 @@ fn round_trip(row: &Row) -> Row {
 }
 
 #[test]
+fn liveness_mode_is_mandatory_nonzero_and_survives_full_row_reconstruction() {
+    for (index, profile) in inputs::profiles().enumerate() {
+        let mut row = inputs::fresh(
+            4_180_000 + index as u64,
+            profile,
+            crate::canonical_fixtures::DIRECTIONS[0],
+            Mode::Negotiated,
+        );
+        row.window.generation = 1;
+        row.window.liveness_limit = std::num::NonZeroU32::new(4);
+        let rebuilt = round_trip(&row);
+        assert_eq!(rebuilt.window.liveness_limit, row.window.liveness_limit);
+        let mut encoded = Codec::encode(&row).unwrap();
+        encoded[4..6].copy_from_slice(&1u16.to_be_bytes());
+        assert!(Codec::decode(&encoded, row.key, row.version, row.sealed_stamp).is_err());
+        encoded[4..6].copy_from_slice(&2u16.to_be_bytes());
+        let mut offset = 6;
+        while encoded[offset] != 6 {
+            offset += 5 + u32::from_be_bytes(encoded[offset + 1..offset + 5].try_into().unwrap())
+                as usize;
+        }
+        let length = u32::from_be_bytes(encoded[offset + 1..offset + 5].try_into().unwrap());
+        // Field 6: generation, two present u32 floors, then the explicit liveness option.
+        let liveness = offset + 5 + 8 + 5 + 5;
+        assert_eq!(&encoded[liveness..liveness + 5], &[1, 0, 0, 0, 4]);
+        encoded[liveness + 1..liveness + 5].fill(0);
+        assert!(Codec::decode(&encoded, row.key, row.version, row.sealed_stamp).is_err());
+        encoded.drain(liveness..liveness + 5);
+        encoded[offset + 1..offset + 5].copy_from_slice(&(length - 5).to_be_bytes());
+        assert!(Codec::decode(&encoded, row.key, row.version, row.sealed_stamp).is_err());
+    }
+}
+
+#[test]
 fn complete_row_codec_requires_every_field_for_all_profiles_roles_and_modes() {
     let mut cases = 0;
     for (index, profile) in inputs::profiles().enumerate() {

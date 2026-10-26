@@ -102,6 +102,7 @@ impl Fixture {
             Some(receive),
             None,
             None,
+            None,
         )
         .unwrap()
         .with_sync_state(
@@ -355,6 +356,7 @@ fn pending_restore_binds_history_floors_packet_nonce_and_reserved_iv() {
                 record.generation(),
                 record.next_send(),
                 record.next_receive(),
+                None,
                 None,
                 None,
             )
@@ -1423,6 +1425,7 @@ fn ordinary_exhaustion_after_recovery_restores_history_and_latches_sync_closure(
         closed.next_receive(),
         closed.outbound().cloned(),
         closed.inbound().cloned(),
+        None,
     )
     .unwrap()
     .with_sync_state(*closed.sync_state().unwrap())

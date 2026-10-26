@@ -1093,8 +1093,16 @@ fn failed_record_rebuild_requires_the_explicit_epoch_teardown_hook() {
     window.reply_empty(&f.request(0)).unwrap();
     drop(window);
     assert_eq!(
-        Record::from_persisted(Domain::from_iv_record(&f.iv), 1, None, Some(0), None, None)
-            .unwrap_err(),
+        Record::from_persisted(
+            Domain::from_iv_record(&f.iv),
+            1,
+            None,
+            Some(0),
+            None,
+            None,
+            None
+        )
+        .unwrap_err(),
         Error::InvalidRecord
     );
     let still_live = start(&f, &original);

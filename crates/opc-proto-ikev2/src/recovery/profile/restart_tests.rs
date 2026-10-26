@@ -106,6 +106,7 @@ fn restore(f: &mut Fixture, serialized: &str) -> Record<Cbc> {
         Some(fields[3].parse().unwrap()),
         None,
         inbound,
+        None,
     )
     .unwrap();
     assert_eq!(store(&f.epoch, &record), serialized);

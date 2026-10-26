@@ -188,7 +188,7 @@ impl<'a> Fields<'a> {
             return Err(Error::Format);
         }
         let mut r = Reader::new(bytes);
-        if r.take(4)? != b"IKER" || r.u16()? != 1 {
+        if r.take(4)? != b"IKER" || r.u16()? != 2 {
             return Err(Error::Format);
         }
         let mut fields = BTreeMap::new();
@@ -261,7 +261,7 @@ impl ProfileCodec {
         }
         let mut out = Writer::new();
         out.raw(b"IKER");
-        out.u16(1);
+        out.u16(2);
         out.field(1, |w| {
             w.u64(row.key.0);
             w.u64(row.version.birth);
@@ -310,6 +310,7 @@ impl ProfileCodec {
             w.u64(image.generation);
             w.opt32(image.next_send);
             w.opt32(image.next_receive);
+            w.opt32(image.liveness_limit.map(std::num::NonZeroU32::get));
             exchange(w, image.outbound.as_ref());
             exchange(w, image.inbound.as_ref());
         })?;
@@ -551,6 +552,10 @@ impl ProfileCodec {
             generation: r.u64()?,
             next_send: r.opt32()?,
             next_receive: r.opt32()?,
+            liveness_limit: r
+                .opt32()?
+                .map(|value| std::num::NonZeroU32::new(value).ok_or(Error::Format))
+                .transpose()?,
             outbound: read_exchange(&mut r)?,
             inbound: read_exchange(&mut r)?,
             sync: None,

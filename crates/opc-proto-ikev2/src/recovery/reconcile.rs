@@ -122,6 +122,7 @@ impl<P: RecoveryProfile> Window<P> {
             return Err(Error::InvalidRecord);
         };
         P::check_epoch_transition(&self.canonical_binding, epoch)?;
+        P::check_packet_evidence(&self.probe.evidence, epoch)?;
         Self::validate_record(&self.record.domain, profile, keys, record, epoch)?;
         // Even a candidate that did not land consumed acknowledged IVs. Its
         // response-only sync IV is represented by minimum_send_iv_end.
@@ -140,6 +141,7 @@ impl<P: RecoveryProfile> Window<P> {
         // Retain the applicable last reply for unchanged/outbound readback.
         self.receive.retire_readback(next, boundary)?;
         self.record = record.clone();
+        self.adopt_send_floor(kind == Some(Kind::Sync));
         self.canonical_binding = epoch.clone();
         if boundary {
             self.receive.adopt_boundary(next);

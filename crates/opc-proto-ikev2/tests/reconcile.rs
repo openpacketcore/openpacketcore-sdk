@@ -795,6 +795,7 @@ fn changed_same_generation_rollback_and_window_iv_floor_are_terminal() {
                     },
                     latest.outbound().cloned(),
                     latest.inbound().cloned(),
+                    None,
                 )
                 .unwrap()
                 .with_sync_state(

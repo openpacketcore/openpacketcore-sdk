@@ -4,7 +4,7 @@
 use super::{packet::SealedPacket, sync_packet::AuthenticatedSync};
 use super::{
     Ikev2AuthenticatedOrdinary as Ordinary, Ikev2CommittedWindow as Window,
-    Ikev2CommittedWindowRecord as Record, Ikev2SyncResponderRecord as SyncRecord,
+    Ikev2CommittedWindowRecord as Record,
 };
 use super::{Ikev2CommittedWindowDomain as Domain, Ikev2WindowError as Error};
 use crate::canonical::{Ikev2CanonicalError as CanonicalError, Ikev2CanonicalPolicy as Policy};
@@ -81,7 +81,10 @@ pub trait RecoveryProfile: Clone + Copy + Default + PartialEq + Eq + Send + Sync
         cleartext: &[u8],
     ) -> Result<Bytes, Error>;
     fn check_local_ordinary(packet: &Ordinary<Self>, epoch: &Self::Epoch) -> Result<(), Error>;
-    fn check_sync_evidence(record: &SyncRecord<Self>, epoch: &Self::Epoch) -> Result<(), Error>;
+    fn check_packet_evidence(
+        evidence: &Self::SyncEvidence,
+        epoch: &Self::Epoch,
+    ) -> Result<(), Error>;
     fn check_next_sync_attempt(
         previous: &mut Self::SyncValidation,
         packet: &AuthenticatedSync<Self>,

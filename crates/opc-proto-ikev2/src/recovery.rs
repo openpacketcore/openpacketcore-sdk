@@ -12,7 +12,9 @@
 //! with canonical bytes and advances a volatile receive floor without a durable
 //! write. Trusted restart reconstruction repairs a lost stateless prefix; the
 //! first nonempty result commits the repaired floor and ends reconstruction.
-//! Replay probes are old bytes, not fresh liveness or new outcome evidence.
+//! Local empty probes require a durably enabled, bounded unwritten-send policy;
+//! cold restore then requires synchronization or retirement before ordinary work.
+//! Replaying historical ordinary work is not fresh liveness evidence.
 
 use std::{cell::Cell, error::Error as StdError, fmt, sync::Arc};
 
@@ -26,6 +28,7 @@ mod cbc_epoch;
 #[cfg(test)]
 pub(crate) mod cbc_test_fixtures;
 mod empty;
+mod liveness;
 mod packet;
 pub(crate) mod profile;
 use profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
@@ -40,6 +43,7 @@ mod sync_recovery_record;
 mod sync_responder;
 pub use cbc_epoch::{Ikev2CbcEpochInputs, Ikev2CbcEpochRecord};
 pub use empty::{Ikev2EmptyReply, Ikev2EmptyReplyObservation};
+pub use liveness::{Ikev2EmptyRequest, Ikev2EmptyRequestCompletion};
 pub use packet::Ikev2AuthenticatedOrdinary;
 pub use profile::{Ikev2CbcRecoveryProfile, Ikev2GcmRecoveryProfile};
 pub use record::{
@@ -90,8 +94,14 @@ pub enum Ikev2WindowError {
     CommitMismatch,
     /// Message-ID or commit-generation space is exhausted; never wrap.
     Exhausted,
-    /// Stateless empty request cannot create durable work or a fresh probe.
+    /// Stateless empty request cannot create durable work; use the liveness API.
     NoDurableWork,
+    /// Commit an explicit unwritten-probe bound before initiating liveness.
+    LivenessDisabled,
+    /// Checkpoint completed probes before consuming more unwritten Message IDs.
+    LivenessCheckpointRequired,
+    /// Lost or abandoned probes require negotiated synchronization or SA retirement.
+    LivenessRecoveryRequired,
     /// Enable the qualified canonical handler before admitting empty-request traffic.
     EmptyRepliesDisabled,
     /// Canonical policy, ledger or output checks refused; there is no fallback.
@@ -131,6 +141,9 @@ impl fmt::Display for Ikev2WindowError {
             Self::CommitMismatch => "ike_committed_window_commit_mismatch",
             Self::Exhausted => "ike_committed_window_exhausted",
             Self::NoDurableWork => "ike_committed_window_no_durable_work",
+            Self::LivenessDisabled => "ike_committed_window_liveness_disabled",
+            Self::LivenessCheckpointRequired => "ike_committed_window_liveness_checkpoint_required",
+            Self::LivenessRecoveryRequired => "ike_committed_window_liveness_recovery_required",
             Self::EmptyRepliesDisabled => "ike_committed_window_empty_replies_disabled",
             Self::Canonical(_) => "ike_committed_window_canonical_refused",
             Self::StaleCompletion => "ike_committed_window_stale_completion",
@@ -244,6 +257,7 @@ pub struct Ikev2CommittedWindow<P: RecoveryProfile = Gcm> {
     reconcile_terminal: bool,
     observed_peer_request: Cell<Option<u32>>,
     receive: empty::ReceiveState<P>,
+    probe: liveness::ProbeState<P>,
     sync_live: bool,
     sync_closed: bool,
     sync_last_observed_unix_ms: Option<u64>,
@@ -305,6 +319,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             reconcile_terminal: false,
             observed_peer_request: Cell::new(None),
             receive: empty::ReceiveState::new(record.next_receive),
+            probe: liveness::ProbeState::restored(record),
             sync_live: false,
             sync_closed: false,
             sync_last_observed_unix_ms: record
@@ -327,7 +342,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         expected.check(profile, keys)?;
         if let Some(sync) = record.sync_state() {
             sync.validate(record)?;
-            P::check_sync_evidence(sync, epoch)?;
+            P::check_packet_evidence(&sync.packet_evidence, epoch)?;
         }
         if let Some(recovery) = record.sync_recovery() {
             recovery.validate_packets(record, profile, keys, epoch)?;
@@ -443,6 +458,11 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     }
 
     fn lifecycle_ready(&self) -> Result<(), Ikev2WindowError> {
+        self.sync_lifecycle_ready()?;
+        self.probe.ready()
+    }
+
+    fn sync_lifecycle_ready(&self) -> Result<(), Ikev2WindowError> {
         if self.sync_closed {
             return Err(Ikev2WindowError::SyncClosed);
         }
@@ -456,6 +476,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     fn next_record(&self) -> Result<Ikev2CommittedWindowRecord<P>, Ikev2WindowError> {
         self.ready()?;
         let mut record = self.record.clone();
+        self.fold_send_floor(&mut record)?;
         record.generation = record
             .generation
             .checked_add(1)
@@ -493,13 +514,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         payloads: PayloadChain<'_>,
     ) -> Result<Ikev2PreparedWindow<'_, P>, Ikev2WindowError> {
         let mut record = self.next_record()?;
-        if record
-            .outbound
-            .as_ref()
-            .is_some_and(|request| request.response.is_none())
-        {
-            return Err(Ikev2WindowError::RequestOutstanding);
-        }
+        self.require_local_slot()?;
         let id = record.next_send.ok_or(Ikev2WindowError::Exhausted)?;
         packet::require_work(exchange.as_u8(), payloads)?;
         let request = packet::seal(
@@ -751,6 +766,7 @@ impl<P: RecoveryProfile> Ikev2PreparedWindow<'_, P> {
         }
         self.window.witness = None;
         self.window.record = self.record;
+        self.window.adopt_send_floor(false);
         self.window.quiescent = false;
         if self.receive_boundary {
             self.window.adopt_receive_boundary()?;
@@ -822,6 +838,7 @@ macro_rules! profile_lifetime_redacted_debug {
 }
 profile_lifetime_redacted_debug!(
     Ikev2PreparedWindow,
+    Ikev2EmptyRequest,
     Ikev2EmptyReply,
     Ikev2AdmittedSyncResponse,
     Ikev2PreparedSyncResponse,

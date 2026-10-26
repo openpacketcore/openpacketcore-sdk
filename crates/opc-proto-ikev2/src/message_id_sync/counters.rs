@@ -18,7 +18,9 @@ use crate::{Header, Ikev2NotifyPayload, PayloadChain, PayloadType, EXCHANGE_TYPE
 /// its proposed ordinary ID, but any subsequent proposal must exceed it.
 ///
 /// Restoration can supply only durable knowledge; unwritten empty requests
-/// answered before a crash cannot contribute to the restored drop floor.
+/// answered before a crash cannot contribute to the restored peer drop history.
+/// A persisted bound on locally originated unwritten requests must instead raise
+/// `next_send` beyond every possibly used local ID before synchronization.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Ikev2MessageIdSyncCounters {
