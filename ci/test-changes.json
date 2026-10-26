@@ -389,6 +389,13 @@
       "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_fails_and_wrong_procedure_ie_is_skipped",
       "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
       "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_mscc_rejects_excessive_nesting_depth",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_service_data_rejects_excessive_nesting_depth",
+      "reason": "Replace the nonconforming online MSCC shape in Rf with Service-Information / PS-Information / Service-Data-Container. Retains the nesting-limit assertion and checks the exact DepthExceeded category at the offline container boundary.",
+      "issue": 1361
     }
   ]
 }

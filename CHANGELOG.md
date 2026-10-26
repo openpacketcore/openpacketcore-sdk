@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-diameter::apps::rf` encodes Subscription-Id and PS-Information
+  inside Service-Information. Replace `multiple_services_credit_controls`,
+  `MultipleServicesCreditControl`, and `UsedServiceUnit` with
+  `PsInformation::service_data_containers` and `ServiceDataContainer`.
+  Supply separate uplink/downlink counts and elapsed time; there is no Rf
+  total-octet field. The former top-level charging groups are rejected when
+  mandatory. SGSN/GGSN address constants are now `AVP_SGSN_ADDRESS` (1228)
+  and `AVP_GGSN_ADDRESS` (847); Charging-Id/PDP-Type clear M. (#1361)
+
 - `opc-proto-gtpv2c`: ARP pre-emption permission booleans now follow the
   enabled-zero PCI/PVI wire convention. Priority level 1 remains highest;
   `cmp_priority` compares that rank independently of permission flags. Remove
