@@ -360,22 +360,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan-work-budget exhaustion remains terminal and is now recorded as its own
   closed qualification error class instead of opaque `Other`. Refs #1160.
 
-- `opc-persist`: configuration snapshot build, install and repair deadlines now
-  derive from the bytes each stage moves instead of one fixed wall-clock budget
-  (#1339). Build derives its SQLite backup stage from the database size and its
-  envelope stage from the captured artifact size; install starts its size-derived
-  work budget after gate acquisition and derives sync/verify, extraction,
-  promotion and SQLite installation budgets from the received sizes; repair
-  derives one attempt deadline from the authenticated leader's published
-  envelope length (falling back to the previous fixed deadline when that probe
-  is unavailable) and caches the verified descriptor once per transfer instead
-  of re-hashing the whole snapshot per 128 KiB cursor chunk. A resent final
-  snapshot chunk is now idempotent while the artifact installs or after it
-  installed, and replacement snapshot reads reuse the digest from the engine
-  read's single whole-file verification instead of hashing twice. Ordinary
-  snapshots keep the previous 60 s build/install and 10 s repair floors; derived
-  budgets add one second per complete 8 MiB with an 8 h ceiling, and every
-  timeout at a derived bound remains typed. Refs #1339.
+- `opc-persist`: large configuration snapshots keep progressing through bounded
+  file operations and SQLite work sized while its connection stays leased.
+  Repair retains the caller's deadline and resumes a verified reader across
+  retries; idle, obsolete and shutdown readers are released. Snapshot integrity
+  evidence belongs to its descriptor and is invalidated by writes. Purge waits
+  for one matching owned installation before checking durable application.
+  Exact final chunks, including data-bearing and single-chunk transfers, join
+  or replay the definitive installation result after RPC timeouts. Failed
+  inspections permit a fresh transfer. Replacement admission and shutdown
+  remain bounded, and successful inspection and installation share one digest
+  verification. Refs #1339.
 
 - `opc-session-store`: a store that receives only protected-roster commands now
   reclaims retained roster history through a bounded leader-owned maintenance

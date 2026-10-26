@@ -674,3 +674,199 @@ async fn slow_healthy_build_stages_follow_size_instead_of_one_shared_budget() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn snapshot_progress_repair_reuses_one_large_verified_reader_across_rpc_deadlines() {
+    use crate::consensus::snapshot_file::test_io::{watchdog, Latency, Phase};
+    use crate::consensus::storage::snapshot_progress_tests::{large_commands, PAYLOAD_BYTES};
+
+    watchdog(async {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = opc_consensus::ConsensusIdentity::new(
+            opc_consensus::ConsensusClusterId::new("large-repair-progress").unwrap(),
+            opc_consensus::ConsensusConfigurationId::from_bytes([0x67; 32]),
+            opc_consensus::ConsensusConfigurationEpoch::new(1).unwrap(),
+        );
+        let backend = SqliteBackend::open_with_audit_key(
+            directory.path().join("config.sqlite"),
+            true,
+            0,
+            crate::AuditKey::new([0x68; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let hooks = backend.consensus_snapshot_test_hooks.clone();
+        let commands = large_commands(identity, backend.audit_key());
+        let store = ConsensusConfigStore::open_with_operation_timeout(
+            ConfigConsensusTopology::try_new(identity, node(1), BTreeSet::from([node(1)])).unwrap(),
+            backend,
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        store.initialize_cluster().await.unwrap();
+        for command in commands {
+            assert!(store
+                .inner
+                .raft
+                .client_write(command)
+                .await
+                .unwrap()
+                .data
+                .result
+                .is_ok());
+        }
+        let required = store.inner.raft.metrics().borrow().last_log_index.unwrap();
+        let vote = store.repair_source_vote().unwrap();
+        store
+            .wait_for_snapshot_cut(
+                Some(required),
+                vote,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let published = store.inner.raft.get_snapshot().await.unwrap().unwrap();
+        let expected = tokio::fs::read(published.snapshot.path()).await.unwrap();
+        drop(published);
+        let reads_before = hooks.reads_started.load(Ordering::Acquire);
+        let mut latency = Latency::new(directory.path(), Phase::Read);
+        let started = Instant::now();
+        let outcome = latency
+            .run(Duration::from_secs(2), async {
+                let mut cursor = None;
+                let mut bytes = Vec::new();
+                let mut failures = 0;
+                let mut chunks = 0;
+                loop {
+                    let request = RepairRequest {
+                        compatibility: store.peer_compatibility(),
+                        budget: ForwardedBudget::from_deadline(
+                            Instant::now() + Duration::from_secs(10),
+                        )
+                        .unwrap(),
+                        cursor,
+                    };
+                    let response = handle(&store, &encode_config_wire(&request).unwrap()).await;
+                    match response.result {
+                        Ok(payload) => {
+                            let chunk: RepairChunk = decode_config_wire(&payload).unwrap();
+                            assert_eq!(chunk.offset, bytes.len() as u64);
+                            assert_eq!(chunk.vote, vote);
+                            assert!(chunk.meta.last_log_id.unwrap().index >= required);
+                            assert!(chunk.bytes.len() <= CHUNK_BYTES);
+                            bytes.extend_from_slice(&chunk.bytes);
+                            chunks += 1;
+                            if chunk.done {
+                                return Some((bytes, chunks));
+                            }
+                            cursor = Some(RepairCursor {
+                                vote: chunk.vote,
+                                snapshot_id: chunk.meta.snapshot_id,
+                                offset: bytes.len() as u64,
+                            });
+                        }
+                        Err(ConsensusPeerError::Unavailable) => {
+                            failures += 1;
+                            if failures == 4 {
+                                return None;
+                            }
+                            cursor = request.cursor;
+                        }
+                        Err(error) => panic!("unexpected repair rejection: {error:?}"),
+                    }
+                }
+            })
+            .await;
+        let verifications = latency.verifications();
+        drop(latency);
+        store.shutdown().await.unwrap();
+        let (bytes, chunks) =
+            outcome.expect("large repair must progress across bounded RPC retries");
+        assert!(started.elapsed() > Duration::from_secs(10));
+        assert!(bytes.len() as u64 > PAYLOAD_BYTES);
+        assert!(chunks > 64);
+        assert_eq!(
+            verifications, 1,
+            "hash the complete stream once, not once per chunk"
+        );
+        assert_eq!(
+            hooks.reads_started.load(Ordering::Acquire) - reads_before,
+            1
+        );
+        assert_eq!(bytes, expected);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn snapshot_progress_repair_rejects_stale_cursors_and_releases_idle_readers() {
+    crate::consensus::snapshot_file::test_io::watchdog(async {
+        let (_directory, store, hooks) = published_build_source().await;
+        let first = store
+            .repair_snapshot_chunk(None, Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        let reads = hooks.reads_started.load(Ordering::Acquire);
+        for change in 0..3 {
+            let mut cursor = RepairCursor {
+                vote: first.vote,
+                snapshot_id: first.meta.snapshot_id.clone(),
+                offset: 0,
+            };
+            match change {
+                0 => cursor.vote = Vote::new_committed(first.vote.leader_id.term + 1, node(1)),
+                1 => cursor.snapshot_id.push_str("-stale"),
+                2 => cursor.offset = storage::SNAPSHOT_MAX_ENVELOPE_BYTES + 1,
+                _ => unreachable!(),
+            }
+            assert!(store
+                .repair_snapshot_chunk(Some(cursor), Instant::now() + Duration::from_secs(3))
+                .await
+                .is_err());
+        }
+        assert_eq!(hooks.reads_started.load(Ordering::Acquire), reads);
+        let (mut retired, descriptor) = {
+            let cached = store.inner.repair_source.lock().await;
+            let source = cached.as_ref().unwrap();
+            let snapshot = source.ready.borrow().clone().unwrap().unwrap();
+            (source.activity.subscribe(), Arc::downgrade(&snapshot))
+        };
+        tokio::time::pause();
+        tokio::time::advance(SOURCE_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), retired.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        tokio::time::resume();
+        assert!(descriptor.upgrade().is_none());
+        assert!(store.inner.repair_source.lock().await.is_none());
+        store
+            .repair_snapshot_chunk(None, Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(hooks.reads_started.load(Ordering::Acquire), reads + 1);
+        let mut retired = store
+            .inner
+            .repair_source
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .activity
+            .subscribe();
+        store.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), retired.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(store.inner.repair_source.lock().await.is_none());
+    })
+    .await;
+}

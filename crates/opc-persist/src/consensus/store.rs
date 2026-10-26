@@ -408,14 +408,13 @@ struct ConsensusConfigStoreInner {
     repair_progress: tokio::sync::Mutex<Option<member_repair::RepairDownload>>,
     /// One verified snapshot descriptor reused by every repair chunk request of
     /// the same transfer (#1339).
-    repair_snapshot_cache: Arc<member_repair::RepairSnapshotCache>,
+    repair_source: tokio::sync::Mutex<Option<Arc<member_repair::RepairSource>>>,
     audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
     durable_progress: Arc<storage::ConfigDurableProgress>,
     storage_shutdown: tokio::sync::watch::Receiver<()>,
-    snapshot_directory_owner: std::sync::Weak<storage::SnapshotDirectoryOwner>,
     voter_profile: Option<Arc<voter_slots::ConfigVoterProfile>>,
     shutdown: planned_shutdown::ConfigShutdownCoordinator,
 }
@@ -740,14 +739,6 @@ impl ConsensusConfigStore {
         .await
         .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         let storage_shutdown = log_store.core.storage_shutdown_observer();
-        // Verification outside the storage worker upgrades admission only for
-        // its active I/O. Retained store handles must not own that admission.
-        let snapshot_directory_owner = Arc::downgrade(
-            &log_store
-                .core
-                .snapshot_directory_owner()
-                .map_err(|_| ConfigConsensusOpenError::StorageUnavailable)?,
-        );
         // A repair root has lost the old voter's log and vote. Do not expose
         // that empty state to a live leader or another candidate. A previously
         // restored root retains its ordinary durable restart behavior.
@@ -840,7 +831,7 @@ impl ConsensusConfigStore {
                 failover: failover::ConfigFailoverAccelerator::default(),
                 repair_pending: AtomicBool::new(repair_pending),
                 repair_progress: tokio::sync::Mutex::new(None),
-                repair_snapshot_cache: Arc::new(member_repair::RepairSnapshotCache::default()),
+                repair_source: tokio::sync::Mutex::new(None),
                 shutdown: planned_shutdown::ConfigShutdownCoordinator::new(),
                 audit_continuity,
                 linearizability,
@@ -850,7 +841,6 @@ impl ConsensusConfigStore {
                 metric_leader: std::sync::Mutex::new(None),
                 durable_progress,
                 storage_shutdown,
-                snapshot_directory_owner,
                 voter_profile,
             }),
         };
@@ -893,7 +883,7 @@ impl ConsensusConfigStore {
             diagnostics::DeadlineDiagnostic::new("config_consensus_initialization", "deadline");
         let result = async {
             self.inner.admitted.store(false, Ordering::Release);
-            let mut deadline = tokio::time::Instant::now()
+            let deadline = tokio::time::Instant::now()
                 .checked_add(self.inner.operation_timeout)
                 .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
             #[cfg(any(test, feature = "test-control"))]
@@ -924,17 +914,7 @@ impl ConsensusConfigStore {
                 {
                     diagnostic.stage = "repair";
                 }
-                // Repairing a large healthy snapshot needs a deadline derived
-                // from its actual size; ordinary snapshots keep the existing
-                // operation deadline because the derived floor is the same.
-                let repair_deadline = self.repair_attempt_deadline(deadline).await;
-                self.recover_member_before_participation(repair_deadline)
-                    .await?;
-                // Post-repair admission work keeps its ordinary budget even if
-                // the size-derived repair attempt consumed the original one.
-                deadline = tokio::time::Instant::now()
-                    .checked_add(self.inner.operation_timeout)
-                    .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
+                self.recover_member_before_participation(deadline).await?;
             }
             if !initialized
                 && canonical_bootstrap == Some(self.inner.local_node_id)

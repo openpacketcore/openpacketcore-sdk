@@ -29,7 +29,7 @@ pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
 #[cfg(test)]
 pub(crate) use storage::SnapshotTestHooks;
-pub(crate) use storage::{SnapshotReadVerification, SnapshotWorkHooks};
+pub(crate) use storage::SnapshotWorkHooks;
 mod store;
 mod types;
 

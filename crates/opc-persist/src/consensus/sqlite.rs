@@ -31,11 +31,11 @@ use sha2::{Digest, Sha256};
 
 use super::storage::ConfigConsensusStorageError;
 use super::types::{CONFIG_CONSENSUS_STORAGE_VERSION, LEGACY_CONFIG_CONSENSUS_COMMAND_VERSION};
+use super::SnapshotWorkHooks;
 use super::{
     ApprovedLegacyConfigRecovery, ConfigConsensusResponse, ConfigMutationFailure,
     ConfigMutationIntent, ConfigRaftTypeConfig,
 };
-use super::{SnapshotReadVerification, SnapshotWorkHooks};
 use crate::backend::SqliteBackend;
 use crate::types::{AuditKey, AuditOpType, CommitSource};
 
@@ -372,8 +372,6 @@ pub(crate) struct ConfigConsensusCore {
     pub(crate) snapshot_test_hooks: Arc<super::storage::SnapshotTestHooks>,
     /// Always-compiled snapshot work accounting shared with the backend.
     pub(crate) snapshot_work_hooks: Arc<SnapshotWorkHooks>,
-    /// Evidence from this core's most recent whole-file snapshot verification.
-    snapshot_read_verification: Arc<std::sync::Mutex<Option<SnapshotReadVerification>>>,
     pub(crate) audit_key: Arc<AuditKey>,
     pub(crate) management_audit_keys: Option<Arc<crate::audit_authority::continuity::AuditKeyRing>>,
     pub(crate) _snapshot_dir_guard: Arc<std::fs::File>,
@@ -394,27 +392,6 @@ pub(crate) struct ConfigConsensusCore {
 impl ConfigConsensusCore {
     pub(crate) fn storage_shutdown_observer(&self) -> tokio::sync::watch::Receiver<()> {
         self.storage_owner.subscribe()
-    }
-
-    /// Reuse the digest computed by the single verification of an engine
-    /// snapshot read, instead of hashing the whole file a second time.
-    pub(crate) fn snapshot_read_verification(
-        &self,
-        snapshot_id: &str,
-    ) -> Option<SnapshotReadVerification> {
-        self.snapshot_read_verification
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .filter(|verification| verification.snapshot_id == snapshot_id)
-            .cloned()
-    }
-
-    pub(crate) fn record_snapshot_read_verification(&self, verification: SnapshotReadVerification) {
-        *self
-            .snapshot_read_verification
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(verification);
     }
 
     pub(crate) fn snapshot_directory_owner(
@@ -630,7 +607,6 @@ impl ConfigConsensusCore {
             #[cfg(test)]
             snapshot_test_hooks: Arc::clone(&backend.consensus_snapshot_test_hooks),
             snapshot_work_hooks: backend.snapshot_work_hooks(),
-            snapshot_read_verification: Arc::new(std::sync::Mutex::new(None)),
             audit_key: Arc::new(backend.audit_key().clone()),
             management_audit_keys: backend.management_audit_keys(),
             _snapshot_dir_guard: snapshot_dir_guard,
@@ -683,6 +659,51 @@ impl ConfigConsensusCore {
             operation,
         )
         .await
+    }
+
+    /// Admit snapshot work separately from its size-dependent execution budget.
+    /// Keep the connection leased from sizing through execution so another
+    /// writer cannot enlarge the database after its size has been measured.
+    pub(crate) async fn run_snapshot_sqlite_cancellable<T, F>(
+        &self,
+        incoming_bytes: u64,
+        operation: F,
+    ) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
+    {
+        let admission_deadline = tokio::time::Instant::now()
+            .checked_add(super::storage::SNAPSHOT_OPERATION_TIMEOUT)
+            .ok_or_else(|| invalid_data("config snapshot SQLite deadline overflow"))?;
+        let lease = acquire_sqlite_worker(
+            self.sqlite_worker_gate.clone(),
+            self.conn.clone(),
+            Some(self.storage_owner.clone()),
+            admission_deadline,
+        )
+        .await?;
+        // These two fixed metadata reads run on the blocking pool too. The
+        // lease (including shutdown ownership) survives cancellation and is
+        // returned intact; this preflight cannot mutate authority.
+        let mut sizing = tokio::task::spawn_blocking(move || {
+            let budget = snapshot_sqlite_budget(&lease.connection, incoming_bytes);
+            (lease, budget)
+        });
+        let (lease, budget) = match tokio::time::timeout_at(admission_deadline, &mut sizing).await {
+            Ok(result) => result.map_err(|_| invalid_data("config snapshot sizing failed"))?,
+            Err(_) => {
+                let _ = sizing.await;
+                return Err(timed_out("config snapshot SQLite admission timed out"));
+            }
+        };
+        if tokio::time::Instant::now() >= admission_deadline {
+            return Err(timed_out("config snapshot SQLite admission timed out"));
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(budget?)
+            .ok_or_else(|| invalid_data("config snapshot SQLite deadline overflow"))?;
+        run_sqlite_worker_owned(lease, deadline, operation).await
     }
 
     #[cfg(test)]
@@ -760,10 +781,27 @@ where
     T: Send + 'static,
     F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
 {
+    let lease = acquire_sqlite_worker(worker_gate, conn, storage_owner, deadline).await?;
+    run_sqlite_worker_owned(lease, deadline, operation).await
+}
+
+struct SqliteWorkerLease {
+    // Fields drop in declaration order: release the connection and permit
+    // before reporting that the last storage owner has drained.
+    connection: tokio::sync::OwnedMutexGuard<crate::backend::BackendConnection>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _storage_owner: Option<tokio::sync::watch::Sender<()>>,
+}
+
+async fn acquire_sqlite_worker(
+    worker_gate: Arc<tokio::sync::Semaphore>,
+    conn: Arc<tokio::sync::Mutex<crate::backend::BackendConnection>>,
+    storage_owner: Option<tokio::sync::watch::Sender<()>>,
+    deadline: tokio::time::Instant,
+) -> io::Result<SqliteWorkerLease> {
     if deadline <= tokio::time::Instant::now() {
         return Err(timed_out("config consensus SQLite deadline elapsed"));
     }
-    let worker_deadline = SqliteWorkDeadline::tokio(deadline);
     let permit = tokio::time::timeout_at(deadline, worker_gate.acquire_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite admission timed out"))?
@@ -771,16 +809,43 @@ where
     let conn = tokio::time::timeout_at(deadline, conn.lock_owned())
         .await
         .map_err(|_| timed_out("config consensus SQLite connection timed out"))?;
+    Ok(SqliteWorkerLease {
+        connection: conn,
+        _permit: permit,
+        _storage_owner: storage_owner,
+    })
+}
+
+fn snapshot_sqlite_budget(conn: &Connection, incoming_bytes: u64) -> io::Result<Duration> {
+    let bytes = database_storage_bytes_sync(conn)?
+        .checked_add(incoming_bytes)
+        .ok_or_else(|| invalid_data("config snapshot SQLite size overflow"))?;
+    // Fixed setup allowance plus one second per MiB of actual input. Install
+    // also charges the destination, whose old history must be replaced. This
+    // remains an absolute, finite work bound even if SQLite stops progressing.
+    super::storage::SNAPSHOT_OPERATION_TIMEOUT
+        .checked_add(Duration::from_secs(bytes.div_ceil(1024 * 1024)))
+        .ok_or_else(|| invalid_data("config snapshot SQLite budget overflow"))
+}
+
+async fn run_sqlite_worker_owned<T, F>(
+    lease: SqliteWorkerLease,
+    deadline: tokio::time::Instant,
+    operation: F,
+) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Connection, &Arc<SqliteWorkCancellation>) -> io::Result<T> + Send + 'static,
+{
+    let worker_deadline = SqliteWorkDeadline::tokio(deadline);
     let cancellation = Arc::new(SqliteWorkCancellation::with_deadline(worker_deadline));
     let mut cancel_on_drop = SqliteWorkCancelOnDrop::new(cancellation.clone());
     let worker_cancellation = cancellation.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
-        // An aborted awaiting future cannot release storage ownership while
-        // the blocking worker still holds its connection. Locals drop in
-        // reverse order, including early errors and unwinding.
-        let _storage_owner = storage_owner;
-        let _permit = permit;
-        let worker_conn = conn;
+        // Retain connection and shutdown ownership through cancellation,
+        // early errors, and unwinding, until the physical worker finishes.
+        let lease = lease;
+        let worker_conn = &lease.connection;
         let commit_cancellation = worker_cancellation.clone();
         worker_conn
             .commit_hook(Some(move || {
@@ -796,7 +861,7 @@ where
                 }),
             )
             .map_err(db_error)?;
-        let result = operation(&worker_conn, &worker_cancellation);
+        let result = operation(worker_conn, &worker_cancellation);
         worker_conn
             .commit_hook(None::<fn() -> bool>)
             .expect("installed SQLite hook belongs to an owned connection");
@@ -3741,6 +3806,11 @@ pub(crate) fn build_snapshot_database_cancellable_sync(
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut destination).map_err(db_error)?;
         loop {
+            #[cfg(test)]
+            super::snapshot_file::test_io::blocking_step(
+                path,
+                super::snapshot_file::test_io::Phase::Backup,
+            );
             cancellation.check_io()?;
             match backup.step(128).map_err(db_error)? {
                 rusqlite::backup::StepResult::Done => break,
