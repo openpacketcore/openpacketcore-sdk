@@ -40,8 +40,8 @@ pub fn open(source: IpAddr, destination: IpAddr, policy: &[u8]) -> io::Result<Tf
     };
     let len = libc::socklen_t::try_from(policy.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "policy too long"))?;
-    // SAFETY: The policy slice remains valid for its checked length; setsockopt copies it.
     let result =
+        // SAFETY: The policy slice remains valid for its checked length; setsockopt copies it.
         unsafe { libc::setsockopt(fd.as_raw_fd(), level, option, policy.as_ptr().cast(), len) };
     if result < 0 {
         return Err(io::Error::last_os_error());
