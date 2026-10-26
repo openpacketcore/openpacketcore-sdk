@@ -321,6 +321,8 @@ impl StoreError {
             Self::FencedTransitionRecoveryJournalUnavailable => {
                 "FencedTransitionRecoveryJournalUnavailable"
             }
+            Self::KeyProviderUnavailable(..) => "KeyProviderUnavailable",
+            Self::KeyCapacityExhausted => "KeyCapacityExhausted",
         }
     }
 }
