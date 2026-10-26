@@ -81,8 +81,8 @@ for the exact crash cut, credential handling and remaining limits.
 
 ## Implemented boundary
 
-- Direct TLS/TCP completes mutually authenticated TLS 1.3 before any Diameter
-  byte is read or written.
+- Direct TLS/TCP completes mutually authenticated TLS before any Diameter byte
+  is read or written. TLS 1.3 is the default; explicit compatibility admits TLS 1.2.
 - In-band TLS/TCP uses consuming typestates to permit one canonical CER/CEA
   exchange and then immediately upgrades that same unbuffered TCP stream.
 - Direct DTLS/SCTP completes mutually authenticated DTLS 1.2 before any
@@ -222,6 +222,18 @@ Application policy and Diameter application state machines remain outside this
 crate.
 
 ## Explicit limits
+
+`DiameterTlsPolicy::tls12_compatibility(frame_limits)` permits TLS 1.3 and TLS
+1.2; also enable `TlsConfigBuilder::with_compat_mode(true)` on the supplied
+authenticated config. TLS 1.3 remains preferred. TLS 1.2 permits ECDHE-ECDSA
+and ECDHE-RSA with AES-128/256-GCM. Static RSA key exchange, CBC and obsolete
+versions remain excluded. `with_allowed_ciphers` filters the handshake before
+admission; a TLS 1.2 suite under the default TLS 1.3-only policy returns
+`CipherVersionMismatch`. `policy.version()` reports the minimum allowed version;
+connection evidence reports the negotiated version and suite. Exact mutual
+identity checks, material epochs, retirement and frame budgets apply to both.
+The DHE-RSA suite required by TS 33.210 §6.2.3 is not supplied by this subset;
+it is not complete 3GPP TLS-profile support. DTLS suite support is separate.
 
 Each candidate receives a monotonic `PeerSessionGeneration`, and the SDK
 exposes the simultaneous-open decision, but the consumer still owns candidate

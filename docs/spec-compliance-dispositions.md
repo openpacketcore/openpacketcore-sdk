@@ -65,8 +65,22 @@ This separation follows the role-specific EKUs and service SANs in
 and the single-URI and dual-EKU requirements in
 [X.509-SVID §§2 and 4.4](https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md).
 The general helper is not a complete NF certificate-profile validator or a
-replacement for peer authorization and revocation. The transport version and
-cipher-suite findings in #1353 remain separate work.
+replacement for peer authorization and revocation.
+
+Diameter now offers explicit TLS 1.2 compatibility while preserving the TLS 1.3
+default. The admitted TLS 1.2 suites use ECDHE-ECDSA or ECDHE-RSA with
+AES-128/256-GCM. [Wire regressions](../crates/opc-diameter-transport/tests/tls_tcp/tls12.rs)
+exercise both roles, all four suites, bidirectional Diameter, in-band upgrade,
+TLS 1.3 preference and material-loss retirement; the legacy strict policy still
+rejects TLS 1.2 during the handshake. The pre-fix peer received a ProtocolVersion
+alert. The 242 transport tests/docs pass on each host and Linux, with strict
+host Clippy and full-workspace Linux Clippy.
+
+[TS 33.210 V18.2.0 §6.2](https://www.etsi.org/deliver/etsi_ts/133200_133299/133210/18.02.00_60/ts_133210v180200p.pdf)
+requires TLS 1.2 and 1.3 and restricts TLS 1.2 suites to AEAD with forward
+secrecy. Static RSA key exchange is therefore not an interoperability fix for
+that profile. The required DHE-RSA suite and DTLS cipher findings remain open;
+the ECDHE subset is not complete 3GPP profile support.
 
 ## Diameter runtime work list #1358
 
