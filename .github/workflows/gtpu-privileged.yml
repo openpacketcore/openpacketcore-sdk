@@ -572,7 +572,8 @@ jobs:
   linux-6-8-classifier-load:
     name: Linux 6.8 committed classifier load
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Include cold builds and the complete guest proof before artifact checks.
+    timeout-minutes: 45
     # Debug symbols dominate these host test executables and are not inputs
     # to the kernel classifier or datapath proofs transferred into the guest.
     env:
