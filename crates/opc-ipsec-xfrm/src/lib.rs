@@ -351,7 +351,7 @@ pub use installed_child_sa::{
     ChildSaInstalledPairRequest, ChildSaInstalledRosterRequest, ChildSaRosterUpdate,
     InstalledChildSaRoster, InstalledChildSaSelection,
 };
-pub use linux::{LinuxXfrmBackend, LinuxXfrmBackendConfig};
+pub use linux::{EspTfcDummySender, LinuxXfrmBackend, LinuxXfrmBackendConfig};
 pub use local_scope::LocalXfrmProfile;
 #[cfg(feature = "scope-store")]
 pub use local_scope::{ScopedXfrmReceipt, ScopedXfrmRequest, ScopedXfrmSuccessorStatus};

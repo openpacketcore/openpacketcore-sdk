@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-ipsec-xfrm`: `EspTfcDummySender` submits Next Header 59 dummies through
+  the same kernel SA as ordinary traffic. Transport mode uses stock Linux;
+  tunnel mode requires the included versioned kernel patch and rejects an
+  unsupported kernel before opening the sender. Caller-owned egress fencing
+  must stop the sender before recovery, relocation or SA replacement. (#1344)
+
 - `opc-consensus`: expose `DURABLE_CONSENSUS_FAILOVER_PATIENCE`, derived from the
   election lease plus stale-route grace; it schedules no election. Refs #1049.
 

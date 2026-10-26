@@ -1905,3 +1905,34 @@ record, and publish only after complete readback. Interrupted moves stay gated
 for exact-target reconciliation. This bounded profile requires the upstream
 MIGRATE_STATE capability and has no delete/reinstall fallback. See the
 [public contract and supported-kernel evidence](../../docs/n3-child-sa-mobike.md).
+
+## ESP dummy sender
+
+`EspTfcDummySender::open_current_namespace(source, destination, template)`
+opens a namespace-pinned protocol-59 socket with a mandatory per-socket ESP
+policy. `send(payload_len)` submits 1–65,495 zero filler bytes through the
+existing SA; the kernel owns sequence/nonce allocation, encryption and
+lifetime enforcement alongside ordinary traffic. The length excludes IP/ESP
+overhead and kernel TFC padding, and path-MTU limits still apply. Submission
+success is not a delivery acknowledgement.
+
+Transport mode works on stock Linux. Tunnel mode requires the included
+[versioned kernel patch and qualification profile](../../kernel/xfrm-tfc-dummy/README.md).
+It fails with `UnsupportedFeature { feature: "esp_tunnel_tfc_dummy_v1" }`
+on an unpatched kernel before opening a raw sender. Sending an inner IP
+protocol-59 packet through an ordinary tunnel SA produces ESP Next Header
+4/41, so it cannot substitute for this capability. The patch retains the
+native sequence allocator; there is no userspace ESP encryption or counter
+reservation path.
+
+The sender selects through lookup mark zero and interface ID zero, requires
+a fixed ESP SPI, and supports software transport/tunnel transforms. Keep the
+selected public tuple unique, including overlapping mark masks. The SA
+selector must admit the inner addresses and protocol 59. Scoped IPv6
+addresses, hardware offload and stacked transforms are outside the qualified
+profile. The caller owns SA lifecycle, negotiation, rate and scheduling.
+Fence this producer along with other egress before counter recovery,
+relocation or SA replacement, then recreate it against the new SA. A sender
+is an ephemeral socket, not durable installation or incarnation authority.
+See [RFC 4303 §2.6](https://www.rfc-editor.org/rfc/rfc4303.html#section-2.6)
+and the [small sender example](examples/esp_tfc_dummy.rs).
