@@ -863,13 +863,15 @@ mod tests {
                 0x34, 255, 0, 9, 1, 2, 3, 4, 0, 0, 0, extension, 1, 0, 0, 0, 0x45,
             ];
             let event = receive(&packet, 49152);
-            // Endpoint comprehension bits (TS 29.281 5.2.1); the shared
-            // codec additionally implements PSC (0x85) and UDP Port (0x40).
-            let required = extension >= 0x80 && extension != 0x85;
+            // The fixed two-octet content is invalid for Long PDCP.
+            let malformed = matches!(extension, 0x03 | 0x82);
+            let required = extension >= 0x80 && !matches!(extension, 0x81..=0x85 | 0xc0);
             assert_eq!(event.bytes(), packet);
             assert_eq!(
                 event.kind(),
-                if required {
+                if malformed {
+                    GtpuControlDatagramKind::Malformed
+                } else if required {
                     GtpuControlDatagramKind::UnsupportedRequiredExtension
                 } else {
                     GtpuControlDatagramKind::Gpdu

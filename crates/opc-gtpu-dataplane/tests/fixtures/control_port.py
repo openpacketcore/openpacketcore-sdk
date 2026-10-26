@@ -52,7 +52,10 @@ def corpus():
     for extension in range(1, 256):
         wire = bytearray(frame(255, b"\x01\x00\x00\x00\x45", flags=0x34, teid=0x01020304))
         wire[11] = extension
-        add(f"extension-{extension}", "R" if extension >= 128 and extension != 0x85 else "G", wire)
+        # Two-octet content is malformed for either Long PDCP assignment.
+        disposition = "M" if extension in [0x03, 0x82] else (
+            "R" if extension >= 128 and extension not in [0x81, 0x83, 0x84, 0x85, 0xc0] else "G")
+        add(f"extension-{extension}", disposition, wire)
     for index, seed in enumerate([echo, reply, error, marker, gpdu, *notifications]):
         for length in range(len(seed)):
             add(f"trunc-{index}-{length}", "M", seed[:length])

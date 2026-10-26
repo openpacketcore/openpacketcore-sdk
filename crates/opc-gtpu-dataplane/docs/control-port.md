@@ -115,9 +115,9 @@ ports at four sequence boundaries, all 255 nonterminal extension types,
 all 256 received Recovery values, malformed framing and explicit byte/ratio
 boundaries. The independent standard-library Python generator
 `tests/fixtures/control_port.py` produces 1,206 receive/response records:
-283 controls, 129 G-PDUs, 127 required-extension events, 249 unmodelled
-messages, two Tunnel Status events and 416 malformed inputs. TSV SHA-256:
-`9ad4fdf871bbd382c4204554f3db85089daf2806646477bbede5e24ef6403664`.
+283 controls, 132 G-PDUs, 122 required-extension events, 249 unmodelled
+messages, two Tunnel Status events and 418 malformed inputs. TSV SHA-256:
+`623387cccf311887be4b7147214187ef57f29f4e754c64f2f59855f57b612589`.
 CI checks byte-exact regeneration. A separate private-network-namespace UDP peer checks actual
 reply bytes/tuples, the single queue, truncation, foreign and replaced socket
 plans, and interface-rename refusal. It does not attach a tc program or GTP

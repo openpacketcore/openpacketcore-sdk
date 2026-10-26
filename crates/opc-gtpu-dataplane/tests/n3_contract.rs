@@ -437,3 +437,27 @@ fn every_shipped_backend_refuses_n3_forwarding_capability() {
         );
     }
 }
+
+#[test]
+fn generic_typed_extensions_do_not_expand_n3_endpoint_comprehension() {
+    use opc_protocol::BorrowDecode;
+    for kind in [0x81, 0x83, 0x84, 0xc0] {
+        let wire = [
+            0x34, 255, 0, 13, 0, 0, 0, 1, 0, 0, 0, kind, 1, 0, 0, 0x85, 1, 0, 9, 0, 0x45,
+        ];
+        let ctx = DecodeContext {
+            unknown_ie_policy: UnknownIePolicy::Reject,
+            ..DecodeContext::default()
+        };
+        assert!(opc_proto_gtpu::GtpuMessage::decode(&wire, ctx).is_ok());
+        assert_eq!(
+            N3PacketView::decode(&wire, N3Direction::Downlink, ctx).unwrap_err(),
+            N3PacketError::UnsupportedExtension
+        );
+    }
+    let long = unhex("34ff0011000000010000008202000000000000850100090045");
+    assert_eq!(
+        N3PacketView::decode(&long, N3Direction::Downlink, DecodeContext::default()).unwrap_err(),
+        N3PacketError::UnsupportedExtension
+    );
+}
