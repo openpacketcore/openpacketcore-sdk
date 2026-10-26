@@ -433,6 +433,24 @@
       "kind": "disabled",
       "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed with its explicit opt-in in the compliance VM: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
       "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_leaves_it",
+      "kind": "disabled",
+      "reason": "New Linux kernel-GTP proof requires CAP_NET_ADMIN, the GTP module, and an isolated network namespace. The privileged GTP-U workflow runs this entire ignored harness with explicit opt-in. Covers a real retained-socket response and stale-device refusal; ordinary unit tests cover tuple, budget, classification and registration boundaries.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::control_port_refuses_a_removed_kernel_attachment",
+      "kind": "disabled",
+      "reason": "New Linux kernel-GTP proof requires CAP_NET_ADMIN, the GTP module, and an isolated network namespace. The privileged GTP-U workflow runs this entire ignored harness with explicit opt-in. Covers a real retained-socket response and stale-device refusal; ordinary unit tests cover tuple, budget, classification and registration boundaries.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::wildcard_control_reply_preserves_the_original_local_destination",
+      "kind": "disabled",
+      "reason": "New privileged kernel-GTP test requires an isolated network namespace and CAP_NET_ADMIN. The privileged workflow runs the complete ignored harness. Actual loopback receive verifies the wildcard socket preserves the original destination in the response source and Peer Address IE.",
+      "issue": 1084
     }
   ]
 }

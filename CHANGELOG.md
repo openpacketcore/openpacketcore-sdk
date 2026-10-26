@@ -239,6 +239,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-gtpu-dataplane`: expose unknown-tunnel observations and bounded Error
+  Indication plans through the ordinary Linux GTP attachment’s retained IPv4
+  UDP/2152 socket. Check live interface and socket identity, retire old control
+  generations, and preserve the triggering tuple. Kernel-owned recoverable
+  attachments remain explicitly unsupported. (#1084)
+
 - `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
   verification time for certificate validity checks while preserving SPIFFE ID,
   trust-domain and workload-path validation. `from_cert_der` continues to use

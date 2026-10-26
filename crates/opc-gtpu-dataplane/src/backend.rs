@@ -109,9 +109,16 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// The eBPF backend also invalidates ports on failed attachment readback.
     /// Retry this open to bind fresh queues once the same live registration
     /// passes all checks; old handles and response plans remain invalid.
-    /// The current eBPF implementation supports concrete IPv4 endpoints only.
-    /// Linux kernel, mock and unsupported adapters return the exact unsupported
-    /// feature below; they do not bind a competing socket or simulate parity.
+    /// The eBPF implementation supports concrete IPv4 endpoints only. The
+    /// Linux kernel-GTP implementation exposes the retained userspace socket
+    /// of an ordinary (non-recoverable) creation: the kernel passes
+    /// non-G-PDUs and G-PDUs whose TEID selects no PDP context back to that
+    /// socket, and this port returns them as bounded observations. Receipt
+    /// does not authorize a tunnel or peer. A kernel-owned recoverable
+    /// attachment (no userspace descriptor) returns
+    /// `UnsupportedFeature { feature: "gtpu_control_port_kernel_owned" }`.
+    /// Mock and unsupported adapters return the exact unsupported feature
+    /// below; no adapter binds a competing socket or simulates parity.
     async fn open_gtpu_control_port(
         &self,
         _device: &GtpDevice,

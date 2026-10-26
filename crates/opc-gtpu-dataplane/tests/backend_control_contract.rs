@@ -7,6 +7,7 @@ use opc_gtpu_dataplane::{
 async fn unqualified_backends_report_exact_control_port_unsupported() {
     let backends: Vec<Box<dyn GtpuDataplaneBackend>> = vec![
         Box::new(MockGtpuDataplaneBackend::new()),
+        #[cfg(not(target_os = "linux"))]
         Box::new(LinuxGtpuDataplaneBackend::new()),
         Box::new(UnsupportedGtpuDataplaneBackend::new()),
     ];
@@ -24,6 +25,21 @@ async fn unqualified_backends_report_exact_control_port_unsupported() {
         ));
         assert!(!format!("{error:?} {error}").contains(&device.name));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_control_port_requires_backend_socket_ownership() {
+    let device = GtpDevice {
+        name: "sensitive-synthetic-device".into(),
+        ifindex: 73,
+    };
+    let error = LinuxGtpuDataplaneBackend::new()
+        .open_gtpu_control_port(&device)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, GtpuError::NotFound));
+    assert!(!format!("{error:?} {error}").contains(&device.name));
 }
 
 #[test]
