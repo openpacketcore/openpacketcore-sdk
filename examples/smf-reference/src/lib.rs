@@ -664,7 +664,9 @@ fn association_release_response(seq: u32) -> Result<OwnedMessage, SmfError> {
             message_priority: None,
             spare_octet: 0,
         },
-        ies: vec![InformationElement::from_typed(&TypedIe::Cause(Cause {
+        ies: vec![InformationElement::from_typed(&TypedIe::NodeId(NodeId {
+            node_id_type: NodeIdType::Fqdn, value: b"ref".to_vec(),
+        }))?, InformationElement::from_typed(&TypedIe::Cause(Cause {
             value: CauseValue::RequestAccepted,
         }))?],
     })
@@ -817,6 +819,8 @@ pub fn build_create_far(
             edrt: false,
             bdpn: false,
             ddpn: false,
+            fssm: false,
+            mbsu: false,
             spare: 0,
         }),
     ];
@@ -912,6 +916,8 @@ pub fn build_update_far(far_id: u32, dst_interface: u8) -> Result<TypedIe, SmfEr
                 edrt: false,
                 bdpn: false,
                 ddpn: false,
+                fssm: false,
+                mbsu: false,
                 spare: 0,
             }),
             TypedIe::UpdateForwardingParameters(update_fwd),

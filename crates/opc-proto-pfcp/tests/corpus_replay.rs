@@ -19,7 +19,7 @@ fn exercise(data: &[u8]) {
     // Borrowed decode at the default (Structural) level.
     let _ = Message::decode(data, DecodeContext::default());
 
-    // Strict decode (spare bits / FO flag enforcement).
+    // Strict receive decode (spare bits ignored and FO accepted).
     let ctx_strict = DecodeContext {
         validation_level: ValidationLevel::Strict,
         ..Default::default()

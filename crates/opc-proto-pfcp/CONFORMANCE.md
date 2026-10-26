@@ -6,7 +6,8 @@ This document defines the conformance of the `opc-proto-pfcp` crate against
 ## Specification Baseline
 
 - **Document**: 3GPP TS 29.244
-- **Release**: Release 18 (R18)
+- **Release**: Release 18 API baseline; wire registries and citations verified
+  against TS 29.244 V19.6.0 (R19), without claiming every R19 procedure.
 - **Status**: v3 — session-management codec subset implemented and published;
   `Production Profile v1` is a compatibility identifier for the N4 codec
   candidate below, not a current production approval
@@ -54,16 +55,24 @@ policy, charging, persistence, or high-availability control-plane behavior.
 
 ### Profile-owned procedures
 
-The named profile owns typed decode, encode, construction, and semantic
-validation for these PFCP procedures:
+The profile checks the mandatory top-level IEs and header class below. New
+node/session-set messages use raw IEs when no typed value model exists; their
+conditional groups and procedure state remain caller-owned. Typed convenience
+builders cover the previously supported heartbeat/association/session subset.
 
 | Procedure | Message types | Profile requirement |
 |:---|:---|:---|
 | Heartbeat | Request (1), Response (2) | Recovery Time Stamp decode/encode and correlation-friendly sequence preservation. |
+| PFD Management | Request (3), Response (4) | Cause on response; request has no unconditional mandatory IE. |
+| Association Update | Request (7), Response (8) | Node ID on both; Cause on response. |
+| Version Not Supported | Response (11) | Header only. |
+| Node Report | Request (12), Response (13) | Node ID on both; Node Report Type on request, Cause on response. |
+| Session Set Deletion | Request (14), Response (15) | Node ID on both; Cause on response. |
+| Session Set Modification | Request (16), Response (17) | Node ID on both; one or more Session Change Info on request, Cause on response. |
 | Association Setup | Request (5), Response (6) | Node ID, Recovery Time Stamp, Cause on response, and Offending IE on rejection paths. |
-| Association Release | Request (9), Response (10) | Cause on response and graceful unsupported-IE handling. |
-| Session Establishment | Request (50), Response (51) | F-SEID and Create PDR/FAR/QER/URR groups with cross-reference validation. |
-| Session Modification | Request (52), Response (53) | Update/Remove/Create PDR/FAR/QER/URR groups with cross-reference validation. |
+| Association Release | Request (9), Response (10) | Node ID on both messages and Cause on response. |
+| Session Establishment | Request (50), Response (51) | Node ID, request F-SEID and Create PDR/FAR groups; Cause and successful-response F-SEID; request rule references. |
+| Session Modification | Request (52), Response (53) | Validate supplied rule groups; existing-rule references are resolved by the session owner. |
 | Session Deletion | Request (54), Response (55) | SEID-bearing request/response validation and Cause on response. |
 | Session Report | Request (56), Response (57) | Report Type, Usage Report groups, UR-SEQN, and Cause on response. |
 
@@ -95,17 +104,21 @@ profile failures and must cover at least these rules:
 - Association Setup Request must include Node ID and Recovery Time Stamp.
 - Association Setup Response must include Node ID, Recovery Time Stamp, and
   Cause; rejection responses should expose Offending IE when present.
-- Session Establishment Request must include CP F-SEID and at least one Create
+- Session Establishment Request must include Node ID, CP F-SEID and at least one Create
   PDR and Create FAR.
-- Create/Update PDR must include PDR ID, Precedence, and PDI.
-- PDI must include Source Interface and at least one traffic-match primitive
-  from the profile-owned packet-detection set.
-- Create/Update FAR must include FAR ID and Apply Action; forwarding action
+- Create PDR requires PDR ID, Precedence and PDI. Update PDR requires PDR ID;
+  Precedence and PDI are optional changes.
+- PDI requires Source Interface. Source-interface-only matching is valid.
+  Traffic Endpoint ID excludes Local F-TEID, Local Ingress Tunnel, Network
+  Instance and UE IP Address.
+- Create FAR requires FAR ID and Apply Action; Update FAR requires FAR ID.
+  Apply Action selects exactly one primary action (FSSM/MBSU count together),
+  and NOCP/BDPN require BUFF. A supplied forwarding action
   must include Forwarding Parameters with Destination Interface.
-- PDR references to FAR/QER/URR IDs must resolve to rule IDs present in the
-  same message when those references create or update local rule graph state.
-- Session Modification Request must contain at least one create/update/remove
-  rule operation.
+- Establishment PDR references to FAR/QER/URR IDs must resolve in that message.
+  Modification references may identify existing rules; the session owner must
+  resolve them against stored state. Modification has no unconditional
+  mandatory operation: parameter-only and empty requests are accepted.
 - Session Deletion Request/Response must be SEID-bearing.
 - Session Report Request must include Report Type and include Usage Report when
   the report type requires it.
@@ -132,24 +145,24 @@ profile failures and must cover at least these rules:
   request/response transaction orchestration.
 - SMF/UPF business logic, node selection, rule persistence, charging policy,
   traffic steering policy, or product-specific admission decisions.
-- PFD Management, Subscriber Management, and non-N4/Sxa/Sxb procedures outside
+- PFD storage, Subscriber Management, and non-N4/Sxa/Sxb procedures outside
   the profile-owned list.
 - Full typed coverage for every TS 29.244 IE outside the session-management
   profile.
 
 ## Supported Features
 
-### 1. Message Header (§7.4.1)
+### 1. Message Header (§7.2.2)
 - Version 1 parsing and validation.
-- Octet-1 flag layout per §7.4.1.1: bits 8–6 version, bits 5–4 spare,
+- Octet-1 flag layout per §7.2.2.1: bits 8–6 version, bits 5–4 spare,
   bit 3 FO, bit 2 MP, bit 1 S — asserted against hand-authored spec bytes
   in the test suite (not merely against this codec's own encoder).
 - S-flag (SEID presence).
 - MP flag: message priority carried in the high nibble of the final
   header octet, preserved byte-exact across decode → encode.
-- FO flag parsing (rejected in strict mode, must be 0).
+- FO is accepted at every validation level and exposed as `Header.fo`.
 - Sequence number (24-bit).
-- Spare bits validation (must be 0 in strict mode).
+- Received header spare bits are ignored at all levels and cleared on encode.
 - The header Length field is honored: the message ends `4 + Length`
   octets in; shorter input is rejected as truncated, a Length smaller
   than the header's own SEID/sequence octets is rejected as structural,
@@ -164,12 +177,17 @@ profile failures and must cover at least these rules:
   `InformationElement` layer. The typed sequence boundary applies
   `UnknownIePolicy`: `Drop` omits them, `Preserve` retains `TypedIe::Raw` in
   wire order, and `Reject` returns `UnknownCriticalIe`, recursively through
-  grouped IEs.
+  grouped IEs. Assigned but unmodelled types are preserved raw under every
+  policy. `IE_DEFINITIONS` contains all 400 assigned R19 types; reserved/spare
+  codes remain unknown. `tools/generate-ie-registry.py` regenerates it from
+  the standard PDF converted by `pdftotext -layout`; `--check` verifies it.
 - Truncated TLV rejection (header and value).
 - Overflow length rejection.
 
 ### 3. Messages
 - Heartbeat Request (1) / Response (2)
+- PFD Management (3/4), Association Update (7/8), Version Not Supported (11),
+  Node Report (12/13), Session Set Deletion (14/15), Session Set Modification (16/17)
 - Association Setup Request (5) / Response (6)
 - Association Release Request (9) / Response (10)
 - Session Establishment Request (50) / Response (51)
@@ -186,21 +204,22 @@ arithmetic, truncation/overflow rejection, and negative tests.
 |:---|:---|:---|:---|
 | Cause | 19 | §8.2.1 | V19.6.0 registry, `Unknown(u8)` fallback, acceptance/rejection classification. |
 | Node ID | 60 | §8.2.38 | IPv4/IPv6/FQDN; length validated per type. |
-| F-SEID | 57 | §8.2.40 | V4/V6 flags, SEID (8 octets), address order. |
+| F-SEID | 57 | §8.2.37 | V4/V6 flags, SEID (8 octets), address order. |
 | F-TEID | 21 | §8.2.3 | V4/V6/CH/CHID flags; CH omits TEID and addresses; conditional Choose ID. |
 | PDR ID | 56 | §8.2.36 | 2 octets. |
-| FAR ID | 108 | §8.2.50 | 4 octets. |
-| QER ID | 109 | §8.2.37 | 4 octets. |
-| URR ID | 81 | §8.2.71 | 4 octets. |
-| Precedence | 29 | §8.2.20 | 4 octets. |
-| Apply Action | 44 | §8.2.26 | 2 octet flags (DROP, FORW, BUFF, …); spare bits preserved. |
+| FAR ID | 108 | §8.2.74 | 4 octets. |
+| QER ID | 109 | §8.2.75 | 4 octets. |
+| URR ID | 81 | §8.2.54 | 4 octets. |
+| Precedence | 29 | §8.2.11 | 4 octets. |
+| Apply Action | 44 | §8.2.26 | Includes FSSM/MBSU; profile validates primary action and buffer notifications. |
 | Source Interface | 20 | §8.2.2 | 1 octet; spare nibble preserved. |
-| Destination Interface | 42 | §8.2.3 | 1 octet; spare nibble preserved. |
+| Destination Interface | 42 | §8.2.24 | 1 octet; spare nibble preserved. |
 | Network Instance | 22 | §8.2.4 | Variable-length DNN octet string. |
 | UE IP Address | 93 | §8.2.62 | V6/V4/SD/IPv6D/CHV4/CHV6/IP6PL flags; IPv6 delegation and prefix length. |
 | Outer Header Creation | 84 | §8.2.56 | 16-bit description (octet 5 = high byte); TEID iff GTP-U (octet 5 bits 1-2), UDP port iff non-GTP UDP (bits 3-4), addresses per bits 1/3/5 and 2/4/6; C-TAG/S-TAG. |
-| Outer Header Removal | 95 | §8.2.57 | 1 octet description. |
-| Recovery Time Stamp | 96 | §8.2.69 | 4 octets, NTP short-format seconds (RFC 5905, 1900 era), carried opaquely. |
+| Outer Header Removal | 95 | §8.2.64 | 1 octet description. |
+| User Plane Inactivity Timer | 117 | §8.2.83 | Four-octet inactivity duration in seconds. |
+| Recovery Time Stamp | 96 | §8.2.65 | 4 octets, NTP short-format seconds (RFC 5905, 1900 era), carried opaquely. |
 | QoS Flow Identifier (QFI) | 124 | §8.2.89 | 1 octet; 6-bit QFI value, spare high bits emitted as zero. |
 | Remove PDR | 15 | §7.5.4.6 | 2 octets; wraps PDR ID. |
 | Remove FAR | 16 | §7.5.4.7 | 4 octets; wraps FAR ID. |
@@ -244,19 +263,19 @@ input. Byte-exact round-trip verified for all listed grouped IEs.
 
 | IE | Type | Section | Member decode |
 |:---|:---|:---|:---|
-| Create PDR | 1 | §7.5.2.1 | Typed members with depth limit. |
-| PDI | 2 | §7.5.2.2 | Typed members with depth limit. |
-| Create FAR | 3 | §7.5.2.3 | Typed members with depth limit. |
-| Forwarding Parameters | 4 | §7.5.2.2.1 | Typed members with depth limit. |
-| Create URR | 6 | §7.5.2.5 | Typed members with depth limit. |
-| Create QER | 7 | §7.5.2.4 | Typed members with depth limit. |
-| Update PDR | 9 | §7.5.4.2 | Typed members with depth limit. |
-| Update FAR | 10 | §7.5.4.3 | Typed members with depth limit. |
-| Update Forwarding Parameters | 11 | §7.5.4.3-2 | Typed members with depth limit. |
+| Create PDR | 1 | §7.5.2.2-1 | Typed members with depth limit. |
+| PDI | 2 | §7.5.2.2-2 | Typed members with depth limit. |
+| Create FAR | 3 | §7.5.2.3-1 | Typed members with depth limit. |
+| Forwarding Parameters | 4 | §7.5.2.3-2 | Typed members with depth limit. |
+| Create URR | 6 | §7.5.2.4-1 | Typed members with depth limit. |
+| Create QER | 7 | §7.5.2.5-1 | Typed members with depth limit. |
+| Update PDR | 9 | §7.5.4.2-1 | Typed members with depth limit. |
+| Update FAR | 10 | §7.5.4.3-1 | Typed members with depth limit. |
+| Update Forwarding Parameters | 11 | §7.5.4.3-2-2 | Typed members with depth limit. |
 | Update URR | 13 | §7.5.4.4 | Typed members with depth limit. |
 | Update QER | 14 | §7.5.4.5 | Typed members with depth limit. |
-| Created PDR | 8 | §7.5.2.6 | Typed members with depth limit. |
-| Usage Report (Session Report Request) | 80 | §7.5.8.3 | Typed members with depth limit. |
+| Created PDR | 8 | §7.5.3.2-1 | Typed members with depth limit. |
+| Usage Report (Session Report Request) | 80 | §7.5.8.3-1 | Typed members with depth limit. |
 
 ## Robustness & Fuzzing
 
@@ -305,3 +324,27 @@ unless a future profile explicitly adds them.
   (e.g., Start/End Time, Application Detection Information).
 - Full message-specific semantic validation (e.g., mandatory-IE presence).
 - PFD Management, Subscriber Management, and other non-SMF/UPF messages.
+
+### Compliance migration and bundle handling (#1359, #1516, #1518–#1525)
+
+`session_establishment_request` now requires the sending Node ID after `seid`.
+Association release builders require Node ID after `seq`.
+`session_establishment_response` requires Node ID and `Option<FSeid>` after
+`seid`; successful responses require `Some`. These changes prevent convenience
+builders from constructing messages missing mandatory identity information.
+`ApplyAction` literals gain `fssm` and `mbsu`; `spare` now describes only octet 6
+bits 6–8. Exhaustive matches must account for new `MessageType` variants,
+`TypedIe::UserPlaneInactivityTimer` and `ProfileValidationError::InvalidCombination`.
+The legacy `MissingOperation`/`MissingTrafficMatch` variants are no longer emitted.
+
+To walk a bundled datagram, call `Message::decode` on the remaining slice.
+Its returned remainder begins at `4 + header.length`. Continue when `header.fo`
+is true, requiring another complete message; the final message has FO false
+and must exhaust the datagram. Use the returned remainder, not an inferred IE
+boundary. `tests/spec_receivers.rs` exercises two independent heartbeat wire
+images, mandatory-IE removal, SEID class, extension policies and action flags.
+Header encoders retain FO and clear spare bits, including the final spare octet.
+
+The registry supplies each typed IE error's defining subclause/table. Table
+8.1.2-1 has typographical errors for IE 55–57 and 299; the generator verifies
+and uses their actual clause headings (8.2.35–37 and 8.2.205).

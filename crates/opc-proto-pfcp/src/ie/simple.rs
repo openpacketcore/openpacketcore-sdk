@@ -315,12 +315,12 @@ impl SimpleIe for NodeId {
 }
 
 // ---------------------------------------------------------------------------
-// F-SEID (§8.2.40)
+// F-SEID (§8.2.37)
 // ---------------------------------------------------------------------------
 
 /// F-SEID IE (type 57).
 ///
-/// TS 29.244 §8.2.40:
+/// TS 29.244 §8.2.37:
 /// - octet 5: bit 2 V4, bit 1 V6, bits 8-3 spare (0)
 /// - octets 6-13: SEID (8 octets)
 /// - octets 14-17: IPv4 address if V4
@@ -615,12 +615,12 @@ impl SimpleIe for PdrId {
 }
 
 // ---------------------------------------------------------------------------
-// FAR ID (§8.2.50)
+// FAR ID (§8.2.74)
 // ---------------------------------------------------------------------------
 
 /// FAR ID IE (type 108).
 ///
-/// TS 29.244 §8.2.50: four octets.
+/// TS 29.244 §8.2.74: four octets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FarId {
     /// Forwarding Action Rule ID.
@@ -646,12 +646,12 @@ impl SimpleIe for FarId {
 }
 
 // ---------------------------------------------------------------------------
-// QER ID (§8.2.37)
+// QER ID (§8.2.75)
 // ---------------------------------------------------------------------------
 
 /// QER ID IE (type 109).
 ///
-/// TS 29.244 §8.2.37: four octets.
+/// TS 29.244 §8.2.75: four octets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QerId {
     /// QoS Enforcement Rule ID.
@@ -1923,12 +1923,12 @@ impl SimpleIe for Gbr {
 }
 
 // ---------------------------------------------------------------------------
-// URR ID (§8.2.71)
+// URR ID (§8.2.54)
 // ---------------------------------------------------------------------------
 
 /// URR ID IE (type 81).
 ///
-/// TS 29.244 §8.2.71: four octets.
+/// TS 29.244 §8.2.54: four octets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UrrId {
     /// Usage Reporting Rule ID.
@@ -1954,12 +1954,12 @@ impl SimpleIe for UrrId {
 }
 
 // ---------------------------------------------------------------------------
-// Precedence (§8.2.20)
+// Precedence (§8.2.11)
 // ---------------------------------------------------------------------------
 
 /// Precedence IE (type 29).
 ///
-/// TS 29.244 §8.2.20: four octets, unsigned integer.
+/// TS 29.244 §8.2.11: four octets, unsigned integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Precedence {
     /// Precedence value (lower = higher priority).
@@ -2002,7 +2002,9 @@ impl SimpleIe for Precedence {
 /// - bit 9: EDRT
 /// - bit 10: BDPN
 /// - bit 11: DDPN
-/// - bits 16-12: spare
+/// - bit 12: FSSM
+/// - bit 13: MBSU
+/// - bits 16-14: spare
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyAction {
     /// DROP (bit 1).
@@ -2027,7 +2029,11 @@ pub struct ApplyAction {
     pub bdpn: bool,
     /// DDPN (bit 11).
     pub ddpn: bool,
-    /// Spare bits (bits 16-12) preserved for byte-exact re-encode.
+    /// Forward packets to lower layer SSM (bit 12).
+    pub fssm: bool,
+    /// Forward and replicate MBS data over unicast (bit 13).
+    pub mbsu: bool,
+    /// Spare bits (bits 16-14) preserved for byte-exact re-encode.
     pub spare: u8,
 }
 
@@ -2052,13 +2058,21 @@ impl SimpleIe for ApplyAction {
             edrt: (b2 & 0x01) != 0,
             bdpn: (b2 & 0x02) != 0,
             ddpn: (b2 & 0x04) != 0,
-            spare: (b2 & 0xF8) >> 3,
+            fssm: b2 & 0x08 != 0,
+            mbsu: b2 & 0x10 != 0,
+            spare: (b2 & 0xE0) >> 5,
         })
     }
 
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         let mut b1: u8 = 0;
-        let mut b2: u8 = (self.spare & 0x1F) << 3;
+        let mut b2: u8 = (self.spare & 0x07) << 5;
+        if self.fssm {
+            b2 |= 0x08;
+        }
+        if self.mbsu {
+            b2 |= 0x10;
+        }
         if self.drop {
             b1 |= 0x01;
         }
@@ -2134,12 +2148,12 @@ impl SimpleIe for SourceInterface {
 }
 
 // ---------------------------------------------------------------------------
-// Destination Interface (§8.2.3)
+// Destination Interface (§8.2.24)
 // ---------------------------------------------------------------------------
 
 /// Destination Interface IE (type 42).
 ///
-/// TS 29.244 §8.2.3: one octet, bits 4-1 = interface value, bits 8-5 = spare.
+/// TS 29.244 §8.2.24: one octet, bits 4-1 = interface value, bits 8-5 = spare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DestinationInterface {
     /// Interface value.
@@ -2378,12 +2392,12 @@ impl SimpleIe for UeIpAddress {
 }
 
 // ---------------------------------------------------------------------------
-// Outer Header Creation (§8.2.12)
+// Outer Header Creation (§8.2.56)
 // ---------------------------------------------------------------------------
 
 /// Outer Header Creation IE (type 84).
 ///
-/// TS 29.244 §8.2.12:
+/// TS 29.244 §8.2.56:
 /// - octets 5-6: Description (2 octets, flags)
 /// - TEID (4 octets) if GTP-U UDP/IP or GRE
 /// - IPv4 address (4 octets) if IPv4
@@ -2552,12 +2566,12 @@ impl SimpleIe for OuterHeaderCreation {
 }
 
 // ---------------------------------------------------------------------------
-// Outer Header Removal (§8.2.57)
+// Outer Header Removal (§8.2.64)
 // ---------------------------------------------------------------------------
 
 /// Outer Header Removal IE (type 95).
 ///
-/// TS 29.244 §8.2.57: one octet, description.
+/// TS 29.244 §8.2.64: one octet, description.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OuterHeaderRemoval {
     /// Description value.
@@ -2583,12 +2597,12 @@ impl SimpleIe for OuterHeaderRemoval {
 }
 
 // ---------------------------------------------------------------------------
-// Recovery Time Stamp (§8.2.69)
+// Recovery Time Stamp (§8.2.65)
 // ---------------------------------------------------------------------------
 
 /// Recovery Time Stamp IE (type 96).
 ///
-/// TS 29.244 §8.2.69: four octets in the format of the first 32 bits of an
+/// TS 29.244 §8.2.65: four octets in the format of the first 32 bits of an
 /// NTP timestamp (IETF RFC 5905), i.e. seconds since the NTP era origin
 /// 1900-01-01 00:00:00 UTC. The value is carried opaquely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2598,6 +2612,33 @@ pub struct RecoveryTimeStamp {
 }
 
 impl SimpleIe for RecoveryTimeStamp {
+    fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
+        if value.len() < 4 {
+            return Err(
+                DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
+            );
+        }
+        Ok(Self {
+            seconds: u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
+        })
+    }
+
+    fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
+        dst.put_u32(self.seconds);
+        Ok(())
+    }
+}
+
+/// User Plane Inactivity Timer IE (type 117).
+///
+/// TS 29.244 §8.2.83: four octets containing the inactivity duration in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserPlaneInactivityTimer {
+    /// Inactivity duration in seconds.
+    pub seconds: u32,
+}
+
+impl SimpleIe for UserPlaneInactivityTimer {
     fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
         if value.len() < 4 {
             return Err(
