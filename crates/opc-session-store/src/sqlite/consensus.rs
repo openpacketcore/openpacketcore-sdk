@@ -16191,11 +16191,18 @@ fn maintain_due_protected_roster_reclaim_sync(
             "protected roster maintenance unavailable".into(),
         ));
     }
-    if due_reclaim {
-        reclaim_protected_rosters_sync(conn, identity, logical_time).map(|()| true)
-    } else {
-        retire_protected_rosters_sync(conn, identity)
+    // Drain an eligible terminal prefix before reclaiming newer rows. The
+    // retirement planner returns false when an older retained row blocks it;
+    // reclaim then keeps its original retention predicate and batch bound.
+    // A retirement turn cannot create tombstones, so reclaim also progresses.
+    if due_retirement && retire_protected_rosters_sync(conn, identity)? {
+        return Ok(true);
     }
+    if due_reclaim {
+        reclaim_protected_rosters_sync(conn, identity, logical_time)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Test-only bounded compaction followed by the production restart scanner.

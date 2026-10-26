@@ -499,7 +499,8 @@ const CAPACITY_POLICY_DESCRIPTOR: &[u8] = concat!(
     "accounting=reserve-terminal-peak,q2-converts,checked-exact-reopen\n",
     "class=ordinary-frame-unchanged,emergency-distinct-frame-and-body-commitment\n",
     "local=emergency-bypasses-authority-and-provider-shares,terminal-reads-have-no-count-quota\n",
-    "retention=preserve-terminal-recovery-evidence,oldest-bounded-maintenance\n"
+    "retention=preserve-terminal-recovery-evidence,oldest-bounded-maintenance\n",
+    "maintenance=eligible-oldest-tombstone-prefix-before-new-reclaim,one-bounded-phase-per-command\n"
 )
 .as_bytes();
 
@@ -9749,6 +9750,29 @@ mod tests {
             Generation::new(1),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn roster_maintenance_order_is_bound_into_activation_compatibility() {
+        let lines: BTreeSet<&[u8]> = CAPACITY_POLICY_DESCRIPTOR
+            .split(|byte| *byte == b'\n')
+            .collect();
+        assert!(lines.contains(
+            b"maintenance=eligible-oldest-tombstone-prefix-before-new-reclaim,one-bounded-phase-per-command".as_slice(),
+        ));
+        let reclaim_first = Profile {
+            schema: SCHEMA_V2,
+            consumer_revision: CONSUMER_REVISION_V2,
+            digest: [
+                0x75, 0xc2, 0x7e, 0xb3, 0x77, 0xc4, 0xde, 0xcc, 0x8d, 0xe5, 0x76, 0x2b, 0x63, 0xac,
+                0x52, 0xea, 0xcb, 0x23, 0x0a, 0x1f, 0xa5, 0xd2, 0x78, 0x7d, 0xb9, 0x36, 0xec, 0x1c,
+                0x16, 0x85, 0x78, 0xcd,
+            ],
+        };
+        assert!(
+            reclaim_first.validate().is_err(),
+            "reclaim-first activation cannot authorize the new deterministic maintenance order"
+        );
     }
 
     #[test]

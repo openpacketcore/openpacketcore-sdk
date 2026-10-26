@@ -85,10 +85,10 @@ async fn run_roster_maintenance_lane<L: RosterMaintenanceLane>(lane: L) {
         if !lane.wait(backoff.delay()).await {
             return;
         }
-        // Recheck once immediately after an applied turn leaves tombstones.
-        // At steady arrivals, waiting a full tick would let the next due row
-        // win reclaim again. Each proposal keeps the unchanged backend batch
-        // bound, and even flat gauges can produce at most two turns per tick.
+        // Recheck once after reclaim or retirement leaves work in the other
+        // phase. Each proposal keeps the unchanged backend batch bound, and
+        // even flat gauges can produce at most two turns per tick.
+        let mut applied_this_tick = false;
         for _ in 0..2 {
             let Some(before) = lane.occupancy() else {
                 return;
@@ -106,16 +106,21 @@ async fn run_roster_maintenance_lane<L: RosterMaintenanceLane>(lane: L) {
             // A successful due turn is progress even when concurrent Q2 completions
             // replace its reclaimed count. Gauges are only a fallback for an
             // indeterminate reply that nevertheless published a visible reduction.
-            if outcome != RosterMaintenanceOutcome::Retry
+            applied_this_tick |= outcome == RosterMaintenanceOutcome::Applied;
+            if applied_this_tick
+                || outcome != RosterMaintenanceOutcome::Retry
                 || roster_maintenance_progressed(&before, &after)
             {
                 backoff.reset();
             } else {
                 backoff = backoff.grew();
             }
+            let follow_up = after.tombstone_reservations > 0
+                || (after.retained_reservations > 0
+                    && after.tombstone_reservations < before.tombstone_reservations);
             if outcome != RosterMaintenanceOutcome::Applied
                 || after.occupancy_valid == 0
-                || after.tombstone_reservations == 0
+                || !follow_up
             {
                 break;
             }

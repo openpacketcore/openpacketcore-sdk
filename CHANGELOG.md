@@ -646,7 +646,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority deadline (expiry reports `AuthorityRejected`); emergency admissions
   bypass those policy limits while
   preserving exact accounting and authority checks. Terminal evidence retains
-  its existing 24-hour recovery policy. (#1307)
+  its existing 24-hour recovery policy. Activation also binds bounded
+  retirement before newer reclaim work, so sustained arrivals cannot starve
+  tombstone removal. (#1307)
 - `opc-session-store`: protected-roster activation now requires a versioned
   witness that retains the maximum original admission fence across V1/V2
   terminal retirement. An absent V2 recovery above that maximum remains

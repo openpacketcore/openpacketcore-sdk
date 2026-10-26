@@ -21,6 +21,10 @@ stream validation and charge accounting bound allocation before publication.
 The minimal change retains the current 24-hour recovery-evidence policy.
 It ceases to imply a fixed number of completions in that interval. Existing
 bounded maintenance releases retained bytes and the final partition metadata.
+An eligible oldest tombstone prefix is retired before newer rows are reclaimed;
+retirement creates no tombstones, so both phases progress under continuous
+arrivals. The leader runs at most two bounded commands per maintenance tick,
+without changing the retention boundary or either phase's batch limit.
 An owned local-leader lane observes the existing ordered reclaim and terminal
 indexes and proposes `AdvanceLogicalTime` only when a bounded turn is eligible.
 It refreshes unknown occupancy, wakes on leadership changes, and joins before

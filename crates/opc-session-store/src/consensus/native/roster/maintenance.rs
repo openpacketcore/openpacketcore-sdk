@@ -143,20 +143,23 @@ impl Store<'_, '_> {
             return Ok(false);
         };
         let reclaim = self.ledger.index.has_due_retained(cutoff);
-        if !reclaim
-            && self
-                .ledger
-                .index
-                .first_terminal_state(witness.retired_terminal_sequence())?
-                != Some(State::Tombstone)
-        {
+        let retire = self
+            .ledger
+            .index
+            .first_terminal_state(witness.retired_terminal_sequence())?
+            == Some(State::Tombstone);
+        if !reclaim && !retire {
             return Ok(false);
         }
         let _memory = VerificationMemory::reserve(SELECTION_MEMORY)?;
-        let next = if reclaim {
-            self.reclaim(maintenance, cutoff, witness)?
-        } else {
+        // Retire an eligible terminal prefix before reclaiming newer rows.
+        // Otherwise continuous arrivals can make every turn choose reclaim.
+        // Retirement creates no new tombstones, so this bounded prefix drain
+        // cannot sustain itself without returning to the reclaim phase.
+        let next = if retire {
             self.retire(witness)?
+        } else {
+            self.reclaim(maintenance, cutoff, witness)?
         };
         // No part of the candidate was visible through this savepoint while
         // a later carrier, partition action or final witness could fail.
