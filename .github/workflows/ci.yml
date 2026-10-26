@@ -532,6 +532,10 @@ jobs:
           RUSTFLAGS: "--cfg opc_linux_gtpu_sys_force_unsupported"
         run: |
           set -euo pipefail
+          umask 0077
+          TMPDIR="$(mktemp -d "${RUNNER_TEMP}/gtpu-cfg.XXXXXX")"
+          export TMPDIR
+          trap 'rm -rf -- "$TMPDIR"' EXIT
           selector=ebpf::tests::remote_selector_regression::singleton_public_protected_flow_preserves_durable_state
           cargo test --locked -p opc-linux-gtpu-sys -p opc-gtpu-dataplane --no-default-features --quiet --lib -- --list --exact "$selector" > unsupported-selector-tests.txt
           python3 - "$selector" <<'PYCODE'
