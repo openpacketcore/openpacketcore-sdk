@@ -1037,7 +1037,10 @@ impl DrainQualificationCodecV1 {
         ] {
             nonzero_commitment(value)?;
         }
-        if qualification_nonce == [0; 16] || precommitted_qualification_nonce == [0; 16] {
+        if qualification_nonce == [0; 16]
+            || precommitted_qualification_nonce == [0; 16]
+            || bool::from(qualification_nonce.ct_eq(&precommitted_qualification_nonce))
+        {
             return Err(SelectorNamespaceCodecError::invalid());
         }
         if backend_epoch == [0; 16] {
@@ -1195,7 +1198,10 @@ impl TransferEdgeCodecV1 {
         ] {
             nonzero_commitment(value)?;
         }
-        if successor_operation_nonce == [0; 16] {
+        if successor_operation_nonce == [0; 16]
+            || predecessor_group == successor_group
+            || predecessor_terminal_generation >= successor_installing_generation
+        {
             return Err(SelectorNamespaceCodecError::invalid());
         }
         Ok(Self {
@@ -1276,6 +1282,20 @@ impl TransferEdgeCodecV1 {
     }
 }
 
+/// Projection of one qualified retired group and its currently available
+/// atoms at the coordinator's expected ledger revision. This internal value
+/// is not an authority capability: a future coordinator must resolve it under
+/// the namespace lease and include the same rows in the admission CAS.
+#[allow(dead_code, reason = "The RFC 017 durable coordinator remains unwired.")]
+#[derive(Clone)]
+struct ResolvedRetiredPredecessorV2 {
+    group: [u8; 32],
+    desired: [u8; 32],
+    terminal_generation: NonZeroU64,
+    complete_atoms: AtomSubsetCodecV1,
+    retired_available_atoms: AtomSubsetCodecV1,
+}
+
 /// Canonical mixed-provenance admission preflight for one complete candidate.
 ///
 /// This is the deterministic value-level half of RFC 017 section 6.1: it builds
@@ -1306,6 +1326,8 @@ impl MixedProvenanceCompositionV2 {
         commitment_key: &SelectorNamespaceCommitmentKeyV2,
         sources: Vec<ProvenanceSourceCodecV1>,
         qualifications: &[DrainQualificationCodecV1],
+        predecessors: &[ResolvedRetiredPredecessorV2],
+        backend_epoch: [u8; 16],
         successor_installing_generation: NonZeroU64,
         successor_operation_nonce: [u8; 16],
     ) -> Result<Self, SelectorNamespaceCodecError> {
@@ -1313,7 +1335,9 @@ impl MixedProvenanceCompositionV2 {
         // pure-fresh partition emits no transfer edges, so a zero nonce is
         // refused here rather than being silently dropped by the empty edge
         // set. (The installing generation is already nonzero by type.)
-        if bool::from(successor_operation_nonce.ct_eq(&[0; 16])) {
+        if bool::from(successor_operation_nonce.ct_eq(&[0; 16]))
+            || bool::from(backend_epoch.ct_eq(&[0; 16]))
+        {
             return Err(SelectorNamespaceCodecError::invalid());
         }
         let partition = ProvenancePartitionCodecV1::new(
@@ -1324,6 +1348,14 @@ impl MixedProvenanceCompositionV2 {
             commitment_key,
             sources,
         )?;
+        let retired_count = partition
+            .sources()
+            .iter()
+            .filter(|source| matches!(source.kind, ProvenanceSourceKindV1::RetiredSubset { .. }))
+            .count();
+        if qualifications.len() != retired_count || predecessors.len() != retired_count {
+            return Err(SelectorNamespaceCodecError::invalid());
+        }
         let mut transfer_edges = Vec::new();
         let mut edge_atoms = std::collections::BTreeSet::new();
         for source in partition.sources() {
@@ -1361,6 +1393,40 @@ impl MixedProvenanceCompositionV2 {
                 return Err(SelectorNamespaceCodecError::invalid());
             }
             let qualification = selected[0];
+            if qualification.backend_epoch != backend_epoch
+                || qualification.precommitted_qualification_generation
+                    >= successor_installing_generation
+            {
+                return Err(SelectorNamespaceCodecError::invalid());
+            }
+            let resolved = predecessors
+                .iter()
+                .filter(|state| state.group == *predecessor_group)
+                .collect::<Vec<_>>();
+            if resolved.len() != 1 {
+                return Err(SelectorNamespaceCodecError::invalid());
+            }
+            let resolved = resolved[0];
+            if resolved.desired != qualification.predecessor_desired
+                || resolved.terminal_generation != *terminal_generation
+                || !commitment_key
+                    .commit(SELECTOR_SET_DOMAIN_V1, &resolved.complete_atoms.encode())?
+                    .matches(predecessor_set)
+                || resolved
+                    .retired_available_atoms
+                    .atoms()
+                    .iter()
+                    .any(|atom| resolved.complete_atoms.atoms().binary_search(atom).is_err())
+                || source.subset.atoms().iter().any(|atom| {
+                    resolved
+                        .retired_available_atoms
+                        .atoms()
+                        .binary_search(atom)
+                        .is_err()
+                })
+            {
+                return Err(SelectorNamespaceCodecError::invalid());
+            }
             let source_subset_commitment = source.subset.commitment(commitment_key)?.0;
             let drain_qualification_commitment = qualification.commitment(commitment_key)?.0;
             for atom in source.subset.atoms() {
@@ -2671,6 +2737,33 @@ mod tests {
         )
         .is_err());
     }
+    fn predecessor_atoms(group: u8) -> AtomSubsetCodecV1 {
+        AtomSubsetCodecV1::new(if group == 0x57 {
+            vec![downlink_atom(0x1000_0002)]
+        } else {
+            vec![mark_atom(7), ipv4_paa_atom([10, 23, 0, 9])]
+        })
+        .unwrap()
+    }
+
+    fn resolved_predecessors(
+        qualifications: &[DrainQualificationCodecV1],
+    ) -> Vec<super::ResolvedRetiredPredecessorV2> {
+        qualifications
+            .iter()
+            .map(|qualification| {
+                let atoms = predecessor_atoms(qualification.predecessor_group[0]);
+                super::ResolvedRetiredPredecessorV2 {
+                    group: qualification.predecessor_group,
+                    desired: qualification.predecessor_desired,
+                    terminal_generation: qualification.terminal_generation,
+                    complete_atoms: atoms.clone(),
+                    retired_available_atoms: atoms,
+                }
+            })
+            .collect()
+    }
+
     fn drain_qualification(
         predecessor_group: u8,
         predecessor_set: u8,
@@ -2679,7 +2772,7 @@ mod tests {
         DrainQualificationCodecV1::new(
             NAMESPACE_BINDING,
             commitment_bytes(predecessor_group),
-            commitment_bytes(predecessor_set),
+            selector_set_commitment(&predecessor_atoms(predecessor_group), &commitment_key()),
             commitment_bytes(predecessor_set.wrapping_add(1)),
             generation(terminal_generation),
             generation(terminal_generation + 1),
@@ -2702,7 +2795,7 @@ mod tests {
         candidate_desired: [u8; 32],
         atoms: Vec<Vec<u8>>,
         predecessor_group: u8,
-        predecessor_set: u8,
+        _predecessor_set: u8,
         terminal_generation: u64,
         qualification: &DrainQualificationCodecV1,
         key: &SelectorNamespaceCommitmentKeyV2,
@@ -2714,7 +2807,7 @@ mod tests {
             candidate_desired,
             AtomSubsetCodecV1::new(atoms).expect("the test subset is canonical"),
             commitment_bytes(predecessor_group),
-            commitment_bytes(predecessor_set),
+            qualification.predecessor_set,
             generation(terminal_generation),
             qualification.commitment(key).expect("commitment").0,
         )
@@ -2902,8 +2995,10 @@ mod tests {
             &candidate,
             &key,
             vec![fresh, retired_a, retired_b],
-            &[qualification_a, qualification_b],
-            generation(88),
+            &[qualification_a.clone(), qualification_b.clone()],
+            &resolved_predecessors(&[qualification_a.clone(), qualification_b.clone()]),
+            [0x66; 16],
+            generation(91),
             nonce(0x33),
         )
         .expect("the mixed partition composes exactly");
@@ -2915,7 +3010,7 @@ mod tests {
             assert_eq!(edge.successor_group, candidate_group);
             assert_eq!(edge.successor_set, candidate_set);
             assert_eq!(edge.successor_desired, candidate_desired);
-            assert_eq!(edge.successor_installing_generation, generation(88));
+            assert_eq!(edge.successor_installing_generation, generation(91));
             assert_eq!(edge.successor_operation_nonce, nonce(0x33));
             assert_eq!(
                 TransferEdgeCodecV1::decode(&edge.encode())
@@ -2969,7 +3064,7 @@ mod tests {
                 AtomSubsetCodecV1::new(vec![mark_atom(7), ipv4_paa_atom([10, 23, 0, 9])])
                     .expect("the retired subset is canonical"),
                 commitment_bytes(0x55),
-                commitment_bytes(0x56),
+                qualification.predecessor_set,
                 generation(77),
                 qualification_commitment,
             )
@@ -2986,6 +3081,8 @@ mod tests {
                 &key,
                 build_sources(qualification_commitment),
                 failure,
+                &resolved_predecessors(failure),
+                [0x66; 16],
                 generation(88),
                 nonce(0x33),
             )
@@ -3007,7 +3104,7 @@ mod tests {
         let mut wrong_set = qualification.clone();
         wrong_set.predecessor_set = commitment_bytes(0xef);
         assert!(compose(&[wrong_set]).is_err(), "changed predecessor set");
-        assert!(compose(&[qualification]).is_ok());
+        assert!(compose(std::slice::from_ref(&qualification)).is_ok());
     }
 
     #[test]
@@ -3032,6 +3129,8 @@ mod tests {
             &key,
             vec![fresh.clone()],
             &[],
+            &resolved_predecessors(&[]),
+            [0x66; 16],
             generation(88),
             [0; 16],
         )
@@ -3044,6 +3143,8 @@ mod tests {
             &key,
             vec![fresh],
             &[],
+            &resolved_predecessors(&[]),
+            [0x66; 16],
             generation(88),
             nonce(0x33),
         )
@@ -3079,7 +3180,7 @@ mod tests {
             AtomSubsetCodecV1::new(vec![mark_atom(7), ipv4_paa_atom([10, 23, 0, 9])])
                 .expect("the retired subset is canonical"),
             candidate_group,
-            commitment_bytes(0x56),
+            qualification.predecessor_set,
             generation(77),
             qualification.commitment(&key).expect("commitment").0,
         )
@@ -3091,7 +3192,305 @@ mod tests {
             &candidate,
             &key,
             vec![fresh, same_group],
-            &[qualification],
+            &[qualification.clone()],
+            &resolved_predecessors(&[qualification.clone()]),
+            [0x66; 16],
+            generation(88),
+            nonce(0x33),
+        )
+        .is_err());
+    }
+    #[test]
+    fn mixed_preflight_rejects_reversed_successor_schedule() {
+        let key = commitment_key();
+        let candidate = AtomSubsetCodecV1::new(vec![mark_atom(7)]).unwrap();
+        let group = commitment_bytes(0x21);
+        let desired = commitment_bytes(0x22);
+        let set = selector_set_commitment(&candidate, &key);
+        let qualification = drain_qualification(0x55, 0x56, 77);
+        for successor in [1, 77, 79, 80] {
+            let source = retired_source(
+                group,
+                set,
+                desired,
+                vec![mark_atom(7)],
+                0x55,
+                0x56,
+                77,
+                &qualification,
+                &key,
+            );
+            assert!(
+                MixedProvenanceCompositionV2::new(
+                    NAMESPACE_BINDING,
+                    group,
+                    desired,
+                    &candidate,
+                    &key,
+                    vec![source],
+                    std::slice::from_ref(&qualification),
+                    &resolved_predecessors(std::slice::from_ref(&qualification)),
+                    [0x66; 16],
+                    generation(successor),
+                    nonce(0x33),
+                )
+                .is_err(),
+                "successor must follow the committed qualification"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_preflight_refuses_unused_qualifications() {
+        let key = commitment_key();
+        let candidate = AtomSubsetCodecV1::new(vec![mark_atom(7)]).unwrap();
+        let group = commitment_bytes(0x21);
+        let desired = commitment_bytes(0x22);
+        let set = selector_set_commitment(&candidate, &key);
+        let fresh = fresh_source(group, set, desired, vec![mark_atom(7)]);
+        assert!(MixedProvenanceCompositionV2::new(
+            NAMESPACE_BINDING,
+            group,
+            desired,
+            &candidate,
+            &key,
+            vec![fresh],
+            &[drain_qualification(0x55, 0x56, 77)],
+            &resolved_predecessors(&[drain_qualification(0x55, 0x56, 77)]),
+            [0x66; 16],
+            generation(88),
+            nonce(0x33),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mixed_preflight_qualification_nonces_must_be_distinct() {
+        let mut encoded = drain_qualification(0x55, 0x56, 77).encode();
+        encoded[177..193].copy_from_slice(&nonce(0x44));
+        assert!(DrainQualificationCodecV1::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn mixed_preflight_transfer_edge_rejects_backwards_generation() {
+        assert!(TransferEdgeCodecV1::new(
+            NAMESPACE_BINDING,
+            commitment_bytes(0x11),
+            commitment_bytes(0x55),
+            generation(77),
+            commitment_bytes(0x21),
+            commitment_bytes(0x22),
+            commitment_bytes(0x23),
+            generation(77),
+            nonce(0x33),
+            commitment_bytes(0x44),
+            commitment_bytes(0x66)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mixed_preflight_transfer_edge_rejects_same_group() {
+        assert!(TransferEdgeCodecV1::new(
+            NAMESPACE_BINDING,
+            commitment_bytes(0x11),
+            commitment_bytes(0x21),
+            generation(77),
+            commitment_bytes(0x21),
+            commitment_bytes(0x22),
+            commitment_bytes(0x23),
+            generation(88),
+            nonce(0x33),
+            commitment_bytes(0x44),
+            commitment_bytes(0x66)
+        )
+        .is_err());
+    }
+    #[test]
+    fn mixed_preflight_rejects_fabricated_predecessor_subset() {
+        let key = commitment_key();
+        let predecessor = AtomSubsetCodecV1::new(vec![mark_atom(7)]).unwrap();
+        let candidate =
+            AtomSubsetCodecV1::new(vec![mark_atom(7), downlink_atom(0xdead_beef)]).unwrap();
+        let group = commitment_bytes(0x21);
+        let desired = commitment_bytes(0x22);
+        let mut qualification = drain_qualification(0x55, 0x56, 77);
+        qualification.predecessor_set = selector_set_commitment(&predecessor, &key);
+        let source = ProvenanceSourceCodecV1::retired_subset(
+            NAMESPACE_BINDING,
+            group,
+            selector_set_commitment(&candidate, &key),
+            desired,
+            candidate.clone(),
+            qualification.predecessor_group,
+            qualification.predecessor_set,
+            qualification.terminal_generation,
+            qualification.commitment(&key).unwrap().0,
+        )
+        .unwrap();
+        assert!(
+            MixedProvenanceCompositionV2::new(
+                NAMESPACE_BINDING,
+                group,
+                desired,
+                &candidate,
+                &key,
+                vec![source],
+                &[qualification.clone()],
+                &[super::ResolvedRetiredPredecessorV2 {
+                    group: qualification.predecessor_group,
+                    desired: qualification.predecessor_desired,
+                    terminal_generation: qualification.terminal_generation,
+                    complete_atoms: predecessor.clone(),
+                    retired_available_atoms: predecessor,
+                }],
+                [0x66; 16],
+                generation(88),
+                nonce(0x33),
+            )
+            .is_err(),
+            "a predecessor cannot transfer an atom it never owned"
+        );
+    }
+
+    #[test]
+    fn mixed_preflight_requires_exact_resolved_retired_available_rows() {
+        let key = commitment_key();
+        let candidate = AtomSubsetCodecV1::new(vec![mark_atom(7)]).unwrap();
+        let group = commitment_bytes(0x21);
+        let desired = commitment_bytes(0x22);
+        let qualification = drain_qualification(0x55, 0x56, 77);
+        let compose = |resolved: &[super::ResolvedRetiredPredecessorV2]| {
+            let source = retired_source(
+                group,
+                selector_set_commitment(&candidate, &key),
+                desired,
+                vec![mark_atom(7)],
+                0x55,
+                0x56,
+                77,
+                &qualification,
+                &key,
+            );
+            MixedProvenanceCompositionV2::new(
+                NAMESPACE_BINDING,
+                group,
+                desired,
+                &candidate,
+                &key,
+                vec![source],
+                std::slice::from_ref(&qualification),
+                resolved,
+                [0x66; 16],
+                generation(88),
+                nonce(0x33),
+            )
+        };
+        let valid = resolved_predecessors(std::slice::from_ref(&qualification));
+        assert!(compose(&valid).is_ok());
+        for change in 0..6 {
+            let mut changed = valid.clone();
+            match change {
+                0 => {
+                    changed[0].complete_atoms = AtomSubsetCodecV1::new(vec![mark_atom(7)]).unwrap()
+                }
+                1 => {
+                    changed[0].retired_available_atoms =
+                        AtomSubsetCodecV1::new(vec![ipv4_paa_atom([10, 23, 0, 9])]).unwrap()
+                }
+                2 => {
+                    changed[0].retired_available_atoms =
+                        AtomSubsetCodecV1::new(vec![mark_atom(7), downlink_atom(0xdead_beef)])
+                            .unwrap()
+                }
+                3 => changed[0].desired = commitment_bytes(0xee),
+                4 => changed[0].terminal_generation = generation(78),
+                _ => changed.push(valid[0].clone()),
+            }
+            assert!(
+                compose(&changed).is_err(),
+                "resolved predecessor change {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_preflight_rejects_qualifications_from_different_epochs() {
+        let key = commitment_key();
+        let candidate =
+            AtomSubsetCodecV1::new(vec![mark_atom(7), downlink_atom(0x1000_0002)]).unwrap();
+        let group = commitment_bytes(0x21);
+        let desired = commitment_bytes(0x22);
+        let set = selector_set_commitment(&candidate, &key);
+        let a = drain_qualification(0x55, 0x56, 77);
+        let mut b = drain_qualification(0x57, 0x58, 78);
+        b.backend_epoch = [0x67; 16];
+        let sa = retired_source(
+            group,
+            set,
+            desired,
+            vec![mark_atom(7)],
+            0x55,
+            0x56,
+            77,
+            &a,
+            &key,
+        );
+        let sb = retired_source(
+            group,
+            set,
+            desired,
+            vec![downlink_atom(0x1000_0002)],
+            0x57,
+            0x58,
+            78,
+            &b,
+            &key,
+        );
+        assert!(MixedProvenanceCompositionV2::new(
+            NAMESPACE_BINDING,
+            group,
+            desired,
+            &candidate,
+            &key,
+            vec![sa, sb],
+            &[a.clone(), b.clone()],
+            &resolved_predecessors(&[a.clone(), b.clone()]),
+            [0x66; 16],
+            generation(88),
+            nonce(0x33),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mixed_preflight_source_cannot_change_a_committed_qualification_coordinate() {
+        let key = commitment_key();
+        let candidate = AtomSubsetCodecV1::new(vec![mark_atom(7)]).unwrap();
+        let group = commitment_bytes(0x21);
+        let desired = commitment_bytes(0x22);
+        let qualification = drain_qualification(0x55, 0x56, 77);
+        let source = retired_source(
+            group,
+            selector_set_commitment(&candidate, &key),
+            desired,
+            vec![mark_atom(7)],
+            0x55,
+            0x56,
+            78,
+            &qualification,
+            &key,
+        );
+        assert!(MixedProvenanceCompositionV2::new(
+            NAMESPACE_BINDING,
+            group,
+            desired,
+            &candidate,
+            &key,
+            vec![source],
+            &[qualification.clone()],
+            &resolved_predecessors(&[qualification.clone()]),
+            [0x66; 16],
             generation(88),
             nonce(0x33),
         )

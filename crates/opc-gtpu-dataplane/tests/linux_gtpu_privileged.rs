@@ -5,7 +5,7 @@ use std::process::Command;
 
 use opc_gtpu_dataplane::control_port::{GtpuControlDatagramKind, GtpuControlResponseBudget};
 use opc_gtpu_dataplane::{
-    CreateGtpDeviceRequest, GtpDevice, GtpPdpContext, GtpVersion, GtpuCapability,
+    CreateGtpDeviceRequest, GtpAddressFamily, GtpDevice, GtpPdpContext, GtpVersion, GtpuCapability,
     GtpuDataplaneBackend, GtpuDownlinkEvent, LinuxGtpuDataplaneBackend, PdpContextInstallOutcome,
     PdpContextLocalTeidSelector, PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector,
     PdpContextSelectorOccupancy, PdpContextUplinkSelector, PdpDeviceIncarnation,
@@ -215,6 +215,20 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
     let device = backend.create_device(create).await?;
     let port = backend.open_gtpu_control_port(&device).await?;
 
+    let selector = PdpContextSelector::LocalTeid(
+        PdpContextLocalTeidSelector::new(
+            device.ifindex,
+            GtpVersion::V1,
+            GtpAddressFamily::Ipv4,
+            Teid::new(0xdead_beef).ok_or("nonzero TEID")?,
+        )
+        .ok_or("canonical selector")?,
+    );
+    assert!(matches!(
+        backend.read_pdp_context(selector).await?,
+        PdpContextReadback::Absent
+    ));
+
     // Exactly one socket owns the retained endpoint: a second UDP/2152 bind
     // in this namespace must fail while the device is live.
     assert!(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, GTPU_PORT)).is_err());
@@ -230,50 +244,74 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
     gpdu.extend_from_slice(&u16::try_from(inner.len())?.to_be_bytes());
     gpdu.extend_from_slice(&0xdead_beef_u32.to_be_bytes());
     gpdu.extend_from_slice(&inner);
-    peer.send_to(&gpdu, (Ipv4Addr::LOCALHOST, GTPU_PORT))?;
+    for ingress in [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)] {
+        peer.send_to(&gpdu, (ingress, GTPU_PORT))?;
 
-    let event = loop {
-        match port.try_receive_downlink(4096) {
-            Ok(Some(event)) => break event,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
-            Err(error) => return Err(format!("consumer failed: {error}").into()),
-        }
-    };
-    let GtpuDownlinkEvent::UnknownTunnel(datagram) = event else {
-        return Err(format!("expected an unknown-tunnel observation, got {event:?}").into());
-    };
-    assert_eq!(datagram.kind(), GtpuControlDatagramKind::Gpdu);
-    assert_eq!(datagram.message_type(), Some(0xff));
-    assert_eq!(datagram.received_length(), gpdu.len());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let event = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unknown G-PDU did not arrive"
+            );
+            match port.try_receive_downlink(4096) {
+                Ok(Some(event)) => break event,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(error) => return Err(format!("consumer failed: {error}").into()),
+            }
+        };
+        let GtpuDownlinkEvent::UnknownTunnel(datagram) = event else {
+            return Err(format!("expected an unknown-tunnel observation, got {event:?}").into());
+        };
+        assert_eq!(datagram.kind(), GtpuControlDatagramKind::Gpdu);
+        assert_eq!(datagram.message_type(), Some(0xff));
+        assert_eq!(datagram.received_length(), gpdu.len());
 
-    // One consuming Error Indication plan; the caller made the tunnel decision.
-    let budget = GtpuControlResponseBudget::new(28, 4)?;
-    let plan = datagram.unknown_tunnel_error(budget)?;
-    assert_eq!(
-        plan.destination(),
-        std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, GTPU_PORT)
-    );
-    assert_eq!(
-        plan.source(),
-        std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, GTPU_PORT)
-    );
-    let sent = port.send_control_response(plan)?;
-    assert_eq!(sent, 28, "one TS 29.281 Error Indication left the socket");
+        // One consuming Error Indication plan; the caller made the tunnel decision.
+        let budget = GtpuControlResponseBudget::new(28, 4)?;
+        let plan = datagram.unknown_tunnel_error(budget)?;
+        assert_eq!(
+            plan.destination(),
+            std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, GTPU_PORT)
+        );
+        assert_eq!(
+            plan.source(),
+            std::net::SocketAddrV4::new(ingress, GTPU_PORT)
+        );
+        let sent = port.send_control_response(plan)?;
+        assert_eq!(sent, 28, "one TS 29.281 Error Indication left the socket");
 
-    // The response is an Error Indication because it came back through the
-    // same retained socket's queue as a non-G-PDU.
-    let event = loop {
-        match port.try_receive_downlink(4096) {
-            Ok(Some(event)) => break event,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
-            Err(error) => return Err(format!("consumer failed: {error}").into()),
-        }
-    };
-    let GtpuDownlinkEvent::Control(datagram) = event else {
-        return Err(format!("expected the looped Error Indication, got {event:?}").into());
-    };
-    assert_eq!(datagram.kind(), GtpuControlDatagramKind::Control);
-    assert_eq!(datagram.message_type(), Some(26), "Error Indication");
+        // The response is an Error Indication because it came back through the
+        // same retained socket's queue as a non-G-PDU.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let event = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Error Indication did not arrive"
+            );
+            match port.try_receive_downlink(4096) {
+                Ok(Some(event)) => break event,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                Err(error) => return Err(format!("consumer failed: {error}").into()),
+            }
+        };
+        let GtpuDownlinkEvent::Control(datagram) = event else {
+            return Err(format!("expected the looped Error Indication, got {event:?}").into());
+        };
+        assert_eq!(datagram.kind(), GtpuControlDatagramKind::Control);
+        assert_eq!(datagram.message_type(), Some(26), "Error Indication");
+        assert_eq!(
+            datagram.peer(),
+            std::net::SocketAddrV4::new(ingress, GTPU_PORT)
+        );
+        let udp = peer.local_addr()?.port().to_be_bytes();
+        let mut expected = vec![
+            0x36, 26, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0x40, 1, udp[0], udp[1], 0, 16, 0xde, 0xad, 0xbe,
+            0xef, 133, 0, 4,
+        ];
+        expected.extend_from_slice(&ingress.octets());
+        assert_eq!(datagram.bytes(), expected);
+        assert!(port.try_receive_downlink(4096)?.is_none());
+    }
 
     backend.remove_device(&device).await?;
     Ok(())

@@ -881,15 +881,14 @@ request. The raw operation-stamp bytes and exact readback remain trusted adapter
 assertions; the receipt does not independently attest them.
 
 A future external production adapter cannot qualify merely by consuming the
-current public request and calling its completion method. The SDK now publishes
-the bounded backend-neutral codec (`selector_adapter_codec`: canonical
-namespace binding, operation stamp and opaque terminal capsule, with versioned
-validation and constant-time comparisons) so an adapter can persist and
-read back the same exact coordinates without accessing the selector secret or
-a public authority constructor. The real external-profile conformance harness
-and qualification evidence required by §14.11 are still missing, so external
-implementations remain `Unsupported`. Test-only authority may exercise protocol
-state transitions, but it is not production qualification.
+current public request and calling its completion method. Before such a profile
+is supported, the SDK MUST publish a bounded backend-neutral stamp/capsule codec
+and conformance harness which let the adapter perform the same exact persistence
+and readback without exposing the selector secret or public authority
+constructors. That change requires its own public-API and mutation tests under
+§14.11. Until then external implementations remain `Unsupported`. Test-only
+authority may exercise protocol state transitions, but it is not production
+qualification.
 
 Terminal-fence inspection is a mandatory part of an RFC 016 backend profile,
 not an eBPF extension. Under the backend's real global ownership gate it returns
@@ -1629,15 +1628,13 @@ The initial implementation publishes the built-in eBPF qualification path and
 test-only authority for state-machine tests. Those test-only authority values
 cannot enter a production constructor. This does not prevent a product from
 passing ordinary fake backend code to the public production lifecycle; doing
-that selects the fake into the TCB and is outside the safety claim. The SDK now
-publishes the bounded backend-neutral operation-stamp/capsule codec
-(`selector_adapter_codec`) required by a third-party production profile, so an
-external implementation can persist and validate the exact canonical
-coordinates. The real external-profile conformance harness and §14.11
-qualification evidence are still missing; therefore an external implementation
-remains unsupported even if it overrides every default method and consumes an
-opaque request. Adding the missing harness is an SDK change, not something a
-product may replace with a local authority type.
+that selects the fake into the TCB and is outside the safety claim. The SDK
+does not yet publish the backend-neutral operation-stamp/capsule codec required
+for a third-party
+production profile. Therefore an external implementation remains unsupported
+even if it overrides every default method and can consume an opaque request.
+Adding the missing generic codec and external-profile harness is an SDK change,
+not something a product may replace with a local authority type.
 
 Once that generic boundary exists, external implementations consume opaque
 authorized requests and use the SDK codec to persist and compare operation

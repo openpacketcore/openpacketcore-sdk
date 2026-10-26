@@ -89,8 +89,10 @@ One consumer shares its UDP/2152 queue with user-packet reassembly. Plans
 preserve message-specific response tuples and require the exact receiving
 socket; admission and aggregate rate policy remain with the caller. The
 Linux kernel-GTP backend exposes the userspace socket retained by an ordinary
-creation for unknown-TEID/non-G-PDU observations and Error Indication plans
-(TS 29.281 7.3.1); kernel-owned recoverable attachments remain unsupported.
+creation for control observations and Error Indication plans (TS 29.281
+7.3.1). Its downlink path checks PDP absence before reporting `UnknownTunnel`;
+known-TEID G-PDUs declined by the driver are dropped. Kernel-owned recoverable
+attachments remain unsupported.
 End Marker ordering and N3 forwarding parity are still unqualified.
 On an eBPF attachment, `try_receive_downlink` on the same port is the
 backend-authoritative consumer for kernel-reassembled and handed-off G-PDUs:
