@@ -91,7 +91,7 @@
     {
       "job": "ci:.github/workflows/ci.yml::session-net-i686-tests",
       "kind": "required-ci-removed",
-      "reason": "Split the ordinary i686 lane by Cargo test binary to avoid its 30-minute job timeout. The ordinary slice retains the library and its existing ten exact exclusions, which still run in contracts. The ordinary-integration slice runs every registered integration target via --test *, all session-net doctests, and the unchanged opc-protocol/opc-proto-gtpv2c command. Both ordinary slices and contracts remain required by the same i686 aggregate. The named inventory partitions exactly as 807 + 572 = 1379, with no missing, extra or duplicate tests; all three doctest targets, features, profiles and test-thread limits are retained.",
+      "reason": "Split the ordinary i686 lane by Cargo test binary, then partition its library work within the unchanged 30-minute job limit. The ordinary-authority slice owns every publication_authority_failover module test and the exact durable-crash matrix; ordinary owns the complement of the complete Cargo library inventory. Both retain the ten exact exclusions owned by contracts, with their original ordinary/O1 profiles and fresh processes. The ordinary-integration slice retains every executable unit test, registered integration target via --test *, all session-net doctests and the portability commands. All four slices remain required by the same aggregate. The workflow-selector fixture proves complete, disjoint coverage for future library, executable and integration tests, including the doctest. No test, assertion, profile or test-thread limit is removed or weakened.",
       "issue": 1172
     },
     {

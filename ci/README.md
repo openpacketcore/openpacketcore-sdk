@@ -90,13 +90,22 @@ maintenance batches, persistence operations, assertions or deadlines. The hosted
 rerun must establish the resulting margin; the cancelled log does not provide
 individual completion times for these proofs.
 
-The required i686 matrix separates session-net library tests from executable
-unit tests, integration tests and doctests. The integration runner exercises the
-workflow selectors against a fixture with a newly discovered executable and a
-new integration target. The required manifest audit rejects other test-enabled
-target kinds until a shard explicitly covers them; future targets cannot silently
-fall outside the split. Both ordinary shards and the isolated contracts remain
-required by the same aggregate.
+The required i686 matrix splits the session-net library into two complementary
+ordinary processes. `ordinary-authority` runs every test beneath
+`stateless_quorum_consumer::publication_authority_failover::` and the exact
+`persistent_three_voter_protected_roster_durable_crash_cut_matrix` test;
+`ordinary` runs the remainder. Both resolve the complete Cargo library inventory
+first, retain the ten exclusions owned by `contracts`, and reject malformed,
+duplicate or missing names. New tests in the authority module join its shard;
+other new library tests join the remainder. Profiles, one-thread execution, test
+bounds and the 30-minute job limit are unchanged.
+
+`ordinary-integration` retains executable unit tests, integration tests,
+doctests and the portability checks. Its fixture exercises future library,
+executable and integration tests against the workflow's actual selectors and
+proves that the split preserves each test exactly once. The required manifest
+audit rejects other test-enabled target kinds until a shard explicitly covers
+them. All four slices remain required by the same aggregate.
 
 ## Borrowed-descriptor Clippy guard
 

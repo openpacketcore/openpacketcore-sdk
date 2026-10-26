@@ -136,6 +136,35 @@ class I686TargetSelectionTests(unittest.TestCase):
                         (root / "contracts.jsonl.profiles").read_text().splitlines()]
             self.assertEqual(profiles, [None] * len(ORDINARY_CONTRACTS)
                              + ["1"] * len(OPTIMIZED_CONTRACTS))
+            for slice_name in SLICES[:2]:
+                commands = workflow_commands(root, slice_name)
+                self.assertEqual(len(commands), 1)
+                self.assertEqual(commands[0][:len(SELECTION) + 4],
+                                 [*SELECTION, "--lib", "--", "--test-threads=1", "--exact"])
+                calls = [json.loads(line) for line in
+                         (root / f"{slice_name}.jsonl").read_text().splitlines()]
+                self.assertEqual(calls[0], [*SELECTION, "--lib", "--", "--list", "--format=terse"])
+                self.assertEqual(len(calls), 2, "resolve the complete inventory before executing")
+                profiles = [json.loads(line) for line in
+                            (root / f"{slice_name}.jsonl.profiles").read_text().splitlines()]
+                self.assertEqual(profiles, [None, None], "both library shards retain the ordinary profile")
+
+    def test_timing_contract_cannot_overlap_the_authority_shard(self) -> None:
+        source = WORKFLOW.read_text().replace(
+            "            " + ORDINARY_CONTRACTS[0] + "\n",
+            "            publication_authority_failover::existing_authority_probe\n", 1)
+        self.assertNotEqual(source, WORKFLOW.read_text())
+        with tempfile.TemporaryDirectory(prefix="i686-overlapping-contract-") as temporary:
+            root = Path(temporary)
+            workflow = root / "ci.yml"
+            workflow.write_text(source)
+            for slice_name in SLICES[:2]:
+                with self.subTest(slice=slice_name), patch(__name__ + ".WORKFLOW", workflow):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        workflow_commands(root, slice_name)
+                    calls = [json.loads(line) for line in
+                             (root / f"{slice_name}.jsonl").read_text().splitlines()]
+                    self.assertTrue(all("--list" in argv for argv in calls))
 
     def test_invalid_inventory_stops_before_running_a_library_partition(self) -> None:
         valid = "\n".join(name + ": test" for name in FIXTURE_LIBRARY_NAMES)
