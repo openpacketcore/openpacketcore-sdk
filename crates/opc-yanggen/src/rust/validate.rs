@@ -928,22 +928,29 @@ fn resolve_path_node(
     }
 }
 
-// Each operand uses one owned, lossless domain. All integer leaf values and
-// all currently supported IR number literals fit in i128, including u64::MAX.
-fn integer_operand(
+// Decimal comparisons follow XPath's number semantics; the existing integer
+// profile keeps its i128 domain. Neither conversion changes stored leaf values.
+fn numeric_operand(
     expr: &ConstraintExpr,
     context_var: &str,
     target_path: &str,
     context_path: &str,
     input: &CanonicalInput,
+    xpath_number: bool,
 ) -> Result<Option<TokenStream>, RustGenerationError> {
     let resolved = match expr {
         ConstraintExpr::Literal(Literal::Number(value)) => {
+            if xpath_number {
+                return Ok(Some(quote! { Some(#value as f64) }));
+            }
             let value = i128::from(*value);
             return Ok(Some(quote! { Some(#value) }));
         }
         ConstraintExpr::Function(function) if function.name == FunctionName::Count => {
             let value = evaluate_expr(expr, context_var, target_path, context_path, input, 0)?;
+            if xpath_number {
+                return Ok(Some(quote! { Some((#value) as f64) }));
+            }
             return Ok(Some(quote! { Some((#value) as i128) }));
         }
         ConstraintExpr::Path(path) => {
@@ -968,11 +975,9 @@ fn integer_operand(
     };
     let nodes = super::NodeIndex::new(&input.nodes);
     let scalar = nodes.scalar_node(&resolved);
-    let Some(ty) = scalar
-        .type_ref
-        .as_ref()
-        .filter(|ty| ty.integer_bounds().is_some())
-    else {
+    let Some(ty) = scalar.type_ref.as_ref().filter(|ty| {
+        ty.integer_bounds().is_some() || (xpath_number && matches!(ty, TypeRef::Decimal64 { .. }))
+    }) else {
         return Ok(None);
     };
     if resolved.kind != SchemaNodeKind::Leaf {
@@ -981,7 +986,13 @@ fn integer_operand(
         ));
     }
     let access = generate_path_access(&resolved, context_path, input)?;
-    let value = if matches!(ty, TypeRef::Uint64 | TypeRef::Int64) {
+    let value = if xpath_number {
+        match ty {
+            TypeRef::Decimal64 { .. } => quote! { value.as_xpath_number() },
+            TypeRef::Uint64 | TypeRef::Int64 => quote! { value.0 as f64 },
+            _ => quote! { *value as f64 },
+        }
+    } else if matches!(ty, TypeRef::Uint64 | TypeRef::Int64) {
         quote! { i128::from(value.0) }
     } else {
         quote! { i128::from(*value) }
@@ -991,6 +1002,26 @@ fn integer_operand(
     } else {
         quote! { #access.as_ref().map(|value| #value) }
     }))
+}
+
+fn decimal_operand_type(expr: &ConstraintExpr, target_path: &str, input: &CanonicalInput) -> bool {
+    let node = match expr {
+        ConstraintExpr::Path(path) => resolve_path_node(target_path, path, &input.nodes).ok(),
+        ConstraintExpr::Function(function) if function.name == FunctionName::Current => input
+            .nodes
+            .iter()
+            .find(|node| node.path == target_path)
+            .cloned(),
+        _ => None,
+    };
+    node.is_some_and(|node| {
+        matches!(
+            super::NodeIndex::new(&input.nodes)
+                .scalar_node(&node)
+                .type_ref,
+            Some(TypeRef::Decimal64 { .. })
+        )
+    })
 }
 
 fn get_path_expr_type(
@@ -1018,7 +1049,7 @@ fn get_path_expr_type(
         Some(TypeRef::Uint32) => Some(quote! { u32 }),
         Some(TypeRef::Uint64) => Some(quote! { u64 }),
         Some(TypeRef::Int64) => Some(quote! { i64 }),
-        Some(TypeRef::Decimal64) => Some(quote! { f64 }),
+        Some(TypeRef::Decimal64 { .. }) => Some(quote! { f64 }),
         _ => Some(quote! { String }),
     }
 }
@@ -1050,9 +1081,21 @@ fn evaluate_expr(
                     ))
                 })?;
             let access = generate_path_access(&resolved_node, context_path, input)?;
+            if matches!(
+                super::NodeIndex::new(&input.nodes)
+                    .scalar_node(&resolved_node)
+                    .type_ref,
+                Some(TypeRef::Decimal64 { .. })
+            ) {
+                return Ok(if resolved_node.config {
+                    quote! { #access.as_option().map(|x| x.as_xpath_number()) }
+                } else {
+                    quote! { #access.as_ref().map(|x| x.as_xpath_number()) }
+                });
+            }
             let is_custom_wrapper = matches!(
                 resolved_node.type_ref,
-                Some(TypeRef::Uint64) | Some(TypeRef::Int64) | Some(TypeRef::Decimal64)
+                Some(TypeRef::Uint64) | Some(TypeRef::Int64)
             );
 
             if resolved_node.kind == SchemaNodeKind::Leaf && resolved_node.config {
@@ -1077,11 +1120,25 @@ fn evaluate_expr(
                 CompareOp::Lte => quote! { <= },
             };
 
-            if super::has_extended_integers(input) {
-                let left_integer =
-                    integer_operand(left, context_var, target_path, context_path, input)?;
-                let right_integer =
-                    integer_operand(right, context_var, target_path, context_path, input)?;
+            let xpath_number = decimal_operand_type(left, target_path, input)
+                || decimal_operand_type(right, target_path, input);
+            if xpath_number || super::has_extended_integers(input) {
+                let left_integer = numeric_operand(
+                    left,
+                    context_var,
+                    target_path,
+                    context_path,
+                    input,
+                    xpath_number,
+                )?;
+                let right_integer = numeric_operand(
+                    right,
+                    context_var,
+                    target_path,
+                    context_path,
+                    input,
+                    xpath_number,
+                )?;
                 match (left_integer, right_integer) {
                     (Some(left), Some(right)) => {
                         return Ok(quote! {
@@ -1277,9 +1334,21 @@ fn evaluate_expr(
                         RustGenerationError::new(format!("target node '{target_path}' not found"))
                     })?;
                 let access = generate_path_access(resolved_node, context_path, input)?;
+                if matches!(
+                    super::NodeIndex::new(&input.nodes)
+                        .scalar_node(resolved_node)
+                        .type_ref,
+                    Some(TypeRef::Decimal64 { .. })
+                ) {
+                    return Ok(if resolved_node.config {
+                        quote! { #access.as_option().map(|x| x.as_xpath_number()) }
+                    } else {
+                        quote! { #access.as_ref().map(|x| x.as_xpath_number()) }
+                    });
+                }
                 let is_custom_wrapper = matches!(
                     resolved_node.type_ref,
-                    Some(TypeRef::Uint64) | Some(TypeRef::Int64) | Some(TypeRef::Decimal64)
+                    Some(TypeRef::Uint64) | Some(TypeRef::Int64)
                 );
                 if resolved_node.kind == SchemaNodeKind::Leaf && resolved_node.config {
                     if is_custom_wrapper {

@@ -3330,6 +3330,7 @@ dependencies = [
  "opc-data-governance",
  "opc-redaction",
  "regex",
+ "serde",
  "sha2 0.11.0",
 ]
 

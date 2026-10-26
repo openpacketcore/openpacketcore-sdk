@@ -224,8 +224,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                         Some(TypeRef::Int64) => quote! {
                             let parsed = YangInt64(_v.parse::<i64>().map_err(#integer_error)?);
                         },
-                        Some(TypeRef::Decimal64) => quote! {
-                            let parsed = YangDecimal64(_v.parse::<f64>().map_err(|_| config_error("invalid-value", "invalid numeric value"))?);
+                        Some(TypeRef::Decimal64 { fraction_digits }) => quote! {
+                            let parsed = _v.parse::<YangDecimal64<#fraction_digits>>().map_err(|_| config_error("invalid-value", "invalid decimal64 value"))?;
                         },
                         Some(TypeRef::Empty) => quote! {
                             let parsed = YangEmpty;
@@ -524,6 +524,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                     Some(TypeRef::Int64) => quote! {
                                         let parsed_key = YangInt64(key_val.parse::<i64>().map_err(#integer_error)?);
                                     },
+                                    Some(TypeRef::Decimal64 { fraction_digits }) => quote! {
+                                        let parsed_key = key_val.parse::<YangDecimal64<#fraction_digits>>().map_err(|_| config_error("invalid-value", "invalid decimal64 key"))?;
+                                    },
                                     _ => quote! {
                                         let parsed_key = key_val.clone();
                                     },
@@ -645,6 +648,9 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                         },
                                         Some(TypeRef::Int64) => quote! {
                                             let #key_ident = YangInt64(key_val.parse::<i64>().map_err(#integer_error)?);
+                                        },
+                                        Some(TypeRef::Decimal64 { fraction_digits }) => quote! {
+                                            let #key_ident = key_val.parse::<YangDecimal64<#fraction_digits>>().map_err(|_| config_error("invalid-value", "invalid decimal64 key"))?;
                                         },
                                         _ => quote! {
                                             let #key_ident = key_val.clone();
@@ -778,8 +784,8 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                                 Some(TypeRef::Int64) => quote! {
                                     let parsed_elem = YangInt64(v.parse::<i64>().map_err(#integer_error)?);
                                 },
-                                Some(TypeRef::Decimal64) => quote! {
-                                    let parsed_elem = YangDecimal64(v.parse::<f64>().map_err(|_| config_error("invalid-value", "invalid numeric value"))?);
+                                Some(TypeRef::Decimal64 { fraction_digits }) => quote! {
+                                    let parsed_elem = v.parse::<YangDecimal64<#fraction_digits>>().map_err(|_| config_error("invalid-value", "invalid decimal64 value"))?;
                                 },
                                 Some(TypeRef::Empty) => quote! {
                                     let parsed_elem = YangEmpty;

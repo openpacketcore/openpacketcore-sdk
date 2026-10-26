@@ -378,7 +378,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     validate_numeric_range(#signed_range_value, numeric_range)?;
                     Ok(Value::String(parsed.to_string()))
                 }
-                LeafType::Decimal64 => Ok(Value::String(decimal64_value(value)?.to_string())),
+                LeafType::Decimal64 { fraction_digits } => Ok(Value::String(decimal64_value(value, fraction_digits)?.to_string())),
                 LeafType::Empty => Ok(Value::Array(vec![Value::Null])),
                 LeafType::Custom { .. } => Err(GnmiError::unimplemented(
                     "gNMI custom typedef Set codec is outside the generated profile",
@@ -423,7 +423,7 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
                     validate_numeric_range(#signed_range_value, numeric_range)?;
                     Ok(parsed.to_string())
                 }
-                LeafType::Decimal64 => Ok(decimal64_value(value)?.to_string()),
+                LeafType::Decimal64 { fraction_digits } => Ok(decimal64_value(value, fraction_digits)?.to_string()),
                 LeafType::Empty => {
                     if value.is_null()
                         || matches!(value.as_array(), Some(values) if values.len() == 1 && values[0].is_null())
@@ -518,20 +518,11 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
             }
         }
 
-        fn decimal64_value(value: &Value) -> Result<f64, GnmiError> {
-            let parsed = if let Some(raw) = value.as_f64() {
-                raw
-            } else {
-                string_value(value)?
-                    .parse::<f64>()
-                    .map_err(|_| GnmiError::invalid("gNMI decimal64 leaf value is invalid"))?
-            };
-            if parsed.is_finite() {
-                Ok(parsed)
-            } else {
-                Err(GnmiError::invalid("gNMI decimal64 leaf value is not finite"))
-            }
+        fn decimal64_value(value: &Value, fraction_digits: u8) -> Result<opc_mgmt_schema::Decimal64, GnmiError> {
+            opc_mgmt_schema::Decimal64::parse(string_value(value)?, fraction_digits)
+                .map_err(|_| GnmiError::invalid("gNMI decimal64 leaf value is invalid"))
         }
+
     };
 
     Ok(tokens.to_string())

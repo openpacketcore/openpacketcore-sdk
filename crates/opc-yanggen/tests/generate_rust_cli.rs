@@ -320,6 +320,8 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
     // #1269 authorized projection and #1270 canonical gNMI key literals. Every
     // generated file remains covered by its complete-file assertion.
     // All pins also include #1274 generated-lint repairs and shared statement formatting.
+    // #1363 pins follow byte-verified 63440381b baselines: exact decimal64 codecs/types
+    // and RFC 6243 trim semantics. All complete-file assertions remain.
     let expected = [
         (
             "gnmi_json.rs",
@@ -328,7 +330,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "gnmi_set.rs",
-            "9f2418e8e05a608095bc3098acf46fad5ebce4805c635f1c92c4ed9a0b9552d3",
+            "851964346f440cf9a676acf3d67ec7a2b56870333555ab75938ec64ae2099d22",
         ),
         (
             "metadata.rs",
@@ -341,7 +343,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         (
             "netconf_xml.rs",
             // #1270 native instance trees plus #1272 bounded content projection.
-            "fec34e4c4d83bd9d25890258a7330ed78e30aa772daf958f1b1583ae2ab3004e",
+            "5c6b707d017e0ebc56ee4105450972bbaba5279d1b50cfc5bbb55d3ccd2edd6a",
         ),
         (
             "netconf_xml_edit.rs",
@@ -357,7 +359,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "redaction.rs",
-            "7b4b5a9c25392bdd000fa8e604a44084e366b7649c59bae556618fe6ca870ebc",
+            "5ca5ac342cb860c354a14f305856ad879abc7a21480f8f4675b90ff0e1ee662e",
         ),
         (
             "schema_registry.rs",
@@ -369,7 +371,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "types.rs",
-            "d42b5261f7586616a18c9a2b5ecd6cdbe614f2ecacf2b2b5c5a29b3c58b4c933",
+            "e8b133ffc1ddadaaf56d2b20664fa00bb598a78c35c322875ec97728e77752bc",
         ),
         (
             "validate.rs",

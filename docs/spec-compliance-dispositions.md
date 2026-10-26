@@ -136,7 +136,7 @@ check mixed delivery, keyed prefixes, Subscribe-versus-Read authorization,
 zero intervals, independent cadences/suppression and heartbeats. The complete
 Linux gNMI suite passes 274 tests, including 62 keyed-read/subscription tests
 and seven retained-audit integration tests. These tests establish the scoped
-subscription change; the YANG generation items in #1363 remain open.
+subscription change; the YANG generation evidence follows below.
 
 Specification: [gNMI 0.10.0 §3.5.1.5.2](https://github.com/openconfig/reference/blob/master/rpc/gnmi/gnmi-specification.md#35152-stream-subscriptions).
 
@@ -151,8 +151,8 @@ requirements, zero-valued mandatory booleans, sensitive leaf-lists and both
 cardinality boundaries. All four runtime tests failed before the fix.
 Source/IR regressions additionally check malformed statements, round trips,
 source mismatch and digest changes. The complete generator suite and its
-294-case generated-code lint/runtime matrix pass on Rust 1.99.1; unchanged
-legacy artifacts retain their full-file digest pins.
+294-case generated-code lint/runtime matrix pass on Rust 1.99.1. At the
+cardinality commit, unchanged legacy artifacts retained their full-file pins.
 
 The remaining non-decimal reports were checked against current code:
 
@@ -168,7 +168,7 @@ The complete Linux NETCONF run passes 533 tests, including retained-audit
 recovery and process-loss cases. It runs with `umask 0077` so the test directories
 satisfy retained-storage admission; the initial group-writable VM directories
 were correctly rejected. No production check or test assertion was relaxed.
-Exact decimal64 representation remains in progress under #1363.
+The decimal64 correction and its verification are described below.
 
 Witnesses: [edit parser](../crates/opc-netconf-server/src/edit_xml.rs),
 [server and tests](../crates/opc-netconf-server/src/server.rs),
@@ -177,3 +177,49 @@ Witnesses: [edit parser](../crates/opc-netconf-server/src/edit_xml.rs),
 [RFC 6022 §3.1](https://www.rfc-editor.org/rfc/rfc6022.html#section-3.1),
 [RFC 5277 §2.1.1](https://www.rfc-editor.org/rfc/rfc5277.html#section-2.1.1),
 and [RFC 8525 §3](https://www.rfc-editor.org/rfc/rfc8525.html#section-3).
+
+## Management work list (#1363): exact decimal64
+
+`fraction-digits` is now mandatory, unique and retained in source IR and runtime
+metadata. Generated `YangDecimal64<F>` stores a signed 64-bit coefficient; the
+shared parser rejects unsupported syntax, non-finite numbers, precision loss
+and values beyond the declared scale. Canonical output retains all significant
+digits and uses `0.0` for zero. JSON requires a string. Redundant fractional
+zeros are valid when they do not change the represented value.
+
+The compiled [decimal fixture](../crates/opc-yanggen/tests/fixtures/decimal64_test.rs)
+checks literal large adjacent values, both domain endpoints, 18 fractional
+digits, canonical zero, defaults, chained leafrefs, list/leaf-list identity,
+JSON, XML, gNMI, patches and value-free errors for secret fields. Baseline
+runtime tests demonstrated that `900719925474099.21` became
+`900719925474099.3` and `9.223372036854775807` lost its last digits. Decimal
+leafrefs and list-key patches also exposed generated-code compilation failures;
+the corrected types and parsers compile and preserve distinct values. The
+shared parser tests every declared scale at signed coefficient boundaries.
+
+XPath comparisons intentionally retain the IEEE 754 number semantics required
+by RFC 7950 §6.4. That conversion is confined to evaluation and never modifies
+the stored value. Public constraint IR is exercised with both path and
+`current()` operands. Source-level must/when lowering and decimal range
+restrictions remain explicitly unsupported by the existing generator profile;
+this change does not silently accept or discard those restrictions.
+
+Default-omission tests also found that NETCONF trim retained explicit values
+equal to their schema default. Both ordinary and bounded subtree projection
+now apply value-based omission, with exact decimal comparison. Existing
+authorization assertions are preserved using a non-default boolean fixture;
+separate tests check trim and explicit reporting of the same default value.
+
+All 78 generated-file pins were first reproduced from commit `63440381b`.
+Only the decimal codec/type/scale-digest changes and RFC 6243 trim changes
+appeared in the reviewed generated output; the complete-file assertions remain.
+The old proof that accepted subnormal/exponent/NaN/infinite float values is
+replaced by exact-domain round trips and explicit refusal assertions. Public
+IR, metadata and generated-type migrations are documented in the changelog.
+
+Witnesses: [exact scalar](../crates/opc-mgmt-schema/src/decimal64.rs),
+[source and IR tests](../crates/opc-yanggen/tests/scalars_and_names/decimal.rs),
+[RFC 7950 §§9.3–9.3.4](https://www.rfc-editor.org/rfc/rfc7950.html#section-9.3),
+[RFC 7950 §6.4](https://www.rfc-editor.org/rfc/rfc7950.html#section-6.4),
+[RFC 7951 §6.1](https://www.rfc-editor.org/rfc/rfc7951.html#section-6.1), and
+[RFC 6243 §3.2](https://www.rfc-editor.org/rfc/rfc6243.html#section-3.2).

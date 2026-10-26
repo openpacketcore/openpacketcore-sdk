@@ -823,8 +823,32 @@ fn parse_type_ref(statement: &Statement) -> Result<ParsedTypeRef, Diagnostic> {
         ),
         "decimal64" => {
             ensure_type_children_supported(statement, &["fraction-digits"])?;
+            let raw = required_child_argument(statement, "fraction-digits")?;
+            let declarations: Vec<_> = statement
+                .children
+                .iter()
+                .filter(|child| child.keyword == "fraction-digits")
+                .collect();
+            let fraction_digits = raw
+                .parse::<u8>()
+                .ok()
+                .filter(|value| (1..=18).contains(value));
+            if declarations.len() != 1
+                || !raw.bytes().all(|b| b.is_ascii_digit())
+                || fraction_digits.is_none()
+            {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::YangSourceSyntaxError,
+                    "decimal64 requires exactly one fraction-digits value in 1..=18",
+                    Some(statement.source.clone()),
+                    Some("supply the decimal64 scale"),
+                ));
+            }
+            ensure_type_children_supported(declarations[0], &[])?;
             Ok(ParsedTypeRef {
-                type_ref: TypeRef::Decimal64,
+                type_ref: TypeRef::Decimal64 {
+                    fraction_digits: fraction_digits.expect("validated scale"),
+                },
                 numeric_range: Vec::new(),
             })
         }
