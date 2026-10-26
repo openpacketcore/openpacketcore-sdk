@@ -449,7 +449,9 @@ impl GtpuControlPort for BackendControlPort {
         limit: crate::GtpuPacketTooBigRateLimit,
     ) -> Result<(), GtpuControlPortError> {
         self.with_attachment(|_, state, _| {
-            state.too_big_limiter = crate::reassembly::PacketTooBigLimiter::new(limit);
+            state
+                .too_big_limiter
+                .set_limit(limit, std::time::Instant::now());
             Ok(())
         })
     }

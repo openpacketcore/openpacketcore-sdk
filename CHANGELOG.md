@@ -498,11 +498,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination or session that was used within the last 255 seconds. The
   bounded tables fail closed with a new typed reason instead of resetting an
   active token bucket or Identification sequence, and eviction uses an O(1)
-  LRU instead of a full-table scan. A limit replacement is accepted only when
-  a carried conservative 255-second bound proves it cannot combine with this
-  registration's earlier admissions into more than 65,535 packets; otherwise
-  `set_inner_fragment_rate_limit` returns `InvalidLimits` and the deployment
-  must re-register to change the budget mid-session. New value-free counters
+  LRU instead of a full-table scan. Reclamation also requires full token-bucket
+  refill, preserving slow limits. Live replacements retain tokens and never
+  apply a faster refill rate to elapsed time under the prior limit. A separate
+  bounded per-destination sliding count preserves the 65,535-admission ceiling
+  across all valid limit replacements without re-registering. New value-free counters
   and typed outcomes are listed under "Added". Refs #1018.
 
 - `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the

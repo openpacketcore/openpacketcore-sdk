@@ -474,13 +474,11 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         "datagrams sent to the hand-off queue: {events:?}"
     );
 
-    // 4. The per-destination budget bounds the work. A mid-registration
-    //    replacement that tightens the 255-second admission bound is accepted
-    //    (the carried conservative bound proves it safe); with a burst of one,
-    //    a second oversized datagram toward the same UE before its 150 ms
-    //    refill is dropped, never forwarded or signalled.
+    // 4. The per-destination budget bounds the work: with a burst of one and
+    //    no refill during the test, a second oversized datagram toward the
+    //    same UE is dropped, never forwarded or signalled.
     port.set_inner_fragment_rate_limit(
-        GtpuInnerFragmentRateLimit::new(1, Duration::from_millis(150)).expect("canonical limit"),
+        GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).expect("canonical limit"),
     )?;
     send(&[&frame(LOCAL_TEID, &datagram(0x56, OVERSIZED_PAYLOAD, true))]);
     send(&[&frame(LOCAL_TEID, &datagram(0x57, OVERSIZED_PAYLOAD, true))]);
@@ -501,15 +499,10 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         ue.recv_from(&mut buffer).is_err(),
         "a rate-limited datagram is never forwarded"
     );
-    // An increase back to the default limit cannot be proven safe after the
-    // admissions above, so the setter refuses it with the typed error and
-    // leaves the tightened limit in place. The later steps fragment one
-    // datagram each and rely on the 150 ms refill.
     assert_eq!(
-        port.set_inner_fragment_rate_limit(GtpuInnerFragmentRateLimit::default())
-            .unwrap_err(),
-        GtpuControlPortError::InvalidLimits,
-        "a mid-registration budget increase must be refused, not granted"
+        port.set_inner_fragment_rate_limit(GtpuInnerFragmentRateLimit::default()),
+        Ok(()),
+        "a valid live update preserves lifetime history without re-registration"
     );
 
     // 5. A dedicated bearer through its real ESP Child SA: every fragment is

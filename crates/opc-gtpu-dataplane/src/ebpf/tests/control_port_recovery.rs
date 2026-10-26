@@ -150,6 +150,59 @@ fn receive<T>(mut poll: impl FnMut() -> Result<Option<T>, GtpuControlPortError>)
     }
 }
 
+#[tokio::test]
+async fn rate_budget_retention_control_port_replacement_never_restores_a_burst() {
+    let fixture = Fixture::new(false).await;
+    let mut context = context();
+    context.link_ifindex = fixture.device.ifindex;
+    context.peer_address = IpAddr::V4(PEER);
+    context.downlink_inner_mtu =
+        Some(crate::GtpuDownlinkInnerMtu::in_tunnel_packet_too_big(576).unwrap());
+    fixture.backend.install_pdp_context(context).await.unwrap();
+    {
+        let mut state = fixture.runtime.state();
+        state
+            .traffic_observation_gate
+            .insert(fixture.device.ifindex, 3);
+        state.grouped_map_ready.insert(fixture.device.ifindex);
+    }
+    let port = fixture.open().await;
+    let limit = crate::GtpuPacketTooBigRateLimit::new(1, Duration::from_secs(3_600)).unwrap();
+    port.set_packet_too_big_rate_limit(limit).unwrap();
+
+    let mut inner = vec![
+        0x45, 0, 0x02, 0xbc, 0x12, 0x34, 0x40, 0, 64, 17, 0, 0, 8, 8, 8, 8, 10, 45, 0, 2,
+    ];
+    let checksum = opc_gtpu_ebpf_common::internet_checksum(&inner);
+    inner[10..12].copy_from_slice(&checksum.to_be_bytes());
+    inner.extend_from_slice(&[0, 53, 0x13, 0xc4, 0x02, 0xa8, 0, 0]);
+    inner.resize(700, 0x5a);
+    let mut gpdu = vec![0x30, 0xff, 0x02, 0xbc, 0x10, 0, 0, 1];
+    gpdu.extend_from_slice(&inner);
+    let signal = || {
+        fixture.peer.send_to(&gpdu, (fixture.local, 2153)).unwrap();
+        let crate::GtpuDownlinkEvent::PacketTooBig(event) =
+            receive(|| port.try_receive_downlink(2048))
+        else {
+            panic!("the authorized oversized datagram must use the PTB policy");
+        };
+        event.signal()
+    };
+    assert_eq!(signal(), crate::GtpuPacketTooBigSignal::Sent);
+    assert_eq!(signal(), crate::GtpuPacketTooBigSignal::RateLimited);
+    for replacement in [
+        limit,
+        crate::GtpuPacketTooBigRateLimit::new(16, Duration::from_secs(3_600)).unwrap(),
+    ] {
+        port.set_packet_too_big_rate_limit(replacement).unwrap();
+        assert_eq!(signal(), crate::GtpuPacketTooBigSignal::RateLimited);
+    }
+    let counters = port.downlink_counters().unwrap();
+    assert_eq!(counters.packet_too_big_signalled, 1);
+    assert_eq!(counters.packet_too_big_rate_limited, 3);
+    assert_eq!(counters.packet_too_big_capacity_exhausted, 0);
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Fault {
     InterfaceReadback,
