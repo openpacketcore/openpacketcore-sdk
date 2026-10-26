@@ -129,16 +129,26 @@ push, and commits already on a base branch other than `main` that has no pull
 request of its own. The push to `main` scans all of them; the daily scan covers
 branches.
 
-Each run makes two passes with the same pinned scanner. The primary pass reads
-`git log -p` over the pull request's exact range, the pushed commit's full
-reachable history, or all fetched refs; it covers ordinary commits and side
-branches. A second merge-only pass (`--merges -m --first-parent`) diffs merge
-commits against their first parent, so text that exists only in a merge
-commit's conflict resolution is scanned even though `git log -p` prints no diff
-for a merge commit. Both passes must complete cleanly, or report a findings
-count, for the scan to pass; a scan that did not complete is never clean. The
-merge-only pass adds coverage after a clean primary pass, and its report is
-`gitleaks-merge-report.json` in the runner temp directory.
+The ordinary `git log -p` walk scans every reachable parent in the event's scope,
+including side-branch changes removed before a merge. A separate full traversal
+examines every merge, including nested merges that a later merge removes. For
+two-parent merges, `git merge-tree --write-tree --allow-unrelated-histories`
+recreates the automatic merge without changing the worktree or index. A
+conflict-free result whose tree is identical to the recorded merge needs no
+second scan: its parent additions were already scanned with their original
+commit-scoped ignore fingerprints. This avoids re-reporting approved false
+positives merely because a clean merge copied them.
+
+Conflicted merges, merges with edits beyond the automatic result, and all
+octopus merges are scanned against their first parent with
+`--diff-merges=first-parent --no-walk`. They are batched only to bound argument
+size; every selected merge is scanned. Unexpected merge-tree failures or missing
+tree output fail the gate. All scanner passes retain their diagnostics and error
+checks, and merge scanning continues after ordinary findings. Finding reports
+contribute to one report and total finding count. Classification failures,
+non-finding scanner failures and malformed reports fail without publishing a
+combined count. As before, a scanner exit 2 retains its findings even if its log
+also contains an error; that run fails. No pass containing findings is a success.
 
 Scheduled runs (daily at 08:17 UTC) fetch and scan all branch and tag refs with
 the `.gitleaksignore` on `main`, including branches without pull requests.
@@ -150,8 +160,7 @@ scan step also fails when the scanner logs an error or does not log `no leaks fo
 That issue does not impose a merge hold on unrelated pull requests. Manual runs
 scan all refs like the scheduled run, with the dispatched commit's
 `.gitleaksignore`, and do not open an issue. Required workflow regressions in
-`ci/test-test-inventory.py` pin these scopes, the merge-commit diff pass, the
-merge-only-text fixture, and scheduled issue reporting.
+`ci/test-test-inventory.py` pin these scopes and scheduled issue reporting.
 
 A pull request is scanned with its own `.gitleaksignore`, so it can silence a
 finding that it adds. Review every change to `.gitleaksignore`, and any new
@@ -159,6 +168,11 @@ finding that it adds. Review every change to `.gitleaksignore`, and any new
 by commit, file, rule and line and says why the value is not a secret. Do not
 add path or rule allowlists. The scan emits a warning when either file changes;
 the warning does not fail the scan.
+
+A conflicted, manually edited, or octopus merge can repeat an approved false
+positive in its first-parent patch. Such a finding still needs an explicit
+fingerprint for that merge, with the same review as an ordinary finding; the
+scanner never broadens an exception from one commit to other commits.
 
 ## Test inventory guard
 
