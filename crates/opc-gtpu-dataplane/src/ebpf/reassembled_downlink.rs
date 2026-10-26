@@ -579,6 +579,26 @@ fn authorize(
         Ok(true) => {}
         Ok(false) | Err(_) => return Verdict::Drop(GtpuDownlinkDrop::StateUnavailable),
     }
+    if let std::net::IpAddr::V6(local) = datagram.local().ip() {
+        let Some(config) = scope.grouped_config else {
+            return Verdict::Drop(GtpuDownlinkDrop::BindingMismatch(
+                DownlinkBindingMismatch::Invalid,
+            ));
+        };
+        let config = config.encode();
+        if !opc_gtpu_ebpf_common::gtpu_session_config_wire_owns_local_ipv6(
+            &config,
+            scope.ifindex,
+            &local.octets(),
+        ) {
+            return Verdict::Drop(GtpuDownlinkDrop::BindingMismatch(
+                DownlinkBindingMismatch::Invalid,
+            ));
+        }
+        if !runtime.grouped_datapath_usable(scope.ifindex, config) {
+            return Verdict::Drop(GtpuDownlinkDrop::StateUnavailable);
+        }
+    }
 
     // tc: `grouped_downlink_authority`. An unknown inner version or zero TEID
     // is a grouped lookup error, never a v5 fallback.
@@ -597,7 +617,11 @@ fn authorize(
         ));
     }
     let mut index_key = [0_u8; GTPU_SESSION_DOWNLINK_KEY_LEN];
-    index_key[0] = GtpuSessionIpFamily::Ipv4 as u8;
+    index_key[0] = if datagram.local().is_ipv4() {
+        GtpuSessionIpFamily::Ipv4
+    } else {
+        GtpuSessionIpFamily::Ipv6
+    } as u8;
     index_key[1] = inner_family as u8;
     index_key[4..8].copy_from_slice(&teid);
     let reference = match runtime.session_downlink_get(scope.ifindex, index_key) {
@@ -614,6 +638,9 @@ fn authorize(
             inner_family,
             payload_offset,
         );
+    }
+    if datagram.local().is_ipv6() {
+        return Verdict::UnknownTunnel;
     }
     authorize_legacy(runtime, scope, datagram, teid, payload_offset)
 }
@@ -680,7 +707,10 @@ fn authorize_grouped(
     if !entry.authorizes_downlink_key(index_key) {
         return invalid;
     }
-    let provenance = datagram.provenance();
+    // IPv6 control observations never acquire IPv4 reassembly authority.
+    let Some(provenance) = datagram.provenance().ipv4() else {
+        return invalid;
+    };
     let mut outer_peer = [0_u8; 16];
     let mut outer_local = [0_u8; 16];
     outer_peer[..4].copy_from_slice(&provenance.peer_address().octets());
@@ -822,7 +852,10 @@ fn authorize_legacy(
         Ok(None) => return invalid,
         Err(_) => return unavailable,
     };
-    let provenance = datagram.provenance();
+    // IPv6 control observations never acquire IPv4 reassembly authority.
+    let Some(provenance) = datagram.provenance().ipv4() else {
+        return invalid;
+    };
     if let Err(reason) = validate_ipv4_downlink_binding_wire(
         &binding,
         provenance.peer_address().octets(),

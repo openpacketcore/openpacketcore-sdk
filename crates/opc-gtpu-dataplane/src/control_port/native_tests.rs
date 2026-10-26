@@ -3,7 +3,7 @@
 use super::*;
 use crate::GtpuReassemblySocket;
 use std::{
-    net::{Ipv4Addr, UdpSocket},
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     time::{Duration, Instant},
 };
 
@@ -72,11 +72,8 @@ fn control_socket_native_preserves_tuple_budget_and_exact_socket() {
     assert!(service.recv_from(&mut reply).is_err());
     peer.send_to(&request, destination).unwrap();
     let event = receive(&socket, 1024);
-    assert_eq!(event.local(), destination);
-    assert_eq!(
-        std::net::SocketAddr::V4(event.peer()),
-        peer.local_addr().unwrap()
-    );
+    assert_eq!(event.local(), SocketAddr::V4(destination));
+    assert_eq!(event.peer(), peer.local_addr().unwrap());
     assert_eq!(
         event.provenance().ingress_ifindex(),
         socket.ingress_ifindex()

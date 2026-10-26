@@ -23,12 +23,12 @@
 
 use super::*;
 use crate::control_port::{
-    GtpuControlDatagram, GtpuControlPort, GtpuControlPortError, GtpuControlSendPlan,
+    socket_io, GtpuControlProvenance, GtpuControlDatagram, GtpuControlPort, GtpuControlPortError, GtpuControlSendPlan,
     GTPU_CONTROL_MAX_DATAGRAM,
 };
-use crate::{DownlinkOuterProvenance, GtpuDownlinkEvent};
+use crate::GtpuDownlinkEvent;
 use bytes::Bytes;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Weak};
 
@@ -91,11 +91,6 @@ pub(super) fn open(
             operation: "gtpu_control_port_attachment",
         });
     }
-    if !owned.bind_address.is_ipv4() {
-        return Err(GtpuError::UnsupportedFeature {
-            feature: "gtpu_control_port_ipv6",
-        });
-    }
     if owned.bind_port != GTPU_PORT {
         return Err(GtpuError::UnsupportedFeature {
             feature: "gtpu_control_port_port",
@@ -110,18 +105,16 @@ pub(super) fn open(
         let fd = handle.linux_as_fd().ok_or(GtpuError::UnsupportedFeature {
             feature: "gtpu_control_port",
         })?;
-        let IpAddr::V4(bound) = owned.bind_address else {
-            unreachable!()
-        };
         if backend.inner.transport.ifindex_by_name(&owned.name).ok() != Some(device.ifindex)
-            || socket_address(fd).ok() != Some(SocketAddrV4::new(bound, owned.bind_port))
+            || socket_address(fd).ok() != Some(SocketAddr::new(owned.bind_address, owned.bind_port))
         {
             drop(backend.retire_control_port_locked(device.ifindex));
             return Err(GtpuError::StateIndeterminate {
                 operation: "gtpu_control_port_attachment",
             });
         }
-        set_packet_info(fd)?;
+        socket_io::set_packet_info(fd, owned.bind_address.is_ipv6())
+            .map_err(|error| GtpuError::io("gtpu_control_port_packet_info", error))?;
         let cookie = opc_linux_gtpu_sys::socket_kernel_identity(fd)
             .map(|identity| identity.socket_cookie())
             .map_err(|error| GtpuError::io("gtpu_control_port_identity", error))?;
@@ -182,7 +175,7 @@ fn with_binding<T>(
     operation: impl FnOnce(
         &LinuxGtpuDataplaneBackend,
         &ControlSlot,
-        SocketAddrV4,
+        SocketAddr,
         BorrowedFd<'_>,
     ) -> Result<T, GtpuControlPortError>,
 ) -> Result<T, GtpuControlPortError> {
@@ -194,10 +187,7 @@ fn with_binding<T>(
     let _operation = port.slot.operations.try_read().map_err(|_| unavailable())?;
     let handle = port.slot.socket.upgrade().ok_or_else(unavailable)?;
     let fd = handle.linux_as_fd().ok_or_else(unavailable)?;
-    let IpAddr::V4(bound) = port.slot.bind_address else {
-        return Err(unavailable());
-    };
-    let local = SocketAddrV4::new(bound, port.slot.bind_port);
+    let local = SocketAddr::new(port.slot.bind_address, port.slot.bind_port);
     let verify = || {
         let matches = port.slot.active.load(Ordering::Acquire)
             && !backend.inner.device_sockets.is_poisoned()
@@ -237,173 +227,37 @@ fn receive_guard(
     }
 }
 
-fn socket_address(fd: BorrowedFd<'_>) -> std::io::Result<SocketAddrV4> {
-    use nix::sys::socket::{getsockname, SockaddrIn};
-    let address = getsockname::<SockaddrIn>(fd.as_raw_fd()).map_err(std::io::Error::from)?;
-    Ok(address.into())
-}
-
-#[cfg(target_os = "linux")]
-fn set_packet_info(fd: BorrowedFd<'_>) -> Result<(), GtpuError> {
-    use nix::sys::socket::{setsockopt, sockopt};
-    setsockopt(&fd, sockopt::Ipv4PacketInfo, &true).map_err(|error| {
-        GtpuError::io("gtpu_control_port_packet_info", std::io::Error::from(error))
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn receive_datagram(
-    fd: BorrowedFd<'_>,
-    buffer: &mut [u8],
-    expected_ifindex: u32,
-    consumed: &mut bool,
-) -> Result<Option<(usize, SocketAddrV4, Ipv4Addr, u32)>, GtpuControlPortError> {
-    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrIn};
-    use std::io::IoSliceMut;
-
-    let mut cmsg_space = nix::cmsg_space!(nix::libc::in_pktinfo);
-    let mut iov = [IoSliceMut::new(buffer)];
-    let message = match recvmsg::<SockaddrIn>(
-        fd.as_raw_fd(),
-        &mut iov,
-        Some(&mut cmsg_space),
-        MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_TRUNC,
-    ) {
-        Ok(message) => message,
-        Err(nix::errno::Errno::EAGAIN) => return Ok(None),
-        Err(error) => return Err(io_error(std::io::Error::from(error))),
-    };
-    *consumed = true;
-    if message
-        .flags
-        .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
-    {
-        return Err(io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "truncated GTP-U datagram",
-        )));
-    }
-    let from = message.address.ok_or_else(|| {
-        io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "missing datagram source",
-        ))
-    })?;
-    let SocketAddr::V4(peer) = SocketAddr::from(from) else {
-        return Err(io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "non-IPv4 datagram source",
-        )));
-    };
-    let mut packet_info = None;
-    for control in message.cmsgs().map_err(|_| {
-        io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid control-message envelope",
-        ))
-    })? {
-        if let ControlMessageOwned::Ipv4PacketInfo(info) = control {
-            packet_info = Some(info);
-        }
-    }
-    let info = packet_info.ok_or_else(|| {
-        io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "missing IP_PKTINFO control message",
-        ))
-    })?;
-    let ifindex = u32::try_from(info.ipi_ifindex).map_err(|_| {
-        io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid ingress interface",
-        ))
-    })?;
-    // The retained socket is not bound to the tunnel device: a kernel GTP
-    // userspace socket receives on the path's real ingress interface, so the
-    // pktinfo ifindex identifies the arrival path, not the attachment. A
-    // zero ifindex cannot establish provenance; the attachment generation is
-    // already proven by the slot.
-    let _ = expected_ifindex;
-    if ifindex == 0 {
-        return Err(io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "zero ingress interface",
-        )));
-    }
-    let local = Ipv4Addr::from(u32::from_be(info.ipi_addr.s_addr));
-    if local.is_unspecified() {
-        return Err(io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "non-canonical local destination",
-        )));
-    }
-    Ok(Some((message.bytes, peer, local, ifindex)))
-}
-
-#[cfg(target_os = "linux")]
-fn send_datagram(
-    fd: BorrowedFd<'_>,
-    peer: SocketAddrV4,
-    source: Ipv4Addr,
-    bytes: &[u8],
-) -> Result<usize, GtpuControlPortError> {
-    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, SockaddrIn};
-    use std::io::IoSlice;
-
-    // Pin the transmitted IP source to the original local destination from the
-    // receive provenance. A wildcard bind would otherwise let routing choose a
-    // different address on a multi-homed GTP endpoint.
-    let packet_info = nix::libc::in_pktinfo {
-        ipi_ifindex: 0,
-        ipi_spec_dst: nix::libc::in_addr {
-            s_addr: u32::from_ne_bytes(source.octets()),
-        },
-        ipi_addr: nix::libc::in_addr { s_addr: 0 },
-    };
-    let control = [ControlMessage::Ipv4PacketInfo(&packet_info)];
-    let iov = [IoSlice::new(bytes)];
-    match sendmsg::<SockaddrIn>(
-        fd.as_raw_fd(),
-        &iov,
-        &control,
-        MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
-        Some(&SockaddrIn::from(peer)),
-    ) {
-        Ok(written) if written == bytes.len() => Ok(written),
-        Ok(_) => Err(GtpuControlPortError::Io {
-            kind: std::io::ErrorKind::WriteZero,
-        }),
-        Err(error) => Err(io_error(std::io::Error::from(error))),
-    }
+fn socket_address(fd: BorrowedFd<'_>) -> std::io::Result<SocketAddr> {
+    use nix::sys::socket::{getsockname, SockaddrStorage};
+    let address = getsockname::<SockaddrStorage>(fd.as_raw_fd()).map_err(std::io::Error::from)?;
+    if let Some(v4) = address.as_sockaddr_in() { return Ok((*v4).into()); }
+    if let Some(v6) = address.as_sockaddr_in6() { return Ok((*v6).into()); }
+    Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
 }
 
 fn receive_bound(
     slot: &ControlSlot,
-    bound: SocketAddrV4,
+    bound: SocketAddr,
     fd: BorrowedFd<'_>,
     buffer: &mut [u8],
     consumed: &mut bool,
 ) -> Result<Option<GtpuControlDatagram>, GtpuControlPortError> {
-    let Some((length, peer, local, ifindex)) =
-        receive_datagram(fd, buffer, slot.ifindex, consumed)?
-    else {
-        return Ok(None);
-    };
-    if !bound.ip().is_unspecified() && *bound.ip() != local {
+    let Some(received) = socket_io::receive_tracked(
+        fd, buffer, nix::sys::socket::MsgFlags::MSG_DONTWAIT, consumed,
+    )? else { return Ok(None); };
+    if !bound.ip().is_unspecified() && bound.ip() != received.local {
         return Err(unavailable());
     }
-    let provenance = DownlinkOuterProvenance::new(*peer.ip(), local, ifindex, peer.port())
-        .ok_or_else(|| {
-            io_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "non-canonical provenance",
-            ))
-        })?;
-    let bytes = Bytes::copy_from_slice(&buffer[..length]);
+    // Packet info identifies the arrival path, not the kernel GTP device.
+    let provenance = GtpuControlProvenance::new(
+        received.peer,
+        socket_io::local_tuple(received.local, GTPU_PORT, received.ifindex),
+        received.ifindex,
+    ).ok_or_else(|| io_error(std::io::Error::new(
+        std::io::ErrorKind::InvalidData, "non-canonical provenance",
+    )))?;
     Ok(Some(GtpuControlDatagram::received(
-        bytes,
-        provenance,
-        Arc::clone(&slot.identity),
+        Bytes::copy_from_slice(&buffer[..received.length]), provenance, Arc::clone(&slot.identity),
     )))
 }
 
@@ -445,15 +299,15 @@ impl GtpuControlPort for LinuxControlPort {
         peer: SocketAddr,
         sequence: u16,
     ) -> Result<usize, GtpuControlPortError> {
-        with_binding(self, |_slot, local, fd| {
-            let (SocketAddr::V4(source), SocketAddr::V4(peer)) = (source, peer) else {
+        with_binding(self, |_, _slot, local, fd| {
+            if source.is_ipv4() != local.is_ipv4() {
                 return Err(GtpuControlPortError::InvalidTuple);
-            };
+            }
             if !local.ip().is_unspecified() && source != local {
                 return Err(GtpuControlPortError::InvalidTuple);
             }
             let bytes = crate::control_port::echo_request_bytes(source, peer, sequence)?;
-            send_datagram(fd, peer, *source.ip(), &bytes)
+            socket_io::send(fd, source, peer, &bytes).map_err(io_error)
         })
     }
 
@@ -479,23 +333,12 @@ impl GtpuControlPort for LinuxControlPort {
         if !Arc::ptr_eq(&plan.socket_identity, &self.slot.identity) {
             return Err(GtpuControlPortError::SocketMismatch);
         }
-        with_binding(self, |_, slot, local, fd| {
-            if plan.source.port() != GTPU_PORT {
-                return Err(GtpuControlPortError::InvalidTuple);
-            }
-            let IpAddr::V4(bound) = slot.bind_address else {
-                return Err(GtpuControlPortError::InvalidTuple);
-            };
-            if plan.source.ip().is_unspecified()
-                || plan.source.ip().is_multicast()
-                || plan.source.ip().is_broadcast()
-            {
-                return Err(GtpuControlPortError::InvalidTuple);
-            }
-            if !bound.is_unspecified() && plan.source != local {
-                return Err(GtpuControlPortError::InvalidTuple);
-            }
-            send_datagram(fd, plan.peer, *plan.source.ip(), &plan.bytes[..])
+        with_binding(self, |_, _slot, local, fd| {
+            if plan.source.port() != GTPU_PORT
+                || plan.source.is_ipv4() != local.is_ipv4()
+                || (!local.ip().is_unspecified() && plan.source != local)
+            { return Err(GtpuControlPortError::InvalidTuple); }
+            socket_io::send(fd, plan.source, plan.peer, &plan.bytes).map_err(io_error)
         })
     }
 

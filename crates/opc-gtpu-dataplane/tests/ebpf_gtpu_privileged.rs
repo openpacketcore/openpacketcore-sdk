@@ -42,6 +42,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "fixtures/control_ipv6.rs"]
+mod control_ipv6;
+
 #[path = "ebpf_gtpu_privileged/attachment_leaf_namespace.rs"]
 mod attachment_leaf_namespace;
 #[path = "ebpf_gtpu_privileged/attachment_receive_interface.rs"]
@@ -11291,11 +11294,6 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
     // consumer. A discard-required option reaches the host IPv6 parser and
     // moves a host discard counter. Neither path moves any SDK counter.
     let host_pass_before = backend.datapath_snapshot(&device).await?;
-    let host_consumer =
-        UdpSocket::bind((EPDG_S2BU_IPV6, GTPU_PORT)).expect("bind host IPv6 GTP-U consumer");
-    host_consumer
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set host IPv6 GTP-U timeout");
     let (non_atomic_first, non_atomic_second) =
         build_outer_ipv6_fragment_pair(&v6_downlink, 48, 0x3440_0002);
     send_raw_gtpu_frame(
@@ -11310,12 +11308,13 @@ async fn ebpf_gtpu_grouped_dual_stack_live_contract() -> Result<(), Box<dyn std:
         &non_atomic_second,
         RawChecksumMetadata::Unverified,
     );
-    let mut reassembled = vec![0_u8; 65_536];
-    let (reassembled_len, reassembled_source) = host_consumer
-        .recv_from(&mut reassembled)
-        .expect("host must receive reassembled outer IPv6 UDP/GTP");
-    assert_eq!(reassembled_source, SocketAddr::from((PGW_IPV6, GTPU_PORT)));
-    assert_eq!(&reassembled[..reassembled_len], v6_gpdu);
+    let reassembled = control_ipv6::receive(grouped_control.as_ref());
+    assert_eq!(reassembled.peer(), SocketAddr::from((PGW_IPV6, GTPU_PORT)));
+    assert_eq!(
+        reassembled.local(),
+        SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT))
+    );
+    assert_eq!(reassembled.bytes(), v6_gpdu);
 
     let host_discards_before = ipv6_host_discard_total();
     let discard_option = build_outer_ipv6_gtpu_frame(
@@ -14420,10 +14419,13 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
             }
         );
         assert_eq!(event.bytes(), gpdu);
-        assert_eq!(event.peer(), std::net::SocketAddrV4::new(PGW_IP, GTPU_PORT));
+        assert_eq!(
+            event.peer(),
+            std::net::SocketAddr::from((PGW_IP, GTPU_PORT))
+        );
         assert_eq!(
             event.local(),
-            std::net::SocketAddrV4::new(EPDG_S2BU_IP, GTPU_PORT)
+            std::net::SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT))
         );
         assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
         let plan = event.extension_notification(
@@ -14446,8 +14448,8 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
         }
 
         // The same committed IPv6 parser must hand the unchanged packet to
-        // the host before any grouped owner lookup. IPv6 typed socket support
-        // remains separate: this checks the actual raw UDP receive boundary.
+        // the host before any grouped owner lookup. This ordinary IPv4
+        // attachment has no configured IPv6 endpoint; retain a raw host probe.
         let frame6 = build_outer_ipv6_gtpu_frame(
             destination_mac,
             source_mac,
@@ -14609,10 +14611,10 @@ async fn ebpf_gtpu_backend_control_port_fences_attachment_lifetime(
     peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
     let event = receive(second.as_ref());
     assert_eq!(event.kind(), GtpuControlDatagramKind::Control);
-    assert_eq!(SocketAddr::from(event.peer()), peer_address);
+    assert_eq!(event.peer(), peer_address);
     assert_eq!(
         event.local(),
-        std::net::SocketAddrV4::new(EPDG_S2BU_IP, GTPU_PORT)
+        std::net::SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT))
     );
     assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
     assert_eq!(event.bytes(), echo);
@@ -14680,21 +14682,60 @@ async fn ebpf_gtpu_backend_control_port_fences_attachment_lifetime(
         first.try_receive_datagram(2048).unwrap_err(),
         GtpuControlPortError::Unavailable
     );
-    let mut ipv6_request = CreateGtpDeviceRequest::new("s2bu");
-    ipv6_request.uplink_mtu_policy = Some(grouped_mtu_policy());
-    let ipv6_request = CreateGtpDeviceEndpointSetRequest::new(
-        ipv6_request,
-        grouped_device_id(),
-        GtpuLocalEndpointSet::new(IpAddr::V6(EPDG_S2BU_IPV6), None)?,
-    )?;
-    let ipv6_only = backend.create_device_with_endpoints(ipv6_request).await?;
-    assert!(matches!(
-        backend.open_gtpu_control_port(&ipv6_only).await,
-        Err(GtpuError::UnsupportedFeature {
-            feature: "gtpu_control_port_ipv6"
-        })
-    ));
-    backend.remove_device(&ipv6_only).await?;
+    for secondary in [None, Some(IpAddr::V4(EPDG_S2BU_IP))] {
+        let mut ipv6_request = CreateGtpDeviceRequest::new("s2bu");
+        ipv6_request.uplink_mtu_policy = Some(grouped_mtu_policy());
+        let ipv6_request = CreateGtpDeviceEndpointSetRequest::new(
+            ipv6_request,
+            grouped_device_id(),
+            GtpuLocalEndpointSet::new(IpAddr::V6(EPDG_S2BU_IPV6), secondary)?,
+        )?;
+        let ipv6_device = backend.create_device_with_endpoints(ipv6_request).await?;
+        let ipv6_port = backend.open_gtpu_control_port(&ipv6_device).await?;
+        let peer6 = in_netns(&net.pgw_ns, || UdpSocket::bind((PGW_IPV6, 0)).unwrap());
+        let service6 = in_netns(&net.pgw_ns, || {
+            UdpSocket::bind((PGW_IPV6, GTPU_PORT)).unwrap()
+        });
+        control_ipv6::exercise(
+            ipv6_port.as_ref(),
+            (EPDG_S2BU_IPV6, GTPU_PORT).into(),
+            &peer6,
+            &service6,
+        );
+        if secondary.is_some() {
+            // Both shared queues have work: service each family without starvation.
+            peer.send_to(&echo, (EPDG_S2BU_IP, GTPU_PORT))?;
+            peer6.send_to(&echo, (EPDG_S2BU_IPV6, GTPU_PORT))?;
+            let a = control_ipv6::receive(ipv6_port.as_ref());
+            let b = control_ipv6::receive(ipv6_port.as_ref());
+            assert_ne!(a.local().is_ipv4(), b.local().is_ipv4());
+            ipv6_port.send_control_response(a.echo_response(budget)?)?;
+            ipv6_port.send_control_response(b.echo_response(budget)?)?;
+            let (length, source) = peer.recv_from(&mut bytes)?;
+            assert_eq!(source, echo_source);
+            assert_eq!(&bytes[..length], response);
+            let (length, source) = peer6.recv_from(&mut bytes)?;
+            assert_eq!(source, SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)));
+            assert_eq!(&bytes[..length], response);
+        }
+        peer6.send_to(&echo, (EPDG_S2BU_IPV6, GTPU_PORT))?;
+        let stale6 = control_ipv6::receive(ipv6_port.as_ref()).echo_response(budget)?;
+        backend.remove_device(&ipv6_device).await?;
+        assert_eq!(
+            ipv6_port.send_control_response(stale6).unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
+        assert_eq!(
+            ipv6_port
+                .send_echo_request(
+                    (EPDG_S2BU_IPV6, GTPU_PORT).into(),
+                    service6.local_addr()?,
+                    1
+                )
+                .unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
+    }
     let replacement = backend.create_device(request).await?;
     assert_eq!(replacement.ifindex, device.ifindex);
     let fresh = backend.open_gtpu_control_port(&replacement).await?;
@@ -14836,8 +14877,18 @@ async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
             ],
         );
         let control = backend.open_gtpu_control_port(&device).await?;
-        let control_v6 = UdpSocket::bind((EPDG_S2BU_IPV6, GTPU_PORT))?;
-        control_v6.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let control_v6 = if grouped {
+            None
+        } else {
+            Some(UdpSocket::bind((EPDG_S2BU_IPV6, GTPU_PORT))?)
+        };
+        if let Some(socket) = &control_v6 {
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        }
+        let peer_service_v6 = in_netns(&net.pgw_ns, || {
+            UdpSocket::bind((PGW_IPV6, GTPU_PORT)).unwrap()
+        });
+        peer_service_v6.set_read_timeout(Some(Duration::from_secs(2)))?;
         let foreign_v4 = UdpSocket::bind((Ipv4Addr::new(192, 0, 2, 90), GTPU_PORT))?;
         let foreign_v6 = UdpSocket::bind(("2001:db8:2::90".parse::<Ipv6Addr>()?, GTPU_PORT))?;
         let trigger = in_netns(&net.pgw_ns, || UdpSocket::bind((PGW_IP, 50001)).unwrap());
@@ -14870,10 +14921,10 @@ async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
             let event = receive();
             assert_eq!(event.kind(), GtpuControlDatagramKind::Gpdu);
             assert_eq!(event.bytes(), gpdu);
-            assert_eq!(event.peer(), std::net::SocketAddrV4::new(PGW_IP, 50001));
+            assert_eq!(event.peer(), std::net::SocketAddr::from((PGW_IP, 50001)));
             assert_eq!(
                 event.local(),
-                std::net::SocketAddrV4::new(EPDG_S2BU_IP, GTPU_PORT)
+                std::net::SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT))
             );
             assert_eq!(event.provenance().ingress_ifindex(), device.ifindex);
             // This synthetic test owns the complete installed roster above.
@@ -14892,8 +14943,8 @@ async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
                 ]
             );
             if grouped {
-                // IPv6 typed responses remain unsupported. This receiver
-                // proves only the exact native parser's raw UDP handoff.
+                // The grouped port retains the IPv6 handoff and sends a
+                // bounded Error Indication through the same attachment.
                 let frame = build_outer_ipv6_gtpu_frame(
                     destination_mac,
                     source_mac,
@@ -14908,9 +14959,20 @@ async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
                     &frame,
                     RawChecksumMetadata::Unverified,
                 );
-                let (length, source) = control_v6.recv_from(&mut bytes)?;
-                assert_eq!(&bytes[..length], gpdu);
-                assert_eq!(source, SocketAddr::from((PGW_IPV6, GTPU_PORT)));
+                let event = receive();
+                assert_eq!(event.bytes(), gpdu);
+                assert_eq!(event.peer(), SocketAddr::from((PGW_IPV6, GTPU_PORT)));
+                assert_eq!(event.local(), SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)));
+                let plan = event.unknown_tunnel_error(GtpuControlResponseBudget::new(40, 1)?)?;
+                assert_eq!(control.send_control_response(plan)?, 40);
+                let (length, source) = peer_service_v6.recv_from(&mut bytes)?;
+                assert_eq!(source, SocketAddr::from((EPDG_S2BU_IPV6, GTPU_PORT)));
+                let mut expected = vec![
+                    0x36, 26, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0x40, 1, 0x08, 0x68, 0, 16, 0xde, 0xad,
+                    0xbe, 0xef, 133, 0, 16,
+                ];
+                expected.extend_from_slice(&EPDG_S2BU_IPV6.octets());
+                assert_eq!(&bytes[..length], expected);
             }
         }
         expect_no_datagram(&trigger);
@@ -15008,7 +15070,9 @@ async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
             RawChecksumMetadata::Unverified,
         );
         expect_no_control_datagram(control.as_ref());
-        expect_no_datagram(&control_v6);
+        if let Some(socket) = &control_v6 {
+            expect_no_datagram(socket);
+        }
         expect_no_datagram(&ue);
 
         // An installed context still decapsulates normally and never produces
@@ -15057,7 +15121,9 @@ async fn ebpf_gtpu_unknown_teid_reaches_shared_control_without_decap(
                 RawChecksumMetadata::Unverified,
             );
             expect_no_control_datagram(control.as_ref());
-            expect_no_datagram(&control_v6);
+            if let Some(socket) = &control_v6 {
+                expect_no_datagram(socket);
+            }
             expect_no_datagram(&ue);
             assert_eq!(pinned_counter(&pin_dir, COUNTER_DL_DECAP), before_refusal);
             groups.insert(grouped_group_id().to_bytes(), original, 0)?;

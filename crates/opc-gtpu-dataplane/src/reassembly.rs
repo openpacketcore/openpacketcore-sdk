@@ -258,21 +258,18 @@ fn authoritative_ingress_ifindex(
 #[cfg(target_os = "linux")]
 fn validate_reassembly_socket_address(
     local: std::net::SocketAddr,
-    expected_address: Ipv4Addr,
+    expected_address: impl Into<std::net::IpAddr>,
     expected_port: u16,
 ) -> std::io::Result<()> {
+    let expected_address = expected_address.into();
     if expected_address.is_unspecified() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "reassembly socket must use a concrete IPv4 UDP/2152 bind",
+            "reassembly socket must use a concrete UDP bind",
         ));
     }
     match local {
-        std::net::SocketAddr::V4(local)
-            if *local.ip() == expected_address && local.port() == expected_port =>
-        {
-            Ok(())
-        }
+        local if local.ip() == expected_address && local.port() == expected_port => Ok(()),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "reassembly socket local binding changed",
@@ -315,7 +312,9 @@ fn validate_bound_device_readback(
 }
 
 #[cfg(target_os = "linux")]
-fn validate_reassembly_envelope_flags(flags: nix::sys::socket::MsgFlags) -> std::io::Result<()> {
+pub(crate) fn validate_reassembly_envelope_flags(
+    flags: nix::sys::socket::MsgFlags,
+) -> std::io::Result<()> {
     if flags
         .intersects(nix::sys::socket::MsgFlags::MSG_TRUNC | nix::sys::socket::MsgFlags::MSG_CTRUNC)
     {
@@ -347,9 +346,7 @@ pub struct DownlinkOuterProvenance {
 impl DownlinkOuterProvenance {
     /// Construct one canonical provenance. Unspecified addresses and a zero
     /// ifindex cannot authorize anything and return `None`.
-    // Provenance is minted from an `IP_PKTINFO` control message on the
-    // Linux-gated receive path; off Linux only the unit tests build one.
-    #[cfg(any(target_os = "linux", test))]
+    // Minted from packet info, or from the IPv4 arm of control provenance.
     #[must_use]
     pub(crate) fn new(
         peer_address: Ipv4Addr,
@@ -418,7 +415,7 @@ pub struct GtpuReassemblySocket {
     control_identity: std::sync::Arc<()>,
     interface_name: std::ffi::OsString,
     ingress_ifindex: u32,
-    local_address: Ipv4Addr,
+    local_address: std::net::IpAddr,
     port: u16,
     /// Cumulative kernel receive-queue drops reported by `SO_RXQ_OVFL`.
     queue_drops: std::sync::atomic::AtomicU32,
@@ -471,6 +468,14 @@ impl GtpuReassemblySocket {
     /// binding, packet-info setup, or mismatched kernel readback return stable
     /// operation labels without the interface name or address.
     pub fn bind(local_address: Ipv4Addr, interface_name: &str) -> std::io::Result<Self> {
+        Self::bind_on_port(local_address.into(), interface_name, GTPU_PORT)
+    }
+
+    /// Bind either control family; IPv6 never enters the IPv4 reassembly API.
+    pub(crate) fn bind_control(
+        local_address: std::net::IpAddr,
+        interface_name: &str,
+    ) -> std::io::Result<Self> {
         Self::bind_on_port(local_address, interface_name, GTPU_PORT)
     }
 
@@ -484,7 +489,7 @@ impl GtpuReassemblySocket {
         interface_name: &str,
     ) -> std::io::Result<Self> {
         Self::bind_on_port(
-            local_address,
+            local_address.into(),
             interface_name,
             opc_gtpu_ebpf_common::GTPU_PACKET_TOO_BIG_QUEUE_PORT,
         )
@@ -500,7 +505,7 @@ impl GtpuReassemblySocket {
         interface_name: &str,
     ) -> std::io::Result<Self> {
         Self::bind_on_port(
-            local_address,
+            local_address.into(),
             interface_name,
             opc_gtpu_ebpf_common::GTPU_INNER_FRAGMENT_QUEUE_PORT,
         )
@@ -519,17 +524,16 @@ impl GtpuReassemblySocket {
     }
 
     fn bind_on_port(
-        local_address: Ipv4Addr,
+        local_address: std::net::IpAddr,
         interface_name: &str,
         port: u16,
     ) -> std::io::Result<Self> {
         use nix::sys::socket::{
             bind, getsockopt, setsockopt, socket, sockopt, AddressFamily, SockFlag, SockType,
-            SockaddrIn,
+            SockaddrStorage,
         };
         use std::ffi::OsString;
-        use std::net::SocketAddrV4;
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsFd, AsRawFd};
 
         if local_address.is_unspecified() {
             return Err(std::io::Error::new(
@@ -554,7 +558,11 @@ impl GtpuReassemblySocket {
         }
 
         let fd = socket(
-            AddressFamily::Inet,
+            if local_address.is_ipv4() {
+                AddressFamily::Inet
+            } else {
+                AddressFamily::Inet6
+            },
             SockType::Datagram,
             SockFlag::SOCK_CLOEXEC,
             None,
@@ -567,15 +575,24 @@ impl GtpuReassemblySocket {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly device binding failed")
         })?;
-        let address = SocketAddrV4::new(local_address, port);
-        bind(fd.as_raw_fd(), &SockaddrIn::from(address)).map_err(|error| {
+        if local_address.is_ipv6() {
+            setsockopt(&fd, sockopt::Ipv6V6Only, &true).map_err(|error| {
+                std::io::Error::new(
+                    std::io::Error::from(error).kind(),
+                    "control IPv6-only setup failed",
+                )
+            })?;
+        }
+        let address =
+            crate::control_port::socket_io::local_tuple(local_address, port, ingress_ifindex);
+        bind(fd.as_raw_fd(), &SockaddrStorage::from(address)).map_err(|error| {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly address binding failed")
         })?;
-        setsockopt(&fd, sockopt::Ipv4PacketInfo, &true).map_err(|error| {
-            let error = std::io::Error::from(error);
-            std::io::Error::new(error.kind(), "reassembly packet-info setup failed")
-        })?;
+        crate::control_port::socket_io::set_packet_info(fd.as_fd(), local_address.is_ipv6())
+            .map_err(|error| {
+                std::io::Error::new(error.kind(), "reassembly packet-info setup failed")
+            })?;
         setsockopt(&fd, sockopt::RxqOvfl, &1).map_err(|error| {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly queue-drop reporting setup failed")
@@ -588,6 +605,12 @@ impl GtpuReassemblySocket {
             local_address,
             port,
         )?;
+        if socket.local_addr()? != address {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control socket scope mismatch",
+            ));
+        }
         let observed_name = getsockopt(&socket, sockopt::BindToDevice).map_err(|error| {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly device readback failed")
@@ -670,6 +693,18 @@ impl GtpuReassemblySocket {
             std::io::Error::new(error.kind(), "reassembly local binding readback failed")
         })?;
         validate_reassembly_socket_address(local, self.local_address, self.port)?;
+        if local
+            != crate::control_port::socket_io::local_tuple(
+                self.local_address,
+                self.port,
+                self.ingress_ifindex,
+            )
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control socket scope changed",
+            ));
+        }
         let observed_name = getsockopt(&self.socket, sockopt::BindToDevice).map_err(|error| {
             let error = std::io::Error::from(error);
             std::io::Error::new(error.kind(), "reassembly device readback failed")
@@ -706,7 +741,20 @@ impl GtpuReassemblySocket {
     /// truncated envelopes, absent packet info, conflicting provenance, or
     /// the underlying receive operation.
     pub fn receive(&self, buffer: &mut [u8]) -> std::io::Result<(usize, DownlinkOuterProvenance)> {
-        self.receive_with_flags(buffer, nix::sys::socket::MsgFlags::empty())
+        if self.local_address.is_ipv6() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "IPv6 control socket has no IPv4 reassembly provenance",
+            ));
+        }
+        let (length, provenance) =
+            self.receive_with_flags(buffer, nix::sys::socket::MsgFlags::empty())?;
+        Ok((
+            length,
+            provenance.ipv4().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid IPv4 provenance")
+            })?,
+        ))
     }
 
     /// Nonblocking receive from the same queue used for reassembled G-PDUs.
@@ -768,7 +816,14 @@ impl GtpuReassemblySocket {
         if !std::sync::Arc::ptr_eq(&plan.socket_identity, &self.control_identity) {
             return Err(GtpuControlPortError::SocketMismatch);
         }
-        if plan.source != std::net::SocketAddrV4::new(self.local_address, GTPU_PORT) {
+        if self.port != GTPU_PORT
+            || plan.source
+                != crate::control_port::socket_io::local_tuple(
+                    self.local_address,
+                    GTPU_PORT,
+                    self.ingress_ifindex,
+                )
+        {
             return Err(GtpuControlPortError::InvalidTuple);
         }
         self.send_control_bytes(plan.peer, &plan.bytes)
@@ -791,7 +846,7 @@ impl GtpuReassemblySocket {
         gpdu: &[u8],
     ) -> Result<usize, crate::control_port::GtpuControlPortError> {
         use crate::control_port::GtpuControlPortError;
-        if local != self.local_address
+        if std::net::IpAddr::V4(local) != self.local_address
             || self.port != GTPU_PORT
             || peer.is_unspecified()
             || peer.is_multicast()
@@ -799,7 +854,7 @@ impl GtpuReassemblySocket {
         {
             return Err(GtpuControlPortError::InvalidTuple);
         }
-        self.send_control_bytes(std::net::SocketAddrV4::new(peer, GTPU_PORT), gpdu)
+        self.send_control_bytes(std::net::SocketAddr::from((peer, GTPU_PORT)), gpdu)
     }
 
     /// Internal send path used only under the backend's retired-source request,
@@ -813,7 +868,7 @@ impl GtpuReassemblySocket {
     ) -> Result<usize, crate::control_port::GtpuControlPortError> {
         use crate::control_port::GtpuControlPortError;
         use opc_proto_gtpu::{GtpuControlMessage, GtpuEndMarker, GtpuTunnelEndpointId};
-        if local != self.local_address
+        if std::net::IpAddr::V4(local) != self.local_address
             || peer.is_unspecified()
             || peer.is_multicast()
             || peer.is_broadcast()
@@ -825,30 +880,23 @@ impl GtpuReassemblySocket {
         )))
         .to_bytes(opc_protocol::EncodeContext::default())
         .map_err(|_| GtpuControlPortError::Encoding)?;
-        self.send_control_bytes(std::net::SocketAddrV4::new(peer, GTPU_PORT), &bytes)
+        self.send_control_bytes(std::net::SocketAddr::from((peer, GTPU_PORT)), &bytes)
     }
 
     fn send_control_bytes(
         &self,
-        peer: std::net::SocketAddrV4,
+        peer: std::net::SocketAddr,
         bytes: &[u8],
     ) -> Result<usize, crate::control_port::GtpuControlPortError> {
-        use crate::control_port::GtpuControlPortError;
-        use nix::sys::socket::{sendto, MsgFlags, SockaddrIn};
-        use std::os::fd::AsRawFd;
+        use std::os::fd::AsFd;
         self.verify_live_binding()?;
-        let written = sendto(
-            self.socket.as_raw_fd(),
-            bytes,
-            &SockaddrIn::from(peer),
-            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
-        )
-        .map_err(std::io::Error::from)?;
-        if written != bytes.len() {
-            return Err(GtpuControlPortError::Io {
-                kind: std::io::ErrorKind::WriteZero,
-            });
-        }
+        let source = crate::control_port::socket_io::local_tuple(
+            self.local_address,
+            self.port,
+            self.ingress_ifindex,
+        );
+        let written =
+            crate::control_port::socket_io::send(self.socket.as_fd(), source, peer, bytes)?;
         self.verify_live_binding()?;
         Ok(written)
     }
@@ -857,68 +905,37 @@ impl GtpuReassemblySocket {
         &self,
         buffer: &mut [u8],
         flags: nix::sys::socket::MsgFlags,
-    ) -> std::io::Result<(usize, DownlinkOuterProvenance)> {
-        use nix::sys::socket::{recvmsg, ControlMessageOwned, SockaddrIn};
-        use std::os::fd::AsRawFd;
-
+    ) -> std::io::Result<(usize, crate::control_port::GtpuControlProvenance)> {
+        use crate::control_port::{socket_io, GtpuControlProvenance};
+        use std::os::fd::AsFd;
         self.verify_live_binding()?;
-        let mut cmsg_space = nix::cmsg_space!(nix::libc::in_pktinfo, u32);
-        let mut iov = [std::io::IoSliceMut::new(buffer)];
-        let message = recvmsg::<SockaddrIn>(
-            self.socket.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg_space),
-            flags,
-        )?;
-        validate_reassembly_envelope_flags(message.flags)?;
-        // Close the blocking-receive race: an interface rename, deletion, or
-        // replacement while waiting cannot make a zero-pktinfo datagram rely
-        // on stale sealed identity.
+        let received = socket_io::receive(self.socket.as_fd(), buffer, flags)?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock))?;
+        // Close the receive race before trusting zero-ifindex reassembly info.
         self.verify_live_binding()?;
-        let from = std::net::SocketAddr::from(message.address.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing datagram source")
-        })?);
-        let std::net::IpAddr::V4(peer) = from.ip() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "non-IPv4 datagram source",
-            ));
-        };
-        let mut packet_info = None;
-        for control in message.cmsgs().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid reassembly control-message envelope",
-            )
-        })? {
-            match control {
-                ControlMessageOwned::Ipv4PacketInfo(info) => packet_info = Some(info),
-                ControlMessageOwned::RxqOvfl(drops) => self
-                    .queue_drops
-                    .store(drops, std::sync::atomic::Ordering::Relaxed),
-                _ => {}
-            }
-        }
-        let packet_info = packet_info.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "missing IP_PKTINFO control message",
-            )
+        let reported = i32::try_from(received.ifindex).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid ingress interface")
         })?;
-        let ingress_ifindex =
-            authoritative_ingress_ifindex(packet_info.ipi_ifindex, self.ingress_ifindex)?;
-        let local = Ipv4Addr::from(u32::from_be(packet_info.ipi_addr.s_addr));
-        if local != self.local_address {
+        let ingress_ifindex = authoritative_ingress_ifindex(reported, self.ingress_ifindex)?;
+        if received.local != self.local_address {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "kernel local destination conflicts with the sealed socket",
+                "kernel local destination conflicts with sealed socket",
             ));
         }
-        let provenance = DownlinkOuterProvenance::new(peer, local, ingress_ifindex, from.port())
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical provenance")
-            })?;
-        Ok((message.bytes, provenance))
+        if let Some(drops) = received.queue_drops {
+            self.queue_drops
+                .store(drops, std::sync::atomic::Ordering::Relaxed);
+        }
+        let provenance = GtpuControlProvenance::new(
+            received.peer,
+            socket_io::local_tuple(received.local, GTPU_PORT, ingress_ifindex),
+            ingress_ifindex,
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical provenance")
+        })?;
+        Ok((received.length, provenance))
     }
 }
 
@@ -931,11 +948,14 @@ impl crate::control_port::GtpuControlPort for GtpuReassemblySocket {
         sequence: u16,
     ) -> Result<usize, crate::control_port::GtpuControlPortError> {
         use crate::control_port::{echo_request_bytes, GtpuControlPortError};
-        let (std::net::SocketAddr::V4(source), std::net::SocketAddr::V4(peer)) = (source, peer)
-        else {
-            return Err(GtpuControlPortError::InvalidTuple);
-        };
-        if *source.ip() != self.local_address || self.port != GTPU_PORT {
+        if source
+            != crate::control_port::socket_io::local_tuple(
+                self.local_address,
+                GTPU_PORT,
+                self.ingress_ifindex,
+            )
+            || self.port != GTPU_PORT
+        {
             return Err(GtpuControlPortError::InvalidTuple);
         }
         let bytes = echo_request_bytes(source, peer, sequence)?;
