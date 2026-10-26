@@ -200,19 +200,13 @@ concurrent one-to-many endpoint receivers; one-to-one associations retain their
 outer gate so receive, notification, and peer-path updates remain in kernel
 order. Split association ownership continues to have one mutable receive half.
 
-The returned `SensitiveBytes` payload owns exactly the received prefix in a
-uniquely owned buffer and never borrows the socket scratch. It is zeroized when
-the `InboundMessage` (or an owning `N2Payload`) is dropped, and it is
-deliberately not `Clone`: duplicating received bytes must be an explicit copy
-with its own custody. After a successful receive, the SDK also zeroizes exactly
-the kernel-reported scratch prefix before the next chunk or return, so small
+The returned `Bytes` owns exactly the received payload prefix and never borrows
+the socket scratch. After a successful receive, the SDK zeroizes exactly the
+kernel-reported scratch prefix before the next chunk or return, so small
 successful messages do not incur a full 64 KiB clear. If the receive syscall
 fails, there is no reliable byte count; the SDK conservatively zeroizes the
 entire offered scratch slice (up to 64 KiB) before returning the error. The
 scratch allocation is released and fully cleared when the socket is dropped.
-Received-payload `Debug` output reports only the length. Diameter convenience
-APIs materialize a caller-owned `Bytes` from a Diameter PPID record at their
-boundary; that path carries Diameter records, not N2 key material.
 
 Partial DATA belongs to the socket. Cancelling a receive, including while
 another receiver is queued, preserves every consumed prefix and the original
@@ -575,3 +569,13 @@ cargo test -p opc-sctp tests::loopback_diameter_recv_surfaces_transport_notifica
 cargo test -p opc-sctp tests::static_multihoming_survives_primary_path_drop -- --ignored --exact
 cargo test -p opc-sctp tests::loopback_authenticated_association_switches_keys_and_drains -- --ignored --exact
 ```
+
+### Receive payload custody
+
+Live receives and `DataChunk::into_inbound_message` place opaque payloads under
+wiping ownership. `Bytes` clones and the N2 handoff retain that owner; storage is
+cleared when the final reference is dropped. Partial-message growth clears the
+old allocation before releasing it, and cancellation/close retain the existing
+socket ownership rules. `InboundMessage` no longer implements `Clone` or equality.
+Caller-constructed messages keep the custody properties of their supplied
+`Bytes`; copying an exposed slice creates a new caller-owned buffer.

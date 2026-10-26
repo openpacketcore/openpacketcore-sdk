@@ -513,7 +513,7 @@ async fn admission_timeout_allows_snapshot_restart(single_chunk: bool) {
             }
         };
         let table = Reader(profile.core.clone())
-            .read_voter_slot_state_now()
+            .read_voter_slot_state()
             .await
             .unwrap()
             .table()

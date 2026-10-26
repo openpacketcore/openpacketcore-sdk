@@ -25,6 +25,10 @@ accepted single-replica profile.
   opens require an explicit non-zero `AuditKey`; this API is not reopen-only.
 - Retained configuration voters use explicit `provision_config_authority`,
   `reopen_config_authority`, and `provision_config_member_repair` operations.
+  Provisioning publishes authenticated intent and a complete database atomically;
+  `begin_resume_config_authority` and `begin_resume_config_member_repair` resume
+  the same authorized operation after interruption. Explicit request identifiers
+  are available through `RetainedConfigProvisionRequest` and the transaction APIs.
   Missing retained storage never falls back to creation during reopen. See the
   [retained lifecycle contract](RETAINED_CONFIG.md) for scope binding,
   interruption, repair, durability choices and rollback-freshness limits.
@@ -399,7 +403,8 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   `PlannedShutdownFallback::Unplanned` reports this route: preparation was
   suppressed, or an in-flight preparation was cancelled and joined (RPCs
   already sent cannot be retracted, so a successor may already be campaigning).
-  Completed reports remain unchanged. Caller cancellation
+  Already published reports remain unchanged; a result racing the unplanned
+  request is reported as `Unplanned`. Caller cancellation
   or timeout cannot reopen admission or abandon the drain. Config bus adapters
   use this route through `RaftManagedDatastore::consensus_store()`; they own no
   separate consensus lifecycle. Surviving voters use ordinary elections, and

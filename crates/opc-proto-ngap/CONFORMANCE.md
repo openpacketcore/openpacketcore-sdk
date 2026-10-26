@@ -70,7 +70,7 @@ singleton/repeatable cardinality.
 - Presence and conditional-presence rules, and semantic validation inside each
   opaque IE value, remain outside this framing subset.
 
-These policies filter the typed generated container, not the preserved wire
+These policies filter the typed owned container, not the preserved wire
 image. `Pdu::raw` remains the immutable received bytes. Raw-preserving encode
 therefore reproduces unknown or duplicate entries removed by `Drop`, `First`,
 or `Last`. Canonical encoding serializes the resulting typed container. Neither
@@ -79,6 +79,15 @@ mode performs nested semantic admission.
 Public `Debug` output for the wrapper and message enums is redacted to
 procedure/outcome metadata, lengths, variant names, and IE counts. It does not
 render `Pdu::raw`, opaque IE values, or NAS payload bytes.
+
+Message SEQUENCE extension-presence bitmaps follow X.691 11.9.3.4,
+11.9.3.8 and 19.7–19.9, including fragmented bitmaps with 16K-bit multiples.
+The scanner borrows each bounded fragment, then validates every present opaque
+addition without copying its bytes. `tests/sequence_extensions.rs` covers the
+16,384-/16,385-bit boundaries, all fragment multipliers, multiple fragments,
+short/long length controls, exact input limits and malformed framing. Root IEs
+and the complete raw encoding survive; live drop observers also cover wiping
+on successful decode and truncated additions.
 
 ## Encoding mode
 
@@ -137,17 +146,17 @@ extension container ID. Bounded explicit receive layout and a fixed aligned
 CHOICE wrapper avoid those defects; qualified generated encoders handle the
 inner structures. NAS shares the independently tested open-type length codec.
 
-All wrappers redact identity, NAS, key and peer values. A received PDU keeps
-its original bytes in an owned `SensitiveBytes` buffer that is zeroized when the
-PDU is dropped, and the id-SecurityKey IE payload is moved out of the generated
-open-type view into the PDU's zeroizing storage (the typed placeholder is
-empty; canonical encoding substitutes the exact bytes back, so the wire contract
-is unchanged). The borrowed `SecurityKey` can be copied into a
-`Zeroizing<Vec<u8>>` hand-off via `SecurityKey::copy_into_zeroizing` for an
-authorized consumer that outlives the PDU. A decode failure after the key IE was
-parsed scrubs every partial open-type copy before returning. Caller-owned input
-and explicit non-zeroizing copies remain caller custody; the generated
-extension-addition decoder's internal allocations are outside this scrub path.
+All wrappers redact identity, NAS, key and peer values. Security Key decoding
+borrows the input without copying; encoded buffers use `zeroize::Zeroizing`.
+Generic PDU raw storage, decoded opaque IE values and fragment coalescing use
+wiping owners, including policy discards and decode errors. Live SCTP payloads
+retain a wiping owner through N2 handoff and last-reference drop. Caller-owned
+input and final wire copies remain caller custody; `decode_zeroizing` accepts
+wiping input, and `SecurityKey::to_zeroizing` provides an explicit protected
+provider handoff. Drop observers check the live raw, IE, fragment, transport and
+partial-receive allocations before release, with and without a key.
+Allocation-counter integration tests additionally check for leaks; their counts
+do not claim to observe cleared contents.
 No association authorization, derivation, import, cryptographic decision or
 backend effect occurs. Location addressing/port assignment, required TAI and
 message-level presence remain caller responsibilities. Nested extensions other
@@ -501,7 +510,7 @@ malformed/extended payloads, because this boundary does not handle handover.
 
 `resource_fields` exposes distinct UplinkTransport and DownlinkTransport types
 with explicit address and 32-bit TEID getters. IPv4/IPv6 roots are qualified;
-dual-address bit strings and extensions are unsupported. The codec permits
+160-bit combined addresses are covered below; extensions are unsupported. The codec permits
 all wire address/TEID values; endpoint validation and installation are external.
 Session AMBR reuses the byte-identical two-BitRate root layout with a distinct
 public type, qualified by independent session vectors. Root QFI values are
@@ -808,8 +817,28 @@ failure/security combinations and maximum-size roots. Public construction and
 semantic reconstruction must reproduce reference bytes; exact and one-short
 resource limits, redaction, truncation and adverse byte mutations are checked.
 Seventy new seeds exercise the same reconstruction in replay and fuzzing.
-Extensions and 160-bit combined addresses remain explicitly unsupported;
+Extensions remain explicitly unsupported; combined addresses are covered below;
 this does not qualify Modify response tunnels, forwarding or live peers.
+
+## Combined transport addresses
+
+`resource_fields::TransportLayerAddress` preserves the 32-bit IPv4, 128-bit IPv6
+and 160-bit combined forms described by
+[TS 38.413 9.3.2.4](https://www.etsi.org/deliver/etsi_ts/138400_138499/138413/18.02.00_60/ts_138413v180200p.pdf)
+and [TS 38.414 5.3](https://www.etsi.org/deliver/etsi_ts/138400_138499/138414/18.00.00_60/ts_138414v180000p.pdf).
+Combined encoding contains IPv4 first and IPv6 second, with one TEID. The public
+address getter returns the explicit `Ipv4`, `Ipv6` or `Ipv4v6` variant; the codec
+does not select a preferred family. Single-address constructors remain available;
+`with_address` constructs any of the three forms.
+
+Synthetic literal APER tests in `tests/n3iwf_dual_stack.rs` independently pin the
+address order and parent alignment for uplink/downlink fields, additional uplink
+lists, Modify tunnel pairs, Setup response flow associations and optional Modify
+response endpoints. Mixed-family additional tunnels retain every association.
+Exact byte/depth/count limits, one-short bounds, every truncation, trailing bytes,
+other address widths, extension flags and nonzero padding remain checked. This
+adds codec coverage; endpoint reachability, selection and authorization remain
+caller responsibilities, and live peer interoperability is not established here.
 
 ## N3IWF session setup lists
 
@@ -1638,10 +1667,10 @@ PDU/IE open types are preflighted through their final length determinant before
 fragment coalescing; the claimed fragment must physically fit. For typed
 procedures the fixed-width 16-bit `ProtocolIE-Container` count must satisfy
 `DecodeContext::max_ies` and the minimum physical bytes required by that many
-entries before materialization. Generated types decode fixed IE headers;
-fragments cannot consume a following IE or PDU. Trailing bytes inside a root
-container are rejected. SEQUENCE extension additions retain the earlier
-generated decoder path; fragmented additions are not qualified. Three
+entries before materialization. Fixed headers and wiping IE owners are decoded
+separately; fragments cannot consume a following IE or PDU. Trailing bytes
+inside a root container are rejected. SEQUENCE extension bitmaps and opaque
+additions are scanned without copying, including fragmented framing. Three
 additional layers guard it:
 
 - **Per-PR regression guard** — `tests/corpus_replay.rs` replays every committed

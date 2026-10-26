@@ -1278,6 +1278,11 @@ impl fmt::Debug for ProtocolConfigurationOptions {
 }
 
 /// Typed Allocation and Retention Priority carried by Bearer QoS.
+///
+/// TS 29.274 clause 8.15 refers to TS 29.212 clauses 5.3.45-5.3.47:
+/// level 1 is highest, and the capability/vulnerability wire bits are zero
+/// when enabled. The public booleans express permission, so `true` encodes
+/// as a clear PCI/PVI bit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocationRetentionPriority {
     priority_level: u8,
@@ -1316,19 +1321,33 @@ impl AllocationRetentionPriority {
         if octet & 0x82 != 0 {
             return Err(BearerQosValidationError::InvalidArpSpareBits);
         }
-        Self::new((octet >> 2) & 0x0f, octet & 0x40 != 0, octet & 0x01 != 0)
+        Self::new((octet >> 2) & 0x0f, octet & 0x40 == 0, octet & 0x01 == 0)
     }
 
     /// Encode the canonical TS 29.274 ARP octet with both spare bits zero.
     pub const fn to_octet(self) -> u8 {
-        ((self.preemption_capability as u8) << 6)
+        ((!self.preemption_capability as u8) << 6)
             | (self.priority_level << 2)
-            | self.preemption_vulnerability as u8
+            | !self.preemption_vulnerability as u8
     }
 
     /// Allocation and Retention Priority level (1 is highest, 15 lowest).
     pub const fn priority_level(self) -> u8 {
         self.priority_level
+    }
+
+    /// Compare priority levels, returning [`std::cmp::Ordering::Greater`] when
+    /// this bearer has higher priority than `other`.
+    ///
+    /// TS 29.274 clause 8.15 refers to TS 29.212 clause 5.3.45: level 1 is
+    /// highest and level 15 is lowest. PCI and PVI do not affect this
+    /// comparison; equal levels compare equal even when those flags differ.
+    /// Admission and pre-emption decisions must separately consider the flags.
+    ///
+    /// This is a priority comparison, not a total ordering of ARP values.
+    #[must_use]
+    pub fn cmp_priority(&self, other: &Self) -> std::cmp::Ordering {
+        other.priority_level.cmp(&self.priority_level)
     }
 
     /// Whether the bearer may pre-empt another bearer.
@@ -1430,6 +1449,10 @@ impl std::error::Error for BearerQosValidationError {}
 /// Standardized QCI semantics are checked on decode and encode. Operator-
 /// specific QCIs remain wire-preservable but require an explicit resource
 /// type through [`BearerQos::validate_with_resource_type`] before policy use.
+///
+/// The IE has a required 22-octet prefix. Decoding ignores unknown trailing
+/// octets per TS 29.274 clause 7.7.7; canonical encoding emits only the known
+/// fields. Raw-preserving message encoding retains the received octets.
 ///
 /// @spec 3GPP TS29274 R18 8.15
 /// @req REQ-3GPP-TS29274-R18-S2B-IE-BEARER-QOS-001
@@ -1592,7 +1615,17 @@ impl BearerQos {
     }
 
     fn decode_value(value: &[u8], offset: usize) -> Result<Self, DecodeError> {
-        require_exact_len(value, 22, offset, "Bearer QoS IE must be twenty-two octets")?;
+        // The raw TLIV parser has already checked the declared boundary.
+        // A complete but short value is an invalid length, not truncated input.
+        if value.len() < 22 {
+            return Err(DecodeError::new(
+                DecodeErrorCode::InvalidLength {
+                    reason: "Bearer QoS IE must be twenty-two octets",
+                },
+                offset,
+            )
+            .with_spec_ref(spec_ref()));
+        }
         let decoded = Self {
             priority_flags: value[0],
             qci: value[1],
@@ -4816,7 +4849,7 @@ mod tests {
     use super::*;
 
     fn arp() -> AllocationRetentionPriority {
-        let Ok(value) = AllocationRetentionPriority::new(3, true, true) else {
+        let Ok(value) = AllocationRetentionPriority::new(3, false, false) else {
             panic!("test ARP must be valid");
         };
         value

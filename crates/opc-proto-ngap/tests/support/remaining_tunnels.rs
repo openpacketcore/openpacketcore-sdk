@@ -13,7 +13,7 @@ pub fn uplinks(value: &UplinkTransportList) -> UplinkTransportList {
         value
             .values()
             .iter()
-            .map(|v| UplinkTransport::new(v.address(), v.teid()))
+            .map(|v| UplinkTransport::with_address(v.address(), v.teid()))
             .collect(),
     )
     .unwrap()
@@ -25,7 +25,10 @@ pub fn response(value: &ModifyResponseTransfer) -> ModifyResponseTransfer {
         .iter()
         .map(|tunnel| {
             DownlinkQosTunnel::new(
-                DownlinkTransport::new(tunnel.downlink().address(), tunnel.downlink().teid()),
+                DownlinkTransport::with_address(
+                    tunnel.downlink().address(),
+                    tunnel.downlink().teid(),
+                ),
                 tunnel
                     .flows()
                     .map(|flow| AssociatedQosFlow {

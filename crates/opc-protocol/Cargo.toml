@@ -16,7 +16,6 @@ categories = ["network-programming", "encoding"]
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
-zeroize = { workspace = true }
 
 [lints]
 workspace = true

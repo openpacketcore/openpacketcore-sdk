@@ -36,6 +36,7 @@ mod types;
 #[cfg(test)]
 mod capacity_tests;
 
+#[cfg(target_os = "linux")]
 pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
 
 pub use history::{ConfigHistoryLimits, ConfigHistoryRetention};

@@ -379,8 +379,10 @@ impl ConfigVoterProfile {
             loop {
                 // Never await admission's serial coordinator while holding the
                 // incoming request guard; publication has its own independent task.
+                // Keep the caller's original deadline while acquiring and
+                // reading the serialized SQLite connection.
                 let state = Reader(self.core.clone())
-                    .read_voter_slot_state(deadline)
+                    .read_voter_slot_state_until(deadline)
                     .await?;
                 if state.table().slots.iter().any(|slot| {
                     slot.member.identity.node_id() == local && slot.phase == VoterSlotPhase::Voting
@@ -774,9 +776,7 @@ impl ConsensusConfigStore {
             .voter_profile
             .as_ref()
             .ok_or(VoterReplacementError::IncompatibleProfile)?;
-        Reader(profile.core.clone())
-            .read_voter_slot_state_now()
-            .await
+        Reader(profile.core.clone()).read_voter_slot_state().await
     }
 
     /// Resolve an accepted request using current controller authorization and a
@@ -1571,7 +1571,7 @@ pub(super) async fn handle(
                     let mut rpc = append.ok_or(VoterReplacementError::UnauthorizedReplacement)?;
                     let original_last = rpc.entries.last().map(|entry| entry.log_id);
                     let state = Reader(profile.core.clone())
-                        .read_voter_slot_state(deadline)
+                        .read_voter_slot_state_until(deadline)
                         .await?;
                     if state.table().slots.iter().any(|slot| {
                         slot.member.identity.node_id() == store.inner.local_node_id
@@ -1808,36 +1808,30 @@ impl std::fmt::Debug for Reader {
 }
 #[async_trait]
 impl VoterSlotStateReader for Reader {
-    async fn read_voter_slot_state(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
-        // This serialized SQLite reader exposes no strict-publication watch, so
-        // it cannot wait for a pending publication. It enforces the caller's
-        // budget before and after the serialized read and maps a spent budget
-        // to `Deadline`; adding a publication watch here is an explicit
-        // follow-up, not a new timeout in this path.
-        if tokio::time::Instant::now() >= deadline {
-            return Err(VoterReplacementError::Deadline);
-        }
-        let read = self
-            .0
-            .run_sqlite(super::super::sqlite::voter_slots::read_sync)
-            .await;
-        if tokio::time::Instant::now() >= deadline {
-            return Err(VoterReplacementError::Deadline);
-        }
-        read.map_err(|_| VoterReplacementError::Unavailable)?
-            .ok_or(VoterReplacementError::IncompatibleProfile)
-    }
-
-    async fn read_voter_slot_state_now(
-        &self,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+    async fn read_voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError> {
         self.0
             .run_sqlite(super::super::sqlite::voter_slots::read_sync)
             .await
             .map_err(|_| VoterReplacementError::Unavailable)?
+            .ok_or(VoterReplacementError::IncompatibleProfile)
+    }
+
+    async fn read_voter_slot_state_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+        self.0
+            .run_sqlite_cancellable_until(deadline, |conn, _| {
+                super::super::sqlite::voter_slots::read_sync(conn)
+            })
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    VoterReplacementError::Deadline
+                } else {
+                    VoterReplacementError::Unavailable
+                }
+            })?
             .ok_or(VoterReplacementError::IncompatibleProfile)
     }
 }
