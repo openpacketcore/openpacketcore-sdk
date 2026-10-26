@@ -631,3 +631,7 @@ fn run_issuer(scenario: Scenario, test_name: &str) {
         }
     });
 }
+
+#[cfg(target_os = "linux")]
+#[path = "issuer_linux_clock_tests.rs"]
+mod linux_clock;

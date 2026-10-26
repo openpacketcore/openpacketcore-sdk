@@ -15,6 +15,9 @@ mod child_read_revocation;
 mod child_reads;
 #[path = "scope_transport/cross_slot.rs"]
 mod cross_slot;
+#[cfg(target_os = "linux")]
+#[path = "scope_transport/linux_clock.rs"]
+mod linux_clock;
 #[path = "scope_transport/scans.rs"]
 mod scans;
 

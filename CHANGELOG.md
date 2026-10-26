@@ -770,27 +770,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported
-  production `AuthenticationTimeSource` for RFC 026 authentication freshness.
-  It reads the Linux kernel clock-adjustment state (one read-only
-  `clock_adjtime(CLOCK_REALTIME)` query, no privilege or clock change) and
-  reports the kernel maximum realtime error as the symmetric uncertainty of one
-  fresh observation. Unsynchronized, unavailable, zero, negative or over-bound
-  kernel state returns the typed retryable `AuthenticationTimeError`; there is
-  no wall-clock fallback. The synchronization generation starts at 1 on the
-  first accepted synchronized observation and increments after synchronization
-  is re-established, while wall steps keep `IntervalClock`'s existing fixed-
-  budget recovery policy. The default maximum accepted uncertainty is 1 s
-  (`PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY`) and can be fixed with
-  `with_maximum_uncertainty` at startup. A fixed, value-free `tracing` warning
-  carries the closed refusal reason. Refs #1244.
+  production source for RFC 026 authentication freshness. It serializes paired,
+  read-only `clock_adjtime(CLOCK_REALTIME)` observations and uses the returned
+  atomic realtime instant. Its conservative symmetric bound includes maximum and
+  estimated error, precision, quantization, oscillator tolerance and sampling
+  elapsed time. Unknown, malformed, faulted or changing synchronization state,
+  an ambiguous leap second and over-budget bounds fail closed. Observed loss and
+  recovery increment the generation once; query failures do not forge recovery.
+  The default maximum remains 1 s and an explicit deployment budget stays fixed.
+  Refusal warnings report only reason changes, with one recovery event. Clock
+  failures and automatic recovery leave authority, receipts and held effects
+  unchanged. Linux requires a maintained kernel time estimate (chrony `rtcsync`)
+  and permission for the unprivileged read-only syscall. Refs #1244.
 
-- `opc-linux-clock-sys`: narrow unsafe Linux clock-adjustment UAPI boundary
-  used only by `opc-session-net`. `read_kernel_clock_adjustment()` performs one
-  read-only `clock_adjtime(CLOCK_REALTIME)` query and returns the kernel
-  synchronization state plus maximum/estimated error; unsupported platforms
-  compile to a stub that fails explicitly. ADR 0017's mechanical unsafe
-  boundary allow-list and `scripts/check-management-plane-policy.py` are
-  amended for this narrowly scoped read-only crate. Refs #1244.
+- `opc-linux-clock-sys`: the narrow ADR 0017 unsafe boundary exposes a complete
+  raw realtime snapshot from one read-only `clock_adjtime(CLOCK_REALTIME)` call,
+  preserving signed error, precision and tolerance fields. Existing adjustment
+  accessors remain; synchronization classification also rejects unknown states,
+  `TIME_OOP` and kernel/PPS faults. Unsupported platforms fail explicitly with
+  no wall-clock fallback. Refs #1244.
 
 - `opc-session-net`: prepared V2 fenced-transition handles expose
   `execute_once_with_failure_diagnostic`, an additive diagnostic wrapper around
