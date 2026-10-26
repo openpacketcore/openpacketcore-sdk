@@ -57,6 +57,18 @@ fn rejected_mutation() -> Vec<u8> {
 
 #[tokio::test(start_paused = true)]
 async fn rejection_after_a_lost_commit_reply_retains_unknown_outcome() {
+    refusal_after_a_lost_commit_reply_retains_unknown_outcome(rejected_mutation()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_quorum_after_a_lost_commit_reply_retains_unknown_outcome() {
+    // Current postcard tag: ForwardMutationReply::NoQuorum (5).
+    let reply =
+        opc_consensus::encode_bounded(&(opc_persist::CONFIG_CONSENSUS_WIRE_VERSION, 5_u8)).unwrap();
+    refusal_after_a_lost_commit_reply_retains_unknown_outcome(reply).await;
+}
+
+async fn refusal_after_a_lost_commit_reply_retains_unknown_outcome(payload: Vec<u8>) {
     schedule::with_frozen_time(async {
         let cluster = ThreeNodeCluster::build([[0x55; 32]; 3]).await;
         let results = tokio::join!(
@@ -84,7 +96,7 @@ async fn rejection_after_a_lost_commit_reply_retains_unknown_outcome() {
         path.install(Arc::new(ApplicationReply {
             inner: cluster.stores[leader].rpc_handler(),
             family: ConsensusRpcFamily::ForwardMutation,
-            payload: rejected_mutation(),
+            payload,
             delay: Duration::ZERO,
             completed: Arc::new(AtomicUsize::new(0)),
         }))

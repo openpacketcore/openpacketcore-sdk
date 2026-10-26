@@ -1167,7 +1167,9 @@ impl ConsensusConfigStore {
             .quorum_lease_recovery_observations
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
-        if observations >= QUORUM_LEASE_RECOVERY_OBSERVATIONS {}
+        if observations >= QUORUM_LEASE_RECOVERY_OBSERVATIONS {
+            self.record_quorum_lease_available();
+        }
     }
 
     /// Number of healthy observations consumed by the most recent recovery from
@@ -1970,9 +1972,11 @@ impl ConsensusConfigStore {
                     }
                 }
                 ForwardMutationReply::NoQuorum => {
-                    // The leader rejected this forwarded request before proposing
-                    // anything: it is definitely not applied, so a retry with the
-                    // same request identity is safe and no ambiguity is added.
+                    // This attempt was not proposed, but its refusal cannot
+                    // settle the effect of an earlier transmitted attempt.
+                    if ambiguity_seen {
+                        return Err(PersistError::outcome_unknown());
+                    }
                     return Err(consensus_unavailable());
                 }
                 ForwardMutationReply::OutcomeUnknown => {
