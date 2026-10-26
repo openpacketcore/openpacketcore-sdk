@@ -68,7 +68,7 @@ enum RosterMaintenanceOutcome {
 }
 
 #[async_trait::async_trait]
-trait RosterMaintenanceLane {
+trait RosterMaintenanceLane: Sync {
     fn occupancy(&self) -> Option<ProtectedRosterConsensusDiagnosticSnapshot>;
     async fn propose(&self) -> Option<RosterMaintenanceOutcome>;
 
