@@ -32,6 +32,9 @@ mod quorum_lease;
 #[path = "consensus_openraft/route_retirement.rs"]
 mod route_retirement;
 
+#[path = "consensus_openraft/leader_rediscovery.rs"]
+mod leader_rediscovery;
+
 #[cfg(feature = "dangerous-test-hooks")]
 #[path = "consensus_openraft/failover_acceleration.rs"]
 mod failover_acceleration;
