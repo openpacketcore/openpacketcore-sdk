@@ -3874,6 +3874,7 @@ dependencies = [
 name = "opc-tls"
 version = "0.2.0"
 dependencies = [
+ "crypto-bigint",
  "opc-identity",
  "opc-redaction",
  "opc-types",

@@ -69,18 +69,30 @@ replacement for peer authorization and revocation.
 
 Diameter now offers explicit TLS 1.2 compatibility while preserving the TLS 1.3
 default. The admitted TLS 1.2 suites use ECDHE-ECDSA or ECDHE-RSA with
-AES-128/256-GCM. [Wire regressions](../crates/opc-diameter-transport/tests/tls_tcp/tls12.rs)
-exercise both roles, all four suites, bidirectional Diameter, in-band upgrade,
+AES-128/256-GCM, or DHE-RSA with AES-128-GCM and RFC 7919 FFDHE4096/2048.
+Both roles require Extended Master Secret. [Wire regressions](../crates/opc-diameter-transport/tests/tls_tcp/tls12.rs)
+exercise both roles, all five suites, bidirectional Diameter, in-band upgrade,
 TLS 1.3 preference and material-loss retirement; the legacy strict policy still
 rejects TLS 1.2 during the handshake. The pre-fix peer received a ProtocolVersion
-alert. The 242 transport tests/docs pass on each host and Linux, with strict
-host Clippy and full-workspace Linux Clippy.
+alert. Follow-up DHE admission and missing-EMS policy regressions failed before
+correction. All 306 affected TLS/transport tests/docs pass on macOS and Linux.
+The fixed-exponent known answers agree independently with Python integer
+arithmetic and LibreSSL 3.3.6. A separate OpenSSL 3.6.5 wire check verifies
+mutual authentication and application bytes in both roles, client agreement
+with FFDHE2048 and FFDHE4096 servers, server agreement with FFDHE4096, and
+rejection of EMS omission in both roles. Its TLS 1.2 ClientHello omits the
+supported-groups extension even with `-groups`; server fallback therefore
+selects the preferred FFDHE4096 group.
 
 [TS 33.210 V18.2.0 §6.2](https://www.etsi.org/deliver/etsi_ts/133200_133299/133210/18.02.00_60/ts_133210v180200p.pdf)
 requires TLS 1.2 and 1.3 and restricts TLS 1.2 suites to AEAD with forward
 secrecy. Static RSA key exchange is therefore not an interoperability fix for
-that profile. The required DHE-RSA suite and DTLS cipher findings remain open;
-the ECDHE subset is not complete 3GPP profile support.
+that profile. The DHE-RSA suite is now supplied using the existing ring
+signature/PRF/record algorithms and constant-time `crypto-bigint` arithmetic
+with fixed 512-bit ephemeral exponents. Named safe-prime public-key checks
+follow [RFC 7919 §§5.1–5.2](https://www.rfc-editor.org/rfc/rfc7919.html#section-5.1);
+custom groups and sub-2048-bit groups are unsupported. This software path
+makes no validated-module claim. DTLS cipher findings keep #1353 open.
 
 ## Diameter runtime work list #1358
 

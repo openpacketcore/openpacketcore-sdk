@@ -85,12 +85,13 @@ fn compatibility_material(rsa: bool) -> TestTlsMaterial {
 }
 
 #[tokio::test]
-async fn tls12_ecdhe_certificate_suites_carry_diameter_in_both_directions() {
+async fn tls12_certificate_suites_carry_diameter_in_both_directions() {
     for (cipher, rsa) in [
         (DiameterTlsCipher::EcdheEcdsaAes128GcmSha256, false),
         (DiameterTlsCipher::EcdheEcdsaAes256GcmSha384, false),
         (DiameterTlsCipher::EcdheRsaAes128GcmSha256, true),
         (DiameterTlsCipher::EcdheRsaAes256GcmSha384, true),
+        (DiameterTlsCipher::DheRsaAes128GcmSha256, true),
     ] {
         let policy = DiameterTlsPolicy::tls12_compatibility(DiameterFrameLimits::default())
             .with_allowed_ciphers(&[cipher])

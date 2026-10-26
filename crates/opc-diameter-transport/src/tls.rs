@@ -79,10 +79,12 @@ pub enum DiameterTlsCipher {
     EcdheRsaAes128GcmSha256,
     /// TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 (TLS 1.2).
     EcdheRsaAes256GcmSha384,
+    /// TLS_DHE_RSA_WITH_AES_128_GCM_SHA256 (TLS 1.2, RFC 7919 named groups).
+    DheRsaAes128GcmSha256,
 }
 
 impl DiameterTlsCipher {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Aes128GcmSha256,
         Self::Aes256GcmSha384,
         Self::Chacha20Poly1305Sha256,
@@ -90,6 +92,7 @@ impl DiameterTlsCipher {
         Self::EcdheEcdsaAes256GcmSha384,
         Self::EcdheRsaAes128GcmSha256,
         Self::EcdheRsaAes256GcmSha384,
+        Self::DheRsaAes128GcmSha256,
     ];
 
     const fn index(self) -> usize {
@@ -101,6 +104,7 @@ impl DiameterTlsCipher {
             Self::EcdheEcdsaAes256GcmSha384 => 4,
             Self::EcdheRsaAes128GcmSha256 => 5,
             Self::EcdheRsaAes256GcmSha384 => 6,
+            Self::DheRsaAes128GcmSha256 => 7,
         }
     }
 
@@ -112,7 +116,8 @@ impl DiameterTlsCipher {
             Self::EcdheEcdsaAes128GcmSha256
             | Self::EcdheEcdsaAes256GcmSha384
             | Self::EcdheRsaAes128GcmSha256
-            | Self::EcdheRsaAes256GcmSha384 => DiameterTlsVersion::Tls12,
+            | Self::EcdheRsaAes256GcmSha384
+            | Self::DheRsaAes128GcmSha256 => DiameterTlsVersion::Tls12,
         }
     }
 
@@ -133,6 +138,7 @@ impl DiameterTlsCipher {
             CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
                 Some(Self::EcdheRsaAes256GcmSha384)
             }
+            CipherSuite::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256 => Some(Self::DheRsaAes128GcmSha256),
             _ => None,
         }
     }
@@ -146,6 +152,7 @@ impl DiameterTlsCipher {
             Self::EcdheEcdsaAes256GcmSha384 => CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
             Self::EcdheRsaAes128GcmSha256 => CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
             Self::EcdheRsaAes256GcmSha384 => CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            Self::DheRsaAes128GcmSha256 => CipherSuite::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
         }
     }
 }
@@ -154,7 +161,7 @@ impl DiameterTlsCipher {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiameterTlsPolicy {
     version: DiameterTlsVersion,
-    allowed_ciphers: [bool; 7],
+    allowed_ciphers: [bool; 8],
     frame_limits: DiameterFrameLimits,
     maximum_connection_age: Duration,
 }
@@ -164,13 +171,13 @@ impl DiameterTlsPolicy {
     pub const fn tls13(frame_limits: DiameterFrameLimits) -> Self {
         Self {
             version: DiameterTlsVersion::Tls13,
-            allowed_ciphers: [true, true, true, false, false, false, false],
+            allowed_ciphers: [true, true, true, false, false, false, false, false],
             frame_limits,
             maximum_connection_age: Duration::from_secs(60 * 60),
         }
     }
 
-    /// Admit TLS 1.3 and TLS 1.2 with ECDHE/AES-GCM certificate suites.
+    /// Admit TLS 1.3 and TLS 1.2 with ECDHE/DHE AES-GCM certificate suites.
     ///
     /// The supplied `opc-tls` config must also enable `with_compat_mode(true)`.
     /// TLS 1.3 remains preferred. Static RSA, CBC and obsolete versions are not
@@ -178,7 +185,7 @@ impl DiameterTlsPolicy {
     pub const fn tls12_compatibility(frame_limits: DiameterFrameLimits) -> Self {
         Self {
             version: DiameterTlsVersion::Tls12,
-            allowed_ciphers: [true; 7],
+            allowed_ciphers: [true; 8],
             ..Self::tls13(frame_limits)
         }
     }
@@ -193,7 +200,7 @@ impl DiameterTlsPolicy {
         if allowed.is_empty() {
             return Err(DiameterTlsPolicyError::EmptyCipherSet);
         }
-        self.allowed_ciphers = [false; 7];
+        self.allowed_ciphers = [false; 8];
         for cipher in allowed {
             if self.version == DiameterTlsVersion::Tls13
                 && cipher.version() == DiameterTlsVersion::Tls12

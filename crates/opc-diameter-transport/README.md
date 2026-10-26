@@ -226,14 +226,17 @@ crate.
 `DiameterTlsPolicy::tls12_compatibility(frame_limits)` permits TLS 1.3 and TLS
 1.2; also enable `TlsConfigBuilder::with_compat_mode(true)` on the supplied
 authenticated config. TLS 1.3 remains preferred. TLS 1.2 permits ECDHE-ECDSA
-and ECDHE-RSA with AES-128/256-GCM. Static RSA key exchange, CBC and obsolete
+and ECDHE-RSA with AES-128/256-GCM, plus DHE-RSA with AES-128-GCM over
+RFC 7919 FFDHE4096 (preferred) or FFDHE2048. Both TLS 1.2 roles require
+Extended Master Secret. Static RSA key exchange, CBC and obsolete
 versions remain excluded. `with_allowed_ciphers` filters the handshake before
 admission; a TLS 1.2 suite under the default TLS 1.3-only policy returns
 `CipherVersionMismatch`. `policy.version()` reports the minimum allowed version;
 connection evidence reports the negotiated version and suite. Exact mutual
 identity checks, material epochs, retirement and frame budgets apply to both.
-The DHE-RSA suite required by TS 33.210 §6.2.3 is not supplied by this subset;
-it is not complete 3GPP TLS-profile support. DTLS suite support is separate.
+The mandatory TS 33.210 §6.2.3 TLS 1.2 suites are available; this does not
+qualify a complete 3GPP endpoint or a validated crypto module. DTLS suite
+support is separate.
 
 Each candidate receives a monotonic `PeerSessionGeneration`, and the SDK
 exposes the simultaneous-open decision, but the consumer still owns candidate

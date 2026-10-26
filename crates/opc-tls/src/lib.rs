@@ -18,6 +18,7 @@ use tokio::sync::watch;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 mod channel_binding;
+mod tls12_dhe;
 pub use channel_binding::{
     AuthenticationTimeInterval, ChannelBindingDomain, ChannelBindingPurpose,
     ScopeTlsAuthentication, ScopeTlsConnection, ScopeTlsError, TlsChannelBinding,
@@ -973,6 +974,9 @@ impl TlsConfigBuilder {
         self
     }
 
+    /// Enable TLS 1.2 with mandatory Extended Master Secret and the ring AEAD
+    /// suites plus DHE-RSA/AES-128-GCM over RFC 7919 FFDHE4096/2048. TLS 1.3
+    /// remains preferred; FFDHE is not added to its supported groups.
     pub fn with_compat_mode(mut self, enabled: bool) -> Self {
         self.compat_mode = enabled;
         self
@@ -1001,7 +1005,7 @@ impl TlsConfigBuilder {
         let provider = self
             .crypto_provider
             .clone()
-            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+            .unwrap_or_else(|| Arc::new(tls12_dhe::provider(self.compat_mode)));
         let verifier = Arc::new(SpiffeServerCertVerifier {
             state_rx: self.state_rx.clone(),
             policy: self.policy.clone(),
@@ -1020,6 +1024,7 @@ impl TlsConfigBuilder {
         client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         client_config.resumption = rustls::client::Resumption::disabled();
         client_config.enable_early_data = false;
+        client_config.require_ems = self.compat_mode;
 
         Ok(client_config)
     }
@@ -1069,7 +1074,7 @@ impl TlsConfigBuilder {
         let provider = self
             .crypto_provider
             .clone()
-            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+            .unwrap_or_else(|| Arc::new(tls12_dhe::provider(self.compat_mode)));
         let verifier = Arc::new(SpiffeClientCertVerifier {
             state_rx: self.state_rx.clone(),
             policy: self.policy.clone(),
@@ -1085,6 +1090,7 @@ impl TlsConfigBuilder {
             .with_cert_resolver(resolver);
 
         disable_server_resumption(&mut server_config);
+        server_config.require_ems = self.compat_mode;
 
         Ok(server_config)
     }
@@ -1239,6 +1245,31 @@ mod policy_tests {
     use opc_types::{SpiffeId, Timestamp};
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::io::Cursor;
+
+    #[test]
+    fn compatibility_provider_admits_the_required_dhe_rsa_aead_suite() {
+        let ca = test_ca();
+        let (_source, receiver) = watch::channel(Some(identity_state(
+            "spiffe://example.test/tenant/t/ns/core/sa/default/nf/amf/instance/a",
+            &ca,
+        )));
+        let config = TlsConfigBuilder::new(receiver.clone())
+            .allow_any_trusted_peer()
+            .with_compat_mode(true)
+            .build_authenticated_client_config()
+            .unwrap();
+        let suite = rustls::CipherSuite::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256;
+        assert!(
+            filtered_crypto_provider(config.rustls_config().crypto_provider(), &[suite]).is_ok()
+        );
+        assert!(config.rustls_config().require_ems);
+        let server = TlsConfigBuilder::new(receiver)
+            .allow_any_trusted_peer()
+            .with_compat_mode(true)
+            .build_authenticated_server_config()
+            .unwrap();
+        assert!(server.rustls_config().require_ems);
+    }
 
     #[test]
     fn cipher_provider_filter_is_exact_and_fails_closed() {
