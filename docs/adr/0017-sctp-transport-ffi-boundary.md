@@ -137,6 +137,13 @@ an SCTP-terminating CNF is in scope:
    exercise registration and drop on admitted platforms. This amendment adds
    no protocol codec FFI and keeps unsafe code out of the three consumers
    (`opc-sctp`, `opc-egress-fence`, and `opc-session-store`).
+   SCTP's abortive-close owner keeps this registration in a synchronous
+   `Mutex<Option<AsyncOwnedFd>>`. Descriptor borrows and readiness guards end
+   within one poll; pending futures retain no descriptor borrow. Abort sets
+   zero-time SO_LINGER, takes and drops the registration, then wakes waiters.
+   Per-direction gates serialize the single-waker polling API. No registered
+   descriptor integer is closed or replaced outside its owner. Native wire
+   capture and pending-read/write tests qualify this close path.
 
 ## Consequences
 

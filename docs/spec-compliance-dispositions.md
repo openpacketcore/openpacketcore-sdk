@@ -430,14 +430,27 @@ The other #1351 lifecycle and optional-extension claims remain separately tracke
   proof explicitly. This is loopback delivery evidence, not a guarantee that
   a peer or network failure cannot interrupt an SCTP shutdown.
 
-Wire ABORT remains open. The legacy `abort` handle closes local I/O using
-SHUT_RDWR and must not be presented as a wire-ABORT API. An uncommitted
-SCTP_ABORT-send prototype returned EINVAL on the native one-to-one association
-and was removed. Linux explicitly rejects that flag for its TCP-style SCTP
-sockets; a correct abort path must coordinate physical descriptor closure
-and abortive linger without replacing an owned descriptor while registered.
-RFC 6733 section 2.1 also requires wire abort when Diameter framing cannot be
-recovered. This remaining requirement is not waived by the graceful-close proof.
+The new `SctpAssociationAbortHandle::abort_on_wire` uses RFC 6458 section 8.1.4
+zero-time SO_LINGER and synchronously drops the owned Tokio registration before
+closing its descriptor. Readiness and syscall borrows cannot escape one poll;
+waiting reads/writes are notified without retaining the descriptor. The legacy
+`abort` handle retains its SHUT_RDWR semantics. Linux rejects SCTP_ABORT send
+flags on one-to-one sockets, so custom user-cause text is not offered. Native
+capture verifies the standard User-Initiated Abort cause (12), with no text.
+
+RFC 6733 section 2.1 requires ABORT for unparseable Diameter framing. Both
+sequential and concurrent protected receivers now abort before publishing that
+failure. The real generic RFC 6083 sender supplies three malformed fixed-frame
+forms to each receiver, independently of the Diameter sender's validation.
+The required CI capture checks six actual aborting associations, one explicit
+abort while handles and a read remain alive, three queued-send graceful closes,
+and one reciprocal DTLS close. All captures require zero packet drops. Ordinary
+tests cover read/write wakeup, queued readers, cancellation and syscall-error
+classification; native regressions retain N2, AUTH, multihoming and rekey checks.
+
+The six #1351 findings are addressed by the implemented fixes and the standards
+dispositions above. Optional hitless rekey, custom abort text and stream-reset
+initiation are not claimed. Peer review is still required before main.
 
 Witnesses: [native close regression](../crates/opc-sctp/src/lib.rs),
 [RFC 6083 sections 4.6–4.8](https://www.rfc-editor.org/rfc/rfc6083.html#section-4.6),

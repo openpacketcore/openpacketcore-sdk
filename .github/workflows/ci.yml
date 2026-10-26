@@ -756,6 +756,17 @@ jobs:
           )"
           sudo unshare -n -- bash ci/qualify-rfc6083-native.sh \
             "$rfc6083_binary" "${RUNNER_TEMP}/rfc6083-native"
+          sctp_binary="$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .profile.test == true
+              and .target.name == "opc_sctp" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one SCTP test binary") end
+          ' "${RUNNER_TEMP}/sctp-progress-build.jsonl")"
+          sudo unshare -n -- bash -euxo pipefail -c '
+            ip link set lo up
+            sysctl -w net.sctp.auth_enable=1
+            exec python3 "$@"
+          ' sctp-close-wire ci/qualify-sctp-close-wire.py "$sctp_binary" \
+            "$rfc6083_binary" "${RUNNER_TEMP}/rfc6083-native/close-wire"
 
       - name: Upload protected SCTP qualification logs
         if: always()

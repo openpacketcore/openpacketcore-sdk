@@ -4,6 +4,8 @@
 
 mod diameter_streams;
 pub(crate) mod generic;
+#[cfg(target_os = "linux")]
+mod wire_abort;
 
 use std::num::NonZeroUsize;
 use std::time::Duration;

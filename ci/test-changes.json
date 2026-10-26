@@ -463,6 +463,18 @@
       "kind": "disabled",
       "reason": "New native Linux SCTP test requires SCTP and IPv6 loopback. The required SCTP workflow executes it explicitly and checks one passing test. It exercises mixed bindx/connectx in both family orders, address readback, primary-path selection and payload delivery over IPv4 and IPv6. Portable configuration and path-identity tests run normally.",
       "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::loopback_wire_abort_closes_with_live_handles_and_pending_receive",
+      "kind": "disabled",
+      "reason": "New native Linux SCTP abort test needs kernel SCTP. Required SCTP workflow executes it through qualify-sctp-close-wire.py and independently captures a User-Initiated ABORT. It retains handles and a pending receive to prove synchronous closure.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-diameter-transport::lib=lib::dtls_tests::wire_abort::kernel_malformed_diameter_frames_abort_sequential_and_runtime_associations",
+      "kind": "disabled",
+      "reason": "New native SCTP-AUTH test sends malformed authenticated Diameter frames through sequential and concurrent receivers. Required SCTP workflow runs it through qualify-sctp-close-wire.py and requires six actual ABORT associations plus separate graceful-close controls.",
+      "issue": 1351
     }
   ]
 }

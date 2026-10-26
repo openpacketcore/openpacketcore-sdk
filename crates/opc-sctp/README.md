@@ -430,6 +430,17 @@ is not DTLS. It does not derive exporter keys, validate certificates or peer
 identity, carry DTLS records, emit PPID 47, or satisfy protected-Diameter
 readiness by itself.
 
+`association.abort_handle().abort_on_wire()` performs RFC 6458 section 8.1.4
+abortive close on Linux. It discards queued DATA and closes the owned descriptor
+synchronously, including while other handles or pending I/O futures remain
+alive. It emits the kernel's User-Initiated Abort cause without custom text.
+The legacy `abort()` operation uses SHUT_RDWR and initiates graceful SCTP
+shutdown. Normal drop also lets the kernel drain queued sends; neither path
+promises delivery through a peer or network failure. Applications can use the
+existing sender-dry barrier when they need confirmation of prior send drain.
+The DTLS Diameter adapter uses wire ABORT for unparseable Diameter frames and
+retains its reciprocal close-notify procedure for normal close.
+
 ### Legacy Diameter PPID 0 interoperability
 
 Strict inbound PPID validation and RFC PPID 46 outbound framing are the

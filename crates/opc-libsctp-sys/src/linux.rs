@@ -671,6 +671,18 @@ pub fn shutdown_both(fd: BorrowedFd<'_>) -> io::Result<()> {
     cvt(unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) })
 }
 
+pub fn set_abort_on_close(fd: BorrowedFd<'_>) -> io::Result<()> {
+    set_sockopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_LINGER,
+        &libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        },
+    )
+}
+
 fn auth_key_option(assoc_id: i32, key_id: u16, key: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
     let key_len = u16::try_from(key.len()).map_err(|_| {
         io::Error::new(
@@ -1325,6 +1337,10 @@ mod tests {
 
     #[test]
     fn libc_sctp_layouts_match_expected_linux_uapi_shape() {
+        assert_eq!(size_of::<libc::linger>(), 8);
+        assert_eq!(align_of::<libc::linger>(), 4);
+        assert_eq!(offset_of!(libc::linger, l_onoff), 0);
+        assert_eq!(offset_of!(libc::linger, l_linger), 4);
         assert_eq!(size_of::<libc::sctp_initmsg>(), 8);
         assert_eq!(align_of::<libc::sctp_initmsg>(), 2);
         assert_eq!(offset_of!(libc::sctp_sndinfo, snd_sid), 0);
