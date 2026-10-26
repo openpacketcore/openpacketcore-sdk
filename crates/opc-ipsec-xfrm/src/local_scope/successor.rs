@@ -1,36 +1,17 @@
-//! Scoped Child-SA rekey overlap: install a successor SA, move the one
-//! protective policy to it, and retire the predecessor SA only once the
-//! successor is live.
-//!
-//! The flow keeps the exact policy lookup identity (selector, direction, mark,
-//! interface ID) throughout. The only kernel effect that moves traffic is the
-//! atomic policy update (`XFRM_MSG_UPDPOLICY`, encoded from the successor
-//! policy) from the predecessor request ID to the successor request ID; the
-//! predecessor SA and its request ID remain untouched until the caller retires
-//! it through [`retire_predecessor`]. No step removes the policy while traffic
-//! could still select it, and undo restores the predecessor policy before
-//! removing the successor SA.
-//!
-//! Every step is exact or reported as indeterminate, never assumed. Progress
-//! flags are recorded before the first possible effect so a lost reply,
-//! cancellation or panic resumes through readback (`undo`) instead of
-//! repeating an uncertain effect.
+//! Scoped Child-SA overlap with resumable installation and exact retirement.
+//! Outbound selection changes atomically; inbound generations share the same
+//! protective policy. Lost observers never undo a completed traffic move.
 
 use super::effect::{unresolved, Readback};
 use crate::XfrmError;
 
-/// Policy readback at the flow's exact lookup identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PolicyReadback {
-    /// The policy at this identity equals the requested parameters.
     Exact,
-    /// Some policy exists at this identity with different parameters.
     Other,
-    /// No policy exists at this identity.
     Absent,
 }
 
-/// Actor-owned progress of one successor install and traffic move.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SuccessorProgress {
     pub(crate) sa_started: bool,
@@ -42,16 +23,15 @@ pub(crate) struct SuccessorProgress {
     pub(crate) retired: bool,
 }
 
-/// Actor-owned progress of retiring one superseded predecessor SA.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PredecessorRetirementProgress {
     pub(crate) sa_started: bool,
     pub(crate) retired: bool,
 }
 
-/// Actor-owned progress of removing a successor after its predecessor retired.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SuccessorRemovalProgress {
+    pub(crate) restored: bool,
     pub(crate) sa_started: bool,
     pub(crate) sa_removed: bool,
     pub(crate) policy_started: bool,
@@ -60,9 +40,7 @@ pub(crate) struct SuccessorRemovalProgress {
 
 #[async_trait::async_trait]
 pub(crate) trait SuccessorKernel: Send {
-    fn outbound(&self) -> bool {
-        true
-    }
+    fn outbound(&self) -> bool;
     fn local(&self) -> Result<(), XfrmError>;
     fn publication(&self) -> Result<(), XfrmError> {
         self.local()
@@ -85,49 +63,69 @@ fn predecessor_not_live() -> XfrmError {
         operation: "local_scope_successor_predecessor",
     }
 }
+fn successor_not_live() -> XfrmError {
+    XfrmError::StateMismatch {
+        operation: "local_scope_successor_not_live",
+    }
+}
 
-/// Install the successor SA and atomically move the protective policy to it.
-///
-/// Preconditions are proved by fresh readback: the predecessor SA and policy
-/// are exact and no successor SA is present. A failed or ambiguous step keeps
-/// the recorded progress and requires [`undo`] through readback.
+/// Resume from readback after every uncertain effect. A started SA creation is
+/// never repeated, since that could reset sequence and replay state.
 pub(crate) async fn install<K: SuccessorKernel>(
     kernel: &mut K,
     progress: &mut SuccessorProgress,
 ) -> Result<(), XfrmError> {
-    if progress.sa_started
-        || progress.move_started
-        || progress.published
-        || progress.undo
-        || progress.retired
-    {
+    if progress.undo || progress.retired || progress.published {
         return Err(unresolved());
     }
     kernel.local()?;
-    kernel.current().await?;
-    if kernel.predecessor_sa().await? != Readback::Exact
-        || kernel.predecessor_policy().await? != PolicyReadback::Exact
-    {
-        return Err(predecessor_not_live());
+    if !progress.sa_started {
+        kernel.current().await?;
+        if kernel.predecessor_sa().await? != Readback::Exact
+            || kernel.predecessor_policy().await? != PolicyReadback::Exact
+        {
+            return Err(predecessor_not_live());
+        }
+        if kernel.successor_sa().await? != Readback::Absent {
+            return Err(XfrmError::AlreadyExists);
+        }
+        kernel.current().await?;
+        progress.sa_started = true;
+        let _ack = kernel.create_successor_sa().await;
     }
-    if kernel.successor_sa().await? != Readback::Absent {
-        return Err(XfrmError::AlreadyExists);
-    }
-    kernel.local()?;
-    kernel.current().await?;
-    progress.sa_started = true;
-    // Record uncertainty before submitting: readback decides, never a retry.
-    let _ack = kernel.create_successor_sa().await;
     if kernel.successor_sa().await? != Readback::Exact {
+        // Exact absence is a failed/expired creation, not permission to reuse
+        // this SPI under the consumed activation.
+        progress.undo = true;
         return Err(unresolved());
     }
     progress.sa_installed = true;
-    kernel.local()?;
+    if !kernel.outbound() {
+        if kernel.predecessor_policy().await? != PolicyReadback::Exact
+            || kernel.successor_policy().await? != PolicyReadback::Exact
+        {
+            return Err(unresolved());
+        }
+        progress.move_started = true;
+        progress.moved = true;
+        return Ok(());
+    }
+    match (
+        kernel.successor_policy().await?,
+        kernel.predecessor_policy().await?,
+    ) {
+        (PolicyReadback::Exact, PolicyReadback::Other) if progress.move_started => {
+            progress.moved = true;
+            return Ok(());
+        }
+        (PolicyReadback::Other, PolicyReadback::Exact) => {}
+        _ => return Err(unresolved()),
+    }
+    // This is the only outbound cutover. Recheck committed authority before
+    // submitting it, but never let a later store outage undo an observed move.
     kernel.current().await?;
     progress.move_started = true;
     let _ack = kernel.move_policy_to_successor().await;
-    // The policy identity always exists exactly once. Exact successor evidence
-    // proves the move even after a lost acknowledgement.
     match (
         kernel.successor_policy().await?,
         kernel.predecessor_policy().await?,
@@ -137,7 +135,7 @@ pub(crate) async fn install<K: SuccessorKernel>(
             Ok(())
         }
         (PolicyReadback::Other, PolicyReadback::Exact) => {
-            // Definite no-effect for the move: undo removes the candidate SA.
+            progress.undo = true;
             Err(XfrmError::StateMismatch {
                 operation: "local_scope_successor_policy_move",
             })
@@ -146,38 +144,34 @@ pub(crate) async fn install<K: SuccessorKernel>(
     }
 }
 
-/// Publish the successor effect after fresh exact readback.
+/// Publication is retained by the actor, independently of reply delivery.
 pub(crate) async fn publish<K: SuccessorKernel>(
     kernel: &mut K,
     progress: &mut SuccessorProgress,
-    observer_closed: impl FnOnce() -> bool,
+    _observer_closed: impl FnOnce() -> bool,
 ) -> Result<(), XfrmError> {
-    if !progress.sa_installed
-        || !progress.moved
-        || progress.undo
-        || progress.retired
-        || progress.published
-    {
+    if !progress.sa_installed || !progress.moved || progress.undo || progress.retired {
         return Err(unresolved());
     }
-    kernel.current().await?;
+    kernel.local()?;
     if kernel.successor_sa().await? != Readback::Exact
         || kernel.successor_policy().await? != PolicyReadback::Exact
-        || kernel.predecessor_policy().await? != PolicyReadback::Other
+        || kernel.predecessor_policy().await?
+            != if kernel.outbound() {
+                PolicyReadback::Other
+            } else {
+                PolicyReadback::Exact
+            }
     {
         return Err(unresolved());
     }
     kernel.publication()?;
-    if observer_closed() {
-        return Err(unresolved());
-    }
     progress.published = true;
     Ok(())
 }
 
-/// Reverse the successor install: restore the predecessor policy first, then
-/// remove the successor SA. Never touches the predecessor SA or its policy
-/// once restored.
+/// Undo only an unpublished candidate whose operation has been fenced or
+/// definitively refused. Restore selection before removing its exact SA.
 pub(crate) async fn undo<K: SuccessorKernel>(
     kernel: &mut K,
     progress: &mut SuccessorProgress,
@@ -187,7 +181,7 @@ pub(crate) async fn undo<K: SuccessorKernel>(
         return Ok(());
     }
     kernel.local()?;
-    if progress.move_started {
+    if progress.move_started && kernel.outbound() {
         match (
             kernel.successor_policy().await?,
             kernel.predecessor_policy().await?,
@@ -200,26 +194,22 @@ pub(crate) async fn undo<K: SuccessorKernel>(
                 {
                     return Err(unresolved());
                 }
-                progress.moved = false;
             }
-            (PolicyReadback::Other, PolicyReadback::Exact) => {
-                // The move never landed; the predecessor still owns selection.
-                progress.moved = false;
-            }
+            (PolicyReadback::Other, PolicyReadback::Exact) => {}
             _ => return Err(unresolved()),
         }
+        progress.moved = false;
     }
     if progress.sa_started {
-        // Traffic must select the predecessor before its candidate disappears.
+        // Fenced unpublished work must release its reset guard even if the
+        // predecessor has expired. Keep the predecessor's protective policy
+        // while removing only this operation's candidate SA.
         if kernel.predecessor_policy().await? != PolicyReadback::Exact {
             return Err(unresolved());
         }
-        match kernel.successor_sa().await? {
-            Readback::Exact => {
-                kernel.local()?;
-                let _ack = kernel.remove_successor_sa().await;
-            }
-            Readback::Absent => {}
+        if kernel.successor_sa().await? == Readback::Exact {
+            kernel.local()?;
+            let _ack = kernel.remove_successor_sa().await;
         }
         if kernel.successor_sa().await? != Readback::Absent {
             return Err(unresolved());
@@ -229,8 +219,9 @@ pub(crate) async fn undo<K: SuccessorKernel>(
     Ok(())
 }
 
-/// Retire one superseded predecessor SA while its published successor owns the
-/// protective policy. The policy is never read, moved or removed.
+/// Retire an unselected member without touching the shared policy. A live
+/// member cannot be dropped while the selected SA has disappeared; a member
+/// already absent from the kernel needs only its retained reservation released.
 pub(crate) async fn retire_predecessor<K: SuccessorKernel>(
     kernel: &mut K,
     progress: &mut PredecessorRetirementProgress,
@@ -239,24 +230,18 @@ pub(crate) async fn retire_predecessor<K: SuccessorKernel>(
         return Ok(());
     }
     kernel.local()?;
-    // Only a live successor (SA *and* policy) authorizes dropping the
-    // predecessor SA. If the successor SA expired or was removed, keeping the
-    // predecessor is the last working path; never drop both.
+    if kernel.predecessor_sa().await? == Readback::Absent {
+        progress.retired = true;
+        return Ok(());
+    }
     if kernel.successor_policy().await? != PolicyReadback::Exact
         || kernel.successor_sa().await? != Readback::Exact
     {
-        return Err(XfrmError::StateMismatch {
-            operation: "local_scope_successor_not_live",
-        });
+        return Err(successor_not_live());
     }
-    match kernel.predecessor_sa().await? {
-        Readback::Exact => {
-            progress.sa_started = true;
-            kernel.local()?;
-            let _ack = kernel.remove_predecessor_sa().await;
-        }
-        Readback::Absent => {}
-    }
+    progress.sa_started = true;
+    kernel.local()?;
+    let _ack = kernel.remove_predecessor_sa().await;
     if kernel.predecessor_sa().await? != Readback::Absent {
         return Err(unresolved());
     }
@@ -264,11 +249,9 @@ pub(crate) async fn retire_predecessor<K: SuccessorKernel>(
     Ok(())
 }
 
-/// Remove one published successor after its predecessor SA was retired.
-///
-/// The protective policy is kept until the successor SA is proved absent, so
-/// traffic that still selects the old key fails closed instead of escaping
-/// unprotected; the policy is removed last.
+/// Abandon a selected successor by restoring another retained member first,
+/// or remove the final SA and then its policy. Both-expired groups can restore
+/// a still-protective policy and release their receipts in either order.
 pub(crate) async fn remove_successor<K: SuccessorKernel>(
     kernel: &mut K,
     progress: &mut SuccessorRemovalProgress,
@@ -277,15 +260,55 @@ pub(crate) async fn remove_successor<K: SuccessorKernel>(
     if progress.retired {
         return Ok(());
     }
-    if !predecessor_retired {
-        return Err(XfrmError::StateMismatch {
-            operation: "local_scope_successor_predecessor_live",
-        });
-    }
     kernel.local()?;
+    if !predecessor_retired {
+        let old_policy = kernel.predecessor_policy().await?;
+        let new_policy = kernel.successor_policy().await?;
+        let restored = old_policy == PolicyReadback::Exact
+            && new_policy
+                == if kernel.outbound() {
+                    PolicyReadback::Other
+                } else {
+                    PolicyReadback::Exact
+                };
+        if restored {
+            progress.restored = true;
+        }
+        let old_sa = kernel.predecessor_sa().await?;
+        let new_sa = kernel.successor_sa().await?;
+        if old_sa != Readback::Exact && new_sa != Readback::Absent {
+            return Err(successor_not_live());
+        }
+        if !restored {
+            if !kernel.outbound()
+                || old_policy != PolicyReadback::Other
+                || new_policy != PolicyReadback::Exact
+            {
+                return Err(unresolved());
+            }
+            kernel.local()?;
+            let _ack = kernel.restore_policy_to_predecessor().await;
+            if kernel.predecessor_policy().await? != PolicyReadback::Exact
+                || kernel.successor_policy().await? != PolicyReadback::Other
+            {
+                return Err(unresolved());
+            }
+            progress.restored = true;
+        }
+        // Expiry can race policy replacement. Retain the current live SA and
+        // expose the new selection so a later receipt operation can restore it.
+        if kernel.predecessor_sa().await? != Readback::Exact
+            && kernel.successor_sa().await? != Readback::Absent
+        {
+            return Err(successor_not_live());
+        }
+    }
     progress.sa_started = true;
     match kernel.successor_sa().await? {
         Readback::Exact => {
+            if predecessor_retired && kernel.successor_policy().await? != PolicyReadback::Exact {
+                return Err(unresolved());
+            }
             kernel.local()?;
             let _ack = kernel.remove_successor_sa().await;
         }
@@ -295,19 +318,19 @@ pub(crate) async fn remove_successor<K: SuccessorKernel>(
         return Err(unresolved());
     }
     progress.sa_removed = true;
-    progress.policy_started = true;
-    kernel.local()?;
-    match kernel.successor_policy().await? {
-        PolicyReadback::Exact => {
-            let _ack = kernel.remove_successor_policy().await;
+    if predecessor_retired {
+        progress.policy_started = true;
+        kernel.local()?;
+        match kernel.successor_policy().await? {
+            PolicyReadback::Exact => {
+                let _ack = kernel.remove_successor_policy().await;
+            }
+            PolicyReadback::Absent => {}
+            PolicyReadback::Other => return Err(unresolved()),
         }
-        PolicyReadback::Absent => {}
-        PolicyReadback::Other => return Err(unresolved()),
-    }
-    // A removed successor policy reads as some other policy at the identity or
-    // absent; exactness is the only refusal.
-    if kernel.successor_policy().await? == PolicyReadback::Exact {
-        return Err(unresolved());
+        if kernel.successor_policy().await? != PolicyReadback::Absent {
+            return Err(unresolved());
+        }
     }
     progress.retired = true;
     Ok(())
@@ -661,18 +684,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successor_removal_is_refused_until_the_predecessor_was_retired() {
+    async fn successor_removal_restores_a_retained_predecessor_without_deleting_its_policy() {
         let mut port = Port::default();
         install_move_publish(&mut port).await;
         let mut removal = SuccessorRemovalProgress::default();
-        assert!(matches!(
-            remove_successor(&mut port, &mut removal, false).await,
-            Err(XfrmError::StateMismatch {
-                operation: "local_scope_successor_predecessor_live"
-            })
-        ));
-        assert_eq!(port.successor_sa, Readback::Exact);
-        assert_eq!(port.policy, Policy::Successor);
+        // Retirement is no longer a mandatory order: RFC 7296 section 2.8.1
+        // permits abandoning a newly created Child SA. Preserve the live
+        // predecessor and its protection while deleting only the candidate.
+        remove_successor(&mut port, &mut removal, false)
+            .await
+            .unwrap();
+        assert!(removal.retired && removal.restored);
+        assert_eq!(port.predecessor_sa, Readback::Exact);
+        assert_eq!(port.successor_sa, Readback::Absent);
+        assert_eq!(port.policy, Policy::Predecessor);
+        assert!(!port.policy_removed);
     }
     #[tokio::test]
     async fn successor_resumes_interrupted_sa_and_policy_steps_without_reinstalling() {

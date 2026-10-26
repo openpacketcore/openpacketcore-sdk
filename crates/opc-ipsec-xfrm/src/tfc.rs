@@ -15,10 +15,30 @@ use crate::XfrmError;
 /// Returns [`XfrmError::InvalidConfig`] for an invalid alignment or an
 /// unrepresentable/unallocatable payload length.
 pub fn esp_dummy_payload(tfc_data: &[u8], alignment: usize) -> Result<Vec<u8>, XfrmError> {
-    let _ = (tfc_data, alignment);
-    Err(XfrmError::UnsupportedFeature {
-        feature: "esp_dummy_payload",
-    })
+    if !(4..=256).contains(&alignment) || !alignment.is_multiple_of(4) {
+        return Err(XfrmError::invalid_config(
+            "alignment",
+            "ESP alignment must be a multiple of four between 4 and 256",
+        ));
+    }
+    let length = tfc_data
+        .len()
+        .checked_add(2)
+        .ok_or_else(|| XfrmError::invalid_config("tfc_data", "dummy payload length overflow"))?;
+    let padding = (alignment - length % alignment) % alignment;
+    let padded_length = length
+        .checked_add(padding)
+        .ok_or_else(|| XfrmError::invalid_config("tfc_data", "dummy payload length overflow"))?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(padded_length)
+        .map_err(|_| XfrmError::invalid_config("tfc_data", "dummy payload allocation failed"))?;
+    payload.extend_from_slice(tfc_data);
+    // The validated alignment bounds this to the one-octet Pad Length.
+    let padding = padding as u8;
+    payload.extend(1..=padding);
+    payload.extend_from_slice(&[padding, 59]);
+    Ok(payload)
 }
 
 #[cfg(test)]

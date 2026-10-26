@@ -2432,15 +2432,14 @@ impl NamespaceBoundLinuxXfrmBackend {
 
     /// Install one Child-SA rekey successor beside a live scoped receipt.
     ///
-    /// The successor must keep the predecessor's exact flow identity (policy
-    /// selector, direction, mark and interface ID) and bring a distinct SA SPI
-    /// and request ID. A new committed activation supplies the successor's own
-    /// use authority. The actor installs the successor SA, moves the single
-    /// protective policy to it in one update and publishes only after exact
-    /// readback; the predecessor SA and its receipt stay live until
-    /// [`Self::remove_scoped`] retires the predecessor SA only. Cancellation or
-    /// reply loss is resolved by the actor's supervised undo/retry path, and
-    /// [`Self::scoped_successor_status`] reports the durable-free milestones.
+    /// The successor keeps the exact flow identity and uses a fresh SPI.
+    /// Outbound rekeys also use a fresh reqid and atomically update the policy;
+    /// inbound generations share a reqid and the unchanged protective policy.
+    /// A distinct committed activation supplies its own use authority. The
+    /// actor retains admitted intent through cancellation and lost replies,
+    /// publishes after exact readback and supports exact retries even after
+    /// predecessor retirement. Published successors can themselves be rekeyed.
+    /// [`Self::scoped_successor_status`] observes partial and completed steps.
     #[cfg(feature = "scope-store")]
     pub async fn install_scoped_successor(
         &self,
@@ -2475,19 +2474,21 @@ impl NamespaceBoundLinuxXfrmBackend {
 
     /// Report which scoped Child-SA rekey successor steps completed.
     ///
-    /// Accepts either the successor receipt or its predecessor receipt. The
-    /// milestones are process-local actor observations that authorize no send,
-    /// effect or retry; a lost reply or cancellation therefore never has to be
-    /// guessed from a completed kernel state.
+    /// Accepts a predecessor or successor receipt while the transition is
+    /// retained. For a receipt with its own successor, reports that outgoing
+    /// transition. SA and policy milestones use fresh local readback; publication
+    /// survives reply loss. The result grants no send, effect or retry authority.
     #[cfg(feature = "scope-store")]
     pub async fn scoped_successor_status(
         &self,
         receipt: &crate::ScopedXfrmReceipt,
     ) -> Result<crate::ScopedXfrmSuccessorStatus, XfrmError> {
+        let guard = receipt.begin().await?;
         self.dispatch(LostReply::ReadOnly, |reply| {
             NamespaceCommand::LocalEffect(
                 crate::local_scope::operations::Command::SuccessorStatus {
                     receipt: receipt.clone(),
+                    guard,
                     reply,
                 },
             )
@@ -2495,9 +2496,11 @@ impl NamespaceBoundLinuxXfrmBackend {
         .await
     }
 
-    /// Retire exactly the receipt's SA, then its protective policy, using
-    /// fresh full-key readback. Cleanup needs no fresh store authority, bypasses
-    /// install admission, and remains supervised if this future is dropped.
+    /// Retire exactly this receipt's SA using fresh readback. Shared policy
+    /// remains until the last member is removed. Removing a selected member
+    /// first restores another retained member; a live last path is preserved
+    /// if that replacement has expired. Cleanup needs no fresh store authority,
+    /// bypasses install admission and stays supervised after caller cancellation.
     #[cfg(feature = "scope-store")]
     pub async fn remove_scoped(&self, receipt: &crate::ScopedXfrmReceipt) -> Result<(), XfrmError> {
         let guard = receipt.begin().await?;
@@ -2512,8 +2515,9 @@ impl NamespaceBoundLinuxXfrmBackend {
     }
 
     /// Fresh local SA/policy readback without reauthorizing or recreating a
-    /// published effect. Expiration reports false and retains the reservation
-    /// until explicit exact cleanup retires the protective policy as well.
+    /// published effect. Expiration or a changed outbound policy reports false
+    /// while retaining the receipt and SA reservation for explicit cleanup.
+    /// Inbound predecessors remain exact while their shared policy accepts them.
     #[cfg(feature = "scope-store")]
     pub async fn read_scoped(&self, receipt: &crate::ScopedXfrmReceipt) -> Result<bool, XfrmError> {
         let guard = receipt.begin().await?;

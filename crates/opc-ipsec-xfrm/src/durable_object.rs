@@ -2283,18 +2283,8 @@ fn map_canonical_encode_error(error: CanonicalEncodeError) -> XfrmObjectInstallD
 /// fingerprints. The `domain` argument keeps sibling record families separate
 /// even when a deployment configures the same key bytes for both.
 ///
-/// # Known coverage gap
-///
-/// `SaParameters::tfc_pad` (Linux Traffic Flow Confidentiality padding target
-/// length) is not encoded, and the durable record carries only the
-/// `Sa`/`Policy` discriminant rather than the request. A recovery request that
-/// differs from the authenticated one only in `tfc_pad` therefore yields the
-/// same fingerprint and is not detected. Closing this needs a new
-/// `opc-xfrm-object-install-request-v2` domain (the
-/// `opc-xfrm-roster-install-request-v1` domain shares this encoder) and a
-/// migration plan for v1-sealed records; both are tracked as a follow-up
-/// (refs #1344). The auth domains intentionally do not change in the TFC
-/// padding feature itself.
+/// Enabled TFC targets append a tagged extension after the existing SA
+/// encoding. An absent target preserves the original encoding exactly.
 ///
 /// # Errors
 ///
@@ -2354,6 +2344,11 @@ pub(crate) fn authenticate_install_request(
                     mac_u8(&mut mac, dscp.get());
                 }
                 None => mac_u8(&mut mac, 0),
+            }
+            // Preserve no-TFC fingerprints while binding every enabled target.
+            if let Some(target) = parameters.tfc_pad {
+                mac_bytes(&mut mac, b"tfc-padding\0")?;
+                mac_u32(&mut mac, target);
             }
         }
         XfrmObjectInstallRequest::Policy(request) => {

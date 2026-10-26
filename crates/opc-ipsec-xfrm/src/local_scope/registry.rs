@@ -4,25 +4,20 @@ use super::ScopedXfrmRequest;
 use crate::XfrmError;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReservationRole {
-    /// A request that owns its complete flow identity.
-    Primary,
-    /// A rekey successor that shares one live primary's policy identity.
-    Successor,
-}
-
 #[derive(Clone)]
 pub(crate) struct Reservation {
     pub(super) request: Arc<ScopedXfrmRequest>,
     identity: Arc<()>,
-    role: ReservationRole,
+    group: Arc<()>,
     predecessor: Option<Arc<()>>,
 }
 impl Reservation {
     #[cfg(test)]
-    pub(super) const fn is_successor(&self) -> bool {
-        matches!(self.role, ReservationRole::Successor)
+    pub(super) fn is_successor(&self) -> bool {
+        self.predecessor.is_some()
+    }
+    pub(crate) fn shares_policy(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.group, &other.group)
     }
 }
 #[derive(Default)]
@@ -44,25 +39,16 @@ impl Registry {
         let receipt = Reservation {
             request,
             identity: Arc::new(()),
-            role: ReservationRole::Primary,
+            group: Arc::new(()),
             predecessor: None,
         };
         self.entries.push(receipt.clone());
         Ok(receipt)
     }
 
-    /// Admit one rekey successor beside a live primary reservation.
-    ///
-    /// The successor keeps the predecessor's policy lookup identity; only its
-    /// SA SPI and request ID differ. Exactly one successor may exist for a
-    /// primary, and the successor's SA deletion key must still be unused. An
-    /// unrelated request on the live policy key remains refused by
-    /// [`Self::reserve`].
-    /// # Errors
-    /// `local_scope_successor_flow`/`local_scope_successor_identity` for an
-    /// invalid successor; [`XfrmError::AlreadyExists`] for a second successor
-    /// or an SA deletion-key collision; `local_scope_successor_chain` when the
-    /// supplied predecessor is itself a successor.
+    /// Reserve a fresh SA beside its predecessor while sharing one policy.
+    /// A live reservation may itself be succeeded, but cannot have two direct
+    /// children. The actor additionally serializes transitions within a group.
     pub(crate) fn reserve_successor(
         &mut self,
         predecessor: &Reservation,
@@ -77,26 +63,21 @@ impl Registry {
                 operation: "local_scope_successor_predecessor",
             });
         };
-        if primary.role != ReservationRole::Primary {
-            return Err(XfrmError::StateMismatch {
-                operation: "local_scope_successor_chain",
-            });
-        }
         request.validate_successor_of(&primary.request)?;
         if self.successor_of(predecessor).is_some() {
             return Err(XfrmError::AlreadyExists);
         }
-        // The successor's SA deletion key is distinct from every live SA key,
-        // but still checked so a caller cannot alias an unrelated receipt.
         if self.entries.iter().any(|entry| {
-            entry.request.sa.id == request.sa.id && entry.request.sa.mark == request.sa.mark
+            (entry.request.sa.id == request.sa.id && entry.request.sa.mark == request.sa.mark)
+                || (!entry.shares_policy(primary) && conflicts(&entry.request, &request))
+                || selection_conflicts(&entry.request, &request)
         }) {
             return Err(XfrmError::AlreadyExists);
         }
         let receipt = Reservation {
             request,
             identity: Arc::new(()),
-            role: ReservationRole::Successor,
+            group: primary.group.clone(),
             predecessor: Some(Arc::clone(&primary.identity)),
         };
         self.entries.push(receipt.clone());
@@ -106,11 +87,10 @@ impl Registry {
     /// The live successor admitted for `predecessor`, when one exists.
     pub(crate) fn successor_of(&self, predecessor: &Reservation) -> Option<&Reservation> {
         self.entries.iter().find(|entry| {
-            entry.role == ReservationRole::Successor
-                && entry
-                    .predecessor
-                    .as_ref()
-                    .is_some_and(|identity| Arc::ptr_eq(identity, &predecessor.identity))
+            entry
+                .predecessor
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &predecessor.identity))
         })
     }
 
@@ -122,31 +102,14 @@ impl Registry {
         &mut self,
         predecessor: &Reservation,
     ) -> Result<(), XfrmError> {
-        if self.successor_of(predecessor).is_none() {
+        if !self.entries.iter().any(|entry| {
+            !Arc::ptr_eq(&entry.identity, &predecessor.identity) && entry.shares_policy(predecessor)
+        }) {
             return Err(XfrmError::StateMismatch {
                 operation: "local_scope_successor_not_live",
             });
         }
         self.retired(predecessor)
-    }
-
-    /// Refuse releasing a successor while its predecessor is still reserved.
-    pub(crate) fn check_successor_release(&self, successor: &Reservation) -> Result<(), XfrmError> {
-        let Some(predecessor) = successor.predecessor.as_ref() else {
-            return Err(XfrmError::StateMismatch {
-                operation: "local_scope_successor_predecessor",
-            });
-        };
-        if self
-            .entries
-            .iter()
-            .any(|entry| Arc::ptr_eq(&entry.identity, predecessor))
-        {
-            return Err(XfrmError::StateMismatch {
-                operation: "local_scope_successor_predecessor_live",
-            });
-        }
-        Ok(())
     }
 
     pub(crate) fn contains(&self, receipt: &Reservation) -> bool {
@@ -174,6 +137,56 @@ fn conflicts(first: &ScopedXfrmRequest, second: &ScopedXfrmRequest) -> bool {
             && first.policy.direction == second.policy.direction
             && first.policy.mark == second.policy.mark
             && first.policy.if_id == second.policy.if_id)
+        || selection_conflicts(first, second)
+}
+fn selection_conflicts(first: &ScopedXfrmRequest, second: &ScopedXfrmRequest) -> bool {
+    use crate::XfrmDirection::Out;
+    let a = &first.sa;
+    let b = &second.sa;
+    // SPI-zero templates select by reqid, endpoints, mode, mark and if_id.
+    // A different policy key is not sufficient when the SA selectors overlap:
+    // a later ordinary install or relocation could also redirect this flow.
+    (first.policy.direction == Out || second.policy.direction == Out)
+        && a.request_id == b.request_id
+        && a.id.destination == b.id.destination
+        && a.id.protocol == b.id.protocol
+        && a.mode == b.mode
+        && a.mark == b.mark
+        && a.if_id == b.if_id
+        && (a.source_address == b.source_address
+            || a.source_address.is_unspecified()
+            || b.source_address.is_unspecified())
+        && selectors_overlap(&a.selector, &b.selector)
+}
+fn selectors_overlap(a: &crate::XfrmSelector, b: &crate::XfrmSelector) -> bool {
+    fn prefix(a: crate::IpAddress, b: crate::IpAddress, bits: u8) -> bool {
+        fn bytes(a: &[u8], b: &[u8], bits: u8) -> bool {
+            a.iter().zip(b).enumerate().all(|(index, (a, b))| {
+                let bits = usize::from(bits).saturating_sub(index * 8).min(8);
+                bits == 0 || (a ^ b) >> (8 - bits) == 0
+            })
+        }
+        match (a, b) {
+            (crate::IpAddress::Ipv4(a), crate::IpAddress::Ipv4(b)) => bytes(&a, &b, bits),
+            (crate::IpAddress::Ipv6(a), crate::IpAddress::Ipv6(b)) => bytes(&a, &b, bits),
+            _ => false,
+        }
+    }
+    (a.protocol == 0 || b.protocol == 0 || a.protocol == b.protocol)
+        && (a.source_port == 0 || b.source_port == 0 || a.source_port == b.source_port)
+        && (a.destination_port == 0
+            || b.destination_port == 0
+            || a.destination_port == b.destination_port)
+        && prefix(
+            a.source,
+            b.source,
+            a.source_prefix_len.min(b.source_prefix_len),
+        )
+        && prefix(
+            a.destination,
+            b.destination,
+            a.destination_prefix_len.min(b.destination_prefix_len),
+        )
 }
 #[cfg(test)]
 mod tests {
@@ -253,11 +266,11 @@ mod tests {
             .is_err());
         // The existing refusal of an unrelated request on the live policy key stays.
         assert!(registry.reserve(predecessor_request.clone()).is_err());
-        // A successor cannot itself be succeeded while its predecessor is live.
+        // A successor still cannot reuse its own SA deletion identity.
         assert!(matches!(
             registry.reserve_successor(&successor, successor_request_for(&predecessor_request)),
             Err(XfrmError::StateMismatch {
-                operation: "local_scope_successor_chain"
+                operation: "local_scope_successor_identity"
             })
         ));
         // A successor SA deletion key cannot alias another live SA.
@@ -285,17 +298,18 @@ mod tests {
         let successor = registry
             .reserve_successor(&predecessor, successor_request_for(&predecessor_request))
             .unwrap();
-        // The successor cannot be released while the predecessor is live.
-        assert!(matches!(
-            registry.check_successor_release(&successor),
-            Err(XfrmError::StateMismatch {
-                operation: "local_scope_successor_predecessor_live"
-            })
-        ));
+        // Abandonment releases only this member; the shared policy stays
+        // reserved by the predecessor, so unrelated installs remain refused.
+        registry.retired(&successor).unwrap();
+        assert!(registry.contains(&predecessor));
+        assert!(!registry.contains(&successor));
+        assert!(registry.reserve(predecessor_request.clone()).is_err());
+        let successor = registry
+            .reserve_successor(&predecessor, successor_request_for(&predecessor_request))
+            .unwrap();
         registry.retire_predecessor(&predecessor).unwrap();
         assert!(!registry.contains(&predecessor));
         assert!(registry.contains(&successor));
-        registry.check_successor_release(&successor).unwrap();
         registry.retired(&successor).unwrap();
         assert!(!registry.contains(&successor));
     }

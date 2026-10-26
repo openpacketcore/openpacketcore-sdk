@@ -1,12 +1,4 @@
-//! Actor-side scoped Child-SA rekey successor: admission, supervised service,
-//! progress and readback.
-//!
-//! The successor effect is a distinct committed activation. Its install keeps
-//! the predecessor receipt's flow alive, moves the single protective policy to
-//! the successor SA, publishes through the same actor supervisor as ordinary
-//! installs, and only then exposes the successor receipt. The predecessor
-//! receipt keeps its SA until the caller retires it; only the predecessor SA is
-//! removed then, never the policy the successor owns.
+//! Actor-owned successor admission, recovery, fresh status and group retirement.
 
 #[cfg(test)]
 use super::operations::TestFault;
@@ -20,16 +12,13 @@ use opc_local_kernel_lifecycle::{
 };
 use tokio::sync::oneshot;
 
-use super::effect::Readback;
+use super::effect::{self, Readback};
 use super::operations::{
-    Operations, ReceiptRole, ScopedXfrmReceipt, ScopedXfrmSuccessorStatus, SuccessorEntry,
-    SuccessorInstall, SuccessorLink, PREDECESSOR_RETIRED, SUCCESSOR_PUBLISHED,
-    SUCCESSOR_SA_INSTALLED, SUCCESSOR_TRAFFIC_MOVED,
+    Entry, GroupRetirement, Operations, RetirementPlan, ScopedXfrmReceipt,
+    ScopedXfrmSuccessorStatus, SuccessorEntry, SuccessorInstall, SuccessorOrigin,
 };
-use super::successor::{
-    self, PolicyReadback, SuccessorKernel, SuccessorProgress, SuccessorRemovalProgress,
-};
-use super::LocalXfrmProfile;
+use super::successor::{self, PolicyReadback, SuccessorKernel, SuccessorProgress};
+use super::{LocalXfrmProfile, ScopedXfrmRequest};
 use crate::{InstallSaRequest, LinuxXfrmBackend, RekeyPolicyRequest, XfrmBackend, XfrmError};
 
 fn mismatch() -> XfrmError {
@@ -37,26 +26,34 @@ fn mismatch() -> XfrmError {
         operation: "local_scope_successor_receipt",
     }
 }
-
 fn uncertain() -> XfrmError {
     XfrmError::StateIndeterminate {
         operation: "local_scope_effect",
     }
 }
-
-fn same_request(first: &crate::ScopedXfrmRequest, second: &crate::ScopedXfrmRequest) -> bool {
+fn pending() -> XfrmError {
+    XfrmError::StateMismatch {
+        operation: "local_scope_successor_pending",
+    }
+}
+fn not_live() -> XfrmError {
+    XfrmError::StateMismatch {
+        operation: "local_scope_successor_not_live",
+    }
+}
+fn same_request(first: &ScopedXfrmRequest, second: &ScopedXfrmRequest) -> bool {
     first.sa == second.sa && first.policy == second.policy
 }
-
-enum SuccessorAction {
-    Install,
-    Remove,
-}
-
-enum SuccessorOutcome {
-    Published,
-    Undone,
-    Removed,
+async fn read_policy(
+    backend: &LinuxXfrmBackend,
+    request: &ScopedXfrmRequest,
+) -> Result<PolicyReadback, XfrmError> {
+    match backend.read_scoped_policy(request).await {
+        Ok(Readback::Exact) => Ok(PolicyReadback::Exact),
+        Ok(Readback::Absent) => Ok(PolicyReadback::Absent),
+        Err(XfrmError::StateMismatch { .. }) => Ok(PolicyReadback::Other),
+        Err(error) => Err(error),
+    }
 }
 
 impl Operations {
@@ -77,7 +74,7 @@ impl Operations {
         } = install;
         if !profile.is_some_and(|profile| Arc::ptr_eq(&profile.binding, &supplied.binding))
             || supplied.recheck().is_err()
-            || guard.recheck().is_err()
+            || !predecessor.epoch_matches(&guard)
             || !effect.matches_operation(&guard)
             || !backend.local_lifecycle().is_some_and(|lifecycle| {
                 lifecycle
@@ -88,116 +85,139 @@ impl Operations {
             let _ = reply.send(Err(mismatch()));
             return;
         }
-        let Some(predecessor_index) = self
+        // Reply loss is resolved before predecessor liveness, new admission or
+        // one-shot consumption. The predecessor may already have been retired.
+        if let Some(entry) = self.entries.iter().find(|entry| {
+            entry
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.predecessor.same_as(&predecessor))
+        }) {
+            let result =
+                if entry.effect.key() != effect.key() || !same_request(&entry.request, &request) {
+                    Err(XfrmError::AlreadyExists)
+                } else if entry.retirement.is_some() || entry.progress.undo {
+                    Err(uncertain())
+                } else {
+                    match Self::read(backend, entry).await {
+                        Ok(true) => Ok(entry.receipt.clone()),
+                        Ok(false) => Err(uncertain()),
+                        Err(error) => Err(error),
+                    }
+                };
+            let _ = reply.send(result);
+            return;
+        }
+        if let Some(entry) = self
+            .successors
+            .iter_mut()
+            .find(|entry| entry.predecessor.same_as(&predecessor))
+        {
+            if entry.effect.key() != effect.key() || !same_request(&entry.request, &request) {
+                let _ = reply.send(Err(XfrmError::AlreadyExists));
+            } else if entry.install_progress.undo {
+                let _ = reply.send(Err(uncertain()));
+            } else if let Some(previous) = entry.observer.replace(reply) {
+                let _ = previous.send(Err(uncertain()));
+            }
+            return;
+        }
+        if self
             .entries
             .iter()
-            .position(|entry| entry.receipt.same_as(&predecessor))
+            .map(|entry| entry.effect.key())
+            .chain(self.successors.iter().map(|entry| entry.effect.key()))
+            .any(|key| key.same_request_id(effect.key()) && key.request() != effect.key().request())
+        {
+            let _ = reply.send(Err(mismatch()));
+            return;
+        }
+        let Some(primary) = self
+            .entries
+            .iter()
+            .find(|entry| entry.receipt.same_as(&predecessor))
         else {
             let _ = reply.send(Err(XfrmError::StateMismatch {
                 operation: "local_scope_successor_predecessor",
             }));
             return;
         };
-        {
-            let primary = &self.entries[predecessor_index];
-            if primary.progress.undo || !primary.progress.published {
-                let _ = reply.send(Err(XfrmError::StateMismatch {
-                    operation: "local_scope_successor_predecessor",
-                }));
-                return;
-            }
-            if primary.successor.is_some() {
-                let _ = reply.send(Err(XfrmError::AlreadyExists));
-                return;
-            }
-        }
-        // Exact retry of a lost admission/publication reply.
-        if let Some(existing_index) = self
-            .successors
-            .iter()
-            .position(|entry| entry.predecessor.same_as(&predecessor))
-        {
-            let existing = &self.successors[existing_index];
-            let result = if same_request(&existing.request, &request)
-                && existing.effect.key() == effect.key()
-            {
-                if existing.install_progress.published && !existing.removal_requested {
-                    match Self::read_successor_entry(backend, existing).await {
-                        Ok(true) => Ok(existing.receipt.clone()),
-                        _ => Err(uncertain()),
-                    }
-                } else {
-                    Err(uncertain())
-                }
-            } else {
-                Err(XfrmError::AlreadyExists)
-            };
-            let _ = reply.send(result);
+        if !primary.progress.published || primary.progress.undo || primary.retirement.is_some() {
+            let _ = reply.send(Err(pending()));
             return;
         }
+        if !Arc::ptr_eq(&primary.request, &primary.protection) {
+            let _ = reply.send(Err(XfrmError::AlreadyExists));
+            return;
+        }
+        if let Err(error) = request.validate_successor_of(&primary.request) {
+            let _ = reply.send(Err(error));
+            return;
+        }
+        let Some(previous_reservation) = primary.reservation.as_ref() else {
+            let _ = reply.send(Err(uncertain()));
+            return;
+        };
+        if self
+            .successors
+            .iter()
+            .any(|entry| entry.reservation.shares_policy(previous_reservation))
+            || self.entries.iter().any(|entry| {
+                entry.retirement.is_some()
+                    && entry
+                        .reservation
+                        .as_ref()
+                        .is_some_and(|reservation| reservation.shares_policy(previous_reservation))
+            })
         {
-            let primary = &self.entries[predecessor_index];
-            if let Err(error) = request.validate_successor_of(&primary.request) {
+            let _ = reply.send(Err(pending()));
+            return;
+        }
+        let predecessor_request = primary.request.clone();
+        let reservation = match self
+            .registry
+            .reserve_successor(previous_reservation, request.clone())
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
                 let _ = reply.send(Err(error));
                 return;
             }
-        }
+        };
         let target = match request.policy.direction {
             crate::XfrmDirection::In => LocalEffectUse::XfrmInbound,
             crate::XfrmDirection::Out => LocalEffectUse::XfrmOutbound,
             crate::XfrmDirection::Forward => LocalEffectUse::XfrmForward,
         };
-        let reservation = {
-            let primary = &self.entries[predecessor_index];
-            let Some(predecessor_reservation) = primary.reservation.as_ref() else {
-                let _ = reply.send(Err(uncertain()));
-                return;
-            };
-            match self
-                .registry
-                .reserve_successor(predecessor_reservation, Arc::clone(&request))
-            {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-            }
-        };
-        // Consume the one-shot activation only after the last refusal gate, so
-        // a refused reservation never burns committed authority.
         if effect.consume(target).is_err() {
             let _ = self.registry.retired(&reservation);
             let _ = reply.send(Err(mismatch()));
             return;
         }
-        let receipt = ScopedXfrmReceipt::successor_receipt(&supplied, predecessor.clone());
         self.successors.push(SuccessorEntry {
             #[cfg(test)]
             fault: self.next_fault.take(),
             predecessor,
+            predecessor_request,
             request,
-            receipt,
+            receipt: ScopedXfrmReceipt::new(supplied),
             effect,
-            reservation: Some(reservation),
-            guard: Some(guard),
-            permit: Some(permit),
+            reservation,
+            guard,
+            permit,
             observer: Some(reply),
-            remover: None,
             install_progress: SuccessorProgress::default(),
-            removal_progress: SuccessorRemovalProgress::default(),
-            removal_requested: false,
             schedule: CleanupSchedule::default(),
         });
     }
 
-    pub(crate) fn command_successor_remove(
+    pub(crate) fn command_member_remove(
         &mut self,
         receipt: ScopedXfrmReceipt,
         guard: LocalOperation,
         reply: oneshot::Sender<Result<(), XfrmError>>,
     ) {
-        if receipt.role() != ReceiptRole::Successor || !receipt.epoch_matches(&guard) {
+        if !receipt.epoch_matches(&guard) {
             let _ = reply.send(Err(mismatch()));
             return;
         }
@@ -206,95 +226,113 @@ impl Operations {
             return;
         }
         let Some(index) = self
-            .successors
+            .entries
             .iter()
             .position(|entry| entry.receipt.same_as(&receipt))
         else {
             let _ = reply.send(Err(mismatch()));
             return;
         };
-        let entry = &mut self.successors[index];
-        if entry.install_progress.published && !entry.predecessor.is_retired() {
-            let _ = reply.send(Err(XfrmError::StateMismatch {
-                operation: "local_scope_successor_predecessor_live",
-            }));
+        let entry = &self.entries[index];
+        if !entry.progress.published || entry.progress.undo {
+            let _ = reply.send(Err(uncertain()));
             return;
         }
+        let Some(reservation) = entry.reservation.as_ref() else {
+            let _ = reply.send(Err(uncertain()));
+            return;
+        };
+        if self
+            .successors
+            .iter()
+            .any(|candidate| candidate.reservation.shares_policy(reservation))
+            || self.entries.iter().enumerate().any(|(other_index, other)| {
+                other_index != index
+                    && other.retirement.is_some()
+                    && other
+                        .reservation
+                        .as_ref()
+                        .is_some_and(|other| other.shares_policy(reservation))
+            })
+        {
+            let _ = reply.send(Err(pending()));
+            return;
+        }
+        let entry = &mut self.entries[index];
         if let Some(previous) = entry.remover.replace(reply) {
             let _ = previous.send(Err(uncertain()));
         }
         entry.guard.get_or_insert(guard);
-        if entry.install_progress.published {
-            entry.removal_requested = true;
-        } else {
-            // Cancel before publication: undo the candidate through readback.
-            entry.install_progress.undo = true;
+        if entry.retirement.is_none() {
+            entry.retirement = Some(GroupRetirement::default());
+            entry.schedule = CleanupSchedule::default();
         }
     }
 
-    pub(crate) async fn read_successor(
+    pub(crate) async fn successor_status_for(
         &self,
         backend: &LinuxXfrmBackend,
         receipt: &ScopedXfrmReceipt,
-    ) -> Result<bool, XfrmError> {
-        let Some(entry) = self
+        guard: &LocalOperation,
+    ) -> Result<ScopedXfrmSuccessorStatus, XfrmError> {
+        if !receipt.epoch_matches(guard) {
+            return Err(mismatch());
+        }
+        receipt.profile().recheck()?;
+        let pending = self
             .successors
             .iter()
-            .find(|entry| entry.receipt.same_as(receipt))
-        else {
-            return if receipt.is_retired() {
-                Ok(false)
-            } else {
-                Err(mismatch())
-            };
-        };
-        if !entry.install_progress.published
-            || entry.install_progress.undo
-            || entry.removal_requested
-        {
-            return Err(uncertain());
-        }
-        Self::read_successor_entry(backend, entry).await
-    }
-
-    async fn read_successor_entry(
-        backend: &LinuxXfrmBackend,
-        entry: &SuccessorEntry,
-    ) -> Result<bool, XfrmError> {
-        let sa = backend.read_scoped_sa(&entry.request).await?;
-        let policy = backend.read_scoped_policy(&entry.request).await;
-        let policy_exact = matches!(policy, Ok(Readback::Exact));
-        Ok(sa == Readback::Exact && policy_exact)
-    }
-
-    pub(crate) fn successor_status_for(
-        &self,
-        receipt: &ScopedXfrmReceipt,
-    ) -> Result<ScopedXfrmSuccessorStatus, XfrmError> {
-        match receipt.role() {
-            ReceiptRole::Successor => Ok(receipt.status()),
-            ReceiptRole::Install => {
-                if let Some(entry) = self
-                    .entries
+            .find(|entry| entry.predecessor.same_as(receipt));
+        let published = self
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.predecessor.same_as(receipt))
+            })
+            .or_else(|| {
+                self.entries
                     .iter()
-                    .find(|entry| entry.receipt.same_as(receipt))
-                {
-                    if let Some(link) = &entry.successor {
-                        return Ok(link.receipt.status());
-                    }
-                }
-                if receipt.has_successor_progress() {
-                    Ok(receipt.status())
-                } else {
-                    Err(XfrmError::StateMismatch {
-                        operation: "local_scope_successor_absent",
-                    })
-                }
-            }
+                    .find(|entry| entry.receipt.same_as(receipt) && entry.origin.is_some())
+            });
+        let (predecessor, successor, published) = if let Some(entry) = pending {
+            (
+                &entry.predecessor_request,
+                &entry.request,
+                entry.install_progress.published,
+            )
+        } else if let Some(entry) = published {
+            let Some(origin) = entry.origin.as_ref() else {
+                return Err(uncertain());
+            };
+            (
+                &origin.predecessor_request,
+                &entry.request,
+                entry.progress.published,
+            )
+        } else {
+            return Err(XfrmError::StateMismatch {
+                operation: "local_scope_successor_absent",
+            });
+        };
+        let successor_sa_installed = backend.read_scoped_sa(successor).await? == Readback::Exact;
+        let traffic_moved = read_policy(backend, successor).await? == PolicyReadback::Exact
+            && successor_sa_installed;
+        let predecessor_retired = backend.read_scoped_sa(predecessor).await? == Readback::Absent;
+        if !receipt.epoch_matches(guard) {
+            return Err(mismatch());
         }
+        Ok(ScopedXfrmSuccessorStatus {
+            successor_sa_installed,
+            traffic_moved,
+            published,
+            predecessor_retired,
+        })
     }
 
-    /// Service at most one due successor or predecessor-retirement step.
+    /// Service one due transition, while unrelated groups keep making progress.
     pub(crate) async fn service_successors(&mut self, backend: &LinuxXfrmBackend) -> bool {
         let now = tokio::time::Instant::now();
         if let Some(index) = self
@@ -308,309 +346,298 @@ impl Operations {
             self.step_retirement_at(backend, index).await;
             return true;
         }
-        let index = self
+        if let Some(index) = self
             .successors
             .iter()
             .enumerate()
-            .filter(|(_, entry)| {
-                (!entry.install_progress.published
-                    || entry.install_progress.undo
-                    || entry.removal_requested)
-                    && entry.schedule.next_attempt() <= now
-            })
+            .filter(|(_, entry)| entry.schedule.next_attempt() <= now)
             .min_by_key(|(_, entry)| entry.schedule.next_attempt())
-            .map(|(index, _)| index);
-        let Some(index) = index else {
-            return false;
-        };
-        self.step_successor_at(backend, index).await;
-        true
+            .map(|(index, _)| index)
+        {
+            self.step_successor_at(backend, index).await;
+            return true;
+        }
+        false
     }
 
     async fn step_successor_at(&mut self, backend: &LinuxXfrmBackend, index: usize) {
-        let predecessor_request = {
-            let Some(entry) = self.successors.get(index) else {
-                return;
-            };
-            match self
-                .entries
-                .iter()
-                .find(|primary| primary.receipt.same_as(&entry.predecessor))
-            {
-                Some(primary) => Arc::clone(&primary.request),
-                None => {
-                    if let Some(entry) = self.successors.get_mut(index) {
-                        if let Some(remover) = entry.remover.take() {
-                            let _ = remover.send(Err(XfrmError::StateMismatch {
-                                operation: "local_scope_successor_predecessor",
-                            }));
-                        }
-                        entry.install_progress.undo = true;
-                    }
-                    return;
-                }
-            }
+        let entry = &mut self.successors[index];
+        let Some(attempt) = entry.schedule.begin() else {
+            return;
         };
-        let predecessor_retired = {
-            let Some(entry) = self.successors.get(index) else {
-                return;
-            };
-            entry.predecessor.is_retired()
+        if !entry.install_progress.published && entry.effect.recheck_local_execution().is_err() {
+            entry.install_progress.undo = true;
+        }
+        let mut kernel = NativeSuccessorKernel {
+            #[cfg(test)]
+            fault: &mut entry.fault,
+            backend,
+            guard: &entry.guard,
+            effect: &entry.effect,
+            predecessor_request: entry.predecessor_request.clone(),
+            request: entry.request.clone(),
+            attempt,
         };
-        let outcome = {
-            let Some(entry) = self.successors.get_mut(index) else {
-                return;
-            };
-            let Some(attempt) = entry.schedule.begin() else {
-                return;
-            };
-            if entry
-                .observer
-                .as_ref()
-                .is_some_and(oneshot::Sender::is_closed)
-                && !entry.install_progress.published
-            {
-                entry.install_progress.undo = true;
-            }
-            if !entry.install_progress.published && entry.effect.recheck_local_execution().is_err()
-            {
-                entry.install_progress.undo = true;
-            }
-            if entry.guard.is_none() {
-                match entry.receipt.profile().try_begin_operation() {
-                    Ok(Some(guard)) => entry.guard = Some(guard),
-                    Ok(None) => {
-                        entry.schedule.failed(rand::random());
-                        return;
-                    }
-                    Err(_) => {
-                        entry.schedule.failed(rand::random());
-                        return;
-                    }
-                }
-            }
-            let Some(guard) = entry.guard.as_ref() else {
-                return;
-            };
-            let action = if entry.install_progress.published {
-                if !entry.removal_requested {
-                    return;
-                }
-                SuccessorAction::Remove
+        let progress = &mut entry.install_progress;
+        let work = async {
+            if progress.undo {
+                successor::undo(&mut kernel, progress).await
             } else {
-                SuccessorAction::Install
-            };
-            let mut kernel = NativeSuccessorKernel {
+                successor::install(&mut kernel, progress).await?;
+                successor::publish(&mut kernel, progress, || false).await
+            }
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            std::panic::AssertUnwindSafe(work).catch_unwind(),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(Ok(())))) && !entry.install_progress.published {
+            // Uncertain reads, timeout and panic retain forward progress. Only
+            // a definitive refusal or a local fence authorizes reverse undo.
+            if matches!(
+                result,
+                Ok(Ok(Err(XfrmError::StateMismatch { .. }
+                    | XfrmError::InvalidConfig { .. }
+                    | XfrmError::AlreadyExists)))
+            ) {
+                entry.install_progress.undo = true;
+            }
+            if let Some(observer) = entry.observer.take() {
+                let _ = observer.send(Err(uncertain()));
+            }
+            entry.schedule.failed(rand::random());
+            return;
+        }
+        if entry.install_progress.retired {
+            if self.registry.retired(&entry.reservation).is_err() {
+                entry.schedule.failed(rand::random());
+                return;
+            }
+            let mut entry = self.successors.remove(index);
+            entry.receipt.binding_retire();
+            if let Some(observer) = entry.observer.take() {
+                let _ = observer.send(Err(uncertain()));
+            }
+        } else if entry.install_progress.published {
+            let mut entry = self.successors.remove(index);
+            for member in &mut self.entries {
+                if member
+                    .reservation
+                    .as_ref()
+                    .is_some_and(|reservation| reservation.shares_policy(&entry.reservation))
+                {
+                    member.protection = entry.request.clone();
+                }
+            }
+            #[cfg(test)]
+            if matches!(entry.fault, Some(TestFault::DropSuccessorReply)) {
+                entry.fault = None;
+                entry.observer = None;
+            }
+            let receipt = entry.receipt.clone();
+            self.entries.push(Entry {
                 #[cfg(test)]
-                fault: &mut entry.fault,
-                backend,
-                guard,
-                effect: &entry.effect,
-                predecessor_request,
-                request: Arc::clone(&entry.request),
-                attempt,
-            };
-            let install_progress = &mut entry.install_progress;
-            let removal_progress = &mut entry.removal_progress;
-            let observer = &entry.observer;
-            let work = async {
-                match action {
-                    SuccessorAction::Install => {
-                        if install_progress.undo {
-                            successor::undo(&mut kernel, install_progress).await
-                        } else {
-                            successor::install(&mut kernel, install_progress).await?;
-                            successor::publish(&mut kernel, install_progress, || {
-                                observer.as_ref().is_none_or(oneshot::Sender::is_closed)
-                            })
-                            .await
-                        }
-                    }
-                    SuccessorAction::Remove => {
-                        successor::remove_successor(
-                            &mut kernel,
-                            removal_progress,
-                            predecessor_retired,
-                        )
-                        .await
+                fault: entry.fault,
+                effect: entry.effect,
+                request: entry.request.clone(),
+                protection: entry.request,
+                receipt: entry.receipt,
+                reservation: Some(entry.reservation),
+                guard: None,
+                permit: None,
+                observer: None,
+                remover: None,
+                progress: effect::Progress {
+                    policy_started: true,
+                    sa_started: true,
+                    installed: true,
+                    published: true,
+                    undo: false,
+                    retired: false,
+                },
+                origin: Some(SuccessorOrigin {
+                    predecessor: entry.predecessor,
+                    predecessor_request: entry.predecessor_request,
+                }),
+                retirement: None,
+                schedule: CleanupSchedule::default(),
+            });
+            if let Some(observer) = entry.observer.take() {
+                let _ = observer.send(Ok(receipt));
+            }
+            drop(entry.guard);
+            drop(entry.permit);
+        }
+    }
+
+    async fn retirement_plan(
+        &self,
+        backend: &LinuxXfrmBackend,
+        index: usize,
+    ) -> Result<RetirementPlan, XfrmError> {
+        let entry = &self.entries[index];
+        let reservation = entry.reservation.as_ref().ok_or_else(uncertain)?;
+        let others = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(other_index, other)| {
+                *other_index != index
+                    && other
+                        .reservation
+                        .as_ref()
+                        .is_some_and(|other| other.shares_policy(reservation))
+            })
+            .map(|(_, other)| other.request.clone())
+            .collect::<Vec<_>>();
+        if others.is_empty() {
+            return Ok(RetirementPlan::Final);
+        }
+        if !Arc::ptr_eq(&entry.request, &entry.protection) {
+            return Ok(RetirementPlan::Keep(entry.protection.clone()));
+        }
+        for request in &others {
+            if backend.read_scoped_sa(request).await? == Readback::Exact {
+                return Ok(RetirementPlan::Restore(request.clone()));
+            }
+        }
+        if backend.read_scoped_sa(&entry.request).await? != Readback::Absent {
+            return Err(not_live());
+        }
+        // All members expired. Restore any retained member's protection so the
+        // final receipt can remove that same policy after proving SA absence.
+        others
+            .first()
+            .cloned()
+            .map(RetirementPlan::Restore)
+            .ok_or_else(uncertain)
+    }
+
+    async fn step_retirement_at(&mut self, backend: &LinuxXfrmBackend, index: usize) {
+        if self.entries[index]
+            .retirement
+            .as_ref()
+            .is_some_and(|retirement| retirement.plan.is_none())
+        {
+            match self.retirement_plan(backend, index).await {
+                Ok(plan) => {
+                    if let Some(retirement) = &mut self.entries[index].retirement {
+                        retirement.plan = Some(plan);
                     }
                 }
-            };
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                std::panic::AssertUnwindSafe(work).catch_unwind(),
-            )
-            .await;
-            if !matches!(result, Ok(Ok(Ok(())))) {
-                if !entry.install_progress.published {
-                    entry.install_progress.undo = true;
-                    entry.schedule.failed(rand::random());
-                    return;
-                }
-                if let Ok(Ok(Err(error @ XfrmError::StateMismatch { .. }))) = result {
-                    entry.removal_requested = false;
+                Err(error @ XfrmError::StateMismatch { .. }) => {
+                    let entry = &mut self.entries[index];
+                    entry.retirement = None;
+                    entry.guard = None;
                     if let Some(remover) = entry.remover.take() {
                         let _ = remover.send(Err(error));
                     }
                     return;
                 }
-                if let Some(observer) = entry.observer.take() {
-                    let _ = observer.send(Err(uncertain()));
+                Err(_) => {
+                    self.entries[index].schedule.failed(rand::random());
+                    return;
                 }
-                entry.removal_requested = false;
-                entry.schedule.failed(rand::random());
-                return;
-            }
-            match action {
-                SuccessorAction::Remove => SuccessorOutcome::Removed,
-                SuccessorAction::Install if entry.install_progress.published => {
-                    SuccessorOutcome::Published
-                }
-                SuccessorAction::Install => SuccessorOutcome::Undone,
-            }
-        };
-        match outcome {
-            SuccessorOutcome::Published => {
-                let receipt = {
-                    let Some(entry) = self.successors.get_mut(index) else {
-                        return;
-                    };
-                    entry.receipt.mark_successor_flags(
-                        SUCCESSOR_SA_INSTALLED | SUCCESSOR_TRAFFIC_MOVED | SUCCESSOR_PUBLISHED,
-                    );
-                    let link = SuccessorLink {
-                        request: Arc::clone(&entry.request),
-                        receipt: entry.receipt.clone(),
-                    };
-                    let receipt = entry.receipt.clone();
-                    if let Some(primary) = self
-                        .entries
-                        .iter_mut()
-                        .find(|primary| primary.receipt.same_as(&entry.predecessor))
-                    {
-                        primary.receipt.mark_successor_flags(
-                            SUCCESSOR_SA_INSTALLED | SUCCESSOR_TRAFFIC_MOVED | SUCCESSOR_PUBLISHED,
-                        );
-                        primary.successor = Some(link);
-                    }
-                    #[cfg(test)]
-                    if matches!(entry.fault, Some(TestFault::DropSuccessorReply)) {
-                        entry.fault = None;
-                        entry.observer = None;
-                    }
-                    let _ = entry
-                        .observer
-                        .take()
-                        .map(|observer| observer.send(Ok(receipt.clone())));
-                    entry.guard = None;
-                    entry.permit = None;
-                    receipt
-                };
-                let _ = receipt;
-            }
-            SuccessorOutcome::Undone | SuccessorOutcome::Removed => {
-                let mut removed = self.successors.remove(index);
-                let _ = removed.reservation.as_ref().map(|reservation| {
-                    let _ = self.registry.check_successor_release(reservation);
-                    let _ = self.registry.retired(reservation);
-                });
-                removed.receipt.binding_retire();
-                let _ = removed
-                    .observer
-                    .take()
-                    .map(|observer| observer.send(Err(uncertain())));
-                let _ = removed.remover.take().map(|remover| remover.send(Ok(())));
             }
         }
-    }
-
-    async fn step_retirement_at(&mut self, backend: &LinuxXfrmBackend, index: usize) {
-        let successor_request = {
-            let Some(entry) = self.entries.get(index) else {
-                return;
-            };
-            let Some(link) = &entry.successor else {
-                return;
-            };
-            Arc::clone(&link.request)
+        let entry = &mut self.entries[index];
+        let Some(attempt) = entry.schedule.begin() else {
+            return;
         };
-        let outcome = {
-            let Some(entry) = self.entries.get_mut(index) else {
-                return;
-            };
-            let Some(attempt) = entry.schedule.begin() else {
-                return;
-            };
-            let Some(retirement) = entry.retirement.as_mut() else {
-                return;
-            };
-            if entry.guard.is_none() {
-                match entry.receipt.profile().try_begin_operation() {
-                    Ok(Some(guard)) => entry.guard = Some(guard),
-                    Ok(None) => {
-                        entry.schedule.failed(rand::random());
-                        return;
-                    }
-                    Err(_) => {
-                        entry.schedule.failed(rand::random());
-                        return;
-                    }
+        let Some(guard) = entry.guard.as_ref() else {
+            return;
+        };
+        let Some(retirement) = entry.retirement.as_mut() else {
+            return;
+        };
+        let Some(plan) = retirement.plan.clone() else {
+            return;
+        };
+        let (predecessor_request, request) = match &plan {
+            RetirementPlan::Keep(selected) => (entry.request.clone(), selected.clone()),
+            RetirementPlan::Restore(replacement) => (replacement.clone(), entry.request.clone()),
+            RetirementPlan::Final => (entry.request.clone(), entry.request.clone()),
+        };
+        let mut kernel = NativeSuccessorKernel {
+            #[cfg(test)]
+            fault: &mut entry.fault,
+            backend,
+            guard,
+            effect: &entry.effect,
+            predecessor_request,
+            request,
+            attempt,
+        };
+        let work = async {
+            match &plan {
+                RetirementPlan::Keep(_) => {
+                    successor::retire_predecessor(&mut kernel, &mut retirement.predecessor).await
+                }
+                RetirementPlan::Restore(_) => {
+                    successor::remove_successor(&mut kernel, &mut retirement.removal, false).await
+                }
+                RetirementPlan::Final => {
+                    successor::remove_successor(&mut kernel, &mut retirement.removal, true).await
                 }
             }
-            let Some(guard) = entry.guard.as_ref() else {
-                return;
-            };
-            let mut kernel = NativeSuccessorKernel {
-                #[cfg(test)]
-                fault: &mut entry.fault,
-                backend,
-                guard,
-                effect: &entry.effect,
-                predecessor_request: Arc::clone(&entry.request),
-                request: successor_request,
-                attempt,
-            };
-            let work = successor::retire_predecessor(&mut kernel, retirement);
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                std::panic::AssertUnwindSafe(work).catch_unwind(),
-            )
-            .await;
-            if !matches!(result, Ok(Ok(Ok(())))) {
-                // A definitive refusal releases the request; an unresolved
-                // removal stays supervised for readback.
-                let definitive = matches!(result, Ok(Ok(Err(XfrmError::StateMismatch { .. }))));
-                if definitive {
-                    entry.retirement = None;
-                    if let Some(remover) = entry.remover.take() {
-                        let _ = remover.send(Err(XfrmError::StateMismatch {
-                            operation: "local_scope_successor_not_live",
-                        }));
-                    }
-                } else {
-                    entry.schedule.failed(rand::random());
-                }
-                return;
-            }
-            true
         };
-        if !outcome {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            std::panic::AssertUnwindSafe(work).catch_unwind(),
+        )
+        .await;
+        let selection = match &plan {
+            RetirementPlan::Restore(replacement) if retirement.removal.restored => {
+                Some(replacement.clone())
+            }
+            _ => None,
+        };
+        if let Some(selection) = selection {
+            let reservation = entry.reservation.clone();
+            for member in &mut self.entries {
+                if member
+                    .reservation
+                    .as_ref()
+                    .zip(reservation.as_ref())
+                    .is_some_and(|(a, b)| a.shares_policy(b))
+                {
+                    member.protection = selection.clone();
+                }
+            }
+        }
+        let entry = &mut self.entries[index];
+        if !matches!(result, Ok(Ok(Ok(())))) {
+            if let Ok(Ok(Err(error @ XfrmError::StateMismatch { .. }))) = result {
+                entry.retirement = None;
+                entry.guard = None;
+                if let Some(remover) = entry.remover.take() {
+                    let _ = remover.send(Err(error));
+                }
+            } else {
+                entry.schedule.failed(rand::random());
+            }
+            return;
+        }
+        let Some(reservation) = entry.reservation.as_ref() else {
+            entry.schedule.failed(rand::random());
+            return;
+        };
+        let retired = if matches!(plan, RetirementPlan::Keep(_)) {
+            self.registry.retire_predecessor(reservation)
+        } else {
+            self.registry.retired(reservation)
+        };
+        if retired.is_err() {
+            entry.schedule.failed(rand::random());
             return;
         }
         let mut removed = self.entries.remove(index);
-        let _ = removed.reservation.as_ref().map(|reservation| {
-            let _ = self.registry.retire_predecessor(reservation);
-        });
-        removed.receipt.mark_successor_flags(PREDECESSOR_RETIRED);
         removed.receipt.binding_retire();
-        if let Some(entry) = self
-            .successors
-            .iter()
-            .find(|entry| entry.predecessor.same_as(&removed.receipt))
-        {
-            entry.receipt.mark_successor_flags(PREDECESSOR_RETIRED);
+        if let Some(remover) = removed.remover.take() {
+            let _ = remover.send(Ok(()));
         }
-        let _ = removed.remover.take().map(|remover| remover.send(Ok(())));
     }
 }
 
@@ -672,7 +699,17 @@ impl SuccessorKernel for NativeSuccessorKernel<'_> {
             return Err(mismatch());
         }
         self.backend.preflight_scoped_sa(&self.request)?;
-        self.effect.recheck().await.map_err(|_| uncertain())
+        self.effect.recheck().await.map_err(|error| match error {
+            opc_local_kernel_lifecycle::LocalEffectError::Closed
+            | opc_local_kernel_lifecycle::LocalEffectError::Stale
+            | opc_local_kernel_lifecycle::LocalEffectError::WrongRequest => mismatch(),
+            opc_local_kernel_lifecycle::LocalEffectError::TransportRevisionMismatch => {
+                XfrmError::StateIndeterminate {
+                    operation: "scope_transport_revision_mismatch",
+                }
+            }
+            _ => uncertain(),
+        })
     }
     async fn predecessor_sa(&mut self) -> Result<Readback, XfrmError> {
         self.local()?;

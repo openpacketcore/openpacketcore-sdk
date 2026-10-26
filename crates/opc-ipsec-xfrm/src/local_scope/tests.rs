@@ -1306,7 +1306,7 @@ fn native_scoped_successor_moves_policy_and_retires_only_the_predecessor() {
                 .await
                 .unwrap();
             let successor = backend
-                .install_scoped_successor(&profile, second, &predecessor, successor_request)
+                .install_scoped_successor(&profile, second, &predecessor, successor_request.clone())
                 .await
                 .unwrap();
             let status = backend.scoped_successor_status(&successor).await.unwrap();
@@ -1316,14 +1316,30 @@ fn native_scoped_successor_moves_policy_and_retires_only_the_predecessor() {
             assert!(!status.predecessor_retired());
             assert!(backend.read_scoped(&successor).await.unwrap());
 
-            // A removal request for the successor before predecessor retirement
-            // is refused and leaves both live.
-            assert!(matches!(
-                backend.remove_scoped(&successor).await,
-                Err(XfrmError::StateMismatch {
-                    operation: "local_scope_successor_predecessor_live"
-                })
-            ));
+            // Abandonment restores the retained predecessor, then a distinct
+            // activation can install another fresh-SPI successor on that flow.
+            backend.remove_scoped(&successor).await.unwrap();
+            assert!(successor.is_retired());
+            assert!(!backend.read_scoped(&successor).await.unwrap());
+            assert!(backend.read_scoped(&predecessor).await.unwrap());
+            let mut sa = successor_request.sa.clone();
+            let mut policy = successor_request.policy.clone();
+            sa.id.spi += 1;
+            sa.request_id = crate::XfrmRequestId::new(101);
+            policy.templates[0].request_id = sa.request_id;
+            let third = authority
+                .commit_activation(quorum.create_request(22).await, child_key(22))
+                .await
+                .unwrap();
+            let successor = backend
+                .install_scoped_successor(
+                    &profile,
+                    third,
+                    &predecessor,
+                    ScopedXfrmRequest::new(sa, policy).unwrap(),
+                )
+                .await
+                .unwrap();
             assert!(backend.read_scoped(&successor).await.unwrap());
 
             // Predecessor retirement removes the old SA only; the successor's

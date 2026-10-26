@@ -242,21 +242,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter fields are additive: both enums and the counter struct are
   `#[non_exhaustive]`. Refs #1018.
 
-- `opc-ipsec-xfrm`: SAs can request Linux Traffic Flow Confidentiality (TFC)
-  padding through the new `SaParameters::tfc_pad: Option<u32>`. A `Some(n)`
-  value serializes the `XFRMA_TFCPAD` attribute (UAPI attribute 22, `__u32`) on
-  install and rekey; Linux ESP output then pads the protected packet to at
-  least `n` bytes when shorter, capped at the path MTU. Validation rejects a
-  zero length, non-ESP SAs, and non-tunnel modes before any netlink mutation,
-  matching the kernel's `verify_newsa_info`. `SaState::tfc_pad` reports the
-  value from exact `GETSA` readback. `None` emits no attribute and keeps the
-  pre-TFC bytes exactly unchanged. The versioned durable install-request and
-  outbound-binding fingerprints do not cover `tfc_pad` in this revision
-  (in-memory request comparisons do); widening them needs its own
-  auth-domain-v2 and migration follow-up. Dummy-packet generation with Next
-  Header 59 (RFC 4303 §2.5/§2.7) is not part of this netlink model and remains
-  a tracked follow-up, so #1344 is only partially addressed by this change
-  (the configuration/encoding acceptance is met). Refs #1344.
+- `opc-ipsec-xfrm`: `SaParameters::tfc_pad` configures Linux ESP tunnel-mode
+  Traffic Flow Confidentiality padding through `XFRMA_TFCPAD` (UAPI 22).
+  Exact binding/scoped readback and durable object/roster authentication include
+  the target; disabled TFC retains its previous encoding and seals.
+  `rekey_sa` verifies GETSA even when clearing TFC and reports indeterminate
+  state if Linux acknowledges an ignored update. `esp_dummy_payload` builds
+  aligned dummy plaintext with Next Header 59 (RFC 4303 §§2.6–2.7), leaving
+  encryption, sequencing, transmission and peer capability policy to the caller.
+  Stored records with enabled TFC from builds that omitted it from authentication
+  require a fresh install when crossing this format change. Refs #1344.
 
 ### Fixed
 
