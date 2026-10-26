@@ -164,11 +164,12 @@ authority-store lease API from `opc-gtpu-dataplane`.
   slot (fragment-affinity capacity refusal), so its counter-map definition
   differs from version 5 even though the pin count is unchanged. The loader
   refuses retained TFT v5, TFT v4, or incomplete TFT graphs before attachment
-  mutation; current recovery proof/WAL formats also advance. Upgrade and rollback require a drain, compatible-version exact
-  cleanup, and fresh attachment. Incompatible retained proofs, WALs, or
-  finalized receipts continue to fence the namespace after graph cleanup. No
-  record conversion is implemented: preserve them and use a separate, freshly
-  authorized namespace. See the
+  mutation; current recovery proof/WAL formats also advance. Crossing this
+  stored-format boundary in either direction requires deleting the prior state
+  volumes and performing a fresh install, one site at a time, after draining
+  traffic without cutting emergency sessions. Incompatible retained proofs,
+  WALs and finalized receipts are rejected; no record conversion is implemented.
+  See the
   [loader lifecycle contract](../opc-gtpu-dataplane/README.md#tft-fragment-affinity-upgrade-and-rollback).
   The separate frozen shipped-25 ABI retains its literal TFT v4 recognition.
 - The grouped-session ABI is used by the current loader and tc programs without

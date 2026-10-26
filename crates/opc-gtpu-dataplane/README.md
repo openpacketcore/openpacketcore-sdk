@@ -308,7 +308,7 @@ MTU-bearing contexts must be drained before an SDK downgrade. See
   adoption rejects partial pin graphs and promotes an all-zero schema marker
   only after the metadata, filter, and fragment-affinity maps are proven empty
   before hook mutation and rechecked empty immediately before publication.
-  Native eBPF TFT classifier ABI/schema v5 remains IPv4-only: filter-map keys
+  Native eBPF TFT classifier ABI/schema v6 remains IPv4-only: filter-map keys
   include the current owner and snapshot generations, and each value carries
   its dense precedence rank. TC therefore finds only rows named by validated
   metadata; exact userspace readback verifies the redundant value identity and
@@ -1253,8 +1253,10 @@ subscriber can therefore occupy at most 256 concurrent fragmented datagrams
 capacity. Two PAAs that hash to the same group share that group's bound, so the
 blast radius of a hash collision is one group rather than the whole table.
 The host `TftUplinkFragmentTable` allocates approximately 24.5 MiB per
-attachment; the partition adds no memory and only two masks to the existing
-single hash pass.
+attachment; the partition adds no memory and folds the upper hash bits before
+each mask in a single hash pass. The 64-range overlap walk accumulates conflicts
+without data-dependent branches, keeping verifier work bounded without reducing
+the supported range count. Exact key matching compares all five 32-bit words.
 
 A duplicate first fragment is accepted only when its parsed classifier fields,
 selected mark, header length, and first range agree. A conflicting first
@@ -1792,37 +1794,23 @@ filters, and affinity state, checked before hook mutation and again before
 marker publication. The independent PMTU-v5 and grouped-session markers do
 not establish TFT compatibility.
 
-Upgrade requires stopping new traffic and producers, draining represented
-sessions and in-flight traffic, then using the prior version's exact device
-removal or authorized graph-recovery procedure to remove its owned hooks and
-pins. The destination version then needs a fresh attachment and reinstallation
-of classifier/session state in an authorized namespace that passes its
-creation checks. Graph cleanup alone does not establish namespace eligibility.
-Retaining pins with `suspend_grouped_device` does not perform this migration.
-Rollback follows the same sequence using this version to clean up its 35-map
-graph before the older version creates its own graph. Neither direction
-supports an in-place live schema change or packet continuity across the
-drained replacement.
+Crossing this stored-format boundary in either direction requires deleting the
+prior state volumes and performing a fresh install, one site at a time, after
+draining traffic without cutting emergency sessions. There is no in-place
+format conversion or packet continuity across that replacement. Ordinary Pod
+restarts and live configuration changes do not require a fresh install.
 
 The wider map identity changes current recovery proof magic from `OPCCURR7` to
 `OPCCURR8` and terminal WAL codec from
 `opc.gtpu.current-ebpf-recovery-terminal-wal.r2` to
 `opc.gtpu.current-ebpf-recovery-terminal-wal.r3`. Older proofs/WALs are not
-converted, and an older binary cannot consume the new ones. Finish pending
-recovery with the version that wrote its records. Terminal recovery retains
+converted, and an older binary cannot consume the new ones. Terminal recovery retains
 `GTPU_CURRENT_RECOVERY_TERMINAL_V1` even after graph removal; recovery to a
 current successor persists `GTPU_CURRENT_RECOVERY_FINALIZED_RECEIPT_V1`.
-Finishing old recovery therefore does not necessarily make that namespace
-reusable. These retained records have the old width and codec commitments,
-and this version rejects them, including finalized receipts. If any
-incompatible proof, WAL, or finalized receipt remains, preserve it and use a
-separate, freshly authorized namespace. Do not delete or rewrite authority
-evidence to force attachment through an authority-bearing recovery flow. An
-unbound, exclusively owned workload may instead discard its entire graph using
-[`reset_exclusive_workload_graph`](#isolated-workload-lifecycle), after abandoning
-retained-graph recovery and stopping the old writer. This never erases selector
-history. Rollback has the same constraint in the opposite direction; no
-cross-version record conversion is implemented.
+Their width and codec commitments are part of the stored format. This version
+rejects incompatible proofs, WALs and finalized receipts rather than
+interpreting them as current authority. No cross-version record conversion is
+implemented.
 
 Ordinary fresh creation in a previously used namespace requires exact graph
 cleanup, no selector-authority markers, no recovery proof, terminal WAL, or
