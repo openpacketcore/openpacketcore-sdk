@@ -12,7 +12,7 @@ use crate::redact::{safe_metric_label, sanitize_error_message};
 use axum::{
     extract::State,
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::Response,
     Router,
 };
 use http::StatusCode;
@@ -305,21 +305,21 @@ async fn auth_middleware(
         let headers = req.headers();
         let sbi_headers = crate::headers::SbiHeaders::parse(headers).map_err(|_| {
             let details = ProblemDetails::new(StatusCode::BAD_REQUEST);
-            (StatusCode::BAD_REQUEST, axum::Json(details)).into_response()
+            problem_response(StatusCode::BAD_REQUEST, &details, None)
         })?;
 
         let bearer_token =
             crate::headers::extract_bearer_token_from_headers(headers).map_err(|_| {
                 let details = ProblemDetails::new(StatusCode::BAD_REQUEST);
-                (StatusCode::BAD_REQUEST, axum::Json(details)).into_response()
+                problem_response(StatusCode::BAD_REQUEST, &details, None)
             })?;
 
         let peer = match req.extensions().get::<crate::auth::SbiPeer>().cloned() {
             Some(peer) => peer,
             None if production_mode => {
-                let mut details = ProblemDetails::new(StatusCode::UNAUTHORIZED);
-                details.detail = Some("peer identity required".to_string());
-                return Err((StatusCode::UNAUTHORIZED, axum::Json(details)).into_response());
+                return Err(auth_failure_response(
+                    crate::auth::SbiAuthError::MissingPeerBinding,
+                ));
             }
             None => crate::auth::SbiPeer {
                 spiffe: None,
@@ -345,15 +345,7 @@ async fn auth_middleware(
                     .insert(crate::auth::ErasedAuthContext::from(&context));
                 req.extensions_mut().insert(context);
             }
-            Err(err) => {
-                let status = match err {
-                    crate::auth::SbiAuthError::MissingBearerToken => StatusCode::UNAUTHORIZED,
-                    _ => StatusCode::FORBIDDEN,
-                };
-                let mut details = ProblemDetails::new(status);
-                details.detail = Some("authorization failed".to_string());
-                return Err((status, axum::Json(details)).into_response());
-            }
+            Err(err) => return Err(auth_failure_response(err)),
         }
     }
     Ok(next.run(req).await)
@@ -406,6 +398,32 @@ async fn catch_panic_middleware(req: axum::extract::Request, next: Next) -> Resp
     }
 }
 
+fn auth_failure_response(error: crate::auth::SbiAuthError) -> Response {
+    use crate::auth::SbiAuthError;
+    let (status, challenge) = match error {
+        SbiAuthError::MissingBearerToken => (StatusCode::UNAUTHORIZED, Some("Bearer")),
+        SbiAuthError::InsufficientScope => (
+            StatusCode::FORBIDDEN,
+            Some("Bearer error=\"insufficient_scope\""),
+        ),
+        SbiAuthError::Internal { .. } => (StatusCode::SERVICE_UNAVAILABLE, None),
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Some("Bearer error=\"invalid_token\""),
+        ),
+    };
+    let mut details = ProblemDetails::new(status);
+    details.detail = Some("authorization failed".to_string());
+    let mut response = problem_response(status, &details, None);
+    if let Some(challenge) = challenge {
+        response.headers_mut().insert(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static(challenge),
+        );
+    }
+    response
+}
+
 fn problem_response(
     status: StatusCode,
     details: &ProblemDetails,
@@ -414,7 +432,7 @@ fn problem_response(
     let body = serde_json::to_vec(details).unwrap_or_else(|_| b"{}".to_vec());
     let mut builder = Response::builder()
         .status(status)
-        .header("content-type", "application/json");
+        .header("content-type", "application/problem+json");
     if let Some(value) = retry_after {
         builder = builder.header("retry-after", value);
     }

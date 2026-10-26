@@ -49,16 +49,16 @@ impl SbiClient {
     /// 4. record success/failure into the circuit breaker and the
     ///    `sbi_requests_total` / `sbi_request_duration_seconds` metrics.
     ///
-    /// Only 2xx responses count as success; other statuses either retry (if
-    /// listed in the policy) or surface as a sanitized `Err(String)` —
-    /// secrets, hosts, and subscriber identifiers never appear in the error.
+    /// HTTP statuses are returned to the caller after any configured retries.
+    /// Only transport errors and 5xx responses count toward opening a circuit;
+    /// errors contain no secrets, hosts, or subscriber identifiers.
     /// Response bodies are read fully and capped at the same body limit.
     pub async fn send(&self, request: Request<Vec<u8>>) -> Result<Response<Bytes>, String> {
         let uri = request.uri().clone();
         let host = uri
             .host()
             .ok_or_else(|| "Missing host in URI".to_string())?;
-        let port = uri.port_u16().unwrap_or(443);
+        let port = connection_port(&uri, self.tls_config.is_some(), self.http2_only)?;
         let addr = format!("{host}:{port}");
 
         let path = uri.path();
@@ -146,7 +146,12 @@ impl SbiClient {
                 }
                 tokio::time::sleep(delay).await;
             } else {
-                lock_or_recover(&cb).record_failure(host, &service_name, Instant::now());
+                match &res {
+                    Ok(response) if !response.status().is_server_error() => {
+                        lock_or_recover(&cb).record_success(host, &service_name);
+                    }
+                    _ => lock_or_recover(&cb).record_failure(host, &service_name, Instant::now()),
+                }
                 return res.map_err(|e| {
                     format!(
                         "request failed after retries: {}",
@@ -225,6 +230,9 @@ impl SbiClient {
                 .await
                 .map_err(|_| "TLS handshake failed".to_string())?;
 
+            if tls_stream.get_ref().1.alpn_protocol() != Some(b"h2") {
+                return Err("TLS peer did not negotiate HTTP/2 ALPN".to_string());
+            }
             let io = TokioIo::new(tls_stream);
             let (send_req, conn) =
                 hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -268,6 +276,15 @@ impl SbiClient {
         }
         Ok(send_req)
     }
+}
+
+fn connection_port(uri: &http::Uri, tls: bool, require_tls: bool) -> Result<u16, String> {
+    let default_port = match (uri.scheme_str(), tls) {
+        (Some("https"), true) => 443,
+        (Some("http"), false) if !require_tls => 80,
+        _ => return Err("URI scheme does not match the configured SBI transport".to_string()),
+    };
+    Ok(uri.port_u16().unwrap_or(default_port))
 }
 
 fn retry_after_delay<B>(response: &Response<B>) -> Option<Duration> {
@@ -322,7 +339,9 @@ impl SbiClientBuilder {
     /// the client speaks plaintext HTTP/2, which `build` rejects in
     /// production mode and `send` rejects while `http2_only` is set.
     pub fn with_tls(mut self, config: Arc<rustls::ClientConfig>) -> Self {
-        self.tls_config = Some(config);
+        let mut config = (*config).clone();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        self.tls_config = Some(Arc::new(config));
         self
     }
 
@@ -448,6 +467,25 @@ impl SbiClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_port_matches_the_uri_scheme_and_configured_transport() {
+        for (uri, tls, require_tls, expected) in [
+            ("http://example.test/", false, false, Some(80)),
+            ("https://example.test/", true, true, Some(443)),
+            ("https://example.test:8443/", true, false, Some(8443)),
+            ("http://example.test:8080/", false, false, Some(8080)),
+            ("http://example.test/", true, false, None),
+            ("https://example.test/", false, false, None),
+            ("http://example.test/", false, true, None),
+            ("ftp://example.test/", false, false, None),
+        ] {
+            assert_eq!(
+                connection_port(&uri.parse().unwrap(), tls, require_tls).ok(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn retry_after_delay_uses_delta_seconds_header() {

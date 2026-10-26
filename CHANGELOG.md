@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-sbi` adds `SbiAuthError::InsufficientScope` (403); invalid credentials
+  return 401 with Bearer challenges and verifier failures return 503.
+  Errors use `application/problem+json`. The client requires negotiated `h2`
+  for TLS, validates URI/transport agreement, uses port 80 for plaintext,
+  and counts only transport/5xx failures toward circuit opening. Message
+  priorities 0–31 are accepted; the NSSF name is `nnssf-nsselection`. (#1362)
+
 - `opc-proto-diameter::apps::rf` encodes Subscription-Id and PS-Information
   inside Service-Information. Replace `multiple_services_credit_controls`,
   `MultipleServicesCreditControl`, and `UsedServiceUnit` with

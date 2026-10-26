@@ -53,6 +53,7 @@ rand.workspace = true
 
 [dev-dependencies]
 serde_json = { workspace = true }
+rcgen.workspace = true
 # Enable testkit for integration tests (self-referential dev-dep is valid in Cargo).
 opc-sbi = { path = ".", version = "0.2.0", features = ["testkit"] }
 

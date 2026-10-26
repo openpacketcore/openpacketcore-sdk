@@ -56,8 +56,8 @@ impl fmt::Debug for SbiAuthRequest {
 
 /// Authorization failure returned by an `SbiAuth` policy.
 ///
-/// The server middleware maps `MissingBearerToken` to HTTP 401 and every
-/// other variant to HTTP 403, always with a generic ProblemDetails body;
+/// The server maps invalid credentials to 401, insufficient scope to 403,
+/// and verifier failures to 503, always with a generic ProblemDetails body;
 /// the `reason` strings are for internal logging/metrics, not clients, and
 /// are redacted from `Debug` output.
 #[derive(Clone, PartialEq, Eq, Error)]
@@ -83,6 +83,9 @@ pub enum SbiAuthError {
         /// subscriber or tenant identifiers, or raw token material).
         reason: String,
     },
+    /// A valid credential does not grant the requested service scope.
+    #[error("insufficient scope")]
+    InsufficientScope,
     /// The policy itself failed (e.g. JWKS refresh error), so the request
     /// is denied fail-closed rather than admitted unverified.
     #[error("internal auth failure")]
@@ -96,6 +99,7 @@ pub enum SbiAuthError {
 impl fmt::Debug for SbiAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InsufficientScope => f.write_str("InsufficientScope"),
             Self::MissingBearerToken => f.write_str("MissingBearerToken"),
             Self::MissingPeerBinding => f.write_str("MissingPeerBinding"),
             Self::TokenBindingMismatch => f.write_str("TokenBindingMismatch"),

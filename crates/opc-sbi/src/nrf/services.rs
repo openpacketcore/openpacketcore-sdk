@@ -37,4 +37,4 @@ pub const NPCF_POLICYAUTHORIZATION: &str = "npcf-policyauthorization";
 pub const NPCF_AM_POLICY_CONTROL: &str = "npcf-am-policy-control";
 
 /// NSSF NS Selection service.
-pub const NSNSSF_NSSELECTION: &str = "nssf-nsselection";
+pub const NSNSSF_NSSELECTION: &str = "nnssf-nsselection";
