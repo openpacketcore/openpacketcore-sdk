@@ -1035,6 +1035,10 @@ impl GtpuControlMessage {
 
     /// Decode exactly one complete GTP-U control datagram.
     ///
+    /// The network receiver skips unexpected IEs and unknown TLVs (`Reject`
+    /// acts as `Drop`), and always uses the first singleton occurrence. Generic
+    /// duplicate-policy settings do not override TS 29.060 §11.1.12.
+    ///
     /// Unlike [`Self::decode`], this datagram boundary rejects bytes following
     /// the GTP-U Length field instead of returning them as a stream tail.
     ///
@@ -1074,13 +1078,12 @@ impl GtpuControlMessage {
             extensions,
             udp_port,
         } = validated;
-        let parsed = parse_ies(message.payload, payload_base, ctx)?;
+        let parsed = parse_ies(message.payload, payload_base, message_type, ctx)?;
 
         match message_type {
             GTPU_MESSAGE_ECHO_REQUEST => {
                 validate_zero_teid_and_sequence(message)?;
                 reject_udp_port(udp_port)?;
-                reject_unexpected(&parsed, &[IE_RECOVERY_TIME_STAMP, IE_PRIVATE_EXTENSION])?;
                 Ok(Self::EchoRequest(GtpuEchoRequest {
                     sequence_number: required_sequence(message)?,
                     optional: parsed.into_optional(),
@@ -1090,10 +1093,6 @@ impl GtpuControlMessage {
             GTPU_MESSAGE_ECHO_RESPONSE => {
                 validate_zero_teid_and_sequence(message)?;
                 reject_udp_port(udp_port)?;
-                reject_unexpected(
-                    &parsed,
-                    &[IE_RECOVERY, IE_RECOVERY_TIME_STAMP, IE_PRIVATE_EXTENSION],
-                )?;
                 if !parsed.recovery {
                     return Err(missing(IE_RECOVERY, message_end));
                 }
@@ -1106,15 +1105,6 @@ impl GtpuControlMessage {
             }
             GTPU_MESSAGE_ERROR_INDICATION => {
                 validate_zero_teid_and_sequence(message)?;
-                reject_unexpected(
-                    &parsed,
-                    &[
-                        IE_TEID_DATA_I,
-                        IE_GTPU_PEER_ADDRESS,
-                        IE_RECOVERY_TIME_STAMP,
-                        IE_PRIVATE_EXTENSION,
-                    ],
-                )?;
                 let teid_data_i = parsed
                     .teid_data_i
                     .ok_or_else(|| missing(IE_TEID_DATA_I, message_end))?;
@@ -1138,10 +1128,6 @@ impl GtpuControlMessage {
             GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION => {
                 validate_zero_teid_and_sequence(message)?;
                 reject_udp_port(udp_port)?;
-                reject_unexpected(
-                    &parsed,
-                    &[IE_EXTENSION_HEADER_TYPE_LIST, IE_PRIVATE_EXTENSION],
-                )?;
                 let supported_types = parsed
                     .extension_header_type_list
                     .ok_or_else(|| missing(IE_EXTENSION_HEADER_TYPE_LIST, message_end))?;
@@ -1162,7 +1148,6 @@ impl GtpuControlMessage {
                     ));
                 }
                 reject_udp_port(udp_port)?;
-                reject_unexpected(&parsed, &[IE_PRIVATE_EXTENSION])?;
                 Ok(Self::EndMarker(GtpuEndMarker {
                     teid: GtpuTunnelEndpointId::new(message.header.teid),
                     private_extensions: parsed.private_extensions,
@@ -1619,15 +1604,53 @@ impl ParsedIes {
     }
 }
 
+// TS 29.060 Table 37: even GTP-C-only TV elements have a known boundary
+// and must be skipped on GTP-U (§11.1.11, via TS 29.281 §9.1).
+fn tv_value_len(ie_type: u8) -> Option<usize> {
+    match ie_type {
+        1 | 8 | 11 | 13..=15 | 19..=21 | 23..=24 | 29 => Some(1),
+        2 => Some(8),
+        3 => Some(6),
+        4..=5 | 16..=17 | 127 => Some(4),
+        9 => Some(28),
+        12 => Some(3),
+        18 => Some(5),
+        22 => Some(9),
+        25..=28 => Some(2),
+        _ => None,
+    }
+}
+
+fn allowed_ies(message_type: u8) -> &'static [u8] {
+    match message_type {
+        GTPU_MESSAGE_ECHO_REQUEST => &[IE_RECOVERY_TIME_STAMP, IE_PRIVATE_EXTENSION],
+        GTPU_MESSAGE_ECHO_RESPONSE => &[IE_RECOVERY, IE_RECOVERY_TIME_STAMP, IE_PRIVATE_EXTENSION],
+        GTPU_MESSAGE_ERROR_INDICATION => &[
+            IE_TEID_DATA_I,
+            IE_GTPU_PEER_ADDRESS,
+            IE_RECOVERY_TIME_STAMP,
+            IE_PRIVATE_EXTENSION,
+        ],
+        GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION => {
+            &[IE_EXTENSION_HEADER_TYPE_LIST, IE_PRIVATE_EXTENSION]
+        }
+        GTPU_MESSAGE_END_MARKER => &[IE_PRIVATE_EXTENSION],
+        _ => &[],
+    }
+}
+
 fn parse_ies(
     payload: &[u8],
     payload_base: usize,
+    message_type: u8,
     ctx: DecodeContext,
 ) -> Result<ParsedIes, GtpuControlCodecError> {
     let mut parsed = ParsedIes::default();
     let mut offset = 0usize;
     let mut count = 0usize;
     let mut previous_type = None;
+    let mut seen = [false; 256];
+    let allowed = allowed_ies(message_type);
 
     while offset < payload.len() {
         let datagram_offset = payload_base
@@ -1649,156 +1672,116 @@ fn parse_ies(
         }
         previous_type = Some(ie_type);
 
-        match ie_type {
-            IE_RECOVERY => {
+        let (header_len, value_len) = match ie_type {
+            0..=127 => (
+                1,
+                tv_value_len(ie_type).ok_or_else(|| {
+                    GtpuControlCodecError::new(
+                        GtpuControlCodecErrorCode::UnknownTvIe { ie_type },
+                        datagram_offset,
+                    )
+                })?,
+            ),
+            IE_EXTENSION_HEADER_TYPE_LIST => {
+                // Figure 8.5-1 uses a one-octet count, unlike other TLVs.
                 require_bytes(payload, offset, 2, datagram_offset)?;
-                if parsed.recovery {
-                    return Err(duplicate(ie_type, datagram_offset));
-                }
-                // The restart counter is explicitly receiver-ignored.
-                parsed.recovery = true;
-                parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                offset += 2;
+                (2, usize::from(payload[offset + 1]))
             }
+            _ => {
+                require_bytes(payload, offset, 3, datagram_offset)?;
+                (
+                    3,
+                    usize::from(u16::from_be_bytes([
+                        payload[offset + 1],
+                        payload[offset + 2],
+                    ])),
+                )
+            }
+        };
+        require_bytes(payload, offset, header_len + value_len, datagram_offset)?;
+        let value_start = offset + header_len;
+        offset = value_start + value_len;
+        let value = &payload[value_start..offset];
+
+        // TS 29.060 §11.1.12: first occurrence wins regardless of generic policy;
+        // TS 29.281 §8.6 explicitly permits repeatable Private Extensions.
+        if seen[usize::from(ie_type)] && ie_type != IE_PRIVATE_EXTENSION {
+            continue;
+        }
+        seen[usize::from(ie_type)] = true;
+        let defined = ie_type < 128
+            || matches!(
+                ie_type,
+                IE_GTPU_PEER_ADDRESS
+                    | IE_EXTENSION_HEADER_TYPE_LIST
+                    | IE_GTPU_TUNNEL_STATUS
+                    | IE_RECOVERY_TIME_STAMP
+                    | IE_PRIVATE_EXTENSION
+            );
+        if defined && !allowed.contains(&ie_type) {
+            continue;
+        }
+        if defined {
+            parsed.known_ie_offsets.push((ie_type, datagram_offset));
+        }
+        match ie_type {
+            IE_RECOVERY => parsed.recovery = true, // Restart counter is receiver-ignored.
             IE_TEID_DATA_I => {
-                require_bytes(payload, offset, 5, datagram_offset)?;
-                if parsed.teid_data_i.is_some() {
-                    return Err(duplicate(ie_type, datagram_offset));
-                }
                 parsed.teid_data_i = Some(GtpuTunnelEndpointId::new(u32::from_be_bytes([
-                    payload[offset + 1],
-                    payload[offset + 2],
-                    payload[offset + 3],
-                    payload[offset + 4],
-                ])));
-                parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                offset += 5;
+                    value[0], value[1], value[2], value[3],
+                ])))
             }
             IE_EXTENSION_HEADER_TYPE_LIST => {
-                // TS 29.281 figure 8.5-1: type, one-octet count, then n
-                // extension types. Do not apply the generic TLV u16 length.
-                require_bytes(payload, offset, 2, datagram_offset)?;
-                let value_len = usize::from(payload[offset + 1]);
-                require_bytes(payload, offset, 2 + value_len, datagram_offset)?;
-                if parsed.extension_header_type_list.is_some() {
-                    return Err(duplicate(ie_type, datagram_offset));
-                }
-                let end = offset + 2 + value_len;
-                let types = payload[offset + 2..end]
-                    .iter()
-                    .copied()
-                    .map(GtpuExtensionHeaderType::new);
+                let types = value.iter().copied().map(GtpuExtensionHeaderType::new);
                 parsed.extension_header_type_list = Some(
                     GtpuExtensionHeaderTypeList::new(types)
                         .map_err(|_| invalid_value(ie_type, datagram_offset))?,
                 );
-                parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                offset = end;
             }
-            0..=127 => {
-                return Err(GtpuControlCodecError::new(
-                    GtpuControlCodecErrorCode::UnknownTvIe { ie_type },
-                    datagram_offset,
+            IE_GTPU_PEER_ADDRESS => {
+                let address = match value {
+                    [a, b, c, d] => IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d)),
+                    bytes if bytes.len() == 16 => {
+                        let octets: [u8; 16] = bytes
+                            .try_into()
+                            .map_err(|_| invalid_length(ie_type, datagram_offset))?;
+                        IpAddr::V6(Ipv6Addr::from(octets))
+                    }
+                    _ => return Err(invalid_length(ie_type, datagram_offset)),
+                };
+                parsed.peer_address = Some(GtpuPeerAddress::new(address));
+            }
+            IE_RECOVERY_TIME_STAMP => {
+                if value.len() < 4 {
+                    return Err(invalid_length(ie_type, datagram_offset));
+                }
+                parsed.recovery_time_stamp = Some(GtpuRecoveryTimeStamp::from_received(
+                    u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
+                    Bytes::copy_from_slice(&value[4..]),
+                ));
+            }
+            IE_PRIVATE_EXTENSION => {
+                if value.len() < 2 {
+                    return Err(invalid_length(ie_type, datagram_offset));
+                }
+                parsed.private_extensions.push(GtpuPrivateExtension::new(
+                    u16::from_be_bytes([value[0], value[1]]),
+                    Bytes::copy_from_slice(&value[2..]),
                 ));
             }
             _ => {
-                require_bytes(payload, offset, 3, datagram_offset)?;
-                let value_len = usize::from(u16::from_be_bytes([
-                    payload[offset + 1],
-                    payload[offset + 2],
-                ]));
-                let value_start = offset.checked_add(3).ok_or_else(length_overflow)?;
-                let end = value_start
-                    .checked_add(value_len)
-                    .ok_or_else(length_overflow)?;
-                if end > payload.len() {
-                    return Err(GtpuControlCodecError::new(
-                        GtpuControlCodecErrorCode::TruncatedIe,
-                        datagram_offset,
-                    ));
+                // TS 29.060 §11.1.9 requires skipping unknown TLVs. Preserve
+                // retains opaque bytes; Reject has the same receive effect as Drop.
+                if ctx.unknown_ie_policy == UnknownIePolicy::Preserve {
+                    parsed.unknown_ies.push(GtpuUnknownControlIe {
+                        ie_type,
+                        value: Bytes::copy_from_slice(value),
+                    });
                 }
-                let value = &payload[value_start..end];
-                match ie_type {
-                    IE_GTPU_PEER_ADDRESS => {
-                        if parsed.peer_address.is_some() {
-                            return Err(duplicate(ie_type, datagram_offset));
-                        }
-                        let address = match value {
-                            [a, b, c, d] => IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d)),
-                            bytes if bytes.len() == 16 => {
-                                let octets: [u8; 16] = bytes
-                                    .try_into()
-                                    .map_err(|_| invalid_length(ie_type, datagram_offset))?;
-                                IpAddr::V6(Ipv6Addr::from(octets))
-                            }
-                            _ => return Err(invalid_length(ie_type, datagram_offset)),
-                        };
-                        parsed.peer_address = Some(GtpuPeerAddress::new(address));
-                        parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                    }
-                    IE_GTPU_TUNNEL_STATUS => {
-                        return Err(GtpuControlCodecError::new(
-                            GtpuControlCodecErrorCode::UnexpectedIe { ie_type },
-                            datagram_offset,
-                        ));
-                    }
-                    IE_RECOVERY_TIME_STAMP => {
-                        if parsed.recovery_time_stamp.is_some() {
-                            return Err(duplicate(ie_type, datagram_offset));
-                        }
-                        if value.len() < 4 {
-                            return Err(invalid_length(ie_type, datagram_offset));
-                        }
-                        parsed.recovery_time_stamp = Some(GtpuRecoveryTimeStamp::from_received(
-                            u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
-                            Bytes::copy_from_slice(&value[4..]),
-                        ));
-                        parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                    }
-                    IE_PRIVATE_EXTENSION => {
-                        if value.len() < 2 {
-                            return Err(invalid_length(ie_type, datagram_offset));
-                        }
-                        parsed.private_extensions.push(GtpuPrivateExtension::new(
-                            u16::from_be_bytes([value[0], value[1]]),
-                            Bytes::copy_from_slice(&value[2..]),
-                        ));
-                        parsed.known_ie_offsets.push((ie_type, datagram_offset));
-                    }
-                    _ => match ctx.unknown_ie_policy {
-                        UnknownIePolicy::Drop => {}
-                        UnknownIePolicy::Preserve => {
-                            parsed.unknown_ies.push(GtpuUnknownControlIe {
-                                ie_type,
-                                value: Bytes::copy_from_slice(value),
-                            });
-                        }
-                        UnknownIePolicy::Reject => {
-                            return Err(GtpuControlCodecError::new(
-                                GtpuControlCodecErrorCode::UnknownIe { ie_type },
-                                datagram_offset,
-                            ));
-                        }
-                    },
-                }
-                offset = end;
             }
         }
     }
-
     Ok(parsed)
-}
-
-fn reject_unexpected(parsed: &ParsedIes, allowed: &[u8]) -> Result<(), GtpuControlCodecError> {
-    for (ie_type, offset) in &parsed.known_ie_offsets {
-        if !allowed.contains(ie_type) {
-            return Err(GtpuControlCodecError::new(
-                GtpuControlCodecErrorCode::UnexpectedIe { ie_type: *ie_type },
-                *offset,
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn require_bytes(
@@ -1815,10 +1798,6 @@ fn require_bytes(
     } else {
         Ok(())
     }
-}
-
-fn duplicate(ie_type: u8, offset: usize) -> GtpuControlCodecError {
-    GtpuControlCodecError::new(GtpuControlCodecErrorCode::DuplicateIe { ie_type }, offset)
 }
 
 fn missing(ie_type: u8, datagram_end: usize) -> GtpuControlCodecError {

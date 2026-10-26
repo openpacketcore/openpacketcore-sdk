@@ -572,6 +572,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-gtpu`: network control receive always skips unexpected IEs,
+  uses the first singleton occurrence, and treats unknown TLV `Reject` as
+  `Drop`, as required by TS 29.060 11.1.9–11.1.12. Framing, ordering and
+  resource bounds still apply to ignored elements. (#1517, #1521, #1528)
+
 - `opc-proto-ikev2`: added variants to the exhaustive DH, PRF, encryption,
   signature-method, signature-public-key and key-error enums require downstream matches to
   be updated.
