@@ -402,7 +402,7 @@ mod tests {
                 self.alive.store(false, Ordering::Relaxed);
             }
             if self.observation.retry_followups.load(Ordering::Relaxed)
-                && *self.observation.proposals.lock().unwrap() % 2 == 0
+                && (*self.observation.proposals.lock().unwrap()).is_multiple_of(2)
             {
                 return Some(RosterMaintenanceOutcome::Retry);
             }

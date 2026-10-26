@@ -48918,10 +48918,43 @@ mod tests {
         let (_, key) = write_retirement_fixture_floor(&conn, bindings[0]);
         write_retirement_fixture_witness(&conn, &records);
 
-        maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
+        // Seed both bounded compaction phases explicitly: automatic maintenance
+        // may retire an eligible prefix between them. This fixture isolates
+        // retirement's full batch and final partial batch from that scheduling.
+        reclaim_protected_rosters_sync(&conn, identity(), maintenance_at)
             .expect("first payload compaction");
-        maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE state=3",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1_024,
+            "the first reclaim phase preserves its exact batch bound"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE state=2",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "one retained payload remains for the final reclaim phase"
+        );
+        reclaim_protected_rosters_sync(&conn, identity(), maintenance_at)
             .expect("final payload compaction");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM consensus_protected_roster_rows WHERE state=3",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1_025,
+            "both compaction phases are complete before testing retirement"
+        );
         assert!(retire_protected_rosters_sync(&conn, identity()).expect("maximum retirement batch"));
         assert!(
             protected_roster_read_retirement_cursor_sync(&conn, identity(), key)
