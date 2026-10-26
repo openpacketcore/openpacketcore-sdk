@@ -552,6 +552,7 @@ fn authorize(
             return Verdict::Drop(GtpuDownlinkDrop::Malformed);
         }
         GtpuControlDatagramKind::Control
+        | GtpuControlDatagramKind::TunnelStatus
         | GtpuControlDatagramKind::Unmodelled
         | GtpuControlDatagramKind::UnsupportedRequiredExtension => return Verdict::Control,
     }

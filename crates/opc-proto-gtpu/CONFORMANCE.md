@@ -4,7 +4,7 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 
 ## Specification Baseline
 - **Document**: 3GPP TS 29.281
-- **Release**: Release 18 (R18)
+- **Release**: Release 19 (TS 29.281 V19.2.0)
 - **Status**: Full support for User Plane GTPv1-U framing and the typed control-codec subset listed below
 
 ## Supported Features
@@ -66,7 +66,7 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 - **Known control extension**: the optional UDP Port extension on Error
   Indication is decoded and canonically encoded with exact four-octet length.
 
-### 6. Path and tunnel-management codec (§§7.2.1–7.2.3, 7.3.1–7.3.2, 8.1–8.6, 8.8)
+### 6. Path and tunnel-management codec (§§7.2.1–7.2.3, 7.3.1–7.3.3, 8.1–8.8)
 - **Echo Request/Response**: exact zero TEID and S-flag checks, sequence copying,
   mandatory Recovery, optional Recovery Time Stamp, and repeatable Private
   Extensions. Received Recovery counters are ignored and canonical output is
@@ -114,8 +114,13 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   and places it first as required by TS 29.281 figure 5.2.1-3 note 4. Unrelated
   optional unknown headers retain their relative order. Generic raw-preserving
   encoding continues to retain the accepted bytes exactly.
-- **Explicit exclusion**: Tunnel Status (§7.3.3 and §8.7) is not implemented
-  by this codec slice; its IE is skipped when received on another procedure.
+- **Tunnel Status** (§7.3.3 and §8.7): S flag zero, tunnel TEID, mandatory
+  Tunnel Status Information with SPOC, and repeatable Private Extensions.
+  Received spare bits are exposed but cleared on canonical send; future octets
+  are retained. The dataplane port classifies a valid message as `TunnelStatus`
+  for consumers to ignore when unsupported or when no tunnel exists. It grants
+  no charging or response authority. Tunnel lookup, pause-of-charging application
+  and upstream forwarding require consumer policy.
 
 ---
 
