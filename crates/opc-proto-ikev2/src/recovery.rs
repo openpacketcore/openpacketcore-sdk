@@ -5,7 +5,8 @@
 //! outcomes. A matching record is not proof of a storage acknowledgement. No
 //! effect or new packet may escape preparation before that acknowledgement.
 //!
-//! The sealed GCM and CBC profiles handle complete SK packets, not SKF recovery.
+//! The sealed GCM and CBC profiles handle SK and bilaterally negotiated SKF.
+//! Fragmentation requires bounded authenticated reassembly and exact packet-set persistence.
 //! Canonical sending requires current profile qualification. Sync requires
 //! persisted negotiated metadata and fixed event/clock
 //! budgets. The opt-in empty handler answers authenticated INFORMATIONAL requests
@@ -32,7 +33,9 @@ mod cbc_epoch;
 #[cfg(test)]
 pub(crate) mod cbc_test_fixtures;
 mod empty;
+mod fragmentation;
 mod liveness;
+mod message;
 mod packet;
 #[cfg(test)]
 mod probe;
@@ -49,7 +52,11 @@ mod sync_recovery_record;
 mod sync_responder;
 pub use cbc_epoch::{Ikev2CbcEpochInputs, Ikev2CbcEpochRecord};
 pub use empty::{Ikev2EmptyReply, Ikev2EmptyReplyObservation};
+pub use fragmentation::{
+    Ikev2FragmentReceive, Ikev2FragmentationParameters, Ikev2FragmentationSize,
+};
 pub use liveness::{Ikev2EmptyProbe, Ikev2LivenessProbePolicy, Ikev2LivenessRecord};
+pub use message::Ikev2ProtectedMessage;
 pub use packet::Ikev2AuthenticatedOrdinary;
 pub use profile::{Ikev2CbcRecoveryProfile, Ikev2GcmRecoveryProfile};
 pub use record::{
@@ -102,6 +109,10 @@ pub enum Ikev2WindowError {
     Exhausted,
     /// Stateless empty request is not durable work; use the opt-in probe API.
     NoDurableWork,
+    /// Authenticated SKF requires bilateral RFC 7383 negotiation.
+    FragmentationNotNegotiated,
+    /// Fragment count, message size, deadline arithmetic or datagram budget exceeded its bound.
+    FragmentationLimit,
     /// Enable the qualified canonical handler before admitting empty-request traffic.
     EmptyRepliesDisabled,
     /// Persist a positive unwritten-send bound before originating probes.
@@ -155,6 +166,8 @@ impl fmt::Display for Ikev2WindowError {
             Self::CommitMismatch => "ike_committed_window_commit_mismatch",
             Self::Exhausted => "ike_committed_window_exhausted",
             Self::NoDurableWork => "ike_committed_window_no_durable_work",
+            Self::FragmentationNotNegotiated => "ike_fragmentation_not_negotiated",
+            Self::FragmentationLimit => "ike_fragmentation_limit",
             Self::EmptyRepliesDisabled => "ike_committed_window_empty_replies_disabled",
             Self::LivenessDisabled => "ike_committed_window_liveness_disabled",
             Self::LivenessLeadExhausted => "ike_committed_window_liveness_lead_exhausted",
@@ -190,12 +203,18 @@ pub enum Ikev2OrdinaryRequestDisposition {
 
 /// Borrowed exact committed bytes. No allocation, effect or fresh liveness occurs.
 pub struct Ikev2ExactReplay<'a> {
-    bytes: &'a [u8],
+    message: &'a Ikev2ProtectedMessage,
 }
 impl Ikev2ExactReplay<'_> {
-    /// Original complete SK packet, unchanged including its Message ID and IV.
-    pub const fn bytes(&self) -> &[u8] {
-        self.bytes
+    /// Exact packets, each sent as a separate datagram under the consumer fence.
+    pub fn packets(&self) -> &[Bytes] {
+        self.message.packets()
+    }
+    /// Exact bytes when the message consists of one packet.
+    /// # Errors
+    /// Refuses a multi-packet message; use `packets` for fragmented transmission.
+    pub fn bytes(&self) -> Result<&[u8], Ikev2WindowError> {
+        self.message.single_packet()
     }
 }
 
@@ -276,6 +295,8 @@ pub struct Ikev2CommittedWindow<P: RecoveryProfile = Gcm> {
     observed_peer_request: Cell<Option<u32>>,
     receive: empty::ReceiveState<P>,
     send: liveness::SendState,
+    fragments: fragmentation::FragmentState,
+    packet_evidence: P::SyncEvidence,
     sync_live: bool,
     sync_closed: bool,
     sync_last_observed_unix_ms: Option<u64>,
@@ -342,6 +363,8 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             observed_peer_request: Cell::new(None),
             receive: empty::ReceiveState::new(record.next_receive),
             send: liveness::SendState::restore(record)?,
+            fragments: fragmentation::FragmentState::default(),
+            packet_evidence: P::SyncEvidence::default(),
             sync_live: false,
             sync_closed: false,
             sync_last_observed_unix_ms: record
@@ -375,8 +398,15 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             (&record.inbound, true, record.next_receive),
         ] {
             if let Some(entry) = entry {
-                let request = packet::open(expected, profile, keys, &entry.request, peer)
-                    .map_err(|_| Error::InvalidRecord)?;
+                let request = packet::open_message(
+                    expected,
+                    profile,
+                    keys,
+                    &entry.request,
+                    peer,
+                    record.fragmentation.is_some(),
+                )
+                .map_err(|_| Error::InvalidRecord)?;
                 request.require_work().map_err(|_| Error::InvalidRecord)?;
                 let highest = if !peer && entry.response.is_some() {
                     request.header.message_id.max(probe_id.unwrap_or(0))
@@ -390,8 +420,15 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
                     P::check_local_ordinary(&request, epoch)?;
                 }
                 if let Some(response) = &entry.response {
-                    let response = packet::open(expected, profile, keys, response, !peer)
-                        .map_err(|_| Error::InvalidRecord)?;
+                    let response = packet::open_message(
+                        expected,
+                        profile,
+                        keys,
+                        response,
+                        !peer,
+                        record.fragmentation.is_some(),
+                    )
+                    .map_err(|_| Error::InvalidRecord)?;
                     if !response.header.flags.response()
                         || response.header.message_id != request.header.message_id
                         || response.header.exchange_type != request.header.exchange_type
@@ -444,7 +481,9 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     /// # Errors
     /// Rejects key/domain mismatches, authentication, framing or inner-chain errors,
     /// and every sync Notify including mixed/malformed sync shapes at ordinary ID 0.
-    /// An otherwise applicable, authenticated SKF returns
+    /// Negotiated fragmentation consumers must use [`Self::receive_peer_packet`].
+    /// This complete-SK entry point retains the following compatibility behavior:
+    /// an otherwise applicable, authenticated SKF returns
     /// [`Ikev2WindowError::UnsupportedShape`] before parsing its partial inner
     /// chain. Unauthenticated or foreign packets remain ordinary drops.
     pub fn open_peer(
@@ -484,6 +523,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     }
 
     fn lifecycle_ready(&self) -> Result<(), Ikev2WindowError> {
+        self.fragments.ready()?;
         if self.sync_closed {
             return Err(Ikev2WindowError::SyncClosed);
         }
@@ -556,7 +596,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             payloads,
         )?;
         record.outbound = Some(Ikev2CommittedExchangeRecord {
-            request: request.into_wire(),
+            request: Ikev2ProtectedMessage::single(request.into_wire()),
             response: None,
             outcome: None,
         });
@@ -649,7 +689,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         )?;
         record.inbound = Some(Ikev2CommittedExchangeRecord {
             request: request.wire.clone(),
-            response: Some(response.into_wire()),
+            response: Some(Ikev2ProtectedMessage::single(response.into_wire())),
             outcome: Some(outcome.clone()),
         });
         record.next_receive = request.header.message_id.checked_add(1);
@@ -672,9 +712,11 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         let mut record = self.next_record()?;
         let outbound = record.outbound.as_mut().ok_or(Ikev2WindowError::Drop)?;
         // The request header was constructed or authenticated when the record was restored.
-        let (_, request_header) =
-            crate::decode_header(&outbound.request, opc_protocol::DecodeContext::default())
-                .map_err(|_| Ikev2WindowError::InvalidRecord)?;
+        let (_, request_header) = crate::decode_header(
+            &outbound.request.packets()[0],
+            opc_protocol::DecodeContext::default(),
+        )
+        .map_err(|_| Ikev2WindowError::InvalidRecord)?;
         if response.domain != record.domain
             || !response.header.flags.response()
             || outbound.response.is_some()
@@ -703,7 +745,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             .as_ref()
             .filter(|entry| entry.response.is_none())
             .map(|entry| Ikev2ExactReplay {
-                bytes: &entry.request,
+                message: &entry.request,
             }))
     }
 
@@ -726,13 +768,13 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         if !self.cached_response_applies(request) {
             return Err(Ikev2WindowError::Drop);
         }
-        let bytes = self
+        let message = self
             .record
             .inbound
             .as_ref()
-            .and_then(|entry| entry.response.as_deref())
+            .and_then(|entry| entry.response.as_ref())
             .ok_or(Ikev2WindowError::InvalidRecord)?;
-        Ok(Ikev2ExactReplay { bytes })
+        Ok(Ikev2ExactReplay { message })
     }
 
     fn cached_response_applies(&self, request: &Ikev2AuthenticatedOrdinary<P>) -> bool {
@@ -831,6 +873,7 @@ macro_rules! redacted_debug {
     })* };
 }
 redacted_debug!(
+    Ikev2ProtectedMessage,
     Ikev2CommittedExchangeRecord,
     Ikev2WindowCommit,
     Ikev2ExactReplay<'_>,
@@ -871,6 +914,7 @@ macro_rules! profile_lifetime_redacted_debug {
 }
 profile_lifetime_redacted_debug!(
     Ikev2PreparedWindow,
+    Ikev2FragmentReceive,
     Ikev2EmptyReply,
     Ikev2AdmittedSyncResponse,
     Ikev2PreparedSyncResponse,

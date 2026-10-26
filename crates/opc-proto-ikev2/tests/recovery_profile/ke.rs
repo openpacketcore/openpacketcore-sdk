@@ -499,7 +499,7 @@ pub fn restore_checkpoint(runtime: &Runtime, operation: &Operation) -> Result<Dh
         crate::canonical_fixtures::opposite(row.direction),
     );
     let opened = wire
-        .open(request.request())
+        .open_message(request.request())
         .map_err(|error| wire_error(error, Error::Format))?;
     let fields = parts(row, operation.kind, operation.group, &opened, false)?;
     if opened.first.as_u8() != operation.first_payload
@@ -553,7 +553,7 @@ pub fn plan_initiator(
         row.spis,
         crate::canonical_fixtures::opposite(row.direction),
     )
-    .open(row.window.outbound.as_ref().ok_or(Error::Format)?.request())
+    .open_message(row.window.outbound.as_ref().ok_or(Error::Format)?.request())
     .map_err(|error| wire_error(error, Error::Integrity))?;
     if packet.header.message_id != request.header.message_id
         || operation.outcome != Outcome::Pending
@@ -820,7 +820,7 @@ pub fn send_failed_child_delete(
                 runtime.row.spis,
                 crate::canonical_fixtures::opposite(runtime.row.direction),
             )
-            .open(entry.request())
+            .open_message(entry.request())
             .map_err(|error| wire_error(error, Error::Integrity))?;
             if request.header.exchange_type != 37 || request.first != first || request.body != body
             {
@@ -871,7 +871,7 @@ pub fn finish_failed_child_delete(
         row.spis,
         crate::canonical_fixtures::opposite(row.direction),
     )
-    .open(entry.request())
+    .open_message(entry.request())
     .map_err(|error| wire_error(error, Error::Integrity))?;
     let expected = child_delete(operation.spis.0)?;
     if entry.response().is_some()
@@ -925,7 +925,7 @@ pub fn validate_row(row: &Row) -> Result<(), Error> {
             row.direction
         };
         let packet = Wire::new(row.profile, &row.keys, row.spis, sending)
-            .open(entry.request())
+            .open_message(entry.request())
             .map_err(|error| wire_error(error, Error::Integrity))?;
         let has_ke = PayloadChain::new(packet.first, &packet.body)
             .iter()
@@ -975,7 +975,7 @@ pub fn validate_row(row: &Row) -> Result<(), Error> {
                 row.spis,
                 crate::canonical_fixtures::opposite(sending),
             )
-            .open(entry.response().ok_or(Error::Format)?)
+            .open_message(entry.response().ok_or(Error::Format)?)
             .map_err(|_| Error::Integrity)?;
             if response.header.message_id != packet.header.message_id {
                 return Err(Error::Format);

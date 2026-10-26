@@ -317,6 +317,8 @@ fn sync_metadata_round_trips_and_ordinary_commits_retain_request_history() {
             record.next_receive(),
             record.outbound().cloned(),
             record.inbound().cloned(),
+            None,
+            None,
         )
         .unwrap()
         .with_sync_state(rebuilt_state)
@@ -340,6 +342,8 @@ fn sync_metadata_round_trips_and_ordinary_commits_retain_request_history() {
             record.next_receive(),
             record.outbound().cloned(),
             record.inbound().cloned(),
+            None,
+            None,
         )
         .unwrap()
         .with_sync_state(missing_history)
@@ -386,9 +390,17 @@ fn sync_metadata_refuses_foreign_agreements_and_impossible_history() {
             0,
         )
         .unwrap();
-        let record =
-            Record::from_persisted(fixture.domain.clone(), 1, Some(5), Some(5), None, None)
-                .unwrap();
+        let record = Record::from_persisted(
+            fixture.domain.clone(),
+            1,
+            Some(5),
+            Some(5),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(matches!(
             record.with_sync_state(state),
             Err(Error::InvalidRecord)
@@ -454,11 +466,19 @@ fn restoring_sync_disposition_keeps_ordinary_work_and_replay_blocked() {
             0,
         )
         .unwrap();
-        let record =
-            Record::from_persisted(fixture.domain.clone(), 1, Some(3), Some(4), None, None)
-                .unwrap()
-                .with_sync_state(state)
-                .unwrap();
+        let record = Record::from_persisted(
+            fixture.domain.clone(),
+            1,
+            Some(3),
+            Some(4),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_sync_state(state)
+        .unwrap();
         let mut window = fixture.restore(&record);
         assert!(matches!(window.replay_request(), Err(error) if error == expected));
         let peer = fixture.peer(4, false, Exchange::Informational, delete(), 100);
@@ -497,9 +517,17 @@ fn first_request_is_committed_before_replay_for_every_gcm_size_and_original_role
             );
             let expected =
                 fixture.packet(direction, 0, false, Exchange::Informational, delete(), 0);
-            assert_eq!(record.outbound().unwrap().request(), expected.as_ref());
             assert_eq!(
-                window.replay_request().unwrap().unwrap().bytes(),
+                record
+                    .outbound()
+                    .unwrap()
+                    .request()
+                    .single_packet()
+                    .unwrap(),
+                expected.as_ref()
+            );
+            assert_eq!(
+                window.replay_request().unwrap().unwrap().bytes().unwrap(),
                 expected.as_ref()
             );
             assert_eq!(window.record().next_send(), Some(1));
@@ -507,7 +535,7 @@ fn first_request_is_committed_before_replay_for_every_gcm_size_and_original_role
             assert_eq!(window.apply_committed(effect).unwrap(), None);
             for _ in 0..10 {
                 assert_eq!(
-                    window.replay_request().unwrap().unwrap().bytes(),
+                    window.replay_request().unwrap().unwrap().bytes().unwrap(),
                     expected.as_ref()
                 );
             }
@@ -517,7 +545,8 @@ fn first_request_is_committed_before_replay_for_every_gcm_size_and_original_role
                     .replay_request()
                     .unwrap()
                     .unwrap()
-                    .bytes(),
+                    .bytes()
+                    .unwrap(),
                 expected.as_ref()
             );
             assert!(matches!(
@@ -572,7 +601,11 @@ fn matching_authenticated_response_settles_once_and_suppresses_request_replay() 
                 .unwrap(),
         );
         assert_eq!(
-            settled.outbound().unwrap().response(),
+            settled
+                .outbound()
+                .unwrap()
+                .response()
+                .map(|message| message.single_packet().unwrap()),
             Some(packet.as_ref())
         );
         assert_eq!(
@@ -607,10 +640,13 @@ fn matching_authenticated_response_settles_once_and_suppresses_request_replay() 
                 .unwrap(),
         );
         assert_eq!(
-            &next.outbound().unwrap().request()[20..24],
+            &next.outbound().unwrap().request().single_packet().unwrap()[20..24],
             &1_u32.to_be_bytes()
         );
-        assert_eq!(iv(next.outbound().unwrap().request()), 1); // Replays allocated nothing.
+        assert_eq!(
+            iv(next.outbound().unwrap().request().single_packet().unwrap()),
+            1
+        ); // Replays allocated nothing.
     }
 }
 
@@ -642,8 +678,13 @@ fn dropped_or_mismatched_commit_quiesces_until_readback_without_sending_new_byte
     // Readback finds the write landed: exact replay, without constructing new bytes.
     window = fixture.restore(&candidate);
     assert_eq!(
-        window.replay_request().unwrap().unwrap().bytes(),
-        candidate.outbound().unwrap().request()
+        window.replay_request().unwrap().unwrap().bytes().unwrap(),
+        candidate
+            .outbound()
+            .unwrap()
+            .request()
+            .single_packet()
+            .unwrap()
     );
     // Alternatively it did not land, and older writes have been fenced out.
     window = fixture.restore(&old);
@@ -657,7 +698,16 @@ fn dropped_or_mismatched_commit_quiesces_until_readback_without_sending_new_byte
             delete(),
         )
         .unwrap();
-    assert_eq!(iv(prepared.record().outbound().unwrap().request()), 1);
+    assert_eq!(
+        iv(prepared
+            .record()
+            .outbound()
+            .unwrap()
+            .request()
+            .single_packet()
+            .unwrap()),
+        1
+    );
     drop(prepared); // Cancellation is uncertain, not an implicit abort acknowledgement.
     assert!(matches!(
         window.replay_request(),
@@ -723,7 +773,7 @@ fn inbound_window_is_strict_and_only_the_last_exact_authenticated_request_replay
             Disposition::CachedResponse
         );
         assert_eq!(
-            window.replay_response(&opened).unwrap().bytes(),
+            window.replay_response(&opened).unwrap().bytes().unwrap(),
             expected.as_ref()
         );
         let changed = fixture.peer(5, false, Exchange::Informational, delete(), 51);
@@ -749,7 +799,10 @@ fn inbound_window_is_strict_and_only_the_last_exact_authenticated_request_replay
                 .unwrap(),
         );
         assert_eq!(window.request_disposition(&opened), Err(Error::Drop));
-        assert_eq!(iv(window.replay_response(&next).unwrap().bytes()), 1);
+        assert_eq!(
+            iv(window.replay_response(&next).unwrap().bytes().unwrap()),
+            1
+        );
     }
 }
 
@@ -792,8 +845,14 @@ fn neither_success_nor_error_response_is_released_before_its_outcome_commit() {
             Disposition::CachedResponse
         );
         assert_eq!(
-            window.replay_response(&opened).unwrap().bytes(),
-            landed.inbound().unwrap().response().unwrap()
+            window.replay_response(&opened).unwrap().bytes().unwrap(),
+            landed
+                .inbound()
+                .unwrap()
+                .response()
+                .unwrap()
+                .single_packet()
+                .unwrap()
         );
     }
 }
@@ -990,6 +1049,8 @@ fn restore_checks_both_key_domains_counters_and_exact_response_identity() {
         Some(0),
         record.outbound().cloned(),
         None,
+        None,
+        None,
     )
     .unwrap();
     assert!(Window::restore(
@@ -1002,7 +1063,14 @@ fn restore_checks_both_key_domains_counters_and_exact_response_identity() {
     .is_err());
     let wrong_response = fixture.peer(1, true, Exchange::Informational, empty(), 130);
     let exchange = ExchangeRecord::from_persisted(
-        Bytes::copy_from_slice(record.outbound().unwrap().request()),
+        Bytes::copy_from_slice(
+            record
+                .outbound()
+                .unwrap()
+                .request()
+                .single_packet()
+                .unwrap(),
+        ),
         Some(wrong_response),
         Some(Bytes::new()),
     )
@@ -1013,6 +1081,8 @@ fn restore_checks_both_key_domains_counters_and_exact_response_identity() {
         Some(1),
         Some(0),
         Some(exchange),
+        None,
+        None,
         None,
     )
     .unwrap();
@@ -1030,6 +1100,8 @@ fn restore_checks_both_key_domains_counters_and_exact_response_identity() {
         u64::MAX,
         Some(0),
         Some(0),
+        None,
+        None,
         None,
         None,
     )
@@ -1093,6 +1165,8 @@ fn restore_requires_iv_high_water_above_every_locally_sent_cached_iv() {
                     Some(u32::from(inbound.is_some())),
                     outbound,
                     inbound,
+                    None,
+                    None,
                 )
                 .unwrap();
                 let highest = request_iv.into_iter().chain(response_iv).max().unwrap();

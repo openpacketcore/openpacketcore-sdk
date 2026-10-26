@@ -580,6 +580,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Persist explicit liveness metadata with every atomic window row; missing or
   unknown format fields must be rejected. Crossing this stored-record change
   requires a fresh install. Refs #1241, #1352.
+- `opc-proto-ikev2` recovery supports negotiated RFC 7383 fragmentation. Exchange
+  records retain ordered `Ikev2ProtectedMessage` packet collections; callers
+  must persist and replay every `packets()` entry. Single-packet accessors now
+  return a `Result`. Persist the explicit `fragmentation` option when rebuilding
+  window records; the strict test consumer row format is version 4. Negotiated
+  consumers use `receive_peer_packet`, with bounded reassembly, scheduled expiry,
+  and authenticated fragment-1 response replay. (#1242)
 
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned

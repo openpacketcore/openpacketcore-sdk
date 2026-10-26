@@ -185,6 +185,8 @@ fn invalid_peer_ke_request_commits_invalid_syntax() {
             .unwrap()
             .response()
             .unwrap()
+            .single_packet()
+            .unwrap()
             .to_vec();
         drop(runtime);
         let mut runtime = Runtime::restore(
@@ -500,6 +502,8 @@ fn invalid_peer_ke_response_commits_terminal_outcome() {
             .as_ref()
             .unwrap()
             .request()
+            .single_packet()
+            .unwrap()
             .to_vec();
         drop(runtime);
         let mut runtime = Runtime::restore(

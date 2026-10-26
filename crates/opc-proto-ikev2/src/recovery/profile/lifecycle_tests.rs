@@ -304,8 +304,18 @@ fn cbc_all_seven_witnesses_accept_only_exact_cancelled_or_landed_readback() {
                         );
                         if landed {
                             assert_eq!(
-                                window.replay_response(&work(&f, 11, 0)).unwrap().bytes(),
-                                candidate.inbound().unwrap().response().unwrap()
+                                window
+                                    .replay_response(&work(&f, 11, 0))
+                                    .unwrap()
+                                    .bytes()
+                                    .unwrap(),
+                                candidate
+                                    .inbound()
+                                    .unwrap()
+                                    .response()
+                                    .unwrap()
+                                    .single_packet()
+                                    .unwrap()
                             );
                             let bytes = window
                                 .reply_empty(&f.request(12, 0))

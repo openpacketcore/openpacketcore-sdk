@@ -429,6 +429,7 @@ impl<P: RecoveryProfile> Window<P> {
             header,
             PayloadChain::new(PayloadType::NoNext, &[]),
         )?;
+        P::retain_sealed(&mut self.packet_evidence, &sealed)?;
         let wire = sealed.into_wire();
         self.send.next = id.checked_add(1);
         self.send.highest_probe = Some(id);

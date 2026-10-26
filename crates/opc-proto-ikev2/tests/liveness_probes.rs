@@ -167,6 +167,7 @@ fn a_pending_probe_allows_peer_requests_but_serializes_local_rekey_and_delete() 
         .replay_response(&incoming)
         .unwrap()
         .bytes()
+        .unwrap()
         .to_vec();
     assert_eq!(peer.receive(&reply), Ok(Event::Completed(0)));
     assert_eq!(f.window.retry_empty_probe(110).unwrap().bytes(), probe);
@@ -185,7 +186,14 @@ fn a_pending_probe_allows_peer_requests_but_serializes_local_rekey_and_delete() 
         .unwrap();
     let row = prepared.record().clone();
     let _commit = prepared.commit_after_durable(&row).unwrap();
-    let request = f.window.replay_request().unwrap().unwrap().bytes().to_vec();
+    let request = f
+        .window
+        .replay_request()
+        .unwrap()
+        .unwrap()
+        .bytes()
+        .unwrap()
+        .to_vec();
     assert_eq!(peer.receive(&request), Ok(Event::NewRequest(1)));
     assert!(matches!(
         f.window
@@ -200,7 +208,10 @@ fn a_pending_probe_allows_peer_requests_but_serializes_local_rekey_and_delete() 
         &f.iv,
     )
     .unwrap();
-    assert_eq!(restored.replay_request().unwrap().unwrap().bytes(), request);
+    assert_eq!(
+        restored.replay_request().unwrap().unwrap().bytes().unwrap(),
+        request
+    );
 }
 
 #[test]
@@ -726,6 +737,8 @@ fn persisted_probe_shape_authentication_and_iv_coverage_are_checked() {
             2,
             Some(1),
             Some(0),
+            None,
+            None,
             None,
             None,
         )

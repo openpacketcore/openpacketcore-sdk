@@ -36,7 +36,7 @@ macro_rules! window {
     };
 }
 
-fn setup(row: &Row) -> (Provider, CasStore, EpochOwners, Command, Runtime) {
+pub(super) fn setup(row: &Row) -> (Provider, CasStore, EpochOwners, Command, Runtime) {
     let provider = Provider::new();
     let mut store = CasStore::new(7);
     let owners = EpochOwners::new(7);
@@ -164,7 +164,7 @@ fn complete(runtime: &mut Runtime, wire: &[u8]) -> Result<u32, Error> {
     })
 }
 
-fn recover(
+pub(super) fn recover(
     runtime: &mut Runtime,
     provider: &Provider,
     store: &mut CasStore,
@@ -591,7 +591,10 @@ fn folding_probes_preserves_the_settled_outcome_and_keeps_the_row_restorable() {
             Some(Bytes::from_static(b"settled"))
         );
         let settled = runtime.row.window.outbound.clone().unwrap();
-        assert_eq!(settled.response(), Some(answer.as_ref()));
+        assert_eq!(
+            settled.response().unwrap().single_packet(),
+            Ok(answer.as_ref())
+        );
         assert_eq!(settled.outcome(), Some(b"settled".as_slice()));
         enable(&mut runtime, &provider, &mut store, 4, Cut::Complete);
         assert_eq!(send(&mut runtime, &mut transport), Ok(1));

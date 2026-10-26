@@ -325,7 +325,7 @@ impl Runtime {
             self.row.direction
         };
         super::wire::Wire::new(self.row.profile, &self.row.keys, self.row.spis, sending)
-            .open(entry.request())
+            .open_message(entry.request())
             .is_ok_and(|packet| {
                 packet.header.exchange_type == 37
                     && packet.first == opc_proto_ikev2::PayloadType::Delete
@@ -442,7 +442,9 @@ impl Runtime {
             let Some(replay) = window.replay_request()? else {
                 return Ok(false);
             };
-            transport.submit(&permit, replay.bytes())?;
+            for packet in replay.packets() {
+                transport.submit(&permit, packet)?;
+            }
         });
         Ok(true)
     }
@@ -484,7 +486,9 @@ impl Runtime {
                 return Err(WindowError::Drop.into());
             }
             let replay = window.replay_response(&opened)?;
-            transport.submit(&permit, replay.bytes())?;
+            for packet in replay.packets() {
+                transport.submit(&permit, packet)?;
+            }
         });
         Ok(())
     }
@@ -845,10 +849,10 @@ impl Runtime {
         };
         if !terminal
             || entry.response().is_none_or(|reply| {
-                !transport
-                    .submitted
+                !reply
+                    .packets()
                     .iter()
-                    .any(|packet| packet.as_ref() == reply)
+                    .all(|packet| transport.submitted.contains(packet))
             })
         {
             return Err(Error::NotCommittedDelete);

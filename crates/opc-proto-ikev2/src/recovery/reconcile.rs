@@ -123,6 +123,7 @@ impl<P: RecoveryProfile> Window<P> {
             return Err(Error::InvalidRecord);
         };
         P::check_epoch_transition(&self.canonical_binding, epoch)?;
+        P::check_packet_evidence(&self.packet_evidence, epoch)?;
         Self::validate_record(&self.record.domain, profile, keys, record, epoch)?;
         if let Some(wire) = &self.send.latest_probe {
             let probe = super::packet::open(&self.record.domain, profile, keys, wire, false)
