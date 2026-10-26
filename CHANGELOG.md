@@ -531,6 +531,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream-zero DTLS control, exact-generation admission and bounded record
   correlation. (#1351)
 
+- Update vendored DTLS P-256/P-384/ECDSA dependencies above the
+  RUSTSEC-2026-0387 arithmetic floor and its standalone `time` dependency
+  above RUSTSEC-2026-0009. OS randomness failures propagate as errors;
+  uncompressed public points and wire signature formats remain unchanged.
+  The vendored minimum Rust version becomes 1.88, below the SDK's 1.89 floor.
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a

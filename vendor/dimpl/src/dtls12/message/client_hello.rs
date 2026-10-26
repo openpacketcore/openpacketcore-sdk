@@ -134,7 +134,7 @@ impl ClientHello {
         let (input, cookie) = Cookie::parse(input)?;
         let (input, cipher_suites_len) = be_u16(input)?;
         let (input, input_cipher) = take(cipher_suites_len)(input)?;
-        let renegotiation_scsv = input_cipher.chunks_exact(2).any(|c| c == [0, 0xff]);
+        let renegotiation_scsv = input_cipher.as_chunks::<2>().0.contains(&[0, 0xff]);
         let (rest, cipher_suites) =
             many1(Dtls12CipherSuite::parse, Dtls12CipherSuite::is_supported)(input_cipher)?;
         if !rest.is_empty() {

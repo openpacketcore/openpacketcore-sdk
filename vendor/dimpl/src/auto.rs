@@ -308,18 +308,18 @@ impl ClientPending {
             self.retransmit_at = Some(now + Duration::from_secs(1));
             return Ok(());
         }
-        if let Some(deadline) = self.retransmit_at {
-            if now >= deadline {
-                if self.retransmit_count >= self.config.flight_retries() {
-                    return Err(Error::Timeout(TimeoutError::HybridClientHello));
-                }
-                self.retransmit_count += 1;
-                self.needs_send = true;
-                // Exponential backoff: 2s, 4s, 8s, ...
-                let shift = self.retransmit_count.min(5) as u32;
-                let rto = Duration::from_secs(1u64 << shift);
-                self.retransmit_at = Some(now + rto);
+        if let Some(deadline) = self.retransmit_at
+            && now >= deadline
+        {
+            if self.retransmit_count >= self.config.flight_retries() {
+                return Err(Error::Timeout(TimeoutError::HybridClientHello));
             }
+            self.retransmit_count += 1;
+            self.needs_send = true;
+            // Exponential backoff: 2s, 4s, 8s, ...
+            let shift = self.retransmit_count.min(5) as u32;
+            let rto = Duration::from_secs(1u64 << shift);
+            self.retransmit_at = Some(now + rto);
         }
         Ok(())
     }
@@ -481,7 +481,9 @@ mod tests {
         offset += 2;
 
         body[offset..offset + suites_len]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
             .collect()
     }

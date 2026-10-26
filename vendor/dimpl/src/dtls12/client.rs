@@ -1344,38 +1344,38 @@ impl State {
         client.local_events.push_back(LocalEvent::Connected);
 
         // Extract and emit SRTP keying material if we have a negotiated profile
-        if !client.engine.config().rfc6083_sctp() {
-            if let Some(profile) = client.negotiated_srtp_profile {
-                let suite_hash = client
-                    .engine
-                    .cipher_suite()
-                    .ok_or(Error::InvalidState(
-                        crate::InvalidStateError::NoCipherSuiteSelected,
-                    ))?
-                    .hash_algorithm();
+        if !client.engine.config().rfc6083_sctp()
+            && let Some(profile) = client.negotiated_srtp_profile
+        {
+            let suite_hash = client
+                .engine
+                .cipher_suite()
+                .ok_or(Error::InvalidState(
+                    crate::InvalidStateError::NoCipherSuiteSelected,
+                ))?
+                .hash_algorithm();
 
-                let mut out = client.engine.pop_buffer();
-                let mut scratch = client.engine.pop_buffer();
-                if let Ok(keying_material) = client
-                    .engine
-                    .crypto_context()
-                    .extract_srtp_keying_material(profile, suite_hash, &mut out, &mut scratch)
-                {
-                    client.engine.push_buffer(out);
-                    client.engine.push_buffer(scratch);
-                    // Emit the keying material event with the negotiated profile
-                    debug!(
-                        "SRTP keying material extracted ({} bytes) for profile: {:?}",
-                        keying_material.len(),
-                        profile
-                    );
-                    client
-                        .local_events
-                        .push_back(LocalEvent::KeyingMaterial(keying_material, profile));
-                } else {
-                    client.engine.push_buffer(out);
-                    client.engine.push_buffer(scratch);
-                }
+            let mut out = client.engine.pop_buffer();
+            let mut scratch = client.engine.pop_buffer();
+            if let Ok(keying_material) = client
+                .engine
+                .crypto_context()
+                .extract_srtp_keying_material(profile, suite_hash, &mut out, &mut scratch)
+            {
+                client.engine.push_buffer(out);
+                client.engine.push_buffer(scratch);
+                // Emit the keying material event with the negotiated profile
+                debug!(
+                    "SRTP keying material extracted ({} bytes) for profile: {:?}",
+                    keying_material.len(),
+                    profile
+                );
+                client
+                    .local_events
+                    .push_back(LocalEvent::KeyingMaterial(keying_material, profile));
+            } else {
+                client.engine.push_buffer(out);
+                client.engine.push_buffer(scratch);
             }
         }
 
