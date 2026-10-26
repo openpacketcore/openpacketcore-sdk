@@ -1026,6 +1026,7 @@ impl SessionConsumerRoster {
             .map(|member| SessionConsumerVoterAuthority {
                 scope: self.scope,
                 member,
+                ordinal: self.consensus_members.range(..node_id).count(),
                 voter_count: self.consensus_members.len(),
                 roster_commitment: self.roster_commitment,
                 roster_attestation_root_identity: self.roster_attestation_root_identity,
@@ -1066,12 +1067,19 @@ impl fmt::Debug for SessionConsumerRoster {
 pub struct SessionConsumerVoterAuthority {
     scope: SessionConsumerScope,
     member: SessionConsumerRosterMember,
+    ordinal: usize,
     voter_count: usize,
     roster_commitment: SessionConsumerRosterCommitment,
     roster_attestation_root_identity: Option<RosterAttestationTrustRootIdentityV1>,
 }
 
 impl SessionConsumerVoterAuthority {
+    /// Zero-based position in canonical node-ID order, suitable for value-free
+    /// routing diagnostics. This position grants no authority by itself.
+    pub const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
     /// Exact consensus scope shared by the voter roster.
     pub const fn scope(&self) -> SessionConsumerScope {
         self.scope

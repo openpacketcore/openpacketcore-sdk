@@ -18,15 +18,27 @@ decisions or wall-clock fallbacks.
   clock and never requests a capability.
 - `KernelClockAdjustment`: an immutable snapshot with
   `is_synchronized()`, `max_error_microseconds()` and
-  `estimated_error_microseconds()`.
+  `estimated_error_microseconds()`. `realtime_snapshot()` also exposes atomic
+  `timex.time`, state/status, precision and scaled oscillator tolerance.
 - Unsupported platforms compile to a stub whose read fails with
   `io::ErrorKind::Unsupported`; an unsynchronized Linux clock is a successful
   read with `is_synchronized() == false`, not an error.
 
-The kernel's `timex.maxerror` is a maximum error, while `timex.esterror` is an
-estimate. Callers that need a bounded authentication interval must use the
-maximum and apply their own fixed acceptance budget; they must not widen that
-budget on retry.
+The safe adapter validates both `maxerror` and `esterror` and takes their larger
+value. A conservative interval also includes precision, quantization, tolerance
+and measured sampling time, using `timex.time` from the same query. The fixed
+acceptance budget must never widen on retry. Linux increases `maxerror` by
+0.5 ms per second between daemon updates. Size the fixed budget for root distance
+plus that growth over the longest actual update interval, plus about 1 ms for
+sampling/precision (or more for measured sampling spans). For example, root
+distance at most 50 ms and successful updates within 1,024 seconds need at least
+563 ms with a 1 ms sampling allowance; the safe adapter's example uses 600 ms.
+Chrony's default `maxpoll 10` allows that poll interval but does not guarantee
+successful updates during packet loss. See the
+[adapter's deployment guidance](../opc-session-net/README.md#authentication-time-source).
+`is_synchronized()` rejects unknown
+states, `TIME_OOP` (the repeating leap second), contradictory leap flags, kernel
+clock faults and broken PPS discipline; it does not validate an error budget.
 
 ## Platform contract
 
@@ -36,7 +48,8 @@ budget on retry.
 - The values are the kernel NTP state, not a portable wall-clock quality
   signal. A node that runs no synchronization daemon typically reports
   `STA_UNSYNC` or the boot-default large error bound; callers must treat that
-  as unavailable, not as a wide-but-trusted bound.
+  as unavailable, not as a wide-but-trusted bound. Chrony requires `rtcsync` to
+  publish kernel synchronization state.
 - The kernel state is host-global and not namespaced per container, so every
   container observes the same underlying clock state.
 

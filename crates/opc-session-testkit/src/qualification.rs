@@ -56,6 +56,12 @@ pub use isolated_scale::{
     QUALIFICATION_ISOLATED_SCALE_UNIX_SECONDS,
 };
 
+/// Synthetic installation identity shared by qualification nodes and probes.
+///
+/// This fixed nonce belongs only to the deterministic qualification fixture.
+/// Production installations generate and persist their own non-zero nonce.
+pub const QUALIFICATION_INSTALLATION_NONCE: [u8; 32] = [0x5a; 32];
+
 const FROZEN_SESSION_HA_PROFILE_V2_JSON: &str =
     include_str!("../qualification/v2/session-ha-profile.json");
 

@@ -179,121 +179,31 @@ state without a leader/read-index round. Failed admission needs no store
 replacement, volume cleanup or coordinated restart; the caller retries the
 same store as connectivity returns.
 
-### Leader quorum-lease authority (check-quorum)
+### Snapshot progress and retry ownership
 
-An engine leader may accept new proposals, prove local writer authority and
-answer forwarded mutations/read barriers only while the pinned Openraft engine
-reports a quorum acknowledgement younger than the fixed quorum-authority ceiling
-`DURABLE_CONSENSUS_LEADER_QUORUM_LEASE` = `election_timeout_max` (8 s). This is
-the point by which every follower's election timer has expired, so the leader can
-conclude it no longer holds a majority for new authority. The pinned engine
-exposes only the acknowledgement age (`RaftMetrics::millis_since_quorum_ack`)
-and defines no application leader lease of its own; the constant is unrelated to
-the SDK's separate 2 s `DURABLE_OPENRAFT_LINEARIZABLE_LEADER_LEASE` read-lease
-reuse. No timing budget changes. Once the ceiling is exceeded the store performs
-an SDK **authority step-down**: local proposals fail with a typed retryable
-`PersistErrorKind::Unavailable` before any proposal is attempted,
-`ensure_local_authority[_at_config_head]` returns
-`ConfigLocalAuthorityOutcome::Retry { leader_hint: None }` (no leader), and
-forwarded mutations/read barriers receive the additive `NoQuorum` reply, which
-the forwarding replica converts to the same retryable unavailability instead of
-holding the caller to its operation deadline. A withheld call proposes,
-applies and commits nothing, and callers retry the same request identity, so
-exactly-once behavior is unchanged.
+Snapshot work (#1339) has bounded storage progress while each caller retains
+its original deadline. Chunked reads, writes and envelope verification use a
+60 s bound per I/O step. SQLite backup and installation size their work budget
+while retaining the same connection lease: 60 s plus one second per MiB of
+storage and incoming data, rounded up. Whole-file sync uses its bounded
+size-based budget; later stages do not inherit an earlier stage's elapsed time.
 
-The transition is observable through
-`ConsensusConfigStore::quorum_lease_state()` (`Available` /
-`NoQuorum { millis_since_quorum_ack }`), the
-`opc_persist_quorum_lease_lost_total` / `opc_persist_quorum_lease_restored_total`
-counters, and one warning/info log per transition. Authority returns
-automatically after two consecutive healthy observations (a one-flush debounce
-against marginal acknowledgements); no restart, vote fabrication or manual step
-is required. A healthy leader whose quorum keeps acknowledging is never fenced.
-A leader that has not yet obtained any quorum acknowledgement is bounded from the
-observed start of its leader term, with up to one heartbeat of observation grace.
-The engine's durable role may still read `Leader` while authority is withheld;
-that is deliberate: the SDK does not fabricate votes or mutate Openraft election
-state, and the majority side independently elects a successor through the
-ordinary election path.
-
-Two tradeoffs are explicit. First, the ceiling is the *latest safe* point: it
-waits until every follower's 5–8 s election timer has expired, so a leader that
-loses its majority can still accept (uncommittable) proposals for up to about
-8 s of the 10 s operation budget before clients receive the typed retryable
-rejection. Fencing earlier (for example at `election_timeout_min`) could reject a
-leader whose quorum is merely slow and would violate the no-false-step-down
-requirement, so the write and read fences intentionally share the same safe
-ceiling; the residual client wait remains bounded and typed, never a full-budget
-hold. Second, a leader that has not yet received *any* acknowledgement is
-observed only by the quorum-lease watchdog (one poll/half-heartbeat cadence), so
-its bound can be up to one heartbeat late across a same-node term change; that
-grace is bounded and never grants authority to a proven-stale leader.
-
-### Snapshot work budgets follow size
-
-Snapshot build, install and repair deadlines scale with the bytes they move
-(#1339). Each stage derives its own bound as the preserved stage floor plus one
-second per complete 8 MiB of that stage's input, capped by an 8 h ceiling:
-build/install stages keep the previous 60 s floor for ordinary snapshots, and a
-repair attempt keeps the previous 10 s floor. No stage shares another stage's
-deadline, so a slow-but-healthy large snapshot cannot consume the budget of a
-later stage, and every timeout at a derived bound is still typed.
-
-- Build derives its SQLite backup stage from the database size, then derives the
-  envelope copy/hash stage from the captured artifact size; directory sync,
-  staging removal, final open and metadata publication keep the 60 s stage floor.
-- Install starts its size-derived work budget only after acquiring the snapshot
-  build gate (the gate wait keeps its own preserved bound), then derives
-  sync/verify, extraction, promotion and SQLite installation budgets from the
-  received envelope/payload sizes.
-- Repair first asks the authenticated leader for the exact published envelope
-  length (a cheap durable-row probe that verifies nothing) and uses it to derive
-  one size-following attempt deadline. A peer that cannot answer keeps the
-  previous fixed attempt deadline, so mixed-version repair remains conservative.
-  The verified snapshot descriptor is then cached per transfer, so the snapshot
-  is hashed once instead of once per 128 KiB cursor chunk.
-- A resent final snapshot chunk is idempotent: while the final artifact is
-  installing or after it installed, a duplicate final chunk receives the
-  ordinary success reply instead of forcing a whole new transfer. A failed
-  installation clears the marker so the engine can restart the transfer.
-- Replacement snapshot reads reuse the digest produced by the engine snapshot
-  read's single whole-file verification instead of hashing the file again.
-
-These bounds are progress/size based, never unbounded: the largest admissible
-artifact at the documented minimum throughput stays below the ceiling, and an
-operation that reaches its derived bound fails typed instead of extending.
-
-### Unplanned leader-loss failover
-
-The engine's committed-vote leader lease and its sampled election timeout are
-applied consecutively, so an unplanned configuration-leader loss would leave
-survivors quiet for the declared 8 s lease plus another 5-8 s election window.
-The store bounds that avoidable second window without changing any election,
-heartbeat, lease or quorum budget: after one complete declared lease plus the
-existing stale-route grace without authenticated leader traffic (8.2 s), a
-follower asks the pinned engine for an ordinary Pre-Vote round through the
-public trigger API. Peers still refuse the inquiry while their lease is live,
-the engine still persists a real self-vote, and real quorum vote grants are
-still required; no vote is fabricated and a healthy leader cannot be deposed.
-Survivor requests are staggered deterministically by membership rank, and the
-derived conditional first-campaign bound is 9.05 s from the last authenticated
-leader contact for the highest follower rank (8.2 s patience + 500 ms poll +
-50 ms per earlier follower for the maximum-membership stagger; rank 0 waits at
-most 8.7 s). A 5-process leader-kill and full 9-member max-membership
-qualification run remains an explicit deployment qualification follow-up. The default complete operation deadline remains the outer typed bound
-for an in-flight mutation, whose retry keeps the same request identity.
-
-The path is observable through
-`ConsensusConfigStore::failover_status()` (`Leading`, `NoKnownLeader`,
-`Following`, `LeaderSilent { millis_since_leader_contact, campaign_requested }`,
-plus the derived bound and accelerated-campaign count), the
-`opc_persist_failover_accelerated_total` and
-`opc_persist_failover_trigger_failures_total` counters, and one info log per
-requested campaign. The accelerator is inactive while automatic elections are
-disabled (repair roots, fixed-slot voter profiles and explicit test control) and
-never runs on the leader. A partial or delayed heartbeat stream can request at
-most one ordinary campaign per silence episode; it cannot change the term or
-the leader while a quorum still acknowledges the leader.
+- A repair source owns one verification across RPC timeouts and resumes its
+  verified descriptor at the authenticated cursor. It retires on idle, obsolete
+  vote or shutdown. Repair neither probes with an unframed request nor extends
+  the caller's operation deadline.
+- Accepted final snapshot chunks remain owned across caller cancellation.
+  Exact retries join or replay their result, including single-chunk transfers
+  and final chunks containing data. Identity includes source, vote, metadata,
+  original offset and the chunk's digest. Failed inspection releases the receipt
+  so a new transfer can start; an admitted installation retains its outcome.
+- Purge waits for at most one matching owned installation before checking the
+  durable applied position. Replacement admission and reconciliation each have
+  a finite bound; a timed-out RPC does not cancel an admitted installation.
+- Integrity evidence belongs to the verified open descriptor and is invalidated
+  by writes. Replacement reads and installation reuse that evidence without a
+  second whole-file hash. Physical I/O ownership and staging cleanup remain
+  active through shutdown.
 
 The HA composition is:
 

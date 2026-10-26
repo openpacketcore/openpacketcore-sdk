@@ -11,7 +11,7 @@ across bounded pages. Retaining the snapshot lets a large scan progress while
 ordinary writes continue, without copying the entire namespace at open time.
 
 `scope_scan::ScopeScanStore` sits beside `ScopeBatchStore`, bound to the existing
-name-derived store identity and explicit `ScopeNamespace { scope, incarnation }`.
+installation-qualified store identity and explicit `ScopeNamespace { scope, incarnation }`.
 It requires strictly durable consensus. Its operations are:
 
 | Operation | Result and admission |

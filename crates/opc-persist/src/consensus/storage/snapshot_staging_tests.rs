@@ -1178,18 +1178,21 @@ async fn snapshot_read_verifies_once_and_publishes_reusable_digest_evidence() {
         machine.core.snapshot_work_hooks.envelope_verifications(),
         "one read verifies the whole file exactly once"
     );
-    let evidence = machine
-        .core
-        .snapshot_read_verification(&snapshot_id)
+    let evidence = read
+        .snapshot
+        .verified_envelope()
         .expect("read publishes its verification evidence");
-    assert_eq!(evidence.snapshot_id, snapshot_id);
-    assert_eq!(evidence.length, expected_length);
+    assert_eq!(
+        evidence.payload_length + SNAPSHOT_FOOTER_BYTES,
+        expected_length
+    );
+    assert_eq!(evidence.total_length, expected_length);
     assert_eq!(read.meta.snapshot_id, snapshot_id);
     assert_ne!(evidence.checksum, [0; 32]);
 
-    // A second read verifies once again (never reuses another read's open
-    // descriptor), then republishes the same single evidence slot.
-    machine
+    // A second descriptor verifies independently and retains equivalent
+    // integrity evidence alongside its own snapshot metadata.
+    let second = machine
         .get_current_snapshot()
         .await
         .expect("second verified read")
@@ -1201,9 +1204,10 @@ async fn snapshot_read_verifies_once_and_publishes_reusable_digest_evidence() {
     );
     assert_eq!(
         evidence,
-        machine
-            .core
-            .snapshot_read_verification(&snapshot_id)
+        second
+            .snapshot
+            .verified_envelope()
             .expect("evidence stays bound to the verified snapshot")
     );
+    assert_eq!(second.meta.snapshot_id, snapshot_id);
 }
