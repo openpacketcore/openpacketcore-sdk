@@ -3237,12 +3237,9 @@ fn set_watch_terminal(terminal: &Arc<std::sync::Mutex<Option<StoreError>>>, erro
 }
 
 #[cfg(all(test, feature = "insecure-test"))]
-#[path = "../../opc-session-store/tests/support/controlled_clock.rs"]
-mod controlled_watch_clock;
-
-#[cfg(all(test, feature = "insecure-test"))]
 mod tests {
     use super::*;
+    use crate::controlled_clock as controlled_watch_clock;
     use crate::protocol::write_frame;
     use futures_util::{FutureExt, StreamExt};
     use opc_session_store::{

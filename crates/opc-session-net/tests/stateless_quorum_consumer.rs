@@ -2,8 +2,7 @@
 
 #![cfg(feature = "test-control")]
 
-#[path = "../../opc-session-store/tests/support/controlled_clock.rs"]
-mod controlled_clock;
+use crate::controlled_clock;
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[path = "stateless_quorum_consumer/fenced_non_execution.rs"]
