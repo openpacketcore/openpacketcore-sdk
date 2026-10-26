@@ -92,7 +92,7 @@ impl EbpfGtpuDataplaneBackend {
 
 fn end_marker_targets(
     group: &GtpuSessionGroup,
-) -> Result<std::collections::BTreeSet<(Ipv4Addr, Ipv4Addr, crate::Teid)>, GtpuError> {
+) -> Result<std::collections::BTreeSet<(Ipv4Addr, Ipv4Addr, crate::PeerTeid)>, GtpuError> {
     group
         .entries()
         .iter()

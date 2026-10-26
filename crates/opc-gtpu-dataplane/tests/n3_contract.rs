@@ -9,7 +9,7 @@ use opc_gtpu_dataplane::n3::{
 use opc_gtpu_dataplane::EbpfGtpuDataplaneBackend;
 use opc_gtpu_dataplane::{
     GtpBearerMark, GtpuCapability, GtpuDataplaneBackend, LinuxGtpuDataplaneBackend,
-    MockGtpuDataplaneBackend, Teid, UnsupportedGtpuDataplaneBackend,
+    MockGtpuDataplaneBackend, PeerTeid, Teid, UnsupportedGtpuDataplaneBackend,
 };
 use opc_protocol::{DecodeContext, DuplicateIePolicy, UnknownIePolicy, ValidationLevel};
 use sha2::{Digest, Sha256};
@@ -29,11 +29,8 @@ fn unhex(text: &str) -> Vec<u8> {
 }
 
 fn insertion(qfi: u8) -> N3UplinkEncapsulation {
-    let tunnel = ReceivedN3UplinkTnl::new(
-        "192.0.2.1".parse().unwrap(),
-        Teid::new(0x1122_3344).unwrap(),
-    )
-    .unwrap();
+    let tunnel =
+        ReceivedN3UplinkTnl::new("192.0.2.1".parse().unwrap(), PeerTeid::new(0x1122_3344)).unwrap();
     N3UplinkEncapsulation::new(tunnel, N3Qfi::new(qfi).unwrap())
 }
 
@@ -117,11 +114,8 @@ fn independent_reference_packets() {
 
 #[test]
 fn n3_uplink_insertion_matches_independent_wire() {
-    let tunnel = ReceivedN3UplinkTnl::new(
-        "192.0.2.1".parse().unwrap(),
-        Teid::new(0x1122_3344).unwrap(),
-    )
-    .unwrap();
+    let tunnel =
+        ReceivedN3UplinkTnl::new("192.0.2.1".parse().unwrap(), PeerTeid::new(0x1122_3344)).unwrap();
     let insertion = N3UplinkEncapsulation::new(tunnel, N3Qfi::new(9).unwrap());
     let mut dst = BytesMut::from(&b"prefix"[..]);
     insertion.encode_gpdu(&[0xab], &mut dst, 17).unwrap();
@@ -358,11 +352,8 @@ fn receive_is_borrowed_and_allocates_nothing() {
 
 #[test]
 fn directional_tunnel_and_marking_intent_is_explicit_and_redacted() {
-    let uplink = ReceivedN3UplinkTnl::new(
-        "192.0.2.1".parse().unwrap(),
-        Teid::new(0x1122_3344).unwrap(),
-    )
-    .unwrap();
+    let uplink =
+        ReceivedN3UplinkTnl::new("192.0.2.1".parse().unwrap(), PeerTeid::new(0x1122_3344)).unwrap();
     let downlink = LocalN3DownlinkTnl::new(
         "2001:db8::2".parse().unwrap(),
         Teid::new(0x5566_7788).unwrap(),

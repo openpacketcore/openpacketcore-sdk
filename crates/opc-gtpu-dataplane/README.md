@@ -10,6 +10,11 @@ eBPF, mock, and unsupported backends, and keeps raw syscalls in
 The crate does not implement GTP-C, PFCP, namespace management, route steering,
 XFRM policy, deployment defaults, or traffic-readiness policy.
 
+`GtpPdpContext.peer_teid` and `ReceivedN3UplinkTnl` use `PeerTeid`, which
+accepts the peer-assigned zero value required by TS 29.281 section 5.1.
+Locally allocated TEIDs still use nonzero `Teid`. Convert an existing peer
+value with `PeerTeid::from(teid)` or construct it with `PeerTeid::new(raw)`.
+
 ## Experimental N3 packet and intent boundary
 
 The `n3` module keeps received uplink UPF TNL information separate from
@@ -210,7 +215,7 @@ MTU-bearing contexts must be drained before an SDK downgrade. See
 - `UnsupportedGtpuDataplaneBackend`: reports unsupported-platform results while
   preserving trait-object usage on non-Linux or disabled builds.
 - Model exports include `CreateGtpDeviceRequest`, `GtpDevice`,
-  `GtpPdpContext`, `GtpBearerMark`, `RemovePdpContextRequest`, `Teid`,
+  `GtpPdpContext`, `GtpBearerMark`, `RemovePdpContextRequest`, `Teid`, `PeerTeid`,
   `GtpuProbe`, `GtpuBackendKind`, `GtpuCapability`,
   `GtpuDownlinkEndpoint`, `GtpuSourcePortPolicy`, `GtpuSourcePortRange`,
   `PdpContextSelector`, `PdpContextReadback`, `PdpContextInstallOutcome`,
@@ -362,7 +367,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use opc_gtpu_dataplane::{
     CreateGtpDeviceRequest, GtpPdpContext, GtpVersion, GtpuDataplaneBackend,
     GtpuSourcePortPolicy, GtpuUplinkSourcePortPolicy, MockGtpuDataplaneBackend,
-    RemovePdpContextRequest, Teid,
+    PeerTeid, RemovePdpContextRequest, Teid,
 };
 
 #[tokio::main]
@@ -374,7 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let context = GtpPdpContext {
         local_teid: Teid::new(0x1000_0001).unwrap(),
-        peer_teid: Teid::new(0x2000_0001).unwrap(),
+        peer_teid: PeerTeid::new(0x2000_0001),
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
         peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
         link_ifindex: device.ifindex,

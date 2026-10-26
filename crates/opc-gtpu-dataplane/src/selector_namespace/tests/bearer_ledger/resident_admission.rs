@@ -13,7 +13,7 @@ fn resident_group(parent: &GtpuSessionGroup, ordinal: usize) -> GtpuSessionGroup
     let mut context = parent.entries()[0].context().clone();
     context.ms_address = IpAddr::V4(Ipv4Addr::from(0x0a1f_0000 + ordinal));
     context.local_teid = Teid::new(0x10000 + ordinal * 2).unwrap();
-    context.peer_teid = Teid::new(0x10001 + ordinal * 2).unwrap();
+    context.peer_teid = crate::PeerTeid::new(0x10001 + ordinal * 2);
     GtpuSessionGroup::new(
         GtpuSessionGroupId::new(id).unwrap(),
         parent.device_id(),

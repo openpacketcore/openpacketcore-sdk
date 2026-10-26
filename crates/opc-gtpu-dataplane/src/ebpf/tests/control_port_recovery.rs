@@ -274,7 +274,7 @@ async fn end_marker_readback_failure_does_not_permanently_disable_control_port()
                     &fixture.device,
                     fixture.local,
                     PEER,
-                    teid(0x2000_0001),
+                    teid(0x2000_0001).into(),
                     || true,
                 )
                 .is_err());

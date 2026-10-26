@@ -25,6 +25,7 @@ use opc_linux_gtpu_sys::{
 };
 
 use crate::backend::error_proves_no_requested_mutation;
+use crate::model::PeerTeid;
 use crate::model::{
     classify_dual_selector_state, DualSelectorState, PdpLiveWriterNamespaceIdentity,
 };
@@ -2711,11 +2712,10 @@ fn parse_pdp_context_response(
         "missing or invalid local TEID attribute",
     )?)
     .ok_or_else(|| invalid("zero local TEID attribute"))?;
-    let peer_teid = Teid::new(decode_pdp_u32(
+    let peer_teid = PeerTeid::new(decode_pdp_u32(
         attributes.peer_teid,
         "missing or invalid peer TEID attribute",
-    )?)
-    .ok_or_else(|| invalid("zero peer TEID attribute"))?;
+    )?);
 
     // GTPA_FAMILY selects the MS/PAA lookup table. The outer peer address is
     // independently selected by the GTP device's UDP socket family, so valid
@@ -3838,7 +3838,7 @@ mod tests {
     fn pdp_context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: teid(0x1122_3344),
-            peer_teid: teid(0x5566_7788),
+            peer_teid: teid(0x5566_7788).into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 42,
@@ -4478,6 +4478,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn pdp_readback_accepts_zero_peer_teid() {
+        let selector_context = pdp_context();
+        let selector = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(&selector_context).unwrap(),
+        );
+        let mut zero_peer = selector_context;
+        zero_peer.peer_teid = PeerTeid::ZERO;
+        let received =
+            parse_pdp_context_response(&pdp_response(&zero_peer, true), &selector, 31).unwrap();
+        assert_eq!(received.peer_teid, PeerTeid::ZERO);
+        assert!(validate_pdp_context(&received).is_ok());
     }
 
     #[test]
@@ -5747,7 +5761,7 @@ mod tests {
 
         let changed_transport = CapturingTransport::new();
         let mut changed = context.clone();
-        changed.peer_teid = teid(9);
+        changed.peer_teid = teid(9).into();
         push_family_lookup(&changed_transport);
         push_present(&changed_transport, &context);
         push_present(&changed_transport, &changed);
@@ -5789,7 +5803,7 @@ mod tests {
         let uplink_conflict_transport = CapturingTransport::new();
         let mut same_uplink = installed.clone();
         same_uplink.local_teid = teid(9);
-        same_uplink.peer_teid = teid(10);
+        same_uplink.peer_teid = teid(10).into();
         push_family_lookup(&uplink_conflict_transport);
         push_absent(&uplink_conflict_transport);
         push_present(&uplink_conflict_transport, &installed);
@@ -5880,7 +5894,7 @@ mod tests {
         }
         post_conflict_transport.push_response(Ok(None));
         let mut conflicting = installed.clone();
-        conflicting.peer_teid = teid(9);
+        conflicting.peer_teid = teid(9).into();
         conflicting.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
         for _ in 0..4 {
             push_present(&post_conflict_transport, &conflicting);
@@ -6089,7 +6103,7 @@ mod tests {
         let transport = CapturingTransport::new();
         let desired = pdp_context();
         let mut foreign = desired.clone();
-        foreign.peer_teid = teid(0x9999_9999);
+        foreign.peer_teid = teid(0x9999_9999).into();
         push_family_lookup(&transport);
         push_exact_readback(&transport, &foreign);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
@@ -6900,7 +6914,7 @@ mod tests {
         let transport = CapturingTransport::new();
         let desired = pdp_context();
         let mut foreign = desired.clone();
-        foreign.peer_teid = teid(0x9999_9999);
+        foreign.peer_teid = teid(0x9999_9999).into();
         push_family_lookup(&transport);
         push_exact_readback(&transport, &foreign);
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone())
@@ -6966,7 +6980,7 @@ mod tests {
         let desired = pdp_context();
         let mut foreign = desired.clone();
         foreign.local_teid = teid(0x7777_7777);
-        foreign.peer_teid = teid(0x8888_8888);
+        foreign.peer_teid = teid(0x8888_8888).into();
         push_family_lookup(&transport);
         // Axis reads interleave local, uplink, local, uplink.
         push_absent(&transport);
@@ -8582,6 +8596,11 @@ mod tests {
         let mut context = pdp_context();
         context.peer_address = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
         assert!(validate_pdp_context(&context).is_err());
+
+        // The peer may assign zero without relaxing local TEID validation.
+        let mut context = pdp_context();
+        context.peer_teid = PeerTeid::ZERO;
+        assert!(validate_pdp_context(&context).is_ok());
 
         let mut remove = RemovePdpContextRequest::from_context(&pdp_context());
         remove.link_ifindex = 0;

@@ -2948,7 +2948,7 @@ fn grouped_model_from_record(
         let mark = u32::from_be_bytes(entry.bearer_mark());
         let context = GtpPdpContext {
             local_teid: Teid::new(u32::from_be_bytes(entry.local_teid()))?,
-            peer_teid: Teid::new(u32::from_be_bytes(entry.peer_teid()))?,
+            peer_teid: crate::PeerTeid::new(u32::from_be_bytes(entry.peer_teid())),
             ms_address: ip_address(entry.inner_paa().canonical_address()),
             peer_address: ip_address(entry.peer_outer_address()),
             link_ifindex: device.ifindex,
@@ -11207,7 +11207,7 @@ impl EbpfGtpuDataplaneBackend {
         let uplink_source_port_policy = commit.uplink_source_port_policy();
         let downlink_inner_mtu = commit_downlink_inner_mtu(commit).ok_or_else(indeterminate)?;
         let local_teid = Teid::new(u32::from_be_bytes(local_teid)).ok_or_else(indeterminate)?;
-        let peer_teid = Teid::new(u32::from_be_bytes(far.o_teid)).ok_or_else(indeterminate)?;
+        let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(far.o_teid));
         Ok(GtpPdpContext {
             local_teid,
             peer_teid,
@@ -11286,8 +11286,7 @@ impl EbpfGtpuDataplaneBackend {
         }
         let local_teid =
             Teid::new(u32::from_be_bytes(owner.local_teid)).ok_or_else(indeterminate)?;
-        let peer_teid =
-            Teid::new(u32::from_be_bytes(owner.uplink_far.o_teid)).ok_or_else(indeterminate)?;
+        let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(owner.uplink_far.o_teid));
         let bearer_mark =
             GtpBearerMark::new(u32::from_be_bytes(key.bearer_mark)).ok_or_else(indeterminate)?;
         let egress_dscp = match owner.egress_dscp() {
@@ -27916,6 +27915,9 @@ mod aya_runtime {
         ) -> Result<(u64, u64), GtpuError> {
             let stat = rustix::fs::statat(pin, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|error| GtpuError::io(operation, error.into()))?;
+            // Linux stat link counts differ in width between architectures.
+            #[allow(clippy::useless_conversion)]
+            let nlink = u64::from(stat.st_nlink);
             if !historical_25_pin_leaf_is_exact(
                 rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file(),
                 stat.st_uid,
@@ -27923,7 +27925,7 @@ mod aya_runtime {
                 rustix::process::geteuid().as_raw(),
                 rustix::process::getegid().as_raw(),
                 stat.st_mode,
-                stat.st_nlink,
+                nlink,
             ) {
                 return Err(state_indeterminate(operation));
             }
@@ -66108,7 +66110,7 @@ mod tests {
     fn context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: teid(0x1000_0001),
-            peer_teid: teid(0x2000_0001),
+            peer_teid: teid(0x2000_0001).into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: S2BU_IFINDEX,
@@ -66133,7 +66135,7 @@ mod tests {
     fn marked_context(mark: u32, local_teid: u32, peer_teid: u32) -> GtpPdpContext {
         let mut context = context();
         context.local_teid = teid(local_teid);
-        context.peer_teid = teid(peer_teid);
+        context.peer_teid = teid(peer_teid).into();
         context.bearer_mark = GtpBearerMark::new(mark);
         context
     }
@@ -69530,7 +69532,7 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: teid(peer_teid),
+                peer_teid: crate::PeerTeid::new(peer_teid),
                 ms_address: IpAddr::V6(ipv6_inner()),
                 peer_address: IpAddr::V6(peer),
                 link_ifindex: S2BU_IFINDEX,
@@ -69550,7 +69552,7 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: teid(peer_teid),
+                peer_teid: crate::PeerTeid::new(peer_teid),
                 ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
                 peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
                 link_ifindex: S2BU_IFINDEX,
@@ -69577,7 +69579,7 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: teid(peer_teid),
+                peer_teid: crate::PeerTeid::new(peer_teid),
                 ms_address: inner,
                 peer_address: peer_outer,
                 link_ifindex: S2BU_IFINDEX,
@@ -80968,7 +80970,7 @@ mod tests {
             backend.install_pdp_context(original.clone()).await.unwrap();
 
             let mut relocated = original.clone();
-            relocated.peer_teid = teid(0x3000_0003);
+            relocated.peer_teid = teid(0x3000_0003).into();
             relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
             relocated.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(21_152);
             relocated.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
@@ -81033,7 +81035,7 @@ mod tests {
             backend.install_pdp_context(original.clone()).await.unwrap();
 
             let mut relocated = original.clone();
-            relocated.peer_teid = teid(0x3000_0003);
+            relocated.peer_teid = teid(0x3000_0003).into();
             relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
             relocated.downlink_source_port_policy = crate::GtpuSourcePortPolicy::Exact(21_152);
             relocated.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
@@ -81292,7 +81294,7 @@ mod tests {
         // The same UE/local-TEID identity may relocate to a new peer. The
         // binding-map replacement is the downlink authorization cutover.
         let mut relocated = context();
-        relocated.peer_teid = teid(0x3000_0003);
+        relocated.peer_teid = teid(0x3000_0003).into();
         relocated.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
         backend.install_pdp_context(relocated).await.unwrap();
         {
@@ -81446,7 +81448,7 @@ mod tests {
         let mut first = context();
         first.egress_dscp = Some(crate::DscpCodepoint::new(10).unwrap());
         let mut second = context();
-        second.peer_teid = teid(0x3000_0003);
+        second.peer_teid = teid(0x3000_0003).into();
         second.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20));
         second.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
         let barrier = Arc::new(Barrier::new(3));
@@ -81509,7 +81511,7 @@ mod tests {
         backend.install_pdp_context(context()).await.unwrap();
 
         let mut replacement = context();
-        replacement.peer_teid = teid(0x3000_0003);
+        replacement.peer_teid = teid(0x3000_0003).into();
         replacement.egress_dscp = Some(crate::DscpCodepoint::new(46).unwrap());
         let barrier = Arc::new(Barrier::new(3));
         let install_task = {
@@ -82164,7 +82166,7 @@ mod tests {
         ));
         let mut default_on_marked_teid = default.clone();
         default_on_marked_teid.local_teid = first.local_teid;
-        default_on_marked_teid.peer_teid = teid(0x2000_0005);
+        default_on_marked_teid.peer_teid = teid(0x2000_0005).into();
         assert!(matches!(
             backend
                 .install_pdp_context(default_on_marked_teid)
@@ -82958,7 +82960,7 @@ mod tests {
 
             let mut desired = original.clone();
             match drift {
-                "far" => desired.peer_teid = teid(0x2000_0003),
+                "far" => desired.peer_teid = teid(0x2000_0003).into(),
                 "dscp" => desired.egress_dscp = Some(crate::DscpCodepoint::new(10).unwrap()),
                 "local_teid" => desired.local_teid = teid(0x1000_0003),
                 _ => desired.bearer_mark = GtpBearerMark::new(0x1002),
@@ -83306,7 +83308,7 @@ mod tests {
 
         let mut same_uplink = installed.clone();
         same_uplink.local_teid = teid(0x1000_0002);
-        same_uplink.peer_teid = teid(0x2000_0002);
+        same_uplink.peer_teid = teid(0x2000_0002).into();
         assert!(matches!(
             backend
                 .install_pdp_context_classified(same_uplink.clone())

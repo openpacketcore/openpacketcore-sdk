@@ -797,7 +797,7 @@ impl GtpuReassemblySocket {
         &self,
         local: Ipv4Addr,
         peer: Ipv4Addr,
-        teid: crate::Teid,
+        teid: crate::PeerTeid,
     ) -> Result<usize, crate::control_port::GtpuControlPortError> {
         use crate::control_port::GtpuControlPortError;
         use opc_proto_gtpu::{GtpuControlMessage, GtpuEndMarker, GtpuTunnelEndpointId};

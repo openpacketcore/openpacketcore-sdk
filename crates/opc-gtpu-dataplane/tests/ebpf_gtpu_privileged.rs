@@ -314,10 +314,11 @@ use opc_gtpu_dataplane::{
     GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy, GtpuV2DrainProof,
     PdpContextIndeterminateReason, PdpContextInstallOutcome, PdpContextLocalTeidSelector,
     PdpContextReadback, PdpContextRemovalOutcome, PdpContextSelector, PdpContextSelectorOccupancy,
-    PdpContextUplinkSelector, RemovePdpContextRequest, RetainedGraphCleanupClassification,
-    RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest, Teid, TftUplinkBearer,
-    TftUplinkClassifier, TftUplinkClassifierReadback, TftUplinkClassifierReconcileOutcome,
-    TftUplinkClassifierRemovalOutcome, TrafficContinuityPolicy,
+    PdpContextUplinkSelector, PeerTeid, RemovePdpContextRequest,
+    RetainedGraphCleanupClassification, RetainedGraphCleanupRefusal, RetainedGraphCleanupRequest,
+    Teid, TftUplinkBearer, TftUplinkClassifier, TftUplinkClassifierReadback,
+    TftUplinkClassifierReconcileOutcome, TftUplinkClassifierRemovalOutcome,
+    TrafficContinuityPolicy,
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, ipv4_header_checksum, udp_ipv4_checksum, udp_ipv6_checksum,
@@ -2958,7 +2959,7 @@ impl Drop for TestNet {
 fn session_context(link_ifindex: u32) -> GtpPdpContext {
     GtpPdpContext {
         local_teid: Teid::new(LOCAL_TEID).expect("nonzero"),
-        peer_teid: Teid::new(PEER_TEID).expect("nonzero"),
+        peer_teid: PeerTeid::new(PEER_TEID),
         ms_address: IpAddr::V4(UE_PAA),
         peer_address: IpAddr::V4(PGW_IP),
         link_ifindex,
@@ -3019,7 +3020,7 @@ fn grouped_entry(
     GtpuSessionEntry::new(
         GtpPdpContext {
             local_teid: Teid::new(local_teid).expect("nonzero grouped local TEID"),
-            peer_teid: Teid::new(peer_teid).expect("nonzero grouped peer TEID"),
+            peer_teid: PeerTeid::new(peer_teid),
             ms_address: inner,
             peer_address: peer_outer,
             link_ifindex,
@@ -3136,7 +3137,7 @@ fn dedicated_session_context(
 ) -> GtpPdpContext {
     let mut context = session_context(link_ifindex);
     context.local_teid = Teid::new(local_teid).expect("nonzero local TEID");
-    context.peer_teid = Teid::new(peer_teid).expect("nonzero peer TEID");
+    context.peer_teid = PeerTeid::new(peer_teid);
     context.bearer_mark = Some(GtpBearerMark::new(mark).expect("nonzero bearer mark"));
     context
 }
@@ -7380,7 +7381,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
     // DSCP state still removes cleanly after its FAR delete.
     let mut no_dscp_removal = session_context(device.ifindex);
     no_dscp_removal.local_teid = Teid::new(0x1000_0010).expect("nonzero local TEID");
-    no_dscp_removal.peer_teid = Teid::new(0x2000_0010).expect("nonzero peer TEID");
+    no_dscp_removal.peer_teid = PeerTeid::new(0x2000_0010);
     no_dscp_removal.ms_address = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 3));
     backend.install_pdp_context(no_dscp_removal.clone()).await?;
     let no_dscp_remove = RemovePdpContextRequest::from_context(&no_dscp_removal);
@@ -7959,8 +7960,7 @@ async fn ebpf_gtpu_uplink_and_downlink_round_trip() -> Result<(), Box<dyn std::e
         let mut uplink_collision = expected.clone();
         uplink_collision.local_teid =
             Teid::new(expected.local_teid.get() + 0x100).ok_or("conflict TEID must be nonzero")?;
-        uplink_collision.peer_teid =
-            Teid::new(expected.peer_teid.get() + 0x100).ok_or("conflict TEID must be nonzero")?;
+        uplink_collision.peer_teid = PeerTeid::new(expected.peer_teid.get() + 0x100);
         assert!(matches!(
             restored
                 .install_pdp_context_classified(uplink_collision)
@@ -8803,6 +8803,55 @@ fn privileged_current_ebpf_graph_recovery_request(
 // PRIVILEGED_TEST_LOCK.
 #[allow(clippy::await_holding_lock)]
 #[ignore = "requires root (CAP_BPF/CAP_NET_ADMIN), a fresh netns, and bpffs"]
+async fn ebpf_gtpu_zero_peer_teid_is_sent_on_the_wire() -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    let _serial = PRIVILEGED_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let net = TestNet::provision();
+    let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
+        bpffs_pin_root: net.pin_root.clone(),
+        ..EbpfGtpuDataplaneBackendConfig::default()
+    });
+    let mut request = CreateGtpDeviceRequest::new("s2bu");
+    request.bind_address = IpAddr::V4(EPDG_S2BU_IP);
+    let device = backend.create_device(request).await?;
+    let mut context = session_context(device.ifindex);
+    context.peer_teid = PeerTeid::ZERO;
+    backend.install_pdp_context(context.clone()).await?;
+    let selector = PdpContextSelector::LocalTeid(
+        PdpContextLocalTeidSelector::from_context(&context).ok_or("local selector")?,
+    );
+    assert_eq!(
+        backend.read_pdp_context(selector).await?,
+        PdpContextReadback::Present(context.clone())
+    );
+    let peer = in_netns(&net.pgw_ns, || UdpSocket::bind((PGW_IP, GTPU_PORT)))?;
+    let sender = in_netns(&net.ue_ns, || UdpSocket::bind((UE_PAA, 5000)))?;
+    let mut wire = [0_u8; 2048];
+    let (len, source) = send_until_received(
+        || {
+            let _ = sender.send_to(b"opc-zero-peer", (REMOTE_HOST, 53));
+        },
+        &peer,
+        &mut wire,
+    )
+    .ok_or("zero-peer uplink G-PDU did not reach the peer")?;
+    assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+    assert_eq!(&wire[..2], &[0x30, 0xff]);
+    assert_eq!(&wire[4..8], &[0, 0, 0, 0]);
+    assert_eq!(usize::from(u16::from_be_bytes([wire[2], wire[3]])), len - 8);
+    assert!(wire[..len].ends_with(b"opc-zero-peer"));
+    backend
+        .remove_pdp_context(RemovePdpContextRequest::from_context(&context))
+        .await?;
+    backend.remove_device(&device).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+#[ignore = "requires CAP_NET_ADMIN, CAP_BPF, bpffs, and isolated netns"]
 async fn ebpf_gtpu_uplink_selected_source_port_on_the_wire(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref() != Ok("1") {
@@ -10232,14 +10281,12 @@ async fn ebpf_gtpu_trusted_traffic_proof_requires_bidirectional_continuity(
     let mut marked_v4 = session_context(device.ifindex);
     marked_v4.local_teid =
         Teid::new(GROUP_LOCAL_TEID_V4_INITIAL).expect("nonzero grouped v4 local TEID");
-    marked_v4.peer_teid =
-        Teid::new(GROUP_PEER_TEID_V4_INITIAL).expect("nonzero grouped v4 peer TEID");
+    marked_v4.peer_teid = PeerTeid::new(GROUP_PEER_TEID_V4_INITIAL);
     marked_v4.bearer_mark = Some(GtpBearerMark::new(MARK_A).expect("nonzero XFRM bearer mark"));
     let mut grouped_v6 = session_context(device.ifindex);
     grouped_v6.local_teid =
         Teid::new(GROUP_LOCAL_TEID_V6_INITIAL).expect("nonzero grouped v6 local TEID");
-    grouped_v6.peer_teid =
-        Teid::new(GROUP_PEER_TEID_V6_INITIAL).expect("nonzero grouped v6 peer TEID");
+    grouped_v6.peer_teid = PeerTeid::new(GROUP_PEER_TEID_V6_INITIAL);
     grouped_v6.ms_address = IpAddr::V6(UE_PAA_IPV6);
     grouped_v6.peer_address = IpAddr::V6(PGW_IPV6);
     grouped_v6.bearer_mark =

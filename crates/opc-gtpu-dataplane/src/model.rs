@@ -123,6 +123,74 @@ impl fmt::Display for Teid {
     }
 }
 
+/// Outgoing/peer GTP-U TEID, where the reserved zero value is admitted.
+///
+/// TS 29.281 section 5.1 requires backward compatibility with peers that assign
+/// an all-zero TEID: a GTP-U entity must accept that value and send subsequent
+/// G-PDUs with the TEID field set to all zeros. Only the peer/outgoing TEID may
+/// be zero. Locally allocated, received and map-key TEIDs remain [`Teid`],
+/// whose zero value stays invalid; this type cannot be used in their place.
+///
+/// TEIDs are sensitive routing/session handles. `Debug` and `Display` never
+/// emit the raw value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct PeerTeid(u32);
+
+impl PeerTeid {
+    /// The TS 29.281 section 5.1 all-zero peer TEID.
+    pub const ZERO: Self = Self(0);
+
+    /// Create a peer TEID. Unlike [`Teid::new`], zero is valid here.
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Reuse an already validated TEID as a peer TEID.
+    #[must_use]
+    pub const fn from_teid(teid: Teid) -> Self {
+        Self(teid.get())
+    }
+
+    /// Return the raw TEID value for kernel encoding or wire construction.
+    ///
+    /// Callers must not expose this value through logs or diagnostics.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Return whether this is the reserved all-zero peer TEID.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Return the network-order wire representation.
+    #[must_use]
+    pub const fn to_be_bytes(self) -> [u8; 4] {
+        self.0.to_be_bytes()
+    }
+}
+
+impl From<Teid> for PeerTeid {
+    fn from(teid: Teid) -> Self {
+        Self::from_teid(teid)
+    }
+}
+
+impl fmt::Debug for PeerTeid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PeerTeid").field(&"<redacted>").finish()
+    }
+}
+
+impl fmt::Display for PeerTeid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted-teid>")
+    }
+}
+
 /// Non-zero Linux packet mark selecting one bearer that shares a UE PAA.
 ///
 /// The eBPF backend owns the complete 32-bit mark: the default inbound Child
@@ -4803,10 +4871,14 @@ impl GtpuDownlinkInnerMtu {
 /// GTP-U PDP context programmed into the Linux `gtp` kernel module.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct GtpPdpContext {
-    /// Incoming/local S2b-U/N3 TEID.
+    /// Incoming/local S2b-U/N3 TEID. Always nonzero.
     pub local_teid: Teid,
     /// Outgoing peer PGW/UPF TEID.
-    pub peer_teid: Teid,
+    ///
+    /// TS 29.281 section 5.1 backward compatibility admits the reserved
+    /// all-zero peer TEID; outgoing G-PDUs then carry TEID zero. A zero value
+    /// is carried by the Linux kernel-GTP and eBPF backends.
+    pub peer_teid: PeerTeid,
     /// MS/UE packet-data-network address.
     pub ms_address: IpAddr,
     /// Peer PGW/UPF GTP-U address.
@@ -6965,7 +7037,7 @@ mod tests {
     fn reconciliation_context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: Teid::new(0x1234_5678).unwrap(),
-            peer_teid: Teid::new(0x8765_4321).unwrap(),
+            peer_teid: PeerTeid::new(0x8765_4321),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
@@ -6985,6 +7057,32 @@ mod tests {
         assert_eq!(teid.get(), 0x1234_5678);
         assert!(!format!("{teid:?}").contains("12345678"));
         assert!(!teid.to_string().contains("12345678"));
+    }
+
+    #[test]
+    fn peer_teid_admits_zero_and_redacts_debug_display() {
+        // TS 29.281 section 5.1 admits the all-zero peer TEID.
+        let zero = PeerTeid::new(0);
+        assert_eq!(zero, PeerTeid::ZERO);
+        assert!(zero.is_zero());
+        assert_eq!(zero.get(), 0);
+        assert_eq!(zero.to_be_bytes(), [0, 0, 0, 0]);
+
+        let nonzero = PeerTeid::new(0x1234_5678);
+        assert!(!nonzero.is_zero());
+        assert_eq!(nonzero.to_be_bytes(), [0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(
+            PeerTeid::from_teid(Teid::new(0x1234_5678).unwrap()),
+            nonzero
+        );
+        assert_eq!(PeerTeid::from(Teid::new(7).unwrap()), PeerTeid::new(7));
+
+        // Redaction is unchanged for both the zero and nonzero values.
+        assert_eq!(format!("{zero:?}"), "PeerTeid(\"<redacted>\")");
+        assert_eq!(format!("{nonzero:?}"), "PeerTeid(\"<redacted>\")");
+        assert!(!format!("{nonzero:?}").contains("12345678"));
+        assert!(!nonzero.to_string().contains("12345678"));
+        assert_eq!(zero.to_string(), "<redacted-teid>");
     }
 
     #[test]
@@ -7014,7 +7112,7 @@ mod tests {
     fn pdp_context_debug_redacts_teids_and_addresses() {
         let ctx = GtpPdpContext {
             local_teid: Teid::new(0x1234_5678).unwrap(),
-            peer_teid: Teid::new(0x8765_4321).unwrap(),
+            peer_teid: PeerTeid::new(0x8765_4321),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             link_ifindex: 7,
@@ -7079,7 +7177,7 @@ mod tests {
         let desired = reconciliation_context();
         let mut existing = desired.clone();
         existing.local_teid = Teid::new(1).unwrap();
-        existing.peer_teid = Teid::new(2).unwrap();
+        existing.peer_teid = PeerTeid::new(2);
         existing.ms_address = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 3));
         existing.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
         existing.link_ifindex = 8;
@@ -7150,7 +7248,7 @@ mod tests {
         );
 
         let mut conflict = desired.clone();
-        conflict.peer_teid = Teid::new(3).unwrap();
+        conflict.peer_teid = PeerTeid::new(3);
         let classified =
             classify_dual_selector_state(&PdpContextReadback::Present(conflict), &absent, &desired);
         assert!(matches!(
@@ -7208,7 +7306,7 @@ mod tests {
     fn remove_request_derives_family_from_context() {
         let ctx = GtpPdpContext {
             local_teid: Teid::new(1).unwrap(),
-            peer_teid: Teid::new(2).unwrap(),
+            peer_teid: PeerTeid::new(2),
             ms_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 9,
@@ -7859,7 +7957,7 @@ mod tests {
         let ipv4_entry = GtpuSessionEntry::new(reconciliation_context(), ipv4_local).unwrap();
         let mut ipv6_context = reconciliation_context();
         ipv6_context.local_teid = Teid::new(0x1234_5679).unwrap();
-        ipv6_context.peer_teid = Teid::new(0x8765_4322).unwrap();
+        ipv6_context.peer_teid = PeerTeid::new(0x8765_4322);
         ipv6_context.ms_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0xbeef));
         ipv6_context.peer_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 3, 0, 0, 0, 0, 10));
         let mut same_prefix_context = ipv6_context.clone();

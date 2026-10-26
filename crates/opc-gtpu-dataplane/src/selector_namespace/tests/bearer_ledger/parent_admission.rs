@@ -106,7 +106,7 @@ fn changed_parent(parent: &GtpuSessionGroup, replace_id: bool) -> GtpuSessionGro
     let id = if replace_id {
         GtpuSessionGroupId::new([0x70; 16]).unwrap()
     } else {
-        context.peer_teid = Teid::new(context.peer_teid.get() + 1).unwrap();
+        context.peer_teid = crate::PeerTeid::new(context.peer_teid.get() + 1);
         parent.id()
     };
     GtpuSessionGroup::new(

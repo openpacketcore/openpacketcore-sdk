@@ -646,7 +646,8 @@ impl GtpuSessionEntry {
     /// Construct one canonical grouped family entry.
     ///
     /// Outer local and peer addresses must use the same family. Every address
-    /// and TEID must be nonzero; DSCP must be at most 63; and the uplink
+    /// and local TEID must be nonzero; a peer TEID may be zero. DSCP must be
+    /// at most 63; and the uplink
     /// source-port policy must have a canonical wire encoding.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -666,7 +667,6 @@ impl GtpuSessionEntry {
             || address_family(peer_outer_address) != address_family(local_outer_address)
             || inner_paa.contains(local_outer_address)
             || local_teid == [0; 4]
-            || peer_teid == [0; 4]
             || egress_dscp.is_some_and(|value| value > 63)
             || uplink_source_port_policy.map_value().is_none()
         {
@@ -976,7 +976,6 @@ fn entry_wire_is_canonical(
             && (!n3_outer_is_unicast(value[2], peer_outer)
                 || !n3_outer_is_unicast(value[2], local_outer)))
         || u32::from_ne_bytes([value[52], value[53], value[54], value[55]]) == 0
-        || u32::from_ne_bytes([value[56], value[57], value[58], value[59]]) == 0
         || !matches!(value[64], 0..=63 | 0xff)
     {
         return false;
@@ -3468,6 +3467,32 @@ mod tests {
             None,
         )
         .is_none());
+    }
+
+    #[test]
+    fn zero_peer_teid_is_valid_in_typed_and_borrowed_group_authority() {
+        for mut bytes in [independent_v4_entry_bytes(), independent_v6_entry_bytes()] {
+            bytes[56..60].fill(0);
+            let entry = GtpuSessionEntry::decode(&bytes).expect("peer TEID zero is valid");
+            assert_eq!(entry.peer_teid(), [0; 4]);
+            assert_eq!(entry.encode(), bytes);
+            bytes[52..56].fill(0);
+            assert!(GtpuSessionEntry::decode(&bytes).is_none());
+        }
+        let mut entry = v4_entry();
+        entry.peer_teid = [0; 4];
+        let authority = active(3, Some(entry), None).encode();
+        let reference = GtpuSessionGroupRef::single(group_id(), candidate(3, entry)).encode();
+        let config = device_config().encode();
+        let selected = select_gtpu_session_entry_wire(
+            &authority,
+            &reference,
+            &config,
+            42,
+            GTPU_SESSION_IPV4_SLOT,
+        )
+        .expect("borrowed zero-peer entry");
+        assert_eq!(selected.peer_teid(), [0; 4]);
     }
 
     fn independent_v4_entry_bytes() -> [u8; GTPU_SESSION_ENTRY_LEN] {

@@ -421,6 +421,18 @@
       "kind": "disabled",
       "reason": "New privileged Linux test requires CAP_NET_ADMIN, XFRM and a fresh network namespace, matching its target harness. It was executed separately with the required opt-in inside an isolated Linux namespace and passes for absent, 512-byte and 65535-byte padding; ordinary unit tests cover encoding, malformed attributes, validation and recovery identities.",
       "issue": 1344
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::zero_peer_teid_is_installed_and_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed with its explicit opt-in in the compliance VM: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_zero_peer_teid_is_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed with its explicit opt-in in the compliance VM: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
     }
   ]
 }

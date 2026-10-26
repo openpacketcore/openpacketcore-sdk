@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-gtpu-dataplane`: outgoing peer TEIDs use `PeerTeid` and admit zero
+  per TS 29.281 section 5.1, including Linux GTP and the rebuilt eBPF object.
+  Migrate `GtpPdpContext.peer_teid` and `ReceivedN3UplinkTnl` callers with
+  `PeerTeid::from(existing_teid)` or `PeerTeid::new(raw)`. Local TEIDs retain
+  the nonzero `Teid` type. (#1346)
+
 - `opc-ipsec-xfrm`: `SaParameters` and `SaState` gain `tfc_pad: Option<u32>`
   for Linux ESP tunnel padding. Initialize it to `None` to retain prior wire
   bytes, recovery fingerprints, and binding IDs. Configured padding is bound

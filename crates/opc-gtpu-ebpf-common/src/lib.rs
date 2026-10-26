@@ -1393,7 +1393,7 @@ impl DownlinkPdr {
 /// FAR, endpoint binding, managed local address, and ingress attachment must
 /// form one canonical graph. This shared predicate keeps the production Aya
 /// loader and its deterministic fake from accepting different persisted
-/// state. It intentionally rejects zero TEIDs, zero peer TEIDs, unspecified UE
+/// state. It intentionally rejects zero local TEIDs and unspecified UE
 /// addresses, and a UE address equal to the managed local endpoint.
 #[must_use]
 pub fn default_bearer_graph_is_valid(
@@ -1409,7 +1409,6 @@ pub fn default_bearer_graph_is_valid(
         && pdr.ue_ip != managed_local_ip
         && far.peer_ip != [0; 4]
         && far.local_ip == managed_local_ip
-        && far.o_teid != [0; 4]
         && binding.is_valid()
         && binding.ingress_ifindex() == ingress_ifindex
         && binding.peer_address() == GtpuEndpointAddress::Ipv4(far.peer_ip)
@@ -1563,7 +1562,6 @@ impl MarkedBearerOwner {
             && self.local_teid != [0; 4]
             && self.uplink_far.peer_ip != [0; 4]
             && self.uplink_far.local_ip != [0; 4]
-            && self.uplink_far.o_teid != [0; 4]
             && (self.egress_dscp_wire <= 63 || self.egress_dscp_wire == 0xff)
             && self.downlink_binding.is_valid()
             && matches!(
@@ -1949,11 +1947,7 @@ fn bearer_owner_ipv4_wire_is_valid<const N: usize>(value: &[u8; N]) -> bool {
     if value[17] != 2 || !matches!(value[18], 1..=3) || value[19] != 0 {
         return false;
     }
-    if wire_u32(value, 0) == 0
-        || wire_u32(value, 4) == 0
-        || wire_u32(value, 8) == 0
-        || wire_u32(value, 12) == 0
-    {
+    if wire_u32(value, 0) == 0 || wire_u32(value, 4) == 0 || wire_u32(value, 8) == 0 {
         return false;
     }
     if value[16] > 63 && value[16] != 0xff {
@@ -2870,7 +2864,7 @@ mod tests {
         ));
         let mut zero_peer_teid = canonical_far;
         zero_peer_teid.o_teid = [0; 4];
-        assert!(!default_bearer_graph_is_valid(
+        assert!(default_bearer_graph_is_valid(
             local_teid,
             pdr,
             zero_peer_teid,
@@ -3001,6 +2995,101 @@ mod tests {
         for forbidden in ["192", "2152", "7"] {
             assert!(!debug.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn zero_peer_teid_preserves_default_and_marked_authority() {
+        let mut outgoing = far();
+        outgoing.o_teid = [0; 4];
+        let binding = ipv4_binding(GtpuSourcePortPolicy::Any);
+        let local = 0x1000_0001_u32.to_be_bytes();
+        assert!(default_bearer_graph_is_valid(
+            local,
+            DownlinkPdr {
+                ue_ip: [10, 23, 0, 2]
+            },
+            outgoing,
+            binding,
+            outgoing.local_ip,
+            binding.ingress_ifindex()
+        ));
+        assert!(!default_bearer_graph_is_valid(
+            [0; 4],
+            DownlinkPdr {
+                ue_ip: [10, 23, 0, 2]
+            },
+            outgoing,
+            binding,
+            outgoing.local_ip,
+            binding.ingress_ifindex()
+        ));
+        let owner = MarkedBearerOwner::new(
+            local,
+            outgoing,
+            None,
+            binding,
+            MarkedBearerOwnerPhase::Active,
+        );
+        assert!(owner.is_valid());
+        assert!(owner.authorizes_uplink(&outgoing, 0xff));
+        let mut substituted = outgoing;
+        substituted.o_teid = [0, 0, 0, 1];
+        assert!(!owner.authorizes_uplink(&substituted, 0xff));
+    }
+
+    #[test]
+    fn zero_peer_teid_preserves_borrowed_authority() {
+        let mut owner = canonical_owner(MarkedBearerOwnerPhase::Active);
+        owner.uplink_far.o_teid = [0; 4];
+        let wire = owner.encode();
+        assert!(marked_owner_wire_is_valid(&wire));
+        assert!(marked_owner_wire_authorizes_uplink(
+            &wire,
+            &owner.uplink_far,
+            owner.egress_dscp_wire()
+        ));
+        assert!(marked_owner_wire_authorizes_downlink(
+            &wire,
+            owner.local_teid,
+            &owner.downlink_binding.encode()
+        ));
+        let commit = PdpContextCommit::new(
+            owner.local_teid,
+            owner.uplink_far,
+            owner.egress_dscp(),
+            owner.downlink_binding,
+            GtpuUplinkSourcePortPolicy::LegacyServicePort,
+            MarkedBearerOwnerPhase::Active,
+        )
+        .expect("zero-peer typed commit")
+        .encode();
+        assert_eq!(
+            pdp_commit_wire_authorized_source_port(
+                &commit,
+                &owner.uplink_far,
+                owner.egress_dscp_wire()
+            ),
+            Some(2152)
+        );
+        assert!(pdp_commit_wire_authorizes_downlink(
+            &commit,
+            owner.local_teid,
+            &owner.downlink_binding.encode()
+        ));
+        let mut substituted = owner.uplink_far;
+        substituted.o_teid = [0, 0, 0, 1];
+        assert!(!marked_owner_wire_authorizes_uplink(
+            &wire,
+            &substituted,
+            owner.egress_dscp_wire()
+        ));
+        assert_eq!(
+            pdp_commit_wire_authorized_source_port(&commit, &substituted, owner.egress_dscp_wire()),
+            None
+        );
+        let mut zero_local = wire;
+        zero_local[..4].fill(0);
+        assert!(!marked_owner_wire_is_valid(&zero_local));
     }
 
     #[test]
@@ -3506,11 +3595,14 @@ mod tests {
             malformed[offset] = replacement;
             assert!(!MarkedBearerOwner::decode(&malformed).is_valid());
         }
-        for range in [0..4, 4..8, 8..12, 12..16] {
+        for range in [0..4, 4..8, 8..12] {
             let mut malformed = encoded;
             malformed[range].fill(0);
             assert!(!MarkedBearerOwner::decode(&malformed).is_valid());
         }
+        let mut zero_peer = encoded;
+        zero_peer[12..16].fill(0);
+        assert!(MarkedBearerOwner::decode(&zero_peer).is_valid());
     }
 
     #[test]
