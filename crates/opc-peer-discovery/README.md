@@ -129,13 +129,16 @@ keys when configuration changes. DNS names are absolute: this API does not use
 system search-domain expansion or perform IDNA conversion. Invalid caller names,
 IP-literal queries and missing address-mode ports return `InvalidQuery`, separate
 from malformed DNS answers. Configure IP literals as static peers.
+Address mode requires RFC 1123 host labels (letters/digits at both ends,
+letters/digits/hyphens within); SRV/S-NAPTR owner labels may contain underscores.
 
 A `DnsCandidate` retains the endpoint and every `DnsRecord` used to reach it,
 in traversal order. Each record carries its canonical owner, type, remaining
 TTL and monotonic observation time. S-NAPTR also retains its alternate paths.
 The cache uses the earliest absolute
 expiry of every record in every candidate chain; completing a traversal never
-restarts earlier TTLs. Zero TTL is immediately stale. A missing TTL remains
+restarts earlier TTLs. Zero-TTL records are usable by the resolving transaction
+but are not cached. A missing TTL remains
 unknown and gains no fresh lifetime. High-bit record TTLs and SOA TTL-valued
 fields are treated as zero under the conservative
 [RFC 2181 section 8](https://www.rfc-editor.org/rfc/rfc2181.html#section-8)
@@ -157,6 +160,12 @@ deadline and publication time plus this cap. The cap does not rewrite record
 provenance. This is an application endpoint cache, not a recursive DNS server
 implementing RFC 8767's stale-answer protocol.
 
+`DnsCache::with_stale_limit` bounds reuse after the effective freshness deadline.
+It defaults to one day, within the one-to-three-day guidance in
+[RFC 8767 section 5](https://www.rfc-editor.org/rfc/rfc8767.html#section-5),
+and is capped at seven days. Zero disables stale reuse. The setting applies to
+existing entries; transient failures never restart the stale timer.
+
 `DnsCacheStatus::fresh_until` exposes the effective positive deadline, including
 the cap, and retains it after expiry or a failed refresh. It is `None` when no
 positive answer exists; unknown TTL uses publication time and stays stale.
@@ -177,7 +186,8 @@ unavailable resolver/mode, and ambiguous legacy lookup failure. Only the stable
 codes, counts and timing, never names, endpoints or opaque configuration IDs.
 Raw accessors are for resolver and connection logic, not diagnostics.
 
-A cold authoritative denial is cached until the observed SOA timing expires:
+An authoritative denial replaces any prior positive answer and is cached until
+the observed SOA timing expires:
 `min(SOA TTL, SOA.MINIMUM)`, as specified by
 [RFC 2308 sections 3 and 5](https://www.rfc-editor.org/rfc/rfc2308.html#section-5).
 SOA observation time prevents a deferred result from gaining a fresh TTL.
@@ -192,10 +202,9 @@ grant no negative cache lifetime. Negatives
 are isolated by the complete query key; this cache deliberately does not
 synthesize a denial across query modes or families. A sole SRV root target
 is a separate explicit withdrawal: `ServiceUnavailable { expires_at }` carries
-the SRV/CNAME deadline without an SOA. The same negative cap bounds it, a cold
-entry is `Negative`, and a warm entry retains `Stale` data with that error.
-Consumers should inspect `last_error` for this withdrawal when deciding whether
-to reuse stale endpoints. Transient errors use
+the SRV/CNAME deadline without an SOA. The same negative cap bounds it; the
+withdrawal clears prior positive data even without remaining cache lifetime.
+Transient errors use
 bounded exponential retry with equal jitter (half to all of the current cap),
 with default caps of 1–30 seconds. A caller can supply bounds and a seed for
 deterministic clock tests. Configured base and cap never exceed five minutes,
@@ -203,9 +212,10 @@ the limit for failure suppression in
 [RFC 2308 sections 7.1 and 7.2](https://www.rfc-editor.org/rfc/rfc2308.html#section-7).
 Backoff resets after success or a cacheable authoritative denial.
 
-Uncacheable negatives use transient backoff but stay `Miss`. A successful zero,
-unknown or already-expired TTL answer remains `Stale` and uses an independent
-refresh interval. `DnsCache::with_refresh_interval` sets it for subsequent
+Uncacheable negatives and zero-TTL successes stay `Miss`. An unknown or
+already-expired nonzero-TTL answer can remain `Stale` within the stale limit.
+These outcomes use an independent refresh interval.
+`DnsCache::with_refresh_interval` sets it for subsequent
 publications, defaulting to five seconds with equal jitter from half to all of
 the interval (2.5–5 seconds by default). It is clamped to 1 ms–2^31 - 1 seconds
 at millisecond precision. Changing it leaves existing retry deadlines and
@@ -213,14 +223,14 @@ failure backoff unchanged. Pacing is separate from freshness and negative
 authority:
 `refresh_due` cannot cause a same-instant retry loop after these outcomes.
 
-A later error, including an authoritative denial, never overwrites a positive
-last-good answer. `DnsCache::lookup` exposes fresh/stale status, stale age and
-the last error. Positive entries have no retention deadline. The consumer must
-call `remove` when it no longer needs a positive key. At capacity, admission
-first reclaims expired cold failures with no answer or in-flight refresh.
+A transient error retains usable positive data within the stale limit;
+authoritative denials and explicit service withdrawals clear it.
+`DnsCache::lookup` exposes fresh/stale status, stale age and the last error.
+The consumer should call `remove` when it no longer needs a key. At capacity,
+admission first reclaims expired entries with no usable answer or in-flight refresh.
 Live negatives, live backoff and in-flight keys remain protected; if no slot
-is available the new key is rejected. No capacity reclamation removes last-good
-data. A reclaimed cold key leaves `refresh_due` and loses its last error;
+is available the new key is rejected. No capacity reclamation removes usable
+last-good data. A reclaimed key leaves `refresh_due` and loses its last error;
 `lookup` then reports `Miss` with no error. Drivers must retain their configured
 key set separately and re-admit keys they still need. Constructors reject more
 than 16 candidates per answer or 16 records per candidate, including its terminal
@@ -235,7 +245,8 @@ The cache is a deterministic state machine, with no threads or I/O. A driver:
    `Pending` callers share the eventual cached answer; `Suppressed` means the
    answer is fresh or a retry/negative deadline remains in force.
 3. Publishes through `finish_refresh` with the one-use token and current time.
-   Errors retain last-good data. Late, foreign or removed-key tokens cannot
+   Transient errors retain bounded last-good data; authoritative denials clear it.
+   Late, foreign or removed-key tokens cannot
    publish. `refresh_due` or another admission reaps abandoned attempt leases
    as timeouts, so cancellation cannot permanently suppress a key.
 4. Wakes its waiting callers and schedules due keys according to its runtime.
@@ -359,8 +370,12 @@ and [RFC 7766 sections 4–5](https://www.rfc-editor.org/rfc/rfc7766.html#sectio
 Length and query bytes are submitted together, following
 [RFC 7766 section 8](https://www.rfc-editor.org/rfc/rfc7766.html#section-8).
 Fallback shares the original server-attempt deadline; it cannot extend the
-budget. Each exchange opens fresh sockets and uses OS randomness for the full
-query-ID range. Binding port zero delegates source-port selection to the host's
+budget. UDP exchanges open fresh sockets; TCP reuses one connection per server,
+with one transaction at a time and a 30-second idle timeout. Cancellation or an
+invalid/partial frame closes the checked-out socket. An idle peer close permits
+one reconnect within the original deadline. TCP pipelining is not implemented.
+Each exchange uses OS randomness for the full query-ID range.
+Binding port zero delegates source-port selection to the host's
 ephemeral allocator. On Linux this honors `ip_local_port_range` and
 `ip_local_reserved_ports`, so operators can reserve ports for other services
 ([kernel IP sysctl documentation](https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html#ip-local-port-range-2-integers)).
@@ -535,7 +550,7 @@ the original error; an alias invalidates any earlier success for that target.
 A target NXDOMAIN/NODATA cannot confer negative-cache
 authority on the service query; service-question negatives use the existing
 RFC 2308 handling. If no target is usable, return a typed failure and let the
-cache retain last-good data with paced retries.
+cache retain bounded last-good data during transient failures with paced retries.
 
 Each candidate retains the complete service-alias, SRV and address chain.
 `DnsCandidate::srv()` also retains every completed target-and-port path to
@@ -743,7 +758,9 @@ and `LegacyOnly` (explicit caller compatibility policy). Another supported
 protocol can be queried independently. Malformation, transport errors, and
 failure after a root match never authorize absence fallback. No-match kinds
 and root RRset/alias deadlines survive ordinary `finish_refresh`, using the
-existing negative TTL cap, last-good retention and retry/token fencing.
+existing negative TTL cap and retry/token fencing. An authoritative no-match
+clears previous positives; a malformed requested service is a caller error
+and does not claim that the DNS data changed.
 `snaptr_root()` is diagnostic context, with no separate cache lifecycle.
 
 An explicit `SnaptrFilter` for service `aaa` implements RFC 6408 section 5(d)/(e):

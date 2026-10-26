@@ -842,6 +842,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and PFCP Session Change Info. Exhaustive matches must handle these variants.
   (#1516, #1518)
 
+- `opc-peer-discovery`: DNS stale reuse is bounded (one day by default,
+  configurable with `with_stale_limit`). Authoritative negatives and service
+  withdrawals clear prior positive data; zero-TTL responses are not cached.
+  Oversized validated TC replies trigger TCP fallback; TCP connections are
+  reused and closed after 30 seconds idle. Address queries reject invalid
+  host labels while SRV/S-NAPTR owners retain underscore support. (#1355, #1360)
+
 ### Added
 
 - `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported

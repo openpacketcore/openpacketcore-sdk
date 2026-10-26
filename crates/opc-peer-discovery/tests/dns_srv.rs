@@ -1724,7 +1724,6 @@ async fn root_withdrawal_uses_its_deadline_for_cold_and_last_good_cache_entries(
             let q = query();
             let mut cache = DnsCache::default()
                 .with_ttl_caps(Duration::from_secs(86_400), Duration::from_secs(cap));
-            let mut last_good = None;
             if warm {
                 let start = PeerDiscoveryTime::from_millis(0);
                 let DnsRefresh::Start(token) = cache
@@ -1738,8 +1737,10 @@ async fn root_withdrawal_uses_its_deadline_for_cold_and_last_good_cache_entries(
                     .await
                     .result
                     .unwrap();
-                last_good = Some(answer.clone());
+                let last_good = answer.clone();
                 assert!(cache.finish_refresh(token, Ok(answer), start));
+                assert!(matches!(cache.lookup(&q.cache_key(), start).result,
+                    DnsCachedResult::Fresh(ref retained) if retained == &last_good));
             }
             let observed = PeerDiscoveryTime::from_millis(2000);
             let DnsRefresh::Start(token) = cache
@@ -1768,11 +1769,8 @@ async fn root_withdrawal_uses_its_deadline_for_cold_and_last_good_cache_entries(
             assert!(cache.finish_refresh(token, Err(error), published));
             let status = cache.lookup(&q.cache_key(), published);
             assert_eq!(status.last_error, Some(error));
-            if let Some(last_good) = &last_good {
-                assert!(
-                    matches!(&status.result, DnsCachedResult::Stale { answer, .. } if answer == last_good)
-                );
-            } else if expected.is_some() {
+            assert_eq!(status.fresh_until, None);
+            if expected.is_some() {
                 assert_eq!(status.result, DnsCachedResult::Negative(error));
             } else {
                 assert_eq!(status.result, DnsCachedResult::Miss);
@@ -2723,7 +2721,7 @@ async fn srv_cache_refuses_mismatched_query_origin_mode_and_transport() {
             ServiceDiscoveryMode::Service,
             PeerTransport::Tcp,
         ),
-        (SERVICE, ServiceDiscoveryMode::Address, PeerTransport::Tcp),
+        (FIRST, ServiceDiscoveryMode::Address, PeerTransport::Tcp),
         (SERVICE, ServiceDiscoveryMode::Service, PeerTransport::Udp),
     ] {
         let wrong = DnsQuery::new(ServiceDiscoveryInput::new(
