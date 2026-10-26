@@ -38,7 +38,8 @@ jobs:
   privileged-gtpu-regressions:
     name: Privileged Linux GTP-U and route regressions
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Installing the runner's optional kernel modules can take 17 minutes.
+    timeout-minutes: 45
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/gtpu-native
     steps:
