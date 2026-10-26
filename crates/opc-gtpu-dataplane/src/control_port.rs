@@ -149,11 +149,12 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// classes) and then drain with `try_receive_downlink` as usual; an empty
     /// readiness snapshot never proves the queues are empty.
     ///
-    /// The source is bound to this port registration. When the attachment is
-    /// removed, replaced, fenced, or its readback fails, the port revokes every
-    /// outstanding source: readiness and receive return
-    /// [`GtpuControlPortError::Unavailable`] and the source never becomes
-    /// readable again. Drop it and reopen the port through
+    /// The source is bound to this port registration. Removal, replacement or
+    /// backend loss revokes it immediately. Fencing and readback loss are
+    /// detected at the next port operation, which then revokes the source.
+    /// Revocation permanently makes its descriptor readable; readiness methods
+    /// and receive report [`GtpuControlPortError::Unavailable`]. Stop waiting
+    /// on and drop that source, then reopen the port through
     /// [`crate::GtpuDataplaneBackend::open_gtpu_control_port`] after a fresh
     /// exact registration. Each call returns an independent source; consumers
     /// should request one source per registration and keep it for its lifetime.
@@ -344,6 +345,8 @@ pub struct GtpuControlDatagram {
     control: Option<GtpuControlMessage>,
     message_type: Option<u8>,
     teid: Option<NonZeroU32>,
+    #[cfg(any(target_os = "linux", test))]
+    has_tpdu: bool,
 }
 
 impl fmt::Debug for GtpuControlDatagram {
@@ -371,6 +374,8 @@ impl GtpuControlDatagram {
             control: None,
             message_type: None,
             teid: None,
+            #[cfg(any(target_os = "linux", test))]
+            has_tpdu: false,
         };
         // The network receiver ignores spare bits while retaining exact
         // framing and bounded walks. The shared typed codec applies its own
@@ -401,6 +406,10 @@ impl GtpuControlDatagram {
         }
         if message.header.message_type == GTPU_MESSAGE_G_PDU {
             result.kind = GtpuControlDatagramKind::Gpdu;
+            #[cfg(any(target_os = "linux", test))]
+            {
+                result.has_tpdu = !message.payload.is_empty();
+            }
         } else {
             match GtpuControlMessage::from_message(&message, ctx) {
                 Ok(control) => {
@@ -426,6 +435,12 @@ impl GtpuControlDatagram {
     #[cfg(target_os = "linux")]
     pub(crate) fn bytes_handle(&self) -> &Bytes {
         &self.bytes
+    }
+
+    /// Nonzero TEID from the validated header, without a forwarding decision.
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn received_teid(&self) -> Option<NonZeroU32> {
+        self.teid
     }
 
     /// Disposition of this complete UDP datagram.
@@ -599,9 +614,19 @@ impl GtpuControlDatagram {
 /// planners (in particular `extension_notification`), while a structurally
 /// complete G-PDU is returned as an untouched unknown-tunnel observation.
 #[must_use]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn downlink_event(datagram: GtpuControlDatagram) -> crate::GtpuDownlinkEvent {
     match datagram.kind() {
-        GtpuControlDatagramKind::Gpdu => crate::GtpuDownlinkEvent::UnknownTunnel(datagram),
+        GtpuControlDatagramKind::Gpdu => {
+            // The structural decoder already checked the complete GTP frame.
+            // TS 29.281 section 6 also permits unstructured T-PDUs, so this
+            // observation must not impose the IP datapath's minimum length.
+            if datagram.teid.is_some() && datagram.has_tpdu {
+                crate::GtpuDownlinkEvent::UnknownTunnel(datagram)
+            } else {
+                crate::GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::Malformed)
+            }
+        }
         GtpuControlDatagramKind::Control
         | GtpuControlDatagramKind::Unmodelled
         | GtpuControlDatagramKind::UnsupportedRequiredExtension => {
@@ -743,6 +768,19 @@ mod tests {
                 .unwrap_err(),
             GtpuControlPortError::WrongProcedure
         );
+    }
+
+    #[test]
+    fn kernel_declined_invalid_gpdus_are_drops() {
+        for packet in [
+            &[0x30, 0xff, 0, 1, 0, 0, 0, 0, 0x45][..],
+            &[0x30, 0xff, 0, 0, 0, 0, 0, 1][..],
+        ] {
+            assert!(matches!(
+                downlink_event(receive(packet, 49152)),
+                crate::GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::Malformed)
+            ));
+        }
     }
 
     #[test]

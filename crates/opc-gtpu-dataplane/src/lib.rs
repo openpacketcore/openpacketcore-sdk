@@ -69,6 +69,23 @@
 //!
 //! Raw Linux netlink and socket syscalls stay in [`opc_linux_gtpu_sys`]; this
 //! crate is safe Rust and never performs `unsafe` operations.
+//!
+//! Canonical backend persistence formats are internal. An ordinary caller
+//! cannot mint selector adapter capabilities from arbitrary stored bytes.
+//!
+//! ```compile_fail
+//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterBinding;
+//! let _ = GtpuSelectorAdapterBinding::decode(&[1_u8; 145]);
+//! ```
+//! ```compile_fail
+//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterTerminalCapsule;
+//! let _ = GtpuSelectorAdapterTerminalCapsule::decode(&[1_u8; 110]);
+//! ```
+//! ```compile_fail
+//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterOperationStamp;
+//! let _ = GtpuSelectorAdapterOperationStamp::decode(&[1_u8; 208]);
+//! ```
+//!
 
 #![forbid(unsafe_code)]
 
@@ -88,7 +105,7 @@ pub mod mock;
 pub mod model;
 pub mod n3;
 pub mod reassembly;
-pub mod selector_adapter_codec;
+mod selector_adapter_codec;
 pub mod selector_namespace;
 mod selector_namespace_v2;
 pub mod testkit;

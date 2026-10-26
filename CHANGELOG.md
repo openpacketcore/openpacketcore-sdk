@@ -17,7 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one transfer edge per retired atom. It refuses missing/duplicate/foreign/
   stale drain qualifications, a changed predecessor set, same-group sources
   cited as transfers, gaps, overlaps, duplicate predecessors, and fresh atoms
-  carrying predecessor lineage, before any durable or backend effect. The
+  carrying predecessor lineage, before any durable or backend effect. Retired
+  sources must match resolved predecessor atoms still available for transfer,
+  the namespace epoch and a strictly increasing authority-generation schedule;
+  unused qualifications and duplicate qualification nonces are refused. The
   one-CAS ledger-v2 admission, transfer-gate transitions, coordinator wiring
   and loss-qualified same-group restore remain unimplemented; RFC 017 row
   017-1 is now `partial`. Refs #663.
@@ -32,20 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   I/O faults, cancellation/join and public authority/member-repair resume paths
   cover the lifecycle. Refs #1114.
 
-- `opc-gtpu-dataplane`: publish the RFC 016 external selector-adapter codec
-  module `selector_adapter_codec`: versioned canonical namespace binding
-  (145 bytes), operation stamp (208 bytes) and opaque terminal capsule
-  (110 bytes), with canonical rejection of wrong width, version, reserved or
-  inconsistent phase/outcome tuples, constant-time equality, closed
-  phase/request-kind/outcome classes and fully redacted `Debug`. Values can
-  only be decoded from durable bytes or minted from the SDK-issued opaque
-  `GtpuSessionSelectorBackendBinding`; there is no selector secret, raw
-  generation/commitment getter, public field/raw-part constructor, `Clone`, or
-  user-selected value. The built-in eBPF stamp and binding encoders now
-  delegate to the same canonical functions, so one codec serves both the
-  built-in and a future external adapter. External adapters remain
-  `Unsupported` until the RFC 016 §14.11 external-profile conformance harness
-  and qualification evidence exist. Refs #671.
+- `opc-gtpu-dataplane`: share the SDK-private canonical namespace-binding
+  and operation-stamp encoders with bounded format validation and golden-byte
+  regression coverage. The incomplete external `selector_adapter_codec` API
+  is not published: raw-byte decode and encode are not request-bound authority
+  leases. External codec leases and the RFC 016 section 14.11 conformance
+  harness remain unimplemented; external adapters remain `Unsupported`.
+  Refs #671.
+
+- `opc-ipsec-xfrm`:
   `NamespaceBoundLinuxXfrmBackend::install_scoped_successor` installs one
   successor SA for a flow that already has a live scoped receipt, moves the
   single protective policy to it with one `UPDPOLICY` update (no unprotected
@@ -79,9 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-gtpu-dataplane`: `LinuxGtpuDataplaneBackend` now opens an
   attachment-bound control port over the userspace UDP/2152 socket retained by
   an ordinary creation. The Linux `gtp` driver passes non-G-PDUs and G-PDUs
-  whose TEID matches no PDP context back to that socket (the TS 29.281 7.3.1
-  unknown-tunnel trigger), so `try_receive_downlink` reports them as
-  value-free `UnknownTunnel`/`Control` observations and one consuming
+  declined by the kernel back to that socket, including known TEIDs with a
+  wrong inner MS binding. `try_receive_downlink` requires stable PDP absence
+  before reporting `UnknownTunnel`; known or indeterminate contexts are
+  dropped. Controls remain available, and one consuming
   `unknown_tunnel_error` plan sends an Error Indication through the same
   retained socket with the Peer Address, TEID Data I and triggering UDP
   source-port fields. Receipt grants no tunnel or peer authority; the caller
@@ -89,7 +88,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel-owned recoverable attachment returns
   `gtpu_control_port_kernel_owned`, no second socket is ever bound, and
   removal, replacement, adoption or a descriptor generation change retires
-  old receive capabilities and plans. Refs #1084.
+  old receive capabilities and plans. Reopening the same live generation
+  preserves plans; I/O rechecks live link and socket binding without waiting
+  on the PDP mutation mutex. Recoverable-socket support remains unimplemented.
+  Refs #1084.
 - `opc-session-store`: native ordinary command outcomes now use a bounded
   committed-state retention rule instead of accumulating for the life of the
   store. The rule stays inert below committed application sequence 65,536
@@ -815,10 +817,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot read, close, duplicate or use it to bypass attachment invalidation.
   Readiness is advisory: it consumes no datagram and does not change the
   existing bounded service order (shared queue first for eight datagrams, then
-  the alternating hand-off queues). Attachment removal, replacement, fencing or
-  readback failure revokes every outstanding source, after which it reports
-  `Unavailable` and never becomes readable again. Ports without backend-owned
-  sockets keep the default `Unsupported` result. Refs #1021.
+  the alternating hand-off queues). Attachment removal, replacement, fencing,
+  readback failure and backend loss permanently signal a private eventfd,
+  waking idle consumers to observe `Unavailable` without a polling timer.
+  Standalone sockets without a downlink consumer keep `Unsupported`. Refs #1021.
 
 - `opc-gtpu-dataplane`: expose IPv4 uplink FAR misses by passed and dropped
   outcome, retaining `uplink_far_misses` as their sum. Reserved counter slots

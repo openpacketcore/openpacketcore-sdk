@@ -416,10 +416,6 @@ impl fmt::Debug for DownlinkOuterProvenance {
 pub struct GtpuReassemblySocket {
     socket: std::net::UdpSocket,
     control_identity: std::sync::Arc<()>,
-    /// Token whose only owner is this socket, used only to revoke readiness
-    /// sources. Kept separate from `control_identity`: a response plan holds
-    /// that identity and can outlive the socket.
-    readiness_liveness: std::sync::Arc<()>,
     interface_name: std::ffi::OsString,
     ingress_ifindex: u32,
     local_address: Ipv4Addr,
@@ -613,7 +609,6 @@ impl GtpuReassemblySocket {
         Ok(Self {
             socket,
             control_identity: std::sync::Arc::new(()),
-            readiness_liveness: std::sync::Arc::new(()),
             interface_name,
             ingress_ifindex,
             local_address,
@@ -944,24 +939,6 @@ impl crate::control_port::GtpuControlPort for GtpuReassemblySocket {
         plan: crate::control_port::GtpuControlSendPlan,
     ) -> Result<usize, crate::control_port::GtpuControlPortError> {
         Self::send_control_response(self, plan)
-    }
-
-    /// Readiness for the shared receive queue of this sealed socket.
-    ///
-    /// The socket stays owned by this value; the source owns only a private
-    /// epoll instance and exposes that instance through `AsFd`, never the
-    /// receive socket. Dropping this value makes the source return
-    /// `Unavailable`.
-    fn downlink_readiness(
-        &self,
-    ) -> Result<crate::control_port::GtpuControlReadiness, crate::control_port::GtpuControlPortError>
-    {
-        use crate::control_port::{GtpuControlQueue, GtpuControlReadiness};
-
-        GtpuControlReadiness::new(
-            [(GtpuControlQueue::Shared, self.readiness_fd())],
-            Some(std::sync::Arc::downgrade(&self.readiness_liveness)),
-        )
     }
 }
 
