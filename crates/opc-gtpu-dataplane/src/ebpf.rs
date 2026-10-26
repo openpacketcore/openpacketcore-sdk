@@ -3879,6 +3879,7 @@ const fn traffic_attempt_capacity_available(current: usize) -> bool {
 /// The drain never appends a record once the batch is full; it marks the drain
 /// overflowed so the consumer fails closed instead of silently truncating.
 /// Kept as one explicitly testable expression for the same evidence reason.
+#[cfg(any(target_os = "linux", test))]
 const fn traffic_observation_batch_full(record_count: usize, budget: usize) -> bool {
     record_count >= budget
 }
