@@ -762,11 +762,11 @@ fn exercise_expired_successor_refusal_releases_reset(native: bool) {
                 .unwrap();
             assert_eq!(retained.id, old_request.sa.id);
             assert!(!old.is_retired() && !next.is_retired());
-            authority.close_execution().await;
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                lifecycle.reset(participants(&lifecycle, &backend)),
-            )
+            eprintln!("OPC_XFRM_EXPIRED_SUCCESSOR_REFUSAL_PROVEN: predecessor remains live");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                authority.close_execution().await;
+                lifecycle.reset(participants(&lifecycle, &backend)).await
+            })
             .await
             .expect("retirement refusal must release the reset barrier")
             .unwrap();
