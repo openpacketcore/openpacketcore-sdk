@@ -26,7 +26,7 @@
 use core::fmt;
 
 /// Current shared-SA TFT map ABI version.
-pub const TFT_CLASSIFIER_ABI_VERSION: u8 = 5;
+pub const TFT_CLASSIFIER_ABI_VERSION: u8 = 6;
 /// The only inner family executable by the current GTP-U tc forwarding path.
 pub const TFT_CLASSIFIER_FAMILY_IPV4: u8 = 4;
 /// Number of immutable filter banks per classifier.
@@ -2734,6 +2734,7 @@ mod tests {
             &TFT_CLASSIFIER_SCHEMA_MARKER_VALUE
         ));
         assert!(!tft_classifier_schema_is_current(b"OPC-TFT-IPv4-v4\0"));
+        assert!(!tft_classifier_schema_is_current(b"OPC-TFT-IPv4-v5\0"));
         for index in 0..TFT_CLASSIFIER_SCHEMA_VALUE_LEN {
             let mut wrong = TFT_CLASSIFIER_SCHEMA_MARKER_VALUE;
             wrong[index] ^= 1;
@@ -2742,5 +2743,13 @@ mod tests {
                 "schema byte {index} must participate in the identity"
             );
         }
+    }
+
+    #[test]
+    fn metadata_abi_matches_the_current_schema_generation() {
+        assert_eq!(meta(true, 0).encode()[0], 6);
+        let mut prior = meta(true, 0).encode();
+        prior[0] = 5;
+        assert!(TftClassifierMeta::decode(prior).is_none());
     }
 }

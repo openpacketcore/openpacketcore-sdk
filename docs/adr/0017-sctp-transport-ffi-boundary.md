@@ -60,7 +60,7 @@ The distinction is decisive:
 ## Decision
 
 Amend ADR 0014 §8 to permit a **narrow, explicitly allowlisted** unsafe
-exception pattern for Linux kernel UAPI sys crates, and adopt **Option A** when
+exception pattern for Linux kernel UAPI sys crates, and adopt **kernel FFI** when
 an SCTP-terminating CNF is in scope:
 
 1. **`opc-libsctp-sys`** provides thin FFI over Linux SCTP socket UAPI and
@@ -127,9 +127,9 @@ an SCTP-terminating CNF is in scope:
    socket/XFRM netlink calls and minimal helper calls that wrap those UAPIs. FFI
    that links a foreign **C protocol codec** (parsing attacker-controlled bytes
    — NGAP/NAS/etc.) remains rejected; those stay pure-Rust per ADR 0013/0015.
-6. SCTP is implemented per Option A behind this boundary, never as scattered
-   `unsafe` and never as a userspace reimplementation without revisiting this
-   ADR.
+6. SCTP is implemented through kernel FFI behind this boundary, never as
+   scattered `unsafe` and never as a userspace reimplementation without
+   revisiting this ADR.
 
 ## Consequences
 

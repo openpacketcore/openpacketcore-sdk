@@ -43,7 +43,7 @@ that can consume the 3GPP ASN.1 modules directly. The evaluation criteria are:
 
 ## Options Evaluated
 
-### Option A: `hampi` / `rasn` ecosystem
+### `hampi` / `rasn` ecosystem
 
 - **hampi** (GitHub: `repnop/hampi`) — ASN.1 compiler generating Rust structs
   with APER/UPER/OER support.
@@ -56,7 +56,7 @@ that can consume the 3GPP ASN.1 modules directly. The evaluation criteria are:
 **Verdict:** Leading candidate. Requires a spike to compile 3GPP R18 NGAP ASN.1
   modules and validate against known-good PCAPs.
 
-### Option B: Generated code from `asn1-codecs` (ERI framework)
+### Generated code from `asn1-codecs` (ERI framework)
 
 The `asn1-codecs` family (used by some telecom OSS projects) generates Rust
 from ASN.1 via an intermediate representation.
@@ -64,7 +64,7 @@ from ASN.1 via an intermediate representation.
 **Pros:** Explicitly designed for telecom ASN.1 modules.
 **Cons:** Mixed maintenance status; some forks carry unsafe code; licensing
   unclear on some forks; heavy dependency tree.
-**Verdict:** Fallback if Option A fails the spike. Requires legal review of
+**Verdict:** Fallback if the `hampi`/`rasn` spike fails. Requires legal review of
   upstream license before adoption.
 
 ### Option C: FFI to `srsRAN` / `OAI` C NGAP codec
@@ -91,7 +91,7 @@ rest.
 
 ## Recommendation
 
-**Proceed with Option A (`hampi`/`rasn`).**
+**Proceed with `hampi`/`rasn`.**
 
 Phased plan:
 
@@ -110,7 +110,7 @@ Phased plan:
 - The SDK gains a maintainable, spec-traceable NGAP codec path.
 - Downstream NF operators must accept a generated-code dependency (acceptable
   given the alternative of FFI or hand-written bugs).
-- If `hampi`/`rasn` fails the spike, we fall back to Option B with a license
+- If `hampi`/`rasn` fails the spike, we fall back to `asn1-codecs` with a license
   review gate.
 
 ## Implementation experience (2026-06)
@@ -135,9 +135,9 @@ Consequences acted on:
 - The workspace MSRV was raised to **1.88**, the actual floor of the
   resolved dependency graph (set by `time`; `edition2024` support needs
   ≥ 1.85, the `icu` stack ≥ 1.86). This repairs the MSRV gate and removes
-  the blocker on Option A. See ADR 0014 for the toolchain/dependency policy.
-- The Option A spike should be re-run against `rasn` on the raised MSRV before
-  any consideration of Option B (`asn1-codecs`, which still carries its
+  the blocker on `rasn`. See ADR 0014 for the toolchain/dependency policy.
+- The `rasn` spike should be re-run on the raised MSRV before
+  any consideration of `asn1-codecs` (which still carries its
   license-review gate per the comparison above).
 
 ## Bounded container framing amendment (2026-09)

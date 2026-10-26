@@ -308,7 +308,7 @@ MTU-bearing contexts must be drained before an SDK downgrade. See
   adoption rejects partial pin graphs and promotes an all-zero schema marker
   only after the metadata, filter, and fragment-affinity maps are proven empty
   before hook mutation and rechecked empty immediately before publication.
-  Native eBPF TFT classifier ABI/schema v5 remains IPv4-only: filter-map keys
+  Native eBPF TFT classifier ABI/schema v6 remains IPv4-only: filter-map keys
   include the current owner and snapshot generations, and each value carries
   its dense precedence rank. TC therefore finds only rows named by validated
   metadata; exact userspace readback verifies the redundant value identity and
@@ -1253,8 +1253,10 @@ subscriber can therefore occupy at most 256 concurrent fragmented datagrams
 capacity. Two PAAs that hash to the same group share that group's bound, so the
 blast radius of a hash collision is one group rather than the whole table.
 The host `TftUplinkFragmentTable` allocates approximately 24.5 MiB per
-attachment; the partition adds no memory and only two masks to the existing
-single hash pass.
+attachment; the partition adds no memory and folds the upper hash bits before
+each mask in a single hash pass. The 64-range overlap walk accumulates conflicts
+without data-dependent branches, keeping verifier work bounded without reducing
+the supported range count. Exact key matching compares all five 32-bit words.
 
 A duplicate first fragment is accepted only when its parsed classifier fields,
 selected mark, header length, and first range agree. A conflicting first

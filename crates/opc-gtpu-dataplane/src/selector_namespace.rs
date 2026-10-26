@@ -11147,7 +11147,6 @@ mod tests {
     mod bearer_ledger;
     mod n3_end_marker;
     mod n3_fixed_flow;
-    mod scale_evidence;
     pub(super) mod worker_lease;
 
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

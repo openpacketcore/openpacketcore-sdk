@@ -6,7 +6,8 @@ use opc_gtpu_ebpf_common::{
     TftClassifierKey, TftClassifierMeta, TftClassifierOwnerId, TftFragmentKey,
     COUNTER_TFT_CLASSIFIER_CAPACITY, COUNTER_TFT_CLASSIFIER_INVALID_STATE,
     COUNTER_TFT_CLASSIFIER_MALFORMED, TFT_FRAGMENT_BUCKETS, TFT_FRAGMENT_BUCKET_VALUE_LEN,
-    TFT_FRAGMENT_LIFETIME_NS, TFT_FRAGMENT_MAX_RANGES, TFT_FRAGMENT_WAYS,
+    TFT_FRAGMENT_LIFETIME_NS, TFT_FRAGMENT_MAX_RANGES, TFT_FRAGMENT_OWNER_BUCKETS,
+    TFT_FRAGMENT_OWNER_MAX_DATAGRAMS, TFT_FRAGMENT_WAYS,
 };
 
 const SPI: u32 = 0x1020_3040;
@@ -855,6 +856,17 @@ pub(super) async fn qualify_capacity() -> TestResult {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let fixture = Fixture::new().await?;
+    let kernel = fs::read_to_string("/proc/sys/kernel/osrelease").expect("read kernel release");
+    for direction in ["egress", "ingress"] {
+        let id = tc_program_id(direction);
+        let info = loaded_programs()
+            .find_map(|result| result.ok().filter(|info| info.id() == id))
+            .expect("the exact attached classifier must remain loaded");
+        println!(
+            "OPC_GTPU_TFT_FRAGMENT_VERIFIER kernel={} hook={} verified_instructions={:?} translated_bytes={:?}",
+            kernel.trim(), direction, info.verified_instruction_count(), info.size_translated(),
+        );
+    }
     let (_, key_size, value_size, max_entries) =
         pinned_map_abi(&fixture.pin_dir, MAP_TFT_FRAGMENT_AFFINITY).unwrap();
     assert_eq!(
@@ -909,6 +921,92 @@ pub(super) async fn qualify_capacity() -> TestResult {
         &esp_fragment(collisions[TFT_FRAGMENT_WAYS], 3),
         DropCounter::Invalid,
     );
+    assert_live(started);
+    expire(started);
+
+    // Fill every bucket this subscriber can reach, while a different group
+    // remains able to establish and finish an independent fragmented datagram.
+    let group = bucket / TFT_FRAGMENT_OWNER_BUCKETS;
+    // The fixture owns .1 as its router and .2 as its first subscriber.
+    let other_paa = (3..=254)
+        .map(|last| Ipv4Addr::new(10, 45, 0, last))
+        .find(|paa| {
+            TftFragmentKey::new(
+                TftClassifierKey::new(fixture.device.ifindex, paa.octets()).unwrap(),
+                paa.octets(),
+                REMOTE_HOST.octets(),
+                IPPROTO_ESP,
+                0,
+            )
+            .bucket()
+                / TFT_FRAGMENT_OWNER_BUCKETS
+                != group
+        })
+        .unwrap();
+    let mut context = session_context(fixture.device.ifindex);
+    context.ms_address = IpAddr::V4(other_paa);
+    context.local_teid = Teid::new(0x1100_0101).unwrap();
+    context.peer_teid = PeerTeid::new(0x2100_0101);
+    fixture.backend.install_pdp_context(context).await?;
+    assert_eq!(
+        fixture.backend.reconcile_tft_uplink_classifier(
+            classifier_for(fixture.device.ifindex, other_paa, &[]),
+        ).await?,
+        TftUplinkClassifierReconcileOutcome::Installed
+    );
+    // Linux raw(7) fills a zero ID under IP_HDRINCL. Explicit nonzero IDs
+    // keep the injected bytes and the precomputed affinity keys identical.
+    fixture.forward(&with_paa(esp_fragment(1, 0), other_paa), 0x2100_0101);
+    let mut pressure = vec![Vec::new(); TFT_FRAGMENT_OWNER_BUCKETS as usize];
+    for id in 1..=u16::MAX {
+        let selected = fragment_key(fixture.device.ifindex, id).bucket();
+        assert_eq!(selected / TFT_FRAGMENT_OWNER_BUCKETS, group);
+        let ids = &mut pressure[(selected % TFT_FRAGMENT_OWNER_BUCKETS) as usize];
+        if ids.len() <= TFT_FRAGMENT_WAYS {
+            ids.push(id);
+        }
+        if pressure
+            .iter()
+            .all(|ids| ids.len() == TFT_FRAGMENT_WAYS + 1)
+        {
+            break;
+        }
+    }
+    assert!(pressure
+        .iter()
+        .all(|ids| ids.len() == TFT_FRAGMENT_WAYS + 1));
+    let admitted: Vec<_> = pressure
+        .iter()
+        .flat_map(|ids| &ids[..TFT_FRAGMENT_WAYS])
+        .map(|id| esp_fragment(*id, MORE))
+        .collect();
+    assert_eq!(admitted.len(), TFT_FRAGMENT_OWNER_MAX_DATAGRAMS as usize);
+    assert_eq!(admitted.len(), 256);
+    let refused: Vec<_> = pressure
+        .iter()
+        .map(|ids| esp_fragment(ids[TFT_FRAGMENT_WAYS], MORE))
+        .collect();
+    let tails: Vec<_> = pressure
+        .iter()
+        .flat_map(|ids| &ids[..TFT_FRAGMENT_WAYS])
+        .map(|id| esp_fragment(*id, 3))
+        .collect();
+    let started = Instant::now();
+    for batch in admitted.chunks(32) {
+        fixture.forward_many(batch, PEER_TEID_A);
+    }
+    fixture.reject_many(&refused, DropCounter::Capacity);
+    fixture.forward_many(
+        &[
+            with_paa(esp_fragment(2, MORE), other_paa),
+            with_paa(esp_fragment(2, 3), other_paa),
+        ],
+        0x2100_0101,
+    );
+    for batch in tails.chunks(32) {
+        fixture.forward_many(batch, PEER_TEID_A);
+    }
+    fixture.reject_many(&refused, DropCounter::Capacity);
     assert_live(started);
     fixture.finish().await
 }

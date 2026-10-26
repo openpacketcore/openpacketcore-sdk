@@ -1052,8 +1052,8 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
    `InnerFragmentCapacityExhausted` (counted in
    `inner_fragment_capacity_exhausted`) instead of resetting another
    destination's budget or Identification sequence. A destination idle for
-   at least 255 seconds may be evicted and restarts with a full bucket; no
-   255-second window can then contain admissions from both lives. A refused
+   at least 255 seconds may be evicted only after its bucket fully refills;
+   this also preserves limits whose refill takes longer than the lifetime. A refused
    admission still counts as a use. An empty bucket is an
    `InnerFragmentRateLimited` drop. Steps 1 and 2 take no token.
 4. **Fragmentation** by the RFC 791 section 3.2 procedure, generalized to
@@ -1082,13 +1082,14 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
    re-adoption or a re-created attachment) still restarts every destination
    from a new random value and a full bucket, possibly within 255 seconds of
    the previous registration's Identifications; that reset is the documented
-   residual of the host-side budget (#1018). A limit replacement is accepted
-   only when a carried conservative 255-second bound proves it cannot combine
-   with earlier admissions of the registration into more than 65,535 packets:
-   an unchanged limit, no prior admission, 255 seconds without an admission,
-   or carried bound plus the new limit's 255-second maximum within 65,535.
-   Otherwise `set_inner_fragment_rate_limit` returns `InvalidLimits` and the
-   deployment must re-register to change the budget mid-session.
+   residual of the host-side budget (#1018). Every valid limit replacement
+   preserves sequences and budgets. A separate per-destination sliding count
+   enforces at most 65,535 admissions across every replacement. Its 256
+   one-second bins retain admissions for up to one extra second, preventing
+   an admission near a bin boundary from expiring early. The counters occupy
+   512 bytes per destination (2 MiB at the 4,096-key cap), plus fixed
+   bookkeeping, and expire at most 256 bins per admission. Live limit changes
+   never require re-registering the attachment.
 
 The result is `GtpuDownlinkEvent::Fragmented`: the fragments in offset order,
 the MTU and the bearer mark. Its `Debug` output shows only the fragment
@@ -1171,9 +1172,11 @@ Destination Unreachable (Fragmentation Needed) error is sent:
   while the table holds only such sessions, a new session's error budget is
   refused fail closed (`CapacityExhausted`, counted in
   `packet_too_big_capacity_exhausted`). A session idle for at least 255
-  seconds may be evicted and re-created with a full bucket; no 255-second
-  window can then contain admissions from both lives, so a flood toward one
-  PAA still exhausts only that session's budget.
+  seconds may be evicted only after its bucket fully refills. Explicitly
+  replacing the limit restarts every session's bucket full, including an equal
+  limit, while retaining tracked identities and their eviction grace. A flood
+  toward one PAA still exhausts only that session's budget. New registrations
+  retain the documented residual of starting with fresh volatile budgets.
 - **Tradeoff.** The error's source is the subscriber's own address. The ePDG
   is routing, so RFC 1812 4.3.2.4 would have it use its own address, but the
   PGW's per-PDN anti-spoofing admits only the PAA. The originator therefore
