@@ -18,7 +18,7 @@ use crate::ie::{decode_typed_ie_sequence, GroupedIe, TypedIe};
 
 /// Create PDR grouped IE (type 1).
 ///
-/// TS 29.244 §7.5.2.1: contains PDR ID, Precedence, PDI, Outer Header Removal,
+/// TS 29.244 §7.5.2.2, Table 7.5.2.2-1: contains PDR ID, Precedence, PDI, Outer Header Removal,
 /// FAR ID, URR IDs, QER IDs, Activate Predefined Rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePdr {
@@ -46,7 +46,7 @@ impl GroupedIe for CreatePdr {
 
 /// PDI grouped IE (type 2).
 ///
-/// TS 29.244 §7.5.2.2: contains Source Interface, F-TEID, Network Instance,
+/// TS 29.244 §7.5.2.2, Table 7.5.2.2-2: contains Source Interface, F-TEID, Network Instance,
 /// UE IP Address, and other traffic-detection parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pdi {
@@ -74,7 +74,7 @@ impl GroupedIe for Pdi {
 
 /// Create FAR grouped IE (type 3).
 ///
-/// TS 29.244 §7.5.2.3: contains FAR ID, Apply Action, Forwarding Parameters,
+/// TS 29.244 §7.5.2.3, Table 7.5.2.3-1: contains FAR ID, Apply Action, Forwarding Parameters,
 /// Duplicating Parameters, BAR ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateFar {
@@ -102,7 +102,7 @@ impl GroupedIe for CreateFar {
 
 /// Forwarding Parameters grouped IE (type 4).
 ///
-/// TS 29.244 §7.5.2.2.1: contains Destination Interface, Network Instance,
+/// TS 29.244 §7.5.2.3, Table 7.5.2.3-2: contains Destination Interface, Network Instance,
 /// Outer Header Creation, Transport Level Marking, Forwarding Policy, etc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardingParameters {
@@ -130,7 +130,7 @@ impl GroupedIe for ForwardingParameters {
 
 /// Create URR grouped IE (type 6).
 ///
-/// TS 29.244 §7.5.2.5: contains URR ID, Measurement Method, Reporting Triggers,
+/// TS 29.244 §7.5.2.4, Table 7.5.2.4-1: contains URR ID, Measurement Method, Reporting Triggers,
 /// etc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateUrr {
@@ -158,7 +158,7 @@ impl GroupedIe for CreateUrr {
 
 /// Create QER grouped IE (type 7).
 ///
-/// TS 29.244 §7.5.2.4: contains QER ID, Gate Status, MBR, GBR, etc.
+/// TS 29.244 §7.5.2.5, Table 7.5.2.5-1: contains QER ID, Gate Status, MBR, GBR, etc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateQer {
     /// Member IEs.
@@ -185,7 +185,7 @@ impl GroupedIe for CreateQer {
 
 /// Update QER grouped IE (type 14).
 ///
-/// TS 29.244 §7.5.4.5: contains QER ID and the subset of QoS parameters
+/// TS 29.244 §7.5.4.5, Table 7.5.4.5: contains QER ID and the subset of QoS parameters
 /// that need to be modified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateQer {
@@ -213,7 +213,7 @@ impl GroupedIe for UpdateQer {
 
 /// Update PDR grouped IE (type 9).
 ///
-/// TS 29.244 §7.5.4.2: contains PDR ID and the subset of detection/action
+/// TS 29.244 §7.5.4.2, Table 7.5.4.2-1: contains PDR ID and the subset of detection/action
 /// parameters that need to be modified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePdr {
@@ -241,7 +241,7 @@ impl GroupedIe for UpdatePdr {
 
 /// Update FAR grouped IE (type 10).
 ///
-/// TS 29.244 §7.5.4.3: contains FAR ID, Apply Action, and Update Forwarding
+/// TS 29.244 §7.5.4.3, Table 7.5.4.3-1: contains FAR ID, Apply Action, and Update Forwarding
 /// Parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateFar {
@@ -269,7 +269,7 @@ impl GroupedIe for UpdateFar {
 
 /// Update Forwarding Parameters grouped IE (type 11).
 ///
-/// TS 29.244 §7.5.4.3-2: contains Destination Interface, Network Instance,
+/// TS 29.244 §7.5.4.3, Table 7.5.4.3-2: contains Destination Interface, Network Instance,
 /// Outer Header Creation, and other forwarding parameters to be modified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateForwardingParameters {
@@ -297,7 +297,7 @@ impl GroupedIe for UpdateForwardingParameters {
 
 /// Update URR grouped IE (type 13).
 ///
-/// TS 29.244 §7.5.4.4: contains URR ID and the subset of measurement/reporting
+/// TS 29.244 §7.5.4.4, Table 7.5.4.4: contains URR ID and the subset of measurement/reporting
 /// parameters that need to be modified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateUrr {
@@ -325,7 +325,7 @@ impl GroupedIe for UpdateUrr {
 
 /// Created PDR grouped IE (type 8).
 ///
-/// TS 29.244 §7.5.2.6: contains PDR ID, F-TEID.
+/// TS 29.244 §7.5.3.2, Table 7.5.3.2-1: contains PDR ID, F-TEID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedPdr {
     /// Member IEs.

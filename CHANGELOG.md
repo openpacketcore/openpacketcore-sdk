@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-pfcp`: require Node ID in establishment/release builders and UP
+  F-SEID for successful establishment responses. Add node/session-set message
+  names, `ApplyAction.fssm`/`mbsu`, `UserPlaneInactivityTimer` and a profile
+  combination-error variant. See crate migration notes. (#1359, #1516, #1524)
+
+
 - `opc-proto-nas`: add the defined SNPN/disaster-roaming registration types,
   NIA/NEA identifiers 4–7, and twelve NSSAA/relay/service-level-authentication/
   remote-UE message names. Exhaustive matches must handle the new variants.
@@ -914,6 +920,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-proto-pfcp`: accept parameter-only/empty modifications, references to
+  existing rules in modification deltas, source-interface-only PDIs and FO
+  bundles; ignore received header spares. Enforce mandatory identities,
+  conflicting PDI fields and Apply Action combinations. Preserve assigned
+  unmodelled IEs under every unknown-IE policy and correct clause diagnostics.
+  (#1359, #1516, #1518, #1519, #1522, #1523, #1524, #1525)
+
 
 - `opc-proto-nas`: apply first-occurrence selection to all optional-element
   tables; accept framed extensions and non-critical unknown IEs at all

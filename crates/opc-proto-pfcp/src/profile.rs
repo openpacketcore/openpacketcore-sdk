@@ -101,13 +101,13 @@ pub enum ProfileValidationError {
         /// Human-readable IE name.
         ie: &'static str,
     },
-    /// A message that must contain at least one rule operation has none.
+    /// Legacy diagnostic retained for source compatibility; no longer emitted.
     #[error("message type {message_type} contains no profile-owned rule operation")]
     MissingOperation {
         /// Numeric PFCP message type.
         message_type: u8,
     },
-    /// A PDI does not contain any profile-owned traffic-match primitive.
+    /// Legacy diagnostic retained for source compatibility; no longer emitted.
     #[error("{scope} does not contain a profile-owned traffic-match IE")]
     MissingTrafficMatch {
         /// Validation scope that lacks a traffic match.
@@ -136,6 +136,14 @@ pub enum ProfileValidationError {
         /// Referenced rule ID.
         id: u32,
     },
+    /// A combination of IEs or flags violates a message/IE table rule.
+    #[error("invalid IE combination in {scope}: {reason}")]
+    InvalidCombination {
+        /// Message or grouped IE being validated.
+        scope: &'static str,
+        /// Violated rule.
+        reason: &'static str,
+    },
     /// Session Report Request includes a Usage Report flag but no Usage Report
     /// grouped IE.
     #[error("Session Report Request has usage-report flag but no Usage Report IE")]
@@ -148,31 +156,22 @@ pub fn validate_production_v1(
     ies: &[InformationElement],
     ctx: DecodeContext,
 ) -> ProfileResult<()> {
+    if header.message_type == MessageType::VersionNotSupportedResponse as u8 && !ies.is_empty() {
+        return Err(ProfileValidationError::InvalidCombination {
+            scope: "Version Not Supported Response",
+            reason: "only a PFCP header is permitted",
+        });
+    }
     let typed_ies = decode_typed_ies("message", ies, ctx)?;
     validate_seid_presence(header)?;
 
     match header.message_type {
-        value if value == MessageType::HeartbeatRequest as u8 => {
-            validate_heartbeat_request(&typed_ies)
-        }
-        value if value == MessageType::HeartbeatResponse as u8 => {
-            validate_heartbeat_response(&typed_ies)
-        }
-        value if value == MessageType::AssociationSetupRequest as u8 => {
-            validate_association_setup_request(&typed_ies)
-        }
-        value if value == MessageType::AssociationSetupResponse as u8 => {
-            validate_association_setup_response(&typed_ies)
-        }
-        value if value == MessageType::AssociationReleaseRequest as u8 => Ok(()),
-        value if value == MessageType::AssociationReleaseResponse as u8 => {
-            validate_association_release_response(&typed_ies)
-        }
+        1..=17 => validate_node_message(header.message_type, &typed_ies),
         value if value == MessageType::SessionEstablishmentRequest as u8 => {
             validate_session_establishment_request(&typed_ies)
         }
         value if value == MessageType::SessionEstablishmentResponse as u8 => {
-            validate_cause_response("Session Establishment Response", &typed_ies)
+            validate_session_establishment_response(&typed_ies)
         }
         value if value == MessageType::SessionModificationRequest as u8 => {
             validate_session_modification_request(&typed_ies)
@@ -223,20 +222,8 @@ fn decode_typed_ies(
 
 fn validate_seid_presence(header: &Header) -> ProfileResult<()> {
     let expected_present = match header.message_type {
-        value if value == MessageType::HeartbeatRequest as u8 => false,
-        value if value == MessageType::HeartbeatResponse as u8 => false,
-        value if value == MessageType::AssociationSetupRequest as u8 => false,
-        value if value == MessageType::AssociationSetupResponse as u8 => false,
-        value if value == MessageType::AssociationReleaseRequest as u8 => false,
-        value if value == MessageType::AssociationReleaseResponse as u8 => false,
-        value if value == MessageType::SessionEstablishmentRequest as u8 => true,
-        value if value == MessageType::SessionEstablishmentResponse as u8 => true,
-        value if value == MessageType::SessionModificationRequest as u8 => true,
-        value if value == MessageType::SessionModificationResponse as u8 => true,
-        value if value == MessageType::SessionDeletionRequest as u8 => true,
-        value if value == MessageType::SessionDeletionResponse as u8 => true,
-        value if value == MessageType::SessionReportRequest as u8 => true,
-        value if value == MessageType::SessionReportResponse as u8 => true,
+        1..=17 => false,
+        50..=57 => true,
         _ => return Ok(()),
     };
 
@@ -250,51 +237,82 @@ fn validate_seid_presence(header: &Header) -> ProfileResult<()> {
     }
 }
 
-fn validate_heartbeat_request(typed_ies: &[TypedIe]) -> ProfileResult<()> {
-    require_one("Heartbeat Request", typed_ies, IeKind::RecoveryTimeStamp)?;
-    reject_duplicates("Heartbeat Request", typed_ies, &[IeKind::RecoveryTimeStamp])
+// M rows in TS 29.244 V19.6.0 §7.4. C/O rows remain procedure-owned.
+fn validate_node_message(message_type: u8, ies: &[TypedIe]) -> ProfileResult<()> {
+    let (scope, required): (&str, &[(u16, &str)]) = match message_type {
+        1 => ("Heartbeat Request", &[(96, "Recovery Time Stamp")]),
+        2 => ("Heartbeat Response", &[(96, "Recovery Time Stamp")]),
+        3 => ("PFD Management Request", &[]),
+        4 => ("PFD Management Response", &[(19, "Cause")]),
+        5 => (
+            "Association Setup Request",
+            &[(60, "Node ID"), (96, "Recovery Time Stamp")],
+        ),
+        6 => (
+            "Association Setup Response",
+            &[(60, "Node ID"), (96, "Recovery Time Stamp"), (19, "Cause")],
+        ),
+        7 => ("Association Update Request", &[(60, "Node ID")]),
+        8 => (
+            "Association Update Response",
+            &[(60, "Node ID"), (19, "Cause")],
+        ),
+        9 => ("Association Release Request", &[(60, "Node ID")]),
+        10 => (
+            "Association Release Response",
+            &[(60, "Node ID"), (19, "Cause")],
+        ),
+        11 => {
+            return if ies.is_empty() {
+                Ok(())
+            } else {
+                Err(ProfileValidationError::InvalidCombination {
+                    scope: "Version Not Supported Response",
+                    reason: "only a PFCP header is permitted",
+                })
+            };
+        }
+        12 => (
+            "Node Report Request",
+            &[(60, "Node ID"), (101, "Node Report Type")],
+        ),
+        13 => ("Node Report Response", &[(60, "Node ID"), (19, "Cause")]),
+        14 => ("Session Set Deletion Request", &[(60, "Node ID")]),
+        15 => (
+            "Session Set Deletion Response",
+            &[(60, "Node ID"), (19, "Cause")],
+        ),
+        16 => (
+            "Session Set Modification Request",
+            &[(60, "Node ID"), (290, "PFCP Session Change Info")],
+        ),
+        17 => (
+            "Session Set Modification Response",
+            &[(60, "Node ID"), (19, "Cause")],
+        ),
+        _ => return Err(ProfileValidationError::UnsupportedMessageType { message_type }),
+    };
+    for &(kind, name) in required {
+        let count = ies.iter().filter(|ie| ie.ie_type() == kind).count();
+        if count == 0 {
+            return Err(ProfileValidationError::MissingIe { scope, ie: name });
+        }
+        // Table 7.4.7.1-1 explicitly allows repeated Session Change Info.
+        if count > 1 && kind != 290 {
+            return Err(ProfileValidationError::DuplicateIe { scope, ie: name });
+        }
+    }
+    Ok(())
 }
 
-fn validate_heartbeat_response(typed_ies: &[TypedIe]) -> ProfileResult<()> {
-    require_one("Heartbeat Response", typed_ies, IeKind::RecoveryTimeStamp)?;
-    reject_duplicates(
-        "Heartbeat Response",
-        typed_ies,
-        &[IeKind::RecoveryTimeStamp],
-    )
-}
-
-fn validate_association_setup_request(typed_ies: &[TypedIe]) -> ProfileResult<()> {
-    require_one("Association Setup Request", typed_ies, IeKind::NodeId)?;
-    require_one(
-        "Association Setup Request",
-        typed_ies,
-        IeKind::RecoveryTimeStamp,
-    )?;
-    reject_duplicates(
-        "Association Setup Request",
-        typed_ies,
-        &[IeKind::NodeId, IeKind::RecoveryTimeStamp],
-    )
-}
-
-fn validate_association_setup_response(typed_ies: &[TypedIe]) -> ProfileResult<()> {
-    require_one("Association Setup Response", typed_ies, IeKind::NodeId)?;
-    require_one(
-        "Association Setup Response",
-        typed_ies,
-        IeKind::RecoveryTimeStamp,
-    )?;
-    validate_cause_response("Association Setup Response", typed_ies)?;
-    reject_duplicates(
-        "Association Setup Response",
-        typed_ies,
-        &[IeKind::NodeId, IeKind::RecoveryTimeStamp, IeKind::Cause],
-    )
-}
-
-fn validate_association_release_response(typed_ies: &[TypedIe]) -> ProfileResult<()> {
-    validate_cause_response("Association Release Response", typed_ies)
+fn validate_session_establishment_response(ies: &[TypedIe]) -> ProfileResult<()> {
+    let scope = "Session Establishment Response";
+    require_one(scope, ies, IeKind::NodeId)?;
+    validate_cause_response(scope, ies)?;
+    if ies.iter().any(|ie| matches!(ie, TypedIe::Cause(cause) if cause.value == crate::ie::CauseValue::RequestAccepted)) {
+        require_one(scope, ies, IeKind::FSeid)?;
+    }
+    reject_duplicates(scope, ies, &[IeKind::NodeId, IeKind::FSeid])
 }
 
 fn validate_cause_response(scope: &'static str, typed_ies: &[TypedIe]) -> ProfileResult<()> {
@@ -303,6 +321,7 @@ fn validate_cause_response(scope: &'static str, typed_ies: &[TypedIe]) -> Profil
 }
 
 fn validate_session_establishment_request(typed_ies: &[TypedIe]) -> ProfileResult<()> {
+    require_one("Session Establishment Request", typed_ies, IeKind::NodeId)?;
     require_one("Session Establishment Request", typed_ies, IeKind::FSeid)?;
     require_one(
         "Session Establishment Request",
@@ -314,17 +333,18 @@ fn validate_session_establishment_request(typed_ies: &[TypedIe]) -> ProfileResul
         typed_ies,
         IeKind::CreateFar,
     )?;
-    reject_duplicates("Session Establishment Request", typed_ies, &[IeKind::FSeid])?;
-    validate_rule_graph("Session Establishment Request", typed_ies)
+    reject_duplicates(
+        "Session Establishment Request",
+        typed_ies,
+        &[IeKind::NodeId, IeKind::FSeid],
+    )?;
+    validate_rule_graph("Session Establishment Request", typed_ies, true)
 }
 
 fn validate_session_modification_request(typed_ies: &[TypedIe]) -> ProfileResult<()> {
-    if !typed_ies.iter().any(is_rule_operation) {
-        return Err(ProfileValidationError::MissingOperation {
-            message_type: MessageType::SessionModificationRequest as u8,
-        });
-    }
-    validate_rule_graph("Session Modification Request", typed_ies)
+    // A modification is a delta: referenced rules can exist in the session.
+    // The session owner resolves these IDs against current state.
+    validate_rule_graph("Session Modification Request", typed_ies, false)
 }
 
 fn validate_session_report_request(typed_ies: &[TypedIe]) -> ProfileResult<()> {
@@ -344,7 +364,11 @@ fn validate_session_report_request(typed_ies: &[TypedIe]) -> ProfileResult<()> {
     Ok(())
 }
 
-fn validate_rule_graph(scope: &'static str, typed_ies: &[TypedIe]) -> ProfileResult<()> {
+fn validate_rule_graph(
+    scope: &'static str,
+    typed_ies: &[TypedIe],
+    require_resolved: bool,
+) -> ProfileResult<()> {
     let mut created_fars = HashSet::new();
     let mut created_qers = HashSet::new();
     let mut created_urrs = HashSet::new();
@@ -404,6 +428,9 @@ fn validate_rule_graph(scope: &'static str, typed_ies: &[TypedIe]) -> ProfileRes
         }
     }
 
+    if !require_resolved {
+        return Ok(());
+    }
     validate_references(scope, "FAR", &far_references, &created_fars)?;
     validate_references(scope, "QER", &qer_references, &created_qers)?;
     validate_references(scope, "URR", &urr_references, &created_urrs)
@@ -443,11 +470,16 @@ fn validate_pdi(scope: &'static str, members: &[TypedIe]) -> ProfileResult<()> {
     require_one(scope, members, IeKind::SourceInterface)?;
     reject_duplicates(scope, members, &[IeKind::SourceInterface])?;
 
-    if members.iter().any(is_traffic_match) {
-        Ok(())
-    } else {
-        Err(ProfileValidationError::MissingTrafficMatch { scope })
+    if members.iter().any(|ie| ie.ie_type() == 131)
+        && members
+            .iter()
+            .any(|ie| matches!(ie.ie_type(), 21 | 22 | 93 | 308))
+    {
+        return Err(ProfileValidationError::InvalidCombination {
+            scope, reason: "Traffic Endpoint ID excludes F-TEID, Network Instance, UE IP Address and Local Ingress Tunnel",
+        });
     }
+    Ok(())
 }
 
 fn validate_create_far(members: &[TypedIe]) -> ProfileResult<()> {
@@ -464,6 +496,27 @@ fn validate_update_far(members: &[TypedIe]) -> ProfileResult<()> {
 }
 
 fn validate_forwarding_parameters(scope: &'static str, members: &[TypedIe]) -> ProfileResult<()> {
+    for member in members {
+        if let TypedIe::ApplyAction(action) = member {
+            let primary_count = [
+                action.drop,
+                action.forward,
+                action.buffer,
+                action.ip_masquerade,
+                action.ip_masquerade_decap,
+                action.fssm || action.mbsu,
+            ]
+            .into_iter()
+            .filter(|set| *set)
+            .count();
+            if primary_count != 1 || ((action.notify_cp || action.bdpn) && !action.buffer) {
+                return Err(ProfileValidationError::InvalidCombination {
+                    scope,
+                    reason: "Apply Action requires one primary action and NOCP/BDPN require BUFF",
+                });
+            }
+        }
+    }
     let forwards = members
         .iter()
         .any(|member| matches!(member, TypedIe::ApplyAction(action) if action.forward));
@@ -576,35 +629,6 @@ fn reject_duplicates(
     Ok(())
 }
 
-fn is_rule_operation(typed_ie: &TypedIe) -> bool {
-    matches!(
-        typed_ie,
-        TypedIe::CreatePdr(_)
-            | TypedIe::CreateFar(_)
-            | TypedIe::CreateQer(_)
-            | TypedIe::CreateUrr(_)
-            | TypedIe::UpdatePdr(_)
-            | TypedIe::UpdateFar(_)
-            | TypedIe::UpdateQer(_)
-            | TypedIe::UpdateUrr(_)
-            | TypedIe::RemovePdr(_)
-            | TypedIe::RemoveFar(_)
-            | TypedIe::RemoveQer(_)
-            | TypedIe::RemoveUrr(_)
-    )
-}
-
-fn is_traffic_match(typed_ie: &TypedIe) -> bool {
-    matches!(
-        typed_ie,
-        TypedIe::FTeid(_)
-            | TypedIe::NetworkInstance(_)
-            | TypedIe::UeIpAddress(_)
-            | TypedIe::Qfi(_)
-            | TypedIe::OuterHeaderRemoval(_)
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IeKind {
     Cause,
@@ -620,7 +644,6 @@ enum IeKind {
     QerId,
     UrrId,
     Precedence,
-    RecoveryTimeStamp,
     ReportType,
 }
 
@@ -641,7 +664,6 @@ impl IeKind {
                 | (Self::QerId, TypedIe::QerId(_))
                 | (Self::UrrId, TypedIe::UrrId(_))
                 | (Self::Precedence, TypedIe::Precedence(_))
-                | (Self::RecoveryTimeStamp, TypedIe::RecoveryTimeStamp(_))
                 | (Self::ReportType, TypedIe::ReportType(_))
         )
     }
@@ -661,7 +683,6 @@ impl IeKind {
             Self::QerId => "QER ID",
             Self::UrrId => "URR ID",
             Self::Precedence => "Precedence",
-            Self::RecoveryTimeStamp => "Recovery Time Stamp",
             Self::ReportType => "Report Type",
         }
     }
