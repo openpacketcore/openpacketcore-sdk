@@ -117,3 +117,23 @@ Standards: [RFC 1877](https://www.rfc-editor.org/rfc/rfc1877.html),
 [RFC 7542 §2.6](https://www.rfc-editor.org/rfc/rfc7542.html#section-2.6),
 [RFC 1812 §4.3.2.3](https://www.rfc-editor.org/rfc/rfc1812.html#section-4.3.2.3),
 and [RFC 4007 §6](https://www.rfc-editor.org/rfc/rfc4007.html#section-6).
+
+## Management work list (#1363): gNMI subscription behavior
+
+`TARGET_DEFINED` now selects configuration events and operational samples
+within the same subtree, using the existing schema-backed path selector and
+Subscribe authorization. Zero `SAMPLE` intervals use the server minimum.
+Sampling, heartbeat and suppression settings remain local to each subscription;
+an ON_CHANGE heartbeat does not require `suppress_redundant`. One initial
+authorized observation seeds every schedule, preserving overlapping-path
+deduplication and changes arriving during initialization.
+
+The six runtime regressions in
+[target_defined.rs](../crates/opc-gnmi-server/src/service/tests/target_defined.rs)
+check mixed delivery, keyed prefixes, Subscribe-versus-Read authorization,
+zero intervals, independent cadences/suppression and heartbeats. The complete
+Linux gNMI suite passes 274 tests, including 62 keyed-read/subscription tests
+and seven retained-audit integration tests. These tests establish the scoped
+subscription change; the YANG generation items in #1363 remain open.
+
+Specification: [gNMI 0.10.0 §3.5.1.5.2](https://github.com/openconfig/reference/blob/master/rpc/gnmi/gnmi-specification.md#35152-stream-subscriptions).
