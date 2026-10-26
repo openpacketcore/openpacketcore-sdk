@@ -83,11 +83,11 @@ Decodes IE *content* (caller strips IEI/length framing):
   length-validated, raw preservation only.
 
 ### 3. Message-Type Registries (Tables 9.7.1 / 9.7.2)
-- 5GMM: 29 message types, Registration Request (0x41) through DL NAS
-  Transport (0x68), with typed-or-raw body dispatch through
+- 5GMM: 37 message names, Registration Request (0x41) through Relay
+  Authentication Response (0x6D), with typed-or-raw body dispatch through
   `decode_mm_message_body` / `PlainMm::decode_body`.
-- 5GSM: 16 message types, PDU Session Establishment Request (0xC1) through
-  5GSM Status (0xD6), with raw-preserving first-CNF body dispatch through
+- 5GSM: 20 message names, PDU Session Establishment Request (0xC1) through
+  Remote UE Report Response (0xDB), with raw-preserving first-CNF body dispatch through
   `decode_sm_message_body` / `Sm::decode_body`.
 - Unknown code points do not fail decoding; `from_u8` returns `None` and
   the raw code remains available on the header.
