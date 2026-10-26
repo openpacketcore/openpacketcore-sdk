@@ -11170,9 +11170,6 @@ impl EbpfGtpuDataplaneBackend {
         let downlink_inner_mtu = commit_downlink_inner_mtu(commit).ok_or_else(indeterminate)?;
         let local_teid = Teid::new(u32::from_be_bytes(local_teid)).ok_or_else(indeterminate)?;
         let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(far.o_teid));
-        // eBPF userspace readback cannot expose a context the committed
-        // datapath object would drop; refuse it with the stable typed label
-        // until the object rebuild follow-up lands.
         Ok(GtpPdpContext {
             local_teid,
             peer_teid,
