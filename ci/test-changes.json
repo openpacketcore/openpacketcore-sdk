@@ -551,6 +551,18 @@
       "kind": "clock-source-changed",
       "reason": "Replace the real post-commit sleep with a held fully validated readback and controlled observer delay. Preserve the 200 ms budget, 400 ms delay, payload, generation and diagnostic assertions. Commit alone cannot authorize unbounded unfinished verification; committed_checkpoint_expiring_before_readback_requires_recovery covers that boundary, while the original real-time cancellation control remains unchanged.",
       "issue": 1336
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::stateless_quorum_consumer::prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once",
+      "kind": "clock-source-changed",
+      "reason": "Run the consumer on the shared controlled clock while voters, disk I/O and the delayed observer retain real time. Keep the 250 ms physical attempt, three-second caller deadline and all ordering, exactly-once, replay and conflict assertions. A 300 ms origin-reply hold fails before the clock change. The existing prepared_cas_three_voter_receipt_converges_after_real_commit_and_lost_response retains real-time physical-attempt expiry and durable receipt recovery.",
+      "issue": 1147
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::stateless_quorum_consumer::prepared_cas_binding_reply_loss_survives_slow_reply_observation",
+      "kind": "clock-source-changed",
+      "reason": "Run the consumer on the shared controlled clock while voters, disk I/O and the delayed observer retain real time. Keep the 250 ms physical attempt, three-second caller deadline and all ordering, exactly-once, replay and conflict assertions. A 300 ms origin-reply hold fails before the clock change. The existing prepared_cas_three_voter_receipt_converges_after_real_commit_and_lost_response retains real-time physical-attempt expiry and durable receipt recovery.",
+      "issue": 1147
     }
   ]
 }
