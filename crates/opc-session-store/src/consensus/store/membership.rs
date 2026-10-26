@@ -2256,6 +2256,10 @@ impl ConsensusSessionStore {
         store
             .stage_topology_transition_peers(&request, desired_peers)
             .map_err(|_| ConsensusSessionStoreOpenError::PeerSetMismatch)?;
+        let _ = store
+            .inner
+            .roster_maintenance
+            .set(roster_maintenance::start(Arc::downgrade(&store.inner)));
         Ok(store)
     }
 

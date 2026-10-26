@@ -4046,7 +4046,7 @@ impl GlobalChargeWitness {
 
     /// Linux test-only read access to the aggregate roster counters.
     ///
-    /// The native consent module (and its tests) are Linux-only. This accessor
+    /// The native consensus module (and its tests) are Linux-only. This accessor
     /// lets those tests assert exact retention capacity without widening the
     /// witness field visibility; it does not exist in production builds or on
     /// non-Linux test targets.

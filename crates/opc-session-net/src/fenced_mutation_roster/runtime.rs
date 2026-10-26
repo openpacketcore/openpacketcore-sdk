@@ -68,6 +68,27 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const PROVIDER_EFFECT_DEADLINE: Duration = Duration::from_secs(30);
 const ADMISSION_CAPACITY_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const ADMISSION_CAPACITY_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Equal jitter keeps independent waiters from synchronizing. The delay is
+/// bounded on both sides, and the caller clamps it to the original lease.
+#[derive(Default)]
+struct AdmissionCapacityBackoff {
+    failures: u32,
+}
+
+impl AdmissionCapacityBackoff {
+    fn next_delay(&mut self, entropy: u64) -> Duration {
+        let minimum = ADMISSION_CAPACITY_RETRY_INTERVAL.as_millis() as u64;
+        let maximum = ADMISSION_CAPACITY_MAX_RETRY_INTERVAL.as_millis() as u64;
+        let ceiling = minimum
+            .saturating_mul(1_u64 << self.failures.min(6))
+            .min(maximum);
+        self.failures = self.failures.saturating_add(1);
+        let floor = (ceiling / 2).max(minimum);
+        Duration::from_millis(floor + entropy % (ceiling - floor + 1))
+    }
+}
 /// One process-wide provider gate can never exceed the durable live-roster cap.
 const MAX_PROVIDER_IN_FLIGHT: usize = super::canonical::MAX_LIVE_ROSTERS;
 /// Authority entries are durable-operation capabilities, not concurrent
@@ -4134,6 +4155,7 @@ where
         .ok()
         .and_then(|remaining| started.checked_add(remaining));
         let mut retrying_capacity = false;
+        let mut backoff = AdmissionCapacityBackoff::default();
         loop {
             // Preserve the original first-attempt authority and uncertainty
             // decisions. Only a conclusive capacity response authorizes this
@@ -4163,7 +4185,7 @@ where
                     }
                     retrying_capacity = true;
                     let wake = tokio::time::Instant::now()
-                        .checked_add(ADMISSION_CAPACITY_RETRY_INTERVAL)
+                        .checked_add(backoff.next_delay(rand::random()))
                         .ok_or(ExecutorError::AuthorityRejected)?
                         .min(deadline);
                     tokio::time::sleep_until(wake).await;
@@ -8167,6 +8189,34 @@ mod production_runtime_cut_matrix_tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn capacity_backoff_jitter_retains_bounded_attempts_and_release_latency() {
+        let mut low = AdmissionCapacityBackoff::default();
+        let mut high = AdmissionCapacityBackoff::default();
+        for (floor, ceiling) in [
+            (25, 25),
+            (25, 50),
+            (50, 100),
+            (100, 200),
+            (200, 400),
+            (400, 800),
+        ] {
+            let minimum = Duration::from_millis(floor);
+            let maximum = Duration::from_millis(ceiling);
+            assert_eq!(low.next_delay(0), minimum);
+            assert!((minimum..=maximum).contains(&high.next_delay(u64::MAX)));
+        }
+        for _ in 0..64 {
+            assert_eq!(low.next_delay(0), Duration::from_millis(500));
+            assert!((Duration::from_millis(500)..=Duration::from_secs(1))
+                .contains(&high.next_delay(u64::MAX)));
+        }
+        let mut first = AdmissionCapacityBackoff::default();
+        let mut second = AdmissionCapacityBackoff::default();
+        assert_eq!(first.next_delay(0), second.next_delay(1));
+        assert_ne!(first.next_delay(0), second.next_delay(1));
     }
 
     #[tokio::test(start_paused = true)]

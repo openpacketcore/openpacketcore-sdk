@@ -171,6 +171,51 @@ impl NativeState {
             .map_err(|_| invalid("native roster diagnostic witness projection invalid"))
     }
 
+    /// Read a bounded scheduling hint from the admitted publication and its
+    /// ordered indexes. The eventual command still validates its own current
+    /// authority and maintenance predecessor before changing any state.
+    pub(crate) fn protected_roster_maintenance_due(
+        &self,
+        now: Timestamp,
+    ) -> io::Result<(
+        crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy,
+        bool,
+    )> {
+        use crate::fenced_mutation_roster::TERMINAL_RETENTION;
+        use crate::fenced_mutation_roster_storage::ConsensusMaintenanceTimestamp;
+
+        self.require_business_proof()?;
+        let witness = self
+            .roster
+            .certificate()?
+            .witness()
+            .unwrap_or_else(GlobalChargeWitness::empty);
+        let occupancy = witness
+            .diagnostic_occupancy()
+            .map_err(|_| invalid("native roster maintenance occupancy invalid"))?;
+        let now = self
+            .logical_time()
+            .map_or(now, |persisted| persisted.max(now));
+        let maintenance = ConsensusMaintenanceTimestamp::from_consensus_timestamp(now)
+            .map_err(|_| invalid("native roster maintenance time invalid"))?;
+        let retention = i128::try_from(TERMINAL_RETENTION.as_nanos())
+            .map_err(|_| invalid("native roster retention overflow"))?;
+        let Some(cutoff) = maintenance
+            .as_nanos()
+            .checked_sub(retention)
+            .filter(|cutoff| *cutoff >= 0)
+        else {
+            return Ok((occupancy, false));
+        };
+        let due = self.roster.index.has_due_retained(cutoff)
+            || self
+                .roster
+                .index
+                .first_terminal_state(witness.retired_terminal_sequence())?
+                == Some(State::Tombstone);
+        Ok((occupancy, due))
+    }
+
     pub(in crate::consensus::native) fn require_legacy_roster_absent(&self) -> io::Result<()> {
         if self.snapshot_origin.is_some() {
             return Err(invalid(

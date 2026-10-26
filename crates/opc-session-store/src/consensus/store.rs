@@ -1736,15 +1736,24 @@ impl ConsensusStoreDiagnosticCounters {
         &self,
         occupancy: crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy,
     ) {
-        self.publish_protected_roster_occupancy(Some(occupancy));
+        self.publish_protected_roster_occupancy(None, Some(occupancy));
     }
 
     pub(crate) fn invalidate_protected_roster_occupancy(&self) {
-        self.publish_protected_roster_occupancy(None);
+        self.publish_protected_roster_occupancy(None, None);
+    }
+
+    fn refresh_protected_roster_occupancy(
+        &self,
+        expected_generation: u64,
+        occupancy: Option<crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy>,
+    ) {
+        self.publish_protected_roster_occupancy(Some(expected_generation), occupancy);
     }
 
     fn publish_protected_roster_occupancy(
         &self,
+        expected_generation: Option<u64>,
         occupancy: Option<crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy>,
     ) {
         while self
@@ -1753,6 +1762,18 @@ impl ConsensusStoreDiagnosticCounters {
             .is_err()
         {
             std::hint::spin_loop();
+        }
+        // A scheduling read releases the backend lock before publication. It
+        // must not overwrite a newer admission/terminal projection, including
+        // replacing newly retained work with a stale empty ledger.
+        if expected_generation.is_some_and(|expected| {
+            self.protected_roster_occupancy_generation
+                .load(Ordering::Acquire)
+                != expected
+        }) {
+            self.protected_roster_occupancy_writer
+                .store(false, Ordering::Release);
+            return;
         }
         self.protected_roster_occupancy_generation
             .fetch_add(1, Ordering::AcqRel);
@@ -2225,6 +2246,12 @@ async fn shutdown_consensus_session_store(
     inner: Arc<ConsensusSessionStoreInner>,
     allow_closed_proof: bool,
 ) -> Result<(), StoreError> {
+    // Stop new retention proposals and join the current turn before selecting
+    // a handoff prefix or asking Raft to stop. The shared coordinator owns this
+    // join even when an observing caller times out.
+    if let Some(lane) = inner.roster_maintenance.get() {
+        lane.shutdown().await;
+    }
     if allow_closed_proof {
         let store = ConsensusSessionStore {
             inner: Arc::clone(&inner),
@@ -4067,7 +4094,6 @@ impl ConsensusSessionStore {
             Arc::downgrade(&inner),
         );
         let store = Self { inner };
-        #[cfg(not(any(test, feature = "test-control")))]
         let _ = store
             .inner
             .roster_maintenance
@@ -4323,7 +4349,12 @@ impl ConsensusSessionStore {
             fenced_transition_v2_status_batch_receiver,
             Arc::downgrade(&inner),
         );
-        Ok(Self { inner })
+        let store = Self { inner };
+        let _ = store
+            .inner
+            .roster_maintenance
+            .set(roster_maintenance::start(Arc::downgrade(&store.inner)));
+        Ok(store)
     }
 
     /// Consensus-only handler to install on the authenticated session-net
@@ -17341,6 +17372,59 @@ mod membership_tests {
         let decoded: ConsensusStoreDiagnosticSnapshot =
             serde_json::from_value(legacy).expect("decode diagnostic snapshot without new field");
         assert!(!decoded.consensus_log_prune_degraded);
+    }
+
+    #[test]
+    fn protected_roster_refresh_cannot_replace_a_newer_admission_projection() {
+        use crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy;
+
+        let counters = ConsensusStoreDiagnosticCounters::default();
+        let read_generation = counters.protected_roster_snapshot().occupancy_generation;
+        counters.set_protected_roster_occupancy(ProtectedRosterLedgerOccupancy {
+            retained_reservations: 1,
+            ..Default::default()
+        });
+        let committed = counters.protected_roster_snapshot();
+        counters.refresh_protected_roster_occupancy(
+            read_generation,
+            Some(ProtectedRosterLedgerOccupancy::default()),
+        );
+        let after_stale_refresh = counters.protected_roster_snapshot();
+        assert_eq!(
+            after_stale_refresh.occupancy_generation,
+            committed.occupancy_generation
+        );
+        assert_eq!(after_stale_refresh.retained_reservations, 1);
+        assert_eq!(after_stale_refresh.occupancy_valid, 1);
+
+        counters.refresh_protected_roster_occupancy(
+            committed.occupancy_generation,
+            Some(ProtectedRosterLedgerOccupancy {
+                tombstone_reservations: 1,
+                ..Default::default()
+            }),
+        );
+        let refreshed = counters.protected_roster_snapshot();
+        assert_eq!(
+            refreshed.occupancy_generation,
+            committed.occupancy_generation + 2
+        );
+        assert_eq!(refreshed.retained_reservations, 0);
+        assert_eq!(refreshed.tombstone_reservations, 1);
+
+        counters.refresh_protected_roster_occupancy(committed.occupancy_generation, None);
+        assert_eq!(counters.protected_roster_snapshot().occupancy_valid, 1);
+        assert_eq!(
+            counters.protected_roster_snapshot().occupancy_generation,
+            refreshed.occupancy_generation
+        );
+        counters.refresh_protected_roster_occupancy(refreshed.occupancy_generation, None);
+        let invalid = counters.protected_roster_snapshot();
+        assert_eq!(invalid.occupancy_valid, 0);
+        assert_eq!(
+            invalid.occupancy_generation,
+            refreshed.occupancy_generation + 2
+        );
     }
 
     #[test]

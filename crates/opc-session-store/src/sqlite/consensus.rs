@@ -9031,6 +9031,28 @@ pub(crate) fn read_membership_transition_evidence_sync(
 }
 
 impl SqliteSessionBackend {
+    pub(crate) async fn consensus_protected_roster_maintenance_due(
+        &self,
+        storage_identity: SessionConsensusIdentity,
+        now: Timestamp,
+    ) -> io::Result<(ProtectedRosterLedgerOccupancy, bool)> {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.native_read(|wal| {
+            wal.native_public_scalar_read(|state| {
+                if state.identity() != storage_identity {
+                    return Err(invalid_data("native roster maintenance identity differs"));
+                }
+                state.protected_roster_maintenance_due(now)
+            })
+        }) {
+            return result;
+        }
+        let conn = self.conn.lock().await;
+        self.with_application_cache_read(&conn, || {
+            protected_roster_maintenance_due_sync(&conn, storage_identity, now)
+        })?
+    }
+
     pub(crate) async fn provisional_consensus_candidate_is_cancelled(
         &self,
         storage_identity: SessionConsensusIdentity,
@@ -13055,6 +13077,82 @@ pub(crate) fn protected_roster_diagnostic_occupancy_sync(
         .unwrap_or_else(GlobalChargeWitness::empty)
         .diagnostic_occupancy()
         .map_err(|_| invalid_data("protected roster diagnostic occupancy is invalid"))
+}
+
+/// Eligibility is a read-only scheduling hint. Query the two fixed reclaim
+/// indexes and at most the first terminal in each profile, never the retained
+/// history. A later tombstone cannot retire past an earlier retained row.
+fn protected_roster_maintenance_due_sync(
+    conn: &Connection,
+    identity: SessionConsensusIdentity,
+    now: Timestamp,
+) -> io::Result<(ProtectedRosterLedgerOccupancy, bool)> {
+    match protected_roster_layout_in_sync(conn, false)? {
+        ProtectedRosterLayout::Legacy | ProtectedRosterLayout::Prepared => {
+            return Ok((ProtectedRosterLedgerOccupancy::default(), false));
+        }
+        ProtectedRosterLayout::Activated => {}
+    }
+    let witness = protected_roster_read_witness_sync(conn, identity)
+        .map_err(|_| invalid_data("protected roster maintenance witness invalid"))?
+        .ok_or_else(|| invalid_data("protected roster maintenance witness missing"))?;
+    let occupancy = witness
+        .diagnostic_occupancy()
+        .map_err(|_| invalid_data("protected roster maintenance occupancy invalid"))?;
+    let now = logical_time_sync(conn, identity)?.map_or(now, |persisted| persisted.max(now));
+    let maintenance = ConsensusMaintenanceTimestamp::from_consensus_timestamp(now)
+        .map_err(|_| invalid_data("protected roster maintenance time invalid"))?;
+    let Some(cutoff) = maintenance
+        .as_nanos()
+        .checked_sub(PROTECTED_ROSTER_TERMINAL_RETENTION_NANOS)
+        .filter(|cutoff| *cutoff >= 0)
+    else {
+        return Ok((occupancy, false));
+    };
+    let v2_present = protected_roster_v2_namespace_is_present_sync(conn)?;
+    let due_reclaim: bool = conn
+        .query_row(
+            if v2_present {
+                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
+             WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1) \
+             OR EXISTS(SELECT 1 FROM consensus_protected_roster_v2_admissions \
+             WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1)"
+            } else {
+                "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows \
+             WHERE state=2 AND terminalized_at IS NOT NULL AND terminalized_at<=?1 LIMIT 1)"
+            },
+            [cutoff.to_be_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if due_reclaim {
+        return Ok((occupancy, true));
+    }
+    let retired = i64::try_from(witness.retired_terminal_sequence())
+        .map_err(|_| invalid_data("protected roster retirement sequence invalid"))?;
+    let head = |table: &str| -> io::Result<Option<(i64, i64)>> {
+        conn.query_row(
+            &format!("SELECT terminal_sequence,state FROM {table} WHERE terminal_sequence>?1 ORDER BY terminal_sequence LIMIT 1"),
+            [retired], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(db_error)
+    };
+    let one = head("consensus_protected_roster_rows")?;
+    let two = if v2_present {
+        head("consensus_protected_roster_v2_admissions")?
+    } else {
+        None
+    };
+    let first = one.into_iter().chain(two).min_by_key(|row| row.0);
+    let due = match first {
+        Some((_, 3)) => true,
+        Some((_, 2)) | None => false,
+        _ => {
+            return Err(invalid_data(
+                "protected roster terminal index state invalid",
+            ))
+        }
+    };
+    Ok((occupancy, due))
 }
 
 fn protected_roster_write_witness_sync(
@@ -33205,8 +33303,9 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
         // logical clock.  Fold one deterministic reclaim turn into every
         // normal command that advances or observes that clock; the helper is
         // an indexed no-op unless an activated roster has an eligible row.
-        // This is maintenance within this Raft apply transaction, never a
-        // separately proposed command and never a replication/watch event.
+        // Reclaim runs inside this Raft apply transaction and emits no watch
+        // event. An idle store's retention lane can propose AdvanceLogicalTime
+        // to trigger the same bounded turn when indexed work becomes eligible.
         if let Some(logical_time) = response.logical_time {
             let maintenance_started = Instant::now();
             if maintain_due_protected_roster_reclaim_sync(&tx, identity, logical_time)
@@ -49203,6 +49302,23 @@ mod tests {
         protected_roster_write_witness_sync(&conn, identity(), witness)
             .expect("persist fixture witness");
 
+        let just_before_due = retained_at
+            .add_seconds(24 * 60 * 60 - 1)
+            .expect("last ineligible second");
+        let (occupancy, due) =
+            protected_roster_maintenance_due_sync(&conn, identity(), just_before_due)
+                .expect("read young retention eligibility");
+        assert_eq!(occupancy.retained_reservations, 1_025);
+        assert!(
+            !due,
+            "young retained rows must not request an empty Raft entry"
+        );
+        assert!(
+            protected_roster_maintenance_due_sync(&conn, identity(), maintenance_at)
+                .expect("read due retention eligibility")
+                .1
+        );
+
         // A malformed admission child must fail the whole compaction turn
         // before it can replace either the retained parent or its mapping.
         let guarded_binding = ordered_retained[0].1;
@@ -49250,6 +49366,11 @@ mod tests {
             [live_binding.to_bytes().as_slice()],
         )
         .expect("corrupt unselected live canonical frame");
+        assert!(
+            protected_roster_maintenance_due_sync(&conn, identity(), maintenance_at)
+                .expect("eligibility never decodes unrelated live frames")
+                .1
+        );
 
         reset_protected_roster_reclaim_hydrated_rows_for_test();
         maintain_due_protected_roster_reclaim_sync(&conn, identity(), maintenance_at)
