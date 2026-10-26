@@ -1,3 +1,5 @@
+#[path = "scalars_and_names/cardinality.rs"]
+mod cardinality;
 mod common;
 #[path = "scalars_and_names/regressions.rs"]
 mod regressions;

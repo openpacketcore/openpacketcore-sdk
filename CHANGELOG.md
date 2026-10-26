@@ -877,6 +877,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   audience, expiry, scope and transport-peer binding. JWT-SVID remains the
   default. NRF mode never accepts mock-token bypasses. (#1362)
 
+- `opc-yanggen`: `SchemaNode` retains optional `mandatory`, `min_elements`,
+  and `max_elements` fields. Initialize them explicitly or use
+  `..SchemaNode::default()` in Rust literals. Source ingestion rejects invalid
+  cardinality statements, and generated configuration validation enforces
+  required leaves and list bounds. Effective constraints enter the schema
+  digest. (#1363)
+
 ### Added
 
 - `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported

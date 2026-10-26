@@ -24,6 +24,14 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     let mut validation_checks = TokenStream::new();
     let mut syntax_checks = TokenStream::new();
     for node in &input.nodes {
+        // Operational presence cannot be a prerequisite for committing configuration.
+        if node.config
+            && (node.mandatory == Some(true)
+                || node.min_elements.is_some()
+                || node.max_elements.is_some())
+        {
+            syntax_checks.extend(generate_cardinality_check(node, input, &nodes_by_path)?);
+        }
         if super::types::has_scalar_constraints(node, &nodes_by_path) {
             syntax_checks.extend(generate_range_check(node, input, &nodes_by_path)?);
         }
@@ -73,6 +81,77 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
     };
 
     Ok(tokens.to_string())
+}
+
+fn generate_cardinality_check(
+    node: &SchemaNode,
+    input: &CanonicalInput,
+    nodes: &super::NodeIndex<'_>,
+) -> Result<TokenStream, RustGenerationError> {
+    let parent = node.path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let ancestors = get_ancestors_along_path(parent, input)?;
+    let field = format_ident!("{}", to_snake_case(clean_segment(last_segment(&node.path))));
+    let access = if super::types::is_sensitive_node(node) {
+        quote! { current.#field.get() }
+    } else {
+        quote! { current.#field }
+    };
+    let path = &node.path;
+    let mut body = TokenStream::new();
+    if node.mandatory == Some(true) {
+        body.extend(quote! {
+            if #access.as_option().is_none() {
+                return Err(ValidationError::syntax(concat!("mandatory leaf is absent at ", #path)));
+            }
+        });
+    }
+    if let Some(min) = node.min_elements.filter(|min| *min > 0) {
+        body.extend(quote! {
+            if (#access.len() as u64) < u64::from(#min) {
+                return Err(ValidationError::syntax(concat!("too few elements at ", #path)));
+            }
+        });
+    }
+    if let Some(max) = node.max_elements {
+        body.extend(quote! {
+            if (#access.len() as u64) > u64::from(#max) {
+                return Err(ValidationError::syntax(concat!("too many elements at ", #path)));
+            }
+        });
+    }
+    if body.is_empty() {
+        return Ok(body);
+    }
+    for ancestor in ancestors.into_iter().rev() {
+        let field = format_ident!(
+            "{}",
+            to_snake_case(clean_segment(last_segment(&ancestor.path)))
+        );
+        body = match ancestor.kind {
+            SchemaNodeKind::Container if ancestor.presence.is_some() => quote! {
+                if let Some(current) = &current.#field { #body }
+            },
+            SchemaNodeKind::Container => {
+                let ty = format_ident!("{}", nodes.type_name(&ancestor));
+                quote! {
+                    let absent;
+                    let current: &#ty = match &current.#field {
+                        Some(value) => value,
+                        None => { absent = #ty::default(); &absent }
+                    };
+                    #body
+                }
+            }
+            SchemaNodeKind::List if ancestor.key_leaves.is_empty() => quote! {
+                for current in &current.#field { #body }
+            },
+            SchemaNodeKind::List => quote! {
+                for current in current.#field.values() { #body }
+            },
+            _ => body,
+        };
+    }
+    Ok(quote! { { let current = _root; #body } })
 }
 
 fn generate_leaf_list_uniqueness_check(
