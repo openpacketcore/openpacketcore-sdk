@@ -390,3 +390,218 @@ async fn test_production_server_rejects_missing_tls_and_auth() {
     let err = server.run_with_listener(listener, app).await.unwrap_err();
     assert!(err.contains("requires TLS"));
 }
+
+#[tokio::test]
+async fn client_errors_do_not_trip_the_circuit_breaker() {
+    let producer = MockProducer::start().await;
+    producer.set_override(
+        "/nnrf-disc/missing",
+        StatusCode::NOT_FOUND,
+        HashMap::new(),
+        Vec::new(),
+    );
+    let breakers = Arc::new(opc_sbi::client::circuit_breaker::CircuitBreakers::new(
+        1,
+        Duration::from_secs(30),
+        1,
+    ));
+    let client = SbiClientBuilder::new()
+        .with_http2_only(false)
+        .with_circuit_breakers(breakers.clone())
+        .build()
+        .unwrap();
+    let consumer = MockConsumer::with_client(client);
+    for _ in 0..3 {
+        let (status, _, _) = consumer
+            .send_get(
+                &format!("{}/nnrf-disc/missing", producer.url()),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        breakers
+            .get("127.0.0.1", "nnrf-disc")
+            .lock()
+            .unwrap()
+            .state(),
+        CircuitState::Closed
+    );
+}
+
+struct RejectAuth(opc_sbi::auth::SbiAuthError);
+
+#[async_trait::async_trait]
+impl SbiAuth for RejectAuth {
+    async fn authorize(
+        &self,
+        _: &SbiAuthRequest,
+    ) -> Result<opc_sbi::auth::SbiAuthContext, opc_sbi::auth::SbiAuthError> {
+        Err(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn auth_failures_include_safe_bearer_challenges_and_problem_media_type() {
+    use opc_sbi::auth::SbiAuthError;
+    for (error, expected_status, challenge) in [
+        (
+            SbiAuthError::MissingBearerToken,
+            StatusCode::UNAUTHORIZED,
+            Some("Bearer"),
+        ),
+        (
+            SbiAuthError::Denied {
+                reason: "private-token-detail".into(),
+            },
+            StatusCode::UNAUTHORIZED,
+            Some("Bearer error=\"invalid_token\""),
+        ),
+        (
+            SbiAuthError::TokenBindingMismatch,
+            StatusCode::UNAUTHORIZED,
+            Some("Bearer error=\"invalid_token\""),
+        ),
+        (
+            SbiAuthError::MissingPeerBinding,
+            StatusCode::UNAUTHORIZED,
+            Some("Bearer error=\"invalid_token\""),
+        ),
+        (
+            SbiAuthError::InsufficientScope,
+            StatusCode::FORBIDDEN,
+            Some("Bearer error=\"insufficient_scope\""),
+        ),
+        (
+            SbiAuthError::Internal {
+                reason: "private-key-fetch-detail".into(),
+            },
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = SbiServerBuilder::new(addr).with_auth_policy(Arc::new(RejectAuth(error)));
+        let app = axum::Router::new().route(
+            "/nnrf-disc/test",
+            axum::routing::get(|| async { "unexpected admission" }),
+        );
+        let task = tokio::spawn(async move { server.run_with_listener(listener, app).await });
+        let client = SbiClientBuilder::new()
+            .with_http2_only(false)
+            .with_retry_policy(RetryPolicy::new(
+                1,
+                Duration::ZERO,
+                Duration::ZERO,
+                Jitter::None,
+            ))
+            .build()
+            .unwrap();
+        let consumer = MockConsumer::with_client(client);
+        let response = consumer
+            .send_get(&format!("http://{addr}/nnrf-disc/test"), HashMap::new())
+            .await;
+        task.abort();
+        let _ = task.await;
+        let (status, headers, body) = response.unwrap();
+        assert_eq!(status, expected_status);
+        assert_eq!(
+            headers.get("www-authenticate").map(String::as_str),
+            challenge
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/problem+json")
+        );
+        assert!(!String::from_utf8_lossy(&body).contains("private-"));
+    }
+}
+
+#[tokio::test]
+async fn tls_client_requires_negotiated_h2_before_sending_requests() {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.der().clone()).unwrap();
+    let config = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    for alpn in [Some(b"h2".as_slice()), None, Some(b"http/1.1".as_slice())] {
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        server_config.alpn_protocols = alpn.into_iter().map(<[u8]>::to_vec).collect();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(AtomicUsize::new(0));
+        let server_received = received.clone();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            if let Ok(tls) = acceptor.accept(tcp).await {
+                let handler = hyper::service::service_fn(move |_| {
+                    server_received.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(
+                            Bytes::new(),
+                        )))
+                    }
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls), handler)
+                    .await;
+            }
+        });
+        let client = SbiClientBuilder::new()
+            .with_tls(config.clone())
+            .with_retry_policy(RetryPolicy::new(
+                1,
+                Duration::ZERO,
+                Duration::ZERO,
+                Jitter::None,
+            ))
+            .build()
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send(
+                http::Request::builder()
+                    .uri(format!("https://{addr}/nnrf-disc/test"))
+                    .body(Vec::new())
+                    .unwrap(),
+            ),
+        )
+        .await;
+        task.abort();
+        let _ = task.await;
+        let response = response.expect("TLS negotiation must be bounded");
+        if alpn == Some(b"h2") {
+            assert_eq!(response.unwrap().status(), StatusCode::OK);
+            assert_eq!(received.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(response.is_err());
+            assert_eq!(received.load(Ordering::SeqCst), 0);
+        }
+    }
+    assert!(
+        config.alpn_protocols.is_empty(),
+        "caller TLS config remains unchanged"
+    );
+}

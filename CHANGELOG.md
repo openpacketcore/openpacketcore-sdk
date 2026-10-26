@@ -858,6 +858,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mandatory. SGSN/GGSN address constants are now `AVP_SGSN_ADDRESS` (1228)
   and `AVP_GGSN_ADDRESS` (847); Charging-Id/PDP-Type clear M. (#1361)
 
+- `opc-sbi` adds `SbiAuthError::InsufficientScope` (403); invalid credentials
+  return 401 with Bearer challenges and verifier failures return 503.
+  Errors use `application/problem+json`. The client requires negotiated `h2`
+  for TLS, validates URI/transport agreement, uses port 80 for plaintext,
+  and counts only transport/5xx failures toward circuit opening. Message
+  priorities 0–31 are accepted; the NSSF name is `nnssf-nsselection`. (#1362)
+
 ### Added
 
 - `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported

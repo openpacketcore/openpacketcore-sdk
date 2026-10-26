@@ -379,9 +379,7 @@ impl SbiAuth for SbiJwtValidator {
                     .entry(("deny".to_string(), "insufficient_scope".to_string()))
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
-                return Err(SbiAuthError::Denied {
-                    reason: "insufficient scope for requested service".to_string(),
-                });
+                return Err(SbiAuthError::InsufficientScope);
             }
         }
 
@@ -737,7 +735,7 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert!(matches!(err, SbiAuthError::Denied { .. }));
+        assert!(matches!(err, SbiAuthError::InsufficientScope));
     }
 
     #[tokio::test]
