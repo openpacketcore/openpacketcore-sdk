@@ -234,6 +234,14 @@ orchestration, listener/reconnect policy, backoff, realm routing, peer
 topology, base `Twinit` selection, initial watchdog scheduling, identifier
 allocation, and all application state machines.
 
+Application-owned SWm overload, DRMP and redirect AVPs are delivered through
+the typed protocol/correlation boundary. The peer runtime does not advertise
+DOIC capabilities, maintain overload reports, schedule by DRMP, or own a
+redirect routing cache. Its control/application queue separation protects base
+peer procedures; it is not an implementation of those application policies.
+Consumers that advertise DOIC must implement the corresponding abatement and
+expiry behavior before submitting affected traffic.
+
 The SDK does not configure or attest an external IPsec deployment. A consumer
 may select `CompatibilityUnprotected` only after applying its own separate
 IPsec policy and evidence; the SDK still reports that association as
