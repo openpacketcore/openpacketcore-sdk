@@ -731,6 +731,28 @@ class QuiescentShardPlanTests(unittest.TestCase):
             set(optimized), TEST_SHARDS.OPTIMIZED_QUIESCENT_LIB_TESTS
         )
 
+    def test_sustained_roster_proofs_run_once_in_the_checked_o1_profile(self) -> None:
+        plan = TEST_SHARDS.load_plan()
+        targets = [plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))]
+        for engine in ("native", "sqlite"):
+            name = ("consensus::store::sequential_wal_sdk_tests::"
+                    f"roster_maintenance_{engine}_keeps_up_with_ten_due_rows_per_second")
+            with self.subTest(engine=engine):
+                owners = [(shard, command) for shard in TEST_SHARDS.shard_ids(plan)
+                          for command in TEST_SHARDS.commands(plan, shard, targets)
+                          if name in command and command[command.index(name) - 1] != "--skip"]
+                self.assertEqual([owner for owner, _ in owners], ["quiescent-o1"])
+                command = owners[0][1]
+                self.assertEqual(command[:4], [
+                    "env", "CARGO_PROFILE_TEST_OPT_LEVEL=1",
+                    "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                    "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true",
+                ])
+                self.assertEqual(command[-3:], ["--test-threads=1", "--exact", name])
+                self.assertIn("--all-features", command)
+                self.assertNotIn("--ignored", command)
+                self.assertEqual(TEST_SHARDS.moved_lib_names(plan).count(name), 1)
+
     def test_completed_roster_history_proof_has_one_dedicated_optimized_owner(self) -> None:
         name = TEST_SHARDS.native_log_bound.ROSTER_HISTORY_TEST
         shard = TEST_SHARDS.native_log_bound.ROSTER_HISTORY_SHARD

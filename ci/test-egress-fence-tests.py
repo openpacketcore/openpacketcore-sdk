@@ -426,6 +426,31 @@ class PartitionTests(unittest.TestCase):
             else:
                 self.assertIn("--lib", argv)
 
+    def test_sustained_roster_proofs_run_once_in_the_checked_o1_profile(self):
+        for engine in ("native", "sqlite"):
+            name = ("consensus::store::sequential_wal_sdk_tests::"
+                    f"roster_maintenance_{engine}_keeps_up_with_ten_due_rows_per_second")
+            with self.subTest(engine=engine):
+                self.assertIn(name, FENCE.OPTIMIZED_LIB)
+                commands = [(shard, command) for shard in FENCE.SHARDS
+                            for command in FENCE.plans(fixture(), shard)
+                            if command["name"] == name]
+                self.assertEqual([shard for shard, _ in commands], [FENCE.PROOF_SHARD])
+                command = commands[0][1]
+                self.assertEqual(command["env"], {
+                    "CARGO_PROFILE_TEST_OPT_LEVEL": "1",
+                    "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS": "true",
+                    "CARGO_PROFILE_TEST_OVERFLOW_CHECKS": "true",
+                })
+                self.assertEqual(command["argv"][-3:], ["--test-threads=1", "--exact", name])
+                self.assertIn("--all-features", command["argv"])
+                for shard in FENCE.ORDINARY_SHARDS:
+                    self.assertIn(name, skips(ordinary(FENCE.plans(fixture(), shard))))
+                ignored = fixture()
+                next(row for row in ignored if row["name"] == name)["ignored"] = True
+                with self.assertRaises(ValueError):
+                    FENCE.verify(ignored)
+
     def test_completed_roster_history_proof_keeps_optimized_enabled_owner(self):
         name = ("consensus::native::generation::catalog::tests::roster_tests::"
                 "native_roster_completed_history_exceeds_old_capacity_and_cold_reopens")
