@@ -1209,7 +1209,7 @@ fn run_signed_v1_sql_ledger(selected: bool) {
                 due.add_seconds(-1).unwrap()
             )
             .unwrap());
-            for turn in 0..3 {
+            for turn in 0..2 {
                 if selected {
                     selected_files.extend(row_tests::select_all(&mut maintenance));
                 }
@@ -1217,24 +1217,25 @@ fn run_signed_v1_sql_ledger(selected: bool) {
                 assert!(native_roster_maintenance_fixture(&path, signed.identity, due).unwrap());
                 assert_mixed_sql_ledger(&maintenance, &sql, 6);
                 match turn {
-                    0 => assert!(maintenance
-                        .ledger
-                        .rows
-                        .values()
-                        .all(|row| row.facts.state == State::Tombstone)),
-                    1 => {
-                        assert!(!maintenance.ledger.rows.contains_key(&v2));
-                        assert!(maintenance.ledger.rows.contains_key(&v1));
+                    0 => {
+                        assert!(maintenance
+                            .ledger
+                            .rows
+                            .values()
+                            .all(|row| row.facts.state == State::Tombstone));
                         assert_eq!(
                             maintenance
                                 .ledger
                                 .witness
                                 .unwrap()
                                 .retired_terminal_sequence(),
-                            2
+                            0,
+                            "reclamation alone does not retire either profile"
                         );
                     }
-                    2 => {
+                    1 => {
+                        assert!(!maintenance.ledger.rows.contains_key(&v2));
+                        assert!(!maintenance.ledger.rows.contains_key(&v1));
                         assert!(maintenance.ledger.rows.is_empty());
                         assert!(maintenance.ledger.partitions.is_empty());
                         assert_eq!(

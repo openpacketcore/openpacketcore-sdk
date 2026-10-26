@@ -723,6 +723,8 @@ fn retired_admission_witness_mixed_native_sqlite_removals_preserve_one_shared_ma
         3
     );
     let mut observed = Vec::new();
+    // The first retirement spans both profile epochs. A later idle turn and
+    // both cold reopens must preserve the same shared witness maximum.
     for index in [9, 10] {
         let result = parity(&wal, &backend, &signed, &[tick(&signed, index, due)]);
         assert!(result
@@ -737,15 +739,15 @@ fn retired_admission_witness_mixed_native_sqlite_removals_preserve_one_shared_ma
         );
         assert_eq!(
             count(&snapshot, "consensus_protected_roster_rows"),
-            u64::from(index == 9)
+            0
         );
         assert_eq!(
             count(&snapshot, "consensus_protected_roster_admissions"),
-            u64::from(index == 9)
+            0
         );
         assert_eq!(
             count(&snapshot, "consensus_protected_roster_floors"),
-            u64::from(index == 9)
+            0
         );
         observed.push(witness_fence(
             protected_roster_read_witness_sync(&snapshot, signed.identity)
