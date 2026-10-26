@@ -9,9 +9,9 @@ use std::pin::Pin;
 
 use opc_gtpu_ebpf_common::GtpuEndpointAddress;
 pub use opc_gtpu_ebpf_common::{
-    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuPeerSourcePolicy, GtpuReassemblyBounds,
-    GtpuSessionDeviceId, GtpuSessionGroupId, GtpuSessionPaa, GtpuSourcePortPolicy,
-    GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
+    GtpuDownlinkFragmentContract, GtpuOuterFragmentPolicy, GtpuPeerSourcePolicy,
+    GtpuReassemblyBounds, GtpuSessionDeviceId, GtpuSessionGroupId, GtpuSessionPaa,
+    GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkMtuPolicy, GtpuUplinkSourcePortPolicy,
 };
 use opc_types::DscpCodepoint;
 use sha2::{Digest, Sha256};

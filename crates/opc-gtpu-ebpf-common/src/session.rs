@@ -6,7 +6,8 @@
 //! point for all of a logical session's family entries.
 
 use crate::{
-    GtpuEndpointAddress, GtpuPeerSourcePolicy, GtpuSourcePortPolicy, GtpuSourcePortRange, GtpuUplinkSourcePortPolicy,
+    GtpuEndpointAddress, GtpuPeerSourcePolicy, GtpuSourcePortPolicy, GtpuSourcePortRange,
+    GtpuUplinkSourcePortPolicy,
 };
 
 /// Fixed byte width of a caller-owned grouped-session identifier.
@@ -873,7 +874,8 @@ impl GtpuSessionEntry {
             dscp,
             downlink_policy,
             uplink_policy,
-        )?.with_peer_source_policy(if value[3] == 1 {
+        )?
+        .with_peer_source_policy(if value[3] == 1 {
             GtpuPeerSourcePolicy::TeidAndLocal
         } else {
             GtpuPeerSourcePolicy::BackendDefault
@@ -888,14 +890,18 @@ impl GtpuSessionEntry {
 
 #[inline(always)]
 const fn entry_is_n3(version: u8) -> bool {
-    matches!(version, N3_ENTRY_FORMAT_VERSION | MULTIHOMING_N3_ENTRY_FORMAT_VERSION)
+    matches!(
+        version,
+        N3_ENTRY_FORMAT_VERSION | MULTIHOMING_N3_ENTRY_FORMAT_VERSION
+    )
 }
 
 #[inline(always)]
 fn entry_profile_is_canonical(value: &[u8; GTPU_SESSION_ENTRY_LEN]) -> bool {
     match (value[0], value[3]) {
         (ENTRY_FORMAT_VERSION, 0) | (MULTIHOMING_ENTRY_FORMAT_VERSION, 1) if value[72] == 0 => {}
-        (N3_ENTRY_FORMAT_VERSION, 0) | (MULTIHOMING_N3_ENTRY_FORMAT_VERSION, 1) if value[72] <= 63 => {}
+        (N3_ENTRY_FORMAT_VERSION, 0) | (MULTIHOMING_N3_ENTRY_FORMAT_VERSION, 1)
+            if value[72] <= 63 => {}
         _ => return false,
     }
     value[73] == 0
@@ -1226,7 +1232,8 @@ impl<'a> GtpuSessionEntryWireView<'a> {
             wire_address_is_canonical(self.wire[2], peer_outer)
                 && (!entry_is_n3(self.wire[0]) || n3_outer_is_unicast(self.wire[2], peer_outer))
         };
-        if !peer_permitted || local_outer[..] != self.wire[36..52]
+        if !peer_permitted
+            || local_outer[..] != self.wire[36..52]
             || !match self.wire[1] {
                 4 => inner_destination[..] == self.wire[4..20],
                 6 => inner_destination[..8] == self.wire[4..12],
@@ -2497,7 +2504,10 @@ pub fn gtpu_session_group_authorizes_downlink(
                 address_family(packet_peer_outer) == entry.outer_family()
                     && !packet_peer_outer.is_unspecified()
                     && (entry.n3_qfi.is_none()
-                        || n3_outer_is_unicast(packet_peer_outer.family_wire(), &address_bytes(packet_peer_outer)))
+                        || n3_outer_is_unicast(
+                            packet_peer_outer.family_wire(),
+                            &address_bytes(packet_peer_outer),
+                        ))
             }
         }
         && entry.local_outer_address == packet_local_outer
@@ -3249,28 +3259,24 @@ mod tests {
                     let mut wrong_teid = GtpuSessionDownlinkKey::from_entry(entry).encode();
                     wrong_teid[7] ^= 1;
                     assert!(!view.authorizes_downlink_key(&wrong_teid));
-                    assert!(
-                        select_gtpu_session_entry_wire(
-                            &authority,
-                            &reference_wire,
-                            &config_wire,
-                            43,
-                            entry.inner_family().slot()
-                        )
-                        .is_none()
-                    );
+                    assert!(select_gtpu_session_entry_wire(
+                        &authority,
+                        &reference_wire,
+                        &config_wire,
+                        43,
+                        entry.inner_family().slot()
+                    )
+                    .is_none());
                     let wrong_generation =
                         GtpuSessionGroupRef::single(group_id(), candidate(10, entry)).encode();
-                    assert!(
-                        select_gtpu_session_entry_wire(
-                            &authority,
-                            &wrong_generation,
-                            &config_wire,
-                            42,
-                            entry.inner_family().slot()
-                        )
-                        .is_none()
-                    );
+                    assert!(select_gtpu_session_entry_wire(
+                        &authority,
+                        &wrong_generation,
+                        &config_wire,
+                        42,
+                        entry.inner_family().slot()
+                    )
+                    .is_none());
                 }
                 for (version, policy) in [(1, 1), (2, 1), (3, 0), (4, 0), (3, 2), (5, 1)] {
                     let mut malformed = wire;

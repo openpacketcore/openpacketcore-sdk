@@ -15925,7 +15925,9 @@ fn encode_downlink_endpoint(
         endpoint.source_port_policy(),
     )
     .map(|binding| {
-        binding.with_peer_source_policy(endpoint.peer_source_policy()).encode()
+        binding
+            .with_peer_source_policy(endpoint.peer_source_policy())
+            .encode()
     })
     .ok_or_else(|| {
         GtpuError::invalid_config(
@@ -57214,9 +57216,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod control_port_recovery;
     mod grouped_bearer_transition;
+    mod multihoming;
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
-    mod multihoming;
     mod ordinary_ipv6;
     #[cfg(target_os = "linux")]
     mod reassembled_downlink;

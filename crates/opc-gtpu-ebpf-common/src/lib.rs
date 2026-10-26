@@ -1231,7 +1231,8 @@ impl DownlinkEndpointBinding {
                 GtpuPeerSourcePolicy::BackendDefault
             },
             format_valid: binding_profile_is_canonical(value[0], value[3])
-                && family_valid && policy_valid,
+                && family_valid
+                && policy_valid,
         }
     }
 }
@@ -1310,7 +1311,9 @@ fn binding_ipv4_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> b
 
 #[inline(always)]
 fn binding_wire_is_valid<const N: usize>(value: &[u8; N], base: usize) -> bool {
-    if !binding_profile_is_canonical(value[base], value[base + 3]) || wire_u32(value, base + 36) == 0 {
+    if !binding_profile_is_canonical(value[base], value[base + 3])
+        || wire_u32(value, base + 36) == 0
+    {
         return false;
     }
     let family_valid = match value[base + 1] {
@@ -3377,12 +3380,17 @@ mod tests {
             &binding,
         ));
 
-        let multihoming_binding = owner.downlink_binding
+        let multihoming_binding = owner
+            .downlink_binding
             .with_peer_source_policy(GtpuPeerSourcePolicy::TeidAndLocal);
         assert!(multihoming_binding.is_valid());
         assert!(!owner.authorizes_downlink(owner.local_teid, &multihoming_binding));
         assert!(!pdp_commit_wire_authorizes_graph(
-            &encoded, owner.local_teid, &owner.uplink_far, 46, &multihoming_binding.encode(),
+            &encoded,
+            owner.local_teid,
+            &owner.uplink_far,
+            46,
+            &multihoming_binding.encode(),
         ));
 
         let mut wrong_far = owner.uplink_far;
