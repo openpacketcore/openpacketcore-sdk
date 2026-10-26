@@ -13,22 +13,14 @@
 //! `try_receive_datagram`) exactly as before, and the queue service order of
 //! that call is unchanged.
 //!
-//! A readiness source is bound to one control port registration. When the
-//! attachment is removed, replaced, fenced or its readback fails, the port
-//! revokes every outstanding source: readiness and receive return
-//! [`GtpuControlPortError::Unavailable`] and the source never becomes
-//! readable again. Revocation is **passive**: it sets a revocation flag and
-//! never signals the epoll, so a blocked [`GtpuControlReadiness::wait`]
-//! returns `Unavailable` only on its next return (at the latest when its
-//! timeout expires), and the exposed descriptor is *not* a revocation wakeup.
-//! Observe revocation by calling [`GtpuControlReadiness::try_readiness`] or by
-//! driving [`crate::control_port::GtpuControlPort::try_receive_downlink`],
-//! which re-validates the registration and returns `Unavailable`. An
-//! `epoll`/`AsyncFd` consumer loop must not treat readiness silence as a
-//! liveness signal: after each wake or timeout it must call
-//! `try_readiness`/`try_receive_downlink`, and stop waiting on readiness once
-//! `Unavailable` is returned. A consumer must drop the source and reopen the
-//! port through the backend after a fresh registration.
+//! A readiness source is bound to one control port registration. Attachment
+//! removal, replacement or backend loss permanently signals a private eventfd
+//! inside the epoll instance. Fencing and readback loss are detected at the
+//! next port operation, which then revokes the source. Revocation wakes idle
+//! consumers; readiness methods report [`GtpuControlPortError::Unavailable`].
+//! The signal is never drained, and an old source never observes a replacement
+//! generation. Stop waiting on and drop the source, then reopen the port
+//! through the backend after a fresh registration.
 
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -37,6 +29,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+use nix::sys::eventfd::{EfdFlags, EventFd};
 
 use super::GtpuControlPortError;
 
@@ -47,6 +40,7 @@ use super::GtpuControlPortError;
 /// its service order: the shared UDP/2152 queue first, then the two hand-off
 /// queues, which alternate between themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum GtpuControlQueue {
     /// Shared UDP/2152 queue: Echo, reassembled outer-fragmented G-PDUs and
     /// unknown-TEID hand-offs.
@@ -59,7 +53,7 @@ pub enum GtpuControlQueue {
 
 impl GtpuControlQueue {
     /// Every queue this SDK exposes, in downlink service order.
-    pub const ALL: [Self; 3] = [Self::Shared, Self::PacketTooBig, Self::InnerFragment];
+    pub const ALL: &'static [Self] = &[Self::Shared, Self::PacketTooBig, Self::InnerFragment];
 
     const fn index(self) -> usize {
         match self {
@@ -105,7 +99,8 @@ impl GtpuDownlinkReadiness {
     /// The ready queues, in [`GtpuControlQueue::ALL`] order.
     pub fn queues(self) -> impl Iterator<Item = GtpuControlQueue> {
         GtpuControlQueue::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .filter(move |queue| self.is_ready(*queue))
     }
 
@@ -135,17 +130,9 @@ impl fmt::Debug for GtpuDownlinkReadiness {
 /// Readiness does not consume a datagram and is not a readiness or forwarding
 /// proof for any session. Attachment removal, replacement, readback failure or
 /// fencing revokes the source: [`GtpuControlPortError::Unavailable`] is
-/// returned and it never becomes readable again.
-///
-/// Revocation is passive and observed lazily: it sets a flag without waking
-/// the epoll, so a blocked [`Self::wait`] returns `Unavailable` only on its
-/// next return, and the exposed descriptor never becomes readable as a
-/// revocation signal. An `epoll`/`AsyncFd` loop must therefore not treat
-/// readiness silence as liveness: after each wake or timeout, call
-/// [`Self::try_readiness`] or drive
-/// [`crate::control_port::GtpuControlPort::try_receive_downlink`] (which
-/// re-validates the registration), and stop waiting once `Unavailable` is
-/// returned.
+/// returned. The private retirement signal stays readable, so an idle
+/// `epoll`/`AsyncFd` consumer wakes without a polling timer. Stop waiting on
+/// that source after `Unavailable`; a replacement port has a separate source.
 ///
 /// The handle must outlive every `epoll`/`AsyncFd` registration that borrows
 /// its [`AsFd`] descriptor: the descriptor is borrowed from this handle and
@@ -183,6 +170,11 @@ impl GtpuControlReadiness {
                 kind: std::io::Error::from(error).kind(),
             }
         })?;
+        let retired = EventFd::from_flags(EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+            .map_err(std::io::Error::from)?;
+        epoll
+            .add(&retired, EpollEvent::new(EpollFlags::EPOLLIN, u64::MAX))
+            .map_err(std::io::Error::from)?;
         let mut watched = Vec::new();
         for (queue, descriptor) in queues {
             if watched.contains(&queue) {
@@ -202,6 +194,7 @@ impl GtpuControlReadiness {
         Ok(Self {
             inner: Arc::new(ReadinessInner {
                 epoll,
+                retired,
                 liveness,
                 revoked: AtomicBool::new(false),
             }),
@@ -223,10 +216,8 @@ impl GtpuControlReadiness {
     /// Wait at most `timeout` for a watched queue to report readiness.
     ///
     /// The call is advisory exactly like [`Self::try_readiness`]; an empty
-    /// result is a timeout, not a refusal. Revocation does not wake a blocked
-    /// wait: a source revoked during this call reports
-    /// [`GtpuControlPortError::Unavailable`] on its next return, which may be
-    /// when the timeout expires.
+    /// result is a timeout, not a refusal. Retirement wakes a blocked wait
+    /// immediately with [`GtpuControlPortError::Unavailable`].
     ///
     /// # Errors
     /// Returns [`GtpuControlPortError::Unavailable`] after revocation,
@@ -250,7 +241,7 @@ impl GtpuControlReadiness {
         if self.inner.is_revoked() {
             return Err(GtpuControlPortError::Unavailable);
         }
-        let mut events = [EpollEvent::empty(); GtpuControlQueue::ALL.len()];
+        let mut events = [EpollEvent::empty(); GtpuControlQueue::ALL.len() + 1];
         let count = self
             .inner
             .epoll
@@ -276,6 +267,7 @@ impl GtpuControlReadiness {
 /// Shared state behind one readiness source.
 pub(crate) struct ReadinessInner {
     epoll: Epoll,
+    retired: EventFd,
     liveness: Option<Weak<()>>,
     revoked: AtomicBool,
 }
@@ -283,6 +275,9 @@ pub(crate) struct ReadinessInner {
 impl ReadinessInner {
     pub(crate) fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);
+        // Never drain this private signal: every existing and future waiter
+        // on the retired generation must wake. EAGAIN already means readable.
+        while self.retired.write(1) == Err(nix::errno::Errno::EINTR) {}
     }
 
     pub(crate) fn is_revoked(&self) -> bool {
@@ -495,7 +490,7 @@ mod tests {
             ]
         );
         let mut mask = GtpuDownlinkReadiness::default();
-        for queue in GtpuControlQueue::ALL {
+        for &queue in GtpuControlQueue::ALL {
             mask.insert(queue);
         }
         assert_eq!(

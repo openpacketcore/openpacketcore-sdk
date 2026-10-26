@@ -9,7 +9,8 @@ use opc_gtpu_dataplane::{
 };
 use opc_gtpu_ebpf_common::{
     internet_checksum, TftClassifierIpv4Packet, TftClassifierKey, TftFragmentKey,
-    TFT_FRAGMENT_BUCKETS, TFT_FRAGMENT_LIFETIME_NS, TFT_FRAGMENT_MAX_RANGES, TFT_FRAGMENT_WAYS,
+    TFT_FRAGMENT_BUCKETS, TFT_FRAGMENT_LIFETIME_NS, TFT_FRAGMENT_MAX_RANGES,
+    TFT_FRAGMENT_OWNER_BUCKETS, TFT_FRAGMENT_OWNER_MAX_DATAGRAMS, TFT_FRAGMENT_WAYS,
 };
 use opc_proto_tft::{
     PacketFilter, PacketFilterComponent, PacketFilterDirection, PacketFilterIdentifier,
@@ -710,6 +711,60 @@ fn full_bucket_refuses_new_ids_and_never_evicts_live_or_completed_entries() {
         ),
         selected(MARK_A)
     );
+}
+
+#[test]
+fn subscriber_pressure_is_bounded_and_another_group_still_forwards() {
+    let snapshot = published(&classifier());
+    let mut table = table();
+    let mut admitted = Vec::new();
+    for id in 0..=u16::MAX {
+        let outcome = classify(&mut table, Some(&snapshot), &esp(id, MORE, SPI), FIRST_TIME);
+        if outcome == selected(MARK_A) {
+            admitted.push(id);
+        } else {
+            assert_eq!(outcome, dropped(TftUplinkDropReason::CapacityExhausted));
+        }
+        assert!(admitted.len() <= TFT_FRAGMENT_OWNER_MAX_DATAGRAMS as usize);
+    }
+    assert_eq!(admitted.len(), 256);
+    let group = fragment_bucket(0) / TFT_FRAGMENT_OWNER_BUCKETS;
+    let other_paa = (1..=254)
+        .map(|last| Ipv4Addr::new(192, 0, 2, last))
+        .find(|paa| {
+            TftFragmentKey::new(
+                TftClassifierKey::new(IFINDEX, paa.octets()).unwrap(),
+                paa.octets(),
+                REMOTE.octets(),
+                50,
+                0,
+            )
+            .bucket()
+                / TFT_FRAGMENT_OWNER_BUCKETS
+                != group
+        })
+        .unwrap();
+    let other = published(&classifier_for(IFINDEX, other_paa, &[(MARK_B, SPI)]));
+    for fragment in [MORE, 3] {
+        let mut packet = esp(0, fragment, SPI);
+        packet[12..16].copy_from_slice(&other_paa.octets());
+        checksum(&mut packet);
+        assert_eq!(
+            table.classify(other_paa, Some(&other), &packet, FIRST_TIME + 1),
+            selected(MARK_B)
+        );
+    }
+    for id in admitted {
+        assert_eq!(
+            classify(
+                &mut table,
+                Some(&snapshot),
+                &esp(id, 3, SPI),
+                FIRST_TIME + 2
+            ),
+            selected(MARK_A)
+        );
+    }
 }
 
 #[test]

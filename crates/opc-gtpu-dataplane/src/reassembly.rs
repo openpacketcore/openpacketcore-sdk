@@ -416,10 +416,6 @@ impl fmt::Debug for DownlinkOuterProvenance {
 pub struct GtpuReassemblySocket {
     socket: std::net::UdpSocket,
     control_identity: std::sync::Arc<()>,
-    /// Token whose only owner is this socket, used only to revoke readiness
-    /// sources. Kept separate from `control_identity`: a response plan holds
-    /// that identity and can outlive the socket.
-    readiness_liveness: std::sync::Arc<()>,
     interface_name: std::ffi::OsString,
     ingress_ifindex: u32,
     local_address: Ipv4Addr,
@@ -613,7 +609,6 @@ impl GtpuReassemblySocket {
         Ok(Self {
             socket,
             control_identity: std::sync::Arc::new(()),
-            readiness_liveness: std::sync::Arc::new(()),
             interface_name,
             ingress_ifindex,
             local_address,
@@ -945,24 +940,6 @@ impl crate::control_port::GtpuControlPort for GtpuReassemblySocket {
     ) -> Result<usize, crate::control_port::GtpuControlPortError> {
         Self::send_control_response(self, plan)
     }
-
-    /// Readiness for the shared receive queue of this sealed socket.
-    ///
-    /// The socket stays owned by this value; the source owns only a private
-    /// epoll instance and exposes that instance through `AsFd`, never the
-    /// receive socket. Dropping this value makes the source return
-    /// `Unavailable`.
-    fn downlink_readiness(
-        &self,
-    ) -> Result<crate::control_port::GtpuControlReadiness, crate::control_port::GtpuControlPortError>
-    {
-        use crate::control_port::{GtpuControlQueue, GtpuControlReadiness};
-
-        GtpuControlReadiness::new(
-            [(GtpuControlQueue::Shared, self.readiness_fd())],
-            Some(std::sync::Arc::downgrade(&self.readiness_liveness)),
-        )
-    }
 }
 
 /// Typed resolution of the downlink PDR lookup for one G-PDU TEID.
@@ -1228,9 +1205,9 @@ pub enum GtpuDownlinkDrop {
     /// fragmented nor signalled.
     InnerFragmentRateLimited,
     /// An authorized over-MTU packet needed a new per-destination budget, but
-    /// the table held only destinations inside their 255-second eviction
-    /// grace. Nothing was evicted and no budget was consumed; the packet was
-    /// not fragmented.
+    /// the oldest entry had not passed both the 255-second idle grace and
+    /// full token refill. Nothing was evicted and no budget was consumed;
+    /// the packet was not fragmented.
     InnerFragmentCapacityExhausted,
     /// An authorized over-MTU packet carries IPv4 options. The inner
     /// fragmenter implements neither the RFC 791 option copy rules nor a
@@ -1276,8 +1253,8 @@ pub struct GtpuDownlinkCounters {
     /// Over-MTU packets dropped without an error by the rate limit.
     pub packet_too_big_rate_limited: u64,
     /// Over-MTU packets whose in-tunnel error was suppressed because the
-    /// per-session error-budget table held only sessions inside their
-    /// 255-second eviction grace. Nothing was evicted or consumed.
+    /// per-session table's oldest entry had not passed both the 255-second
+    /// idle grace and full token refill. Nothing was evicted or consumed.
     pub packet_too_big_capacity_exhausted: u64,
     /// Over-MTU packets for which no error may or could be sent: an invalid
     /// invoking header (RFC 1812 5.2.2), a never-answer rule (RFC 1122
@@ -1307,9 +1284,9 @@ pub struct GtpuDownlinkCounters {
     pub inner_fragments: u64,
     /// Over-MTU packets dropped by the per-destination fragmentation budget.
     pub inner_fragment_rate_limited: u64,
-    /// Over-MTU packets dropped because the per-destination budget table held
-    /// only destinations inside their 255-second eviction grace. Nothing was
-    /// evicted or consumed.
+    /// Over-MTU packets dropped because the oldest per-destination budget had
+    /// not passed both the 255-second idle grace and full token refill.
+    /// Nothing was evicted or consumed.
     pub inner_fragment_capacity_exhausted: u64,
     /// Over-MTU packets not fragmented because they carry IPv4 options.
     pub inner_unfragmentable: u64,
@@ -1414,8 +1391,8 @@ pub enum GtpuPacketTooBigSignal {
     Sent,
     /// The attachment's error rate limit suppressed the error.
     RateLimited,
-    /// The per-session error-budget table held only sessions inside their
-    /// 255-second eviction grace; no error was sent and nothing was evicted.
+    /// The oldest per-session budget had not passed both the 255-second idle
+    /// grace and full token refill; no error was sent and nothing was evicted.
     CapacityExhausted,
     /// The error could not be built or submitted; nothing was sent.
     Unsendable,
@@ -1480,10 +1457,12 @@ impl GtpuDownlinkPacketTooBig {
 /// session's budget. When every tracked session is inside that grace, a new
 /// session's error budget is refused fail closed and counted in
 /// [`GtpuDownlinkCounters::packet_too_big_capacity_exhausted`] instead of
-/// evicting one. A session idle for at least 255 seconds may be evicted; a
-/// half-open 255-second window cannot then contain admissions from both the
-/// old and the re-created bucket, so the per-session bound holds across the
-/// re-creation.
+/// evicting one. Reclamation requires both 255 seconds idle and a fully
+/// refilled bucket, preserving even limits whose refill takes longer than
+/// the datagram lifetime. Explicitly replacing the limit restarts every
+/// session's bucket full while retaining tracked identities and their eviction
+/// grace. A new attachment registration starts fresh budgets; this state does
+/// not survive restart or re-adoption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GtpuPacketTooBigRateLimit {
     burst: u32,
@@ -1541,6 +1520,20 @@ impl TokenBucket {
         refill_interval: std::time::Duration,
         now: std::time::Instant,
     ) -> bool {
+        self.refill(burst, refill_interval, now);
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+
+    fn refill(
+        &mut self,
+        burst: u32,
+        refill_interval: std::time::Duration,
+        now: std::time::Instant,
+    ) {
         let last = self.last_refill;
         let elapsed = now.saturating_duration_since(last);
         let intervals = elapsed.as_nanos() / refill_interval.as_nanos().max(1);
@@ -1552,11 +1545,6 @@ impl TokenBucket {
                 .and_then(|advance| last.checked_add(advance));
             self.last_refill = advanced.unwrap_or(now).min(now);
         }
-        if self.tokens == 0 {
-            return false;
-        }
-        self.tokens -= 1;
-        true
     }
 }
 
@@ -1571,8 +1559,8 @@ enum BucketAdmission<'a, T> {
     Admitted(&'a mut T),
     /// The key is tracked and its bucket is empty.
     RateLimited,
-    /// The table holds only keys inside their eviction grace. Nothing was
-    /// evicted, created or consumed.
+    /// The oldest key is inside its eviction grace or has not fully refilled.
+    /// Nothing was evicted, created or consumed.
     CapacityExhausted,
 }
 
@@ -1593,13 +1581,13 @@ struct BucketEntry<T> {
 /// small piece of per-key state.
 ///
 /// Only the least recently used key is an eviction candidate, and only when
-/// it has been idle for at least one maximum datagram lifetime. A new key is
+/// it has been idle for at least one maximum datagram lifetime and its bucket
+/// has fully refilled. A new key is
 /// otherwise refused fail closed: nothing is evicted, so another destination's
 /// token bucket, budget and Identification sequence are never reset by
-/// pressure from new keys. Because the grace is one half-open 255-second
-/// window, no such window can contain admissions from both the old and the
-/// re-created key, so RFC 6864 section 4.3 Identification uniqueness and the
-/// configured token-bucket envelope both hold across a re-creation.
+/// pressure from new keys. The grace protects RFC 6864 section 4.3
+/// Identification uniqueness; full refill preserves the configured
+/// token-bucket envelope across re-creation even at slow refill rates.
 ///
 /// The LRU is a slot-indexed intrusive list: hash lookup plus a bounded number
 /// of index updates per admission, independent of how many keys are tracked.
@@ -1670,14 +1658,26 @@ impl<T> SessionBuckets<T> {
         self.index.len()
     }
 
-    /// Apply a new token-bucket shape, keeping each tracked key's state and at
-    /// most its current tokens.
-    fn replace_limit(&mut self, burst: u32, refill_interval: std::time::Duration) {
+    /// Apply a new token-bucket shape, keeping each tracked key's state and
+    /// tokens, including refill earned under the old shape, capped at the new burst.
+    fn replace_limit(
+        &mut self,
+        burst: u32,
+        refill_interval: std::time::Duration,
+        now: std::time::Instant,
+    ) {
+        if (burst, refill_interval) == (self.burst, self.refill_interval) {
+            return;
+        }
+        for entry in self.entries.iter_mut().flatten() {
+            entry.bucket.refill(self.burst, self.refill_interval, now);
+            entry.bucket.tokens = entry.bucket.tokens.min(burst);
+            // A faster replacement must not turn time accrued under the old
+            // rate into an immediate extra burst.
+            entry.bucket.last_refill = entry.bucket.last_refill.max(now);
+        }
         self.burst = burst;
         self.refill_interval = refill_interval;
-        for entry in self.entries.iter_mut().flatten() {
-            entry.bucket.tokens = entry.bucket.tokens.min(burst);
-        }
     }
 
     /// Detach `slot` from the LRU list.
@@ -1768,18 +1768,22 @@ impl<T> SessionBuckets<T> {
         slot
     }
 
-    /// Whether the least recently used key has been idle for the grace.
-    fn tail_is_evictable(&self, now: std::time::Instant) -> bool {
+    /// Whether the oldest key has passed the grace and recovered its budget.
+    fn tail_is_evictable(&mut self, now: std::time::Instant) -> bool {
         self.tail.is_some_and(|tail| {
-            self.entries[tail].as_ref().is_some_and(|entry| {
-                now.saturating_duration_since(entry.last_use) >= self.eviction_grace
+            self.entries[tail].as_mut().is_some_and(|entry| {
+                if now.saturating_duration_since(entry.last_use) < self.eviction_grace {
+                    return false;
+                }
+                entry.bucket.refill(self.burst, self.refill_interval, now);
+                entry.bucket.tokens == self.burst
             })
         })
     }
 
     /// Take one token from `key`'s bucket at `now`, creating a full bucket
     /// with `init` state when the key is untracked and the table has room (or
-    /// its least recently used key is outside the eviction grace).
+    /// its oldest key is outside the eviction grace and fully refilled).
     ///
     /// A rate-limited call still counts as a use for eviction purposes.
     fn admit(
@@ -1794,7 +1798,7 @@ impl<T> SessionBuckets<T> {
             let Some(entry) = self.entries[slot].as_mut() else {
                 return BucketAdmission::CapacityExhausted;
             };
-            entry.last_use = now;
+            entry.last_use = entry.last_use.max(now);
             if !entry.bucket.admit(burst, refill_interval, now) {
                 return BucketAdmission::RateLimited;
             }
@@ -1825,8 +1829,8 @@ pub(crate) enum PacketTooBigAdmission {
     Admitted,
     /// The session is tracked and its bucket is empty.
     RateLimited,
-    /// The table holds only sessions inside their eviction grace; nothing was
-    /// evicted or consumed.
+    /// The oldest session is inside its grace or has not fully refilled;
+    /// nothing was evicted or consumed.
     CapacityExhausted,
 }
 
@@ -1849,6 +1853,17 @@ impl PacketTooBigLimiter {
             limit.refill_interval,
             MAXIMUM_DATAGRAM_LIFETIME,
         ))
+    }
+
+    pub(crate) fn set_limit(&mut self, limit: GtpuPacketTooBigRateLimit, now: std::time::Instant) {
+        // Explicit PTB reconfiguration starts each session with a full burst,
+        // including equal limits, while preserving the bounded tracking table.
+        self.0.burst = limit.burst;
+        self.0.refill_interval = limit.refill_interval;
+        for entry in self.0.entries.iter_mut().flatten() {
+            entry.bucket.tokens = limit.burst;
+            entry.bucket.last_refill = entry.bucket.last_refill.max(now);
+        }
     }
 
     /// Take one token from `session`'s bucket at `now`; other sessions are
@@ -1990,11 +2005,9 @@ const MAXIMUM_DATAGRAM_LIFETIME: std::time::Duration = std::time::Duration::from
 /// destination is inside that grace, a new destination is refused fail closed
 /// and counted in
 /// [`GtpuDownlinkCounters::inner_fragment_capacity_exhausted`] instead of
-/// evicting one. A destination idle for at least 255 seconds may be evicted
-/// and re-created with a full bucket and a fresh keyed-random Identification
-/// sequence; no half-open 255-second window can contain admissions from both
-/// lives of that destination, so RFC 6864 section 4.3 uniqueness and the
-/// configured bound hold across the re-creation.
+/// evicting one. Reclamation requires both 255 seconds idle and a fully
+/// refilled bucket. Re-creation then preserves RFC 6864 section 4.3
+/// uniqueness and the configured rate bound, including slow refill rates.
 ///
 /// A new attachment registration (a process restart, a re-adoption or a
 /// re-created attachment) still restarts every destination with a full bucket
@@ -2003,14 +2016,13 @@ const MAXIMUM_DATAGRAM_LIFETIME: std::time::Duration = std::time::Duration::from
 /// registrations; that reset is the documented residual of the host-side
 /// budget (#1018).
 ///
-/// A limit replacement is accepted only when it cannot combine with earlier
-/// admissions of the same registration into more than 65,535 admissions in a
-/// 255-second window: an unchanged limit, no admission yet, 255 seconds
-/// without an admission, or a carried conservative window bound plus the new
-/// limit's 255-second maximum within 65,535. Otherwise the control port
-/// returns
-/// [`GtpuControlPortError::InvalidLimits`](crate::control_port::GtpuControlPortError::InvalidLimits)
-/// and the deployment must re-register to change the budget mid-session.
+/// A separate sliding count enforces at most 65,535 admissions per
+/// destination across every live limit replacement. Its 256 one-second bins
+/// conservatively retain admissions for up to one extra second and expire at
+/// most 256 bins per admission, independently of the number of destinations.
+/// The counters add 512 bytes per tracked destination (2 MiB at capacity),
+/// plus fixed bookkeeping. Replacements preserve sequences and at most the
+/// current tokens, without granting a new burst or repricing elapsed time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GtpuInnerFragmentRateLimit {
     burst: u32,
@@ -2058,16 +2070,6 @@ impl GtpuInnerFragmentRateLimit {
     pub const fn refill_interval(&self) -> std::time::Duration {
         self.refill_interval
     }
-
-    /// Largest number of admissions this limit can allow in any 255-second
-    /// window: `burst + ceil(255 s / refill_interval)` (an accepted limit is
-    /// at most 65,535).
-    fn maximum_window_admissions(&self) -> u32 {
-        let refills = MAXIMUM_DATAGRAM_LIFETIME
-            .as_nanos()
-            .div_ceil(self.refill_interval.as_nanos());
-        u32::try_from(u128::from(self.burst).saturating_add(refills)).unwrap_or(u32::MAX)
-    }
 }
 
 /// Outcome of one per-destination inner fragmentation admission.
@@ -2079,8 +2081,8 @@ pub(crate) enum InnerFragmentAdmission {
     Admitted(Option<u16>),
     /// The destination is tracked and its budget is empty.
     RateLimited,
-    /// The table holds only destinations inside their eviction grace; nothing
-    /// was evicted or consumed.
+    /// The oldest destination is inside its grace or has not fully refilled;
+    /// nothing was evicted or consumed.
     CapacityExhausted,
 }
 
@@ -2089,22 +2091,64 @@ pub(crate) enum InnerFragmentAdmission {
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct InnerFragmentBudget {
-    buckets: SessionBuckets<u16>,
+    buckets: SessionBuckets<FragmentSequence>,
     /// Per-registration random SipHash keys seeding each destination's
     /// first Identification, so a destination re-created after eviction
     /// restarts from an unpredictable value rather than a fixed one.
     seed_keys: std::collections::hash_map::RandomState,
     seeded: u64,
-    /// Conservative upper bound on fragmentation admissions in any trailing
-    /// 255-second window, carried across accepted limit replacements. It
-    /// starts at the current limit's 255-second maximum and only grows with an
-    /// accepted replacement, so repeated replacements cannot combine into
-    /// more than 65,535 admissions.
-    window_upper_bound: u32,
-    /// Fragmentation admissions since this registration was created.
-    admissions: u64,
-    /// Time of the latest fragmentation admission, if any.
-    last_admission: Option<std::time::Instant>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct FragmentSequence {
+    next: u16,
+    lifetime: FragmentLifetimeBudget,
+}
+
+/// A fixed-size conservative sliding count, independent of limit replacement.
+/// The extra bin keeps admissions at the end of a second for at least 255 s.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct FragmentLifetimeBudget {
+    origin: std::time::Instant,
+    second: u64,
+    bins: [u16; 256],
+    total: u32,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl FragmentLifetimeBudget {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            origin: now,
+            second: 0,
+            bins: [0; 256],
+            total: 0,
+        }
+    }
+
+    fn admit(&mut self, now: std::time::Instant) -> bool {
+        let second = now
+            .saturating_duration_since(self.origin)
+            .as_secs()
+            .max(self.second);
+        if second - self.second >= 256 {
+            self.bins.fill(0);
+            self.total = 0;
+        } else if second > self.second {
+            for elapsed in self.second + 1..=second {
+                let bin = &mut self.bins[(elapsed % 256) as usize];
+                self.total -= u32::from(*bin);
+                *bin = 0;
+            }
+        }
+        self.second = second;
+        if self.total >= u32::from(u16::MAX) {
+            return false;
+        }
+        self.bins[(second % 256) as usize] += 1;
+        self.total += 1;
+        true
+    }
 }
 
 impl Default for InnerFragmentBudget {
@@ -2124,9 +2168,6 @@ impl InnerFragmentBudget {
             ),
             seed_keys: std::collections::hash_map::RandomState::new(),
             seeded: 0,
-            window_upper_bound: limit.maximum_window_admissions(),
-            admissions: 0,
-            last_admission: None,
         }
     }
 
@@ -2138,17 +2179,9 @@ impl InnerFragmentBudget {
         }
     }
 
-    /// Replace the limit when doing so cannot make this registration exceed
-    /// 65,535 fragmentation admissions in any 255-second window.
-    ///
-    /// Accepted when the limit is unchanged, before this registration's first
-    /// admission, after at least 255 seconds without an admission, or when the
-    /// carried conservative window bound plus the new limit's 255-second
-    /// maximum stays within 65,535. Tracked destinations keep their
-    /// Identification sequences and at most their current tokens, so an
-    /// accepted replacement never grants an extra burst.
-    ///
-    /// Returns `false` when the replacement is refused; the limit is unchanged.
+    /// Install a valid limit while preserving every destination's sequence,
+    /// lifetime admissions and at most its current tokens. The independent
+    /// lifetime budget enforces the 65,535 bound across every replacement.
     pub(crate) fn set_limit(
         &mut self,
         limit: GtpuInnerFragmentRateLimit,
@@ -2157,24 +2190,8 @@ impl InnerFragmentBudget {
         if limit == self.current_limit() {
             return true;
         }
-        let new_bound = limit.maximum_window_admissions();
-        let quiet = self
-            .last_admission
-            .is_none_or(|last| now.saturating_duration_since(last) >= MAXIMUM_DATAGRAM_LIFETIME);
-        let window_upper_bound = if self.admissions == 0 || quiet {
-            // No admission can be inside the trailing lifetime window, so the
-            // new limit alone bounds every future window.
-            new_bound
-        } else {
-            let combined = self.window_upper_bound.saturating_add(new_bound);
-            if combined > u32::from(u16::MAX) {
-                return false;
-            }
-            combined
-        };
         self.buckets
-            .replace_limit(limit.burst, limit.refill_interval);
-        self.window_upper_bound = window_upper_bound;
+            .replace_limit(limit.burst, limit.refill_interval, now);
         true
     }
 
@@ -2195,17 +2212,24 @@ impl InnerFragmentBudget {
             destination.hash(&mut hasher);
             seeded.hash(&mut hasher);
             // 1..=65,535: zero is never assigned.
-            u16::try_from(hasher.finish() % u64::from(u16::MAX)).map_or(1, |value| value + 1)
+            FragmentSequence {
+                next: u16::try_from(hasher.finish() % u64::from(u16::MAX))
+                    .map_or(1, |value| value + 1),
+                lifetime: FragmentLifetimeBudget::new(now),
+            }
         });
         let assigned = match outcome {
             BucketAdmission::RateLimited => return InnerFragmentAdmission::RateLimited,
             BucketAdmission::CapacityExhausted => {
                 return InnerFragmentAdmission::CapacityExhausted;
             }
-            BucketAdmission::Admitted(next) => {
+            BucketAdmission::Admitted(sequence) => {
+                if !sequence.lifetime.admit(now) {
+                    return InnerFragmentAdmission::RateLimited;
+                }
                 if atomic {
-                    let identification = *next;
-                    *next = match next.wrapping_add(1) {
+                    let identification = sequence.next;
+                    sequence.next = match identification.wrapping_add(1) {
                         0 => 1,
                         following => following,
                     };
@@ -2215,8 +2239,6 @@ impl InnerFragmentBudget {
                 }
             }
         };
-        self.admissions = self.admissions.saturating_add(1);
-        self.last_admission = Some(now);
         InnerFragmentAdmission::Admitted(assigned)
     }
 }
@@ -2961,6 +2983,284 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rate_budget_retention_preserves_slow_packet_too_big_buckets() {
+        use std::time::{Duration, Instant};
+        let mut limiter = PacketTooBigLimiter::new(
+            GtpuPacketTooBigRateLimit::new(1, Duration::from_secs(3_600)).unwrap(),
+        );
+        let start = Instant::now();
+        for key in 0..4_096_u32 {
+            assert_eq!(
+                limiter.admit(key.to_be_bytes(), start),
+                PacketTooBigAdmission::Admitted
+            );
+        }
+        for age in [254, 255, 3_599] {
+            let now = start + Duration::from_secs(age);
+            assert_eq!(
+                limiter.admit(4_096_u32.to_be_bytes(), now),
+                PacketTooBigAdmission::CapacityExhausted,
+                "an idle but depleted bucket must remain tracked"
+            );
+            assert_eq!(
+                limiter.admit(0_u32.to_be_bytes(), now),
+                PacketTooBigAdmission::RateLimited
+            );
+        }
+        assert_eq!(
+            limiter.admit(4_096_u32.to_be_bytes(), start + Duration::from_secs(3_600)),
+            PacketTooBigAdmission::Admitted
+        );
+        assert_eq!(limiter.0.tracked(), 4_096);
+    }
+
+    #[test]
+    fn rate_budget_retention_preserves_slow_fragment_buckets() {
+        use std::time::{Duration, Instant};
+        let mut budget = InnerFragmentBudget::new(
+            GtpuInnerFragmentRateLimit::new(2, Duration::from_secs(3_600)).unwrap(),
+        );
+        let start = Instant::now();
+        let first = require_fragmentation(budget.admit(0_u32.to_be_bytes(), start, true)).unwrap();
+        for key in 1..4_096_u32 {
+            require_fragmentation(budget.admit(key.to_be_bytes(), start, true));
+        }
+        let later = start + Duration::from_secs(255);
+        assert_eq!(
+            budget.admit(4_096_u32.to_be_bytes(), later, true),
+            InnerFragmentAdmission::CapacityExhausted
+        );
+        assert_eq!(
+            require_fragmentation(budget.admit(0_u32.to_be_bytes(), later, true)),
+            Some(first.checked_add(1).unwrap_or(1)),
+            "table pressure must preserve the destination's sequence"
+        );
+        assert_eq!(
+            budget.admit(0_u32.to_be_bytes(), later, true),
+            InnerFragmentAdmission::RateLimited
+        );
+        assert_eq!(budget.buckets.tracked(), 4_096);
+    }
+
+    #[test]
+    fn rate_budget_replacement_packet_too_big_tightening_restarts_the_smaller_burst() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut limiter = PacketTooBigLimiter::new(
+            GtpuPacketTooBigRateLimit::new(2, Duration::from_secs(3_600)).unwrap(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                limiter.admit(UE.octets(), start),
+                PacketTooBigAdmission::Admitted
+            );
+        }
+        assert_eq!(
+            limiter.admit(UE.octets(), start),
+            PacketTooBigAdmission::RateLimited
+        );
+        limiter.set_limit(
+            GtpuPacketTooBigRateLimit::new(1, Duration::from_secs(3_600)).unwrap(),
+            start,
+        );
+        assert_eq!(
+            limiter.admit(UE.octets(), start),
+            PacketTooBigAdmission::Admitted
+        );
+        assert_eq!(
+            limiter.admit(UE.octets(), start),
+            PacketTooBigAdmission::RateLimited
+        );
+    }
+
+    #[test]
+    fn rate_budget_replacement_packet_too_big_keeps_earned_refill() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut limiter = PacketTooBigLimiter::default();
+        for _ in 0..16 {
+            assert_eq!(
+                limiter.admit(UE.octets(), start),
+                PacketTooBigAdmission::Admitted
+            );
+        }
+        assert_eq!(
+            limiter.admit(UE.octets(), start),
+            PacketTooBigAdmission::RateLimited
+        );
+        let replacement = start + Duration::from_secs(60);
+        limiter.set_limit(
+            GtpuPacketTooBigRateLimit::new(32, Duration::from_millis(10)).unwrap(),
+            replacement,
+        );
+        for _ in 0..16 {
+            assert_eq!(
+                limiter.admit(UE.octets(), replacement),
+                PacketTooBigAdmission::Admitted,
+                "admissions allowed by both limits must survive the replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_budget_replacement_fragmentation_keeps_earned_refill_and_sequence() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut budget = InnerFragmentBudget::default();
+        let mut last = None;
+        for _ in 0..64 {
+            last = require_fragmentation(budget.admit(UE.octets(), start, true));
+        }
+        assert_eq!(
+            budget.admit(UE.octets(), start, true),
+            InnerFragmentAdmission::RateLimited
+        );
+        let replacement = start + Duration::from_secs(10);
+        assert!(budget.set_limit(
+            GtpuInnerFragmentRateLimit::new(128, Duration::from_millis(4)).unwrap(),
+            replacement,
+        ));
+        for _ in 0..64 {
+            let next = require_fragmentation(budget.admit(UE.octets(), replacement, true));
+            assert_eq!(next, Some(last.unwrap().checked_add(1).unwrap_or(1)));
+            last = next;
+        }
+        assert_eq!(
+            budget.admit(UE.octets(), replacement, true),
+            InnerFragmentAdmission::RateLimited,
+            "a larger burst must not create tokens beyond the old limit's earned refill"
+        );
+    }
+
+    #[test]
+    fn rate_budget_replacement_does_not_freeze_refilled_packet_too_big_capacity() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut limiter = PacketTooBigLimiter::new(
+            GtpuPacketTooBigRateLimit::new(1, Duration::from_secs(3_600)).unwrap(),
+        );
+        for key in 0..4_096_u32 {
+            assert_eq!(
+                limiter.admit(key.to_be_bytes(), start),
+                PacketTooBigAdmission::Admitted
+            );
+        }
+        let replacement = start + Duration::from_secs(7_200);
+        limiter.set_limit(
+            GtpuPacketTooBigRateLimit::new(1, Duration::from_secs(1_800)).unwrap(),
+            replacement,
+        );
+        assert_eq!(
+            limiter.admit(4_096_u32.to_be_bytes(), replacement),
+            PacketTooBigAdmission::Admitted,
+            "an idle fully refilled key must remain evictable across replacement"
+        );
+        assert_eq!(limiter.0.tracked(), 4_096);
+    }
+
+    #[test]
+    fn rate_budget_replacement_does_not_freeze_refilled_fragment_capacity() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut budget = InnerFragmentBudget::new(
+            GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).unwrap(),
+        );
+        for key in 0..4_096_u32 {
+            require_fragmentation(budget.admit(key.to_be_bytes(), start, true));
+        }
+        let replacement = start + Duration::from_secs(7_200);
+        assert!(budget.set_limit(
+            GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(1_800)).unwrap(),
+            replacement,
+        ));
+        require_fragmentation(budget.admit(4_096_u32.to_be_bytes(), replacement, true));
+        assert_eq!(budget.buckets.tracked(), 4_096);
+    }
+
+    #[test]
+    fn rate_budget_retention_replacement_does_not_reprice_elapsed_time() {
+        use std::time::{Duration, Instant};
+        let mut budget = InnerFragmentBudget::new(
+            GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).unwrap(),
+        );
+        let start = Instant::now();
+        require_fragmentation(budget.admit(UE.octets(), start, true));
+        let replacement = start + Duration::from_secs(254);
+        assert!(budget.set_limit(
+            GtpuInnerFragmentRateLimit::new(254, Duration::from_secs(1)).unwrap(),
+            replacement
+        ));
+        assert_eq!(
+            budget.admit(UE.octets(), replacement, true),
+            InnerFragmentAdmission::RateLimited
+        );
+        require_fragmentation(budget.admit(
+            UE.octets(),
+            replacement + Duration::from_secs(1),
+            true,
+        ));
+        assert_eq!(
+            budget.admit(UE.octets(), replacement + Duration::from_secs(1), true),
+            InnerFragmentAdmission::RateLimited
+        );
+    }
+
+    #[test]
+    fn rate_budget_retention_accepts_live_tightening_and_restore() {
+        use std::time::{Duration, Instant};
+        let mut budget = InnerFragmentBudget::default();
+        let start = Instant::now();
+        let first = require_fragmentation(budget.admit(UE.octets(), start, true)).unwrap();
+        let replacement = start + Duration::from_millis(1);
+        assert!(budget.set_limit(
+            GtpuInnerFragmentRateLimit::new(64, Duration::from_millis(10)).unwrap(),
+            replacement
+        ));
+        assert!(budget.set_limit(GtpuInnerFragmentRateLimit::default(), replacement));
+        assert_eq!(
+            require_fragmentation(budget.admit(UE.octets(), replacement, true)),
+            Some(first.checked_add(1).unwrap_or(1))
+        );
+    }
+
+    #[test]
+    fn rate_budget_retention_preserves_lifetime_bound_across_limit_replacement() {
+        use std::time::{Duration, Instant};
+        let mut budget = InnerFragmentBudget::new(
+            GtpuInnerFragmentRateLimit::new(65_534, Duration::from_secs(3_600)).unwrap(),
+        );
+        let start = Instant::now();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..65_534 {
+            assert!(
+                seen.insert(require_fragmentation(budget.admit(UE.octets(), start, true)).unwrap())
+            );
+        }
+        assert!(budget.set_limit(
+            GtpuInnerFragmentRateLimit::new(1, Duration::from_millis(4)).unwrap(),
+            start
+        ));
+        for step in 1..=1_000 {
+            match budget.admit(UE.octets(), start + Duration::from_millis(step * 4), true) {
+                InnerFragmentAdmission::Admitted(Some(id)) => {
+                    assert!(
+                        seen.insert(id),
+                        "replacement repeated an Identification within 255 s"
+                    );
+                }
+                InnerFragmentAdmission::RateLimited => {}
+                other => panic!("unexpected lifetime admission: {other:?}"),
+            }
+        }
+        assert_eq!(seen.len(), 65_535);
+        assert_eq!(
+            budget.admit(UE.octets(), start + Duration::from_secs(254), true),
+            InnerFragmentAdmission::RateLimited
+        );
+        require_fragmentation(budget.admit(UE.octets(), start + Duration::from_secs(256), true));
+    }
+
     /// RFC 6864 section 4.3: a destination's 65,535 non-zero Identifications
     /// must not wrap within the 255-second maximum datagram lifetime, so an
     /// accepted limit may admit at most 65,535 packets in any such window.
@@ -3036,8 +3336,7 @@ mod tests {
         assert!(format!("{budget:?}").contains("tracked: 4096"));
     }
 
-    /// A key idle for at least the 255-second grace is the only eviction
-    /// candidate, and its re-created bucket/sequence starts fresh.
+    /// The oldest key must pass both the idle grace and its full refill.
     #[test]
     fn session_buckets_evict_the_least_recently_used_key_after_the_grace() {
         use std::time::{Duration, Instant};
@@ -3049,10 +3348,17 @@ mod tests {
             require_fragmentation(budget.admit(key.to_be_bytes(), at(key), true));
         }
         let after_grace = start + Duration::from_secs(256);
-        // The least recently used destination (key 0) is idle past the grace
-        // and is replaced by the new destination.
+        assert_eq!(
+            budget.admit(4_096_u32.to_be_bytes(), after_grace, true),
+            InnerFragmentAdmission::CapacityExhausted
+        );
+        let after_grace = start + Duration::from_secs(3_601);
+        // Key 0 is now idle and fully refilled, so only that LRU tail is replaced.
         require_fragmentation(budget.admit(4_096_u32.to_be_bytes(), after_grace, true));
-        // Key 1 is still tracked and empty: only the LRU tail was replaced.
+        assert!(!budget.buckets.index.contains_key(&0_u32.to_be_bytes()));
+        assert!(budget.buckets.index.contains_key(&1_u32.to_be_bytes()));
+        require_fragmentation(budget.admit(1_u32.to_be_bytes(), after_grace, true));
+        // Key 1 stays tracked and rate-limited after consuming its refill.
         assert_eq!(
             budget.admit(1_u32.to_be_bytes(), after_grace, true),
             InnerFragmentAdmission::RateLimited
@@ -3087,8 +3393,8 @@ mod tests {
             refusal_steps <= 2_000,
             "a refused new key must take O(1) work, took {refusal_steps}"
         );
-        // The eviction path (idle past the grace) is bounded too.
-        let after_grace = start + Duration::from_secs(256);
+        // The eviction path (idle past the grace and full refill) is bounded too.
+        let after_grace = start + Duration::from_secs(3_601);
         let before = budget.buckets.work();
         for key in 0..200_u32 {
             let now = after_grace + Duration::from_micros(u64::from(key));
@@ -3205,9 +3511,8 @@ mod tests {
         );
     }
 
-    /// Limit replacement preserves the 255-second admission bound with
-    /// constant state: an unchanged limit, no prior admission, a quiet
-    /// lifetime, or a carried conservative bound within 65,535.
+    /// Repeated valid replacements preserve budgets without blocking live
+    /// configuration changes or requiring a new registration.
     #[test]
     fn limit_replacement_preserves_the_lifetime_bound() {
         use std::time::{Duration, Instant};
@@ -3225,15 +3530,17 @@ mod tests {
             GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).unwrap(),
             start
         ));
-        // After an admission, an increase the carried bound cannot prove safe
-        // is refused and leaves the limit unchanged.
+        // A valid increase succeeds but cannot restore the depleted bucket.
         require_fragmentation(budget.admit(destination, start, true));
-        let current = budget.current_limit();
-        let unsafe_limit = GtpuInnerFragmentRateLimit::new(65_534, Duration::from_secs(255))
+        let largest_limit = GtpuInnerFragmentRateLimit::new(65_534, Duration::from_secs(255))
             .expect("bound 65,535 is accepted");
-        assert!(!budget.set_limit(unsafe_limit, start + Duration::from_millis(1)));
-        assert_eq!(budget.current_limit(), current);
-        // A tight replacement stays within the carried bound.
+        assert!(budget.set_limit(largest_limit, start + Duration::from_millis(1)));
+        assert_eq!(budget.current_limit(), largest_limit);
+        assert_eq!(
+            budget.admit(destination, start + Duration::from_millis(1), true),
+            InnerFragmentAdmission::RateLimited
+        );
+        // Tightening and restoring the default preserve the same live state.
         assert!(budget.set_limit(
             GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(7_200)).unwrap(),
             start + Duration::from_millis(2)
@@ -3244,9 +3551,8 @@ mod tests {
             start + Duration::from_millis(2) + Duration::from_secs(255)
         ));
 
-        // Repeated replacements carry the conservative bound accumulated from
-        // every earlier phase; the naive "current limit only" check would let
-        // this loop run forever.
+        // Repeated replacements never block valid configuration or restore a
+        // token; the first tightening retains just one token from the default.
         let mut budget = InnerFragmentBudget::new(default);
         require_fragmentation(budget.admit(destination, start, true));
         let first = GtpuInnerFragmentRateLimit::new(1, Duration::from_secs(3_600)).unwrap();
@@ -3260,16 +3566,21 @@ mod tests {
                 break;
             }
             accepted += 1;
+            if round == 0 {
+                require_fragmentation(budget.admit(
+                    destination,
+                    start + Duration::from_millis(1),
+                    true,
+                ));
+            } else {
+                assert_eq!(
+                    budget.admit(destination, start + Duration::from_millis(1), true),
+                    InnerFragmentAdmission::RateLimited
+                );
+            }
         }
-        assert!(
-            refused,
-            "the carried 255-second bound must eventually refuse"
-        );
-        assert!(
-            accepted > 0 && accepted < 4_000,
-            "accepted replacements: {accepted}"
-        );
-        // After the carried bound refused, a quiet lifetime resets it.
+        assert!(!refused, "valid live replacements must remain available");
+        assert_eq!(accepted, 4_000, "every replacement must be applied");
         assert!(budget.set_limit(default, start + Duration::from_secs(256)));
     }
 
@@ -3288,14 +3599,14 @@ mod tests {
         }
         let mut starts = std::collections::HashSet::new();
         for round in 0..3_u32 {
-            let now = start + Duration::from_secs(600 * u64::from(round + 1));
+            let now = start + Duration::from_secs(7_202 * u64::from(round + 1));
             // The marker replaces the current least recently used entry: the
             // oldest key in round 0, the previous round's UE afterwards. Its
-            // admission time is 300 s before this round, so it stays evictable
+            // admission time is 3,601 s before this round, so it stays evictable
             // when it becomes the tail at the end of the round.
             require_fragmentation(budget.admit(
                 (0x0400_0000 + round).to_be_bytes(),
-                now - Duration::from_secs(300),
+                now - Duration::from_secs(3_601),
                 true,
             ));
             // Replace every other tracked entry (including a previous round's
@@ -3314,6 +3625,23 @@ mod tests {
         }
         // Equal starts in all three rounds have probability 65,535^-2.
         assert!(starts.len() > 1, "a re-tracked destination reused its seed");
+    }
+
+    #[test]
+    fn rate_budget_retention_lifetime_bins_keep_the_end_of_each_second() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut lifetime = FragmentLifetimeBudget::new(start);
+        let end_of_second = start + Duration::from_millis(999);
+        for _ in 0..u16::MAX {
+            assert!(lifetime.admit(end_of_second));
+        }
+        assert!(!lifetime.admit(start + Duration::from_secs(255)));
+        assert!(!lifetime.admit(end_of_second + Duration::from_secs(255)));
+        assert!(lifetime.admit(start + Duration::from_secs(256)));
+        assert_eq!(lifetime.total, 1);
+        assert!(lifetime.admit(start + Duration::from_secs(1_000)));
+        assert_eq!(lifetime.total, 1);
     }
 
     /// A new attachment registration builds a new budget with a full bucket

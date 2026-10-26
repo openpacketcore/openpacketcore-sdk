@@ -111,8 +111,9 @@ impl TftFragmentKey {
     /// The first eight bytes are the classifier identity (attachment interface
     /// index and subscriber PAA); they select the owner group. The remaining
     /// key bytes continue the same hash and select a bucket inside that group.
-    /// Work is one FNV pass over the 20 key bytes, as before: the group boundary
-    /// adds only masks, not a second hash. Collisions never permit eviction.
+    /// One FNV pass covers all 20 key bytes. Folding the upper hash bits before
+    /// masking keeps the high bits of every key byte relevant to placement.
+    /// Collisions never permit eviction.
     #[must_use]
     #[inline(always)]
     pub fn bucket(self) -> u32 {
@@ -122,12 +123,12 @@ impl TftFragmentKey {
             hash = (hash ^ u32::from(self.0[index])).wrapping_mul(16_777_619);
             index += 1;
         }
-        let owner = hash & (TFT_FRAGMENT_OWNER_GROUPS - 1);
+        let owner = (hash ^ (hash >> 16)) & (TFT_FRAGMENT_OWNER_GROUPS - 1);
         while index < TFT_FRAGMENT_KEY_LEN {
             hash = (hash ^ u32::from(self.0[index])).wrapping_mul(16_777_619);
             index += 1;
         }
-        let within = hash & (TFT_FRAGMENT_OWNER_BUCKETS - 1);
+        let within = (hash ^ (hash >> 16)) & (TFT_FRAGMENT_OWNER_BUCKETS - 1);
         owner * TFT_FRAGMENT_OWNER_BUCKETS + within
     }
 
@@ -140,8 +141,13 @@ impl TftFragmentKey {
     #[inline(always)]
     fn matches(&self, other: &Self) -> bool {
         let mut difference = 0;
-        for index in 0..TFT_FRAGMENT_KEY_LEN {
-            difference |= self.0[index] ^ other.0[index];
+        // Compare five complete words so the inlined bucket scan retains
+        // five key scalars rather than twenty byte scalars on the BPF stack.
+        // Both operands still use every exact key byte, including reserved.
+        let left = self.0.as_chunks::<4>().0;
+        let right = other.0.as_chunks::<4>().0;
+        for index in 0..TFT_FRAGMENT_KEY_LEN / 4 {
+            difference |= u32::from_le_bytes(left[index]) ^ u32::from_le_bytes(right[index]);
         }
         difference == 0
     }
@@ -361,12 +367,6 @@ impl TftFragmentBucket {
             if !fragment.is_first() {
                 return TftFragmentDisposition::Drop;
             }
-            if available == TFT_FRAGMENT_WAYS {
-                // Every slot in this owner bucket is live or poisoned: the
-                // per-owner bound refused this datagram without touching
-                // another owner's buckets.
-                return TftFragmentDisposition::Capacity;
-            }
             let Some((packet, mark)) = first else {
                 return TftFragmentDisposition::Malformed;
             };
@@ -381,6 +381,10 @@ impl TftFragmentBucket {
             let Some(expires_at) = now_ns.checked_add(TFT_FRAGMENT_LIFETIME_NS) else {
                 return TftFragmentDisposition::Drop;
             };
+            if available == TFT_FRAGMENT_WAYS {
+                // Capacity is distinct from a malformed first fragment.
+                return TftFragmentDisposition::Capacity;
+            }
             // Write only the live fields and first range. Old unused ranges
             // remain inaccessible behind range_count, avoiding a large memset.
             let entry = &mut self.entries[available];
@@ -456,35 +460,47 @@ impl TftFragmentBucket {
             entry.poisoned = 1;
             return TftFragmentDisposition::Drop;
         }
+        let mut conflict = 0;
         for index in 0..TFT_FRAGMENT_MAX_RANGES as u32 {
             // Keep the address bound local to every access. The barrier stops
             // LLVM replacing this with a walking pointer; the mask survives
             // optimization even when an older verifier forgets scalar bounds
             // across a stack reload. It is an identity for this 0..64 loop.
             let index = core::hint::black_box(index) & (TFT_FRAGMENT_MAX_RANGES as u32 - 1);
-            if index >= u32::from(entry.range_count) {
-                // This is the first unused record. Reuse the same bounded
-                // index for the append, rather than reloading an older count
-                // whose bound an older verifier may have lost on the stack.
-                entry.ranges[index as usize] =
-                    [fragment.start.to_be_bytes(), fragment.end.to_be_bytes()];
-                entry.range_count += 1;
-                if !fragment.more {
-                    entry.final_end = fragment.end.to_be_bytes();
-                }
-                return TftFragmentDisposition::Selected(mark);
-            }
             let start = u16::from_be_bytes(entry.ranges[index as usize][0]);
             let end = u16::from_be_bytes(entry.ranges[index as usize][1]);
-            if (fragment.start < end && start < fragment.end)
-                || (!fragment.more && end > fragment.end)
-            {
-                entry.poisoned = 1;
-                return TftFragmentDisposition::Drop;
-            }
+            // Each operand is at most 16 bits, so the high bit of a wrapping
+            // u32 subtraction is exactly the strict-less-than result. Keep
+            // these arithmetic masks and their compiler barriers: without
+            // the barriers LLVM turns them back into boolean comparisons,
+            // multiplying BPF verifier states on every loop iteration.
+            // Inactive records may contain old bytes and contribute nothing.
+            let active =
+                core::hint::black_box(index.wrapping_sub(u32::from(entry.range_count))) >> 31;
+            let overlap =
+                (core::hint::black_box(u32::from(fragment.start).wrapping_sub(u32::from(end)))
+                    >> 31)
+                    & (core::hint::black_box(
+                        u32::from(start).wrapping_sub(u32::from(fragment.end)),
+                    ) >> 31);
+            let beyond_final =
+                core::hint::black_box(u32::from(fragment.end).wrapping_sub(u32::from(end))) >> 31;
+            conflict |= active & (overlap | (u32::from(!fragment.more) & beyond_final));
         }
-        entry.poisoned = 1;
-        TftFragmentDisposition::Drop
+        if conflict != 0 {
+            entry.poisoned = 1;
+            return TftFragmentDisposition::Drop;
+        }
+        // The earlier range-count check proves this is the first unused slot.
+        // Retain the address mask across verifier stack reloads, as in the walk.
+        let index = core::hint::black_box(u32::from(entry.range_count))
+            & (TFT_FRAGMENT_MAX_RANGES as u32 - 1);
+        entry.ranges[index as usize] = [fragment.start.to_be_bytes(), fragment.end.to_be_bytes()];
+        entry.range_count += 1;
+        if !fragment.more {
+            entry.final_end = fragment.end.to_be_bytes();
+        }
+        TftFragmentDisposition::Selected(mark)
     }
 }
 
@@ -557,6 +573,113 @@ mod tests {
             None,
             Some(12),
         )
+    }
+
+    #[test]
+    fn high_identification_bits_preserve_available_fragment_capacity() {
+        let mut buckets: [TftFragmentBucket; TFT_FRAGMENT_OWNER_BUCKETS as usize] =
+            core::array::from_fn(|_| TftFragmentBucket::new());
+        let metadata = meta(1);
+        // These identities differ only above each byte's lowest six bits.
+        // Ignoring those bits sends all five into one four-way bucket.
+        let identities = [0x0001, 0x0041, 0x0081, 0x00c1, 0x4001];
+        for id in identities {
+            let key = key(id);
+            let bucket = &mut buckets[(key.bucket() % TFT_FRAGMENT_OWNER_BUCKETS) as usize];
+            assert_eq!(
+                bucket.apply(
+                    key,
+                    Some(first()),
+                    Some(&metadata),
+                    Some((&packet(), 11)),
+                    10,
+                ),
+                TftFragmentDisposition::Selected(11),
+                "high Identification bits must distribute these five datagrams"
+            );
+        }
+        for id in identities {
+            let key = key(id);
+            let bucket = &mut buckets[(key.bucket() % TFT_FRAGMENT_OWNER_BUCKETS) as usize];
+            assert_eq!(
+                bucket.apply(key, Some(last()), Some(&metadata), None, 11),
+                TftFragmentDisposition::Selected(11)
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_key_comparison_uses_every_byte_including_reserved() {
+        let original = key(1);
+        assert!(original.matches(&original));
+        for index in 0..TFT_FRAGMENT_KEY_LEN {
+            let mut changed = original;
+            changed.0[index] ^= 0x80;
+            assert!(
+                !original.matches(&changed),
+                "key byte {index} must remain exact"
+            );
+        }
+    }
+
+    #[test]
+    fn full_bucket_keeps_malformed_first_fragments_distinct_from_capacity() {
+        let mut bucket = TftFragmentBucket::new();
+        let metadata = meta(1);
+        for id in 1..=4 {
+            assert_eq!(
+                bucket.apply(
+                    key(id),
+                    Some(first()),
+                    Some(&metadata),
+                    Some((&packet(), 11)),
+                    10
+                ),
+                TftFragmentDisposition::Selected(11)
+            );
+        }
+        assert_eq!(
+            bucket.apply(key(5), Some(first()), Some(&metadata), None, 20),
+            TftFragmentDisposition::Malformed,
+            "an incomplete first-fragment transport header is malformed even at capacity"
+        );
+        let short_udp = TftClassifierIpv4Packet::new(
+            [192, 0, 2, 1],
+            [198, 51, 100, 2],
+            17,
+            0,
+            Some(1234),
+            Some(5678),
+            None,
+        )
+        .with_udp_length(4);
+        assert_eq!(
+            bucket.apply(
+                key(6),
+                Some(first()),
+                Some(&metadata),
+                Some((&short_udp, 11)),
+                20
+            ),
+            TftFragmentDisposition::Malformed,
+            "invalid UDP length must not be reported as capacity pressure"
+        );
+        assert_eq!(
+            bucket.apply(
+                key(7),
+                Some(first()),
+                Some(&metadata),
+                Some((&packet(), 11)),
+                20
+            ),
+            TftFragmentDisposition::Capacity
+        );
+        for id in 1..=4 {
+            assert_eq!(
+                bucket.apply(key(id), Some(last()), Some(&metadata), None, 30),
+                TftFragmentDisposition::Selected(11)
+            );
+        }
     }
 
     #[test]
@@ -672,6 +795,45 @@ mod tests {
                 TftFragmentDisposition::Selected(11)
             );
         }
+    }
+
+    #[test]
+    fn range_scan_ignores_expired_slots_unused_by_the_new_datagram() {
+        let mut bucket = TftFragmentBucket::new();
+        let metadata = meta(1);
+        assert_eq!(
+            bucket.apply(
+                key(1),
+                Some(first()),
+                Some(&metadata),
+                Some((&packet(), 11)),
+                10
+            ),
+            TftFragmentDisposition::Selected(11)
+        );
+        for index in 1..TFT_FRAGMENT_MAX_RANGES as u16 {
+            let fragment =
+                TftIpv4Fragment::from_header(0x45, 28, 28, 0x2000 | (2 + index)).unwrap();
+            assert_eq!(
+                bucket.apply(key(1), Some(fragment), Some(&metadata), None, 11),
+                TftFragmentDisposition::Selected(11)
+            );
+        }
+        let reused_at = 10 + TFT_FRAGMENT_LIFETIME_NS;
+        assert_eq!(
+            bucket.apply(
+                key(2),
+                Some(first()),
+                Some(&metadata),
+                Some((&packet(), 11)),
+                reused_at
+            ),
+            TftFragmentDisposition::Selected(11)
+        );
+        assert_eq!(
+            bucket.apply(key(2), Some(last()), Some(&metadata), None, reused_at + 1),
+            TftFragmentDisposition::Selected(11)
+        );
     }
 
     #[test]

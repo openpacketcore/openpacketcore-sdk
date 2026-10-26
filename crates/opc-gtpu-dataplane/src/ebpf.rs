@@ -3859,27 +3859,13 @@ const MAX_TRAFFIC_PROOF_ATTEMPTS: usize = 256;
 const MAX_TRAFFIC_PROOF_DRAIN_BATCH: usize = MAX_RETAINED_EVENTS;
 const TRAFFIC_OBSERVATION_SEQUENCE_WINDOW: u64 = MAX_RETAINED_EVENTS as u64;
 
-/// Bounded live-attempt admission predicate used by the renewal and admission
-/// paths.
-///
-/// Before extraction, renewal rejected `attempts.len() >=
-/// MAX_TRAFFIC_PROOF_ATTEMPTS` while admission rejected `attempts.len() ==
-/// MAX_TRAFFIC_PROOF_ATTEMPTS`. The predicate normalizes both to `current <
-/// MAX` (both reject at-or-above the cap). That is fail-closed-equivalent for
-/// every reachable state: the attempts map is in-memory behind the guarded
-/// insert path, so its length cannot exceed the cap. Kept as one explicitly
-/// testable expression so the host-portable scale evidence can exercise the
-/// exact failure boundary without constructing a full backend; it has no
-/// behavior of its own.
+/// Shared admission and renewal guard for the bounded live-attempt table.
 const fn traffic_attempt_capacity_available(current: usize) -> bool {
     current < MAX_TRAFFIC_PROOF_ATTEMPTS
 }
 
-/// Bounded observation-drain batch predicate.
-///
-/// The drain never appends a record once the batch is full; it marks the drain
-/// overflowed so the consumer fails closed instead of silently truncating.
-/// Kept as one explicitly testable expression for the same evidence reason.
+/// A full drain batch must report overflow rather than silently truncate.
+#[cfg(any(target_os = "linux", test))]
 const fn traffic_observation_batch_full(record_count: usize, budget: usize) -> bool {
     record_count >= budget
 }
@@ -57252,7 +57238,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod reassembled_downlink;
     mod retained_namespace_boundary;
-    mod scale_evidence;
+    mod traffic_capacity;
     // This fixture constructs real durable consensus, whose public platform
     // contract is Linux-only. The portable fake-runtime tests remain below.
     #[cfg(target_os = "linux")]

@@ -1689,15 +1689,14 @@ fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications()
     };
     assert_eq!(second, first.checked_add(1).unwrap_or(1));
 
-    // An equal replacement is always accepted; an increase after admissions is
-    // refused unless the carried conservative window bound allows it.
+    // Replacements preserve the live sequence and never restore a burst.
     assert!(budget.set_limit(limit, refilled));
     assert!(
         budget.set_limit(
             Limit::new(64, Duration::from_secs(3_600)).unwrap(),
             refilled
         ),
-        "the carried bound plus this tightening limit stays within 65,535"
+        "a valid tightening remains available during traffic"
     );
     assert_eq!(
         budget.admit(a, refilled, true),
@@ -1705,8 +1704,12 @@ fn inner_fragment_budget_is_per_destination_with_non_repeating_identifications()
         "a replacement keeps the sequence and never grants an extra burst"
     );
     assert!(
-        !budget.set_limit(default, refilled),
-        "a later mid-registration increase is refused by the carried bound"
+        budget.set_limit(default, refilled),
+        "the default can be restored without replacing the registration"
+    );
+    assert_eq!(
+        budget.admit(a, refilled, true),
+        InnerFragmentAdmission::RateLimited
     );
 
     // One destination's sequence assigns every non-zero Identification

@@ -22,6 +22,12 @@ pub mod qualification_kubernetes_concurrent_v5;
 pub mod qualification_kubernetes_concurrent_v5_artifacts;
 pub mod qualification_sequential;
 
+#[path = "../../opc-session-store/tests/support/election_progress.rs"]
+mod election_progress;
+
+#[cfg(test)]
+mod election_progress_tests;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -627,24 +633,52 @@ impl ConsensusTestCluster {
 
     /// Wait until one member proves a fresh linearizable barrier.
     ///
-    /// This observes readiness within a diagnostic acceptance deadline. It
-    /// does not guarantee convergence for an uncontrolled election schedule.
+    /// The unchanged watchdog detects stalled election progress. Each real
+    /// higher term allows the automatic engine to retry another split vote.
     pub async fn wait_node_durable_ready(&self, index: usize) {
         let store = self
             .stores
             .get(index)
             .unwrap_or_else(|| panic!("consensus test node {index} does not exist"));
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if store.probe_durable_readiness().await.is_ready() {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "consensus test node did not become durable-ready"
-            );
+        let readiness = election_progress::wait(
+            Duration::from_secs(30),
+            store.status().term,
+            async {
+                loop {
+                    if store.probe_durable_readiness().await.is_ready() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+            |term| Self::next_election_term(std::slice::from_ref(store), term),
+        )
+        .await;
+        assert!(
+            readiness.is_ok(),
+            "consensus test node did not become durable-ready"
+        );
+    }
+
+    async fn next_election_term(stores: &[ConsensusSessionStore], term: u64) -> u64 {
+        #[cfg(any(test, feature = "test-control"))]
+        {
+            use futures_util::StreamExt;
+            let mut changes = stores
+                .iter()
+                .map(|store| store.wait_for_status_for_test(move |status| status.term > term))
+                .collect::<futures_util::stream::FuturesUnordered<_>>();
+            let _ = changes.next().await;
+        }
+        #[cfg(not(any(test, feature = "test-control")))]
+        while stores.iter().all(|store| store.status().term <= term) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(term)
     }
 
     async fn wait_ready(&self, fixed: bool) {
@@ -652,31 +686,42 @@ impl ConsensusTestCluster {
     }
 
     async fn wait_ready_stores(stores: &[ConsensusSessionStore], fixed: bool) {
-        // A diagnostic acceptance deadline, not an automatic-election bound.
-        // Automatic campaigns remain enabled during formation and failover.
-        let deadline = tokio::time::Instant::now() + CONSENSUS_TEST_TRANSITION_TIMEOUT;
-        loop {
-            let reports = join_all(stores.iter().map(|store| async move {
-                if fixed {
-                    store
-                        .probe_fixed_durable_quorum_readiness()
-                        .await
-                        .traffic_authority()
-                        == opc_session_store::FixedQuorumTrafficAuthority::Granted
-                } else {
-                    store.probe_durable_readiness().await.state() == DurableReadinessState::Ready
+        let initial_term = stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(0);
+        let readiness = election_progress::wait(
+            CONSENSUS_TEST_TRANSITION_TIMEOUT,
+            initial_term,
+            async {
+                loop {
+                    let reports = join_all(stores.iter().map(|store| async move {
+                        if fixed {
+                            store
+                                .probe_fixed_durable_quorum_readiness()
+                                .await
+                                .traffic_authority()
+                                == opc_session_store::FixedQuorumTrafficAuthority::Granted
+                        } else {
+                            store.probe_durable_readiness().await.state()
+                                == DurableReadinessState::Ready
+                        }
+                    }))
+                    .await;
+                    if reports.iter().all(|ready| *ready) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-            }))
-            .await;
-            if reports.iter().all(|ready| *ready) {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "consensus test fleet did not become durable-ready"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+            },
+            |term| Self::next_election_term(stores, term),
+        )
+        .await;
+        assert!(
+            readiness.is_ok(),
+            "consensus test fleet did not become durable-ready"
+        );
     }
 }
 

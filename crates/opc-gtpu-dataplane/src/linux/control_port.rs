@@ -2,9 +2,10 @@
 //! the retained Linux kernel-GTP userspace socket.
 //!
 //! The Linux `gtp` driver passes every datagram that is not a G-PDU and every
-//! G-PDU whose TEID selects no PDP context back to the userspace socket passed
-//! as `IFLA_GTP_FD1`. That is exactly the TS 29.281 7.3.1 unknown-tunnel
-//! trigger. This port exposes that queue without creating, duplicating or
+//! G-PDU it declines back to the userspace socket passed as `IFLA_GTP_FD1`,
+//! including known TEIDs with an incorrect inner MS binding. Stable backend
+//! PDP readback must establish absence before reporting `UnknownTunnel`.
+//! This port exposes that queue without creating, duplicating or
 //! rebinding a socket: the backend's retained descriptor stays the only
 //! socket owner, and every received datagram, response plan and operation is
 //! bound to this exact attachment generation.
@@ -14,9 +15,9 @@
 //! has no tunnel and whether to plan one Error Indication. Controls, unmodelled
 //! messages and unsupported-required-extension events are returned as
 //! `Control` (so the existing notification planners still work); only
-//! malformed framing is a drop. Receive and response are non-blocking with
-//! respect to attachment mutation: contention returns the typed `Busy`
-//! outcome. A response pins its transmitted IP source with an `IP_PKTINFO`
+//! malformed framing is a drop. Receive and classification are serialized
+//! per attachment: contention returns `Busy` before dequeue. Responses do not
+//! contend with receive or PDP observation. A response pins its IP source with an `IP_PKTINFO`
 //! cmsg to the original local destination, so a wildcard bind on a multi-homed
 //! endpoint keeps the packet's ingress address.
 
@@ -39,10 +40,7 @@ pub(super) struct LinuxControlPort {
 
 impl fmt::Debug for LinuxControlPort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LinuxControlPort")
-            .field("ifindex", &self.slot.ifindex)
-            .field("values", &"<redacted>")
-            .finish()
+        f.write_str("LinuxControlPort(<redacted>)")
     }
 }
 
@@ -56,29 +54,13 @@ fn io_error(error: std::io::Error) -> GtpuControlPortError {
 
 /// Open (or re-open) the shared control queue of one retained userspace socket.
 ///
-/// Reopening shares the same socket but publishes a new attachment generation
-/// and retires the previous slot (single-consumer semantics); it never binds,
-/// duplicates or reopens a descriptor. A concurrent attachment mutation makes
-/// this return a typed `WouldBlock` I/O class instead of waiting. Only an
-/// ordinary (non-recoverable) creation keeps a userspace descriptor: a
-/// kernel-owned recoverable attachment has no userspace queue and returns
-/// `UnsupportedFeature`.
+/// Reopening shares the same socket and attachment generation. Only an
+/// ordinary creation retains a userspace descriptor; a recoverable kernel-
+/// owned attachment has no userspace queue and remains unsupported.
 pub(super) fn open(
     backend: &LinuxGtpuDataplaneBackend,
     device: GtpDevice,
 ) -> Result<Arc<dyn GtpuControlPort>, GtpuError> {
-    let _operation = match backend.inner.pdp_operation_lock.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::WouldBlock) => {
-            return Err(GtpuError::io(
-                "gtpu_control_port_open",
-                std::io::Error::from(std::io::ErrorKind::WouldBlock),
-            ));
-        }
-        Err(std::sync::TryLockError::Poisoned(_)) => {
-            return Err(GtpuError::io("gtpu_control_port_open", poisoned_lock()));
-        }
-    };
     let sockets = backend
         .inner
         .device_sockets
@@ -94,7 +76,11 @@ pub(super) fn open(
                 feature: "gtpu_control_port_kernel_owned",
             });
         }
-        return Err(GtpuError::NotFound);
+        // An unattached backend has no qualified control-port capability,
+        // preserving the trait's fail-closed unsupported contract.
+        return Err(GtpuError::UnsupportedFeature {
+            feature: "gtpu_control_port",
+        });
     };
     if owned.name != device.name {
         return Err(GtpuError::NotFound);
@@ -124,6 +110,17 @@ pub(super) fn open(
         let fd = handle.linux_as_fd().ok_or(GtpuError::UnsupportedFeature {
             feature: "gtpu_control_port",
         })?;
+        let IpAddr::V4(bound) = owned.bind_address else {
+            unreachable!()
+        };
+        if backend.inner.transport.ifindex_by_name(&owned.name).ok() != Some(device.ifindex)
+            || socket_address(fd).ok() != Some(SocketAddrV4::new(bound, owned.bind_port))
+        {
+            drop(backend.retire_control_port_locked(device.ifindex));
+            return Err(GtpuError::StateIndeterminate {
+                operation: "gtpu_control_port_attachment",
+            });
+        }
         set_packet_info(fd)?;
         let cookie = opc_linux_gtpu_sys::socket_kernel_identity(fd)
             .map(|identity| identity.socket_cookie())
@@ -132,6 +129,27 @@ pub(super) fn open(
     } else {
         (None, Arc::new(()))
     };
+    // Registry publication uses device_sockets, then control_ports. Live I/O
+    // pins its descriptor through this slot without retaining either lock.
+    let mut ports = backend
+        .inner
+        .control_ports
+        .lock()
+        .map_err(|_| GtpuError::io("gtpu_control_port_state", poisoned_lock()))?;
+    if let Some(current) = ports.get(&device.ifindex).filter(|slot| {
+        slot.active.load(Ordering::Acquire)
+            && slot.name == owned.name
+            && slot.namespace == owned.namespace
+            && slot.bind_address == owned.bind_address
+            && slot.bind_port == owned.bind_port
+            && slot.socket_cookie == socket_cookie
+            && slot.socket.ptr_eq(&Arc::downgrade(handle))
+    }) {
+        return Ok(Arc::new(LinuxControlPort {
+            backend: Arc::downgrade(&backend.inner),
+            slot: Arc::clone(current),
+        }));
+    }
     let slot = Arc::new(ControlSlot {
         ifindex: device.ifindex,
         name: owned.name.clone(),
@@ -139,16 +157,14 @@ pub(super) fn open(
         bind_address: owned.bind_address,
         bind_port: owned.bind_port,
         socket_cookie,
+        socket: Arc::downgrade(handle),
         identity,
         active: AtomicBool::new(true),
+        operations: std::sync::RwLock::new(()),
+        receive: Mutex::new(()),
+        #[cfg(test)]
+        after_receive: Mutex::new(None),
     });
-    // Lock order everywhere is device_sockets, then control_ports, so a
-    // replacement cannot retire a slot while an operation holds the sockets.
-    let mut ports = backend
-        .inner
-        .control_ports
-        .lock()
-        .map_err(|_| GtpuError::io("gtpu_control_port_state", poisoned_lock()))?;
     if let Some(previous) = ports.insert(device.ifindex, Arc::clone(&slot)) {
         previous.active.store(false, Ordering::SeqCst);
     }
@@ -159,11 +175,12 @@ pub(super) fn open(
     }))
 }
 
-/// Exact live socket binding for one operation, re-read under the backend's
-/// device-socket lock and compared with the generation captured at open.
+/// Pin and verify this attachment's exact socket for one operation. No
+/// backend-wide registry guard is held across socket I/O or PDP observation.
 fn with_binding<T>(
     port: &LinuxControlPort,
     operation: impl FnOnce(
+        &LinuxGtpuDataplaneBackend,
         &ControlSlot,
         SocketAddrV4,
         BorrowedFd<'_>,
@@ -171,62 +188,59 @@ fn with_binding<T>(
 ) -> Result<T, GtpuControlPortError> {
     let inner = port.backend.upgrade().ok_or_else(unavailable)?;
     let backend = LinuxGtpuDataplaneBackend { inner };
-    let _operation = match backend.inner.pdp_operation_lock.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::WouldBlock) => return Err(GtpuControlPortError::Busy),
-        Err(std::sync::TryLockError::Poisoned(_)) => return Err(unavailable()),
-    };
-    let sockets = backend
-        .inner
-        .device_sockets
-        .lock()
-        .map_err(|_| unavailable())?;
-    let owned = sockets
-        .userspace
-        .get(&port.slot.ifindex)
-        .ok_or_else(unavailable)?;
-    if owned.name != port.slot.name
-        || owned.namespace != port.slot.namespace
-        || owned.bind_address != port.slot.bind_address
-        || owned.bind_port != port.slot.bind_port
-    {
-        return Err(unavailable());
-    }
-    let OwnedGtpuSocket::Userspace(handle) = &owned.socket else {
-        return Err(unavailable());
-    };
+    // Only retirement takes the write guard, after announcing active=false.
+    // Therefore a failed acquisition is a lost binding, never retryable Busy.
+    // In particular, sending an affine plan cannot lose it to receive contention.
+    let _operation = port.slot.operations.try_read().map_err(|_| unavailable())?;
+    let handle = port.slot.socket.upgrade().ok_or_else(unavailable)?;
     let fd = handle.linux_as_fd().ok_or_else(unavailable)?;
-    if handle.is_real() {
-        let cookie = opc_linux_gtpu_sys::socket_kernel_identity(fd)
-            .map(|identity| identity.socket_cookie())
-            .map_err(io_error)?;
-        if port.slot.socket_cookie != Some(cookie) {
-            return Err(unavailable());
-        }
-    }
-    if backend.inner.transport.current_namespace_identity().ok() != port.slot.namespace {
-        return Err(unavailable());
-    }
-    {
-        let ports = backend
-            .inner
-            .control_ports
-            .lock()
-            .map_err(|_| unavailable())?;
-        match ports.get(&port.slot.ifindex) {
-            Some(current)
-                if Arc::ptr_eq(current, &port.slot) && port.slot.active.load(Ordering::SeqCst) => {}
-            _ => return Err(unavailable()),
-        }
-    }
     let IpAddr::V4(bound) = port.slot.bind_address else {
         return Err(unavailable());
     };
-    operation(
-        &port.slot,
-        SocketAddrV4::new(bound, port.slot.bind_port),
-        fd,
-    )
+    let local = SocketAddrV4::new(bound, port.slot.bind_port);
+    let verify = || {
+        let matches = port.slot.active.load(Ordering::Acquire)
+            && !backend.inner.device_sockets.is_poisoned()
+            && !backend.inner.control_ports.is_poisoned()
+            && backend.inner.transport.current_namespace_identity().ok() == port.slot.namespace
+            && backend
+                .inner
+                .transport
+                .ifindex_by_name(&port.slot.name)
+                .ok()
+                == Some(port.slot.ifindex)
+            && socket_address(fd).ok() == Some(local)
+            && opc_linux_gtpu_sys::socket_kernel_identity(fd)
+                .ok()
+                .map(|identity| identity.socket_cookie())
+                == port.slot.socket_cookie;
+        if matches {
+            Ok(())
+        } else {
+            port.slot.active.store(false, Ordering::Release);
+            Err(unavailable())
+        }
+    };
+    verify()?;
+    let result = operation(&backend, &port.slot, local, fd);
+    verify()?;
+    result
+}
+
+fn receive_guard(
+    port: &LinuxControlPort,
+) -> Result<std::sync::MutexGuard<'_, ()>, GtpuControlPortError> {
+    match port.slot.receive.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::WouldBlock) => Err(GtpuControlPortError::Busy),
+        Err(std::sync::TryLockError::Poisoned(_)) => Err(unavailable()),
+    }
+}
+
+fn socket_address(fd: BorrowedFd<'_>) -> std::io::Result<SocketAddrV4> {
+    use nix::sys::socket::{getsockname, SockaddrIn};
+    let address = getsockname::<SockaddrIn>(fd.as_raw_fd()).map_err(std::io::Error::from)?;
+    Ok(address.into())
 }
 
 #[cfg(target_os = "linux")]
@@ -242,6 +256,7 @@ fn receive_datagram(
     fd: BorrowedFd<'_>,
     buffer: &mut [u8],
     expected_ifindex: u32,
+    consumed: &mut bool,
 ) -> Result<Option<(usize, SocketAddrV4, Ipv4Addr, u32)>, GtpuControlPortError> {
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, SockaddrIn};
     use std::io::IoSliceMut;
@@ -258,7 +273,11 @@ fn receive_datagram(
         Err(nix::errno::Errno::EAGAIN) => return Ok(None),
         Err(error) => return Err(io_error(std::io::Error::from(error))),
     };
-    if message.flags.contains(MsgFlags::MSG_TRUNC) {
+    *consumed = true;
+    if message
+        .flags
+        .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
+    {
         return Err(io_error(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "truncated GTP-U datagram",
@@ -358,6 +377,67 @@ fn send_datagram(
     }
 }
 
+fn receive_bound(
+    slot: &ControlSlot,
+    bound: SocketAddrV4,
+    fd: BorrowedFd<'_>,
+    buffer: &mut [u8],
+    consumed: &mut bool,
+) -> Result<Option<GtpuControlDatagram>, GtpuControlPortError> {
+    let Some((length, peer, local, ifindex)) =
+        receive_datagram(fd, buffer, slot.ifindex, consumed)?
+    else {
+        return Ok(None);
+    };
+    if !bound.ip().is_unspecified() && *bound.ip() != local {
+        return Err(unavailable());
+    }
+    let provenance = DownlinkOuterProvenance::new(*peer.ip(), local, ifindex, peer.port())
+        .ok_or_else(|| {
+            io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "non-canonical provenance",
+            ))
+        })?;
+    let bytes = Bytes::copy_from_slice(&buffer[..length]);
+    Ok(Some(GtpuControlDatagram::received(
+        bytes,
+        provenance,
+        Arc::clone(&slot.identity),
+    )))
+}
+
+/// Require two equal reads in each inner-family table. The received payload
+/// cannot choose which table owns its TEID (TS 29.281 sections 6 and 7.3.1).
+fn context_absent(
+    backend: &LinuxGtpuDataplaneBackend,
+    slot: &ControlSlot,
+    teid: Teid,
+) -> Result<bool, GtpuError> {
+    // All netlink sockets are nonblocking. One receive attempt with no delay
+    // either supplies immediate evidence or fails closed; the try-call never
+    // waits for a response and never takes the PDP mutation mutex.
+    let config = LinuxGtpuDataplaneBackendConfig {
+        receive_attempts: 1,
+        retry_delay: Duration::ZERO,
+        ..backend.inner.config
+    };
+    let family_id = backend.resolve_gtp_family_id_with_config(config)?;
+    let mut absent = true;
+    for family in [GtpAddressFamily::Ipv4, GtpAddressFamily::Ipv6] {
+        let selector = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::new(slot.ifindex, GtpVersion::V1, family, teid).ok_or(
+                GtpuError::StateIndeterminate {
+                    operation: "gtpu_control_port_attachment",
+                },
+            )?,
+        );
+        let readback = backend.get_pdp_context_stable_with_config(family_id, &selector, config)?;
+        absent &= matches!(readback, PdpContextReadback::Absent);
+    }
+    Ok(absent)
+}
+
 impl GtpuControlPort for LinuxControlPort {
     fn try_receive_datagram(
         &self,
@@ -366,26 +446,11 @@ impl GtpuControlPort for LinuxControlPort {
         if !(8..=GTPU_CONTROL_MAX_DATAGRAM).contains(&maximum_bytes) {
             return Err(GtpuControlPortError::InvalidLimits);
         }
+        let _receive = receive_guard(self)?;
         let mut buffer = vec![0_u8; maximum_bytes];
-        with_binding(self, |slot, _local, fd| {
-            let Some((length, peer, local, ifindex)) =
-                receive_datagram(fd, &mut buffer, slot.ifindex)?
-            else {
-                return Ok(None);
-            };
-            let provenance = DownlinkOuterProvenance::new(*peer.ip(), local, ifindex, peer.port())
-                .ok_or_else(|| {
-                    io_error(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "non-canonical provenance",
-                    ))
-                })?;
-            let bytes = Bytes::copy_from_slice(&buffer[..length]);
-            Ok(Some(GtpuControlDatagram::received(
-                bytes,
-                provenance,
-                Arc::clone(&slot.identity),
-            )))
+        let mut consumed = false;
+        with_binding(self, |_, slot, bound, fd| {
+            receive_bound(slot, bound, fd, &mut buffer, &mut consumed)
         })
     }
 
@@ -396,7 +461,7 @@ impl GtpuControlPort for LinuxControlPort {
         if !Arc::ptr_eq(&plan.socket_identity, &self.slot.identity) {
             return Err(GtpuControlPortError::SocketMismatch);
         }
-        with_binding(self, |slot, local, fd| {
+        with_binding(self, |_, slot, local, fd| {
             if plan.source.port() != GTPU_PORT {
                 return Err(GtpuControlPortError::InvalidTuple);
             }
@@ -420,9 +485,46 @@ impl GtpuControlPort for LinuxControlPort {
         &self,
         maximum_bytes: usize,
     ) -> Result<Option<GtpuDownlinkEvent>, GtpuControlPortError> {
-        let Some(datagram) = self.try_receive_datagram(maximum_bytes)? else {
-            return Ok(None);
-        };
-        Ok(Some(crate::control_port::downlink_event(datagram)))
+        if !(8..=GTPU_CONTROL_MAX_DATAGRAM).contains(&maximum_bytes) {
+            return Err(GtpuControlPortError::InvalidLimits);
+        }
+        // This is the only acquisition that can return Busy, before recvmsg.
+        let _receive = receive_guard(self)?;
+        let mut buffer = vec![0_u8; maximum_bytes];
+        let mut consumed = false;
+        let result = with_binding(self, |backend, slot, bound, fd| {
+            let Some(datagram) = receive_bound(slot, bound, fd, &mut buffer, &mut consumed)? else {
+                return Ok(None);
+            };
+            #[cfg(test)]
+            if let Some(hook) = slot.after_receive.lock().unwrap().clone() {
+                hook();
+            }
+            let event = crate::control_port::downlink_event(datagram);
+            let GtpuDownlinkEvent::UnknownTunnel(datagram) = event else {
+                return Ok(Some(event));
+            };
+            let teid = datagram
+                .received_teid()
+                .and_then(|value| Teid::new(value.get()))
+                .ok_or_else(unavailable)?;
+            // A known TEID may reach this socket because the driver declined
+            // its inner binding. Preserve framing and never infer authority
+            // from that untrusted payload's IP-version nibble.
+            let outcome = match context_absent(backend, slot, teid) {
+                Ok(true) => GtpuDownlinkEvent::UnknownTunnel(datagram),
+                Ok(false) => {
+                    GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::DestinationMismatch)
+                }
+                Err(_) => GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::StateUnavailable),
+            };
+            Ok(Some(outcome))
+        });
+        match result {
+            Err(GtpuControlPortError::Unavailable) if consumed => Ok(Some(
+                GtpuDownlinkEvent::Dropped(crate::GtpuDownlinkDrop::StateUnavailable),
+            )),
+            outcome => outcome,
+        }
     }
 }

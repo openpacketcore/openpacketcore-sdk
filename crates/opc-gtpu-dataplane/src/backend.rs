@@ -112,9 +112,9 @@ pub trait GtpuDataplaneBackend: Send + Sync + std::fmt::Debug {
     /// The eBPF implementation supports concrete IPv4 endpoints only. The
     /// Linux kernel-GTP implementation exposes the retained userspace socket
     /// of an ordinary (non-recoverable) creation: the kernel passes
-    /// non-G-PDUs and G-PDUs whose TEID selects no PDP context back to that
-    /// socket, and this port returns them as bounded observations. Receipt
-    /// does not authorize a tunnel or peer. A kernel-owned recoverable
+    /// non-G-PDUs and declined G-PDUs back to that socket. Stable PDP absence
+    /// is required for `UnknownTunnel`; declined known-TEID traffic is dropped.
+    /// Receipt does not authorize a tunnel or peer. A kernel-owned recoverable
     /// attachment (no userspace descriptor) returns
     /// `UnsupportedFeature { feature: "gtpu_control_port_kernel_owned" }`.
     /// Mock and unsupported adapters return the exact unsupported feature

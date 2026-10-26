@@ -9,31 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `opc-gtpu-dataplane` / `opc-dataplane-observation`: add host-portable RED
-  scale-limit evidence for the #720 traffic-proof subsystem (tests only; no
-  production path, map, pin, object, ABI or proof-semantic change). The
-  evidence characterizes the current bounds against the required ePDG pool:
-  the pinned 65,536-byte ring holds 682 payload-only records (~630 usable once
-  the 8-byte BPF ring-buffer header per 96-byte event is included) vs a
-  40,000-event burst, `MAX_TRAFFIC_PROOF_ATTEMPTS` is 256 vs 10,000 simultaneous
-  attempts,
-  the drain/replay window and retained-event bound are 4,096, selector
-  authority is capped at 1,024 permanent / 512 live groups vs ~50,000
-  identities, and shared-event delivery is modeled as O(events × attempts)
-  rather than group-indexed O(events). The extracted admission predicate
-  unifies the previous renewal (`>=`) and admission (`==`) checks into `>=`;
-  that is equivalent for every reachable state because the in-memory attempts
-  map cannot exceed the cap. The testable capacity/batch predicates fail closed
-  at their exact boundaries, a deterministic baseline run below capacity
-  agrees with the group-indexed model, and an ignored release-mode
-  benchmark emits bounded count-only evidence with
-  `live_proof_claimed=false`. This **does not** meet #720 acceptance and adds
-  no live-proof claim; #720 remains partial. The remaining scope is the
-  recorded Option A owner decision: sharded pinned event-ring maps plus a
-  group/authority index (pin-count/marker/MAP_ABI/object rebuild with the
-  pinned toolchain and privileged CI lanes), selector-v2 capacity/durable
-  format changes, and release-mode 50k/10k/40k qualification. Refs #720.
-
 - `opc-gtpu-dataplane`: staged the RFC 017 mixed-selector-provenance codec and
   preflight slice (internal; no public API or backend behavior change). Added
   canonical `DrainQualificationCodecV1` (305 bytes) and `TransferEdgeCodecV1`
@@ -42,7 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one transfer edge per retired atom. It refuses missing/duplicate/foreign/
   stale drain qualifications, a changed predecessor set, same-group sources
   cited as transfers, gaps, overlaps, duplicate predecessors, and fresh atoms
-  carrying predecessor lineage, before any durable or backend effect. The
+  carrying predecessor lineage, before any durable or backend effect. Retired
+  sources must match resolved predecessor atoms still available for transfer,
+  the namespace epoch and a strictly increasing authority-generation schedule;
+  unused qualifications and duplicate qualification nonces are refused. The
   one-CAS ledger-v2 admission, transfer-gate transitions, coordinator wiring
   and loss-qualified same-group restore remain unimplemented; RFC 017 row
   017-1 is now `partial`. Refs #663.
@@ -57,20 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   I/O faults, cancellation/join and public authority/member-repair resume paths
   cover the lifecycle. Refs #1114.
 
-- `opc-gtpu-dataplane`: publish the RFC 016 external selector-adapter codec
-  module `selector_adapter_codec`: versioned canonical namespace binding
-  (145 bytes), operation stamp (208 bytes) and opaque terminal capsule
-  (110 bytes), with canonical rejection of wrong width, version, reserved or
-  inconsistent phase/outcome tuples, constant-time equality, closed
-  phase/request-kind/outcome classes and fully redacted `Debug`. Values can
-  only be decoded from durable bytes or minted from the SDK-issued opaque
-  `GtpuSessionSelectorBackendBinding`; there is no selector secret, raw
-  generation/commitment getter, public field/raw-part constructor, `Clone`, or
-  user-selected value. The built-in eBPF stamp and binding encoders now
-  delegate to the same canonical functions, so one codec serves both the
-  built-in and a future external adapter. External adapters remain
-  `Unsupported` until the RFC 016 §14.11 external-profile conformance harness
-  and qualification evidence exist. Refs #671.
+- `opc-gtpu-dataplane`: share the SDK-private canonical namespace-binding
+  and operation-stamp encoders with bounded format validation and golden-byte
+  regression coverage. The incomplete external `selector_adapter_codec` API
+  is not published: raw-byte decode and encode are not request-bound authority
+  leases. External codec leases and the RFC 016 section 14.11 conformance
+  harness remain unimplemented; external adapters remain `Unsupported`.
+  Refs #671.
+
+- `opc-ipsec-xfrm`:
   `NamespaceBoundLinuxXfrmBackend::install_scoped_successor` installs one
   successor SA for a flow that already has a live scoped receipt, moves the
   single protective policy to it with one `UPDPOLICY` update (no unprotected
@@ -104,9 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-gtpu-dataplane`: `LinuxGtpuDataplaneBackend` now opens an
   attachment-bound control port over the userspace UDP/2152 socket retained by
   an ordinary creation. The Linux `gtp` driver passes non-G-PDUs and G-PDUs
-  whose TEID matches no PDP context back to that socket (the TS 29.281 7.3.1
-  unknown-tunnel trigger), so `try_receive_downlink` reports them as
-  value-free `UnknownTunnel`/`Control` observations and one consuming
+  declined by the kernel back to that socket, including known TEIDs with a
+  wrong inner MS binding. `try_receive_downlink` requires stable PDP absence
+  before reporting `UnknownTunnel`; known or indeterminate contexts are
+  dropped. Controls remain available, and one consuming
   `unknown_tunnel_error` plan sends an Error Indication through the same
   retained socket with the Peer Address, TEID Data I and triggering UDP
   source-port fields. Receipt grants no tunnel or peer authority; the caller
@@ -114,7 +88,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel-owned recoverable attachment returns
   `gtpu_control_port_kernel_owned`, no second socket is ever bound, and
   removal, replacement, adoption or a descriptor generation change retires
-  old receive capabilities and plans. Refs #1084.
+  old receive capabilities and plans. Reopening the same live generation
+  preserves plans; I/O rechecks live link and socket binding without waiting
+  on the PDP mutation mutex. Recoverable-socket support remains unimplemented.
+  Refs #1084.
 - `opc-session-store`: native ordinary command outcomes now use a bounded
   committed-state retention rule instead of accumulating for the life of the
   store. The rule stays inert below committed application sequence 65,536
@@ -486,11 +463,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination or session that was used within the last 255 seconds. The
   bounded tables fail closed with a new typed reason instead of resetting an
   active token bucket or Identification sequence, and eviction uses an O(1)
-  LRU instead of a full-table scan. A limit replacement is accepted only when
-  a carried conservative 255-second bound proves it cannot combine with this
-  registration's earlier admissions into more than 65,535 packets; otherwise
-  `set_inner_fragment_rate_limit` returns `InvalidLimits` and the deployment
-  must re-register to change the budget mid-session. New value-free counters
+  LRU instead of a full-table scan. Reclamation also requires full token-bucket
+  refill, preserving slow limits. Fragmentation limit replacements retain
+  tokens, including refill earned under the old rate, without repricing elapsed
+  time. Explicit PTB limit replacement preserves its existing full-burst restart
+  contract while retaining the tracked sessions and their eviction grace. A separate
+  bounded per-destination sliding count preserves the 65,535-admission ceiling
+  across all valid limit replacements without re-registering. New value-free counters
   and typed outcomes are listed under "Added". Refs #1018.
 
 - `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
@@ -838,10 +817,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot read, close, duplicate or use it to bypass attachment invalidation.
   Readiness is advisory: it consumes no datagram and does not change the
   existing bounded service order (shared queue first for eight datagrams, then
-  the alternating hand-off queues). Attachment removal, replacement, fencing or
-  readback failure revokes every outstanding source, after which it reports
-  `Unavailable` and never becomes readable again. Ports without backend-owned
-  sockets keep the default `Unsupported` result. Refs #1021.
+  the alternating hand-off queues). Attachment removal, replacement, fencing,
+  readback failure and backend loss permanently signal a private eventfd,
+  waking idle consumers to observe `Unavailable` without a polling timer.
+  Standalone sockets without a downlink consumer keep `Unsupported`. Refs #1021.
 
 - `opc-gtpu-dataplane`: expose IPv4 uplink FAR misses by passed and dropped
   outcome, retaining `uplink_far_misses` as their sum. Reserved counter slots
@@ -1608,6 +1587,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report redirect deltas, iteration, counters, tentative IPv6 addresses, and
   neighbour/route state, including failed diagnostic reads. Packet counts and
   measurement deadlines are unchanged. (#1188)
+
+- `opc-session-store`: run functional lease and late-CAS readback observations
+  with their logical-time supervisors on controlled clocks. Preserve the
+  original timeout, fencing and exactly-once assertions, reproduce stalled
+  runtimes, and verify the exact acquire deadline and rejection of expired
+  queued reads. (#1308, #1211)
 
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 
@@ -9300,7 +9285,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coverage verifies strategy fields are persisted correctly on a real
   API server.
 - `opc-proto-ngap` (experimental v0): NGAP (3GPP TS 38.413) codec built on
-  `rasn` per ADR 0013 Option A. NGAP-PDU framing for all three outcome
+  `rasn` per ADR 0013's native Rust ASN.1 strategy. NGAP-PDU framing for all
+  three outcome
   classes with outcome-aware dispatch, typed APER decoding of
   NGSetupRequest (field-level external `asn1c`/libngap fixture) and
   InitialUEMessage, and raw-preserving encode so decode->encode

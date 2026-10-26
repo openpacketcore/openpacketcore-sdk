@@ -57,28 +57,44 @@ an IPv6-only attachment returns `UnsupportedFeature { feature:
 another listener or expose their private file descriptors.
 
 For `LinuxGtpuDataplaneBackend`, an ordinary (non-recoverable) creation keeps
-a userspace UDP socket and passes its descriptor to the kernel GTP driver.
-The driver passes every non-G-PDU and every G-PDU whose TEID matches no PDP
-context back to that socket's ordinary queue: the TS 29.281 7.3.1
-unknown-tunnel trigger. `open_gtpu_control_port` exposes exactly that queue
-and never binds, duplicates or reopens a socket; a recoverable kernel-owned
-attachment has no userspace descriptor and returns `UnsupportedFeature {
-feature: "gtpu_control_port_kernel_owned" }`. The port accepts only a
-concrete IPv4 bind on UDP/2152 (else `gtpu_control_port_ipv6` or
-`gtpu_control_port_port`). `try_receive_downlink` returns a G-PDU as
-`UnknownTunnel` (an observation, never tunnel or peer authority), controls,
-unmodelled messages and unsupported required-extension events as `Control`
-(so `extension_notification` still applies), and malformed framing as a
-`Malformed` drop. Receive and response return the typed `Busy` result instead
-of waiting behind an attachment mutation, and every response pins its
-transmitted IP source with an `IP_PKTINFO` cmsg to the original local
-destination, so a wildcard bind on a multi-homed endpoint keeps the ingress
-address. A
-`GtpuControlDatagram::unknown_tunnel_error` plan is bound to the exact
-receiving generation; removal, replacement, adoption or a socket/descriptor
-generation change retires the old port and every outstanding plan, so an old
-receive capability can never send through a replacement generation. The
-retained descriptor remains the only socket owner.
+one userspace UDP socket and passes its descriptor to the kernel GTP driver.
+The driver returns non-G-PDUs, unknown-TEID G-PDUs, and some known-TEID
+G-PDUs with an invalid inner MS binding to this queue. Socket delivery alone
+therefore does not establish the TS 29.281 section 7.3.1 Error Indication
+trigger. `try_receive_downlink` validates nonzero TEID and nonempty T-PDU,
+then performs two equal PDP reads in each of the IPv4 and IPv6 tables for
+that TEID. Only absence in both yields `UnknownTunnel`; a context in either
+family yields `Dropped(DestinationMismatch)`, and any readback error yields
+`Dropped(StateUnavailable)`. The T-PDU can be short or unstructured; its bytes
+never select the table to consult. Each netlink transaction makes one
+nonblocking receive attempt with no retry delay. A delayed reply therefore
+produces `Dropped(StateUnavailable)`, without waiting. Controls,
+unmodelled messages and unsupported required-extension events remain
+`Control`; malformed framing is dropped. `try_receive_datagram` exposes the
+received observation without a PDP lookup. Its caller must establish current
+context absence before planning an Error Indication. Neither API grants peer
+authorization or decides response policy.
+
+`open_gtpu_control_port` never binds, duplicates or reopens a socket. Repeated
+opens share the same socket generation and preserve already prepared response
+plans. Receive and response verify namespace, link name/index, socket cookie
+and local bind before and after I/O. Observed binding loss permanently retires
+that generation. Receive and classification share one attachment operation
+boundary, without the backend socket-registry or PDP mutation mutex. A
+competing receive returns `Busy` before consuming anything. Binding loss after
+dequeue yields `Dropped(StateUnavailable)`. Responses can proceed during
+receive/classification and do not return `Busy`; a retired binding returns
+`Unavailable`. A response pins its IP source with
+`IP_PKTINFO` to the original local destination, including for wildcard binds.
+Removal, replacement, adoption or socket-generation change retires old ports
+and plans. The retained descriptor remains the only socket owner.
+
+Only IPv4 UDP/2152 userspace sockets are supported, including wildcard binds.
+A kernel-owned recoverable attachment has no userspace descriptor and returns
+`UnsupportedFeature { feature: "gtpu_control_port_kernel_owned" }`; restart
+recovery of a control queue is not implemented. Non-IPv4 and nonstandard-port
+binds return `gtpu_control_port_ipv6` and `gtpu_control_port_port`. An
+unattached backend retains the default `gtpu_control_port` unsupported result.
 
 The backend checks its exact current tc hooks/maps and serializes each socket
 operation per attachment, through that registration's socket slot. PDP
@@ -217,20 +233,19 @@ queues are empty. Every wake from the exposed descriptor must be consumed with
 `try_readiness` (which names the ready queue classes) or `wait(timeout)`;
 `try_readiness` never blocks and `wait` blocks for a bounded interval.
 
-The source is bound to one registration. Attachment removal, replacement,
-fencing or a failed readback revokes every outstanding source: readiness and
-receive return `Unavailable`, and the source never becomes readable again.
-Revocation is passive and observed lazily: it sets a flag and does not wake the
-epoll, so a blocked `wait(long_timeout)` returns `Unavailable` only on its next
-return (at the latest when the timeout expires), and the exposed descriptor is
-not a revocation wakeup. An `AsyncFd`/epoll loop can therefore sleep
-indefinitely after revocation. After each wake or timeout, call
-`try_readiness`, or drive `try_receive_downlink` (it re-validates the
-registration and returns `Unavailable`); stop waiting on readiness and surface
-`Unavailable` to the caller. Do not treat readiness silence as a liveness
-signal. Drop the source and reopen the port after a fresh exact registration.
-Backends without backend-owned sockets inherit the default `Unsupported`
-result.
+The source is bound to one registration. Attachment removal, replacement or
+backend loss permanently signals a private eventfd inside the epoll instance.
+Fencing and failed readback are observed at the next port operation, which
+then revokes the source. Revocation wakes an idle `AsyncFd`/epoll consumer;
+`try_readiness`, `wait` and receive report `Unavailable`. The signal is never
+drained, so the descriptor remains readable for every observer. Stop waiting
+on and drop that source, then reopen through the backend after a fresh exact
+registration. An old source never observes the replacement queues.
+
+Ports without backend-owned downlink queues, including standalone
+`GtpuReassemblySocket` values and Linux kernel-GTP control ports, keep the
+default `Unsupported` readiness result. A standalone reassembly socket does
+not implement `try_receive_downlink` either.
 
 ## Backend-authoritative downlink consumer
 
@@ -1052,8 +1067,8 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
    `InnerFragmentCapacityExhausted` (counted in
    `inner_fragment_capacity_exhausted`) instead of resetting another
    destination's budget or Identification sequence. A destination idle for
-   at least 255 seconds may be evicted and restarts with a full bucket; no
-   255-second window can then contain admissions from both lives. A refused
+   at least 255 seconds may be evicted only after its bucket fully refills;
+   this also preserves limits whose refill takes longer than the lifetime. A refused
    admission still counts as a use. An empty bucket is an
    `InnerFragmentRateLimited` drop. Steps 1 and 2 take no token.
 4. **Fragmentation** by the RFC 791 section 3.2 procedure, generalized to
@@ -1082,13 +1097,14 @@ The G-PDU is re-authorized against the same Active commit. Then, in order:
    re-adoption or a re-created attachment) still restarts every destination
    from a new random value and a full bucket, possibly within 255 seconds of
    the previous registration's Identifications; that reset is the documented
-   residual of the host-side budget (#1018). A limit replacement is accepted
-   only when a carried conservative 255-second bound proves it cannot combine
-   with earlier admissions of the registration into more than 65,535 packets:
-   an unchanged limit, no prior admission, 255 seconds without an admission,
-   or carried bound plus the new limit's 255-second maximum within 65,535.
-   Otherwise `set_inner_fragment_rate_limit` returns `InvalidLimits` and the
-   deployment must re-register to change the budget mid-session.
+   residual of the host-side budget (#1018). Every valid limit replacement
+   preserves sequences and budgets. A separate per-destination sliding count
+   enforces at most 65,535 admissions across every replacement. Its 256
+   one-second bins retain admissions for up to one extra second, preventing
+   an admission near a bin boundary from expiring early. The counters occupy
+   512 bytes per destination (2 MiB at the 4,096-key cap), plus fixed
+   bookkeeping, and expire at most 256 bins per admission. Live limit changes
+   never require re-registering the attachment.
 
 The result is `GtpuDownlinkEvent::Fragmented`: the fragments in offset order,
 the MTU and the bearer mark. Its `Debug` output shows only the fragment
@@ -1171,9 +1187,11 @@ Destination Unreachable (Fragmentation Needed) error is sent:
   while the table holds only such sessions, a new session's error budget is
   refused fail closed (`CapacityExhausted`, counted in
   `packet_too_big_capacity_exhausted`). A session idle for at least 255
-  seconds may be evicted and re-created with a full bucket; no 255-second
-  window can then contain admissions from both lives, so a flood toward one
-  PAA still exhausts only that session's budget.
+  seconds may be evicted only after its bucket fully refills. Explicitly
+  replacing the limit restarts every session's bucket full, including an equal
+  limit, while retaining tracked identities and their eviction grace. A flood
+  toward one PAA still exhausts only that session's budget. New registrations
+  retain the documented residual of starting with fresh volatile budgets.
 - **Tradeoff.** The error's source is the subscriber's own address. The ePDG
   is routing, so RFC 1812 4.3.2.4 would have it use its own address, but the
   PGW's per-PDN anti-spoofing admits only the PAA. The originator therefore
