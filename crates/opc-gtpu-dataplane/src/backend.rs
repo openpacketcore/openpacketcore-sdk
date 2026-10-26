@@ -1484,7 +1484,7 @@ mod tests {
         ));
         let context = GtpPdpContext {
             local_teid: crate::Teid::new(1).unwrap(),
-            peer_teid: crate::PeerTeid::new(2),
+            peer_teid: crate::Teid::new(2).unwrap().into(),
             ms_address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             peer_address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2)),
             link_ifindex: 7,

@@ -7037,7 +7037,7 @@ mod tests {
     fn reconciliation_context() -> GtpPdpContext {
         GtpPdpContext {
             local_teid: Teid::new(0x1234_5678).unwrap(),
-            peer_teid: PeerTeid::new(0x8765_4321),
+            peer_teid: Teid::new(0x8765_4321).unwrap().into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 7,
@@ -7112,7 +7112,7 @@ mod tests {
     fn pdp_context_debug_redacts_teids_and_addresses() {
         let ctx = GtpPdpContext {
             local_teid: Teid::new(0x1234_5678).unwrap(),
-            peer_teid: PeerTeid::new(0x8765_4321),
+            peer_teid: Teid::new(0x8765_4321).unwrap().into(),
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
             peer_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             link_ifindex: 7,
@@ -7177,7 +7177,7 @@ mod tests {
         let desired = reconciliation_context();
         let mut existing = desired.clone();
         existing.local_teid = Teid::new(1).unwrap();
-        existing.peer_teid = PeerTeid::new(2);
+        existing.peer_teid = Teid::new(2).unwrap().into();
         existing.ms_address = IpAddr::V4(Ipv4Addr::new(10, 23, 0, 3));
         existing.peer_address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
         existing.link_ifindex = 8;
@@ -7248,7 +7248,7 @@ mod tests {
         );
 
         let mut conflict = desired.clone();
-        conflict.peer_teid = PeerTeid::new(3);
+        conflict.peer_teid = Teid::new(3).unwrap().into();
         let classified =
             classify_dual_selector_state(&PdpContextReadback::Present(conflict), &absent, &desired);
         assert!(matches!(
@@ -7306,7 +7306,7 @@ mod tests {
     fn remove_request_derives_family_from_context() {
         let ctx = GtpPdpContext {
             local_teid: Teid::new(1).unwrap(),
-            peer_teid: PeerTeid::new(2),
+            peer_teid: Teid::new(2).unwrap().into(),
             ms_address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: 9,
@@ -7957,7 +7957,7 @@ mod tests {
         let ipv4_entry = GtpuSessionEntry::new(reconciliation_context(), ipv4_local).unwrap();
         let mut ipv6_context = reconciliation_context();
         ipv6_context.local_teid = Teid::new(0x1234_5679).unwrap();
-        ipv6_context.peer_teid = PeerTeid::new(0x8765_4322);
+        ipv6_context.peer_teid = Teid::new(0x8765_4322).unwrap().into();
         ipv6_context.ms_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0xbeef));
         ipv6_context.peer_address = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 3, 0, 0, 0, 0, 10));
         let mut same_prefix_context = ipv6_context.clone();

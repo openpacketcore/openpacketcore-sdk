@@ -69532,7 +69532,7 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: crate::PeerTeid::new(peer_teid),
+                peer_teid: teid(peer_teid).into(),
                 ms_address: IpAddr::V6(ipv6_inner()),
                 peer_address: IpAddr::V6(peer),
                 link_ifindex: S2BU_IFINDEX,
@@ -69552,7 +69552,7 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: crate::PeerTeid::new(peer_teid),
+                peer_teid: teid(peer_teid).into(),
                 ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
                 peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
                 link_ifindex: S2BU_IFINDEX,
@@ -69579,7 +69579,7 @@ mod tests {
         GtpuSessionEntry::new(
             GtpPdpContext {
                 local_teid: teid(local_teid),
-                peer_teid: crate::PeerTeid::new(peer_teid),
+                peer_teid: teid(peer_teid).into(),
                 ms_address: inner,
                 peer_address: peer_outer,
                 link_ifindex: S2BU_IFINDEX,
