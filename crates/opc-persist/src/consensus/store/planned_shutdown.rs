@@ -82,12 +82,8 @@ impl ConfigShutdownCoordinator {
             let mut timeout_reason = PlannedShutdownFallback::DeadlineElapsed;
             #[cfg(any(test, feature = "test-control"))]
             let mut diagnostic_outer_timeout = false;
-            let preparation = tokio::select! {
-                biased;
-                _ = unplanned.wait_for(|requested| *requested) => {
-                    Err(PlannedShutdownFallback::Unplanned)
-                }
-                result = tokio::time::timeout_at(
+            let preparation = select_preparation(&mut unplanned, async {
+                let result = tokio::time::timeout_at(
                     deadline,
                     store.transfer_before_shutdown(
                         deadline,
@@ -95,16 +91,15 @@ impl ConfigShutdownCoordinator {
                         #[cfg(any(test, feature = "test-control"))]
                         &mut diagnostic,
                     ),
-                ) => {
-                    #[cfg(any(test, feature = "test-control"))]
-                    { diagnostic_outer_timeout = result.is_err(); }
-                    result.unwrap_or(Err(timeout_reason))
-                },
-            };
-            // Unplanned wins whenever its flag is set, including when it lands
-            // after the select resolved: a concurrent unplanned drain must not
-            // be reported as a handoff failure.
-            let preparation = prefer_unplanned(preparation, &unplanned);
+                )
+                .await;
+                #[cfg(any(test, feature = "test-control"))]
+                {
+                    diagnostic_outer_timeout = result.is_err();
+                }
+                result.unwrap_or(Err(timeout_reason))
+            })
+            .await;
             // Keep the trace outside the timed future so cancellation retains
             // the last attempted read proof and the observed successor vote.
             #[cfg(any(test, feature = "test-control"))]
@@ -157,6 +152,22 @@ fn prefer_unplanned(
     } else {
         preparation
     }
+}
+
+async fn select_preparation(
+    unplanned: &mut watch::Receiver<bool>,
+    preparation: impl std::future::Future<
+        Output = Result<PlannedShutdownOutcome, PlannedShutdownFallback>,
+    >,
+) -> Result<PlannedShutdownOutcome, PlannedShutdownFallback> {
+    let result = tokio::select! {
+        biased;
+        _ = unplanned.wait_for(|requested| *requested) => {
+            Err(PlannedShutdownFallback::Unplanned)
+        }
+        result = preparation => result,
+    };
+    prefer_unplanned(result, unplanned)
 }
 
 impl ConsensusConfigStore {

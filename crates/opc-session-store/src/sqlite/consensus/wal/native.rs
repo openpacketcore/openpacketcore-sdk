@@ -2069,16 +2069,6 @@ impl Wal {
         self.with_durable_voter_slots(|native| native.voter_slot_state())
     }
 
-    pub(crate) fn native_voter_slots_before(
-        &self,
-        end: u64,
-    ) -> io::Result<(
-        Option<LogId<SessionConsensusNodeId>>,
-        opc_consensus::voter_slots::VoterSlotTable,
-    )> {
-        self.with_durable_voter_slots(|native| native.voter_slots_before(end))
-    }
-
     pub(crate) fn assert_voter_snapshot_fences(
         &self,
         source: &crate::consensus::snapshot::PinnedSqliteFile,
@@ -2120,12 +2110,6 @@ impl Wal {
             ));
         }
         Ok(())
-    }
-
-    pub(crate) fn native_voter_snapshot(
-        &self,
-    ) -> io::Result<Option<super::super::CurrentSnapshot>> {
-        self.with_durable_voter_slots(|native| Ok(native.business.current_snapshot()))
     }
 
     /// Backpressure a peer while strict publication is pending. A notification
@@ -2183,12 +2167,20 @@ impl Wal {
                 "native voter-slot publication is not durable",
             ));
         }
-        read(
+        let result = read(
             state
                 .native
                 .as_ref()
                 .ok_or_else(|| invalid_data("native voter-slot owner missing"))?,
-        )
+        );
+        #[cfg(test)]
+        {
+            drop(state);
+            if result.is_ok() {
+                (self.control.hook)(Point::AfterNativeVoterRead)?;
+            }
+        }
+        result
     }
 
     #[cfg(any(test, feature = "test-control"))]

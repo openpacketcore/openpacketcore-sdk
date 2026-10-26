@@ -887,3 +887,28 @@ mod retry_tests;
 
 #[path = "snapshot_tests.rs"]
 mod snapshot_tests;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voter_admission_read_uses_the_original_sqlite_deadline() {
+    let fleet = Fleet::open().await;
+    let profile = fleet.nodes[0].inner.voter_profile.as_ref().unwrap();
+    let reader = Reader(profile.core.clone());
+    let connection = profile.core.conn.lock().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    let observed = tokio::time::timeout(
+        Duration::from_millis(250),
+        reader.read_voter_slot_state_until(deadline),
+    )
+    .await;
+    let expired = tokio::time::Instant::now() >= deadline;
+    drop(connection);
+    // Always release the held connection and close the fleet, including when
+    // the request incorrectly starts a separate SQLite lifecycle timeout.
+    let published = reader
+        .read_voter_slot_state_until(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await;
+    fleet.close().await;
+    assert_eq!(observed, Ok(Err(VoterReplacementError::Deadline)));
+    assert!(expired);
+    assert_eq!(published.unwrap().table(), &genesis());
+}

@@ -82,16 +82,7 @@ fn request(slot: u16, seed: u8) -> VoterReplacementRequest {
 struct Reader(Mutex<VoterSlotDurableState>);
 #[async_trait]
 impl VoterSlotStateReader for Reader {
-    async fn read_voter_slot_state(
-        &self,
-        _deadline: Instant,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
-        Ok(self.0.lock().unwrap().clone())
-    }
-
-    async fn read_voter_slot_state_now(
-        &self,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+    async fn read_voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError> {
         Ok(self.0.lock().unwrap().clone())
     }
 }
@@ -595,3 +586,68 @@ async fn resolving_leader_snapshot_does_not_wait_for_the_prepare_it_must_resolve
     pending.await.unwrap().unwrap();
     assert!(engine.closed.lock().unwrap().is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn owned_snapshot_completion_outlives_rpc_budget_but_queued_admission_is_bounded() {
+    let (admission, reader, engine) = runtime(VoterSlotDurableState::new(genesis()).unwrap()).await;
+    let mut incoming = genesis();
+    let cut = VoterSlotLogId { term: 2, index: 10 };
+    incoming
+        .apply_control(&VoterSlotControl::Begin(Box::new(request(3, 1))), cut)
+        .unwrap();
+    let (entered, start) = oneshot::channel();
+    let (complete, finish) = oneshot::channel();
+    let runtime = admission.clone();
+    let installing = tokio::spawn(async move {
+        runtime
+            .run_snapshot_to_completion(
+                incoming.clone(),
+                (1..=3).map(node).collect(),
+                Instant::now() + Duration::from_secs(10),
+                move || async move {
+                    entered.send(()).unwrap();
+                    finish.await.unwrap();
+                    reader
+                        .0
+                        .lock()
+                        .unwrap()
+                        .publish_snapshot(incoming, cut)
+                        .unwrap();
+                    Ok(7)
+                },
+            )
+            .await
+    });
+    start.await.unwrap();
+    tokio::time::advance(Duration::from_secs(12)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !installing.is_finished(),
+        "the dispatched install remains owned"
+    );
+    assert!(engine.closed.lock().unwrap().contains(&node(3)));
+    assert_eq!(
+        admission
+            .run_snapshot_to_completion::<(), _, _>(
+                genesis(),
+                (1..=3).map(node).collect(),
+                Instant::now() + Duration::from_secs(1),
+                || async {
+                    panic!("expired queued snapshot must never dispatch");
+                },
+            )
+            .await,
+        Err(VoterReplacementError::Deadline)
+    );
+    complete.send(()).unwrap();
+    assert_eq!(installing.await.unwrap(), Ok(7));
+    assert!(admission
+        .durable_view()
+        .unwrap()
+        .table()
+        .is_retired(node(3)));
+    assert!(engine.closed.lock().unwrap().contains(&node(3)));
+}
+
+#[path = "voter_slot_admission/deadlines.rs"]
+mod deadline_tests;

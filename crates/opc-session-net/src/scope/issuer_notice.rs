@@ -204,7 +204,8 @@ impl IssuerStartupSession {
     /// boot instead of a ticket notice.
     ///
     /// Use this when the issuer's own trusted reads definitively refuse this
-    /// boot: a definitively invalid or changed installed observation, or a
+    /// boot: a definitively invalid observation, independently changed boot
+    /// facts that cannot reconcile the retained key, or a
     /// definitively refused discovery/key-set prerequisite. The motivating
     /// **observation-sandwich limit** is that two consistent reads of the
     /// platform workload record around the bootstrap proof do not establish
@@ -214,6 +215,9 @@ impl IssuerStartupSession {
     /// generation for the retained immutable ticket would conflict, so the
     /// issuer must refuse the key before staging anything and this call tells
     /// the worker to finish shutdown and start a fresh boot key.
+    /// A resource-version-only `StartupError::PlatformChanged` requires a new
+    /// probe of the same boot, not a refusal. `PrerequisiteRefused` is an explicit
+    /// caller decision; a worker restart does not repair discovery/key access.
     ///
     /// The call performs no platform read of its own (the caller owns the
     /// refusal decision and may already have observed the changed facts); it

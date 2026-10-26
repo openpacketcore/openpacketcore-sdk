@@ -496,7 +496,7 @@ async fn standard_snapshot_rejects_incomparable_vote_before_staging() {
     )
     .await
     .unwrap();
-    store.disable_automatic_elections_for_test();
+    store.inner.raft.runtime_config().elect(false);
     let current_vote = Vote::new(5, local);
     store
         .inner
@@ -579,4 +579,38 @@ fn unplanned_flag_wins_over_other_fallbacks() {
         prefer_unplanned(Ok(PlannedShutdownOutcome::FollowerRetired), &receiver),
         Err(PlannedShutdownFallback::Unplanned)
     );
+}
+
+#[tokio::test]
+async fn unplanned_request_racing_preparation_result_keeps_its_reason() {
+    for result in [
+        Err(PlannedShutdownFallback::NotAdmitted),
+        Err(PlannedShutdownFallback::DeadlineElapsed),
+        Ok(PlannedShutdownOutcome::FollowerRetired),
+    ] {
+        let (requested, mut unplanned) = watch::channel(false);
+        let observed = select_preparation(&mut unplanned, async {
+            // Request unplanned shutdown after its branch was polled but
+            // before this preparation result is retained for every clone.
+            requested.send_replace(true);
+            result
+        })
+        .await;
+        assert_eq!(observed, Err(PlannedShutdownFallback::Unplanned));
+    }
+}
+
+#[tokio::test]
+async fn preparation_result_without_unplanned_request_is_preserved() {
+    for result in [
+        Err(PlannedShutdownFallback::NotAdmitted),
+        Ok(PlannedShutdownOutcome::FollowerRetired),
+    ] {
+        let (requested, mut unplanned) = watch::channel(false);
+        assert_eq!(
+            select_preparation(&mut unplanned, async { result }).await,
+            result
+        );
+        drop(requested);
+    }
 }

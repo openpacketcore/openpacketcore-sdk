@@ -1,10 +1,9 @@
-//! Installation-qualified identity at the topology-admission boundary.
+//! Installation-qualified identity at topology admission and retained-store open.
 //!
-//! The retained-store/open path consumes `SessionReplicationManifest`'s
-//! consensus identity through `ValidatedQuorumTopology`. A fresh installation
-//! reusing the same human-readable cluster name therefore presents a different
-//! typed store identity; the store's identity-mismatch refusal itself is
-//! exercised by the existing `opc-session-store` retained-reopen lanes (Linux).
+//! A fresh installation reusing the same human-readable cluster name presents
+//! a distinct typed identity through `SessionReplicationManifest` and
+//! `ValidatedQuorumTopology`. Linux retained-store checks also prove refusal of
+//! a foreign installation preserves the original installation's reopenability.
 
 use std::collections::BTreeSet;
 
@@ -112,4 +111,89 @@ fn reinstalled_cluster_name_yields_a_distinct_store_admission_identity() {
         manifest([0x31; 32]).consensus_identity(),
         original.consensus_identity()
     );
+}
+
+#[cfg(target_os = "linux")]
+mod retained {
+    use super::*;
+    use opc_session_store::{
+        ConsensusSessionStore, ConsensusSessionStoreOpenError, SessionConsensusIdentity,
+        SessionConsensusNodeId, SessionConsensusPeer, SessionConsensusPeerError,
+        SessionConsensusWireRequest, SessionConsensusWireResponse, SqliteSessionBackend,
+    };
+    use std::{collections::BTreeMap, sync::Arc};
+
+    #[derive(Debug)]
+    struct UnavailablePeer {
+        node: SessionConsensusNodeId,
+        identity: SessionConsensusIdentity,
+    }
+    #[async_trait::async_trait]
+    impl SessionConsensusPeer for UnavailablePeer {
+        fn node_id(&self) -> SessionConsensusNodeId {
+            self.node
+        }
+        fn scope_identity(&self) -> Option<SessionConsensusIdentity> {
+            Some(self.identity)
+        }
+        async fn call(
+            &self,
+            _: SessionConsensusWireRequest,
+        ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+            Err(SessionConsensusPeerError::Unavailable)
+        }
+    }
+
+    async fn open(
+        directory: &std::path::Path,
+        nonce: [u8; 32],
+    ) -> Result<ConsensusSessionStore, ConsensusSessionStoreOpenError> {
+        let manifest = manifest(nonce);
+        let topology = topology(&manifest);
+        let local = topology.local_consensus_node_id().unwrap();
+        let peers: BTreeMap<_, Arc<dyn SessionConsensusPeer>> = topology
+            .members()
+            .iter()
+            .filter_map(|member| {
+                let node = topology.consensus_node_id(member.replica_id()).unwrap();
+                if node == local {
+                    None
+                } else {
+                    Some((
+                        node,
+                        Arc::new(UnavailablePeer {
+                            node,
+                            identity: manifest.consensus_identity(),
+                        }) as Arc<dyn SessionConsensusPeer>,
+                    ))
+                }
+            })
+            .collect();
+        ConsensusSessionStore::open(
+            topology,
+            SqliteSessionBackend::open(directory.join("session.sqlite")).unwrap(),
+            directory.join("snapshots"),
+            peers,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn retained_store_rejects_a_new_installation_and_still_reopens_the_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = open(directory.path(), [0x31; 32])
+            .await
+            .expect("persist the original installation identity");
+        original.shutdown().await.unwrap();
+        drop(original);
+        let result = open(directory.path(), [0x32; 32]).await;
+        assert_eq!(
+            result.err(),
+            Some(ConsensusSessionStoreOpenError::DurableIdentityMismatch)
+        );
+        let original = open(directory.path(), [0x31; 32])
+            .await
+            .expect("a rejected foreign installation leaves the original reopenable");
+        original.shutdown().await.unwrap();
+    }
 }

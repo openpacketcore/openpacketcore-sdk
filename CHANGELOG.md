@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-consensus`: expose `DURABLE_CONSENSUS_FAILOVER_PATIENCE`, derived from the
+  election lease plus stale-route grace; it schedules no election. Refs #1049.
+
 - `opc-gtpu-dataplane`: staged the RFC 017 mixed-selector-provenance codec and
   preflight slice (internal; no public API or backend behavior change). Added
   canonical `DrainQualificationCodecV1` (305 bytes) and `TransferEdgeCodecV1`
@@ -25,31 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and loss-qualified same-group restore remain unimplemented; RFC 017 row
   017-1 is now `partial`. Refs #663.
 
-- `opc-persist`: retained-authority provisioning is now crash-resumable. A
-  fixed-size authenticated provisioning intent (`<database>.opc-retained.intent`).
-  It binds the exact topology, backing identity, key scope, audit-key
-  epoch/fingerprint and operation class (new authority or member repair), carries
-  fresh per-publication entropy, and is synced with its parent directory before
-  the first artifact mutation. Request identity for resume/conflict decisions is
-  that authenticated binding digest plus the operation class; the API carries no
-  caller request id, so two publications with the same binding/audit key/class
-  are the same request. A retry
-  of the same interrupted request either reconciles a committed admission
-  exactly once (returning the validated backend even when the original caller
-  never observed success) or removes its authenticated partial prefix under
-  the exclusive lifetime lock and runs one fresh attempt, so no caller marker
-  deletion, guessed cleanup or manual backing replacement is needed for an
-  interruption caused by that transaction. Conflicting requests, foreign data,
-  unverifiable records beside artifacts and established stores are never
-  adopted, overwritten or deleted; committed-store validation failure stays
-  `RecoveryRequired`/`Rejected`. Established database and admission-record
-  formats are unchanged, and cancellation/deadline outcomes remain
-  `AdmissionBound`/`Indeterminate` with same-request resumability, distinct
-  from `RetainedConfigOpenRetirement`. The deterministic crash matrix now
-  covers intent publication, lock/database/schema/binding/sync/record/intent
-  boundaries plus injected I/O faults, same-request resume,
-  conflicting-request refusal, lock-leak, partial-authority and
-  established-store-loss assertions. Refs #1114.
+- `opc-persist`: retained configuration provisioning publishes authenticated,
+  request-bound intent, a complete database and a completion witness using
+  atomic no-replacement links. Explicit resume finishes the same authorized
+  request after interruption without deleting or replacing existing artifacts;
+  ordinary reopen never initializes storage. Conflicting keys, requests and
+  unverifiable records are preserved and refused. Writer exclusion remains held
+  until SQLite and every extra database descriptor close. Subprocess crashes,
+  I/O faults, cancellation/join and public authority/member-repair resume paths
+  cover the lifecycle. Refs #1114.
 
 - `opc-gtpu-dataplane`: share the SDK-private canonical namespace-binding
   and operation-stamp encoders with bounded format validation and golden-byte
@@ -155,7 +142,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing single-peer behaviour (wait for the one coalesced cooldown edge or
   the caller deadline). `ReconnectCooldownPolicy::FailOver` is the routed
   policy: a foreground call that reaches a peer whose shared reconnect cooldown
-  is active returns the bounded, value-free pre-write
+  is active or whose probe is already in flight returns the bounded, value-free pre-write
   `SessionConsumerClientError::Cooldown` immediately (remaining cooldown and
   gate wait in milliseconds) so the caller's routing loop can select another
   voter without waiting for this peer's recovery edge. No request byte is
@@ -163,7 +150,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another peer; once a byte may have been accepted the existing
   exact-identity/status recovery is unchanged. Both policies retain the shared
   exponential backoff, the single serialized probe at cooldown expiry, and the
-  existing deadlines, retry and authority rules. Refs #1248.
+  existing deadlines, retry and authority rules. Admission precedes DNS and
+  pool waits, and routed callers do not join another pending warm or retained
+  setup. Value-free physical-attempt spans record operation kind, canonical
+  voter/successor ordinals, gate time, cooldown and transmission classification.
+  `opc-session-store::SessionConsumerVoterAuthority::ordinal` exposes the
+  canonical roster position for those diagnostics without granting authority.
+  Refs #1248.
 - `opc-gtpu-dataplane`: ordinary inner-IPv6 PDP contexts can now opt into
   in-tunnel RFC 4443 Packet Too Big. The family-tagged entry gains a versioned
   opt-in downlink inner MTU profile (entry version 3, the 2-byte field at
@@ -200,7 +193,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can carry it. The issuer-side observation-sandwich limit (two consistent
   workload-record reads around the proof do not establish that the platform has
   published the current container restart) is documented on the delivery API
-  and in the crate README. Refs #1245.
+  and in the crate README. A refusal after any ticket-notice page is invalid;
+  RFC 026 and independent revision-two vectors specify its exact 81-byte body.
+  Normal predecessor exit releases the exclusion guard so a fresh boot can
+  start without deleting retained records. Refs #1245.
 - `opc-gtpu-dataplane`: the native TFT fragment-affinity table now partitions
   its 16,384 buckets into 256 owner groups of 64 buckets selected by the
   attachment and subscriber PAA, so one classified subscriber can occupy at
@@ -256,6 +252,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the configuration/encoding acceptance is met). Refs #1344.
 
 ### Fixed
+
+- `opc-session-net`: preserve configured reconnect admission for the first
+  prepared-request warm flight, before shared prewarm permits and DNS. `FailOver`
+  immediately selects another voter when cooldown or existing setup prevents
+  admission; administrative prewarming keeps `Wait`. Authentication clock
+  examples now size the fixed budget for kernel error growth between daemon
+  updates. Refs #1248. Refs #1244.
+
+- `opc-persist`: release snapshot receipts when admission fails before engine
+  dispatch, so an identical single-chunk retry or a restarted transfer can
+  recover after transient contention. Dispatched work keeps its owned receipt.
+  Size both received-artifact sync budgets from the bounded descriptor length,
+  preserving finite metadata admission and storage-worker ownership. Refs #1339.
+
+- `opc-session-store` and `opc-persist`: retain the `Unplanned` shutdown reason
+  when an unplanned request races admission fencing or preparation completion.
+  Already published reports remain unchanged. (#1376)
+
+- `opc-consensus`, `opc-session-store` and `opc-persist`: voter-slot request
+  reads retain the original deadline while waiting for strict publication.
+  Control replies read state and evidence from one durable cut; post-dispatch
+  expiry remains an unknown outcome. The public session `voter_slot_state()`
+  observer now waits for publication up to the store's operation timeout.
+  The reader trait retains its original method and adds a defaulted bounded
+  method. (#1205)
 
 - `opc-session-store`: native key-removal business-change journal (partial
   #1252, PR2a). `BusinessChanges` can now stage an exact-predecessor key
@@ -313,25 +334,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beyond the preemptive headroom and full consumer/batch backpressure coverage
   remain in that qualification. Refs #1377.
 
-- `opc-persist`: an unplanned configuration-consensus leader loss no longer
-  waits for the engine's committed-vote lease **plus** a full sampled election
-  timeout before survivors campaign. A follower that has observed no
-  authenticated leader traffic for one complete declared lease plus the existing
-  stale-route grace (8.2 s) now requests an ordinary Pre-Vote round through the
-  public engine trigger; peer leader leases still deny the inquiry for a live
-  leader and the engine still persists a real self-vote and requires real quorum
-  vote grants, so no vote is fabricated and no election, heartbeat, lease or
-  quorum budget changes. Requests are staggered deterministically by membership
-  rank; the derived conditional first-campaign bound is 9.05 s from the last
-  authenticated leader contact for the highest follower rank (rank 0: 8.7 s;
-  maximum membership 9) while the complete operation deadline remains
-  the outer typed bound for an in-flight mutation. The path is value-free
-  observable through `ConsensusConfigStore::failover_status()`, the
-  `opc_persist_failover_accelerated_total` and
-  `opc_persist_failover_trigger_failures_total` counters and one info log per
-  requested campaign; the accelerator stays inactive when automatic elections
-  are disabled and never runs on the leader. Refs #1037.
-
 - `opc-session-store` / `opc-session-testkit`: a survivor restore scan whose
   caller deadline is consumed by the logical-time fence or the backend scan
   phase now reports a retryable availability outcome instead of the terminal
@@ -341,22 +343,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan-work-budget exhaustion remains terminal and is now recorded as its own
   closed qualification error class instead of opaque `Other`. Refs #1160.
 
-- `opc-persist`: configuration snapshot build, install and repair deadlines now
-  derive from the bytes each stage moves instead of one fixed wall-clock budget
-  (#1339). Build derives its SQLite backup stage from the database size and its
-  envelope stage from the captured artifact size; install starts its size-derived
-  work budget after gate acquisition and derives sync/verify, extraction,
-  promotion and SQLite installation budgets from the received sizes; repair
-  derives one attempt deadline from the authenticated leader's published
-  envelope length (falling back to the previous fixed deadline when that probe
-  is unavailable) and caches the verified descriptor once per transfer instead
-  of re-hashing the whole snapshot per 128 KiB cursor chunk. A resent final
-  snapshot chunk is now idempotent while the artifact installs or after it
-  installed, and replacement snapshot reads reuse the digest from the engine
-  read's single whole-file verification instead of hashing twice. Ordinary
-  snapshots keep the previous 60 s build/install and 10 s repair floors; derived
-  budgets add one second per complete 8 MiB with an 8 h ceiling, and every
-  timeout at a derived bound remains typed. Refs #1339.
+- `opc-persist`: large configuration snapshots keep progressing through bounded
+  file operations and SQLite work sized while its connection stays leased.
+  Repair retains the caller's deadline and resumes a verified reader across
+  retries; idle, obsolete and shutdown readers are released. Snapshot integrity
+  evidence belongs to its descriptor and is invalidated by writes. Purge waits
+  for one matching owned installation before checking durable application.
+  Exact final chunks, including data-bearing and single-chunk transfers, join
+  or replay the definitive installation result after RPC timeouts. Failed
+  inspections permit a fresh transfer. Replacement admission and shutdown
+  remain bounded, and successful inspection and installation share one digest
+  verification. Refs #1339.
 
 - `opc-session-store`: a store that receives only protected-roster commands now
   reclaims retained roster history through a bounded leader-owned maintenance
@@ -381,32 +378,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   discharge (caller-deadline capacity backpressure is a documented follow-up);
   this change does not claim those acceptance items. Refs #1307.
 
-- `opc-persist`: a configuration-consensus leader that cannot obtain a quorum
-  acknowledgement within the fixed quorum-authority ceiling
-  (`election_timeout_max` = 8 s; the engine exposes only the
-  acknowledgement-age metric and defines no application leader lease, and this
-  is not the SDK's 2 s read-lease reuse constant) now withholds leader
-  authority instead of holding clients: local proposals fail with a typed
-  retryable `PersistErrorKind::Unavailable` before any proposal is attempted,
-  `ensure_local_authority[_at_config_head]` reports
-  `ConfigLocalAuthorityOutcome::Retry { leader_hint: None }`, and forwarded
-  mutations/read barriers receive the additive `NoQuorum` reply, which the
-  forwarding replica converts to the same bounded retryable outcome. A withheld
-  call proposes/applies/commits nothing and callers retry the same request
-  identity, so exactly-once behavior is unchanged. The transition is typed and
-  value-free through `ConsensusConfigStore::quorum_lease_state()`, the
-  `opc_persist_quorum_lease_lost_total` / `_restored_total` counters and one
-  warning/info log per transition, and authority returns automatically after two
-  consecutive healthy observations (a one-flush recovery debounce that prevents
-  marginal acknowledgements from flapping the fence). The ceiling is the latest
-  safe point — it waits until every follower's 5–8 s election timer has expired,
-  so a leader that just lost its majority may still accept uncommittable
-  proposals for up to about 8 s of the 10 s operation budget before the typed
-  retryable rejection; fencing earlier could reject a merely slow quorum and is
-  deliberately not done. The engine's election, heartbeat, quorum and
-  committed-log semantics are unchanged; the majority side independently elects
-  a successor. Refs #1048.
-
 - `opc-session-store`: the deterministic in-memory backend no longer refuses new
   work for the process lifetime after a fixed number of keys or lab
   fenced-transitions. Under capacity pressure it first retires only state that
@@ -421,24 +392,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authoritative the backend keeps the typed `FencedTransitionHistoryFull`
   failure without mutating state. Refs #1257.
 
-- `opc-proto-ngap` / `opc-sctp` / `opc-protocol`: the N3IWF receive path no
-  longer leaves N3IWF security-key octets in uncleared SDK-owned heap buffers.
-  SCTP inbound payloads use a uniquely owned `SensitiveBytes` buffer zeroized on
-  drop; the NGAP raw receive copy uses the same carrier; and the id-SecurityKey
-  IE payload is moved out of the generated typed `Any` copy into the owning
-  PDU's zeroizing storage, with canonical encoding substituting the exact bytes
-  back. Every decode error after the key IE is parsed scrubs partial open-type
-  copies first. `SecurityKey::copy_into_zeroizing` provides the explicit
-  `Zeroizing<Vec<u8>>` hand-off the IKEv2 protocol-key import requires. Received
-  payload/Pdu types no longer clone or compare implicitly, and `Debug` stays
-  length/structure-only. Content clearing is proven by safe drop-audit unit
-  tests on the shared `SensitiveBytes` carrier, which now owns the raw receive
-  copy, the SCTP inbound payload and the extracted id-SecurityKey octets
-  (`SensitiveBytes::from_vec` adopts an owned vector's allocation without an
-  intermediate copy); the explicit IKEv2 hand-off copy remains
-  `Zeroizing<Vec<u8>>`. Allocation-counter integration tests prove the decode,
-  error and drop paths retain no allocation, with positive controls for `Vec`
-  and `bytes::Bytes` retention. Refs #1262.
+- `opc-proto-ngap` / `opc-sctp`: retain wiping custody of received security
+  material through SCTP accumulation and growth, the last payload reference,
+  raw PDU storage, each decoded IE, coalesced fragments and error/policy discards.
+  The typed SecurityKey value remains intact for admission and reconstruction.
+  `SecurityKey::to_zeroizing()` provides an explicit protected provider handoff.
+  Live drop observers check every owner before release, with and without keys;
+  allocation-counter tests additionally check for retained allocations. Valid
+  fragmented SEQUENCE extension bitmaps remain accepted without copying their
+  additions. Non-canonical short bitmap lengths are rejected. Refs #1262.
+
 - `opc-gtpu-dataplane`: one subscriber can no longer monopolize the shared
   inner-uplink IPv4 fragment-affinity table. Bucket selection is partitioned by
   the attachment interface index and the subscriber PAA, so a subscriber is
@@ -466,14 +429,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-persist`: a configuration-consensus leader-routed call is now bounded by
   this replica's own leader view. Once the engine has observed a successor for
   a lost leader, an unanswered forwarded mutation or linearizable read barrier
-  is abandoned after `DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (200 ms) and
+  is abandoned after `DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (one heartbeat, 2 s) and
   re-offered through that successor, instead of occupying the complete
   operation deadline. A route with no observed successor keeps the existing
   operation deadline and its typed ambiguous outcome; an abandoned forwarded
   mutation is classified as possibly transmitted and retries on the same
   request identity, so the configuration store still applies it exactly once.
   Election, heartbeat and forwarded-mutation timing budgets are unchanged.
-  Refs #1049.
+  Redirects retain the local view under which they were chosen, changing or
+  unknown successor views do not renew retirement, and a later refusal cannot
+  erase an earlier transmitted attempt's unknown outcome. Refs #1049.
 - `opc-gtpu-dataplane`: the per-destination inner fragmentation budget and
   the per-session in-tunnel Packet Too Big error budget no longer evict a
   destination or session that was used within the last 255 seconds. The
@@ -496,15 +461,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strictly nonzero (`Teid::new(0)` still returns `None`), with Debug redaction
   unchanged. Before downgrading to an SDK without zero-peer support, remove zero-peer contexts or perform a fresh installation. Refs #1346.
 
-- `opc-proto-gtpv2c`: an S2b Update Bearer request or response carrying a
-  Protocol Configuration Options (PCO) IE no longer rejects the rest of the
-  procedure. PCO is not S2b-applicable (`CONFORMANCE.md`; TS 29.274 Tables
-  7.2.15/7.2.16), so it is handled as an unexpected IE under clause 7.7.9: the
-  procedure continues, the IE is retained byte-for-byte in the projection's
-  additional IEs, and the SDK never interprets it (a caller that re-encodes the
-  projected message will carry it). Malformed PCO and mandatory-field
-  validation are unchanged, and Create Bearer behaviour is unchanged.
-  Refs #1441.
+- `opc-proto-gtpv2c`: accept unknown extension octets after the required
+  Bearer QoS prefix while retaining 40-bit rate bounds and QoS validation.
+  Canonical encoding emits the known fields; raw-preserving message encoding
+  retains the extension. Refs #1356 (GTPv2-C item).
+
+- `opc-proto-gtpv2c`: S2b receive discards unexpected Update Bearer PCO,
+  non-S2b-U Create/Update Bearer F-TEIDs, and SGW-only Create/Update/Delete
+  Bearer control entries before typed decoding. Mandatory fields, TLIV framing,
+  strict sender validation and Create Bearer PCO compatibility are preserved.
+  Raw-preserving encoding retains the received bytes. Fixes #1441.
 
 - `opc-session-store`: a cancelled Dynamic-authority current-snapshot
   admission no longer releases publication exclusion, its namespace lease or
@@ -530,9 +496,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The public error stays `Unavailable`, and no failure class restores dispatch
   authority. Refs #1378.
 
-### Breaking
+### Changed
 
-- `opc-session-net` (fresh-install boundary): session cluster identity, consensus
+- `opc-persist`: the retained configuration admission encoding now includes a
+  permanent intent and completion witness. Crossing this format boundary
+  requires a fresh installation. The Linux filesystem must support `O_TMPFILE`,
+  atomic hard links, file/directory synchronization and `flock`; procfs is also
+  required. Use `begin_resume_config_authority` or
+  `begin_resume_config_member_repair` for interrupted binding-based requests.
+  Explicit request IDs use the transaction provision/resume/reopen APIs and
+  must be retained independently of the destination database. Refs #1114.
+
+- `opc-proto-gtpv2c`: correct ARP capability and vulnerability wire polarity.
+  The public booleans mean "may pre-empt" and "may be pre-empted"; `true` now
+  maps to a clear PCI/PVI bit, as TS 29.212 requires. Callers that compensated
+  for the old inversion must remove that compensation. Priority levels remain
+  literal 1..=15; `cmp_priority` compares importance with level 1 highest.
+  Fixes #1354.
+
+- **Breaking — fresh install:** `opc-session-net` session cluster identity, consensus
   node IDs and the configuration digest are installation-qualified. Every
   `SessionReplicationManifest` constructor now requires the persisted non-zero
   32-byte installation nonce; the consensus cluster ID derives through
@@ -545,7 +527,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity/replacement errors instead of joining the new installation. No
   migration is provided; consumers must generate and persist the nonce with the
   immutable manifest at first install, and changing it on existing storage is a
-  fresh installation. Refs #1187.
+  fresh installation. `opc-consensus` now reports
+  `ConsensusIdentityError::InvalidInstallationNonce` for a zero nonce passed to
+  `ConsensusClusterId::for_installation`. Qualification node manifests and their
+  rendered readiness probes derive the same installation-qualified voter IDs.
+  Refs #1187.
+
+### Breaking
 
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned
@@ -557,24 +545,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses the newer marker. Crossing schema generations requires a fresh
   installation; no in-place migration is provided. Refs #1007.
 
-- `opc-sctp`: `InboundMessage.payload` is now `opc_protocol::SensitiveBytes`
-  (uniquely owned, zeroized on drop, `Debug` length-only, no `Clone`,
-  `PartialEq` or `Eq`); `InboundMessage` itself no longer derives
-  `Clone`/`PartialEq`/`Eq`. `N2Payload::payload()` returns `&SensitiveBytes` and
-  `N2Payload::into_payload()` returns `SensitiveBytes`;
-  `DiameterSctpPeer::inbound_payload` returns `&[u8]`. `OutboundMessage` now has
-  a redacted `Debug` implementation instead of a derived payload-printing one.
-  Callers that copied or compared received payloads must make the copy/compare
-  explicit. Refs #1262.
+- `opc-proto-ngap`: `Pdu`, `PduKind`, `Message` and borrowed `ProtocolIe`
+  no longer implement cloning or equality over opaque key-bearing bytes.
+  `Pdu.raw`, unknown message bodies and decoded IE values use redacted
+  `SensitiveBytes` owners that clear storage on drop. `messages` exposes owned
+  containers with uniform `u16` IE identifiers and `Criticality`, replacing the
+  generated containers. Use borrowed bytes and explicit reconstruction instead
+  of cloning. `opc-sctp::InboundMessage` likewise loses cloning and equality;
+  its payload retains the `Bytes` API with wiping ownership through N2 handoff
+  and the final shared reference. Outbound message diagnostics expose payload
+  length only. Refs #1262.
 
-- `opc-proto-ngap`: `Pdu.raw` is private; use `Pdu::raw()` (and
-  `Pdu::has_raw()`), with `Pdu::new(kind)` for constructed PDUs. `Pdu` no longer
-  derives `Clone`, `PartialEq` or `Eq`, and `Message`/`PduKind` no longer derive
-  `Clone`/`PartialEq`/`Eq` because received structures must not be duplicated or
-  compared implicitly. `Message::Unknown` carries `SensitiveBytes` instead of
-  `bytes::Bytes`. The id-SecurityKey IE appears as an empty typed placeholder;
-  admission reads the key from the PDU's zeroizing storage and canonical
-  encoding reproduces the original bytes. Refs #1262.
+- `opc-proto-ngap`: uplink/downlink transport `address()` now returns
+  `TransportLayerAddress`, preserving IPv4, IPv6 or both addresses from a
+  160-bit NGAP value. Existing `new(IpAddr, teid)` constructors remain; use
+  `with_address` for combined values and match the address variant before
+  selecting a destination. Setup and Modify tunnel codecs preserve both
+  families in TS 38.414 order, including nested additional tunnels. Refs #1357.
+
 - `opc-session-net`: `StartupError` adds `BootRefused(BootRefusalReason)` for an
   authenticated issuer refusal of one exact candidate boot attempt. It is
   distinct from retryable `Unavailable`/`AuthTimeUnavailable` results and grants
@@ -610,13 +598,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-net`: `StartupError` adds `PlatformInvalid`,
   `PlatformChanged`, and `PrerequisiteRefused`. Issuer probe and retained-session
-  revalidation now preserve a definitively invalid or changed installed
+  revalidation now preserve an invalid or changed installed
   platform observation and a definitively refused discovery/key-set
   prerequisite instead of collapsing them into retryable `Unavailable`;
   transient reads and transport failures remain `Unavailable`. This is an
   error-classification change only: no read absence, closed connection or
   refusal becomes authority, evidence a worker ended, or an authenticated boot
-  refusal. Downstream exhaustive matches must handle the new variants.
+  refusal. Resource-version-only changes require re-probing the same boot.
+  Failed or cancelled key refreshes preserve their failure classification
+  through the shared one-second throttle and recover on a later successful
+  refresh. Downstream exhaustive matches must handle the new variants.
   Refs #1246.
 
 - `opc-session-store`: `StoreError` adds `KeyProviderUnavailable`. Key-provider
@@ -772,27 +763,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported
-  production `AuthenticationTimeSource` for RFC 026 authentication freshness.
-  It reads the Linux kernel clock-adjustment state (one read-only
-  `clock_adjtime(CLOCK_REALTIME)` query, no privilege or clock change) and
-  reports the kernel maximum realtime error as the symmetric uncertainty of one
-  fresh observation. Unsynchronized, unavailable, zero, negative or over-bound
-  kernel state returns the typed retryable `AuthenticationTimeError`; there is
-  no wall-clock fallback. The synchronization generation starts at 1 on the
-  first accepted synchronized observation and increments after synchronization
-  is re-established, while wall steps keep `IntervalClock`'s existing fixed-
-  budget recovery policy. The default maximum accepted uncertainty is 1 s
-  (`PLATFORM_AUTHENTICATION_TIME_MAX_UNCERTAINTY`) and can be fixed with
-  `with_maximum_uncertainty` at startup. A fixed, value-free `tracing` warning
-  carries the closed refusal reason. Refs #1244.
+  production source for RFC 026 authentication freshness. It serializes paired,
+  read-only `clock_adjtime(CLOCK_REALTIME)` observations and uses the returned
+  atomic realtime instant. Its conservative symmetric bound includes maximum and
+  estimated error, precision, quantization, oscillator tolerance and sampling
+  elapsed time. Unknown, malformed, faulted or changing synchronization state,
+  an ambiguous leap second and over-budget bounds fail closed. Observed loss and
+  recovery increment the generation once; query failures do not forge recovery.
+  The default maximum remains 1 s and an explicit deployment budget stays fixed.
+  Refusal warnings report only reason changes, with one recovery event. Clock
+  failures and automatic recovery leave authority, receipts and held effects
+  unchanged. Linux requires a maintained kernel time estimate (chrony `rtcsync`)
+  and permission for the unprivileged read-only syscall. Refs #1244.
 
-- `opc-linux-clock-sys`: narrow unsafe Linux clock-adjustment UAPI boundary
-  used only by `opc-session-net`. `read_kernel_clock_adjustment()` performs one
-  read-only `clock_adjtime(CLOCK_REALTIME)` query and returns the kernel
-  synchronization state plus maximum/estimated error; unsupported platforms
-  compile to a stub that fails explicitly. ADR 0017's mechanical unsafe
-  boundary allow-list and `scripts/check-management-plane-policy.py` are
-  amended for this narrowly scoped read-only crate. Refs #1244.
+- `opc-linux-clock-sys`: the narrow ADR 0017 unsafe boundary exposes a complete
+  raw realtime snapshot from one read-only `clock_adjtime(CLOCK_REALTIME)` call,
+  preserving signed error, precision and tolerance fields. Existing adjustment
+  accessors remain; synchronization classification also rejects unknown states,
+  `TIME_OOP` and kernel/PPS faults. Unsupported platforms fail explicitly with
+  no wall-clock fallback. Refs #1244.
 
 - `opc-session-net`: prepared V2 fenced-transition handles expose
   `execute_once_with_failure_diagnostic`, an additive diagnostic wrapper around
@@ -818,6 +807,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readback failure and backend loss permanently signal a private eventfd,
   waking idle consumers to observe `Unavailable` without a polling timer.
   Standalone sockets without a downlink consumer keep `Unsupported`. Refs #1021.
+
+- `opc-gtpu-dataplane`: expose IPv4 uplink FAR misses by passed and dropped
+  outcome, retaining `uplink_far_misses` as their sum. Reserved counter slots
+  preserve the map layout; forwarding behavior is unchanged. The public
+  `EbpfGtpuDatapathCounters` remains exhaustive: out-of-crate struct literals
+  and exhaustive destructurings must add `uplink_far_misses_passed` and
+  `uplink_far_misses_dropped`. When adopting a pre-split counter pin, the public
+  total starts from the new outcome slots; earlier raw-slot history cannot be
+  attributed to either outcome. (#1184)
 
 - `opc-identity`: `WorkloadIdentity::from_cert_der_at` accepts an explicit
   verification time for certificate validity checks while preserving SPIFFE ID,
@@ -1570,6 +1568,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-gtpu-dataplane`: measured End Marker and redirect-delivery timeouts now
+  report redirect deltas, iteration, counters, tentative IPv6 addresses, and
+  neighbour/route state, including failed diagnostic reads. Packet counts and
+  measurement deadlines are unchanged. (#1188)
+
+- `opc-session-store`: run functional lease and late-CAS readback observations
+  with their logical-time supervisors on controlled clocks. Preserve the
+  original timeout, fencing and exactly-once assertions, reproduce stalled
+  runtimes, and verify the exact acquire deadline and rejection of expired
+  queued reads. (#1308, #1211)
 
 - Go operators now require Go 1.26.10 for the `crypto/x509` fix GO-2026-6809.
 

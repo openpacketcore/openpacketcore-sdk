@@ -11,18 +11,28 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::time::Instant;
 
 use super::*;
-use crate::consensus::snapshot_timing::{snapshot_transfer_budget, SNAPSHOT_WORK_BASE_BUDGET};
 
 #[cfg(test)]
 #[path = "member_repair_snapshot_tests.rs"]
 mod tests;
 
 const CHUNK_BYTES: usize = 128 * 1024;
+const SOURCE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The cursor offset reserved for a cheap snapshot-size probe. A normal repair
-/// chunk never uses this offset because it would exceed every admissible
-/// artifact length.
-const REPAIR_PROBE_OFFSET: u64 = u64::MAX;
+/// At most one owned verification is pending per store. RPC cancellation drops
+/// only its waiter; the next request joins the same read and verified descriptor.
+pub(super) struct RepairSource {
+    vote: Vote<ConsensusNodeId>,
+    ready: tokio::sync::watch::Receiver<Option<Result<Arc<RepairSnapshot>, ()>>>,
+    activity: tokio::sync::watch::Sender<Instant>,
+    retired: tokio::sync::Notify,
+}
+
+struct RepairSnapshot {
+    meta: SnapshotMeta<ConsensusNodeId, EmptyNode>,
+    length: u64,
+    file: tokio::sync::Mutex<Box<crate::consensus::snapshot_file::ConfigSnapshotFile>>,
+}
 
 #[derive(Serialize, Deserialize)]
 struct RepairRequest {
@@ -45,40 +55,6 @@ struct RepairChunk {
     offset: u64,
     bytes: Vec<u8>,
     done: bool,
-}
-
-/// One transfer's verified snapshot. Built by the first chunk request and
-/// reused by every later chunk request for the same vote and snapshot ID, so a
-/// snapshot is verified once per transfer instead of once per 128 KiB cursor
-/// chunk (#1339).
-#[derive(Default)]
-pub(super) struct RepairSnapshotCache {
-    entry: tokio::sync::Mutex<Option<CachedRepairSnapshot>>,
-}
-
-struct CachedRepairSnapshot {
-    vote: Vote<ConsensusNodeId>,
-    meta: SnapshotMeta<ConsensusNodeId, EmptyNode>,
-    length: u64,
-    snapshot: Snapshot<ConfigRaftTypeConfig>,
-}
-
-fn valid_repair_probe(
-    source: ConsensusNodeId,
-    chunk: &RepairChunk,
-    members: &BTreeSet<ConsensusNodeId>,
-) -> bool {
-    chunk.vote.is_committed()
-        && chunk.vote.leader_id.voted_for() == Some(source)
-        && chunk.meta.last_log_id.is_some()
-        && exact_uniform_voter_membership(&chunk.meta.last_membership, members)
-        && chunk.offset > 0
-        // Mirror the leader's own reply bound: a compromised member cannot
-        // claim an arbitrarily large envelope and stretch the derived repair
-        // attempt deadline to the 8 h ceiling.
-        && chunk.offset <= storage::SNAPSHOT_MAX_ENVELOPE_BYTES
-        && chunk.bytes.is_empty()
-        && chunk.done
 }
 
 pub(super) struct RepairDownload {
@@ -112,39 +88,6 @@ fn same_repair_snapshot(
     first: &RepairChunk,
 ) -> bool {
     download.source == source && download.vote == first.vote && download.meta == first.meta
-}
-
-async fn read_cached_repair_chunk(
-    entry: &mut CachedRepairSnapshot,
-    offset: u64,
-) -> Result<RepairChunk, PersistError> {
-    let length = entry.length;
-    if offset > length || length > storage::SNAPSHOT_MAX_ENVELOPE_BYTES {
-        return Err(consensus_unavailable());
-    }
-    let chunk_bytes = (length - offset).min(CHUNK_BYTES as u64);
-    let mut bytes = vec![0; chunk_bytes as usize];
-    // The cached descriptor is owned by this request while the cache lock is
-    // held; the read is bounded by one chunk.
-    entry
-        .snapshot
-        .snapshot
-        .seek(std::io::SeekFrom::Start(offset))
-        .await
-        .map_err(|_| consensus_unavailable())?;
-    entry
-        .snapshot
-        .snapshot
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|_| consensus_unavailable())?;
-    Ok(RepairChunk {
-        vote: entry.vote,
-        meta: entry.meta.clone(),
-        offset,
-        bytes,
-        done: offset + chunk_bytes == length,
-    })
 }
 
 pub(super) async fn handle(store: &ConsensusConfigStore, payload: &[u8]) -> ConsensusWireResponse {
@@ -195,58 +138,51 @@ impl ConsensusConfigStore {
         let vote = self
             .repair_source_vote()
             .ok_or_else(consensus_unavailable)?;
-        if let Some(cursor) = cursor.as_ref() {
-            if cursor.offset == REPAIR_PROBE_OFFSET {
-                // Cheap size probe: read the durable published-snapshot row
-                // instead of hashing the artifact. The requester derives its
-                // transfer deadline from this exact envelope length.
-                return self.repair_probe_snapshot(vote, deadline).await;
-            }
+        let (required, snapshot_id, offset) = if let Some(cursor) = cursor {
             if cursor.vote != vote || cursor.snapshot_id.len() > 128 {
                 return Err(consensus_unavailable());
             }
-        }
-
-        // Wait for the required cut before taking the cache lock so a slow
-        // snapshot build cannot block other repair requests behind it.
-        let required_cut = if cursor.is_none() {
+            (None, Some(cursor.snapshot_id), cursor.offset)
+        } else {
             // Matching may include an accepted but not yet applied suffix.
             // A snapshot of only the current committed cut is insufficient.
             let required = self.inner.raft.metrics().borrow().last_log_index;
             self.wait_for_snapshot_cut(required, vote, deadline).await?;
-            required
-        } else {
-            None
+            (required, None, 0)
         };
-
-        let mut cache = self.inner.repair_snapshot_cache.entry.lock().await;
-        let requested_snapshot_id = cursor.as_ref().map(|cursor| cursor.snapshot_id.as_str());
-        let refresh = match cache.as_ref() {
-            Some(entry) => {
-                let vote_changed = entry.vote != vote;
-                let snapshot_changed = requested_snapshot_id
-                    .is_some_and(|snapshot_id| entry.meta.snapshot_id != snapshot_id);
-                let cut_not_covered = required_cut.is_some_and(|required| {
-                    entry
-                        .meta
-                        .last_log_id
-                        .is_none_or(|cut| cut.index < required)
-                });
-                vote_changed || snapshot_changed || cut_not_covered
+        let source = self
+            .repair_snapshot_source(vote, required, deadline)
+            .await?;
+        let mut ready = source.ready.clone();
+        let snapshot = tokio::time::timeout_at(deadline, async {
+            loop {
+                if let Some(result) = ready.borrow_and_update().clone() {
+                    return result.map_err(|_| consensus_unavailable());
+                }
+                ready.changed().await.map_err(|_| consensus_unavailable())?;
             }
-            None => true,
-        };
-        if refresh {
-            *cache = Some(
-                self.load_repair_snapshot(vote, requested_snapshot_id, required_cut, deadline)
-                    .await?,
-            );
+        })
+        .await
+        .map_err(|_| consensus_unavailable())??;
+        if source.vote != vote
+            || snapshot.meta.last_log_id.map(|log| log.index) < required
+            || snapshot_id
+                .as_ref()
+                .is_some_and(|id| *id != snapshot.meta.snapshot_id)
+            || offset > snapshot.length
+        {
+            return Err(consensus_unavailable());
         }
-        let entry = cache.as_mut().ok_or_else(consensus_unavailable)?;
-        let offset = cursor.as_ref().map_or(0, |cursor| cursor.offset);
-        let chunk = read_cached_repair_chunk(entry, offset).await?;
-        drop(cache);
-
+        let length = snapshot.length;
+        let mut bytes = vec![0; (length - offset).min(CHUNK_BYTES as u64) as usize];
+        tokio::time::timeout_at(deadline, async {
+            let mut file = snapshot.file.lock().await;
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            file.read_exact(&mut bytes).await
+        })
+        .await
+        .map_err(|_| consensus_unavailable())?
+        .map_err(|_| consensus_unavailable())?;
         // The supervised check starts after this request was admitted; it
         // never reuses a read lease or joins an already-started read round.
         if !matches!(
@@ -256,146 +192,102 @@ impl ConsensusConfigStore {
         {
             return Err(consensus_unavailable());
         }
-        Ok(chunk)
-    }
-
-    /// Verify the snapshot once and cache it for every later chunk request.
-    async fn load_repair_snapshot(
-        &self,
-        vote: Vote<ConsensusNodeId>,
-        snapshot_id: Option<&str>,
-        required: Option<u64>,
-        deadline: Instant,
-    ) -> Result<CachedRepairSnapshot, PersistError> {
-        let snapshot = tokio::time::timeout_at(deadline, self.inner.raft.get_snapshot())
-            .await
-            .map_err(|_| consensus_unavailable())?
-            .map_err(|_| consensus_unavailable())?
-            .ok_or_else(consensus_unavailable)?;
-        if snapshot.meta.last_log_id.is_none()
-            || !exact_uniform_voter_membership(&snapshot.meta.last_membership, &self.inner.members)
-            || required.is_some_and(|required| {
-                snapshot
-                    .meta
-                    .last_log_id
-                    .is_none_or(|cut| cut.index < required)
-            })
-            || snapshot_id.is_some_and(|snapshot_id| snapshot.meta.snapshot_id != snapshot_id)
-        {
-            return Err(consensus_unavailable());
-        }
-        let mut snapshot = snapshot;
-        let length = snapshot
-            .snapshot
-            .seek(std::io::SeekFrom::End(0))
-            .await
-            .map_err(|_| consensus_unavailable())?;
-        if length == 0 || length > storage::SNAPSHOT_MAX_ENVELOPE_BYTES {
-            return Err(consensus_unavailable());
-        }
-        snapshot
-            .snapshot
-            .seek(std::io::SeekFrom::Start(0))
-            .await
-            .map_err(|_| consensus_unavailable())?;
-        let meta = snapshot.meta.clone();
-        Ok(CachedRepairSnapshot {
-            vote,
-            meta,
-            length,
-            snapshot,
-        })
-    }
-
-    /// Cheap, non-verifying published snapshot size probe.
-    async fn repair_probe_snapshot(
-        &self,
-        vote: Vote<ConsensusNodeId>,
-        deadline: Instant,
-    ) -> Result<RepairChunk, PersistError> {
-        let budget = deadline
-            .saturating_duration_since(Instant::now())
-            .min(SNAPSHOT_WORK_BASE_BUDGET);
-        if budget.is_zero() {
-            return Err(consensus_unavailable());
-        }
-        let identity = self.inner.identity;
-        let members = self.inner.members.clone();
-        let current = super::super::run_backend_sqlite_with_timeout(
-            &self.inner.backend,
-            budget,
-            move |conn, _cancellation| {
-                super::super::sqlite::read_current_snapshot_sync(conn, identity, &members)
-            },
-        )
-        .await
-        .map_err(|_| consensus_unavailable())?;
-        let (meta, _file_name, _checksum, length) = current.ok_or_else(consensus_unavailable)?;
-        if meta.last_log_id.is_none()
-            || !exact_uniform_voter_membership(&meta.last_membership, &self.inner.members)
-            || length == 0
-            || length > storage::SNAPSHOT_MAX_ENVELOPE_BYTES
-        {
-            return Err(consensus_unavailable());
-        }
+        source.activity.send_replace(Instant::now());
         Ok(RepairChunk {
             vote,
-            meta,
-            offset: length,
-            bytes: Vec::new(),
-            done: true,
+            meta: snapshot.meta.clone(),
+            offset,
+            done: offset + bytes.len() as u64 == length,
+            bytes,
         })
     }
 
-    /// Discover the authenticated leader snapshot's exact envelope length.
-    ///
-    /// The bounded probe lets the caller derive one size-following repair
-    /// attempt deadline; an unknown or incompatible peer keeps the existing
-    /// fixed attempt deadline.
-    pub(super) async fn probe_repair_snapshot_size(&self, deadline: Instant) -> Option<u64> {
-        let mut requests = futures_util::stream::FuturesUnordered::new();
-        for target in self.inner.peers.keys().copied() {
-            requests.push(async move { (target, self.fetch_repair_probe(target, deadline).await) });
+    async fn repair_snapshot_source(
+        &self,
+        vote: Vote<ConsensusNodeId>,
+        required: Option<u64>,
+        deadline: Instant,
+    ) -> Result<Arc<RepairSource>, PersistError> {
+        let mut cached = tokio::time::timeout_at(deadline, self.inner.repair_source.lock())
+            .await
+            .map_err(|_| consensus_unavailable())?;
+        if let Some(source) = cached.as_ref() {
+            let pending = source.ready.borrow().is_none();
+            let reusable = source.vote == vote
+                && source.ready.borrow().as_ref().is_some_and(|result| {
+                    result.as_ref().is_ok_and(|snapshot| {
+                        snapshot.meta.last_log_id.map(|log| log.index) >= required
+                    })
+                });
+            if pending || reusable {
+                // A changed vote never starts another read while the previous
+                // engine request is still owned. Its result cannot authorize
+                // this caller and is retired when that request completes.
+                return Ok(source.clone());
+            }
+            source.retired.notify_one();
         }
-        use futures_util::StreamExt;
-        while let Some((target, result)) = requests.next().await {
-            if let Ok(chunk) = result {
-                if valid_repair_probe(target, &chunk, &self.inner.members) {
-                    return Some(chunk.offset);
+        let (published, ready) = tokio::sync::watch::channel(None);
+        let (activity, mut activity_rx) = tokio::sync::watch::channel(Instant::now());
+        let source = Arc::new(RepairSource {
+            vote,
+            ready,
+            activity,
+            retired: tokio::sync::Notify::new(),
+        });
+        *cached = Some(source.clone());
+        let owned = source.clone();
+        let store = self.clone();
+        tokio::spawn(async move {
+            let result = store
+                .inner
+                .raft
+                .get_snapshot()
+                .await
+                .ok()
+                .flatten()
+                .filter(|snapshot| {
+                    snapshot.meta.last_log_id.is_some()
+                        && exact_uniform_voter_membership(
+                            &snapshot.meta.last_membership,
+                            &store.inner.members,
+                        )
+                        && store.repair_source_vote() == Some(vote)
+                })
+                .and_then(|snapshot| {
+                    let length = snapshot.snapshot.verified_envelope()?.total_length;
+                    (length <= storage::SNAPSHOT_MAX_ENVELOPE_BYTES).then(|| {
+                        Arc::new(RepairSnapshot {
+                            meta: snapshot.meta,
+                            length,
+                            file: tokio::sync::Mutex::new(snapshot.snapshot),
+                        })
+                    })
+                })
+                .ok_or(());
+            let succeeded = result.is_ok();
+            owned.activity.send_replace(Instant::now());
+            published.send_replace(Some(result));
+            let mut metrics = store.inner.raft.metrics();
+            while succeeded && store.repair_source_vote() == Some(vote) {
+                let idle_deadline = *activity_rx.borrow_and_update() + SOURCE_IDLE_TIMEOUT;
+                tokio::select! {
+                    _ = store.inner.shutdown.wait_started() => break,
+                    _ = owned.retired.notified() => break,
+                    _ = tokio::time::sleep_until(idle_deadline) => break,
+                    changed = metrics.changed() => if changed.is_err() { break; },
+                    changed = activity_rx.changed() => if changed.is_err() { break; },
                 }
             }
-        }
-        None
-    }
-
-    /// A bounded repair attempt deadline derived from the snapshot size.
-    pub(super) async fn repair_attempt_deadline(&self, fallback: Instant) -> Instant {
-        match self.probe_repair_snapshot_size(fallback).await {
-            Some(length) => super::super::snapshot_timing::derived_deadline(
-                Instant::now(),
-                snapshot_transfer_budget(length),
-            )
-            .map(|derived| derived.max(fallback))
-            .unwrap_or(fallback),
-            None => fallback,
-        }
-    }
-
-    async fn fetch_repair_probe(
-        &self,
-        target: ConsensusNodeId,
-        deadline: Instant,
-    ) -> Result<RepairChunk, PersistError> {
-        self.fetch_repair_chunk(
-            target,
-            Some(RepairCursor {
-                vote: Vote::new(0, self.inner.local_node_id),
-                snapshot_id: String::new(),
-                offset: REPAIR_PROBE_OFFSET,
-            }),
-            deadline,
-        )
-        .await
+            let mut cached = store.inner.repair_source.lock().await;
+            if cached
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &owned))
+            {
+                *cached = None;
+            }
+        });
+        Ok(source)
     }
 
     pub(super) async fn recover_member_before_participation(
@@ -473,15 +365,6 @@ impl ConsensusConfigStore {
             if self.installed_repair_is_ready().await {
                 *progress = None;
                 self.inner.repair_pending.store(false, Ordering::Release);
-                // A repair root is opened with automatic elections disabled
-                // and no fixed-slot voter profile (the failover accelerator is
-                // ineligible for both), so this completed-repair path is the
-                // only owner that restores the engine flag and the SDK mirror
-                // together.
-                debug_assert!(self.inner.voter_profile.is_none());
-                self.inner
-                    .automatic_elections_enabled
-                    .store(true, Ordering::Release);
                 self.inner.raft.runtime_config().elect(true);
                 self.inner.raft.runtime_config().heartbeat(true);
                 return Ok(());
@@ -551,18 +434,17 @@ impl ConsensusConfigStore {
     }
 
     async fn installed_repair_is_ready(&self) -> bool {
-        let Ok(Some(snapshot)) = self.inner.raft.get_snapshot().await else {
-            return false;
-        };
-        if snapshot.meta.last_log_id.is_none()
-            || !exact_uniform_voter_membership(&snapshot.meta.last_membership, &self.inner.members)
-            || self.inner.shutdown.is_started()
-        {
+        if self.inner.shutdown.is_started() {
             return false;
         }
+        // This root started empty with engine RPCs fenced. Only the owned
+        // repair install can publish a snapshot, after storage verified and
+        // committed it. Observe that durable cut without hashing it again on
+        // every bounded recovery attempt.
         map_watch_snapshot(&self.inner.raft.metrics(), |current| {
             current.running_state.is_ok()
-                && current.last_applied >= snapshot.meta.last_log_id
+                && current.snapshot.is_some()
+                && current.last_applied >= current.snapshot
                 && exact_uniform_voter_membership(
                     current.membership_config.as_ref(),
                     &self.inner.members,

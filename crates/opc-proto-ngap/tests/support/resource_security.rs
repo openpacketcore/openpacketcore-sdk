@@ -35,7 +35,7 @@ pub fn request(value: &SetupRequestTransfer) -> SetupRequestTransfer {
         UplinkTransportList::new(
             list.values()
                 .iter()
-                .map(|v| UplinkTransport::new(v.address(), v.teid()))
+                .map(|v| UplinkTransport::with_address(v.address(), v.teid()))
                 .collect(),
         )
         .unwrap()

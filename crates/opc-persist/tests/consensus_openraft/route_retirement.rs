@@ -1,9 +1,6 @@
 //! Configuration-store leader-route rediscovery regressions (#1049).
 //!
-//! These fixtures form a real three-node consensus cluster and therefore run in
-//! the serial all-features e2e lane. They cannot run on the macOS analysis host:
-//! the existing consensus fixtures fail during store open with the pre-existing
-//! `StorageUnavailable` environment limitation there.
+//! These real three-node fixtures run in the serial all-features end-to-end lane.
 //!
 //! The configuration store previously waited for the complete operation
 //! deadline on a leader-routed call even after its own engine had already named
@@ -48,8 +45,8 @@ async fn wait_for_forward_mutation_attempt(path: &LoopbackPeer, prior: usize) {
 
 /// Advance the paused protocol clock past the survivors' committed-vote leases
 /// from the current leader, so a replacement campaign can win immediately
-/// instead of waiting for a randomized election timeout. Heartbeats do not
-/// refresh the vote lease in this engine; only a new accepted vote does.
+/// instead of waiting for a randomized election timeout. The caller first stops
+/// leader traffic because accepted heartbeats refresh the committed-vote lease.
 async fn advance_past_committed_vote_leases(cluster: &ThreeNodeCluster, voters: [usize; 2]) {
     for node in voters {
         cluster.stores[node]
@@ -80,6 +77,10 @@ async fn routed_write_rediscovers_the_successor_after_a_black_holed_lost_leader(
     cluster.stores[successor].disable_automatic_elections_for_test();
     cluster.stores[stale_leader].disable_automatic_elections_for_test();
 
+    for survivor in [follower, successor] {
+        cluster.paths[&(stale_leader, survivor)].set_enabled(false);
+    }
+
     // A campaign cannot win before the survivors' committed-vote leases from
     // the current leader expire. Advance through those exact leases on the
     // paused clock before the write, so the deterministic replacement election
@@ -98,6 +99,7 @@ async fn routed_write_rediscovers_the_successor_after_a_black_holed_lost_leader(
     let tx_id = TxId::new();
     let record = commit(tx_id, None, 1, 0x49);
     let records_audit = audit(tx_id);
+    let replay = attested(record.clone(), records_audit.clone());
     let follower_store = cluster.stores[follower].clone();
     let write_started = tokio::time::Instant::now();
     let write = tokio::spawn(async move {
@@ -164,10 +166,7 @@ async fn routed_write_rediscovers_the_successor_after_a_black_holed_lost_leader(
     assert_eq!(latest.record.tx_id, tx_id);
     assert_eq!(latest.record.version, ConfigVersion::new(1));
     cluster.stores[follower]
-        .append_commit_idempotent(
-            request_id,
-            attested(commit(tx_id, None, 1, 0x49), audit(tx_id)),
-        )
+        .append_commit_idempotent(request_id, replay)
         .await
         .expect("same request identity replays the committed result");
     let replayed = cluster.stores[follower]

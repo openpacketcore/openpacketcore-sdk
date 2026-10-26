@@ -5,11 +5,8 @@ mod audit_continuity;
 mod compatibility;
 #[cfg(any(test, feature = "test-control"))]
 mod diagnostics;
-mod failover;
+mod leader_route;
 mod member_repair;
-pub use failover::{
-    ConfigFailoverState, ConfigFailoverStatus, CONFIG_CONSENSUS_UNPLANNED_FAILOVER_DETECTION_BOUND,
-};
 mod planned_shutdown;
 pub(crate) mod voter_slots;
 
@@ -23,20 +20,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use opc_consensus::engine::error::{ClientWriteError, InitializeError, RaftError};
-use opc_consensus::engine::{EmptyNode, LogId, ServerState, StoredMembership};
+use opc_consensus::engine::{EmptyNode, LogId, StoredMembership};
 use opc_consensus::{
     durable_openraft_config, encode_bounded, ConsensusNodeId, ConsensusPeer, ConsensusPeerError,
     ConsensusRpcFamily, ConsensusRpcHandler, ConsensusWireRequest, ConsensusWireResponse,
     DurableOpenraftDomain, EnsureLinearizableOutcome, EnsureLinearizableSupervisor,
     LinearizableReadBarrier, LinearizableReadBarrierError, LinearizableReadLease,
-    DURABLE_CONSENSUS_LEADER_QUORUM_LEASE, DURABLE_CONSENSUS_OPERATION_TIMEOUT,
-    DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE, DURABLE_CONSENSUS_TIMING_PROFILE,
+    DURABLE_CONSENSUS_OPERATION_TIMEOUT, DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE,
     DURABLE_OPENRAFT_APPEND_ENTRIES_TARGET_BYTES, DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS,
 };
 use serde::{Deserialize, Serialize};
@@ -51,6 +47,8 @@ use super::{
     ConfigConsensusTopology, ConfigMutationIntent, ConfigRaft, ConfigRaftTypeConfig,
     PreparedConfigCommit, SystemConfigConsensusClock,
 };
+use leader_route::LeaderRoute;
+
 use crate::backend::SqliteBackend;
 use crate::error::PersistError;
 use crate::preflight::PersistCapabilities;
@@ -63,10 +61,6 @@ pub const DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT: Duration =
     DURABLE_CONSENSUS_OPERATION_TIMEOUT;
 
 const ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-/// Consecutive healthy quorum observations required before authority returns
-/// after the check-quorum fence engaged. Two observations give a one-flush
-/// debounce against marginal acknowledgements flapping the fence.
-const QUORUM_LEASE_RECOVERY_OBSERVATIONS: u8 = 2;
 const MAX_FORWARDED_BUDGET: Duration = Duration::from_secs(60);
 const REQUEST_ID_DOMAIN: &[u8] = b"openpacketcore/config-consensus/request-id/v1\0";
 
@@ -154,36 +148,6 @@ pub struct ConfigConsensusStatus {
     pub audit_key_fingerprint: [u8; 32],
     /// Whether exact configured membership has been admitted and remains live.
     pub admitted: bool,
-}
-
-/// Fixed, value-free quorum-lease observation for this configuration-consensus
-/// leader.
-///
-/// A leader may accept new proposals, serve authority checks and answer
-/// forwarded calls only while its engine-reported quorum acknowledgement is
-/// younger than the fixed quorum-authority ceiling
-/// ([`DURABLE_CONSENSUS_LEADER_QUORUM_LEASE`], `election_timeout_max`; not an
-/// Openraft application lease and unrelated to the SDK's 2 s read-lease reuse
-/// constant). Once the ceiling is exceeded the store withholds leader authority
-/// with a typed retryable "no leader" outcome until a fresh quorum
-/// acknowledgement renews it. This is an SDK authority step-down: it fabricates
-/// no vote, changes no committed-log semantics, and leaves the engine's
-/// election, heartbeat and quorum timing untouched. The engine's durable role
-/// may still be `Leader`; clients and forwarding replicas observe no usable
-/// leader from this node for the withheld period.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfigQuorumLeaseState {
-    /// This node is not the leader, or a quorum acknowledgement is within the
-    /// fixed quorum-authority ceiling.
-    Available,
-    /// This node is the engine leader but no quorum acknowledgement arrived
-    /// within the fixed quorum-authority ceiling. Leader authority is
-    /// withheld.
-    NoQuorum {
-        /// Engine-reported age of the newest quorum acknowledgement.
-        millis_since_quorum_ack: u64,
-    },
 }
 
 /// Result of a local-only writer-of-record authority check.
@@ -283,19 +247,12 @@ struct ForwardMutationRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum ForwardMutationReply {
     Applied(Box<ConfigConsensusResponse>),
-    NotLeader {
-        leader: Option<ConsensusNodeId>,
-    },
+    NotLeader { leader: Option<ConsensusNodeId> },
     Unavailable,
     Rejected(ForwardMutationRejection),
     // Keep additive variants after the original discriminants so their
     // postcard shapes remain stable inside the current exact-revision payload.
     OutcomeUnknown,
-    /// The addressed leader had no acknowledged quorum within its fixed leader
-    /// lease, so it rejected the call before proposing or applying anything.
-    /// This is a definite not-applied reply: callers may retry the same request
-    /// identity as a retryable unavailability.
-    NoQuorum,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,7 +268,7 @@ enum RouteBoundedReply<Reply> {
     Reply(Reply),
     /// The local engine named a successor before the peer answered. The call
     /// was abandoned and may have been transmitted before the abandonment.
-    Retired { leader: ConsensusNodeId },
+    Retired { leader: Option<ConsensusNodeId> },
     /// The local engine had already superseded the attempted route, so the
     /// call was not transmitted.
     Superseded { leader: ConsensusNodeId },
@@ -358,13 +315,8 @@ struct ConfigPeerCompatibility {
 enum ReadBarrierReply {
     Compatible,
     Ready(Option<LogId<ConsensusNodeId>>),
-    NotLeader {
-        leader: Option<ConsensusNodeId>,
-    },
+    NotLeader { leader: Option<ConsensusNodeId> },
     Unavailable,
-    /// The addressed leader had no acknowledged quorum within its fixed leader
-    /// lease and rejected the barrier without a read.
-    NoQuorum,
 }
 
 struct ConsensusConfigStoreInner {
@@ -379,40 +331,17 @@ struct ConsensusConfigStoreInner {
     clock: Arc<dyn ConfigConsensusClock>,
     operation_timeout: Duration,
     admitted: AtomicBool,
-    /// Set while this engine leader's authority is withheld because no quorum
-    /// acknowledgement arrived within the fixed quorum-authority ceiling. Used
-    /// only for value-free transition logging and metrics.
-    quorum_lease_latched: AtomicBool,
-    /// Start of the current leader role, keyed by term. Used to bound a leader
-    /// that has not yet received *any* quorum acknowledgement (engine metrics
-    /// report `None` in that case).
-    leader_since: std::sync::Mutex<Option<(u64, tokio::time::Instant)>>,
-    /// Consecutive healthy observations collected while recovery is debounced.
-    quorum_lease_recovery_observations: AtomicU8,
-    /// Last observed over-ceiling acknowledgement age, exposed by the
-    /// side-effect-free state getter.
-    quorum_lease_last_millis: AtomicU64,
-    /// Number of healthy observations consumed by the last recovery. Test-only
-    /// diagnostics prove the debounce actually engaged.
-    quorum_lease_last_recovery_observations: AtomicU8,
-    /// Whether the engine's automatic-election path is enabled for this store.
-    /// Mirrored in the SDK because the pinned fork has no public getter; the
-    /// failover accelerator must never request a campaign while it is disabled.
-    automatic_elections_enabled: AtomicBool,
-    /// Bounded unplanned-leader-loss failover observation and acceleration.
-    failover: failover::ConfigFailoverAccelerator,
     repair_pending: AtomicBool,
     repair_progress: tokio::sync::Mutex<Option<member_repair::RepairDownload>>,
     /// One verified snapshot descriptor reused by every repair chunk request of
     /// the same transfer (#1339).
-    repair_snapshot_cache: Arc<member_repair::RepairSnapshotCache>,
+    repair_source: tokio::sync::Mutex<Option<Arc<member_repair::RepairSource>>>,
     audit_continuity: Option<Arc<crate::audit_authority::continuity::AuditContinuityPolicy>>,
     linearizability: EnsureLinearizableSupervisor<ConfigRaftTypeConfig>,
     proposal_admission: Arc<tokio::sync::Semaphore>,
     metric_leader: std::sync::Mutex<Option<ConsensusNodeId>>,
     durable_progress: Arc<storage::ConfigDurableProgress>,
     storage_shutdown: tokio::sync::watch::Receiver<()>,
-    snapshot_directory_owner: std::sync::Weak<storage::SnapshotDirectoryOwner>,
     voter_profile: Option<Arc<voter_slots::ConfigVoterProfile>>,
     shutdown: planned_shutdown::ConfigShutdownCoordinator,
 }
@@ -448,17 +377,6 @@ impl ConsensusConfigStore {
             .is_ok_and(|append| append.entries.is_empty())
     }
 
-    /// Observe the current leader-silence interval without changing it. The
-    /// regression anchors its exact derived bound to the last known contact.
-    #[cfg(feature = "dangerous-test-hooks")]
-    #[doc(hidden)]
-    pub fn leader_silence_millis_for_test(&self) -> Option<u64> {
-        let contact = self.inner.failover.contact_locked();
-        contact
-            .as_ref()
-            .map(|contact| u64::try_from(contact.at.elapsed().as_millis()).unwrap_or(u64::MAX))
-    }
-
     /// Observe the actual vote-update instant, without changing the lease.
     #[cfg(feature = "dangerous-test-hooks")]
     #[doc(hidden)]
@@ -474,12 +392,9 @@ impl ConsensusConfigStore {
 
     /// Disable automatic campaigns for a deterministic concurrent fixture.
     /// Explicit test campaigns still use the engine's normal voting path.
-    #[cfg(any(test, feature = "dangerous-test-hooks"))]
+    #[cfg(feature = "dangerous-test-hooks")]
     #[doc(hidden)]
     pub fn disable_automatic_elections_for_test(&self) {
-        self.inner
-            .automatic_elections_enabled
-            .store(false, Ordering::Release);
         self.inner.raft.runtime_config().elect(false);
     }
 
@@ -737,14 +652,6 @@ impl ConsensusConfigStore {
         .await
         .map_err(|_| ConfigConsensusOpenError::AuditContinuityUnavailable)?;
         let storage_shutdown = log_store.core.storage_shutdown_observer();
-        // Verification outside the storage worker upgrades admission only for
-        // its active I/O. Retained store handles must not own that admission.
-        let snapshot_directory_owner = Arc::downgrade(
-            &log_store
-                .core
-                .snapshot_directory_owner()
-                .map_err(|_| ConfigConsensusOpenError::StorageUnavailable)?,
-        );
         // A repair root has lost the old voter's log and vote. Do not expose
         // that empty state to a live leader or another candidate. A previously
         // restored root retains its ordinary durable restart behavior.
@@ -789,7 +696,6 @@ impl ConsensusConfigStore {
             config.enable_elect = false;
             config.enable_heartbeat = false;
         }
-        let automatic_elections_enabled = config.enable_elect;
         let raft = ConfigRaft::new(
             local_node_id,
             Arc::new(config),
@@ -828,16 +734,9 @@ impl ConsensusConfigStore {
                 clock,
                 operation_timeout,
                 admitted: AtomicBool::new(false),
-                quorum_lease_latched: AtomicBool::new(false),
-                leader_since: std::sync::Mutex::new(None),
-                quorum_lease_recovery_observations: AtomicU8::new(0),
-                quorum_lease_last_millis: AtomicU64::new(0),
-                quorum_lease_last_recovery_observations: AtomicU8::new(0),
-                automatic_elections_enabled: AtomicBool::new(automatic_elections_enabled),
-                failover: failover::ConfigFailoverAccelerator::default(),
                 repair_pending: AtomicBool::new(repair_pending),
                 repair_progress: tokio::sync::Mutex::new(None),
-                repair_snapshot_cache: Arc::new(member_repair::RepairSnapshotCache::default()),
+                repair_source: tokio::sync::Mutex::new(None),
                 shutdown: planned_shutdown::ConfigShutdownCoordinator::new(),
                 audit_continuity,
                 linearizability,
@@ -847,13 +746,10 @@ impl ConsensusConfigStore {
                 metric_leader: std::sync::Mutex::new(None),
                 durable_progress,
                 storage_shutdown,
-                snapshot_directory_owner,
                 voter_profile,
             }),
         };
         voter_slots::start_coordinator(&store);
-        start_quorum_lease_watchdog(&store);
-        failover::start_failover_watchdog(&store);
         Ok(store)
     }
 
@@ -890,7 +786,7 @@ impl ConsensusConfigStore {
             diagnostics::DeadlineDiagnostic::new("config_consensus_initialization", "deadline");
         let result = async {
             self.inner.admitted.store(false, Ordering::Release);
-            let mut deadline = tokio::time::Instant::now()
+            let deadline = tokio::time::Instant::now()
                 .checked_add(self.inner.operation_timeout)
                 .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
             #[cfg(any(test, feature = "test-control"))]
@@ -921,17 +817,7 @@ impl ConsensusConfigStore {
                 {
                     diagnostic.stage = "repair";
                 }
-                // Repairing a large healthy snapshot needs a deadline derived
-                // from its actual size; ordinary snapshots keep the existing
-                // operation deadline because the derived floor is the same.
-                let repair_deadline = self.repair_attempt_deadline(deadline).await;
-                self.recover_member_before_participation(repair_deadline)
-                    .await?;
-                // Post-repair admission work keeps its ordinary budget even if
-                // the size-derived repair attempt consumed the original one.
-                deadline = tokio::time::Instant::now()
-                    .checked_add(self.inner.operation_timeout)
-                    .ok_or(ConfigConsensusOpenError::ClusterFormationRejected)?;
+                self.recover_member_before_participation(deadline).await?;
             }
             if !initialized
                 && canonical_bootstrap == Some(self.inner.local_node_id)
@@ -1052,178 +938,6 @@ impl ConsensusConfigStore {
         }
     }
 
-    /// Fixed, value-free quorum-lease observation for this configuration
-    /// consensus leader.
-    ///
-    /// While the engine reports this node as leader but the newest quorum
-    /// acknowledgement is older than the fixed quorum-authority ceiling
-    /// (`election_timeout_max`, not an Openraft application lease), the store
-    /// withholds new-proposal, local-authority, forwarded-mutation and
-    /// read-barrier authority with typed retryable "no leader" outcomes. A
-    /// fresh quorum acknowledgement restores it automatically after a one-flush
-    /// debounce. This is an SDK authority step-down; it fabricates no vote and
-    /// changes no election, heartbeat or quorum budget.
-    ///
-    /// The observation is side-effect-free: the store's quorum-lease watchdog
-    /// publishes the typed transitions and their metrics/logs. A freshly
-    /// withdrawn fence may be visible here before the on-demand admission gates
-    /// have served a request, and a withheld call is never admitted while this
-    /// returns [`ConfigQuorumLeaseState::NoQuorum`].
-    pub fn quorum_lease_state(&self) -> ConfigQuorumLeaseState {
-        if self.inner.quorum_lease_latched.load(Ordering::Acquire) {
-            ConfigQuorumLeaseState::NoQuorum {
-                millis_since_quorum_ack: self
-                    .inner
-                    .quorum_lease_last_millis
-                    .load(Ordering::Relaxed),
-            }
-        } else {
-            ConfigQuorumLeaseState::Available
-        }
-    }
-
-    /// Whether leader authority is withheld right now, with the engine-reported
-    /// acknowledgement age.
-    ///
-    /// The raw over-ceiling evidence fences immediately. A recorded fence is
-    /// also honored during the short recovery debounce, so authority never
-    /// returns on a single marginal acknowledgement.
-    fn quorum_lease_withheld(&self) -> Option<u64> {
-        match self.quorum_lease_evidence() {
-            Some(millis_since_quorum_ack) => {
-                self.record_quorum_lease_lost(millis_since_quorum_ack);
-                Some(millis_since_quorum_ack)
-            }
-            None if self.inner.quorum_lease_latched.load(Ordering::Acquire) => {
-                Some(self.inner.quorum_lease_last_millis.load(Ordering::Relaxed))
-            }
-            None => None,
-        }
-    }
-
-    fn quorum_lease_evidence(&self) -> Option<u64> {
-        let metrics = self.inner.raft.metrics();
-        let (state, term, millis_since_quorum_ack) = map_watch_snapshot(&metrics, |current| {
-            (
-                current.state,
-                current.current_term,
-                current.millis_since_quorum_ack,
-            )
-        });
-        self.leader_quorum_evidence(state, term, millis_since_quorum_ack)
-    }
-
-    /// Over-ceiling acknowledgement age for an engine leader.
-    fn leader_quorum_evidence(
-        &self,
-        state: ServerState,
-        term: u64,
-        millis_since_quorum_ack: Option<u64>,
-    ) -> Option<u64> {
-        if state != ServerState::Leader {
-            return None;
-        }
-        if let Some(millis) = millis_since_quorum_ack {
-            return (u128::from(millis) > DURABLE_CONSENSUS_LEADER_QUORUM_LEASE.as_millis())
-                .then_some(millis);
-        }
-        // A leader that has not had any quorum acknowledgement yet reports
-        // `None`; bound that case from the observed start of its leader role.
-        // The watchdog keeps `leader_since` current for the exact term.
-        let since = {
-            let observed = self
-                .inner
-                .leader_since
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match *observed {
-                Some((observed_term, since)) if observed_term == term => Some(since),
-                _ => None,
-            }
-        }?;
-        let age = since.elapsed();
-        (age > DURABLE_CONSENSUS_LEADER_QUORUM_LEASE)
-            .then(|| u64::try_from(age.as_millis()).unwrap_or(u64::MAX))
-    }
-
-    /// Record a withheld-authority observation. Called from the admission fence
-    /// (immediate) and from the watchdog (proactive).
-    fn record_quorum_lease_lost(&self, millis_since_quorum_ack: u64) {
-        self.inner
-            .quorum_lease_last_millis
-            .store(millis_since_quorum_ack, Ordering::Relaxed);
-        self.inner
-            .quorum_lease_recovery_observations
-            .store(0, Ordering::Release);
-        if !self.inner.quorum_lease_latched.swap(true, Ordering::AcqRel) {
-            opc_redaction::metrics::METRICS
-                .persist_quorum_lease_lost
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                millis_since_quorum_ack,
-                "configuration consensus leader has no acknowledged quorum within the fixed quorum-authority ceiling; withholding leader authority"
-            );
-        }
-    }
-
-    /// Publish one healthy observation after withholding. Authority returns only
-    /// after [`QUORUM_LEASE_RECOVERY_OBSERVATIONS`] consecutive healthy
-    /// observations, which debounces marginal acknowledgements.
-    fn observe_quorum_lease_recovery(&self, healthy: bool) {
-        if !self.inner.quorum_lease_latched.load(Ordering::Acquire) {
-            return;
-        }
-        if !healthy {
-            self.inner
-                .quorum_lease_recovery_observations
-                .store(0, Ordering::Release);
-            return;
-        }
-        let observations = self
-            .inner
-            .quorum_lease_recovery_observations
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        if observations >= QUORUM_LEASE_RECOVERY_OBSERVATIONS {}
-    }
-
-    /// Number of healthy observations consumed by the most recent recovery from
-    /// the check-quorum fence. Test-only diagnostics; grants no authority.
-    #[cfg(feature = "dangerous-test-hooks")]
-    #[doc(hidden)]
-    pub fn quorum_lease_last_recovery_observations_for_test(&self) -> u8 {
-        self.inner
-            .quorum_lease_last_recovery_observations
-            .load(Ordering::Acquire)
-    }
-
-    fn record_quorum_lease_available(&self) {
-        self.inner.quorum_lease_last_recovery_observations.store(
-            self.inner
-                .quorum_lease_recovery_observations
-                .load(Ordering::Acquire),
-            Ordering::Relaxed,
-        );
-        self.inner
-            .quorum_lease_recovery_observations
-            .store(0, Ordering::Release);
-        self.inner
-            .quorum_lease_last_millis
-            .store(0, Ordering::Relaxed);
-        if self
-            .inner
-            .quorum_lease_latched
-            .swap(false, Ordering::AcqRel)
-        {
-            opc_redaction::metrics::METRICS
-                .persist_quorum_lease_restored
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::info!(
-                "configuration consensus leader quorum acknowledgement renewed within the fixed quorum-authority ceiling; restoring leader authority"
-            );
-        }
-    }
-
     /// Proves that this node is the current writer of record without routing
     /// the check to another member.
     ///
@@ -1235,13 +949,6 @@ impl ConsensusConfigStore {
         else {
             return ConfigLocalAuthorityOutcome::Unavailable;
         };
-        if self.quorum_lease_withheld().is_some() {
-            // A leader beyond the fixed quorum-authority ceiling is not a
-            // usable writer of record. Report "no leader" instead of a hint
-            // back to this node so callers retry instead of waiting out a full
-            // operation deadline.
-            return ConfigLocalAuthorityOutcome::Retry { leader_hint: None };
-        }
         let barrier = self.local_authority_barrier();
         match barrier.admit(deadline).await {
             Ok(_) if self.require_admission().is_ok() && self.exact_membership_is_admitted() => {
@@ -1270,9 +977,6 @@ impl ConsensusConfigStore {
         else {
             return ConfigLocalAuthorityOutcome::Unavailable;
         };
-        if self.quorum_lease_withheld().is_some() {
-            return ConfigLocalAuthorityOutcome::Retry { leader_hint: None };
-        }
         let Ok(slot_count) = u32::try_from(DURABLE_OPENRAFT_PROPOSAL_ADMISSION_SLOTS) else {
             return ConfigLocalAuthorityOutcome::Unavailable;
         };
@@ -1831,9 +1535,6 @@ impl ConsensusConfigStore {
         let result = async {
             preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
                 .map_err(ForwardMutationRejection::into_persist_error)?;
-            if self.quorum_lease_withheld().is_some() {
-                return Err(consensus_unavailable());
-            }
             self.require_admission()?;
             let deadline = tokio::time::Instant::now()
                 .checked_add(self.inner.operation_timeout)
@@ -1848,7 +1549,6 @@ impl ConsensusConfigStore {
                 ForwardMutationReply::Applied(response) => Ok(*response),
                 ForwardMutationReply::Rejected(rejection) => Err(rejection.into_persist_error()),
                 ForwardMutationReply::OutcomeUnknown => Err(PersistError::outcome_unknown()),
-                ForwardMutationReply::NoQuorum => Err(consensus_unavailable()),
                 ForwardMutationReply::NotLeader { .. } | ForwardMutationReply::Unavailable => {
                     Err(consensus_unavailable())
                 }
@@ -1872,28 +1572,17 @@ impl ConsensusConfigStore {
     ) -> Result<ConfigConsensusResponse, PersistError> {
         preflight_config_command_replication_budget(self.inner.identity, request_id, &intent)
             .map_err(ForwardMutationRejection::into_persist_error)?;
-        if self.quorum_lease_withheld().is_some() {
-            // Reject before any proposal or forwarding attempt: the request is
-            // definitely not applied, so a retry with the same request identity
-            // keeps exactly-once semantics.
-            return Err(consensus_unavailable());
-        }
         self.require_admission()?;
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         let mut preferred = None;
-        // A leader hint returned by a peer is fresher than this replica's
-        // metrics view; the pre-send supersession check only applies to routes
-        // this replica selected from its own view.
-        let mut preferred_from_hint = false;
         let mut ambiguity_seen = false;
         loop {
-            let from_hint = preferred.is_some() && preferred_from_hint;
-            let leader = match preferred.take() {
-                Some(leader) => leader,
+            let route = match preferred.take() {
+                Some(route) => route,
                 None => match self.wait_for_known_leader(deadline).await {
-                    Ok(leader) => leader,
+                    Ok(leader) => LeaderRoute::from_local_view(leader),
                     Err(error) if ambiguity_seen => {
                         drop(error);
                         return Err(PersistError::outcome_unknown());
@@ -1901,6 +1590,7 @@ impl ConsensusConfigStore {
                     Err(error) => return Err(error),
                 },
             };
+            let leader = route.target;
             let budget = match ForwardedBudget::from_deadline(deadline) {
                 Ok(budget) => budget,
                 Err(error) if ambiguity_seen => {
@@ -1920,18 +1610,16 @@ impl ConsensusConfigStore {
             } else {
                 match self
                     .call_peer_on_route::<_, ForwardMutationReply>(
-                        leader,
+                        route,
                         ConsensusRpcFamily::ForwardMutation,
                         &request,
                         deadline,
-                        !from_hint,
                     )
                     .await
                 {
                     Ok(RouteBoundedReply::Reply(reply)) => reply,
                     Ok(RouteBoundedReply::Superseded { leader: observed }) => {
-                        preferred = Some(observed);
-                        preferred_from_hint = false;
+                        preferred = Some(LeaderRoute::from_local_view(observed));
                         continue;
                     }
                     Ok(RouteBoundedReply::Retired { leader: observed }) => {
@@ -1939,8 +1627,7 @@ impl ConsensusConfigStore {
                         // before the route was abandoned, so its outcome is
                         // ambiguous even though a retry is attempted.
                         ambiguity_seen = true;
-                        preferred = Some(observed);
-                        preferred_from_hint = false;
+                        preferred = observed.map(LeaderRoute::from_local_view);
                         continue;
                     }
                     Err(_) => {
@@ -1958,16 +1645,22 @@ impl ConsensusConfigStore {
                     return Ok(*response);
                 }
                 ForwardMutationReply::Rejected(rejection) => {
+                    // A refusal of this attempt cannot disprove an earlier
+                    // transmitted attempt's durable effect.
+                    if ambiguity_seen {
+                        return Err(PersistError::outcome_unknown());
+                    }
                     return Err(rejection.into_persist_error());
                 }
                 ForwardMutationReply::NotLeader { leader: next } => {
                     opc_redaction::metrics::METRICS
                         .persist_stale_leader_rejections
                         .fetch_add(1, Ordering::Relaxed);
-                    preferred = next.filter(|candidate| {
-                        *candidate != leader && self.inner.members.contains(candidate)
-                    });
-                    preferred_from_hint = preferred.is_some();
+                    preferred = next
+                        .filter(|candidate| {
+                            *candidate != leader && self.inner.members.contains(candidate)
+                        })
+                        .map(|target| LeaderRoute::redirected(target, self.member_leader_view()));
                     if preferred.is_none() {
                         if let Err(error) = self.wait_for_route_refresh(leader, deadline).await {
                             if ambiguity_seen {
@@ -1986,12 +1679,6 @@ impl ConsensusConfigStore {
                         }
                         return Err(error);
                     }
-                }
-                ForwardMutationReply::NoQuorum => {
-                    // The leader rejected this forwarded request before proposing
-                    // anything: it is definitely not applied, so a retry with the
-                    // same request identity is safe and no ambiguity is added.
-                    return Err(consensus_unavailable());
                 }
                 ForwardMutationReply::OutcomeUnknown => {
                     ambiguity_seen = true;
@@ -2015,13 +1702,6 @@ impl ConsensusConfigStore {
             &request.intent,
         ) {
             return ForwardMutationReply::Rejected(rejection);
-        }
-        if self.quorum_lease_withheld().is_some() {
-            // A forwarded mutation reaches this leader only while peers still
-            // route to it. Without an acknowledged quorum, reject it as a
-            // definite not-applied "no leader" reply instead of holding the
-            // forwarding replica until its operation deadline.
-            return ForwardMutationReply::NoQuorum;
         }
         if self.require_admission().is_err() {
             return ForwardMutationReply::Unavailable;
@@ -2215,102 +1895,29 @@ impl ConsensusConfigStore {
             .filter(|leader| self.inner.members.contains(leader))
     }
 
-    /// Wait until this replica's engine names a different member leader and the
-    /// stale-leader route grace has elapsed.
-    ///
-    /// Returns the currently observed successor. Fails closed at `deadline`:
-    /// without an observed successor the caller keeps the existing complete
-    /// operation bound and its ambiguity classification instead of hanging for
-    /// longer. A successful peer answer inside the grace interval wins because
-    /// the caller's `select` observes it before this future resolves.
-    async fn wait_for_stale_leader_route_retirement(
-        &self,
-        attempted_leader: ConsensusNodeId,
-        deadline: tokio::time::Instant,
-    ) -> Result<ConsensusNodeId, PersistError> {
-        let mut metrics = self.inner.raft.metrics();
-        // Absolute grace deadline and the successor it was armed for. Ordinary
-        // metrics churn (replication progress, applied index, term) must not
-        // re-arm the grace; only an actual `current_leader` change does.
-        let mut armed: Option<(ConsensusNodeId, tokio::time::Instant)> = None;
-        loop {
-            let successor =
-                map_watch_snapshot(&metrics, |current| current.current_leader).filter(|leader| {
-                    *leader != attempted_leader && self.inner.members.contains(leader)
-                });
-            let Some(successor) = successor else {
-                armed = None;
-                match tokio::time::timeout_at(deadline, metrics.changed()).await {
-                    Ok(Ok(())) => continue,
-                    Ok(Err(_)) | Err(_) => return Err(consensus_unavailable()),
-                }
-            };
-            let grace_deadline = match armed {
-                Some((observed, grace_deadline)) if observed == successor => grace_deadline,
-                _ => {
-                    let grace_deadline = tokio::time::Instant::now()
-                        .checked_add(DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE)
-                        .map_or(deadline, |grace| grace.min(deadline));
-                    armed = Some((successor, grace_deadline));
-                    grace_deadline
-                }
-            };
-            let now = tokio::time::Instant::now();
-            if now >= grace_deadline {
-                if now >= deadline {
-                    return Err(consensus_unavailable());
-                }
-                // Keep the absolute grace absolute: re-read the leader view and
-                // retire only if the successor is still named after the grace.
-                let still_successor =
-                    map_watch_snapshot(&metrics, |current| current.current_leader).filter(
-                        |leader| *leader != attempted_leader && self.inner.members.contains(leader),
-                    );
-                if let Some(leader) = still_successor {
-                    return Ok(leader);
-                }
-                armed = None;
-                continue;
-            }
-            // Wake on any metrics update so an actual leader change is seen
-            // promptly, but keep the absolute grace across unrelated churn.
-            match tokio::time::timeout_at(grace_deadline, metrics.changed()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return Err(consensus_unavailable()),
-                // Grace elapsed; the loop head decides whether to retire.
-                Err(_) => {}
-            }
-        }
-    }
-
     /// One leader-routed peer call whose lifetime is bounded by this replica's
     /// own leader view.
     ///
     /// The call is not transmitted when the local engine has already superseded
     /// the route. Once the engine names a successor, an unanswered call is
     /// abandoned after [`DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE`] instead of
-    /// occupying the complete operation deadline. `allow_pre_send_supersede` is
-    /// false for a route taken from a peer's fresher leader hint.
+    /// occupying the complete operation deadline. A redirect retains the view
+    /// under which it was chosen until that view advances.
     async fn call_peer_on_route<Req, Resp>(
         &self,
-        target: ConsensusNodeId,
+        mut route: LeaderRoute,
         family: ConsensusRpcFamily,
         request: &Req,
         deadline: tokio::time::Instant,
-        allow_pre_send_supersede: bool,
     ) -> Result<RouteBoundedReply<Resp>, PersistError>
     where
         Req: Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
     {
-        if allow_pre_send_supersede {
-            if let Some(observed) = self
-                .member_leader_view()
-                .filter(|observed| *observed != target)
-            {
-                return Ok(RouteBoundedReply::Superseded { leader: observed });
-            }
+        if let Some(observed) = route.observe(self.member_leader_view()) {
+            return Ok(RouteBoundedReply::Superseded { leader: observed });
         }
+        let target = route.target;
         let peer = self.peer_for(target)?;
         let wire = self.peer_wire(family, request)?;
         let call = async {
@@ -2323,7 +1930,12 @@ impl ConsensusConfigStore {
                 .map_err(|_| consensus_unavailable())
         };
         tokio::pin!(call);
-        let retirement = self.wait_for_stale_leader_route_retirement(target, deadline);
+        let retirement = leader_route::wait_for_retirement(
+            self.inner.raft.metrics(),
+            &self.inner.members,
+            route,
+            deadline,
+        );
         tokio::pin!(retirement);
         tokio::select! {
             biased;
@@ -2335,9 +1947,6 @@ impl ConsensusConfigStore {
     }
 
     async fn local_read_barrier(&self, deadline: tokio::time::Instant) -> ReadBarrierReply {
-        if self.quorum_lease_withheld().is_some() {
-            return ReadBarrierReply::NoQuorum;
-        }
         if self.require_admission().is_err() {
             return ReadBarrierReply::Unavailable;
         }
@@ -2382,19 +1991,18 @@ impl ConsensusConfigStore {
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(consensus_unavailable)?;
         let mut preferred = None;
-        let mut preferred_from_hint = false;
         loop {
-            let from_hint = preferred.is_some() && preferred_from_hint;
-            let leader = match preferred.take() {
-                Some(leader) => leader,
-                None => self.wait_for_known_leader(deadline).await?,
+            let route = match preferred.take() {
+                Some(route) => route,
+                None => LeaderRoute::from_local_view(self.wait_for_known_leader(deadline).await?),
             };
+            let leader = route.target;
             let reply = if leader == self.inner.local_node_id {
                 self.local_read_barrier(deadline).await
             } else {
                 match self
                     .call_peer_on_route::<_, ReadBarrierReply>(
-                        leader,
+                        route,
                         ConsensusRpcFamily::ReadBarrier,
                         &ReadBarrierRequest {
                             compatibility: self.peer_compatibility(),
@@ -2402,15 +2010,16 @@ impl ConsensusConfigStore {
                             budget: ForwardedBudget::from_deadline(deadline)?,
                         },
                         deadline,
-                        !from_hint,
                     )
                     .await
                 {
                     Ok(RouteBoundedReply::Reply(reply)) => reply,
-                    Ok(RouteBoundedReply::Superseded { leader: observed })
-                    | Ok(RouteBoundedReply::Retired { leader: observed }) => {
-                        preferred = Some(observed);
-                        preferred_from_hint = false;
+                    Ok(RouteBoundedReply::Superseded { leader: observed }) => {
+                        preferred = Some(LeaderRoute::from_local_view(observed));
+                        continue;
+                    }
+                    Ok(RouteBoundedReply::Retired { leader: observed }) => {
+                        preferred = observed.map(LeaderRoute::from_local_view);
                         continue;
                     }
                     Err(_) => {
@@ -2421,7 +2030,6 @@ impl ConsensusConfigStore {
             };
             match reply {
                 ReadBarrierReply::Compatible => return Err(consensus_unavailable()),
-                ReadBarrierReply::NoQuorum => return Err(consensus_unavailable()),
                 ReadBarrierReply::Ready(log_id) => {
                     if let Some(log_id) = log_id {
                         self.wait_for_local_apply(log_id.index, deadline).await?;
@@ -2433,10 +2041,11 @@ impl ConsensusConfigStore {
                     opc_redaction::metrics::METRICS
                         .persist_stale_leader_rejections
                         .fetch_add(1, Ordering::Relaxed);
-                    preferred = next.filter(|candidate| {
-                        *candidate != leader && self.inner.members.contains(candidate)
-                    });
-                    preferred_from_hint = preferred.is_some();
+                    preferred = next
+                        .filter(|candidate| {
+                            *candidate != leader && self.inner.members.contains(candidate)
+                        })
+                        .map(|target| LeaderRoute::redirected(target, self.member_leader_view()));
                     if preferred.is_none() {
                         self.wait_for_route_refresh(leader, deadline).await?;
                     }
@@ -2713,12 +2322,6 @@ impl ConfigConsensusService {
                 {
                     return ConsensusWireResponse { result: Err(error) };
                 }
-                if matches!(
-                    request.family,
-                    ConsensusRpcFamily::AppendEntries | ConsensusRpcFamily::InstallSnapshot
-                ) {
-                    self.store.record_leader_contact(authenticated_sender);
-                }
                 self.store
                     .inner
                     .raft_handler
@@ -2924,87 +2527,6 @@ impl ConfigStore for ConsensusConfigStore {
     async fn preflight(&self) -> Result<PersistCapabilities, PersistError> {
         self.inner.backend.preflight().await
     }
-}
-
-/// Keep the observed start of the current leader role and proactively publish
-/// quorum-lease transitions. The admission fence itself computes its typed state
-/// on demand; this task keeps the never-acknowledged-leader bound current and
-/// makes transitions observable without waiting for a caller.
-fn start_quorum_lease_watchdog(store: &ConsensusConfigStore) {
-    let weak = Arc::downgrade(&store.inner);
-    let mut metrics = store.inner.raft.metrics();
-    let poll =
-        Duration::from_millis(DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis);
-    tokio::spawn(async move {
-        loop {
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            let (is_leader, term, millis_since_quorum_ack) = {
-                let current = metrics.borrow();
-                if current.running_state.is_err() {
-                    return;
-                }
-                (
-                    current.state == ServerState::Leader,
-                    current.current_term,
-                    current.millis_since_quorum_ack,
-                )
-            };
-            let store = ConsensusConfigStore { inner };
-            if is_leader {
-                // Refresh the observed start of this leader term before the
-                // evidence check (the never-acknowledged fallback uses it).
-                {
-                    let mut observed = store
-                        .inner
-                        .leader_since
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match *observed {
-                        Some((observed_term, _)) if observed_term == term => {}
-                        _ => *observed = Some((term, tokio::time::Instant::now())),
-                    }
-                }
-                match store.leader_quorum_evidence(
-                    ServerState::Leader,
-                    term,
-                    millis_since_quorum_ack,
-                ) {
-                    Some(millis_since_quorum_ack) => {
-                        store.record_quorum_lease_lost(millis_since_quorum_ack);
-                    }
-                    None => {
-                        // Recovery debounce: authority returns only after two
-                        // consecutive observations with a fresh acknowledgement
-                        // (age within one heartbeat flush), which keeps a
-                        // marginal quorum from flapping the fence.
-                        let heartbeat_millis =
-                            DURABLE_CONSENSUS_TIMING_PROFILE.append_entries_timeout_millis;
-                        let healthy = millis_since_quorum_ack
-                            .is_some_and(|millis| millis <= heartbeat_millis);
-                        store.observe_quorum_lease_recovery(healthy);
-                    }
-                }
-            } else {
-                *store
-                    .inner
-                    .leader_since
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                store.record_quorum_lease_available();
-            }
-            drop(store);
-            tokio::select! {
-                changed = metrics.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                }
-                _ = tokio::time::sleep(poll) => {}
-            }
-        }
-    });
 }
 
 #[cfg(test)]

@@ -29,22 +29,21 @@ pub(crate) use sqlite::run_backend_sqlite_with_timeout;
 mod storage;
 #[cfg(test)]
 pub(crate) use storage::SnapshotTestHooks;
-pub(crate) use storage::{SnapshotReadVerification, SnapshotWorkHooks};
+pub(crate) use storage::SnapshotWorkHooks;
 mod store;
 mod types;
 
 #[cfg(test)]
 mod capacity_tests;
 
+#[cfg(target_os = "linux")]
 pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
 
 pub use history::{ConfigHistoryLimits, ConfigHistoryRetention};
 
 pub use store::{
-    ConfigConsensusOpenError, ConfigConsensusStatus, ConfigFailoverState, ConfigFailoverStatus,
-    ConfigLocalAuthorityOutcome, ConfigQuorumLeaseState, ConsensusConfigStore,
-    CONFIG_CONSENSUS_UNPLANNED_FAILOVER_DETECTION_BOUND,
-    DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    ConfigConsensusOpenError, ConfigConsensusStatus, ConfigLocalAuthorityOutcome,
+    ConsensusConfigStore, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use types::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusClusterId,

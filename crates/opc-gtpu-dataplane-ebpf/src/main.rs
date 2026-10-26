@@ -75,7 +75,7 @@ use opc_gtpu_ebpf_common::trusted_traffic_observation_abi::{
 use opc_gtpu_ebpf_common::{
     apply_uplink_mtu_policy, build_uplink_encap_with_dscp_and_source_port, classify_gtpu,
     classify_udp_checksum, consumer_is_bound_to_attachment, control_block_flags_word,
-    decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_hand_off_port,
+    count_uplink_far_miss, decide_uplink_pmtu, downlink_frame_end, downlink_ipv4_hand_off_port,
     downlink_ipv6_exceeds_inner_mtu, downlink_parse_ipv4_total_length,
     downlink_parse_payload_offset, downlink_parse_teid, gtpu_session_config_wire_owns_local_ipv4,
     gtpu_session_config_wire_owns_local_ipv6, hand_off_assignment_keeps_datagram,
@@ -100,7 +100,7 @@ use opc_gtpu_ebpf_common::{
     COUNTER_DL_DST_MISMATCH, COUNTER_DL_MALFORMED, COUNTER_DL_MISSING_CONSUMER,
     COUNTER_DL_UNKNOWN_TEID, COUNTER_SLOTS, COUNTER_TFT_CLASSIFIER_CAPACITY,
     COUNTER_TFT_CLASSIFIER_INVALID_STATE, COUNTER_TFT_CLASSIFIER_MALFORMED,
-    COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_FAR_MISS, COUNTER_UL_MTU_REJECT,
+    COUNTER_TFT_CLASSIFIER_NO_MATCH, COUNTER_UL_ENCAP, COUNTER_UL_MTU_REJECT,
     COUNTER_UL_PMTU_CORRUPT, COUNTER_UL_REDIRECT_RESOLVED, DOWNLINK_BINDING_COUNTER_SLOTS,
     DOWNLINK_ENDPOINT_BINDING_VALUE_LEN, DOWNLINK_PDR_VALUE_LEN, ETH_HDR_LEN, ETH_P_IPV4,
     ETH_P_IPV6, GTPU_ENCAP_LEN, GTPU_FLAGS_V1_GPDU, GTPU_FLAG_E, GTPU_IPV6_ENCAP_LEN,
@@ -4004,7 +4004,7 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
         GTPU_ULM_FAR.get_ptr(marked_key)
     };
     let Some(far_ptr) = far_ptr else {
-        count(COUNTER_UL_FAR_MISS);
+        count_uplink_far_miss(mark, count);
         return Ok(non_encapsulation_action(mark));
     };
     // SAFETY: the map value outlives this program invocation and is only
@@ -4101,7 +4101,7 @@ fn try_legacy_uplink(ctx: &mut TcContext, mark: u32, eth_proto: u16) -> Result<i
         // this exact lookup provenance at the subprogram boundary, and a
         // concurrent owner removal must fail closed in either case.
         let Some(owner_ptr) = GTPU_M_OWNER.get_ptr(marked_key) else {
-            count(COUNTER_UL_FAR_MISS);
+            count_uplink_far_miss(mark, count);
             return Ok(TC_ACT_SHOT);
         };
         // SAFETY: the owner remains map-owned and read-only. Both halves are

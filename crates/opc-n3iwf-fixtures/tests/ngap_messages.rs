@@ -11,14 +11,14 @@ type Field = (u16, u8, Vec<u8>);
 
 fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
     macro_rules! view {
-        ($name:literal, $message:expr $(, $inner:tt)?) => {
+        ($name:literal, $message:expr) => {
             (
                 $name,
                 $message
                     .protocol_ies
                     .0
                     .iter()
-                    .map(|ie| (ie.id$(.$inner)?, ie.criticality as u8, ie.value.as_bytes().to_vec()))
+                    .map(|ie| (ie.id, ie.criticality as u8, ie.value.as_bytes().to_vec()))
                     .collect(),
             )
         };
@@ -29,7 +29,7 @@ fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
         Message::NgSetupFailure(value) => view!("NGSetupFailure", value),
         Message::InitialUeMessage(value) => view!("InitialUEMessage", value),
         Message::DownlinkNasTransport(value) => view!("DownlinkNASTransport", value),
-        Message::UplinkNasTransport(value) => view!("UplinkNASTransport", value, 0),
+        Message::UplinkNasTransport(value) => view!("UplinkNASTransport", value),
         Message::PduSessionResourceModifyRequest(value) => {
             view!("PDUSessionResourceModifyRequest", value)
         }
@@ -41,7 +41,7 @@ fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
         Message::NgResetAcknowledge(value) => view!("NGResetAcknowledge", value),
         Message::ErrorIndication(value) => view!("ErrorIndication", value),
         Message::NasNonDeliveryIndication(value) => view!("NASNonDeliveryIndication", value),
-        Message::UeContextReleaseRequest(value) => view!("UEContextReleaseRequest", value, 0),
+        Message::UeContextReleaseRequest(value) => view!("UEContextReleaseRequest", value),
         Message::InitialContextSetupRequest(value) => view!("InitialContextSetupRequest", value),
         Message::InitialContextSetupResponse(value) => view!("InitialContextSetupResponse", value),
         Message::InitialContextSetupFailure(value) => view!("InitialContextSetupFailure", value),
@@ -57,8 +57,8 @@ fn message_fields(message: &Message) -> (&'static str, Vec<Field>) {
         Message::PduSessionResourceReleaseResponse(value) => {
             view!("PDUSessionResourceReleaseResponse", value)
         }
-        Message::UeContextReleaseCommand(value) => view!("UEContextReleaseCommand", value, 0),
-        Message::UeContextReleaseComplete(value) => view!("UEContextReleaseComplete", value, 0),
+        Message::UeContextReleaseCommand(value) => view!("UEContextReleaseCommand", value),
+        Message::UeContextReleaseComplete(value) => view!("UEContextReleaseComplete", value),
         Message::Paging(_) | Message::Unknown(_) => panic!("reference outcome not dispatched"),
     }
 }
@@ -237,7 +237,7 @@ fn complete_reference_messages_exercise_every_sdk_typed_field() {
         assert_eq!(crit, criticality(&outer["criticality"]));
         let (message_name, observed) = message_fields(message);
         assert_eq!(message_name, case["message"].as_str().expect("message"));
-        let mut expected: Vec<Field> = case["encoded_ies"]
+        let expected: Vec<Field> = case["encoded_ies"]
             .as_array()
             .expect("IEs")
             .iter()
@@ -249,25 +249,6 @@ fn complete_reference_messages_exercise_every_sdk_typed_field() {
                 )
             })
             .collect();
-        // The id-SecurityKey payload is deliberately absent from the typed view:
-        // decoding moves it into the PDU's zeroizing custody and canonical
-        // encoding substitutes it back. The raw-preserving equality assertion
-        // below proves the exact bytes are still emitted.
-        let mut observed = observed;
-        for (id, _, value) in &mut expected {
-            if *id == 94 {
-                assert!(!value.is_empty(), "reference key IE must be nonempty");
-                value.clear();
-            }
-        }
-        for (id, _, value) in &mut observed {
-            if *id == 94 {
-                assert!(
-                    value.is_empty(),
-                    "security-key typed placeholder must be empty"
-                );
-            }
-        }
         assert!(
             observed == expected,
             "SDK typed fields differ from reference for {name}"
@@ -354,7 +335,7 @@ fn constructed_containers_match_every_independent_admitted_outcome() {
             .map(|(id, crit, value)| ProtocolIe::new(*id, *crit, value))
             .collect();
         let pdu = Pdu::from_protocol_ies(kind, &ies, DecodeContext::default()).expect("construct");
-        assert!(pdu.raw().is_empty());
+        assert!(pdu.raw.is_empty());
         let expected = octets(case["wire_hex"].as_str().expect("wire"));
         assert!(
             opc_proto_ngap::encode(&pdu, EncodeContext::default()).expect("encode") == expected,

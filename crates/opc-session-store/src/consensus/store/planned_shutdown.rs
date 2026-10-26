@@ -62,24 +62,33 @@ impl ConsensusRetirementCoordinator {
             // Automatic preparation reserves time for drain. Later callers
             // observe the first deadline and result, never extend or restart it.
             let mut timeout_reason = PlannedShutdownFallback::DeadlineElapsed;
-            let result = tokio::select! {
-                biased;
-                _ = unplanned.wait_for(|requested| *requested) => {
-                    Err(PlannedShutdownFallback::Unplanned)
-                }
-                result = tokio::time::timeout_at(
+            let result = select_preparation(&mut unplanned, async {
+                tokio::time::timeout_at(
                     deadline,
                     store.prepare_shutdown_before(deadline, &mut timeout_reason),
-                ) => result.unwrap_or(Err(timeout_reason)),
-            };
-            // The unplanned flag wins whenever it is set, including when it
-            // lands after the select resolved: a concurrent unplanned drain
-            // must never be reported as a handoff failure.
-            let result = prefer_unplanned(result, &unplanned);
+                )
+                .await
+                .unwrap_or(Err(timeout_reason))
+            })
+            .await;
             sender.send_replace(Some(result));
         });
         receiver
     }
+}
+
+async fn select_preparation(
+    unplanned: &mut tokio::sync::watch::Receiver<bool>,
+    preparation: impl std::future::Future<Output = RetirementResult>,
+) -> RetirementResult {
+    let result = tokio::select! {
+        biased;
+        _ = unplanned.wait_for(|requested| *requested) => {
+            Err(PlannedShutdownFallback::Unplanned)
+        }
+        result = preparation => result,
+    };
+    prefer_unplanned(result, unplanned)
 }
 
 impl ConsensusSessionStore {
@@ -433,5 +442,38 @@ mod tests {
             prefer_unplanned(Ok(PlannedShutdownOutcome::FollowerRetired), &receiver),
             Err(PlannedShutdownFallback::Unplanned)
         );
+    }
+    #[tokio::test]
+    async fn unplanned_request_racing_preparation_result_keeps_its_reason() {
+        for result in [
+            Err(PlannedShutdownFallback::NotAdmitted),
+            Err(PlannedShutdownFallback::DeadlineElapsed),
+            Ok(PlannedShutdownOutcome::FollowerRetired),
+        ] {
+            let (requested, mut unplanned) = tokio::sync::watch::channel(false);
+            let observed = select_preparation(&mut unplanned, async {
+                // The unplanned branch has already observed false in this
+                // poll. A concurrent request arrives as preparation finishes.
+                requested.send_replace(true);
+                result
+            })
+            .await;
+            assert_eq!(observed, Err(PlannedShutdownFallback::Unplanned));
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_result_without_unplanned_request_is_preserved() {
+        for result in [
+            Err(PlannedShutdownFallback::NotAdmitted),
+            Ok(PlannedShutdownOutcome::FollowerRetired),
+        ] {
+            let (requested, mut unplanned) = tokio::sync::watch::channel(false);
+            assert_eq!(
+                select_preparation(&mut unplanned, async { result }).await,
+                result
+            );
+            drop(requested);
+        }
     }
 }

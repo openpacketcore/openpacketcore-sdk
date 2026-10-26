@@ -505,28 +505,18 @@ impl<'a> ResourceSetupMessage<'a> {
         pdu.wire_len(output_context(ctx))
             .map_err(|_| invalid("resource setup container policy"))?;
         macro_rules! fields {
-            ($kind:ident, $value:ident) => {{
-                // The security-key IE value is no longer held in the generated
-                // typed view: it lives in the PDU's zeroizing owner. Substitute
-                // it back for admission while every other IE keeps its typed
-                // open-type bytes.
-                let mut key_values = pdu.security_key_values().iter();
+            ($kind:ident, $value:ident) => {
                 admit(
                     MessageType::$kind,
-                    $value.protocol_ies.0.iter().map(|ie| {
-                        let value = if ie.id == crate::constructed::SECURITY_KEY_IE_ID {
-                            key_values
-                                .next()
-                                .map_or(ie.value.as_bytes(), |value| value.as_slice())
-                        } else {
-                            ie.value.as_bytes()
-                        };
-                        (ie.id, ie.criticality as u8, value)
-                    }),
+                    $value
+                        .protocol_ies
+                        .0
+                        .iter()
+                        .map(|ie| (ie.id, ie.criticality as u8, ie.value.as_bytes())),
                     resource_types,
                     ctx,
                 )
-            }};
+            };
         }
         match &pdu.kind {
             PduKind::Initiating {

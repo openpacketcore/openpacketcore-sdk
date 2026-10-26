@@ -29,7 +29,7 @@ serde_json = { workspace = true }
 zeroize = { workspace = true }
 
 # SQLite with bundled static library (no system SQLite needed)
-rusqlite = { workspace = true, features = ["backup", "bundled", "hooks"] }
+rusqlite = { workspace = true, features = ["backup", "bundled", "hooks", "serialize"] }
 rand = { workspace = true }
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }

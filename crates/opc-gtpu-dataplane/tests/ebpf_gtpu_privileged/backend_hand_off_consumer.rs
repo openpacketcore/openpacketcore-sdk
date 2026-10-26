@@ -237,12 +237,9 @@ impl<'a> Silence<'a> {
             }
             assert!(
                 Instant::now() < deadline,
-                "{}",
-                super::DatapathTimeoutDiagnostics::new(context)
-                    .observe("missing-consumer tc drops", self.drops, counted)
-                    .observe("UDP input discarded", self.udp_input_errors, discarded)
-                    .observe("host reassembled", self.reassembled, host_reassembled())
-                    .render()
+                "{context}: tc counted {counted} missing-consumer drops, expected {}; UDP input discarded {discarded} datagrams, expected {}",
+                self.drops,
+                self.udp_input_errors
             );
             std::thread::sleep(Duration::from_millis(5));
         }

@@ -3,6 +3,9 @@ mod management_audit_authority;
 #[path = "../../opc-session-store/tests/support/formation_clock.rs"]
 mod formation_clock;
 
+#[path = "../../opc-session-store/tests/support/election_progress.rs"]
+mod election_progress;
+
 #[path = "consensus_openraft/fixture_formation.rs"]
 mod fixture_formation;
 
@@ -24,23 +27,18 @@ mod planned_shutdown;
 #[path = "consensus_openraft/member_repair.rs"]
 mod member_repair;
 
-#[cfg(target_os = "linux")]
-#[path = "consensus_openraft/quorum_lease.rs"]
-mod quorum_lease;
-
 #[cfg(feature = "dangerous-test-hooks")]
 #[path = "consensus_openraft/route_retirement.rs"]
 mod route_retirement;
 
-#[cfg(feature = "dangerous-test-hooks")]
-#[path = "consensus_openraft/failover_acceleration.rs"]
-mod failover_acceleration;
+#[path = "consensus_openraft/leader_rediscovery.rs"]
+mod leader_rediscovery;
 
 use quorum_admission::rolling_election;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -96,8 +94,6 @@ struct LoopbackPeer {
     compatibility: Option<opc_consensus::ConsensusCompatibility>,
     handler: Arc<tokio::sync::RwLock<Option<Arc<dyn ConsensusRpcHandler>>>>,
     enabled: Arc<AtomicBool>,
-    append_entries_delay_millis: Arc<AtomicU64>,
-    drop_append_entries_responses: Arc<AtomicBool>,
     drop_forward_responses: Arc<AtomicUsize>,
     forward_mutation_attempts: Arc<AtomicUsize>,
     stall_forward_mutation: Arc<AtomicBool>,
@@ -122,8 +118,6 @@ impl LoopbackPeer {
             compatibility: None,
             handler: Arc::new(tokio::sync::RwLock::new(None)),
             enabled: Arc::new(AtomicBool::new(true)),
-            append_entries_delay_millis: Arc::new(AtomicU64::new(0)),
-            drop_append_entries_responses: Arc::new(AtomicBool::new(false)),
             drop_forward_responses: Arc::new(AtomicUsize::new(0)),
             forward_mutation_attempts: Arc::new(AtomicUsize::new(0)),
             stall_forward_mutation: Arc::new(AtomicBool::new(false)),
@@ -150,29 +144,8 @@ impl LoopbackPeer {
         self.enabled.store(enabled, Ordering::SeqCst);
     }
 
-    /// Delay delivery of every AppendEntries (including heartbeats) sent
-    /// through this route. Used to model bounded process scheduling starvation
-    /// without changing the engine timing profile.
-    #[cfg(feature = "dangerous-test-hooks")]
-    fn delay_append_entries(&self, delay: std::time::Duration) {
-        self.append_entries_delay_millis.store(
-            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-            Ordering::SeqCst,
-        );
-    }
-
     fn drop_forward_responses(&self, count: usize) {
         self.drop_forward_responses.store(count, Ordering::SeqCst);
-    }
-
-    /// Drop AppendEntries responses after the target has processed the request.
-    /// This models a black-holed response path: a follower keeps its leader view
-    /// and lease from received heartbeats, while the leader accumulates no
-    /// quorum acknowledgement.
-    #[cfg(target_os = "linux")]
-    fn drop_append_entries_responses(&self, drop: bool) {
-        self.drop_append_entries_responses
-            .store(drop, Ordering::SeqCst);
     }
 
     #[cfg(feature = "dangerous-test-hooks")]
@@ -235,10 +208,6 @@ impl ConsensusPeer for LoopbackPeer {
     ) -> Result<opc_consensus::ConsensusCallResponse, ConsensusPeerError> {
         if !self.enabled.load(Ordering::SeqCst) {
             return Err(ConsensusPeerError::Unavailable);
-        }
-        let append_entries_delay = self.append_entries_delay_millis.load(Ordering::SeqCst);
-        if request.family == ConsensusRpcFamily::AppendEntries && append_entries_delay != 0 {
-            tokio::time::sleep(Duration::from_millis(append_entries_delay)).await;
         }
         if request.family == ConsensusRpcFamily::ForwardMutation {
             self.forward_mutation_attempts
@@ -387,15 +356,6 @@ impl ConsensusPeer for LoopbackPeer {
             self.release_forward_response.notified().await;
         }
         if family == ConsensusRpcFamily::ForwardMutation && take_one(&self.drop_forward_responses) {
-            return Err(ConsensusPeerError::Unavailable);
-        }
-        if family == ConsensusRpcFamily::AppendEntries
-            && self.drop_append_entries_responses.load(Ordering::SeqCst)
-        {
-            // The target has already processed the request (follower view,
-            // lease, log and commit state are updated); only its response is
-            // black-holed. The leader therefore accumulates no quorum
-            // acknowledgement while the follower keeps treating it as leader.
             return Err(ConsensusPeerError::Unavailable);
         }
         Ok(opc_consensus::ConsensusCallResponse {
@@ -620,21 +580,58 @@ impl ThreeNodeCluster {
     }
 
     async fn wait_ready(&self) {
-        tokio::time::timeout(CLUSTER_TRANSITION_TIMEOUT, async {
-            loop {
-                let (one, two, three) = tokio::join!(
-                    self.stores[0].probe_durable_readiness(),
-                    self.stores[1].probe_durable_readiness(),
-                    self.stores[2].probe_durable_readiness(),
-                );
-                if one.is_ok() && two.is_ok() && three.is_ok() {
-                    return;
+        let term = self
+            .stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(0);
+        election_progress::wait(
+            CLUSTER_TRANSITION_TIMEOUT,
+            term,
+            async {
+                loop {
+                    let (one, two, three) = tokio::join!(
+                        self.stores[0].probe_durable_readiness(),
+                        self.stores[1].probe_durable_readiness(),
+                        self.stores[2].probe_durable_readiness(),
+                    );
+                    if one.is_ok() && two.is_ok() && three.is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
+            },
+            |term| self.next_election_term(term),
+        )
         .await
         .expect("cluster ready");
+    }
+
+    async fn next_election_term(&self, term: u64) -> u64 {
+        #[cfg(feature = "dangerous-test-hooks")]
+        {
+            use futures_util::StreamExt;
+            let mut changes = self
+                .stores
+                .iter()
+                .map(|store| store.wait_for_raft_status_for_test(move |status| status.term > term))
+                .collect::<futures_util::stream::FuturesUnordered<_>>();
+            changes
+                .next()
+                .await
+                .expect("config voters")
+                .expect("live config engine during election wait");
+        }
+        #[cfg(not(feature = "dangerous-test-hooks"))]
+        while self.stores.iter().all(|store| store.status().term <= term) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.stores
+            .iter()
+            .map(|store| store.status().term)
+            .max()
+            .unwrap_or(term)
     }
 
     fn leader(&self) -> usize {

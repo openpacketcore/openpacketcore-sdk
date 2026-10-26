@@ -129,16 +129,26 @@ push, and commits already on a base branch other than `main` that has no pull
 request of its own. The push to `main` scans all of them; the daily scan covers
 branches.
 
-Each run makes two passes with the same pinned scanner. The primary pass reads
-`git log -p` over the pull request's exact range, the pushed commit's full
-reachable history, or all fetched refs; it covers ordinary commits and side
-branches. A second merge-only pass (`--merges -m --first-parent`) diffs merge
-commits against their first parent, so text that exists only in a merge
-commit's conflict resolution is scanned even though `git log -p` prints no diff
-for a merge commit. Both passes must complete cleanly, or report a findings
-count, for the scan to pass; a scan that did not complete is never clean. The
-merge-only pass adds coverage after a clean primary pass, and its report is
-`gitleaks-merge-report.json` in the runner temp directory.
+The ordinary `git log -p` walk scans every reachable parent in the event's scope,
+including side-branch changes removed before a merge. A separate full traversal
+examines every merge, including nested merges that a later merge removes. For
+two-parent merges, `git merge-tree --write-tree --allow-unrelated-histories`
+recreates the automatic merge without changing the worktree or index. A
+conflict-free result whose tree is identical to the recorded merge needs no
+second scan: its parent additions were already scanned with their original
+commit-scoped ignore fingerprints. This avoids re-reporting approved false
+positives merely because a clean merge copied them.
+
+Conflicted merges, merges with edits beyond the automatic result, and all
+octopus merges are scanned against their first parent with
+`--diff-merges=first-parent --no-walk`. They are batched only to bound argument
+size; every selected merge is scanned. Unexpected merge-tree failures or missing
+tree output fail the gate. All scanner passes retain their diagnostics and error
+checks, and merge scanning continues after ordinary findings. Finding reports
+contribute to one report and total finding count. Classification failures,
+non-finding scanner failures and malformed reports fail without publishing a
+combined count. As before, a scanner exit 2 retains its findings even if its log
+also contains an error; that run fails. No pass containing findings is a success.
 
 Scheduled runs (daily at 08:17 UTC) fetch and scan all branch and tag refs with
 the `.gitleaksignore` on `main`, including branches without pull requests.
@@ -150,8 +160,7 @@ scan step also fails when the scanner logs an error or does not log `no leaks fo
 That issue does not impose a merge hold on unrelated pull requests. Manual runs
 scan all refs like the scheduled run, with the dispatched commit's
 `.gitleaksignore`, and do not open an issue. Required workflow regressions in
-`ci/test-test-inventory.py` pin these scopes, the merge-commit diff pass, the
-merge-only-text fixture, and scheduled issue reporting.
+`ci/test-test-inventory.py` pin these scopes and scheduled issue reporting.
 
 A pull request is scanned with its own `.gitleaksignore`, so it can silence a
 finding that it adds. Review every change to `.gitleaksignore`, and any new
@@ -159,6 +168,11 @@ finding that it adds. Review every change to `.gitleaksignore`, and any new
 by commit, file, rule and line and says why the value is not a secret. Do not
 add path or rule allowlists. The scan emits a warning when either file changes;
 the warning does not fail the scan.
+
+A conflicted, manually edited, or octopus merge can repeat an approved false
+positive in its first-parent patch. Such a finding still needs an explicit
+fingerprint for that merge, with the same review as an ordinary finding; the
+scanner never broadens an exception from one commit to other commits.
 
 ## Test inventory guard
 
@@ -324,13 +338,23 @@ origin/main` to `HEAD`. Fetch the remote history first; a missing `origin/main`
 fails with guidance to fetch it. An explicit `--base` must be an ancestor of
 both the checked-out `HEAD` and `origin/main`. For example, `--base HEAD` is
 rejected on a branch with unmerged commits. A main-only or unrelated base is
-also rejected. This applies even when `--head` is supplied.
+also rejected. This applies even when `--head` is supplied, except for the
+explicit backlog-target comparison below.
 When both `--base` and `--head` are explicitly supplied, they must resolve to
 different commits, including when different refs name the same commit.
 Default, base-only and event comparisons with identical revisions pass as
 "nothing to compare", including local runs on unchanged main and train pushes
 at main's tip. Their JSON report sets `nothing_to_compare` to `true` and uses
 null inventory counts because no inventory comparison is needed.
+
+For a pull request into the integration branch, run
+`ci/test-inventory.py --base origin/backlog --head HEAD`. This narrowly named
+mode resolves the fetched `refs/remotes/origin/backlog` ref, requires it to be
+an ancestor of the comparison head, and requires that head to be in the
+checked-out history, as PR CI does. The full ref name is also accepted. Equal
+revisions, bare branch-only SHAs, other branch names and base-only invocations
+do not gain this exception. This qualifies the delta into `backlog`; the
+default main comparison remains necessary when landing that branch on main.
 
 Commit the candidate before comparing: the guard reads committed trees, not the
 working tree. For a historical proof, supply both `--base BASE` and `--head HEAD`;

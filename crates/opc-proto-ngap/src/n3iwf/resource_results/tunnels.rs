@@ -1,4 +1,5 @@
 use super::*;
+use crate::n3iwf::modify_fields::{read_transport, write_transport};
 use crate::n3iwf::reset_fields::{encode_root, Sink};
 
 /// Root mapping indication reported for one associated QoS flow.
@@ -231,19 +232,7 @@ pub(in crate::n3iwf) fn write_tunnel(
     value: &DownlinkQosTunnel,
 ) -> Result<(), EncodeError> {
     out.bits(0, 2)?;
-    out.bits(0, 4)?;
-    let address_bits = if value.downlink.address().is_ipv4() {
-        32
-    } else {
-        128
-    };
-    out.bits(address_bits - 1, 8)?;
-    out.align();
-    match value.downlink.address() {
-        IpAddr::V4(address) => write_octets(out, &address.octets())?,
-        IpAddr::V6(address) => write_octets(out, &address.octets())?,
-    }
-    write_octets(out, &value.downlink.teid().to_be_bytes())?;
+    write_transport(out, value.downlink.address(), value.downlink.teid())?;
     out.bits((value.accepted.len() - 1) as u16, 6)?;
     for flow in value.flows() {
         out.bits(u16::from(flow.mapping.is_some()) * 4, 4)?;
@@ -261,18 +250,8 @@ pub(in crate::n3iwf) fn read_tunnel(
     materialize: bool,
 ) -> Result<DownlinkQosTunnel, DecodeError> {
     reader.flags(2)?;
-    reader.flags(4)?;
-    let address_bits = reader.bits(8)? + 1;
-    if !matches!(address_bits, 32 | 128) {
-        return Err(unsupported());
-    }
-    reader.align()?;
-    let address = if address_bits == 32 {
-        IpAddr::V4(std::net::Ipv4Addr::from(read_octets::<4>(reader)?))
-    } else {
-        IpAddr::V6(std::net::Ipv6Addr::from(read_octets::<16>(reader)?))
-    };
-    let downlink = DownlinkTransport::new(address, u32::from_be_bytes(read_octets(reader)?));
+    let (address, teid) = read_transport(reader)?;
+    let downlink = DownlinkTransport::with_address(address, teid);
     let count = reader.count(6, 64, 10)?;
     let mut accepted = Vec::with_capacity(if materialize { count } else { 0 });
     let mut mappings = [None; 64];

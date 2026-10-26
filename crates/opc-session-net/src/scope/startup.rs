@@ -27,9 +27,9 @@ pub enum StartupError {
     /// The installed platform observation is definitively invalid.
     #[error("scope startup platform observation invalid")]
     PlatformInvalid,
-    /// The installed platform observation changed and no longer matches the
-    /// enrollment; retrying the same observation cannot succeed until the
-    /// platform and enrollment are reconciled.
+    /// The retained platform observation changed. Re-probe before deciding
+    /// whether the boot facts changed: an opaque resource-version update alone
+    /// can be reconciled by the same boot and never justifies a boot refusal.
     #[error("scope startup platform observation changed")]
     PlatformChanged,
     /// The trusted API definitively refused the issuer discovery or key-set
@@ -577,6 +577,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> StartupSession<S> {
             process: *self.process.boot.process_nonce(),
             key: self.process.boot.key_digest(),
         });
+        let mut notice_started = false;
         tokio::time::timeout_at(deadline, async {
             loop {
                 self.route
@@ -608,8 +609,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> StartupSession<S> {
                     return Err(StartupError::Invalid);
                 }
                 match header.kind {
-                    FrameKind::TicketNotice => {}
-                    FrameKind::BootRefusal => {
+                    FrameKind::TicketNotice => notice_started = true,
+                    FrameKind::BootRefusal if !notice_started => {
                         // One exact bounded refusal body, authenticated and
                         // revalidated before it can end the boot attempt.
                         let mut body = vec![0; header.payload_len];

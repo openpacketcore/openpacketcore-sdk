@@ -746,6 +746,15 @@ also report in-flight state before any Prepare is appended. Caller cancellation
 or deadline expiry does not release that reservation before definitive
 completion and durable reconciliation.
 
+Request reads of the table, provisional intent, snapshot evidence and applied
+frontier wait for strict publication within the original caller deadline. A
+quorum proof, liveness probe or dispatch does not restart that budget. Control
+replies read their state and supporting evidence at one durable cut. Only a
+transient publication interval is waited out; terminal writer failure and other
+storage errors remain refusals. A deadline after dispatch is an unknown outcome,
+not proof that the accepted work was cancelled. Opening and background
+reconciliation retain their explicit lifecycle policy without new read budgets.
+
 Use `W = 2 * DURABLE_OPENRAFT_PROFILE.election_timeout_max_millis` as the
 recent-traffic window, measured independently on each survivor's monotonic
 clock. Before proposing Prepare, query every reachable retained voter under

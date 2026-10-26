@@ -435,15 +435,28 @@ impl Drop for DiskRelease {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_recovery_cancelled_promise_owns_disk_until_shutdown_and_replacement() {
-    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(false).await;
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn protected_async_recovery_cancelled_promise_owns_disk_until_shutdown_and_replacement() {
-    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(true).await;
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(true, false).await;
 }
 
-async fn exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(protected: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_promise_deadline_observation_survives_host_delay() {
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_cancelled_promise_deadline_observation_survives_host_delay() {
+    exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(true, true).await;
+}
+
+async fn exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(
+    protected: bool,
+    delay_observation: bool,
+) {
     use crate::sqlite::consensus::wal::Point;
     let _timing = crate::acquire_consensus_timing_test_permit().await;
     let mut fleet = if protected {
@@ -487,47 +500,100 @@ async fn exercise_cancelled_promise_owns_disk_until_shutdown_and_replacement(pro
         );
         let peer = Arc::clone(&fleet.peers[0]);
         let request = tokio::spawn(async move { peer.call(request).await });
-        tokio::time::timeout(OPERATION_BOUND, hold.entered.notified())
-            .await
-            .unwrap();
+        let entered = Arc::clone(&hold);
+        clock::run(async move {
+            tokio::time::timeout(OPERATION_BOUND, entered.entered.notified())
+                .await
+                .unwrap();
+        })
+        .await;
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
         // Passive state remains observable while the accepted fsync is held.
         let observed = fleet.store(0).clone();
         let health = tokio::task::spawn_blocking(move || observed.persistence_health());
-        assert!(tokio::time::timeout(OPERATION_BOUND, health)
-            .await
-            .unwrap()
-            .unwrap()
-            .asynchronous
-            .unwrap()
-            .background_failure
-            .is_none());
-        let started = tokio::time::Instant::now();
-        assert!(control(&fleet, 0, Action::Prepare(round.clone()))
-            .await
-            .is_err());
-        assert!(started.elapsed() < OPERATION_BOUND * 2);
+        clock::run(async move {
+            assert!(tokio::time::timeout(OPERATION_BOUND, health)
+                .await
+                .unwrap()
+                .unwrap()
+                .asynchronous
+                .unwrap()
+                .background_failure
+                .is_none());
+        })
+        .await;
+        let peer = Arc::clone(&fleet.peers[0]);
+        let retry = wire(
+            fleet.store(0),
+            coordinator(&fleet),
+            SessionPersistenceMode::Async,
+            SessionConsensusRpcFamily::ReadBarrier,
+            &Request::new(Action::Prepare(round.clone())),
+        );
+        clock::run(async move {
+            let started = tokio::time::Instant::now();
+            let retry = peer.call(retry);
+            tokio::pin!(retry);
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            tokio::time::advance(OPERATION_BOUND - Duration::from_millis(1)).await;
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let rejected = retry.await.unwrap().result;
+            if delay_observation {
+                // Delay the observer, not the protocol timer or disk owner.
+                tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1_700)))
+                    .await
+                    .unwrap();
+            }
+            assert!(rejected.is_err());
+            assert_eq!(rejected, Err(SessionConsensusPeerError::Timeout));
+            assert!(started.elapsed() < OPERATION_BOUND * 2);
+            assert_eq!(started.elapsed(), OPERATION_BOUND);
+        })
+        .await;
         assert!(!fleet.store(0).inner.persistence_protocol.is_active());
 
         *fleet.peers[0].handler.write().await = None;
         let store = fleet.stores[0].take().unwrap();
-        let closed = tokio::spawn(async move { store.shutdown_with_closed_proof(false).await });
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        let observed = store.clone();
+        let progress = store.inner.private_wal.as_ref().unwrap().async_progress_for_test();
+        let mut closed = tokio::spawn(clock::complete(OPERATION_BOUND, async move {
+            store.shutdown_with_closed_proof(false).await
+        }));
+        // Draining is published when the native shutdown reaches its writer.
+        // The held authority write must still own that writer until release.
+        clock::watchdog(
+            async {
+                tokio::select! {
+                    biased;
+                    result = &mut closed => panic!("shutdown completed before disk release: {result:?}"),
+                    () = races::wait_for([progress], || {
+                        observed.persistence_health().storage_state == SessionStorageState::Draining
+                    }) => {}
+                }
+            },
+            "shutdown reaches the held native writer",
+        )
+        .await;
         assert!(
             !closed.is_finished(),
             "shutdown must join the accepted disk owner"
         );
+        drop(observed);
         assert!(
             fleet.open(0, SessionPersistenceMode::Async).await.is_err(),
             "replacement cannot acquire the still-owned root"
         );
         hold.release();
-        tokio::time::timeout(OPERATION_BOUND * 2, closed)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        clock::run(async move {
+            tokio::time::timeout(OPERATION_BOUND * 2, closed)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        })
+        .await;
         fleet.open(0, SessionPersistenceMode::Async).await.unwrap();
         assert!(control(&fleet, 0, Action::Prepare(round.clone()))
             .await

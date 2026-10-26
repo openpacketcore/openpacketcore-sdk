@@ -21,22 +21,25 @@ mod tests;
 /// snapshot, client timeout or detached cache cannot prove intent absence.
 #[async_trait]
 pub trait VoterSlotStateReader: Send + Sync + std::fmt::Debug {
-    /// Read one internally consistent strict-durability publication.
-    ///
-    /// The caller owns `deadline`; implementations may wait only while strict
-    /// publication is pending and must never start a new budget or timeout.
-    async fn read_voter_slot_state(
+    /// Read one internally consistent strict-durability publication under the
+    /// store's opening/reconciliation lifecycle policy, without a new request
+    /// budget. A separate pending publication may be refused immediately.
+    async fn read_voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError>;
+
+    /// Read within the original request deadline. Stores with a separate strict
+    /// publication boundary must wait only for that boundary, then recheck it.
+    /// Other storage errors remain refusals; a wakeup alone grants no authority.
+    async fn read_voter_slot_state_until(
         &self,
         deadline: Instant,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError>;
-
-    /// Read the current strict-durability publication without waiting.
-    ///
-    /// Opening and background reconciliation have no caller-owned budget. They
-    /// keep their existing non-waiting behavior and retry from their own loops.
-    async fn read_voter_slot_state_now(
-        &self,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError>;
+    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+        if Instant::now() >= deadline {
+            return Err(VoterReplacementError::Deadline);
+        }
+        tokio::time::timeout_at(deadline, self.read_voter_slot_state())
+            .await
+            .map_err(|_| VoterReplacementError::Deadline)?
+    }
 }
 
 /// The engine-owned response fence and its surrounding application lease boundary.
@@ -213,9 +216,7 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
         local: ConsensusNodeId,
         reader: Arc<dyn VoterSlotStateReader>,
     ) -> Result<Arc<Self>, VoterReplacementError> {
-        // Store opening has no caller-owned request budget. Preserve its
-        // existing immediate read; the open path already fails closed.
-        let durable = reader.read_voter_slot_state_now().await?;
+        let durable = reader.read_voter_slot_state().await?;
         let members = known_members(durable.table());
         if !members.contains(&local) && !durable.table().is_retired(local) {
             return Err(VoterReplacementError::UnauthorizedReplacement);
@@ -575,7 +576,7 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
                 if origin == VoterIntentOrigin::Leader
                     && runtime
                         .reader
-                        .read_voter_slot_state(deadline)
+                        .read_voter_slot_state_until(deadline)
                         .await?
                         .intent()
                         .is_some()
@@ -594,6 +595,7 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
             // Closed flags and the owned attempt retain the fence. Do not hold
             // the coordinator mutex while waiting for Raft: a higher-term
             // leader may need it to install the snapshot that resolves us.
+            let dispatched = prepared.is_ok();
             let response = match prepared {
                 Ok(()) => dispatch().await,
                 Err(error) => Err(error),
@@ -605,13 +607,15 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
                 }
             }
             let reconciled = runtime
-                .reconcile_locked(&mut receipts, Some(deadline))
+                .reconcile_locked_until(&mut receipts, Some(deadline))
                 .await;
             if reconciled.is_err() {
                 runtime.notify_durable_changed();
             }
             let _ = reply.send(match reconciled {
                 Ok(()) => response,
+                Err(_) if !dispatched => response,
+                Err(VoterReplacementError::Deadline) => Err(VoterReplacementError::OutcomeUnknown),
                 Err(error) => Err(error),
             });
         });
@@ -633,9 +637,7 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
             .get()
             .ok_or(VoterReplacementError::Unavailable)?;
         let target = target_of(request);
-        // The caller's original Prepare budget bounds the strict publication
-        // wait; do not restart it after the quorum proof or dispatch.
-        let durable = self.reader.read_voter_slot_state(deadline).await?;
+        let durable = self.reader.read_voter_slot_state_until(deadline).await?;
         if durable
             .intent()
             .is_some_and(|intent| !same_request(&intent.request, request))
@@ -699,7 +701,7 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
     /// Call outside engine storage callbacks; callbacks use `notify_durable_changed`.
     pub async fn reconcile(&self) -> Result<(), VoterReplacementError> {
         let mut receipts = self.serial.lock().await;
-        self.reconcile_locked(&mut receipts, None).await
+        self.reconcile_locked(&mut receipts).await
     }
 
     /// Fence a fully verified snapshot's retirement floors before engine installation.
@@ -720,10 +722,62 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, VoterReplacementError>> + Send + 'static,
     {
+        let result = self.start_snapshot(incoming, incoming_members, deadline, false, dispatch);
+        match tokio::time::timeout_at(deadline, result).await {
+            Ok(Ok(result)) => result,
+            _ => Err(VoterReplacementError::OutcomeUnknown),
+        }
+    }
+
+    /// Await the definitive result of an owned snapshot installation.
+    ///
+    /// This uses the same fencing and cancellation ownership as [`Self::run_snapshot`].
+    /// The deadline bounds admission and peer drains, while the dispatch future
+    /// must bound its storage work by progress or input size. Once dispatched,
+    /// installation is awaited even past the admission deadline. Reconciliation
+    /// then gets a separate bound equal to the original admission budget.
+    /// Use this in an owned transfer task whose RPC callers have separate deadlines,
+    /// so a retry can observe the eventual result without dispatching another install.
+    pub async fn run_snapshot_to_completion<T, F, Fut>(
+        self: &Arc<Self>,
+        incoming: VoterSlotTable,
+        incoming_members: BTreeSet<ConsensusNodeId>,
+        deadline: Instant,
+        dispatch: F,
+    ) -> Result<T, VoterReplacementError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, VoterReplacementError>> + Send + 'static,
+    {
+        self.start_snapshot(incoming, incoming_members, deadline, true, dispatch)
+            .await
+            .unwrap_or(Err(VoterReplacementError::OutcomeUnknown))
+    }
+
+    fn start_snapshot<T, F, Fut>(
+        self: &Arc<Self>,
+        incoming: VoterSlotTable,
+        incoming_members: BTreeSet<ConsensusNodeId>,
+        deadline: Instant,
+        reconcile_after_completion: bool,
+        dispatch: F,
+    ) -> oneshot::Receiver<Result<T, VoterReplacementError>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, VoterReplacementError>> + Send + 'static,
+    {
         let runtime = self.clone();
+        let admission_budget = deadline.saturating_duration_since(Instant::now());
         let (reply, result) = oneshot::channel();
         tokio::spawn(async move {
-            let mut receipts = runtime.serial.lock().await;
+            let Ok(mut receipts) = tokio::time::timeout_at(deadline, runtime.serial.lock()).await
+            else {
+                let _ = reply.send(Err(VoterReplacementError::Deadline));
+                return;
+            };
+            let mut dispatched = false;
             let response = async {
                 if Instant::now() >= deadline {
                     return Err(VoterReplacementError::Deadline);
@@ -732,11 +786,18 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
                     .engine
                     .get()
                     .ok_or(VoterReplacementError::Unavailable)?;
-                let current = runtime.reader.read_voter_slot_state(deadline).await?;
+                let current = tokio::time::timeout_at(
+                    deadline,
+                    runtime.reader.read_voter_slot_state_until(deadline),
+                )
+                .await
+                .map_err(|_| VoterReplacementError::Deadline)??;
                 incoming
                     .validate_successor_of(current.table())
                     .map_err(|_| VoterReplacementError::InvalidTransition)?;
-                let mut effective = engine.effective_members().await?;
+                let mut effective = tokio::time::timeout_at(deadline, engine.effective_members())
+                    .await
+                    .map_err(|_| VoterReplacementError::Deadline)??;
                 effective.extend(incoming_members);
                 let incoming_state = VoterSlotDurableState::new(incoming.clone())
                     .map_err(|_| VoterReplacementError::InvalidTransition)?;
@@ -798,27 +859,44 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
                 // Closed flags exclude new work; release write guards before the
                 // engine call, whose normal replication may involve admitted peers.
                 drop(drains);
+                if Instant::now() >= deadline {
+                    return Err(VoterReplacementError::Deadline);
+                }
+                dispatched = true;
                 dispatch().await
             }
             .await;
+            let reconciliation_deadline = if reconcile_after_completion {
+                Instant::now()
+                    .checked_add(admission_budget)
+                    .unwrap_or(deadline)
+            } else {
+                deadline
+            };
             let reconciled = runtime
-                .reconcile_locked(&mut receipts, Some(deadline))
+                .reconcile_locked_until(&mut receipts, Some(reconciliation_deadline))
                 .await;
             if reconciled.is_err() {
                 runtime.notify_durable_changed();
             }
             let _ = reply.send(match reconciled {
                 Ok(()) => response,
+                Err(_) if !dispatched => response,
+                Err(VoterReplacementError::Deadline) => Err(VoterReplacementError::OutcomeUnknown),
                 Err(error) => Err(error),
             });
         });
-        match tokio::time::timeout_at(deadline, result).await {
-            Ok(Ok(result)) => result,
-            _ => Err(VoterReplacementError::OutcomeUnknown),
-        }
+        result
     }
 
     async fn reconcile_locked(
+        &self,
+        receipts: &mut BTreeMap<ConsensusNodeId, E::Receipt>,
+    ) -> Result<(), VoterReplacementError> {
+        self.reconcile_locked_until(receipts, None).await
+    }
+
+    async fn reconcile_locked_until(
         &self,
         receipts: &mut BTreeMap<ConsensusNodeId, E::Receipt>,
         deadline: Option<Instant>,
@@ -827,12 +905,13 @@ impl<E: VoterResponseFenceEngine> VoterAdmission<E> {
             .engine
             .get()
             .ok_or(VoterReplacementError::Unavailable)?;
-        // Owned post-dispatch reconciliation inherits the caller's original
-        // budget. Background reconciliation and engine attachment have no
-        // caller budget and keep their existing non-waiting open lifecycle.
+        // Ordinary RPC operations retain their original caller deadline;
+        // owned snapshot completion supplies its separately bounded phase.
+        // Background reconciliation and engine attachment have no caller
+        // budget and keep their existing non-waiting open lifecycle.
         let durable = match deadline {
-            Some(deadline) => self.reader.read_voter_slot_state(deadline).await?,
-            None => self.reader.read_voter_slot_state_now().await?,
+            Some(deadline) => self.reader.read_voter_slot_state_until(deadline).await?,
+            None => self.reader.read_voter_slot_state().await?,
         };
         let effective = engine.effective_members().await?;
         let mut needed = durable.engine_fences(&effective);
