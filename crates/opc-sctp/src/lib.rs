@@ -297,6 +297,7 @@ pub enum DeliveryOrder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SctpAuthenticationConfig {
     authenticate_forward_tsn: bool,
+    prefer_sha256: bool,
 }
 
 impl SctpAuthenticationConfig {
@@ -305,7 +306,18 @@ impl SctpAuthenticationConfig {
     pub const fn data() -> Self {
         Self {
             authenticate_forward_tsn: false,
+            prefer_sha256: false,
         }
+    }
+
+    /// Prefer HMAC-SHA-256 while retaining RFC 4895's required SHA-1 fallback.
+    ///
+    /// Applied and read back before association setup. The kernel must support
+    /// SHA-256; failure is returned rather than silently retaining its defaults.
+    #[must_use]
+    pub const fn with_sha256_preference(mut self) -> Self {
+        self.prefer_sha256 = true;
+        self
     }
 
     /// Also require FORWARD-TSN authentication for partial-reliability use.
@@ -336,6 +348,39 @@ fn validate_peer_authenticated_chunks(
         if !peer_chunks.contains(&chunk_type) {
             return Err(SctpError::PeerAuthenticationChunkUnavailable { chunk_type });
         }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_local_authentication(
+    authentication: SctpAuthenticationConfig,
+    chunks: &[u8],
+    hmac_identifiers: &[u16],
+) -> io::Result<()> {
+    validate_local_authenticated_chunks(authentication, chunks)?;
+    if authentication.prefer_sha256 && hmac_identifiers != [3, 1] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SCTP authentication readback mismatch",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_local_authenticated_chunks(
+    authentication: SctpAuthenticationConfig,
+    chunks: &[u8],
+) -> io::Result<()> {
+    if authentication
+        .chunk_types()
+        .any(|chunk| !chunks.contains(&chunk))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SCTP local authenticated chunk readback mismatch",
+        ));
     }
     Ok(())
 }
@@ -3266,6 +3311,11 @@ impl SctpAssociation {
         self.imp.authenticates_data_chunks()
     }
 
+    /// Read the kernel's local authenticated-chunk requirements for this association.
+    pub fn local_authenticated_chunks(&self) -> Result<Vec<u8>, SctpError> {
+        self.imp.local_authenticated_chunks()
+    }
+
     /// Maximum reassembled user-message bytes accepted by this association.
     #[must_use]
     pub fn max_message_bytes(&self) -> usize {
@@ -4225,6 +4275,11 @@ mod platform {
             self.authentication.is_some()
         }
 
+        pub fn local_authenticated_chunks(&self) -> Result<Vec<u8>, SctpError> {
+            opc_libsctp_sys::local_authenticated_chunks(self.socket.fd.get_ref().as_fd(), 0)
+                .map_err(|source| auth_io_err("local_authenticated_chunks", source))
+        }
+
         pub fn max_message_bytes(&self) -> usize {
             self.socket.max_message_bytes
         }
@@ -4953,10 +5008,15 @@ mod platform {
         if let Some(authentication) = authentication {
             opc_libsctp_sys::set_authentication_enabled(fd, true)
                 .map_err(|source| auth_io_err("enable_authentication", source))?;
+            if authentication.prefer_sha256 {
+                opc_libsctp_sys::set_hmac_identifiers(fd, &[3, 1])
+                    .map_err(|source| auth_io_err("set_hmac_identifiers", source))?;
+            }
             for chunk_type in authentication.chunk_types() {
                 opc_libsctp_sys::require_authenticated_chunk(fd, chunk_type)
                     .map_err(|source| auth_io_err("require_authenticated_chunk", source))?;
             }
+            require_local_authentication(fd, authentication)?;
         }
         opc_libsctp_sys::set_initmsg(fd, sys_init(init))
             .map_err(|source| io_err("set_initmsg", source))?;
@@ -5016,7 +5076,25 @@ mod platform {
         }?;
         let peer_chunks = opc_libsctp_sys::peer_authenticated_chunks(fd, 0)
             .map_err(|source| auth_io_err("peer_authenticated_chunks", source))?;
-        validate_peer_authenticated_chunks(authentication, &peer_chunks)
+        validate_peer_authenticated_chunks(authentication, &peer_chunks)?;
+        let local_chunks = opc_libsctp_sys::local_authenticated_chunks(fd, 0)
+            .map_err(|source| auth_io_err("local_authenticated_chunks", source))?;
+        // Linux accept creates a fresh endpoint; HMAC_IDENT there is not the
+        // association's inherited HMAC list. That list was verified before listen.
+        validate_local_authenticated_chunks(authentication, &local_chunks)
+            .map_err(|source| auth_io_err("local_authenticated_chunks", source))
+    }
+
+    fn require_local_authentication(
+        fd: std::os::fd::BorrowedFd<'_>,
+        authentication: SctpAuthenticationConfig,
+    ) -> Result<(), SctpError> {
+        let chunks = opc_libsctp_sys::local_authenticated_chunks(fd, 0)
+            .map_err(|source| auth_io_err("local_authenticated_chunks", source))?;
+        let identifiers = opc_libsctp_sys::hmac_identifiers(fd)
+            .map_err(|source| auth_io_err("hmac_identifiers", source))?;
+        validate_local_authentication(authentication, &chunks, &identifiers)
+            .map_err(|source| auth_io_err("authentication_readback", source))
     }
 
     pub(super) fn record_remote_submission_result(
@@ -5148,6 +5226,10 @@ mod platform {
         pub fn authenticates_data_chunks(&self) -> bool {
             let _ = self;
             false
+        }
+
+        pub fn local_authenticated_chunks(&self) -> Result<Vec<u8>, SctpError> {
+            Err(SctpError::UnsupportedPlatform)
         }
 
         pub fn max_message_bytes(&self) -> usize {
@@ -5577,6 +5659,31 @@ mod tests {
             &[SCTP_FORWARD_TSN_CHUNK_TYPE, SCTP_DATA_CHUNK_TYPE]
         )
         .is_ok());
+    }
+
+    #[test]
+    fn local_authentication_readback_requires_chunks_and_exact_requested_hmac_order() {
+        let ordinary = SctpAuthenticationConfig::data();
+        let preferred = ordinary.with_forward_tsn().with_sha256_preference();
+        assert!(validate_local_authentication(ordinary, &[0], &[1]).is_ok());
+        assert!(validate_local_authentication(preferred, &[0, 192], &[3, 1]).is_ok());
+        assert!(validate_local_authentication(preferred, &[192, 0, 193], &[3, 1]).is_ok());
+        for chunks in [&[][..], &[0], &[192]] {
+            assert_eq!(
+                validate_local_authentication(preferred, chunks, &[3, 1])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for hmac in [&[][..], &[1], &[1, 3], &[3]] {
+            assert_eq!(
+                validate_local_authentication(preferred, &[0, 192], hmac)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]
@@ -7771,7 +7878,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Linux kernel SCTP-AUTH and sender-dry support"]
     async fn loopback_authenticated_association_switches_keys_and_drains() {
-        let authentication = SctpAuthenticationConfig::data();
+        let authentication = SctpAuthenticationConfig::data().with_sha256_preference();
         let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
         // Lifecycle notifications must remain intact even when the caller's
         // DATA cap is smaller than every typed notification.
@@ -7793,6 +7900,12 @@ mod tests {
             .unwrap();
         assert!(client.is_pristine_rfc6083_auth_state());
         assert!(accepted.is_pristine_rfc6083_auth_state());
+        for association in [&client, &accepted] {
+            assert!(association
+                .local_authenticated_chunks()
+                .unwrap()
+                .contains(&SCTP_DATA_CHUNK_TYPE));
+        }
 
         let first_key_id = SctpAuthKeyId::new(1).unwrap();
         client
