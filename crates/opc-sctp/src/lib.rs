@@ -10,8 +10,9 @@
 //!
 //! Each Linux socket reuses one bounded 64 KiB receive scratch allocation.
 //! One-to-many callers share its async ownership gate; one-to-one associations
-//! retain their wider receive/event ordering gate. Returned payloads own only
-//! the received prefix, and that prefix is zeroized in the reusable scratch
+//! retain their wider receive/event ordering gate. Returned payloads keep a
+//! wiping owner until their final `Bytes` reference is dropped. Their received
+//! prefix is also zeroized in the reusable scratch
 //! before the receive operation completes. Partial DATA stays socket-owned
 //! across receive cancellation and non-lifecycle notifications, with the same
 //! cumulative byte bound. Close clears it without waiting for receive polling.
@@ -26,6 +27,8 @@
 
 mod data_chunk;
 mod lifecycle;
+mod receive_payload;
+use receive_payload::ReceivePayload;
 pub mod n2;
 pub use data_chunk::{DataChunk, DataChunkError, DataChunkFlags};
 pub use lifecycle::{
@@ -46,15 +49,12 @@ use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
-#[cfg_attr(not(any(target_os = "linux", test)), allow(unused_imports))]
 use bytes::Bytes;
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
-use opc_protocol::SensitiveBytes;
 use thiserror::Error;
 #[cfg(target_os = "linux")]
 use zeroize::Zeroize;
-#[cfg_attr(not(any(target_os = "linux", test)), allow(unused_imports))]
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
@@ -642,7 +642,7 @@ fn invalid_receive_scratch_error() -> SctpError {
 #[cfg(target_os = "linux")]
 struct ReceiveAccumulator {
     max_message_bytes: usize,
-    payload: BytesMut,
+    payload: ReceivePayload,
     first_received: Option<opc_libsctp_sys::Received>,
     payload_truncated: bool,
     control_truncated: bool,
@@ -653,7 +653,7 @@ impl ReceiveAccumulator {
     fn new(max_message_bytes: usize) -> Self {
         Self {
             max_message_bytes,
-            payload: BytesMut::new(),
+            payload: ReceivePayload::default(),
             first_received: None,
             payload_truncated: false,
             control_truncated: false,
@@ -756,8 +756,7 @@ impl ReceiveAccumulator {
             {
                 return Err(invalid_record_error());
             }
-            let mut notification = BytesMut::with_capacity(received.bytes);
-            notification.extend_from_slice(received_prefix);
+            let notification = ReceivePayload::copy_from_slice(received_prefix);
             return Ok(Some(map_recv(received, notification)));
         }
 
@@ -781,7 +780,8 @@ impl ReceiveAccumulator {
         let first = self.first_received.get_or_insert(received);
         self.payload_truncated |= received.flags.payload_truncated;
         self.control_truncated |= received.flags.control_truncated;
-        self.payload.extend_from_slice(received_prefix);
+        self.payload
+            .extend_from_slice(received_prefix, self.max_message_bytes);
 
         if received.flags.end_of_record {
             let mut complete = *first;
@@ -828,13 +828,6 @@ fn same_record_metadata(
         }
         (None, None) => true,
         _ => false,
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for ReceiveAccumulator {
-    fn drop(&mut self) {
-        self.payload.as_mut().zeroize();
     }
 }
 
@@ -1142,9 +1135,6 @@ impl SctpConnectConfig {
 }
 
 /// Outbound SCTP message metadata and payload.
-///
-/// `Debug` reports only the payload length: caller-provided payloads may
-/// contain sensitive protocol data and must never be formatted.
 #[derive(Clone)]
 pub struct OutboundMessage {
     /// Payload bytes.
@@ -1488,9 +1478,9 @@ impl DiameterSctpPeer {
     pub fn inbound_payload<'a>(
         &self,
         message: &'a InboundMessage,
-    ) -> Result<&'a [u8], DiameterSctpError> {
+    ) -> Result<&'a Bytes, DiameterSctpError> {
         self.validate_inbound_message(message)?;
-        Ok(message.payload.as_slice())
+        Ok(&message.payload)
     }
 
     /// Open a live SDK SCTP association to this Diameter peer.
@@ -1840,12 +1830,7 @@ impl DiameterSctpAssociation {
                 "accepted legacy inbound Diameter SCTP PPID 0"
             );
         }
-        // Diameter payloads are caller-owned Diameter PDUs, not N2 key
-        // material. Materialize a caller-owned Bytes handle at this legacy
-        // convenience boundary; the SCTP-owned carrier still clears itself.
-        Ok(DiameterSctpInbound::Payload(Bytes::copy_from_slice(
-            message.payload.as_slice(),
-        )))
+        Ok(DiameterSctpInbound::Payload(message.payload))
     }
 
     /// Receive one Diameter payload after SCTP metadata validation.
@@ -2373,10 +2358,8 @@ impl fmt::Debug for SctpPathHealth {
 
 /// Inbound SCTP message metadata and payload.
 ///
-/// The payload is a uniquely owned [`SensitiveBytes`] buffer that is zeroized
-/// when the message is dropped. It is deliberately not `Clone`: duplicating a
-/// received payload must be an explicit, visible copy with its own custody.
-/// `Debug` reports only the payload length.
+/// Diagnostics report only payload length. Live payload storage is cleared when
+/// its final Bytes reference is dropped, including references held across N2 admission.
 ///
 /// ```compile_fail
 /// fn requires_clone<T: Clone>(_: &T) {}
@@ -2385,8 +2368,9 @@ impl fmt::Debug for SctpPathHealth {
 /// }
 /// ```
 pub struct InboundMessage {
-    /// Owned payload bytes, zeroized when the message is dropped.
-    pub payload: SensitiveBytes,
+    /// Payload bytes. Live receives retain a wiping owner until the last Bytes
+    /// reference is dropped. A caller-supplied Bytes retains its original owner.
+    pub payload: Bytes,
     /// SCTP stream identifier.
     pub stream_id: u16,
     /// Payload protocol identifier.
@@ -3716,7 +3700,7 @@ fn sys_send_info(message: &OutboundMessage) -> opc_libsctp_sys::SendInfo {
 }
 
 #[cfg(target_os = "linux")]
-fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMessage {
+fn map_recv(received: opc_libsctp_sys::Received, buffer: ReceivePayload) -> InboundMessage {
     let info = received.info.unwrap_or(opc_libsctp_sys::RecvInfo {
         stream_id: 0,
         ssn: 0,
@@ -3733,12 +3717,12 @@ fn map_recv(received: opc_libsctp_sys::Received, buffer: BytesMut) -> InboundMes
         DeliveryOrder::Ordered
     };
     let event = if received.flags.notification {
-        parse_sctp_event(&buffer)
+        parse_sctp_event(buffer.as_ref())
     } else {
         None
     };
     InboundMessage {
-        payload: SensitiveBytes::from_bytes_mut(buffer),
+        payload: buffer.into_bytes(),
         stream_id: info.stream_id,
         ppid: PayloadProtocolIdentifier::from_network_order(info.ppid_network_order),
         order,
@@ -5289,7 +5273,7 @@ mod tests {
 
     fn diameter_inbound(ppid: PayloadProtocolIdentifier) -> InboundMessage {
         InboundMessage {
-            payload: SensitiveBytes::from_slice(b"diameter"),
+            payload: Bytes::from_static(b"diameter"),
             stream_id: DIAMETER_DEFAULT_STREAM_ID,
             ppid,
             order: DeliveryOrder::Ordered,
@@ -5628,6 +5612,137 @@ mod tests {
         let _ = endpoint as fn(&SctpEndpoint);
         let _ = association as fn(&SctpAssociation);
         let _ = receive_half as fn(&mut SctpAssociationReceiveHalf);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn security_key_ownership_received_payload_keeps_its_zeroizing_owner() {
+        for payload in [vec![0xab; 32], b"ngap-without-key".to_vec()] {
+            let mut accumulator = ReceiveAccumulator::new(1024);
+            let message = accumulator
+                .push(
+                    synthetic_received(
+                        payload.len(),
+                        1,
+                        NGAP_PPID,
+                        7,
+                        synthetic_recv_flags(false, true, false, false),
+                    ),
+                    &payload,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.payload.as_ref(), payload.as_slice());
+            // An owner-backed Bytes cannot shed its wiping destructor by
+            // becoming an ordinary uniquely-owned BytesMut.
+            assert!(message.payload.try_into_mut().is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn security_key_ownership_sctp_and_n2_handoff_wipe_the_last_payload_owner() {
+        for payload in [vec![0xab; 32], b"ngap-without-key".to_vec()] {
+            receive_payload::audit::take();
+            let mut accumulator = ReceiveAccumulator::new(1024);
+            let message = accumulator
+                .push(
+                    synthetic_received(
+                        payload.len(),
+                        1,
+                        NGAP_PPID,
+                        7,
+                        synthetic_recv_flags(false, true, false, false),
+                    ),
+                    &payload,
+                )
+                .unwrap()
+                .unwrap();
+            receive_payload::audit::take();
+            let pointer = message.payload.as_ptr() as usize;
+            let n2::N2Inbound::Payload(admitted) = n2::UnprotectedN2Profile::new(1024)
+                .unwrap()
+                .admit(message)
+                .unwrap()
+            else {
+                panic!("DATA payload");
+            };
+            let bytes = admitted.into_payload();
+            let retained = bytes.clone();
+            drop(bytes);
+            assert!(receive_payload::audit::take().is_empty());
+            assert_eq!(retained.as_ref(), payload.as_slice());
+            drop(retained);
+            assert_eq!(
+                receive_payload::audit::take(),
+                vec![(pointer, payload.len(), true)]
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn security_key_ownership_partial_receive_growth_and_rejection_wipe_storage() {
+        receive_payload::audit::take();
+        let mut accumulator = ReceiveAccumulator::new(128);
+        let first = [0xab; 32];
+        assert!(accumulator
+            .push(
+                synthetic_received(
+                    32,
+                    1,
+                    NGAP_PPID,
+                    7,
+                    synthetic_recv_flags(false, false, false, false)
+                ),
+                &first,
+            )
+            .unwrap()
+            .is_none());
+        let old_pointer = accumulator.payload.as_ref().as_ptr() as usize;
+        receive_payload::audit::take();
+        let message = accumulator
+            .push(
+                synthetic_received(
+                    64,
+                    1,
+                    NGAP_PPID,
+                    7,
+                    synthetic_recv_flags(false, true, false, false),
+                ),
+                &[0xcd; 64],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receive_payload::audit::take(),
+            vec![(old_pointer, 32, true)]
+        );
+        let pointer = message.payload.as_ptr() as usize;
+        assert!(n2::UnprotectedN2Profile::new(32)
+            .unwrap()
+            .admit(message)
+            .is_err());
+        assert_eq!(receive_payload::audit::take(), vec![(pointer, 96, true)]);
+
+        let mut partial = ReceiveAccumulator::new(128);
+        assert!(partial
+            .push(
+                synthetic_received(
+                    32,
+                    1,
+                    NGAP_PPID,
+                    7,
+                    synthetic_recv_flags(false, false, false, false)
+                ),
+                &first,
+            )
+            .unwrap()
+            .is_none());
+        let pointer = partial.payload.as_ref().as_ptr() as usize;
+        receive_payload::audit::take();
+        drop(partial);
+        assert_eq!(receive_payload::audit::take(), vec![(pointer, 32, true)]);
     }
 
     #[cfg(target_os = "linux")]
