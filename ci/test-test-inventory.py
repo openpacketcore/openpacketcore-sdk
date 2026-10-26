@@ -676,6 +676,248 @@ class RepositoryWorkflowTests(unittest.TestCase):
                 self.assertNotEqual(run(status).returncode, 0)
 
 
+class AdvisoryWorkflowTests(unittest.TestCase):
+    REGISTRY = 'registry+https://github.com/rust-lang/crates.io-index'
+
+    def setUp(self):
+        root = Path(__file__).resolve().parents[1]
+        path = '.github/workflows/security.yml'
+        workflow = documents({path: (root / path).read_text()})[path]
+        self.step = next(step for step in workflow['jobs']['rust-advisories']['steps']
+                         if step['name'] == 'Run cargo audit')
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo = self.root / 'checkout'
+        self.repo.mkdir()
+        subprocess.run(['git', 'init', '-q', str(self.repo)], check=True)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.record = self.root / 'calls.jsonl'
+        self.env = {**os.environ, 'PATH': str(self.bin) + os.pathsep + os.environ['PATH'],
+                    'RUNNER_TEMP': str(self.root), 'ADVISORY_CALLS': str(self.record),
+                    'ADVISORY_METADATA': json.dumps({'packages': [], 'resolve': {'nodes': []}})}
+        cargo = self.bin / 'cargo'
+        cargo.write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ['ADVISORY_CALLS'], 'a') as output:
+    output.write(json.dumps(args) + '\\n')
+operation = args[0]
+if operation == 'metadata':
+    print(os.environ['ADVISORY_METADATA'])
+elif operation == 'audit':
+    lock = args[args.index('--file') + 1] if '--file' in args else 'Cargo.lock'
+    if lock == os.environ.get('FAIL_AUDIT_LOCK'):
+        raise SystemExit(17)
+    # Model the ID-wide ignore: a vulnerable bigint alone does not fail audit.
+    print('audit accepted configured exceptions')
+elif operation == 'fetch':
+    if os.environ.get('FAIL_FETCH'):
+        raise SystemExit(19)
+else:
+    raise SystemExit('unexpected cargo command: ' + repr(args))
+''')
+        cargo.chmod(0o755)
+        self.write('crates/opc-proto-ikev2/Cargo.toml',
+                   '[dependencies]\ncrypto-bigint = { version = "0.7.10" }\n')
+        self.write('.cargo/audit.toml', '[advisories]\nignore = ["RUSTSEC-2026-0387"]\n')
+        self.lock('Cargo.lock')
+
+    def write(self, name, content):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        subprocess.run(['git', '-C', str(self.repo), 'add', '--', name], check=True)
+
+    def lock(self, name, version='0.7.10', source=None):
+        source = self.REGISTRY if source is None else source
+        if version == '0.5.5' and source == self.REGISTRY:
+            self.graph_lock(name, self.legacy_graph())
+        else:
+            self.write(name, 'version = 4\n[[package]]\nname = "crypto-bigint"\n'
+                       f'version = {json.dumps(version)}\nsource = {json.dumps(source)}\n')
+
+    def graph_lock(self, name, metadata):
+        packages = {package['id']: package for package in metadata['packages']}
+        nodes = {node['id']: node for node in metadata['resolve']['nodes']}
+        parts = ['version = 4']
+        for identifier, package in packages.items():
+            parts.extend(['[[package]]', f'name = {json.dumps(package["name"])}',
+                          f'version = {json.dumps(package["version"])}'])
+            if package['source'] is not None:
+                parts.append(f'source = {json.dumps(package["source"])}')
+            dependencies = []
+            for edge in nodes.get(identifier, {}).get('deps', []):
+                dependency = packages[edge['pkg']]
+                dependencies.append(f'{dependency["name"]} {dependency["version"]}')
+            parts.append(f'dependencies = {json.dumps(dependencies)}')
+        self.write(name, '\n'.join(parts) + '\n')
+
+    def legacy_graph(self):
+        versions = {'crypto-bigint': '0.5.5', 'elliptic-curve': '0.13.8', 'ecdsa': '0.16.9',
+                    'primeorder': '0.13.6', 'p256': '0.13.2', 'p384': '0.13.1',
+                    'dimpl': '0.7.2', 'opc-diameter-transport': '0.2.0'}
+        paths = {'dimpl': 'vendor/dimpl/Cargo.toml',
+                 'opc-diameter-transport': 'crates/opc-diameter-transport/Cargo.toml'}
+        packages = [{'id': name, 'name': name, 'version': version,
+                     'source': None if name in paths else self.REGISTRY,
+                     'manifest_path': str(self.repo / paths.get(name, f'registry/{name}/Cargo.toml'))}
+                    for name, version in versions.items()]
+        parents = {'crypto-bigint': ['elliptic-curve'],
+                   'elliptic-curve': ['ecdsa', 'primeorder', 'p256', 'p384'],
+                   'ecdsa': ['p256', 'p384', 'dimpl'], 'primeorder': ['p256', 'p384'],
+                   'p256': ['dimpl'], 'p384': ['dimpl'], 'dimpl': ['opc-diameter-transport']}
+        nodes = {name: {'id': name, 'deps': []} for name in versions}
+        for child, incoming in parents.items():
+            for parent in incoming:
+                nodes[parent]['deps'].append({'pkg': child})
+        return {'packages': packages, 'resolve': {'nodes': list(nodes.values())}}
+
+    def scan(self, metadata=None, **extra):
+        if self.record.exists():
+            self.record.unlink()
+        env = {**self.env, **extra}
+        if metadata is not None:
+            env['ADVISORY_METADATA'] = json.dumps(metadata)
+        result = subprocess.run(['bash', '-e', '-c', self.step['run']], cwd=self.repo,
+                                env=env, text=True, capture_output=True)
+        calls = [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+        return result, calls
+
+    def test_every_production_example_fuzz_and_consumer_lock_is_audited(self):
+        locks = ['Cargo.lock', 'crates/protocol/fuzz/Cargo.lock',
+                 'crates/protocol/tests/consumer/Cargo.lock', 'examples/reference/Cargo.lock']
+        for name in locks[1:]:
+            self.lock(name)
+        self.lock('ci/fixtures/rejected-crypto/Cargo.lock', '0.7.5')
+        result, calls = self.scan()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        audits = [args for args in calls if args[0] == 'audit']
+        self.assertEqual([args[args.index('--file') + 1] for args in audits], locks)
+        self.assertNotIn('--no-fetch', audits[0])
+        self.assertTrue(all('--no-fetch' in args for args in audits[1:]))
+        self.assertTrue(all('--deny' in args and 'warnings' in args for args in audits))
+        metadata = [args for args in calls if args[0] == 'metadata']
+        self.assertEqual(len(metadata), len(locks))
+        self.assertTrue(all('--locked' in args and '--offline' in args and '--all-features' in args
+                            for args in metadata))
+
+    def test_id_wide_ignore_does_not_accept_unpatched_independent_consumer(self):
+        name = 'crates/protocol/tests/consumer/Cargo.lock'
+        self.lock(name, '0.7.5')
+        result, _ = self.scan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f'{name}: RUSTSEC-2026-0387 is not accepted for crypto-bigint 0.7.5', result.stderr)
+
+    def test_other_affected_versions_and_prereleases_fail_closed(self):
+        for version in ('0.5.4', '0.5.5+unreviewed', '0.6.1', '0.7.0', '0.7.6-rc.1'):
+            with self.subTest(version=version):
+                self.lock('Cargo.lock', version)
+                result, _ = self.scan()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'is not accepted for crypto-bigint {version}', result.stderr)
+
+    def test_ike_manifest_cannot_keep_a_vulnerable_consumer_floor(self):
+        self.write('crates/opc-proto-ikev2/Cargo.toml',
+                   '[dependencies]\ncrypto-bigint = { version = "0.7.5" }\n')
+        result, calls = self.scan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('must require a patched stable release', result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_reviewed_vendored_legacy_stack_is_accepted(self):
+        self.lock('Cargo.lock', '0.5.5')
+        result, calls = self.scan(self.legacy_graph())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(args[0] == 'audit' for args in calls), 1)
+
+    def test_additional_legacy_consumer_is_rejected_at_every_boundary(self):
+        for target in ('crypto-bigint', 'elliptic-curve', 'ecdsa', 'primeorder', 'p256', 'p384', 'dimpl'):
+            with self.subTest(target=target):
+                self.lock('Cargo.lock', '0.5.5')
+                metadata = self.legacy_graph()
+                metadata['packages'].append({'id': 'extra', 'name': 'extra', 'version': '0.1.0',
+                                             'source': None, 'manifest_path': str(self.repo / 'extra/Cargo.toml')})
+                metadata['resolve']['nodes'].append({'id': 'extra', 'deps': [{'pkg': target}]})
+                result, _ = self.scan(metadata)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'unaccepted legacy crypto dependency: extra -> {target}', result.stderr)
+
+    def test_optional_locked_consumer_cannot_hide_outside_enabled_metadata(self):
+        # Cargo.lock retains optional packages outside the enabled feature graph.
+        resolved = self.legacy_graph()
+        locked = deepcopy(resolved)
+        locked['packages'].append({'id': 'optional', 'name': 'optional', 'version': '0.1.0',
+                                   'source': self.REGISTRY, 'manifest_path': '/unused/Cargo.toml'})
+        locked['resolve']['nodes'].append({'id': 'optional', 'deps': [{'pkg': 'crypto-bigint'}]})
+        self.graph_lock('Cargo.lock', locked)
+        result, _ = self.scan(resolved)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unaccepted legacy crypto dependency: optional -> crypto-bigint', result.stderr)
+
+    def test_standalone_checked_in_fork_is_the_only_allowed_terminal_dimpl(self):
+        metadata = self.legacy_graph()
+        metadata['packages'] = [package for package in metadata['packages']
+                                if package['name'] != 'opc-diameter-transport']
+        metadata['resolve']['nodes'] = [node for node in metadata['resolve']['nodes']
+                                        if node['id'] != 'opc-diameter-transport']
+        self.graph_lock('vendor/dimpl/Cargo.lock', metadata)
+        result, calls = self.scan(metadata)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(args[0] == 'audit' for args in calls), 2)
+        self.graph_lock('Cargo.lock', metadata)
+        result, _ = self.scan(metadata)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr)
+
+    def test_similarly_named_registry_or_unvendored_fork_is_rejected(self):
+        self.lock('Cargo.lock', '0.5.5')
+        for name in ('dimpl', 'opc-diameter-transport'):
+            for field, value in (('source', self.REGISTRY),
+                                 ('manifest_path', str(self.repo / 'different/Cargo.toml'))):
+                with self.subTest(name=name, field=field):
+                    metadata = self.legacy_graph()
+                    package = next(package for package in metadata['packages'] if package['name'] == name)
+                    package[field] = value
+                    result, _ = self.scan(metadata)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f'must use the checked-in {name}', result.stderr)
+
+    def test_unresolved_or_disconnected_legacy_copy_is_rejected(self):
+        self.lock('Cargo.lock', '0.5.5')
+        result, _ = self.scan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('cannot verify the locked crypto-bigint 0.5.5 dependency path', result.stderr)
+        metadata = self.legacy_graph()
+        for node in metadata['resolve']['nodes']:
+            node['deps'] = []
+        result, _ = self.scan(metadata)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr)
+
+    def test_registry_source_is_part_of_the_exception(self):
+        self.lock('Cargo.lock', '0.5.5', 'registry+https://registry.example.invalid/index')
+        result, _ = self.scan(self.legacy_graph())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('crypto-bigint must use the reviewed registry source', result.stderr)
+
+    def test_lock_resolution_and_advisory_errors_still_fail_the_gate(self):
+        for settings in ({'FAIL_FETCH': '1'}, {'FAIL_AUDIT_LOCK': 'Cargo.lock'}):
+            with self.subTest(settings=settings):
+                result, _ = self.scan(**settings)
+                self.assertNotEqual(result.returncode, 0)
+        self.lock('examples/reference/Cargo.lock')
+        result, _ = self.scan(FAIL_AUDIT_LOCK='examples/reference/Cargo.lock')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_empty_or_missing_root_lock_inventory_is_rejected(self):
+        subprocess.run(['git', '-C', str(self.repo), 'rm', '--cached', '-q', 'Cargo.lock'], check=True)
+        result, _ = self.scan()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('no tracked root Cargo.lock to audit', result.stderr)
+
+
 class SecretScanWorkflowTests(unittest.TestCase):
     def setUp(self):
         root = Path(__file__).resolve().parents[1]
