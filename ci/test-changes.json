@@ -2,13 +2,6 @@
   "version": 1,
   "changes": [
     {
-      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::control_port_recovery::rate_budget_retention_control_port_replacement_never_restores_a_burst",
-      "kind": "removed",
-      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::control_port_recovery::rate_budget_retention_control_port_replacement_restarts_each_burst",
-      "reason": "Restore the public Packet Too Big setter contract: every explicit reconfiguration restarts a full burst. The renamed UDP regression checks each equal or larger configured burst, the following rate-limited packet, and exact signalled, rate-limited and capacity counters. The privileged IPv4 reference scenario and all its assertions remain unchanged.",
-      "issue": 1018
-    },
-    {
       "test": "rust:crates/opc-local-kernel-lifecycle::lib=lib::authority::readback_tests::matching_store_readback_follows_current_execute_current_read_current_order",
       "kind": "removed",
       "renamed_to": "rust:crates/opc-local-kernel-lifecycle::lib=lib::authority::readback_tests::matching_store_readback_preserves_pre_submission_current_and_one_child_cut",
@@ -371,6 +364,13 @@
       "kind": "assertions-decreased",
       "reason": "Replace the ad-hoc redirect-IT timeout eprintln block (which called `ip -6 addr/neigh show` with an expect) with the shared DatapathTimeoutDiagnostics formatter. The timeout assertion and every behavioral assertion are unchanged; the removed diagnostic `expect` is now a failure-safe bounded renderer, so the static helper resolver attributes fewer assertions while failures report strictly more datapath state (redirect delta, shared-peer iteration, counter values, tentative addresses, neighbours, routes).",
       "issue": 1188
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::control_port_recovery::rate_budget_retention_control_port_replacement_never_restores_a_burst",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::ebpf::tests::control_port_recovery::rate_budget_retention_control_port_replacement_restarts_each_burst",
+      "reason": "Restore the public Packet Too Big setter contract: every explicit reconfiguration restarts a full burst. The renamed UDP regression checks each equal or larger configured burst, the following rate-limited packet, and exact signalled, rate-limited and capacity counters. The privileged IPv4 reference scenario and all its assertions remain unchanged.",
+      "issue": 1018
     }
   ]
 }
