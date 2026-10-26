@@ -682,3 +682,110 @@ fn native_scoped_successor_panic_forward_completion() {
 fn native_transport_scoped_successor_panic_forward_completion() {
     exercise(Case::Panic, true);
 }
+
+fn exercise_expired_successor_refusal_releases_reset(native: bool) {
+    let (_cleanup, lifecycle) = scope();
+    let backend = backend(&lifecycle);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let quorum = Quorum::open(native).await;
+            let reset = lifecycle
+                .reset(participants(&lifecycle, &backend))
+                .await
+                .unwrap();
+            let profile = backend.admit_scoped_profile(&reset).await.unwrap();
+            let authority = TestAuthority::new(lifecycle.clone(), &quorum)
+                .await
+                .unwrap();
+            let old_request = request(200, XfrmDirection::Out);
+            let old = backend
+                .install_scoped(
+                    &profile,
+                    grant(&authority, &quorum, 200).await,
+                    old_request.clone(),
+                )
+                .await
+                .unwrap();
+            let next_request = candidate(&old_request, 1);
+            let mut next_sa = next_request.sa.clone();
+            next_sa.lifetime.hard_add_expires_seconds = 1;
+            let next_request =
+                ScopedXfrmRequest::new(next_sa, next_request.policy.clone()).unwrap();
+            let next = backend
+                .install_scoped_successor(
+                    &profile,
+                    grant(&authority, &quorum, 201).await,
+                    &old,
+                    next_request.clone(),
+                )
+                .await
+                .unwrap();
+            // Let the kernel hard lifetime expire the SA, with no external
+            // DELSA and no receipt cleanup that could release a leaked guard.
+            let reader = LinuxXfrmBackend::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match reader
+                        .query_sa(QuerySaRequest {
+                            destination: next_request.sa.id.destination,
+                            spi: next_request.sa.id.spi,
+                            protocol: next_request.sa.id.protocol,
+                            mark: next_request.sa.mark,
+                        })
+                        .await
+                    {
+                        Err(XfrmError::NotFound) => break,
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                        Err(error) => panic!("unexpected expiry readback: {error:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("successor must reach its kernel hard lifetime");
+            assert!(matches!(
+                backend.remove_scoped(&old).await,
+                Err(XfrmError::StateMismatch {
+                    operation: "local_scope_successor_not_live"
+                })
+            ));
+            let retained = reader
+                .query_sa(QuerySaRequest {
+                    destination: old_request.sa.id.destination,
+                    spi: old_request.sa.id.spi,
+                    protocol: old_request.sa.id.protocol,
+                    mark: old_request.sa.mark,
+                })
+                .await
+                .unwrap();
+            assert_eq!(retained.id, old_request.sa.id);
+            assert!(!old.is_retired() && !next.is_retired());
+            authority.close_execution().await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                lifecycle.reset(participants(&lifecycle, &backend)),
+            )
+            .await
+            .expect("retirement refusal must release the reset barrier")
+            .unwrap();
+            assert!(backend.local_namespace_empty().await.unwrap());
+            assert!(backend.read_scoped(&old).await.is_err());
+            assert!(backend.read_scoped(&next).await.is_err());
+            quorum.close().await;
+        });
+}
+
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_scoped_successor_expiry_refusal_releases_reset() {
+    exercise_expired_successor_refusal_releases_reset(false);
+}
+
+#[cfg(feature = "native-scope")]
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_transport_scoped_successor_expiry_refusal_releases_reset() {
+    exercise_expired_successor_refusal_releases_reset(true);
+}
