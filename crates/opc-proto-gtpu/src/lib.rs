@@ -23,6 +23,8 @@ use opc_protocol::{
 };
 
 mod control;
+mod extension;
+pub use extension::GtpuTypedExtension;
 
 pub use control::{
     GtpuControlCodecError, GtpuControlCodecErrorCode, GtpuControlMessage, GtpuEchoRequest,
@@ -150,10 +152,11 @@ impl GtpuExtensionHeaderType {
         }
     }
 
-    /// Return whether this crate has a typed decoder for the extension.
+    /// Return whether this crate has a typed decoder for the extension format.
+    /// Opaque RAN containers still require inner-protocol support in the consumer.
     #[must_use]
     pub const fn is_supported_by_codec(self) -> bool {
-        matches!(self.0, GTPU_EXT_UDP_PORT | GTPU_EXT_PDU_SESSION_CONTAINER)
+        matches!(self.0, 0x03 | 0x20 | 0x40 | 0x81..=0x85 | 0xc0)
     }
 
     /// Return whether an unsupported header requires comprehension by the
@@ -253,7 +256,8 @@ impl<'a> GtpuMessage<'a> {
     /// The scan is allocation-free. A caller acting as an endpoint must not
     /// decapsulate a message when this returns `Some`; request/G-PDU handling
     /// can use the type to plan a bounded Supported Extension Headers
-    /// Notification outside this codec.
+    /// Notification outside this codec. `None` proves format support only;
+    /// opaque RAN payload semantics still require consumer comprehension.
     ///
     /// # Errors
     ///
@@ -402,6 +406,7 @@ fn first_unsupported_required_extension<'a>(
     let mut first_unsupported = None;
     for extension in extensions.by_ref() {
         let extension = extension?;
+        extension::validate_fixed_length(&extension)?;
         let extension_type = GtpuExtensionHeaderType::new(extension.ext_type);
         if first_unsupported.is_none()
             && extension_type.unsupported_requires_comprehension_by(recipient)
@@ -1560,6 +1565,18 @@ impl<'a> BorrowDecode<'a> for GtpuMessage<'a> {
                 };
 
                 let next_ext = packet_bytes[next_ext_offset];
+
+                if ctx.validation_level == ValidationLevel::ProcedureAware {
+                    extension::validate_fixed_length(&GtpuExtensionHeader {
+                        ext_type: current_next_ext,
+                        content: &packet_bytes[current_offset + 1..next_ext_offset],
+                        next_ext_type: next_ext,
+                    })
+                    .map_err(|error| {
+                        DecodeError::new(error.code().clone(), current_offset)
+                            .with_spec_ref(SpecRef::new("3gpp", "TS29281", "5.2.2"))
+                    })?;
+                }
 
                 let extension_type = GtpuExtensionHeaderType::new(current_next_ext);
                 if extension_type

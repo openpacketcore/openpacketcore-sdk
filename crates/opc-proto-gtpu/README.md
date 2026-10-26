@@ -198,3 +198,12 @@ cargo test -p opc-proto-gtpu --all-features
 ## License
 
 Apache-2.0. See [LICENSE](../../LICENSE).
+
+### Other typed G-PDU extension values
+
+`GtpuTypedExtension::decode` and `encode` support short/long PDCP numbers,
+Service Class Indicator, UDP Port, the existing PSC subset, and borrowed opaque
+RAN/Xw/NR RAN containers. Long PDCP uses current type `0x03`; `0x82` is the
+explicit legacy form. Typed encoding checks widths and clears spare bits.
+Opaque inner protocols and interface-specific short-PDCP widths require caller
+validation; the N3 endpoint continues to accept only its existing PSC semantics.

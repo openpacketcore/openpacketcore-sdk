@@ -441,6 +441,13 @@ impl<'a> N3PacketView<'a> {
         let mut psc = None;
         for extension in message.extensions() {
             let extension = extension.map_err(map_decode_error)?;
+            // This endpoint implements PSC semantics only. Additional generic
+            // typed headers do not expand its comprehension claim.
+            if extension.ext_type != GTPU_EXT_PDU_SESSION_CONTAINER
+                && extension.ext_type & 0x80 != 0
+            {
+                return Err(N3PacketError::UnsupportedExtension);
+            }
             if extension.ext_type == GTPU_EXT_PDU_SESSION_CONTAINER {
                 if psc.is_some() {
                     return Err(N3PacketError::DuplicatePsc);

@@ -160,7 +160,7 @@ fn unknown_extension_header_reject_policy_fails_closed() {
         0x11, 0x22, 0x33, 0x44, // TEID
         0x00, 0x05, // Seq = 5
         0x00, // NPDU
-        0x84, // unsupported Next Ext
+        0x87, // unsupported Next Ext
         0x01, // Extension Length Units = 1 (4 octets)
         0xAA, 0xBB, // Opaque extension content
         0x00, // Next Extension Header = 0 (ends)

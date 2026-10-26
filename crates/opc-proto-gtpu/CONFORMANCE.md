@@ -51,6 +51,22 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 - **Owned Slicing**: `OwnedGtpuMessage` implements cheap reference-counted slicing of `bytes::Bytes` for thread-safe boundaries.
 
 ### 5. Extension-header comprehension (§5.2.1)
+- **Typed values**: `GtpuTypedExtension` decodes/encodes UDP Port, short PDCP,
+  18-bit Long PDCP, Service Class Indicator, and the existing PSC subset. RAN,
+  Xw RAN and NR RAN container bytes are borrowed and opaque. Fixed lengths,
+  aligned container bounds, 18-bit send limits and SCI send values 0–31 are
+  checked. Receive ignores spare bits; typed send clears them. Short PDCP
+  interface-specific 12/15-bit restrictions remain caller policy.
+- **Long PDCP assignments**: figure 5.2.1-3 notes 2/3 require current senders
+  to use `0x03`; `0x82` is the earlier-release receive form (the issue's legacy
+  wording was reversed). Both have typed decode; explicit legacy encoding is
+  available for interop, not the current sender default.
+- **Comprehension scope**: opaque RAN content still requires the consumer's
+  inner-protocol support. The N3 endpoint independently retains its PSC-only
+  comprehension profile. Structural GTP-U decode retains raw known extensions;
+  `ProcedureAware`, the typed decode and comprehension scan check fixed lengths.
+  Unknown required types still fail under `Reject`. PDU Set containers `0x04`
+  and `0x86` remain unimplemented pending that feature's TS 38.415 semantics.
 - **Typed classes**: all four bits-8/7 comprehension classes are exposed for
   endpoint and intermediate recipients, including the type `0xc0` SGW/G-PDU
   exception.

@@ -1089,7 +1089,10 @@ fn comprehension_bits_drive_unknown_extension_handling() {
     }
 
     let pdcp = GtpuExtensionHeaderType::new(0xc0);
-    assert!(pdcp.unsupported_requires_comprehension_by(GtpuExtensionHeaderRecipient::Intermediate));
+    assert!(!pdcp.unsupported_requires_comprehension_by(GtpuExtensionHeaderRecipient::Intermediate));
+    assert!(pdcp
+        .comprehension()
+        .is_required_by(GtpuExtensionHeaderRecipient::Intermediate));
     assert!(!pdcp.unsupported_requires_comprehension_by(
         GtpuExtensionHeaderRecipient::ServingGatewayReceivingGpdu
     ));
@@ -1097,9 +1100,13 @@ fn comprehension_bits_drive_unknown_extension_handling() {
 
 #[test]
 fn generic_decoder_rejects_only_unknown_comprehension_required_extensions() {
-    for (extension_type, should_reject) in
-        [(0x04, false), (0x44, false), (0x84, true), (0xc4, true)]
-    {
+    for (extension_type, should_reject) in [
+        (0x04, false),
+        (0x44, false),
+        (0x84, false),
+        (0x87, true),
+        (0xc4, true),
+    ] {
         let wire = [
             0x34,
             0xff,
