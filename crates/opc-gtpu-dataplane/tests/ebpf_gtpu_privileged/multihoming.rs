@@ -2,8 +2,7 @@ use super::*;
 use opc_gtpu_dataplane::GtpuPeerSourcePolicy;
 
 #[allow(clippy::await_holding_lock)]
-pub(super) async fn exercise_multihoming()
--> Result<(), Box<dyn std::error::Error>> {
+pub(super) async fn exercise_multihoming() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
     let _serial = PRIVILEGED_TEST_LOCK
         .lock()
@@ -32,19 +31,17 @@ pub(super) async fn exercise_multihoming()
     );
     // Establish neighbour resolution using the original, still-authorized peer.
     let mut buffer = [0; 2048];
-    assert!(
-        send_until_received(
-            || send_raw_gtpu_frame(
-                &net.pgw_ns,
-                "s2bup",
-                &original,
-                RawChecksumMetadata::Unverified
-            ),
-            &ue,
-            &mut buffer
-        )
-        .is_some()
-    );
+    assert!(send_until_received(
+        || send_raw_gtpu_frame(
+            &net.pgw_ns,
+            "s2bup",
+            &original,
+            RawChecksumMetadata::Unverified
+        ),
+        &ue,
+        &mut buffer
+    )
+    .is_some());
     drain_datagrams(&ue);
     let mut alternate = original.clone();
     alternate[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&[192, 0, 2, 11]);

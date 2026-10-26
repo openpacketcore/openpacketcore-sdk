@@ -10912,8 +10912,9 @@ fn atom_codec(tag: u8, bytes: &[u8]) -> Vec<u8> {
 fn canonical_desired_bytes(group: &GtpuSessionGroup) -> Vec<u8> {
     let mut output = Vec::new();
     let n3 = group.entries().iter().any(|entry| entry.n3_qfi().is_some());
-    let multihoming = group.entries().iter().any(|entry|
-        entry.context().downlink_peer_source_policy == crate::GtpuPeerSourcePolicy::TeidAndLocal);
+    let multihoming = group.entries().iter().any(|entry| {
+        entry.context().downlink_peer_source_policy == crate::GtpuPeerSourcePolicy::TeidAndLocal
+    });
     output.push(match (n3, multihoming) {
         (false, false) => 1,
         (true, false) => 2,
