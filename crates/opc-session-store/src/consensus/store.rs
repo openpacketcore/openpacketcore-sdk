@@ -23556,6 +23556,7 @@ mod membership_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     pub(super) async fn assert_roster_maintenance_with_steady_due_rows(
         store: &ConsensusSessionStore,
         clock: &MutableClock,
@@ -23595,6 +23596,7 @@ mod membership_tests {
         assert!(retired_during_arrivals, "signed history must retire while rows continuously become due: retained={}, tombstones={}", snapshot.retained_reservations, snapshot.tombstone_reservations);
     }
 
+    #[cfg(target_os = "linux")]
     pub(super) async fn assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second(
         store: &ConsensusSessionStore,
         clock: &MutableClock,
