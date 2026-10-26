@@ -62,9 +62,13 @@ The driver returns non-G-PDUs, unknown-TEID G-PDUs, and some known-TEID
 G-PDUs with an invalid inner MS binding to this queue. Socket delivery alone
 therefore does not establish the TS 29.281 section 7.3.1 Error Indication
 trigger. `try_receive_downlink` validates nonzero TEID and nonempty T-PDU,
-then performs stable PDP readback for that TEID: absence yields
-`UnknownTunnel`, a known context yields `Dropped(DestinationMismatch)`, and
-indeterminate readback yields `Dropped(StateUnavailable)`. Controls,
+then performs two equal PDP reads in each of the IPv4 and IPv6 tables for
+that TEID. Only absence in both yields `UnknownTunnel`; a context in either
+family yields `Dropped(DestinationMismatch)`, and any readback error yields
+`Dropped(StateUnavailable)`. The T-PDU can be short or unstructured; its bytes
+never select the table to consult. Each netlink transaction makes one
+nonblocking receive attempt with no retry delay. A delayed reply therefore
+produces `Dropped(StateUnavailable)`, without waiting. Controls,
 unmodelled messages and unsupported required-extension events remain
 `Control`; malformed framing is dropped. `try_receive_datagram` exposes the
 received observation without a PDP lookup. Its caller must establish current
@@ -75,8 +79,12 @@ authorization or decides response policy.
 opens share the same socket generation and preserve already prepared response
 plans. Receive and response verify namespace, link name/index, socket cookie
 and local bind before and after I/O. Observed binding loss permanently retires
-that generation. Operations do not acquire the PDP mutation mutex; concurrent
-socket ownership changes return `Busy`. A response pins its IP source with
+that generation. Receive and classification share one attachment operation
+boundary, without the backend socket-registry or PDP mutation mutex. A
+competing receive returns `Busy` before consuming anything. Binding loss after
+dequeue yields `Dropped(StateUnavailable)`. Responses can proceed during
+receive/classification and do not return `Busy`; a retired binding returns
+`Unavailable`. A response pins its IP source with
 `IP_PKTINFO` to the original local destination, including for wildcard binds.
 Removal, replacement, adoption or socket-generation change retires old ports
 and plans. The retained descriptor remains the only socket owner.
@@ -225,12 +233,13 @@ queues are empty. Every wake from the exposed descriptor must be consumed with
 `try_readiness` (which names the ready queue classes) or `wait(timeout)`;
 `try_readiness` never blocks and `wait` blocks for a bounded interval.
 
-The source is bound to one registration. Attachment removal, replacement,
-fencing, failed readback or backend loss permanently signals a private eventfd
-inside the epoll instance. An idle `AsyncFd`/epoll consumer wakes immediately;
+The source is bound to one registration. Attachment removal, replacement or
+backend loss permanently signals a private eventfd inside the epoll instance.
+Fencing and failed readback are observed at the next port operation, which
+then revokes the source. Revocation wakes an idle `AsyncFd`/epoll consumer;
 `try_readiness`, `wait` and receive report `Unavailable`. The signal is never
-drained, so every observer can detect retirement without a polling timer.
-Stop waiting on that source and reopen through the backend after a fresh exact
+drained, so the descriptor remains readable for every observer. Stop waiting
+on and drop that source, then reopen through the backend after a fresh exact
 registration. An old source never observes the replacement queues.
 
 Ports without backend-owned downlink queues, including standalone

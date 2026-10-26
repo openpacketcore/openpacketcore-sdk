@@ -14,11 +14,13 @@
 //! that call is unchanged.
 //!
 //! A readiness source is bound to one control port registration. Attachment
-//! removal, replacement, fencing, readback failure or backend loss permanently
-//! signals a private eventfd inside the epoll instance. Idle consumers wake
-//! immediately and observe [`GtpuControlPortError::Unavailable`]. The signal
-//! is never drained, and an old source never observes a replacement generation.
-//! Reopen the port through the backend after a fresh registration.
+//! removal, replacement or backend loss permanently signals a private eventfd
+//! inside the epoll instance. Fencing and readback loss are detected at the
+//! next port operation, which then revokes the source. Revocation wakes idle
+//! consumers; readiness methods report [`GtpuControlPortError::Unavailable`].
+//! The signal is never drained, and an old source never observes a replacement
+//! generation. Stop waiting on and drop the source, then reopen the port
+//! through the backend after a fresh registration.
 
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd};

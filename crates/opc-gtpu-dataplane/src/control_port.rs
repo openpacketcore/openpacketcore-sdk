@@ -149,11 +149,12 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// classes) and then drain with `try_receive_downlink` as usual; an empty
     /// readiness snapshot never proves the queues are empty.
     ///
-    /// The source is bound to this port registration. When the attachment is
-    /// removed, replaced, fenced, or its readback fails, the port revokes every
-    /// outstanding source: readiness and receive return
-    /// [`GtpuControlPortError::Unavailable`] and the source never becomes
-    /// readable again. Drop it and reopen the port through
+    /// The source is bound to this port registration. Removal, replacement or
+    /// backend loss revokes it immediately. Fencing and readback loss are
+    /// detected at the next port operation, which then revokes the source.
+    /// Revocation permanently makes its descriptor readable; readiness methods
+    /// and receive report [`GtpuControlPortError::Unavailable`]. Stop waiting
+    /// on and drop that source, then reopen the port through
     /// [`crate::GtpuDataplaneBackend::open_gtpu_control_port`] after a fresh
     /// exact registration. Each call returns an independent source; consumers
     /// should request one source per registration and keep it for its lifetime.
@@ -434,6 +435,12 @@ impl GtpuControlDatagram {
     #[cfg(target_os = "linux")]
     pub(crate) fn bytes_handle(&self) -> &Bytes {
         &self.bytes
+    }
+
+    /// Nonzero TEID from the validated header, without a forwarding decision.
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn received_teid(&self) -> Option<NonZeroU32> {
+        self.teid
     }
 
     /// Disposition of this complete UDP datagram.

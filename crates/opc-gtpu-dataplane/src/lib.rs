@@ -1,19 +1,3 @@
-//! Canonical backend persistence formats are internal. An ordinary caller
-//! cannot mint selector adapter capabilities from arbitrary stored bytes.
-//!
-//! ```compile_fail
-//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterBinding;
-//! let _ = GtpuSelectorAdapterBinding::decode(&[1_u8; 145]);
-//! ```
-//! ```compile_fail
-//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterTerminalCapsule;
-//! let _ = GtpuSelectorAdapterTerminalCapsule::decode(&[1_u8; 110]);
-//! ```
-//! ```compile_fail
-//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterOperationStamp;
-//! let _ = GtpuSelectorAdapterOperationStamp::decode(&[1_u8; 208]);
-//! ```
-//!
 //! Safe Linux GTP-U dataplane backend model for OpenPacketCore.
 //!
 //! This crate provides a backend trait for GTP-U dataplane device and
@@ -85,6 +69,23 @@
 //!
 //! Raw Linux netlink and socket syscalls stay in [`opc_linux_gtpu_sys`]; this
 //! crate is safe Rust and never performs `unsafe` operations.
+//!
+//! Canonical backend persistence formats are internal. An ordinary caller
+//! cannot mint selector adapter capabilities from arbitrary stored bytes.
+//!
+//! ```compile_fail
+//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterBinding;
+//! let _ = GtpuSelectorAdapterBinding::decode(&[1_u8; 145]);
+//! ```
+//! ```compile_fail
+//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterTerminalCapsule;
+//! let _ = GtpuSelectorAdapterTerminalCapsule::decode(&[1_u8; 110]);
+//! ```
+//! ```compile_fail
+//! use opc_gtpu_dataplane::selector_adapter_codec::GtpuSelectorAdapterOperationStamp;
+//! let _ = GtpuSelectorAdapterOperationStamp::decode(&[1_u8; 208]);
+//! ```
+//!
 
 #![forbid(unsafe_code)]
 
