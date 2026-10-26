@@ -198,6 +198,81 @@ async fn probe_owned_socket_lifecycle(
     Ok(())
 }
 
+#[path = "fixtures/control_ipv6.rs"]
+mod control_ipv6;
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn ipv6_control_preserves_tuples_and_rejects_retired_ports(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert_ne!(
+        std::fs::read_link("/proc/self/ns/net")?,
+        std::fs::read_link("/proc/1/ns/net")?
+    );
+    let local: std::net::Ipv6Addr = "fd00:341::1".parse()?;
+    let remote: std::net::Ipv6Addr = "fd00:341::2".parse()?;
+    for args in [
+        vec!["link", "set", "lo", "up"],
+        vec!["-6", "addr", "add", "fd00:341::1/64", "dev", "lo", "nodad"],
+        vec!["-6", "addr", "add", "fd00:341::2/64", "dev", "lo", "nodad"],
+    ] {
+        assert!(Command::new("ip").args(args).status()?.success());
+    }
+    let backend = LinuxGtpuDataplaneBackend::new();
+    let mut create = CreateGtpDeviceRequest::new("gtpcontrol6");
+    create.bind_address = IpAddr::V6(local);
+    let device = backend.create_device(create).await?;
+    let port = backend.open_gtpu_control_port(&device).await?;
+    let peer = UdpSocket::bind((remote, 0))?;
+    let service = UdpSocket::bind((remote, GTPU_PORT))?;
+    control_ipv6::exercise(port.as_ref(), (local, GTPU_PORT).into(), &peer, &service);
+    backend.remove_device(&device).await?;
+    assert_eq!(
+        port.send_echo_request((local, GTPU_PORT).into(), service.local_addr()?, 1)
+            .unwrap_err(),
+        opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
+    );
+    drop(service);
+    let mut create = CreateGtpDeviceRequest::new("gtpcontrol6wild");
+    create.bind_address = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+    let wildcard = backend.create_device(create).await?;
+    let port = backend.open_gtpu_control_port(&wildcard).await?;
+    let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x12, 0x34, 0, 0];
+    peer.send_to(&echo, (local, GTPU_PORT))?;
+    let event = control_ipv6::receive(port.as_ref());
+    assert_eq!(
+        event.local(),
+        std::net::SocketAddr::from((local, GTPU_PORT))
+    );
+    port.send_control_response(event.echo_response(GtpuControlResponseBudget::new(14, 2)?)?)?;
+    let mut bytes = [0_u8; 64];
+    let (length, from) = peer.recv_from(&mut bytes)?;
+    assert_eq!(from, std::net::SocketAddr::from((local, GTPU_PORT)));
+    assert_eq!(
+        &bytes[..length],
+        &[0x32, 2, 0, 6, 0, 0, 0, 0, 0x12, 0x34, 0, 0, 14, 0]
+    );
+    // The wildcard queue receives the request sent to its other local alias.
+    port.send_echo_request(
+        (local, GTPU_PORT).into(),
+        (remote, GTPU_PORT).into(),
+        0x1234,
+    )?;
+    let looped = control_ipv6::receive(port.as_ref());
+    assert_eq!(
+        looped.local(),
+        std::net::SocketAddr::from((remote, GTPU_PORT))
+    );
+    assert_eq!(
+        looped.peer(),
+        std::net::SocketAddr::from((local, GTPU_PORT))
+    );
+    assert_eq!(looped.bytes(), echo);
+    backend.remove_device(&wildcard).await?;
+    Ok(())
+}
+
 async fn receive_control_downlink(
     port: &dyn opc_gtpu_dataplane::control_port::GtpuControlPort,
 ) -> Result<GtpuDownlinkEvent, Box<dyn std::error::Error>> {
@@ -270,11 +345,11 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         let plan = datagram.unknown_tunnel_error(GtpuControlResponseBudget::new(28, 4)?)?;
         assert_eq!(
             plan.destination(),
-            std::net::SocketAddrV4::new(peer_ip, GTPU_PORT)
+            std::net::SocketAddr::from((peer_ip, GTPU_PORT))
         );
         assert_eq!(
             plan.source(),
-            std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, GTPU_PORT)
+            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, GTPU_PORT))
         );
         assert_eq!(port.send_control_response(plan)?, 28);
         let mut response = [0_u8; 64];
@@ -371,10 +446,13 @@ async fn wildcard_control_reply_preserves_the_original_local_destination(
         };
         assert_eq!(
             datagram.local(),
-            std::net::SocketAddrV4::new(local, GTPU_PORT)
+            std::net::SocketAddr::from((local, GTPU_PORT))
         );
         let plan = datagram.unknown_tunnel_error(GtpuControlResponseBudget::new(28, 4)?)?;
-        assert_eq!(plan.source(), std::net::SocketAddrV4::new(local, GTPU_PORT));
+        assert_eq!(
+            plan.source(),
+            std::net::SocketAddr::from((local, GTPU_PORT))
+        );
         assert_eq!(port.send_control_response(plan)?, 28);
         // Both loopback aliases belong to this wildcard socket. Its returned
         // response proves the actual sendmsg source, not merely the plan tuple.
@@ -384,11 +462,11 @@ async fn wildcard_control_reply_preserves_the_original_local_destination(
         };
         assert_eq!(
             response.peer(),
-            std::net::SocketAddrV4::new(local, GTPU_PORT)
+            std::net::SocketAddr::from((local, GTPU_PORT))
         );
         assert_eq!(
             response.local(),
-            std::net::SocketAddrV4::new(peer, GTPU_PORT)
+            std::net::SocketAddr::from((peer, GTPU_PORT))
         );
         let mut expected = [
             0x36, 26, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0x40, 1, 0, 0, 0, 16, 0xde, 0xad, 0xbe, 0xef,

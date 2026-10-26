@@ -238,11 +238,11 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(datagram.bytes(), echo);
         assert_eq!(
             datagram.peer(),
-            std::net::SocketAddrV4::new(PGW_IP, GTPU_PORT)
+            std::net::SocketAddr::from((PGW_IP, GTPU_PORT))
         );
         assert_eq!(
             datagram.local(),
-            std::net::SocketAddrV4::new(EPDG_S2BU_IP, GTPU_PORT)
+            std::net::SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT))
         );
         for inner6 in [false, true] {
             n3_fixed_flow::uplink_inner(&net, inner6, b"after-retirement");

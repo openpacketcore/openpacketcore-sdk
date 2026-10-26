@@ -475,6 +475,12 @@
       "kind": "disabled",
       "reason": "New native SCTP-AUTH test sends malformed authenticated Diameter frames through sequential and concurrent receivers. Required SCTP workflow runs it through qualify-sctp-close-wire.py and requires six actual ABORT associations plus separate graceful-close controls.",
       "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::ipv6_control_preserves_tuples_and_rejects_retired_ports",
+      "kind": "disabled",
+      "issue": 341,
+      "reason": "New native IPv6 kernel-GTP control test requires CAP_NET_ADMIN and a private network namespace. Required GTP CI runs every ignored Linux GTP integration case explicitly. Independent wire bytes cover Echo, Error Indication, extension notification, budgets and retired handles."
     }
   ]
 }

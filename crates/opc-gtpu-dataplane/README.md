@@ -3219,7 +3219,7 @@ sudo unshare -n -- bash -lc 'ip link set lo up && OPC_GTPU_RUN_PRIVILEGED=1 carg
 ```
 
 The backend trait exposes `open_gtpu_control_port` for eBPF attachments with
-an IPv4 endpoint and for Linux kernel-GTP userspace-socket attachments. The
+IPv4 and/or IPv6 endpoints and for Linux kernel-GTP userspace-socket attachments. The
 former lose access on removal, replacement, backend loss or observed hook
 loss; the latter are retired on removal, replacement, adoption or socket
 generation change, and a kernel-owned recoverable attachment returns an exact

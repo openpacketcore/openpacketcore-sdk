@@ -1,14 +1,16 @@
 # Shared GTP-U control receive queue
 
 `control_port::GtpuControlPort` defines bounded, nonblocking receive and
-response operations. The first implementation is the existing Linux IPv4
-`GtpuReassemblySocket`. Both its legacy `receive` and new
+response operations over IPv4 and IPv6. The sealed Linux
+`GtpuReassemblySocket` supplies the eBPF queues. Both its legacy IPv4 `receive` and
 `try_receive_datagram` consume the **same UDP/2152 queue**. One consumer must
 demultiplex that queue; a competing reuse-port listener can steal controls
 or reassembled user packets.
 
 Each non-cloneable `GtpuControlDatagram` retains exact received bytes,
-length, peer/local tuple and kernel ingress provenance. It reports typed
+length, peer/local `SocketAddr` tuples and `GtpuControlProvenance` from kernel
+packet info. IPv6 retains link-local scope and refuses IPv4-mapped aliases;
+`provenance().ipv4()` returns a legacy reassembly observation only for IPv4. It reports typed
 control, structurally complete G-PDU, unsupported required extension,
 `TunnelStatus`, unmodelled message, or malformed input. G-PDU framing alone grants no
 decapsulation authority: installed-selector and current-generation checks
@@ -65,10 +67,11 @@ only static classes and lengths; packet and deployment values are exposed
 only by explicit processing getters.
 
 `GtpuDataplaneBackend::open_gtpu_control_port` exposes the queue for an
-existing eBPF attachment with a concrete IPv4 endpoint. Repeated opens share
-one backend-owned socket. This includes a grouped attachment with IPv4;
-an IPv6-only attachment returns `UnsupportedFeature { feature:
-"gtpu_control_port_ipv6" }`. Mock and unsupported backends return
+existing eBPF attachment with concrete IPv4 and/or IPv6 endpoints. Repeated
+opens share one backend-owned socket per family; IPv6 sockets are `V6ONLY`.
+A dual-stack port alternates nonempty shared queues, preserving the bounded
+turns for the IPv4 hand-off queues. All families share the attachment generation
+and are revoked together. Mock and unsupported backends return
 `UnsupportedFeature { feature: "gtpu_control_port" }`.
 
 For `LinuxGtpuDataplaneBackend`, an ordinary creation retains the userspace
@@ -76,9 +79,9 @@ UDP socket passed to the kernel GTP driver. The driver passes non-G-PDUs and
 G-PDUs whose TEID matches no PDP context to that socket. The port exposes this
 queue without binding, duplicating or reopening a socket. A recoverable
 kernel-owned attachment has no userspace descriptor and returns
-`UnsupportedFeature { feature: "gtpu_control_port_kernel_owned" }`. IPv4
-binds, including wildcard addresses, on UDP/2152 are supported. Other families
-or ports return `gtpu_control_port_ipv6` or `gtpu_control_port_port`.
+`UnsupportedFeature { feature: "gtpu_control_port_kernel_owned" }`. IPv4 and
+IPv6 binds, including wildcard addresses, on UDP/2152 are supported where the
+kernel GTP attachment is supported. Other ports return `gtpu_control_port_port`.
 
 Linux `try_receive_downlink` returns validated G-PDUs as `UnknownTunnel`,
 controls (including Tunnel Status) and unsupported-extension observations as
@@ -87,7 +90,7 @@ does not authorize a peer, prove durable tunnel absence, or send a response.
 The caller decides whether to consume it into an Error Indication plan and
 supplies the size/amplification budget. The response uses the same retained
 socket and pins its source IP to the original local destination with
-`IP_PKTINFO`; its destination port is the peer's GTP-U service port, and the
+`IP_PKTINFO` or `IPV6_PKTINFO`; its destination port is the peer's GTP-U service port, and the
 triggering source port is carried in the UDP Port extension.
 
 Linux checks the live interface name/index, network namespace, socket cookie,
@@ -125,9 +128,9 @@ retried. An external listener produces a bind
 error; no reuse-port distribution is enabled.
 
 The port grants no tunnel installation, selector provenance, peer admission,
-or forwarding authority. Kernel/eBPF/mock parity, IPv6 typed responses,
-per-tunnel End Marker ordering and installed N3
-forwarding remain tracked by #341 and #790.
+or forwarding authority. Mock backends have no network queue. End Marker
+ordering remains tied to an admitted tunnel's retirement procedure; this
+control port does not authorize handover or create a new tunnel send path.
 Existing forwarding capabilities and checksum-offload control pass-through
 are unchanged.
 
@@ -138,8 +141,12 @@ GTP-U bytes and never forwards the inner packet. The unknown-TEID counter
 still counts the lookup miss. A retained grouped selector with invalid
 authority, or a legacy endpoint binding without its PDR, remains a drop;
 neither becomes an unknown-tunnel event. This lookup-miss path refuses zero
-TEID and malformed packets. Grouped IPv6 attachments deliver the raw G-PDU to
-the local UDP stack, but the typed IPv6 port remains unsupported.
+TEID and malformed packets. IPv6 controls and unknown-tunnel G-PDUs now have
+the same typed response planners. This does not enable IPv6 reassembly
+forwarding: `try_receive_downlink` uses the IPv6 selector key, returns only a
+lookup miss as an observation, and refuses any retained IPv6 selector before
+the IPv4 decapsulation path. `try_receive_datagram` remains a raw bounded
+observation requiring caller lookup and policy.
 
 An observed lookup miss is not an absence receipt. Installed state can
 change before a consumer processes the datagram, and the queue also serves
@@ -170,8 +177,12 @@ extension handoffs outside PSC: 122 unknown identifiers permit bounded
 notifications, and five codec-known RAN/PDCP formats remain unforwarded without
 claiming an unknown-extension response. Original tuple/bytes, all 127 optional
 identifiers and malformed suffix rejection are also checked.
-The IPv6 parser handoff still uses an ordinary UDP receiver and does not
-qualify IPv6 typed responses. A second native case checks dynamic-port Echo
+The ordinary IPv4 attachment's IPv6 parser handoff retains a raw UDP probe
+because that attachment has no configured IPv6 control endpoint. Separate
+IPv6-only and dual-stack attachment tests qualify typed Echo, Error Indication
+and extension-notification bytes. Both live backends share the independent
+IPv6 wire fixture, including source selection on a wildcard Linux bind.
+A second native case checks dynamic-port Echo
 bytes, shared-queue behavior, external-listener exclusion, kernel-observed
 queued receive retirement, same-tuple reinstall, old-plan rejection, backend
 loss and live hook loss. Its completion marker and exact native inventory

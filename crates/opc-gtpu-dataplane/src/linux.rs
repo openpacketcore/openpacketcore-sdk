@@ -8769,7 +8769,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn linux_control_port_refuses_nonstandard_port_and_ipv6_bind() {
+    async fn linux_control_port_refuses_nonstandard_port_and_accepts_ipv6_bind() {
         let transport = control_transport();
         let backend = LinuxGtpuDataplaneBackend::with_transport(transport);
         let mut request = CreateGtpDeviceRequest::new("gtp-port");
@@ -8784,12 +8784,7 @@ mod tests {
         let mut request = CreateGtpDeviceRequest::new("gtp-v6");
         request.bind_address = IpAddr::V6(Ipv6Addr::LOCALHOST);
         let device = backend.create_device(request).await.unwrap();
-        assert!(matches!(
-            backend.open_gtpu_control_port(&device).await,
-            Err(GtpuError::UnsupportedFeature {
-                feature: "gtpu_control_port_ipv6"
-            })
-        ));
+        assert!(backend.open_gtpu_control_port(&device).await.is_ok());
     }
 
     #[cfg(target_os = "linux")]

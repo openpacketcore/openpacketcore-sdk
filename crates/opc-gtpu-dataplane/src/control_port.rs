@@ -9,11 +9,14 @@
 #[cfg(all(test, target_os = "linux"))]
 mod native_tests;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod socket_io;
+
 #[cfg(any(test, target_os = "linux"))]
 use std::sync::Arc;
 use std::{
     fmt,
-    net::{SocketAddr, SocketAddrV4},
+    net::{IpAddr, SocketAddr},
     num::NonZeroU32,
 };
 
@@ -30,9 +33,9 @@ use opc_protocol::{BorrowDecode, DecodeContext, UnknownIePolicy, ValidationLevel
 
 use crate::{DownlinkOuterProvenance, GTPU_PORT};
 
-/// Maximum UDP payload admitted by this IPv4 socket profile.
+/// Common IPv4/IPv6 control payload ceiling.
 ///
-/// This is the IPv4/UDP envelope limit, not a path-MTU or fragmentation claim.
+/// Uses the smaller IPv4/UDP envelope limit; this is not a path-MTU claim.
 pub const GTPU_CONTROL_MAX_DATAGRAM: usize = 65_507;
 
 /// Backend-neutral nonblocking access to one shared GTP-U receive queue.
@@ -240,22 +243,122 @@ impl From<std::io::Error> for GtpuControlPortError {
 
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) fn echo_request_bytes(
-    source: SocketAddrV4,
-    peer: SocketAddrV4,
+    source: SocketAddr,
+    peer: SocketAddr,
     sequence: u16,
 ) -> Result<Bytes, GtpuControlPortError> {
+    if source.is_ipv4() != peer.is_ipv4() {
+        return Err(GtpuControlPortError::InvalidTuple);
+    }
     for tuple in [source, peer] {
-        if tuple.port() != GTPU_PORT
-            || tuple.ip().is_unspecified()
-            || tuple.ip().is_multicast()
-            || tuple.ip().is_broadcast()
-        {
+        if tuple.port() != GTPU_PORT || !unicast_tuple(tuple) {
             return Err(GtpuControlPortError::InvalidTuple);
         }
     }
     GtpuControlMessage::EchoRequest(opc_proto_gtpu::GtpuEchoRequest::new(sequence))
         .to_bytes(EncodeContext::default())
         .map_err(|_| GtpuControlPortError::Encoding)
+}
+
+fn unicast_tuple(tuple: SocketAddr) -> bool {
+    !tuple.ip().is_unspecified()
+        && !tuple.ip().is_multicast()
+        && match tuple {
+            SocketAddr::V4(v4) => !v4.ip().is_broadcast(),
+            SocketAddr::V6(v6) => {
+                v6.ip().to_ipv4_mapped().is_none()
+                    && v6.flowinfo() == 0
+                    && (v6.ip().is_unicast_link_local() == (v6.scope_id() != 0))
+            }
+        }
+}
+
+/// Kernel-observed transport tuples and ingress interface for one datagram.
+/// IPv6 link-local tuples retain their interface scope. This observation grants
+/// neither peer admission nor installed-tunnel authority.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GtpuControlProvenance {
+    local: SocketAddr,
+    peer: SocketAddr,
+    ingress_ifindex: u32,
+}
+
+impl fmt::Debug for GtpuControlProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GtpuControlProvenance(<redacted>)")
+    }
+}
+
+impl GtpuControlProvenance {
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn new(peer: SocketAddr, local: SocketAddr, ingress_ifindex: u32) -> Option<Self> {
+        if peer.is_ipv4() != local.is_ipv4()
+            || peer.ip().is_unspecified()
+            || local.ip().is_unspecified()
+            || ingress_ifindex == 0
+        {
+            return None;
+        }
+        for tuple in [peer, local] {
+            if let SocketAddr::V6(v6) = tuple {
+                if v6.ip().to_ipv4_mapped().is_some()
+                    || v6.flowinfo() != 0
+                    || v6.scope_id()
+                        != if v6.ip().is_unicast_link_local() {
+                            ingress_ifindex
+                        } else {
+                            0
+                        }
+                {
+                    return None;
+                }
+            }
+        }
+        Some(Self {
+            peer,
+            local,
+            ingress_ifindex,
+        })
+    }
+
+    /// Observed source IP address, without its UDP port.
+    #[must_use]
+    pub const fn peer_address(&self) -> IpAddr {
+        self.peer.ip()
+    }
+    /// Observed destination IP address, without its UDP port.
+    #[must_use]
+    pub const fn local_address(&self) -> IpAddr {
+        self.local.ip()
+    }
+    /// Observed ingress interface index.
+    #[must_use]
+    pub const fn ingress_ifindex(&self) -> u32 {
+        self.ingress_ifindex
+    }
+    /// Observed UDP source port.
+    #[must_use]
+    pub const fn source_port(&self) -> u16 {
+        self.peer.port()
+    }
+    /// Convert only IPv4 observations for the existing reassembly consumer.
+    #[must_use]
+    pub fn ipv4(&self) -> Option<DownlinkOuterProvenance> {
+        let (SocketAddr::V4(peer), SocketAddr::V4(local)) = (self.peer, self.local) else {
+            return None;
+        };
+        DownlinkOuterProvenance::new(*peer.ip(), *local.ip(), self.ingress_ifindex, peer.port())
+    }
+}
+
+impl From<DownlinkOuterProvenance> for GtpuControlProvenance {
+    fn from(provenance: DownlinkOuterProvenance) -> Self {
+        Self {
+            local: SocketAddr::new(provenance.local_address().into(), GTPU_PORT),
+            peer: SocketAddr::new(provenance.peer_address().into(), provenance.source_port()),
+            ingress_ifindex: provenance.ingress_ifindex(),
+        }
+    }
 }
 
 /// Explicit caller policy for one response, excluding IP/UDP headers.
@@ -336,7 +439,7 @@ pub enum GtpuControlDatagramKind {
 /// ```
 pub struct GtpuControlDatagram {
     bytes: Bytes,
-    provenance: DownlinkOuterProvenance,
+    provenance: GtpuControlProvenance,
     #[cfg(any(test, target_os = "linux"))]
     socket_identity: Arc<()>,
     kind: GtpuControlDatagramKind,
@@ -359,12 +462,12 @@ impl GtpuControlDatagram {
     #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn received(
         bytes: Bytes,
-        provenance: DownlinkOuterProvenance,
+        provenance: impl Into<GtpuControlProvenance>,
         socket_identity: Arc<()>,
     ) -> Self {
         let mut result = Self {
             bytes,
-            provenance,
+            provenance: provenance.into(),
             socket_identity,
             kind: GtpuControlDatagramKind::Malformed,
             control: None,
@@ -445,23 +548,20 @@ impl GtpuControlDatagram {
 
     /// Exact peer/local/ingress metadata established by the socket.
     #[must_use]
-    pub const fn provenance(&self) -> &DownlinkOuterProvenance {
+    pub const fn provenance(&self) -> &GtpuControlProvenance {
         &self.provenance
     }
 
     /// Local destination tuple. This socket profile binds UDP/2152.
     #[must_use]
-    pub fn local(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(self.provenance.local_address(), GTPU_PORT)
+    pub fn local(&self) -> SocketAddr {
+        self.provenance.local
     }
 
     /// Peer source tuple, including a dynamic source port.
     #[must_use]
-    pub fn peer(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(
-            self.provenance.peer_address(),
-            self.provenance.source_port(),
-        )
+    pub fn peer(&self) -> SocketAddr {
+        self.provenance.peer
     }
 
     /// Type from a structurally complete GTP-U header, if one was admitted.
@@ -525,10 +625,11 @@ impl GtpuControlDatagram {
             return Err(GtpuControlPortError::WrongProcedure);
         }
         let teid = self.teid.ok_or(GtpuControlPortError::WrongProcedure)?;
-        let error = GtpuErrorIndication::new(teid, (*self.local().ip()).into())
+        let error = GtpuErrorIndication::new(teid, self.local().ip())
             .with_triggering_udp_source_port(self.peer().port())
             .map_err(|_| GtpuControlPortError::Encoding)?;
-        let peer = SocketAddrV4::new(*self.peer().ip(), GTPU_PORT);
+        let mut peer = self.peer();
+        peer.set_port(GTPU_PORT);
         self.response(GtpuControlMessage::ErrorIndication(error), peer, budget)
     }
 
@@ -550,7 +651,8 @@ impl GtpuControlDatagram {
         {
             return Err(GtpuControlPortError::WrongProcedure);
         }
-        let peer = SocketAddrV4::new(*self.peer().ip(), GTPU_PORT);
+        let mut peer = self.peer();
+        peer.set_port(GTPU_PORT);
         self.response(
             GtpuControlMessage::SupportedExtensionHeadersNotification(
                 GtpuSupportedExtensionHeadersNotification::new(supported),
@@ -563,17 +665,11 @@ impl GtpuControlDatagram {
     fn response(
         self,
         message: GtpuControlMessage,
-        peer: SocketAddrV4,
+        peer: SocketAddr,
         budget: GtpuControlResponseBudget,
     ) -> Result<GtpuControlSendPlan, GtpuControlPortError> {
         let source = self.local();
-        if peer.port() == 0
-            || peer.ip().is_unspecified()
-            || peer.ip().is_multicast()
-            || peer.ip().is_broadcast()
-            || source.ip().is_multicast()
-            || source.ip().is_broadcast()
-        {
+        if peer.port() == 0 || !unicast_tuple(peer) || !unicast_tuple(source) {
             return Err(GtpuControlPortError::InvalidTuple);
         }
         let bytes = message
@@ -629,8 +725,8 @@ pub(crate) fn downlink_event(datagram: GtpuControlDatagram) -> crate::GtpuDownli
 /// ```
 pub struct GtpuControlSendPlan {
     pub(crate) bytes: Bytes,
-    pub(crate) source: SocketAddrV4,
-    pub(crate) peer: SocketAddrV4,
+    pub(crate) source: SocketAddr,
+    pub(crate) peer: SocketAddr,
     #[cfg(any(test, target_os = "linux"))]
     pub(crate) socket_identity: Arc<()>,
     received_length: usize,
@@ -639,12 +735,12 @@ pub struct GtpuControlSendPlan {
 impl GtpuControlSendPlan {
     /// Exact source tuple selected by the message-specific response rule.
     #[must_use]
-    pub const fn source(&self) -> SocketAddrV4 {
+    pub const fn source(&self) -> SocketAddr {
         self.source
     }
     /// Exact destination tuple selected by that rule.
     #[must_use]
-    pub const fn destination(&self) -> SocketAddrV4 {
+    pub const fn destination(&self) -> SocketAddr {
         self.peer
     }
     /// Encoded UDP payload length to charge to the caller's aggregate limiter.
@@ -673,7 +769,7 @@ impl fmt::Debug for GtpuControlSendPlan {
 mod tests {
     use super::*;
     use opc_proto_gtpu::GtpuExtensionHeaderType;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     const ECHO: &[u8] = &[0x32, 1, 0, 4, 0, 0, 0, 0, 0x12, 0x34, 0, 0];
     const GPDU: &[u8] = &[0x30, 255, 0, 1, 1, 2, 3, 4, 0x45];
@@ -696,10 +792,53 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_control_preserves_link_scope_and_refuses_mapped_or_foreign_scope() {
+        let peer: SocketAddr = "[fe80::2%7]:49152".parse().unwrap();
+        let local: SocketAddr = "[fe80::1%7]:2152".parse().unwrap();
+        let provenance = GtpuControlProvenance::new(peer, local, 7).unwrap();
+        assert!(provenance.ipv4().is_none());
+        assert_eq!(
+            format!("{provenance:?}"),
+            "GtpuControlProvenance(<redacted>)"
+        );
+        let event =
+            GtpuControlDatagram::received(Bytes::from_static(ECHO), provenance, Arc::new(()));
+        let plan = event.echo_response(budget()).unwrap();
+        assert_eq!(plan.source(), local);
+        assert_eq!(plan.destination(), peer);
+        for bad in [
+            "[fe80::2]:49152",
+            "[fe80::2%8]:49152",
+            "[2001:db8::2%7]:49152",
+            "[::ffff:192.0.2.2]:49152",
+            "192.0.2.2:49152",
+        ] {
+            assert!(GtpuControlProvenance::new(bad.parse().unwrap(), local, 7).is_none());
+        }
+        let source: SocketAddr = "[2001:db8::1]:2152".parse().unwrap();
+        for bad in [
+            "[::]:2152",
+            "[ff02::1]:2152",
+            "[::ffff:192.0.2.2]:2152",
+            "192.0.2.2:2152",
+            "[2001:db8::2]:0",
+            "[fe80::2]:2152",
+        ] {
+            assert_eq!(
+                echo_request_bytes(source, bad.parse().unwrap(), 1),
+                Err(GtpuControlPortError::InvalidTuple)
+            );
+        }
+    }
+
+    #[test]
     fn outgoing_echo_validates_both_tuples_and_encodes_canonical_request() {
         let source = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), GTPU_PORT);
         let peer = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), GTPU_PORT);
-        assert_eq!(echo_request_bytes(source, peer, 0x1234).unwrap(), ECHO);
+        assert_eq!(
+            echo_request_bytes(source.into(), peer.into(), 0x1234).unwrap(),
+            ECHO
+        );
         for invalid in [
             SocketAddrV4::new(*source.ip(), 0),
             SocketAddrV4::new(*source.ip(), 2153),
@@ -708,11 +847,11 @@ mod tests {
             SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), GTPU_PORT),
         ] {
             assert_eq!(
-                echo_request_bytes(invalid, peer, 1),
+                echo_request_bytes(invalid.into(), peer.into(), 1),
                 Err(GtpuControlPortError::InvalidTuple)
             );
             assert_eq!(
-                echo_request_bytes(source, invalid, 1),
+                echo_request_bytes(source.into(), invalid.into(), 1),
                 Err(GtpuControlPortError::InvalidTuple)
             );
         }
@@ -730,11 +869,11 @@ mod tests {
             assert!(Arc::ptr_eq(&identity, &plan.socket_identity));
             assert_eq!(
                 plan.source(),
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2152)
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2152))
             );
             assert_eq!(
                 plan.destination(),
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), port)
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), port))
             );
             assert_eq!(
                 &plan.bytes[..],
@@ -806,11 +945,11 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 plan.source(),
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2152)
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2152))
             );
             assert_eq!(
                 plan.destination(),
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), 2152)
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), 2152))
             );
             assert_eq!(plan.received_length(), packet.len());
             assert_eq!(plan.response_length(), 28);
