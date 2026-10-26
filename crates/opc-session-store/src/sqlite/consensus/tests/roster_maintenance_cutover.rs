@@ -101,13 +101,15 @@ fn row_states(conn: &Connection) -> Vec<i64> {
 fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("retained-cutover.sqlite");
-    initialize_protected_roster_v2_recovery_fixture(
+    let predecessor = members(&[7, 8, 9]);
+    initialize_protected_roster_v2_recovery_fixture_with_members(
         &path,
         if v1 {
             ProtectedRosterV2RecoveryFixtureState::Established
         } else {
             ProtectedRosterV2RecoveryFixtureState::Aborted
         },
+        predecessor.clone(),
     )
     .unwrap();
     let signed = if v1 {
@@ -118,8 +120,7 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
     let backend = SqliteSessionBackend::open(&path).unwrap();
     let conn = backend.conn.blocking_lock();
     let storage = signed.identity;
-    let predecessor = expected_members();
-    let successor = members(&[7, 8, 9]);
+    let successor = members(&[7, 8, 9, 10, 11]);
     let successor_identity = SessionConsensusIdentity::new(
         storage.cluster_id(),
         SessionConsensusConfigurationId::from_bytes([0xD7; 32]),
