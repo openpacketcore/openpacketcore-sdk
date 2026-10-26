@@ -45,8 +45,10 @@ pub const MAX_SCTP_AUTH_KEY_BYTES: usize = u16::MAX as usize;
 pub enum AddressFamily {
     /// IPv4 socket.
     Ipv4,
-    /// IPv6 socket.
+    /// IPv6 socket with the host's existing IPv6-only policy.
     Ipv6,
+    /// Explicit dual-stack IPv6 socket with native IPv4 address readback.
+    Ipv6DualStack,
 }
 
 /// SCTP socket style.
@@ -246,8 +248,8 @@ pub fn bind(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<()> {
 
 /// Atomically bind an SCTP socket to a bounded set of local addresses.
 ///
-/// All addresses must use one family and port. Callers that have exactly one
-/// address should use [`bind`] to preserve the ordinary socket path.
+/// All addresses must use one port. Mixed IPv4/IPv6 sets require a dual-stack
+/// socket. Callers with exactly one address should use [`bind`].
 pub fn bind_addresses(fd: BorrowedFd<'_>, addrs: &[SocketAddr]) -> io::Result<()> {
     platform::bind_addresses(fd, addrs)
 }
@@ -269,8 +271,8 @@ pub fn connect(fd: BorrowedFd<'_>, addr: &SocketAddr) -> io::Result<ConnectStatu
 
 /// Start a nonblocking SCTP connect using a bounded peer address set.
 ///
-/// All addresses must use one family and port. Callers that have exactly one
-/// address should use [`connect`] to preserve the ordinary socket path.
+/// All addresses must use one port. Mixed IPv4/IPv6 sets require a dual-stack
+/// socket. Callers with exactly one address should use [`connect`].
 pub fn connect_addresses(fd: BorrowedFd<'_>, addrs: &[SocketAddr]) -> io::Result<ConnectStatus> {
     platform::connect_addresses(fd, addrs)
 }

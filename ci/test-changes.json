@@ -948,6 +948,12 @@
       "kind": "assertions-decreased",
       "reason": "Extract the body into prepared_cas_binding_reply_loss_case in crates/opc-session-net/tests/stateless_quorum_consumer.rs, moving the fleet through the controlled-clock closure. All original assertions and calls to application_sequences, quiesce, voter_authority, wait_for_observed_leader and withhold_next_forward_mutation_reply remain; their helper bodies are unchanged. Static receiver resolution loses their eight setup/cleanup expectations after fleet is rebound, while two clock assertions are added (116 -> 110). Cargo disables automatic integration targets and includes this file in the library; its actual lib=lib target also resolves the shared clock helper and grows 116 -> 117. No runtime coverage is removed.",
       "issue": 1147
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::loopback_dual_stack_multihoming_selects_both_families",
+      "kind": "disabled",
+      "reason": "New native Linux SCTP test requires SCTP and IPv6 loopback. The required SCTP workflow executes it explicitly and checks one passing test. It exercises mixed bindx/connectx in both family orders, address readback, primary-path selection and payload delivery over IPv4 and IPv6. Portable configuration and path-identity tests run normally.",
+      "issue": 1351
     }
   ]
 }

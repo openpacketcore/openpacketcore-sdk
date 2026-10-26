@@ -1,7 +1,7 @@
 use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr;
 
 use zeroize::Zeroizing;
@@ -157,7 +157,7 @@ struct SctpPeerAddressParameters(PackedSctpPeerAddressParameters);
 pub fn open_socket(family: AddressFamily, style: SocketStyle) -> io::Result<OwnedFd> {
     let domain = match family {
         AddressFamily::Ipv4 => libc::AF_INET,
-        AddressFamily::Ipv6 => libc::AF_INET6,
+        AddressFamily::Ipv6 | AddressFamily::Ipv6DualStack => libc::AF_INET6,
     };
     let socket_type = match style {
         SocketStyle::OneToOne => libc::SOCK_STREAM,
@@ -174,7 +174,18 @@ pub fn open_socket(family: AddressFamily, style: SocketStyle) -> io::Result<Owne
     } else {
         // SAFETY: `fd` is a fresh descriptor returned by `socket` above and is
         // not owned anywhere else.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        if family == AddressFamily::Ipv6DualStack {
+            // Explicit dual-stack admission must not depend on the host's bindv6only default.
+            set_sockopt(fd.as_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &0_i32)?;
+            set_sockopt(
+                fd.as_fd(),
+                libc::IPPROTO_SCTP,
+                libc::SCTP_I_WANT_MAPPED_V4_ADDR,
+                &0_i32,
+            )?;
+        }
+        Ok(fd)
     }
 }
 
@@ -875,15 +886,6 @@ fn validate_socket_address_set(addrs: &[SocketAddr]) -> io::Result<()> {
             "SCTP address set exceeds the bounded maximum",
         ));
     }
-    if addrs
-        .iter()
-        .any(|address| address.is_ipv4() != first.is_ipv4())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "SCTP address set mixes address families",
-        ));
-    }
     if addrs.iter().any(|address| address.port() != first.port()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1534,11 +1536,13 @@ mod tests {
         );
 
         assert!(pack_socket_addresses(&[]).is_err());
-        assert!(pack_socket_addresses(&[
-            "127.0.0.1:38412".parse().unwrap(),
-            "[::1]:38412".parse().unwrap(),
-        ])
-        .is_err());
+        let mixed = pack_socket_addresses(&[v4[0], v6[0]]).unwrap();
+        assert_eq!(mixed.len(), v4_bytes + v6_bytes);
+        assert_eq!(&mixed[..v4_bytes], &packed[..v4_bytes]);
+        assert_eq!(&mixed[v4_bytes..], &packed_v6[..v6_bytes]);
+        let reversed = pack_socket_addresses(&[v6[0], v4[0]]).unwrap();
+        assert_eq!(&reversed[..v6_bytes], &packed_v6[..v6_bytes]);
+        assert_eq!(&reversed[v6_bytes..], &packed[..v4_bytes]);
         assert!(pack_socket_addresses(&[
             "127.0.0.1:38412".parse().unwrap(),
             "127.0.0.2:38413".parse().unwrap(),

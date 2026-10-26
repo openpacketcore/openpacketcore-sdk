@@ -202,6 +202,7 @@ impl SctpConnectProgressHandle {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn advance(&self, stage: SctpConnectStage) {
         let mut observed = self.stage.load(Ordering::Acquire);
         while observed < stage as u8 {
@@ -1127,8 +1128,8 @@ impl SctpConnectConfig {
         if !self.local_addrs.is_empty() {
             validate_address_set(&self.local_addrs, "local_addrs")?;
         }
-        if let (Some(local), Some(remote)) = (self.local_addrs.first(), self.remote_addrs.first()) {
-            validate_same_family(local, remote)?;
+        if !self.local_addrs.is_empty() {
+            validate_same_family(&self.local_addrs, &self.remote_addrs)?;
         }
         Ok(())
     }
@@ -2761,7 +2762,11 @@ fn same_sctp_path(left: SocketAddr, right: SocketAddr) -> bool {
                 && left.port() == right.port()
                 && left.scope_id() == right.scope_id()
         }
-        (SocketAddr::V4(_), SocketAddr::V6(_)) | (SocketAddr::V6(_), SocketAddr::V4(_)) => false,
+        (SocketAddr::V4(v4), SocketAddr::V6(v6)) | (SocketAddr::V6(v6), SocketAddr::V4(v4)) => {
+            v6.scope_id() == 0
+                && v6.ip().to_ipv4_mapped() == Some(*v4.ip())
+                && v6.port() == v4.port()
+        }
     }
 }
 
@@ -3617,15 +3622,6 @@ fn validate_address_set(
     }
     if addresses
         .iter()
-        .any(|address| address.is_ipv4() != first.is_ipv4())
-    {
-        return Err(SctpError::InvalidConfig {
-            field: "address_family",
-            reason: "all addresses must use the same IP family",
-        });
-    }
-    if addresses
-        .iter()
         .any(|address| address.port() != first.port())
     {
         return Err(SctpError::InvalidConfig {
@@ -3646,13 +3642,17 @@ fn validate_address_set(
     Ok(())
 }
 
-fn validate_same_family(left: &SocketAddr, right: &SocketAddr) -> Result<(), SctpError> {
-    if left.is_ipv4() == right.is_ipv4() {
+fn validate_same_family(left: &[SocketAddr], right: &[SocketAddr]) -> Result<(), SctpError> {
+    if left.iter().any(|local| {
+        right.iter().any(|remote| {
+            local.ip().to_canonical().is_ipv4() == remote.ip().to_canonical().is_ipv4()
+        })
+    }) {
         Ok(())
     } else {
         Err(SctpError::InvalidConfig {
             field: "address_family",
-            reason: "local and remote addresses must use the same IP family",
+            reason: "local and remote address sets must share an IP family",
         })
     }
 }
@@ -3668,11 +3668,19 @@ fn sys_init(init: InitConfig) -> opc_libsctp_sys::InitMsg {
 }
 
 #[cfg(target_os = "linux")]
-fn sys_family(addr: &SocketAddr) -> opc_libsctp_sys::AddressFamily {
-    if addr.is_ipv4() {
-        opc_libsctp_sys::AddressFamily::Ipv4
+fn sys_family(local: &[SocketAddr], remote: &[SocketAddr]) -> opc_libsctp_sys::AddressFamily {
+    if local.iter().chain(remote).any(SocketAddr::is_ipv6) {
+        if local
+            .iter()
+            .chain(remote)
+            .any(|address| address.ip().to_canonical().is_ipv4())
+        {
+            opc_libsctp_sys::AddressFamily::Ipv6DualStack
+        } else {
+            opc_libsctp_sys::AddressFamily::Ipv6
+        }
     } else {
-        opc_libsctp_sys::AddressFamily::Ipv6
+        opc_libsctp_sys::AddressFamily::Ipv4
     }
 }
 
@@ -4002,8 +4010,11 @@ mod platform {
         authentication: Option<SctpAuthenticationConfig>,
     ) -> Result<Endpoint, SctpError> {
         let local = config.local_addrs[0];
-        let fd = opc_libsctp_sys::open_socket(sys_family(&local), sys_style(config.mode))
-            .map_err(|source| io_err("socket", source))?;
+        let fd = opc_libsctp_sys::open_socket(
+            sys_family(&config.local_addrs, &[]),
+            sys_style(config.mode),
+        )
+        .map_err(|source| io_err("socket", source))?;
         configure_fd(
             fd.as_fd(),
             config.init,
@@ -4040,8 +4051,10 @@ mod platform {
     ) -> Result<Association, SctpError> {
         let remote = config.remote_addrs[0];
         let peer_paths = SctpPathTracker::new(&config.remote_addrs);
-        let fd_result =
-            opc_libsctp_sys::open_socket(sys_family(&remote), sys_style(SctpMode::OneToOne));
+        let fd_result = opc_libsctp_sys::open_socket(
+            sys_family(&config.local_addrs, &config.remote_addrs),
+            sys_style(SctpMode::OneToOne),
+        );
         progress.advance(SctpConnectStage::SocketCreationAttempted);
         let fd = fd_result.map_err(|source| io_err("socket", source))?;
         progress.advance(SctpConnectStage::SocketCreationSucceeded);
@@ -7300,13 +7313,7 @@ mod tests {
         assert!(config.validate().is_ok());
 
         config.local_addrs.push("[::1]:38412".parse().unwrap());
-        assert!(matches!(
-            config.validate(),
-            Err(SctpError::InvalidConfig {
-                field: "address_family",
-                ..
-            })
-        ));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -7460,13 +7467,34 @@ mod tests {
         ]);
         assert!(config.validate().is_ok());
 
-        config.remote_addrs.push("[::1]:38412".parse().unwrap());
+        config.remote_addrs.push("[::1]:38413".parse().unwrap());
         assert!(matches!(
             config.validate(),
             Err(SctpError::InvalidConfig {
-                field: "address_family",
+                field: "remote_addrs",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn mapped_ipv4_path_identity_preserves_port_and_scope_checks() {
+        let v4 = "192.0.2.1:38412".parse().unwrap();
+        let mapped = "[::ffff:192.0.2.1]:38412".parse().unwrap();
+        assert!(same_sctp_path(v4, mapped));
+        assert!(same_sctp_path(mapped, v4));
+        assert!(!same_sctp_path(
+            v4,
+            "[::ffff:192.0.2.1]:38413".parse().unwrap()
+        ));
+        assert!(!same_sctp_path(
+            v4,
+            "[::ffff:192.0.2.1%3]:38412".parse().unwrap()
+        ));
+        assert!(!same_sctp_path(v4, "[::192.0.2.1]:38412".parse().unwrap()));
+        assert!(!same_sctp_path(
+            v4,
+            "[::ffff:192.0.2.2]:38412".parse().unwrap()
         ));
     }
 
@@ -8149,6 +8177,75 @@ mod tests {
                 .await
                 .expect("multihomed payload timed out");
         assert_eq!(received.payload, Bytes::from_static(b"multihomed-sctp"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Linux kernel SCTP and IPv6 loopback support"]
+    async fn loopback_dual_stack_multihoming_selects_both_families() {
+        for ipv6_first in [false, true] {
+            let mut server_config = SctpEndpointConfig::one_to_one("127.0.0.1:0".parse().unwrap());
+            server_config.local_addrs.push("[::1]:0".parse().unwrap());
+            if ipv6_first {
+                server_config.local_addrs.reverse();
+            }
+            let server = SctpEndpoint::bind(server_config).unwrap();
+            let mut addresses = server.local_addresses().unwrap();
+            addresses.sort_unstable();
+            assert_eq!(addresses.len(), 2);
+            assert_eq!(addresses[0].ip().to_string(), "127.0.0.1");
+            assert_eq!(addresses[1].ip().to_string(), "::1");
+            assert_ne!(addresses[0].port(), 0);
+            assert_eq!(addresses[0].port(), addresses[1].port());
+            if ipv6_first {
+                addresses.reverse();
+            }
+            let mut config = SctpConnectConfig::new(addresses[0]);
+            config.remote_addrs = addresses.clone();
+            config.local_addrs = vec!["127.0.0.2:0".parse().unwrap(), "[::1]:0".parse().unwrap()];
+            let client =
+                tokio::time::timeout(Duration::from_secs(5), SctpAssociation::connect(config))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let accepted = tokio::time::timeout(Duration::from_secs(5), server.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut peer_addresses = client.peer_addresses().unwrap();
+            peer_addresses.sort_unstable();
+            let mut expected = addresses.clone();
+            expected.sort_unstable();
+            assert_eq!(peer_addresses, expected);
+            let mut client_addresses = client.local_addresses().unwrap();
+            client_addresses.sort_unstable();
+            assert_eq!(client_addresses.len(), 2);
+            assert_eq!(client_addresses[0].ip().to_string(), "127.0.0.2");
+            assert_eq!(client_addresses[1].ip().to_string(), "::1");
+
+            for address in addresses {
+                client.set_primary_peer_path(address).unwrap();
+                let paths = client.peer_path_health();
+                assert_eq!(paths.len(), 2);
+                let primary: Vec<_> = paths.iter().filter(|path| path.primary).collect();
+                assert_eq!(primary.len(), 1);
+                assert!(same_sctp_path(primary[0].peer_addr, address));
+                client
+                    .send(OutboundMessage::ordered(
+                        Bytes::from_static(b"dual-stack"),
+                        1,
+                        NGAP_PPID,
+                    ))
+                    .await
+                    .unwrap();
+                let received = tokio::time::timeout(Duration::from_secs(5), recv_data(&accepted))
+                    .await
+                    .unwrap();
+                assert_eq!(received.payload, Bytes::from_static(b"dual-stack"));
+                assert_eq!(received.stream_id, 1);
+                assert_eq!(received.ppid, NGAP_PPID);
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
