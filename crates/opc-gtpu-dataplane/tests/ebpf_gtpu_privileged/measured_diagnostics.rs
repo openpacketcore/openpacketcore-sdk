@@ -203,6 +203,7 @@ mod tests {
                             (MAP_COUNTERS, COUNTER_UL_ENCAP) => 17,
                             (MAP_COUNTERS, COUNTER_UL_FAR_MISS_PASSED) => 2,
                             (MAP_COUNTERS, COUNTER_UL_FAR_MISS_DROPPED) => 3,
+                            (MAP_COUNTERS, COUNTER_DL_MISSING_CONSUMER) => 5,
                             (MAP_DOWNLINK_BINDING_COUNTERS, COUNTER_DL_BINDING_PEER_MISMATCH) => 4,
                             (MAP_UPLINK_PMTU_COUNTERS, COUNTER_UL_MTU_REJECT) => 5,
                             (MAP_TFT_CLASSIFIER_COUNTERS, COUNTER_TFT_CLASSIFIER_NO_MATCH) => 6,
@@ -229,6 +230,7 @@ mod tests {
                 "uplink_encapsulated=17",
                 "uplink_far_misses_passed=2",
                 "uplink_far_misses_dropped=3",
+                "downlink_missing_consumer=5",
                 "downlink_binding_peer_mismatches=4",
                 "uplink_mtu_rejected=5",
                 "tft_classifier_no_match=6",
@@ -246,6 +248,10 @@ mod tests {
                     "missing {expected:?}: {message}"
                 );
             }
+            assert!(
+                !message.contains("INVITE") && !message.contains("password"),
+                "diagnostics must stay value-free: {message}"
+            );
         }
     }
 

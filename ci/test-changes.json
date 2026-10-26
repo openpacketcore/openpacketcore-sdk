@@ -342,10 +342,204 @@
       "issue": 1407
     },
     {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_rejects_wrong_instances_and_invalid_nested_shapes",
+      "kind": "assertions-decreased",
+      "reason": "The four PCO rejection assertions moved to positive retention/ignore coverage for issue #1441 in new tests (issue payloads, request/response retention, nonzero instances, builder round-trip, framing). The negative test keeps its AMBR, bearer-context, instance-shape and malformed-cause assertions; only the PCO-specific local-helper assertions were removed because that behaviour intentionally stopped being a rejection.",
+      "issue": 1441
+    },
+    {
       "test": "rust:crates/opc-session-store::test=consensus_openraft::stepdown::superseded_leader_stops_replication_before_truncating_its_uncommitted_suffix",
       "kind": "assertions-decreased",
       "reason": "Issue #1208 replaces the two immediate status reads (higher term, non-leader) with one bounded wait_for_status_for_test predicate that checks the same two conditions; the static helper resolver attributes one fewer assertion to the test. Openraft publishes the successor term and non-leader state from its own engine task, so a single immediate read could observe the pre-stepdown snapshot. Every original property and the existing RECOVERY_TIMEOUT bound are preserved; no timeout was raised and no assertion was weakened.",
       "issue": 1208
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::forced_timeout_reports_datapath_state_fields",
+      "kind": "disabled",
+      "reason": "Forced-timeout diagnostics regression is marked #[ignore] because this target executes with the privileged GTP-U datapath lane (`--ignored --nocapture`), the only lane that runs it; the regression itself needs no privilege. It asserts the shared datapath timeout diagnostics render every required field (redirect delta, shared-peer iteration, measured counter/drop expected and observed values, tentative addresses, neighbour and route state) and only adds coverage.",
+      "issue": 1188
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_n3_end_marker_retirement_ordering",
+      "kind": "assertions-decreased",
+      "reason": "Replace the ad-hoc redirect-IT timeout eprintln block (which called `ip -6 addr/neigh show` with an expect) with the shared DatapathTimeoutDiagnostics formatter. The timeout assertion and every behavioral assertion are unchanged; the removed diagnostic `expect` is now a failure-safe bounded renderer, so the static helper resolver attributes fewer assertions while failures report strictly more datapath state (redirect delta, shared-peer iteration, counter values, tentative addresses, neighbours, routes).",
+      "issue": 1188
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::forced_timeout_reports_datapath_state_fields",
+      "kind": "removed",
+      "reason": "Issue #1188 replaces the synthetic DatapathTimeoutDiagnostics formatter with the actual measured failure-path renderer. In crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged/measured_diagnostics.rs, the two enabled forced-timeout tests check the original panic, redirect delta, both shared-peer iterations, live counter values, tentative addresses, IPv4/IPv6 neighbours/routes, command status/stderr and unavailable reads. The missing-consumer value and payload-marker exclusion assertions are retained there. Arbitrary expected/observed labels belong to the deleted synthetic formatter; the replacement reports the real six-GPDU assertion and current counters.",
+      "issue": 1188,
+      "replacements": [
+        "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::measured_diagnostics::tests::forced_timeout_reports_redirect_delta_iteration_and_datapath_state",
+        "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::measured_diagnostics::tests::forced_timeout_preserves_the_failure_when_diagnostics_are_unavailable"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-n3iwf-fixtures::test=ngap_messages::complete_reference_messages_exercise_every_sdk_typed_field",
+      "kind": "assertions-decreased",
+      "reason": "Issue #1262 keeps SecurityKey IE bytes in their zeroizing typed owner. In crates/opc-n3iwf-fixtures/tests/ngap_messages.rs, this test now compares every reference IE value directly, including id 94. The two deleted assertions checked the obsolete empty-key placeholder and cleared the expected key before comparison. Exact typed-field equality, canonical encoding and raw-preserving encoding remain; restoring the placeholder assertions would contradict intact key custody.",
+      "issue": 1262
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::retained::tests::a_conflicting_provisioning_request_never_adopts_or_overwrites_authenticated_state",
+      "kind": "assertions-decreased",
+      "reason": "In crates/opc-persist/src/retained/tests.rs, the successful preliminary reopen was removed from established_before because it could change SQLite headers after the preservation snapshot and before the rejected request. Its transitive helper assertions explain 47 -> 41. The same test still checks refusal and byte-for-byte preservation at every CRASH_STAGES boundary, then requires established-store reopen, authorized resume and final reopen. The positive-control reopen now occurs after the preservation assertion, and cannot silently suppress itself through is_ok().",
+      "issue": 1114
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::retained::tests::abort_does_not_remove_a_concurrent_owners_fresh_lock",
+      "kind": "removed",
+      "reason": "Issue #1114 uses a permanent authenticated intent/lock inode and explicit resume rather than abort/unlink recovery. Replacement resume_does_not_remove_a_concurrent_owners_admission_lock in crates/opc-persist/src/retained/tests.rs holds the real admission lock, requires InUse and exact artifact preservation, then releases the owner and requires successful resume.",
+      "issue": 1114,
+      "replacements": [
+        "rust:crates/opc-persist::lib=lib::retained::tests::resume_does_not_remove_a_concurrent_owners_admission_lock"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::retained::tests::durable_intent_publication_is_classified_as_a_mutation",
+      "kind": "assertions-decreased",
+      "reason": "In crates/opc-persist/src/retained/tests.rs, this test replaces separate old fault loops with all 19 PROVISION_STEPS. At every step it requires failure and checks mutation classification and named intent presence against the publication boundary. The three prepublication O_TMPFILE steps must additionally leave an empty directory. Both pre-effect and post-publication outcomes remain asserted; removing the duplicated pre-effect setup/helper calls accounts for 20 -> 14 static assertions.",
+      "issue": 1114
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::retained::tests::process_loss_after_intent_retirement_leaves_an_established_reopenable_store",
+      "kind": "removed",
+      "reason": "Issue #1114 replaces intent deletion with permanent intent plus synchronized completion publication. Replacement process_loss_after_completion_leaves_an_established_reopenable_store in crates/opc-persist/src/retained/tests.rs crashes after record_synced, requires both witnesses, successful ordinary reopen, AlreadyExists for fresh provisioning and a second successful reopen. The obsolete intent_removed hook no longer represents a production boundary.",
+      "issue": 1114,
+      "replacements": [
+        "rust:crates/opc-persist::lib=lib::retained::tests::process_loss_after_completion_leaves_an_established_reopenable_store"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::retained::tests::remove_intent_file_refuses_foreign_file_types",
+      "kind": "removed",
+      "reason": "Issue #1114 removes intent-unlink recovery. Replacement resume_preserves_foreign_intent_file_types in crates/opc-persist/src/retained/tests.rs exercises the public recovery path against the same writable regular-file and symlink cases, requires rejection, and verifies that both the foreign entry and symlink target remain unchanged.",
+      "issue": 1114,
+      "replacements": [
+        "rust:crates/opc-persist::lib=lib::retained::tests::resume_preserves_foreign_intent_file_types"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::retained::tests::torn_first_intent_without_artifacts_is_replaced_and_completes",
+      "kind": "removed",
+      "reason": "The old successful replacement assertion violated issue #1114: unauthenticated/torn intent cannot authorize initialization or deletion. Replacement torn_first_intent_without_artifacts_is_preserved_and_refused in crates/opc-persist/src/retained/tests.rs requires failed resume and reopen, byte-identical artifacts and no database. provisioning_regressions::unverifiable_interrupted_intent_is_preserved additionally covers empty and truncated records.",
+      "issue": 1114,
+      "replacements": [
+        "rust:crates/opc-persist::lib=lib::retained::tests::torn_first_intent_without_artifacts_is_preserved_and_refused",
+        "rust:crates/opc-persist::lib=lib::retained::tests::provisioning_regressions::unverifiable_interrupted_intent_is_preserved"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::create_bearer_retains_a_well_formed_nested_pco_like_update_bearer",
+      "kind": "removed",
+      "reason": "Renamed to create_bearer_retains_a_well_formed_nested_pco in crates/opc-proto-gtpv2c/tests/dedicated_bearer.rs. The Create Bearer test body and retention assertions are unchanged; only its name/comment stop claiming that Update Bearer has the same receive grammar. TS 29.274 V19.6.0 tables 7.2.3/4 and 7.2.15/16 distinguish those procedures.",
+      "issue": 1441,
+      "replacements": [
+        "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::create_bearer_retains_a_well_formed_nested_pco"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_builders_round_trip_a_retained_pco",
+      "kind": "removed",
+      "reason": "TS 29.274 V19.6.0 tables 7.2.15/16 do not assign PCO to S2b Update Bearer senders. Replacement update_bearer_builders_reject_non_s2b_pco in crates/opc-proto-gtpv2c/tests/dedicated_bearer.rs checks request/response builder refusal at both scopes and retains a valid request round-trip. update_bearer_rejects_wrong_instances_and_invalid_nested_shapes restores all four strict projection checks; issue_1441_payloads_decode_and_preserve_bearer_policy checks canonical omission and exact raw preservation of received PCO.",
+      "issue": 1441,
+      "replacements": [
+        "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_builders_reject_non_s2b_pco",
+        "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_rejects_wrong_instances_and_invalid_nested_shapes",
+        "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::issue_1441_payloads_decode_and_preserve_bearer_policy"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_duplicate_nested_pco_keeps_the_first",
+      "kind": "removed",
+      "reason": "TS 29.274 V19.6.0 clause 7.7.9 discards non-applicable receive IEs before value interpretation or singleton bookkeeping; retaining the first unexpected PCO was incorrect. Replacement update_bearer_duplicate_nested_pco_discards_all_occurrences in crates/opc-proto-gtpv2c/tests/dedicated_bearer.rs uses the same two distinct nested PCOs and requires both discarded, no duplicate diagnostic, retained EBI and TFT, and successful projection.",
+      "issue": 1441,
+      "replacements": [
+        "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_duplicate_nested_pco_discards_all_occurrences"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_tolerates_and_retains_declared_pco_slots",
+      "kind": "removed",
+      "reason": "TS 29.274 V19.6.0 clause 7.7.9 and tables 7.2.15/16 require discarding non-S2b PCO. Replacement update_bearer_discards_non_s2b_pco_at_both_scopes in crates/opc-proto-gtpv2c/tests/dedicated_bearer.rs retains request/response fixtures and bearer-policy checks, but correctly requires zero retained top-level and nested PCOs. issue_1441_payloads_decode_and_preserve_bearer_policy separately checks canonical omission and exact raw preservation.",
+      "issue": 1441,
+      "replacements": [
+        "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_discards_non_s2b_pco_at_both_scopes",
+        "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::issue_1441_payloads_decode_and_preserve_bearer_policy"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-proto-ngap::test=constructed::canonical_encoding_revalidates_mutable_message_and_wrapper",
+      "kind": "assertions-decreased",
+      "reason": "Issue #1262 prevents implicit cloning of key-bearing structures. In crates/opc-proto-ngap/tests/constructed.rs, each adversary is built directly from the same paging_drx IE instead of clone_pdu encode/decode helper calls. All seven invalid wrapper/message/IE cases still require canonical rejection and unchanged destination, and every case explicitly receives saved raw bytes and checks exact raw-preserving output. Removed clone_pdu setup expectations and its transitive decoder helpers explain both guard findings; no adversary or rejection assertion was removed.",
+      "issue": 1262
+    },
+    {
+      "test": "rust:crates/opc-protocol::lib=lib::sensitive::test_audit::drop_zeroizes_content_before_the_allocation_is_released",
+      "kind": "removed",
+      "reason": "Issue #1262 moves NGAP byte custody from the removed shared opc-protocol carrier into crates/opc-proto-ngap/src/sensitive.rs. Replacement sensitive::tests::drop_zeroizes_content_before_the_allocation_is_released: The same 32-byte nonzero input is checked before drop, then the exact allocation pointer, length and cleared flag are observed before release instead of aggregate counters.",
+      "issue": 1262,
+      "replacements": [
+        "rust:crates/opc-proto-ngap::lib=lib::sensitive::tests::drop_zeroizes_content_before_the_allocation_is_released"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-protocol::lib=lib::sensitive::test_audit::empty_and_partially_zero_buffers_are_handled",
+      "kind": "removed",
+      "reason": "Issue #1262 moves NGAP byte custody from the removed shared opc-protocol carrier into crates/opc-proto-ngap/src/sensitive.rs. Replacement sensitive::tests::empty_and_partially_zero_buffers_are_handled: The same empty and mixed-zero buffers are dropped; the replacement checks two observations, all cleared flags and the exact mixed allocation pointer/length.",
+      "issue": 1262,
+      "replacements": [
+        "rust:crates/opc-proto-ngap::lib=lib::sensitive::tests::empty_and_partially_zero_buffers_are_handled"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-protocol::lib=lib::sensitive::test_audit::from_bytes_mut_is_zeroized_too",
+      "kind": "removed",
+      "reason": "Issue #1262 moves NGAP byte custody from the removed shared opc-protocol carrier into crates/opc-proto-ngap/src/sensitive.rs. Replacement sensitive::tests::from_zeroizing_is_zeroized_too: The obsolete BytesMut carrier constructor was removed. The actual Zeroizing-owner constructor now has a 16-byte input/drop test with an exact pointer/length/cleared observation, stronger than the old length-only constructor check.",
+      "issue": 1262,
+      "replacements": [
+        "rust:crates/opc-proto-ngap::lib=lib::sensitive::tests::from_zeroizing_is_zeroized_too"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-protocol::lib=lib::sensitive::test_audit::from_vec_adopts_the_allocation_and_clears_it_on_drop",
+      "kind": "removed",
+      "reason": "Issue #1262 moves NGAP byte custody from the removed shared opc-protocol carrier into crates/opc-proto-ngap/src/sensitive.rs. Replacement sensitive::tests::from_vec_adopts_the_allocation_and_clears_it_on_drop: The same 24-byte vector must retain its allocation pointer and length, then produce the exact cleared-before-release observation.",
+      "issue": 1262,
+      "replacements": [
+        "rust:crates/opc-proto-ngap::lib=lib::sensitive::tests::from_vec_adopts_the_allocation_and_clears_it_on_drop"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-sctp::test=data_chunk::wire_and_kernel_metadata_use_identical_n2_admission",
+      "kind": "assertions-decreased",
+      "reason": "In crates/opc-sctp/tests/data_chunk.rs, all nine assert_same_message checks were inlined in this same test: payload, stream_id, ppid, order, assoc_id, notification, event, truncated and control_truncated. Issue #1262 restores bytes::Bytes payload compatibility using wiping ownership, so direct payload equality replaces as_slice equality. The guard flags the deleted helper signature even though every comparison and both admission paths remain.",
+      "issue": 1262
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::lost_voter_replacement_installs_snapshot_and_finishes_real_joint_consensus",
+      "kind": "assertions-decreased",
+      "reason": "Issue #1204 is not resolved by treating every StorageUnavailable refusal as transient. In crates/opc-session-store/src/consensus/store/voter_slot_tests.rs, both survivor and successor reopen paths again make one real open call and unwrap its result. Removing reopen_with_transient_wait and the global injected-error hook reduces transitive static count 321 -> 320; all snapshot, key-identity, replacement, joint-consensus, final-state and restart assertions remain. Real exclusion/release and incompatible-identity controls live in voter_slot_lifecycle_tests.rs.",
+      "issue": 1204
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::non_transient_and_persistent_reopen_failures_remain_refusals",
+      "kind": "removed",
+      "reason": "Issue #1204 does not authorize blanket retries of unclassified StorageUnavailable errors; its root cause remains open. Replacement incompatible_reopen_preserves_the_retained_voter_identity in crates/opc-session-store/src/consensus/store/voter_slot_lifecycle_tests.rs: The old test only exercised mock return values of the deleted retry helper. The replacement opens real storage with an incompatible enrollment key, requires VoterIdentityReplacementRequired, then reopens the original identity and verifies its unchanged voter table.",
+      "issue": 1204,
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::lifecycle_tests::incompatible_reopen_preserves_the_retained_voter_identity"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::transient_reopen_failures_are_waited_through_within_the_opening_bound",
+      "kind": "removed",
+      "reason": "Issue #1204 does not authorize blanket retries of unclassified StorageUnavailable errors; its root cause remains open. Replacement retained_store_owner_refuses_reopen_until_its_release in crates/opc-session-store/src/consensus/store/voter_slot_lifecycle_tests.rs: The old mock-success-after-three-attempts assertion only specified the deleted blanket retry helper. The replacement retains a real owner after shutdown, requires StorageUnavailable on a single reopen, releases the owner and requires a successful single reopen.",
+      "issue": 1204,
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::lifecycle_tests::retained_store_owner_refuses_reopen_until_its_release"
+      ]
     }
   ]
 }
