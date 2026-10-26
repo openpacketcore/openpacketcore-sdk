@@ -1605,22 +1605,57 @@ mod tests {
         assert!(error.source().is_some(), "typed source remains available");
     }
 
-    /// Hang watchdog for the test-only worker-reply observation. This is not a
-    /// correctness bound: the product's 25 ms acknowledgement/shutdown bounds
-    /// are exercised separately, and the event observed here is the worker's
-    /// own reply after `release()`. A hosted-runner scheduling delay may move
-    /// that reply, but only a genuinely wedged worker hits the watchdog.
-    const WORKER_REPLY_WATCHDOG: Duration = Duration::from_secs(30);
+    /// Hang watchdog for test-only worker-start and reply observations. The
+    /// product's 25 ms acknowledgement/shutdown bounds are checked separately;
+    /// these phases observe worker signals despite backend scheduling delay.
+    /// Keep this below the hold fallback so a forgotten explicit release cannot
+    /// be mistaken for successful completion after automatic release.
+    const WORKER_OBSERVATION_WATCHDOG: Duration = Duration::from_secs(10);
 
     #[test]
     fn worker_observation_watchdog_precedes_hold_fallback() {
         assert!(
-            WORKER_REPLY_WATCHDOG
+            WORKER_OBSERVATION_WATCHDOG
                 .checked_mul(2)
                 .expect("watchdog bound")
                 <= DURABLE_AUDIT_TESTING_HOLD_MAX_DURATION,
             "the reply observation must fail before a forgotten release can self-release"
         );
+    }
+
+    async fn observe_worker_start(
+        sink: &DurableAuditSink,
+    ) -> Result<DurableAuditWorkerHold, DurableAuditSinkError> {
+        sink.hold_worker_for_testing(WORKER_OBSERVATION_WATCHDOG)
+            .await
+    }
+
+    #[tokio::test]
+    async fn worker_setup_observation_waits_for_explicit_start() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sink = open_sink(&database(&tempdir), 0x51, RETAIN_ALL).await;
+        let initial_hold = sink
+            .hold_worker_for_testing(WORKER_OBSERVATION_WATCHDOG)
+            .await
+            .expect("hold the worker before delaying the next start");
+
+        // Keep coverage of the original short testing-seam deadline. Its
+        // expiration is expected while another hold prevents worker entry.
+        assert!(matches!(
+            sink.hold_worker_for_testing(Duration::from_millis(200))
+                .await,
+            Err(DurableAuditSinkError::AcknowledgementTimeout)
+        ));
+
+        let completion = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            initial_hold.release();
+        });
+        let observed = observe_worker_start(&sink).await;
+        completion.await.expect("join delayed worker start release");
+        observed
+            .expect("fixture setup observes worker entry despite delayed scheduling")
+            .release();
     }
 
     fn observe_with_delayed_worker_release<T>(
@@ -1657,8 +1692,7 @@ mod tests {
         .await
         .expect("durable sink");
 
-        let held_worker = sink
-            .hold_worker_for_testing(Duration::from_millis(200))
+        let held_worker = observe_worker_start(&sink)
             .await
             .expect("observe the held worker before admitting requests");
         let stall_started = std::time::Instant::now();
@@ -1687,12 +1721,12 @@ mod tests {
 
         // Acknowledgement timeout and bounded shutdown do not establish the
         // admitted append's outcome. Release the worker and observe its real
-        // reply; the reply is the event, and WORKER_REPLY_WATCHDOG only guards
-        // against a genuinely wedged worker (not a correctness deadline).
+        // reply; WORKER_OBSERVATION_WATCHDOG bounds this observation phase,
+        // independently of the product deadlines already checked above.
         observe_with_delayed_worker_release(held_worker, || {
             assert!(matches!(
                 admitted_reply
-                    .recv_timeout(WORKER_REPLY_WATCHDOG)
+                    .recv_timeout(WORKER_OBSERVATION_WATCHDOG)
                     .expect("observe the admitted append's final result")
                     .expect("the admitted append must complete successfully"),
                 WorkerReply::Appended
@@ -1725,8 +1759,7 @@ mod tests {
         )
         .await
         .expect("durable sink");
-        let held_worker = sink
-            .hold_worker_for_testing(Duration::from_millis(200))
+        let held_worker = observe_worker_start(&sink)
             .await
             .expect("observe the held worker before admitting the failing append");
         let connection = Connection::open(&path).expect("open failure control");
@@ -1749,7 +1782,7 @@ mod tests {
         drop(sink);
         observe_with_delayed_worker_release(held_worker, || {
             match admitted_reply
-                .recv_timeout(WORKER_REPLY_WATCHDOG)
+                .recv_timeout(WORKER_OBSERVATION_WATCHDOG)
                 .expect("observe the admitted append's final failure")
             {
                 Err(DurableAuditSinkError::Store(ManagementAuditStoreError::Persistence(
