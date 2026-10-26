@@ -47,18 +47,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refs #671.
 
 - `opc-ipsec-xfrm`:
-  `NamespaceBoundLinuxXfrmBackend::install_scoped_successor` installs one
-  successor SA for a flow that already has a live scoped receipt, moves the
-  single protective policy to it with one `UPDPOLICY` update (no unprotected
-  interval), and keeps the predecessor SA until the caller retires it through
-  the existing `remove_scoped` (which then removes the predecessor SA only).
-  `scoped_successor_status` reports install/traffic-move/publication/
-  predecessor-retirement milestones for lost-reply and cancellation recovery.
-  A separate committed activation supplies the successor's own role use; the
-  request must keep the predecessor's exact policy/flow identity and bring a
-  distinct SPI and request ID. Ambiguous policy readback retains both objects
-  and is resolved by readback, never assumed. Rekey-trigger ownership and peer
-  signalling remain consumer policy. Refs #1239.
+  `NamespaceBoundLinuxXfrmBackend::install_scoped_successor` installs a fresh
+  scoped Child SA while retaining its predecessor. Outbound successors use a
+  distinct reqid and atomically update the existing protective policy;
+  inbound successors share the reqid and policy so both SAs remain acceptable.
+  Exact retries resume retained progress, and lost replies never undo a
+  completed traffic move. `scoped_successor_status` reads current SA and policy
+  state while retaining the publication milestone. Published successors can
+  themselves be rekeyed. `remove_scoped` retires an unselected SA only, restores
+  a retained live generation when abandoning the selected one, and removes the
+  shared policy only with the final member. Expired groups clean up in either
+  order without manual repair. Each new successor requires its own committed
+  activation. Rekey-trigger ownership and peer signalling remain consumer
+  policy. Ordinary scoped installs also wait on an overlapping outbound SA
+  selection identity. Refs #1239.
 
 - `opc-proto-ikev2`: the executable IKE_SA_INIT/IKE_AUTH transform surface now
   covers RFC 3526 MODP groups 15-18 (Transform IDs 15/16/17/18, 3072/4096/6144/
@@ -159,7 +161,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refs #1248.
 - `opc-gtpu-dataplane`: ordinary inner-IPv6 PDP contexts can now opt into
   in-tunnel RFC 4443 Packet Too Big. The family-tagged entry gains a versioned
-  opt-in downlink inner MTU profile (entry versions 3/4, the 2-byte field at
+  opt-in downlink inner MTU profile (entry version 3, the 2-byte field at
   bytes 73..74, byte 75 reserved); tc's
   family-tagged decapsulation steers an over-MTU inner IPv6 packet to the
   existing packet-too-big hand-off queue, and the consumer sends exactly one
@@ -168,7 +170,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never-answer-before-token order as the IPv4 opt-in. The IPv4
   fragment-inner default remains refused for IPv6
   (`downlink_inner_mtu_inner_ipv6_fragmentation`), and the IPv6 MTU must be at
-  least 1,280. Refusal is explicit rather than installing without enforcement.
+  least 1,280. The profile requires IPv4 outer endpoints and the legacy
+  UDP/2152 uplink source port; grouped and N3 APIs refuse it. The consumer
+  validates default-bearer authority and suppresses errors and Redirects
+  behind extension headers before consuming a rate-limit token. Refusal is
+  explicit rather than installing without enforcement.
   Refs #1007.
 
 - `opc-session-net`: an issuer can now deliver one authenticated, typed boot
@@ -231,21 +237,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter fields are additive: both enums and the counter struct are
   `#[non_exhaustive]`. Refs #1018.
 
-- `opc-ipsec-xfrm`: SAs can request Linux Traffic Flow Confidentiality (TFC)
-  padding through the new `SaParameters::tfc_pad: Option<u32>`. A `Some(n)`
-  value serializes the `XFRMA_TFCPAD` attribute (UAPI attribute 22, `__u32`) on
-  install and rekey; Linux ESP output then pads the protected packet to at
-  least `n` bytes when shorter, capped at the path MTU. Validation rejects a
-  zero length, non-ESP SAs, and non-tunnel modes before any netlink mutation,
-  matching the kernel's `verify_newsa_info`. `SaState::tfc_pad` reports the
-  value from exact `GETSA` readback. `None` emits no attribute and keeps the
-  pre-TFC bytes exactly unchanged. The versioned durable install-request and
-  outbound-binding fingerprints do not cover `tfc_pad` in this revision
-  (in-memory request comparisons do); widening them needs its own
-  auth-domain-v2 and migration follow-up. Dummy-packet generation with Next
-  Header 59 (RFC 4303 §2.5/§2.7) is not part of this netlink model and remains
-  a tracked follow-up, so #1344 is only partially addressed by this change
-  (the configuration/encoding acceptance is met). Refs #1344.
+- `opc-ipsec-xfrm`: `SaParameters::tfc_pad` configures Linux ESP tunnel-mode
+  Traffic Flow Confidentiality padding through `XFRMA_TFCPAD` (UAPI 22).
+  Exact binding/scoped readback and durable object/roster authentication include
+  the target; disabled TFC retains its previous encoding and seals.
+  `rekey_sa` verifies GETSA even when clearing TFC and reports indeterminate
+  state if Linux acknowledges an ignored update. `esp_dummy_payload` builds
+  aligned dummy plaintext with Next Header 59 (RFC 4303 §§2.6–2.7), leaving
+  encryption, sequencing, transmission and peer capability policy to the caller.
+  Stored records with enabled TFC from builds that omitted it from authentication
+  require a fresh install when crossing this format change. Refs #1344.
 
 ### Fixed
 
@@ -450,15 +451,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and typed outcomes are listed under "Added". Refs #1018.
 
 - `opc-gtpu-dataplane`: a PDP context whose outgoing peer TEID is the
-  TS 29.281 section 5.1 all-zero value is now representable and installable on
-  the model and mock-software paths, and the N3 software G-PDU encoder emits
-  the TEID field as zero for it. Locally allocated/received/map-key TEIDs
-  remain strictly nonzero (`Teid::new(0)` still returns `None`), with Debug
-  redaction unchanged. The Linux kernel-GTP netlink path cannot install
-  `GTPA_O_TEI = 0` in this release and returns the stable typed
-  `GtpuError::UnsupportedFeature { feature: "peer_teid_zero" }` on install and
-  readback; the eBPF userspace adapter returns the same typed refusal until its
-  committed datapath object is rebuilt with zero-peer-TEID support. Refs #1346.
+  TS 29.281 section 5.1 all-zero value is now installable on Linux kernel-GTP
+  and eBPF. Readback, reconciliation and retained-owner recovery preserve it,
+  and the rebuilt tc datapath and software G-PDU/End Marker encoders transmit
+  the peer TEID as zero. Locally allocated/received/map-key TEIDs remain
+  strictly nonzero (`Teid::new(0)` still returns `None`), with Debug redaction
+  unchanged. Before downgrading to an SDK without zero-peer support, remove zero-peer contexts or perform a fresh installation. Refs #1346.
 
 - `opc-proto-gtpv2c`: accept unknown extension octets after the required
   Bearer QoS prefix while retaining 40-bit rate bounds and QoS validation.
@@ -536,13 +534,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned
-  opt-in downlink inner MTU profiles (versions 3 and 4, the 2-byte field at
+  opt-in downlink inner MTU profile (version 3, the 2-byte field at
   bytes 73..74, byte 75 reserved); the
   entry still occupies 80 bytes, but an old decoder rejects the new profile as
   non-canonical. A retained version-6 graph is therefore refused and needs a
   fresh attachment, and downgrading to an SDK that predates version 7 likewise
-  refuses the newer marker. No in-place migration is provided; drain or
-  re-create the attachment in either direction. Refs #1007.
+  refuses the newer marker. Crossing schema generations requires a fresh
+  installation; no in-place migration is provided. Refs #1007.
 
 - `opc-proto-ngap`: `Pdu`, `PduKind`, `Message` and borrowed `ProtocolIe`
   no longer implement cloning or equality over opaque key-bearing bytes.
@@ -583,7 +581,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public peer/outgoing-TEID type that admits the TS 29.281 section 5.1 all-zero
   value; `Teid` remains the strictly nonzero local/received TEID type and its
   `new(0) -> None` contract is unchanged. `ReceivedN3UplinkTnl::new` and
-  `ReceivedN3UplinkTnl::teid` now use `PeerTeid`. Construct peer values with
+  `ReceivedN3UplinkTnl::teid` now use `PeerTeid`. Its constructor accepts
+  either `PeerTeid` or an existing nonzero `Teid`. Construct peer values with
   `PeerTeid::new`, `PeerTeid::ZERO`, or `PeerTeid::from(teid)`; `Teid` remains
   for `local_teid` and every selector/map key. Downstream code that assigned a
   `Teid` to `peer_teid` must convert or construct a `PeerTeid`. Refs #1346.

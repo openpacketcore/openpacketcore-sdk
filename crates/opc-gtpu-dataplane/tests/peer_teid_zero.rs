@@ -1,9 +1,7 @@
 //! Peer TEID zero: TS 29.281 section 5.1 backward compatibility.
 //!
-//! These tests exercise the software/model boundary only. The Linux kernel-GTP
-//! netlink adapter and the eBPF userspace adapter refuse a zero peer TEID with
-//! the stable `peer_teid_zero` unsupported-feature refusal until their
-//! datapath support lands; they are not claimed here.
+//! These tests exercise the software/model boundary. Linux kernel-GTP and tc
+//! forwarding are exercised separately by the privileged native suites.
 
 use bytes::BytesMut;
 use opc_gtpu_dataplane::n3::{N3Qfi, N3UplinkEncapsulation, ReceivedN3UplinkTnl};
@@ -87,4 +85,12 @@ fn peer_teid_zero_does_not_relax_local_teid() {
         .get(),
         0
     );
+}
+
+#[test]
+fn received_n3_uplink_tunnel_accepts_existing_nonzero_teid_callers() {
+    let teid = Teid::new(0x1122_3344).expect("nonzero");
+    let tunnel = ReceivedN3UplinkTnl::new("192.0.2.10".parse().unwrap(), teid)
+        .expect("existing nonzero TEID callers remain source compatible");
+    assert_eq!(tunnel.teid(), PeerTeid::from(teid));
 }

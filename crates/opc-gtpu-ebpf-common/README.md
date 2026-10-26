@@ -66,13 +66,21 @@ GTP-U encapsulation/classification helpers.
   authority value, exact device configuration, and a bounded in-flight
   transaction journal.
   Entry version 1 retains its exact legacy encoding; version 2 binds one
-  six-bit N3 QFI at byte 72. Versions 3 and 4 add a canonical
-  `DownlinkInnerMtu` field at bytes 73..74, with byte 75 reserved (the family-tagged opt-in used by
-  ordinary inner-IPv6 in-tunnel Packet Too Big); version 0, bytes 3 and
-  bytes 75..79 stay reserved. Every profile occupies 80 bytes inside the same
+  six-bit N3 QFI at byte 72. Version 3 adds a canonical `DownlinkInnerMtu`
+  field at bytes 73..74 for ordinary inner IPv6 over outer IPv4, using the
+  legacy UDP/2152 source port and an in-tunnel Packet Too Big MTU of at least
+  1,280. The constructor returns `None` for unsupported profiles, and both
+  readers reject them, including version 4 (N3 with MTU). Version 0, byte 3
+  and bytes 75..79 stay reserved. Every profile occupies 80 bytes inside the same
   208-byte group authority, and typed/zero-copy readers enforce the same
   canonical contract. The grouped schema marker advances to
-  `OPC-GROUP-IP-v7`; a retained version-6 graph needs a fresh attachment.
+  `OPC-GROUP-IP-v7`; crossing from version 6 requires a fresh installation.
+  Grouped-session APIs still refuse MTU policies; the ordinary IPv6 path
+  shares their wire layout without granting those APIs an unenforced policy.
+
+Outgoing peer TEIDs admit zero under TS 29.281 section 5.1. Local TEIDs,
+receive keys and required endpoint addresses remain nonzero. Owner and
+authority comparisons still require the exact committed peer TEID, including zero.
 
 All multi-byte wire and map fields are network byte order unless noted in the
 Rust docs.

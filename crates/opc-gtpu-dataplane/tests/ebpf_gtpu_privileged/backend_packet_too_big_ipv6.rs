@@ -3,8 +3,8 @@
 //!
 //! The UE-facing link is narrower than the oversized packet, so a
 //! decapsulation would make the host emit its own ICMPv6 Packet Too Big
-//! toward the originator, unencapsulated. The contract is exactly one
-//! well-formed error inside the session's in-tunnel G-PDU and no
+//! toward the originator, unencapsulated. With the opt-in installed, the
+//! contract is exactly one well-formed error inside the session's G-PDU and no
 //! host-generated ICMPv6 anywhere.
 
 use super::*;
@@ -126,6 +126,65 @@ fn plaintext_icmpv6_ptb_frames(capture: &OwnedFd) -> usize {
     seen
 }
 
+fn host_icmpv6_packet_too_big() -> u64 {
+    fs::read_to_string("/proc/net/snmp6")
+        .expect("read IPv6 counters")
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == "Icmp6OutPktTooBigs").then(|| {
+                fields
+                    .next()
+                    .expect("counter value")
+                    .parse()
+                    .expect("integer counter")
+            })
+        })
+        .expect("Icmp6OutPktTooBigs counter")
+}
+
+/// Before installing tc, prove the same oversized IPv6 packet triggers a
+/// host PTB when it reaches ordinary forwarding toward the access link.
+fn assert_host_packet_too_big_control(net: &TestNet) {
+    let capture = packet_capture_socket(&net.pgw_ns);
+    let before = host_icmpv6_packet_too_big();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&main_link_address("s2bu"));
+    frame.extend_from_slice(&net.pgw_link_address("s2bup"));
+    frame.extend_from_slice(&[0x86, 0xdd]);
+    frame.extend_from_slice(&inner(OVERSIZED_PAYLOAD, REMOTE_HOST_IPV6));
+    send_raw_gtpu_frame(
+        &net.pgw_ns,
+        "s2bup",
+        &frame,
+        RawChecksumMetadata::Unverified,
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut captured = 0;
+    loop {
+        captured += plaintext_icmpv6_ptb_frames(&capture);
+        if host_icmpv6_packet_too_big() > before && captured > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ordinary forwarding must generate and deliver a host PTB: counter {}, before {before}, captured {captured}",
+            host_icmpv6_packet_too_big()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(host_icmpv6_packet_too_big(), before + 1);
+    assert_eq!(captured, 1);
+    let output = Command::new("ip")
+        .args(["-j", "link", "show", "dev", "ue0"])
+        .output()
+        .expect("read gateway access MTU");
+    assert!(output.status.success());
+    let link: serde_json::Value = serde_json::from_slice(&output.stdout).expect("link JSON");
+    assert_eq!(link[0]["mtu"].as_u64(), Some(u64::from(SESSION_MTU)));
+    eprintln!("OPC_GTPU_HOST_IPV6_PTB_CONTROL_PROVEN: one counter increment and plaintext frame");
+}
+
 // The serial guard is deliberately held for the entire body; see
 // PRIVILEGED_TEST_LOCK.
 #[allow(clippy::await_holding_lock)]
@@ -141,10 +200,12 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let net = TestNet::provision();
     // The access-side link is narrower than the oversized packet, so a
     // decapsulation would make the host emit its own ICMPv6 PTB.
+    run("ip", &["link", "set", "ue0", "mtu", "1300"]);
     run(
         "ip",
         &["-n", &net.ue_ns, "link", "set", "ue1", "mtu", "1300"],
     );
+    assert_host_packet_too_big_control(&net);
     let backend = EbpfGtpuDataplaneBackend::with_config(EbpfGtpuDataplaneBackendConfig {
         bpffs_pin_root: net.pin_root.clone(),
         ..EbpfGtpuDataplaneBackendConfig::default()
@@ -197,6 +258,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     run("ping", &["-c", "1", "-W", "1", "192.0.2.10"]);
     let _ = plaintext_icmpv6_ptb_frames(&pgw_capture);
     let _ = plaintext_icmpv6_ptb_frames(&ue_capture);
+    let host_ptb_before = host_icmpv6_packet_too_big();
     let destination_mac = main_link_address("s2bu");
     let source_mac = net.pgw_link_address("s2bup");
     let send_gpdu = |teid: u32, packet: &[u8]| {
@@ -247,6 +309,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         0,
         "no host-generated ICMPv6 toward the UE"
     );
+    assert_eq!(host_icmpv6_packet_too_big(), host_ptb_before);
 
     // 2. A fitting packet is decapsulated and forwarded, never signalled.
     let fitting = inner(FITTING_PAYLOAD, REMOTE_HOST_IPV6);
@@ -289,6 +352,16 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
         plaintext_icmpv6_ptb_frames(&pgw_capture),
         0,
         "still no host-generated ICMPv6 toward the core"
+    );
+    assert_eq!(
+        plaintext_icmpv6_ptb_frames(&ue_capture),
+        0,
+        "still no host-generated ICMPv6 toward the UE"
+    );
+    assert_eq!(
+        host_icmpv6_packet_too_big(),
+        host_ptb_before,
+        "in-tunnel handling must not generate a host PTB"
     );
 
     drop(port);

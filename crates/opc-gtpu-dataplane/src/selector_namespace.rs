@@ -11205,6 +11205,24 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn peer_teid_zero_survives_authenticated_descriptor_codec() {
+        for paa in ["10.23.0.2", "2001:db8:23::"] {
+            let original = group_with_paa(1, 1, 7, paa.parse().unwrap(), None);
+            let entry = &original.entries()[0];
+            let mut context = entry.context().clone();
+            context.peer_teid = crate::PeerTeid::new(0);
+            let desired = GtpuSessionGroup::new(
+                original.id(),
+                original.device_id(),
+                vec![GtpuSessionEntry::new(context, entry.local_outer_address()).unwrap()],
+            )
+            .unwrap();
+            let encoded = canonical_desired_bytes(&desired);
+            assert_eq!(decode_canonical_desired(&encoded), Some(desired));
+        }
+    }
+
     fn test_backend_mutation_window() -> SelectorBackendMutationWindow {
         SelectorBackendMutationWindow::mint(SELECTOR_NAMESPACE_MAX_LEASE_TTL)
             .expect("test mutation window")

@@ -4,7 +4,7 @@
   "context": {
     "source_vector": {
       "path": "crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json",
-      "sha256": "76fee6c1a58eb38aa89ff39bf8fd4e0a29f8048e40a294abbef8639e9c9bbd97",
+      "sha256": "95413a05dba9145e734f9cf3efeb39f9052b0741982ded2b89c06436384ab9b5",
       "case": "relocation-complete"
     },
     "cases": 4,

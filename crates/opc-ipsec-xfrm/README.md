@@ -884,25 +884,26 @@ least `n` bytes when it is shorter, capped at the SA's path MTU. Validation
 rejects a zero length, non-ESP SAs, and non-tunnel modes before any netlink
 mutation, matching the kernel's `verify_newsa_info`. `None` emits no attribute
 and keeps the pre-TFC request bytes unchanged. `SaState::tfc_pad` reports the
-value from exact `GETSA` readback; the kernel omits the attribute for an unset
-length, and a zero-valued attribute is reported as absent. Dummy-packet
-generation (RFC 4303 §2.5/§2.7, Next Header 59) builds ESP packets and is a
-dataplane concern outside this netlink model.
+value from `GETSA` readback; zero-valued, non-ESP and non-tunnel attributes
+are rejected. Binding and scoped-receipt validation compare the exact presence
+and value with the requested configuration. Linux may acknowledge an in-place
+`UPDSA` without changing TFC, so `rekey_sa` verifies the target (including
+absence) and reports `StateIndeterminate` when readback does not match.
 
-Keyed identity encodings are versioned store formats. The durable
-object/roster install-request authentication domains
-(`opc-xfrm-object-install-request-v1`,
-`opc-xfrm-roster-install-request-v1`) and the outbound-binding fingerprint
-(`opc-xfrm-outbound-sa-binding-v1`) are unchanged in this revision, so
-`tfc_pad` is not covered by those keyed fingerprints; in-memory
-`SaParameters` comparisons do include it. The durable record carries only the
-`Sa`/`Policy` discriminant rather than the request, so a recovery request that
-differs from the authenticated one only in `tfc_pad` is undetectable. That is
-a documented, low-likelihood integrity gap (the proof key is held by the same
-actor, so it is a commitment/correctness issue rather than a forgery vector).
-Closing it requires new `-v2` auth domains plus a migration plan for
-v1-sealed records and persisted binding IDs, tracked as a follow-up
-(refs #1344); changing the auth domains is deliberately out of scope here.
+`esp_dummy_payload(tfc_data, alignment)` constructs dummy ESP plaintext with
+separate encryption padding, Pad Length and Next Header 59, as specified in
+[RFC 4303 §§2.4–2.7](https://www.rfc-editor.org/rfc/rfc4303.html#section-2.6).
+The caller supplies the TFC bytes and transform alignment and owns sequence
+allocation, IVs, encryption, authentication, transmission and scheduling. The
+caller must honor the peer's direction-specific `ESP_TFC_PADDING_NOT_SUPPORTED`
+notification ([RFC 7296 §1.3.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-1.3.1));
+this helper does not inject traffic through a kernel-owned SA.
+
+Durable object/roster authentication and outbound-binding IDs include enabled
+TFC targets as a tagged extension; absent targets retain all pre-TFC bytes and
+seals. Records and binding IDs written by a build that omitted an enabled TFC
+target are incompatible with the corrected encoding; crossing that change
+requires deleting the affected volumes and a fresh install, one site at a time.
 
 Binding and inbound peer-observation readback recognize the Linux 6.10+
 `XFRMA_SA_DIR` attribute at its UAPI number 33 and validate its one-byte
@@ -1837,23 +1838,32 @@ roles, retained by the lifecycle across authority-adapter rebuilds. Completed
 effects cannot be reinstalled by replaying a token, and the actor retains no
 history proportional to session churn.
 
-`install_scoped_successor` adds Child-SA rekey overlap for one already-live
-scoped receipt. A distinct committed activation supplies the successor's role
-use; the successor request must keep the predecessor's exact flow identity and
-bring a distinct SPI and request ID. The actor installs the successor SA, moves
-the single protective policy to it in one update, and publishes only after
-exact readback. The predecessor SA and receipt stay live; after the move
-`read_scoped` reports `false` for the superseded predecessor while
-`scoped_successor_status` reports the milestones. `remove_scoped` on the
-predecessor then retires only that SA (never the successor-owned policy), and is
-refused unless the successor SA and policy are both still live. The successor
-cannot be removed before its predecessor is retired. The pinned flow identity
-includes the selector mark, output mark, fixed outer DSCP, policy priority and
-template selector, so a rekeyed flow presents identical marking and scheduling.
-`scoped_successor_status` reports the completed install/move/publication/
-retirement milestones after a lost reply or cancellation. Ambiguous readback
-retains both objects and retries through the actor's supervised readback path;
-rekey-trigger ownership and peer signalling remain caller policy.
+`install_scoped_successor` rekeys one live scoped flow under a distinct
+committed activation. Every successor uses a fresh SPI. Outbound generations
+use different reqids and one atomic policy update; inbound generations share a
+reqid and the unchanged policy, preserving predecessor inbound acceptance
+([RFC 7296 §2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)).
+Selectors, outer addresses, UDP encapsulation, marks, DSCP, mode and policy
+priority remain fixed. Published generations can themselves be rekeyed.
+
+`read_scoped` checks the receipt's own SA and policy: it returns `false` for an
+outbound predecessor after selection moves, while that predecessor's SA remains
+retained. Inbound predecessors remain readable through their shared policy.
+`scoped_successor_status` freshly checks the installed SA, current selection and
+predecessor absence, including during an unpublished transition. Publication is
+an actor decision that survives reply loss. An exact install retry recovers the
+published receipt before checking predecessor liveness or consuming authority.
+
+Removing an unselected member deletes only that SA. Removing the selected
+member first restores another live member and verifies selection before deleting
+it, so a newly created Child SA can be abandoned as required by
+[RFC 7296 §2.8.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8.1).
+A refusal to drop the last live path releases its operation guard; expired
+members can be removed, then final cleanup deletes the last SA and policy.
+Groups whose SAs have all expired also clean up in either order. Uncertain
+operations retain their exact intent and reservation for supervised readback;
+observer loss alone never reverses a traffic move. Rekey scheduling and peer
+signalling remain caller policy.
 
 The scoped actor refuses `allocate_spi` and legacy mutation/reset entry points;
 generic `remove_sa_exact` remains unsupported. It adds no persistent object

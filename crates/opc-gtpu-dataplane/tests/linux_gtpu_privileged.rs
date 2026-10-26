@@ -503,6 +503,22 @@ async fn mixed_inner_outer_families_read_back_and_reconcile_in_current_netns(
             0x1100_0002,
             0x2100_0002,
         ),
+        (
+            format!("gz4{suffix}"),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "2001:db8:23:2::".parse::<IpAddr>()?,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0x1100_0003,
+            0,
+        ),
+        (
+            format!("gz6{suffix}"),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 23, 0, 4)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            0x1100_0004,
+            0,
+        ),
     ];
 
     for (name, bind_address, ms_address, peer_address, local_teid, peer_teid) in cases {

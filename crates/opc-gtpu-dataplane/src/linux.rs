@@ -27,10 +27,10 @@ use opc_linux_gtpu_sys::{
 };
 
 use crate::backend::error_proves_no_requested_mutation;
+use crate::model::PeerTeid;
 use crate::model::{
     classify_dual_selector_state, DualSelectorState, PdpLiveWriterNamespaceIdentity,
 };
-use crate::model::{reject_unsupported_zero_peer_teid, PeerTeid};
 use crate::{
     CreateGtpDeviceRequest, GtpAddressFamily, GtpDevice, GtpPdpContext, GtpRole, GtpVersion,
     GtpuBackendKind, GtpuCapability, GtpuDataplaneBackend, GtpuDownlinkFragmentContract, GtpuError,
@@ -2487,9 +2487,6 @@ fn validate_pdp_context(context: &GtpPdpContext) -> Result<(), GtpuError> {
             "peer address must not be unspecified",
         ));
     }
-    // GTPA_O_TEI = 0 is not supported by this release's kernel-GTP path.
-    // Reject it with a stable typed refusal before any netlink mutation.
-    reject_unsupported_zero_peer_teid(context.peer_teid)?;
     Ok(())
 }
 
@@ -2886,10 +2883,6 @@ fn parse_pdp_context_response(
         attributes.peer_teid,
         "missing or invalid peer TEID attribute",
     )?);
-    // This release cannot install a peer TEID of zero through GTPA_O_TEI:
-    // report the same stable typed refusal as install instead of decoding a
-    // context the kernel path cannot forward.
-    reject_unsupported_zero_peer_teid(peer_teid)?;
 
     // GTPA_FAMILY selects the MS/PAA lookup table. The outer peer address is
     // independently selected by the GTP device's UDP socket family, so valid
@@ -4671,19 +4664,42 @@ mod tests {
     }
 
     #[test]
-    fn pdp_readback_pins_zero_peer_teid_typed_refusal() {
-        let selector_context = pdp_context();
+    fn peer_teid_zero_is_valid_and_preserved_in_kernel_readback() {
+        let mut context = pdp_context();
+        context.peer_teid = PeerTeid::ZERO;
+        assert!(validate_pdp_context(&context).is_ok());
         let selector = PdpContextSelector::LocalTeid(
-            PdpContextLocalTeidSelector::from_context(&selector_context).unwrap(),
+            PdpContextLocalTeidSelector::from_context(&context).unwrap(),
         );
-        let mut zero_peer = selector_context;
-        zero_peer.peer_teid = PeerTeid::ZERO;
-        assert!(matches!(
-            parse_pdp_context_response(&pdp_response(&zero_peer, true), &selector, 31),
-            Err(GtpuError::UnsupportedFeature {
-                feature: "peer_teid_zero"
-            })
-        ));
+        assert_eq!(
+            parse_pdp_context_response(&pdp_response(&context, true), &selector, 31).unwrap(),
+            context,
+        );
+        let body = encode_install_pdp_context(&context).unwrap();
+        let attributes = &body[GENERIC_NETLINK_HEADER_LEN..];
+        assert_eq!(
+            attr_payload(attributes, GTPA_O_TEI),
+            Some(&0_u32.to_ne_bytes()[..])
+        );
+        assert_eq!(
+            attr_payload(attributes, GTPA_I_TEI),
+            Some(&context.local_teid.get().to_ne_bytes()[..])
+        );
+    }
+
+    #[test]
+    fn pdp_readback_preserves_the_full_peer_teid_domain() {
+        for peer_teid in [0, 1, u32::MAX] {
+            let mut context = pdp_context();
+            context.peer_teid = PeerTeid::new(peer_teid);
+            let selector = PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+            );
+            assert_eq!(
+                parse_pdp_context_response(&pdp_response(&context, true), &selector, 31).unwrap(),
+                context,
+            );
+        }
     }
 
     #[test]
@@ -6035,6 +6051,30 @@ mod tests {
                 if conflict.occupied() == crate::PdpContextSelectorOccupancy::LocalTeid
         ));
         assert!(local_conflict_transport
+            .requests()
+            .iter()
+            .all(|request| request.operation != "install_pdp_context"));
+    }
+
+    #[tokio::test]
+    async fn peer_teid_zero_resident_is_a_conflict_without_install_effects() {
+        let desired = pdp_context();
+        let mut resident = desired.clone();
+        resident.peer_teid = PeerTeid::ZERO;
+        let transport = CapturingTransport::new();
+        push_family_lookup(&transport);
+        for _ in 0..4 {
+            push_present(&transport, &resident);
+        }
+        let backend = LinuxGtpuDataplaneBackend::with_transport(transport.clone());
+        assert!(matches!(
+            backend
+                .install_pdp_context_classified(desired)
+                .await
+                .unwrap(),
+            PdpContextInstallOutcome::Conflict(_)
+        ));
+        assert!(transport
             .requests()
             .iter()
             .all(|request| request.operation != "install_pdp_context"));
@@ -8789,16 +8829,10 @@ mod tests {
         context.peer_address = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
         assert!(validate_pdp_context(&context).is_err());
 
-        // GTPA_O_TEI = 0 is refused with a stable typed label rather than
-        // being accepted and then failing inside the kernel.
+        // TS 29.281 section 5.1 admits GTPA_O_TEI = 0; the local key stays nonzero.
         let mut context = pdp_context();
         context.peer_teid = PeerTeid::ZERO;
-        assert!(matches!(
-            validate_pdp_context(&context),
-            Err(GtpuError::UnsupportedFeature {
-                feature: "peer_teid_zero"
-            })
-        ));
+        assert!(validate_pdp_context(&context).is_ok());
 
         let mut remove = RemovePdpContextRequest::from_context(&pdp_context());
         remove.link_ifindex = 0;

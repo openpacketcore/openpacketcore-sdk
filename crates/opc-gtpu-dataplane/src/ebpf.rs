@@ -100,9 +100,7 @@ use rand::{rngs::SysRng, TryRng};
 use sha2::{Digest, Sha256};
 
 use crate::backend::error_proves_no_requested_mutation;
-use crate::model::{
-    classify_dual_selector_state, reject_unsupported_zero_peer_teid, DualSelectorState,
-};
+use crate::model::{classify_dual_selector_state, DualSelectorState};
 use crate::traffic_observation::{
     GtpuTrafficProofAuthorityStoreIdentity, GtpuTrafficProofAuthorityStoreRebindReady,
     GtpuTrafficProofAuthorityToken, GtpuTrafficProofDispatchAuthority, GtpuTrafficProofRevoker,
@@ -2897,35 +2895,6 @@ fn commit_downlink_inner_mtu(
     }
 }
 
-fn reject_zero_peer_group(group: &GtpuSessionGroup) -> Result<(), GtpuError> {
-    for entry in group.entries() {
-        reject_unsupported_zero_peer_teid(entry.context().peer_teid)?;
-    }
-    Ok(())
-}
-
-/// Refuse a persisted grouped-session observation whose peer TEID is zero.
-///
-/// The committed tc object validates that field as nonzero, so surfacing such
-/// an observation as a readback would describe forwarding the datapath cannot
-/// perform. Return the stable typed refusal until the object rebuild lands.
-fn reject_zero_peer_group_observation(observation: &GroupedObservation) -> Result<(), GtpuError> {
-    let Some(encoded) = observation.authority.as_ref() else {
-        return Ok(());
-    };
-    let Some(record) = GtpuSessionGroupRecord::decode(encoded) else {
-        return Ok(());
-    };
-    for family in [GtpuSessionIpFamily::Ipv4, GtpuSessionIpFamily::Ipv6] {
-        if let Some(entry) = record.entry(family) {
-            reject_unsupported_zero_peer_teid(crate::PeerTeid::new(u32::from_be_bytes(
-                entry.peer_teid(),
-            )))?;
-        }
-    }
-    Ok(())
-}
-
 fn grouped_entry_to_ebpf(entry: &GtpuSessionEntry) -> Option<EbpfSessionEntry> {
     let context = entry.context();
     validate_gtp_version(context.gtp_version).ok()?;
@@ -2977,6 +2946,12 @@ fn grouped_model_from_record(
         let Some(entry) = record.entry(family) else {
             continue;
         };
+        // The ordinary IPv6 path shares this wire layout, but the grouped
+        // API does not support its MTU policy. Never erase retained policy
+        // while projecting an authority record into the grouped model.
+        if entry.downlink_inner_mtu().is_some() {
+            return None;
+        }
         let mark = u32::from_be_bytes(entry.bearer_mark());
         let context = GtpPdpContext {
             local_teid: Teid::new(u32::from_be_bytes(entry.local_teid()))?,
@@ -6368,17 +6343,7 @@ impl EbpfGtpuDataplaneBackend {
             );
         };
         match self.validate_grouped_model_attachment(&group, context) {
-            Ok(()) => match reject_zero_peer_group(&group) {
-                Ok(()) => GtpuSessionGroupReadback::Active(group),
-                // Defense in depth only: the public grouped-readback entry
-                // points return the typed `peer_teid_zero` refusal before this
-                // classifier runs. If a future caller reaches this fallback,
-                // fail closed as indeterminate rather than exposing a
-                // forwarding claim the committed datapath object cannot honor.
-                Err(_) => GtpuSessionGroupReadback::Indeterminate(
-                    GtpuSessionGroupIndeterminateReason::IncompleteState,
-                ),
-            },
+            Ok(()) => GtpuSessionGroupReadback::Active(group),
             Err(reason) => GtpuSessionGroupReadback::Indeterminate(reason),
         }
     }
@@ -6400,10 +6365,9 @@ impl EbpfGtpuDataplaneBackend {
                 operation: "ebpf_grouped_raw_readback_bound",
             })?;
         let result = match self.stable_grouped_observation(&context, selector.id()) {
-            Ok(Some(observation)) => match reject_zero_peer_group_observation(&observation) {
-                Ok(()) => Ok(self.classify_grouped_readback(selector, &context, observation)),
-                Err(error) => Err(error),
-            },
+            Ok(Some(observation)) => {
+                Ok(self.classify_grouped_readback(selector, &context, observation))
+            }
             Ok(None) => Ok(GtpuSessionGroupReadback::Indeterminate(
                 GtpuSessionGroupIndeterminateReason::StateChanged,
             )),
@@ -6456,7 +6420,6 @@ impl EbpfGtpuDataplaneBackend {
                             ))
                         };
                     }
-                    reject_zero_peer_group_observation(&observation)?;
                     let readback = self.classify_grouped_readback(
                         GtpuSessionGroupSelector::new(expected.id(), expected.device_id()),
                         &context,
@@ -7920,9 +7883,6 @@ impl EbpfGtpuDataplaneBackend {
     ) -> Result<GtpuSessionGroupReconcileOutcome, GtpuError> {
         let _operation = self.operation_guard()?;
         let (desired, admission, provenance) = request.into_parts();
-        for entry in desired.entries() {
-            reject_unsupported_zero_peer_teid(entry.context().peer_teid)?;
-        }
         // The affine admission is consumed under the host-global operation
         // lease before even journal recovery can mutate a map. `run_blocking`
         // owns its worker to terminal completion, so cancellation cannot leave
@@ -8925,9 +8885,7 @@ impl EbpfGtpuDataplaneBackend {
             .downlink_binding_get(ifindex, local_teid)?;
         let far_is_owned = far.is_none_or(|value| {
             let value = UplinkFar::decode(&value);
-            value.peer_ip != [0; 4]
-                && value.local_ip == commit.uplink_far().local_ip
-                && value.o_teid != [0; 4]
+            value.peer_ip != [0; 4] && value.local_ip == commit.uplink_far().local_ip
         });
         let binding_is_owned = binding.is_none_or(|value| {
             let value = DownlinkEndpointBinding::decode(&value);
@@ -11213,10 +11171,6 @@ impl EbpfGtpuDataplaneBackend {
         let downlink_inner_mtu = commit_downlink_inner_mtu(commit).ok_or_else(indeterminate)?;
         let local_teid = Teid::new(u32::from_be_bytes(local_teid)).ok_or_else(indeterminate)?;
         let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(far.o_teid));
-        // eBPF userspace readback cannot expose a context the committed
-        // datapath object would drop; refuse it with the stable typed label
-        // until the object rebuild follow-up lands.
-        reject_unsupported_zero_peer_teid(peer_teid)?;
         Ok(GtpPdpContext {
             local_teid,
             peer_teid,
@@ -11296,7 +11250,6 @@ impl EbpfGtpuDataplaneBackend {
         let local_teid =
             Teid::new(u32::from_be_bytes(owner.local_teid)).ok_or_else(indeterminate)?;
         let peer_teid = crate::PeerTeid::new(u32::from_be_bytes(owner.uplink_far.o_teid));
-        reject_unsupported_zero_peer_teid(peer_teid)?;
         let bearer_mark =
             GtpBearerMark::new(u32::from_be_bytes(key.bearer_mark)).ok_or_else(indeterminate)?;
         let egress_dscp = match owner.egress_dscp() {
@@ -11550,7 +11503,6 @@ impl EbpfGtpuDataplaneBackend {
         &self,
         request: GtpPdpContext,
     ) -> Result<PdpContextInstallOutcome, GtpuError> {
-        reject_unsupported_zero_peer_teid(request.peer_teid)?;
         let _operation = self.operation_guard()?;
         self.with_graph_effect(request.link_ifindex, || {
             self.validate_reconciliation_context_locked(&request)?;
@@ -11778,11 +11730,6 @@ impl EbpfGtpuDataplaneBackend {
     }
 
     fn install_pdp_context_sync(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
-        // The committed tc object validates the FAR/owner TEID as nonzero; a
-        // zero peer TEID context would install and then drop every uplink
-        // packet. Refuse it with a stable typed label until the datapath
-        // object rebuild follow-up lands.
-        reject_unsupported_zero_peer_teid(request.peer_teid)?;
         let _operation = self.operation_guard()?;
         self.with_graph_effect(request.link_ifindex, || {
             self.install_pdp_context_locked(request)
@@ -11790,7 +11737,6 @@ impl EbpfGtpuDataplaneBackend {
     }
 
     fn install_pdp_context_locked(&self, request: GtpPdpContext) -> Result<(), GtpuError> {
-        reject_unsupported_zero_peer_teid(request.peer_teid)?;
         validate_gtp_version(request.gtp_version)?;
         if request.ms_address.is_ipv6() {
             let local_ip = {
@@ -32795,10 +32741,7 @@ mod aya_runtime {
                     match far.get(&ue_ip, 0) {
                         Ok(value) => {
                             let value = UplinkFar::decode(&value);
-                            if value.local_ip != local_ip
-                                || value.peer_ip == [0; 4]
-                                || value.o_teid == [0; 4]
-                            {
+                            if value.local_ip != local_ip || value.peer_ip == [0; 4] {
                                 return Err(invalid());
                             }
                         }
@@ -32867,10 +32810,7 @@ mod aya_runtime {
                     match marked_far.get(&selector, 0) {
                         Ok(value) => {
                             let value = UplinkFar::decode(&value);
-                            if value.local_ip != local_ip
-                                || value.peer_ip == [0; 4]
-                                || value.o_teid == [0; 4]
-                            {
+                            if value.local_ip != local_ip || value.peer_ip == [0; 4] {
                                 return Err(invalid());
                             }
                         }
@@ -33163,7 +33103,7 @@ mod aya_runtime {
                 };
                 let transitional_resources_owned = far.is_none_or(|value| {
                     let value = UplinkFar::decode(&value);
-                    value.local_ip == local_ip && value.peer_ip != [0; 4] && value.o_teid != [0; 4]
+                    value.local_ip == local_ip && value.peer_ip != [0; 4]
                 }) && dscp.is_none_or(|value| value[0] <= 63)
                     && pdr.is_none_or(|value| value == expected_pdr)
                     && binding.is_none_or(|value| {
@@ -52818,6 +52758,52 @@ mod aya_runtime {
                     info.verified_instruction_count()
                 );
             }
+            // The real loader must refuse a retained v6 marker before any
+            // attachment can interpret the IPv6 MTU entry format as v6 state.
+            let config = GtpuSessionDeviceConfig::new(
+                opc_gtpu_ebpf_common::GtpuSessionDeviceId::new([0x42; 16]).unwrap(),
+                7,
+                Some([192, 0, 2, 1]),
+                None,
+            )
+            .unwrap();
+            AyaGtpuRuntime::grouped_config_write_verified(&mut ebpf, config.encode()).unwrap();
+            for (marker, current) in [
+                (*b"OPC-GROUP-IP-v6\0", false),
+                (*b"OPC-GROUP-IP-v7\0", true),
+            ] {
+                {
+                    let mut schema = Array::<_, [u8; GTPU_SESSION_SCHEMA_MARKER_LEN]>::try_from(
+                        ebpf.map_mut(MAP_SESSION_SCHEMA).unwrap(),
+                    )
+                    .unwrap();
+                    schema.set(0, marker, 0).unwrap();
+                }
+                let observed =
+                    AyaGtpuRuntime::grouped_schema_preflight(&pin_dir, BearerSchemaState::PmtuV5);
+                if current {
+                    assert!(
+                        matches!(observed, Ok(GroupedSchemaState::Retained { config: actual }) if actual == config)
+                    );
+                } else {
+                    assert!(matches!(
+                        observed,
+                        Err(GtpuError::StateIndeterminate {
+                            operation: "ebpf_grouped_schema"
+                        })
+                    ));
+                }
+                assert_eq!(
+                    AyaGtpuRuntime::grouped_schema_read(&ebpf).unwrap(),
+                    marker,
+                    "preflight must not rewrite retained schema state"
+                );
+                assert_eq!(
+                    AyaGtpuRuntime::grouped_config_read(&ebpf).unwrap(),
+                    config.encode()
+                );
+            }
+            println!("OPC_GTPU_RETAINED_GROUPED_SCHEMA_V6_REFUSAL_PROVEN");
             drop(ebpf);
             fs::remove_dir_all(&pin_dir).expect("remove live tag proof pins");
             println!("OPC_GTPU_TAG_PROOF_PROVEN");
@@ -57233,6 +57219,8 @@ mod tests {
     mod control_port_recovery;
     mod grouped_bearer_transition;
     #[cfg(target_os = "linux")]
+    mod ipv6_packet_too_big;
+    #[cfg(target_os = "linux")]
     mod n3_end_marker;
     mod ordinary_ipv6;
     #[cfg(target_os = "linux")]
@@ -59906,7 +59894,7 @@ mod tests {
                 };
                 let resources_owned = far.is_none_or(|value| {
                     let value = UplinkFar::decode(&value);
-                    value.local_ip == local_ip && value.peer_ip != [0; 4] && value.o_teid != [0; 4]
+                    value.local_ip == local_ip && value.peer_ip != [0; 4]
                 }) && dscp.is_none_or(|value| value[0] <= 63)
                     && pdr.is_none_or(|value| value == expected_pdr)
                     && binding.is_none_or(|value| {
@@ -60161,7 +60149,7 @@ mod tests {
                 }
                 if state.far.get(&(*index, *ue_ip)).is_some_and(|value| {
                     let value = UplinkFar::decode(value);
-                    value.local_ip != local_ip || value.peer_ip == [0; 4] || value.o_teid == [0; 4]
+                    value.local_ip != local_ip || value.peer_ip == [0; 4]
                 }) || state
                     .dscp
                     .get(&(*index, *ue_ip))
@@ -60232,9 +60220,7 @@ mod tests {
                         .get(&(*index, *selector))
                         .is_some_and(|value| {
                             let value = UplinkFar::decode(value);
-                            value.local_ip != local_ip
-                                || value.peer_ip == [0; 4]
-                                || value.o_teid == [0; 4]
+                            value.local_ip != local_ip || value.peer_ip == [0; 4]
                         })
                     || state
                         .marked_dscp
@@ -66166,6 +66152,70 @@ mod tests {
         context
     }
 
+    #[tokio::test]
+    async fn peer_teid_zero_installs_encapsulates_and_survives_restart() {
+        // TS 29.281 section 5.1: peer zero must survive every lifecycle boundary.
+        for mark in [None, GtpBearerMark::new(7)] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let mut desired = context();
+            desired.peer_teid = crate::PeerTeid::new(0);
+            desired.bearer_mark = mark;
+            assert_eq!(
+                backend
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::Installed,
+            );
+            let selector = PdpContextSelector::LocalTeid(
+                PdpContextLocalTeidSelector::from_context(&desired).unwrap(),
+            );
+            assert_eq!(
+                backend.read_pdp_context(selector.clone()).await.unwrap(),
+                PdpContextReadback::Present(desired.clone()),
+            );
+            let far = {
+                let state = runtime.state();
+                let encoded = match mark {
+                    None => state.far.get(&(S2BU_IFINDEX, [10, 45, 0, 2])).unwrap(),
+                    Some(mark) => state
+                        .marked_far
+                        .get(&(
+                            S2BU_IFINDEX,
+                            UplinkFarKey {
+                                ue_ip: [10, 45, 0, 2],
+                                bearer_mark: mark.get().to_be_bytes(),
+                            }
+                            .encode(),
+                        ))
+                        .unwrap(),
+                };
+                UplinkFar::decode(encoded)
+            };
+            let packet = opc_gtpu_ebpf_common::build_uplink_encap(&far, 28).unwrap();
+            assert_eq!(&packet[28..36], &[0x30, 0xff, 0, 28, 0, 0, 0, 0]);
+            simulate_process_loss(&runtime, false);
+            let restarted = EbpfGtpuDataplaneBackend::with_runtime(runtime.clone());
+            restarted.resolve_device("s2bu").await.unwrap();
+            assert_eq!(
+                restarted.read_pdp_context(selector).await.unwrap(),
+                PdpContextReadback::Present(desired.clone()),
+            );
+            assert_eq!(
+                restarted
+                    .install_pdp_context_classified(desired.clone())
+                    .await
+                    .unwrap(),
+                PdpContextInstallOutcome::ExactAlreadyPresent,
+            );
+            assert_eq!(
+                restarted.remove_pdp_context_exact(desired).await.unwrap(),
+                PdpContextRemovalOutcome::Removed,
+            );
+        }
+    }
+
     fn commit_for_context(
         context: &GtpPdpContext,
         phase: MarkedBearerOwnerPhase,
@@ -69629,24 +69679,82 @@ mod tests {
         GtpuSessionGroup::new(grouped_group_id(id), device_id, entries).unwrap()
     }
 
-    #[test]
-    fn grouped_zero_peer_teid_is_refused_with_the_stable_typed_label() {
-        let device_id = GtpuSessionDeviceId::new([0x42; 16]).unwrap();
-        let zero_peer = grouped_group(1, device_id, vec![grouped_v4_entry(0x1234_5678, 0)]);
-        let error = reject_zero_peer_group(&zero_peer).unwrap_err();
-        assert!(matches!(
-            error,
-            GtpuError::UnsupportedFeature {
-                feature: "peer_teid_zero"
-            }
-        ));
+    #[tokio::test]
+    async fn grouped_peer_teids_survive_reconcile_readback_and_restart() {
+        for peer_teid in [0, 0x2000_0001] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let device_id = grouped_device_id(0x42);
+            let endpoints = GtpuLocalEndpointSet::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                Some(IpAddr::V6(ipv6_local())),
+            )
+            .unwrap();
+            let backend = attach_grouped_fake(runtime.clone(), device_id, endpoints).await;
+            let group = grouped_group(
+                1,
+                device_id,
+                vec![
+                    grouped_v4_entry(0x1234_5678, peer_teid),
+                    grouped_v6_entry(0x1234_5679, peer_teid, ipv6_peer()),
+                ],
+            );
+            assert_eq!(
+                backend
+                    .reconcile_pdp_context_group(fresh_group_request(&backend, group.clone()))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReconcileOutcome::Activated,
+            );
+            assert_eq!(
+                backend
+                    .read_pdp_context_group_authorized(&group, fresh_group_admission(&group))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Active(group.clone()),
+            );
+            let restarted = restart_grouped_fake(runtime, device_id, endpoints).await;
+            assert_eq!(
+                restarted
+                    .read_pdp_context_group_authorized(&group, fresh_group_admission(&group))
+                    .await
+                    .unwrap(),
+                GtpuSessionGroupReadback::Active(group),
+            );
+        }
+    }
 
-        let nonzero_peer = grouped_group(
-            1,
-            device_id,
-            vec![grouped_v4_entry(0x1234_5678, 0x2000_0001)],
+    #[test]
+    fn grouped_readback_refuses_an_unmodeled_ordinary_mtu_profile() {
+        let model = grouped_entry_for_addresses(
+            IpAddr::V6("2001:db8:100:1::".parse().unwrap()),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            0x1000_0001,
+            0x2000_0001,
+            None,
         );
-        assert!(reject_zero_peer_group(&nonzero_peer).is_ok());
+        let entry = grouped_entry_to_ebpf(&model)
+            .unwrap()
+            .with_downlink_inner_mtu(
+                opc_gtpu_ebpf_common::DownlinkInnerMtu::in_tunnel_packet_too_big(1300).unwrap(),
+            )
+            .unwrap();
+        let record = GtpuSessionGroupRecord::active(
+            grouped_group_id(1),
+            grouped_device_id(2),
+            GtpuSessionGeneration::INITIAL,
+            None,
+            Some(entry),
+        )
+        .unwrap();
+        let device = GtpDevice {
+            name: "s2bu".into(),
+            ifindex: S2BU_IFINDEX,
+        };
+        assert!(
+            grouped_model_from_record(record, &device).is_none(),
+            "grouped readback must not silently erase an ordinary-only MTU policy"
+        );
     }
 
     fn selector_namespace_current() -> impl FnMut() -> Result<(), GtpuError> {
