@@ -10,11 +10,11 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 #[cfg(all(test, target_os = "linux", feature = "test-vfs"))]
-use std::sync::{Condvar, OnceLock};
+use std::sync::Condvar;
 
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
@@ -167,7 +167,6 @@ mod fenced_transition_maintenance;
 mod membership;
 mod planned_shutdown;
 mod quorum_readiness;
-#[cfg(any(test, not(feature = "test-control")))]
 mod roster_maintenance;
 mod scheduling;
 mod scope_authority;
@@ -2172,6 +2171,7 @@ struct ConsensusSessionStoreInner {
     diagnostics: Arc<ConsensusStoreDiagnosticCounters>,
     shutdown: ConsensusShutdownCoordinator,
     retirement: ConsensusRetirementCoordinator,
+    roster_maintenance: OnceLock<roster_maintenance::RosterMaintenanceTask>,
     #[cfg(test)]
     accepted_receiver_test_outcomes: Mutex<VecDeque<AcceptedClientWriteReceiverTestOutcome>>,
 }
@@ -4049,6 +4049,7 @@ impl ConsensusSessionStore {
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),
+            roster_maintenance: OnceLock::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
@@ -4067,7 +4068,10 @@ impl ConsensusSessionStore {
         );
         let store = Self { inner };
         #[cfg(not(any(test, feature = "test-control")))]
-        roster_maintenance::start(Arc::downgrade(&store.inner));
+        let _ = store
+            .inner
+            .roster_maintenance
+            .set(roster_maintenance::start(Arc::downgrade(&store.inner)));
         #[cfg(not(any(test, feature = "test-control")))]
         fenced_transition_maintenance::start(Arc::downgrade(&store.inner));
         voter_slots::start_coordinator(&store);
@@ -4302,6 +4306,7 @@ impl ConsensusSessionStore {
             diagnostics,
             shutdown: ConsensusShutdownCoordinator::new(),
             retirement: ConsensusRetirementCoordinator::new(),
+            roster_maintenance: OnceLock::new(),
             #[cfg(test)]
             accepted_receiver_test_outcomes: Mutex::new(VecDeque::new()),
         });
@@ -17560,14 +17565,14 @@ mod membership_tests {
     }
 
     #[derive(Debug)]
-    struct MutableClock(Mutex<Timestamp>);
+    pub(super) struct MutableClock(Mutex<Timestamp>);
 
     impl MutableClock {
-        fn new(now: Timestamp) -> Self {
+        pub(super) fn new(now: Timestamp) -> Self {
             Self(Mutex::new(now))
         }
 
-        fn set(&self, now: Timestamp) {
+        pub(super) fn set(&self, now: Timestamp) {
             *self.0.lock().expect("clock lock") = now;
         }
     }
@@ -17788,7 +17793,7 @@ mod membership_tests {
         handshake_epoch: u64,
     }
 
-    fn roster_ingress_test_root() -> RosterAttestationTrustRootV1 {
+    pub(super) fn roster_ingress_test_root() -> RosterAttestationTrustRootV1 {
         let root_key = SigningKey::from_bytes((&[0x41; 32]).into()).expect("root key");
         RosterAttestationTrustRootV1::new(
             [0x42; 32],
@@ -18466,6 +18471,80 @@ mod membership_tests {
             .shutdown()
             .await
             .expect("shut down reopened fixed store");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-vfs"))]
+    #[tokio::test]
+    async fn roster_maintenance_is_joined_before_held_raft_shutdown() {
+        let directory = tempfile::tempdir().expect("roster shutdown directory");
+        let database = directory.path().join("store.sqlite");
+        let snapshots = directory.path().join("snapshots");
+        let topology = fixed_shutdown_topology();
+        let store = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+            topology.clone(),
+            legacy_sqlite_maintenance_backend(&database),
+            &snapshots,
+            unavailable_fixed_shutdown_peers(&topology),
+            crate::SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await
+        .expect("open roster shutdown fixture");
+        // Exercise the production task even when a build omits automatic wiring.
+        // The separate signed-traffic tests require automatic construction.
+        if store.inner.roster_maintenance.get().is_none() {
+            assert!(store
+                .inner
+                .roster_maintenance
+                .set(roster_maintenance::start(Arc::downgrade(&store.inner)),)
+                .is_ok());
+        }
+        let hold = store.hold_raft_shutdown_before_core_for_test();
+        let gate = Arc::clone(&hold.gate);
+        let clone = store.clone();
+        let shutdown = tokio::spawn(async move { clone.shutdown_unplanned().await });
+        let reached_core =
+            tokio::task::spawn_blocking(move || gate.wait_until_entered(Duration::from_secs(1)))
+                .await
+                .expect("observe held core shutdown");
+        let joined_before_core = store
+            .inner
+            .roster_maintenance
+            .get()
+            .unwrap()
+            .is_finished_for_test()
+            .await;
+        drop(hold);
+        shutdown
+            .await
+            .expect("join shutdown observer")
+            .expect("shutdown result");
+        // Reap the intentionally unjoined task in a failing implementation too.
+        store
+            .inner
+            .roster_maintenance
+            .get()
+            .unwrap()
+            .abort_for_test()
+            .await;
+        drop(store);
+        let reopened = ConsensusSessionStore::open_fixed_durable_quorum_with_snapshot_integrity(
+            topology.clone(),
+            legacy_sqlite_maintenance_backend(&database),
+            &snapshots,
+            unavailable_fixed_shutdown_peers(&topology),
+            crate::SnapshotIntegrityPolicy::PortableVerified,
+        )
+        .await
+        .expect("reopen after releasing every old task and handle");
+        reopened
+            .shutdown_unplanned()
+            .await
+            .expect("close reopened store");
+        assert!(reached_core, "shutdown must reach its held Raft phase");
+        assert!(
+            joined_before_core,
+            "the roster worker must be stopped and joined before Raft shutdown begins"
+        );
     }
 
     #[cfg(all(target_os = "linux", feature = "test-vfs"))]
@@ -22856,6 +22935,385 @@ mod membership_tests {
             protected_roster_ingress_has_two_mutations_and_read_only_status_paths_case(),
         )
         .await;
+    }
+
+    /// Create one terminal through authenticated Q1 and Q2, without a
+    /// caller-issued logical-time or maintenance command after terminalization.
+    pub(super) async fn seed_roster_maintenance_retained(
+        store: &ConsensusSessionStore,
+        start: Timestamp,
+    ) {
+        let identity = store.current_scope().expect("roster scope").0;
+        let root = roster_ingress_test_root();
+        let key = SessionKey {
+            tenant: TenantId::new("roster-ingress").expect("tenant"),
+            nf_kind: NetworkFunctionKind::smf(),
+            key_type: SessionKeyType::PduSession,
+            stable_id: Bytes::from_static(b"two-mutations")
+                .try_into()
+                .expect("stable ID"),
+        };
+        let owner = OwnerId::new("roster-ingress-owner").expect("owner");
+        let lease = store
+            .acquire(&key, owner.clone(), Duration::from_secs(60))
+            .await
+            .expect("roster ingress lease");
+        let initial = consumer_record_with_payload_len(&key, &lease, 1024);
+        assert!(matches!(
+            store
+                .compare_and_set(CompareAndSet {
+                    key: key.clone(),
+                    lease: lease.clone(),
+                    expected_generation: None,
+                    new_record: initial,
+                })
+                .await
+                .expect("write initial roster business record"),
+            CompareAndSetResult::Success
+        ));
+
+        let scope = store.consumer_scope().expect("consumer scope");
+        let consumer_identity = SessionConsumerIdentity::new(
+            "spiffe://test.example/tenant/roster-ingress/ns/default/sa/store/nf/smf/instance/one",
+        )
+        .expect("consumer identity");
+        let manifest = store
+            .consumer_authorization_manifest([SessionConsumerAuthorizationGrant::try_new(
+                SpiffeId::new(consumer_identity.as_str()).expect("consumer SPIFFE ID"),
+                [SessionConsumerTenantNfScope::new(
+                    key.tenant.clone(),
+                    key.nf_kind.clone(),
+                )],
+            )
+            .expect("consumer grant")])
+            .await
+            .expect("consumer authorization manifest");
+        let authorization = manifest
+            .authorize(&consumer_identity)
+            .expect("consumer authorization");
+        let activation_deadline = tokio::time::Instant::now()
+            .checked_add(store.inner.operation_timeout)
+            .expect("activation deadline");
+        assert!(matches!(
+            store
+                .require_protected_roster_profile_activation_before(activation_deadline)
+                .await,
+            Err(StoreError::CapabilityNotSupported(reason))
+                if reason == "protected_roster_profile_not_activated"
+        ));
+        store
+            .activate_protected_roster_profile()
+            .await
+            .expect("activate immutable protected roster profile");
+        let roster_authorization = authorization.roster_authorization();
+        let roster_scope = Scope::from_digest(session_consumer_roster_scope_commitment(scope));
+        let admission = Admission::authenticate(
+            AdmissionProposal::new(
+                Profile::v1(),
+                RosterId::from_bytes([0x51; 16]).expect("roster ID"),
+                (0..FRESH_ROSTER_MEMBERS)
+                    .map(|ordinal| {
+                        Member::new(
+                            ordinal as u8,
+                            MemberOperationId::from_bytes([ordinal as u8 + 1; 16])
+                                .expect("member operation ID"),
+                            vec![ordinal as u8 + 1],
+                            1,
+                        )
+                        .expect("member")
+                    })
+                    .collect(),
+                EstablishedMutation::no_op(),
+                vec![0x52],
+                vec![0x53],
+                vec![0x54],
+            )
+            .expect("admission proposal"),
+            key.clone(),
+            roster_scope,
+            owner,
+            lease.fence(),
+            Generation::new(1),
+        )
+        .expect("admission");
+        let authority = AuthorityBinding::for_admission(
+            &admission,
+            lease.owner().clone(),
+            lease.fence(),
+            AuthorityLeaseMetadata::new(
+                lease.credential_id(),
+                Generation::new(1),
+                lease.acquired_at(),
+                lease.expires_at(),
+            ),
+        )
+        .expect("authority binding");
+        let issuer = RosterIngressTestIssuer::new(
+            identity,
+            Timestamp::from_str("2024-12-31T23:59:59Z").expect("certificate start"),
+            Timestamp::from_str("2025-01-01T00:00:30Z").expect("certificate expiry"),
+        );
+        let peer_identity_commitment =
+            session_consumer_identity_commitment(authorization.identity());
+        let service = store.consumer_service();
+        let original_admission_capsule = admission_capsule(roster_scope, &admission, &authority);
+        let admission_request_id = SessionConsumerRequestId::from_bytes([0x55; 16]);
+        let admission_request = SessionConsumerRequest::new(
+            scope,
+            admission_request_id,
+            SessionConsumerOperation::FencedMutationRosterPollAdmit {
+                request: Box::new(original_admission_capsule.clone()),
+            },
+        );
+        let (admission_tag, admission_digest) =
+            session_consumer_roster_ingress_operation(admission_request.operation())
+                .expect("admission ingress operation");
+
+        let admission_attestation = issuer.ingress(
+            peer_identity_commitment,
+            roster_scope.digest(),
+            admission_request_id,
+            admission_tag,
+            admission_digest,
+        );
+        let admission_subject_identity_commitment = [0x4a; 32];
+        let admission_provenance_input = service
+            .prepare_compact_admission_provenance_input(
+                &roster_authorization,
+                &admission_request,
+                &admission_attestation,
+                admission_subject_identity_commitment,
+            )
+            .expect("compact admission provenance input");
+        let admission_provenance = issuer.compact_admission(
+            roster_scope.digest(),
+            admission_subject_identity_commitment,
+            &admission_provenance_input,
+        );
+        let admission_response = service
+            .execute_roster_ingress(
+                &roster_authorization,
+                admission_request,
+                admission_attestation.clone(),
+                Some(admission_provenance.clone()),
+            )
+            .await;
+        let admission_response_capsule = match admission_response {
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::Recorded(capsule),
+            ) => capsule,
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::OutcomeUnknown,
+            ) => panic!("expected recorded fresh roster admission, got OutcomeUnknown"),
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::NotTransmitted,
+            ) => panic!("expected recorded fresh roster admission, got NotTransmitted"),
+            SessionConsumerResponse::FencedMutationRosterPollAdmit(
+                SessionConsumerRosterAdmissionMutationResponse::Rejected(rejection),
+            ) => panic!("expected recorded fresh roster admission, got {rejection:?}"),
+            response => panic!("expected fresh roster admission, got {response:?}"),
+        };
+        let admission_wire: RosterIngressAdmissionResponseWire =
+            crate::fenced_mutation_roster::decode_frame(
+                admission_response_capsule.canonical_bytes(),
+                TEST_ADMISSION_RESPONSE_MAGIC,
+                TEST_ADMISSION_RESPONSE_DOMAIN,
+                crate::fenced_mutation_roster_transport::MAX_PROTECTED_ROSTER_ADMISSION_CAPSULE_BYTES,
+            )
+            .expect("decode fresh admission response");
+        let (registration, registration_request_id) = match admission_wire {
+            RosterIngressAdmissionResponseWire::Fresh {
+                scope: response_scope,
+                registration,
+                ..
+            } => {
+                assert_eq!(response_scope, roster_scope.digest());
+                let request_id = registration.request_id;
+                (registration.registration(&admission), request_id)
+            }
+            _ => panic!("expected fresh admission response wire"),
+        };
+        let binding = admission
+            .binding_key(registration_request_id.history_epoch())
+            .expect("admission binding");
+        let (terminal, proof_bundle, terminal_evidence) = issuer.terminal(
+            &admission,
+            binding,
+            registration,
+            &authority,
+            &admission_provenance,
+        );
+        verify_compact_terminal_evidence_v2(CompactTerminalEvidenceVerificationV2 {
+            root: &root,
+            configuration_identity: identity,
+            logical_time: start,
+            binding,
+            registration,
+            admission_provenance: &admission_provenance,
+            committing_authority: &authority,
+            evidence: &terminal_evidence,
+        })
+        .expect("terminal evidence verifies before ingress");
+        verify_executor_terminal_proof_bundle(ExecutorTerminalProofVerification {
+            root: Some(&root),
+            configuration_identity: identity,
+            logical_time: start,
+            binding,
+            registration,
+            admission: &admission,
+            authority: &authority,
+            terminal: &terminal,
+            bundle: &proof_bundle,
+        })
+        .expect("terminal proof bundle verifies before ingress");
+        let terminal_capsule = terminal_capsule(TerminalCapsuleInput {
+            scope: roster_scope,
+            binding,
+            registration,
+            authority: &authority,
+            terminal: &terminal,
+            admission: &admission,
+            proof_bundle: &proof_bundle,
+            terminal_evidence: &terminal_evidence,
+        });
+        let terminal_request_id = SessionConsumerRequestId::from_bytes([0x56; 16]);
+        let terminal_request = SessionConsumerRequest::new(
+            scope,
+            terminal_request_id,
+            SessionConsumerOperation::FencedMutationRosterTerminalize {
+                request: Box::new(terminal_capsule.clone()),
+            },
+        );
+        let (terminal_tag, terminal_digest) =
+            session_consumer_roster_ingress_operation(terminal_request.operation())
+                .expect("terminal ingress operation");
+        assert_eq!(
+            crate::fenced_mutation_roster_transport::roster_terminal_ingress_capsule_commitment(
+                binding,
+                registration,
+                &authority,
+                &terminal,
+                &admission,
+                &proof_bundle,
+                &terminal_evidence,
+            )
+            .expect("reconstruct terminal ingress capsule"),
+            terminal_digest,
+            "test terminal request must match the durable command reconstruction"
+        );
+        let terminal_response = service
+            .execute_roster_ingress(
+                &roster_authorization,
+                terminal_request,
+                issuer.ingress(
+                    peer_identity_commitment,
+                    roster_scope.digest(),
+                    terminal_request_id,
+                    terminal_tag,
+                    terminal_digest,
+                ),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            terminal_response,
+            SessionConsumerResponse::FencedMutationRosterTerminalize(
+                SessionConsumerRosterTerminalMutationResponse::Recorded(_)
+            )
+        ));
+        let occupancy = store.protected_roster_diagnostic_snapshot();
+        assert_eq!(occupancy.occupancy_valid, 1);
+        assert_eq!(occupancy.live_reservations, 0);
+        assert_eq!(occupancy.retained_reservations, 1);
+    }
+
+    pub(super) async fn assert_roster_maintenance_without_ordinary_traffic(
+        store: &ConsensusSessionStore,
+        clock: &MutableClock,
+        start: Timestamp,
+    ) {
+        let terminal_log = store.inner.raft.metrics().borrow().last_log_index;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            terminal_log,
+            "young retained rows must not generate empty maintenance proposals"
+        );
+        clock.set(
+            start
+                .add_seconds(86_399)
+                .expect("one second before retention"),
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            store
+                .protected_roster_diagnostic_snapshot()
+                .retained_reservations,
+            1,
+            "the exact retention boundary remains enforced"
+        );
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            terminal_log,
+            "no maintenance proposal is due before the retention boundary"
+        );
+        clock.set(start.add_seconds(86_400).expect("exact retention boundary"));
+        let completed = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let snapshot = store.protected_roster_diagnostic_snapshot();
+                if snapshot.occupancy_valid == 1
+                    && snapshot.retained_reservations == 0
+                    && snapshot.tombstone_reservations == 0
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let snapshot = store.protected_roster_diagnostic_snapshot();
+        assert!(completed.is_ok(),
+            "automatic maintenance must reclaim and retire signed Q1/Q2 history: retained={}, tombstones={}",
+            snapshot.retained_reservations, snapshot.tombstone_reservations);
+        assert_eq!(snapshot.live_reservations, 0);
+        assert_eq!(
+            store.inner.raft.metrics().borrow().last_log_index,
+            terminal_log.map(|index| index + 2),
+            "one bounded reclaim and one retirement command clear the sole terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_maintenance_sqlite_reclaims_signed_roster_without_ordinary_traffic() {
+        use futures_util::FutureExt;
+        let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+        let directory = tempfile::tempdir().expect("automatic roster maintenance directory");
+        let start = Timestamp::from_str("2025-01-01T00:00:00Z").expect("test start");
+        let clock = Arc::new(MutableClock::new(start));
+        let store = ConsensusSessionStore::open_with_clock(
+            roster_ingress_singleton_topology(roster_ingress_test_root()),
+            SqliteSessionBackend::open(directory.path().join("store.sqlite")).expect("backend"),
+            directory.path().join("snapshots"),
+            BTreeMap::new(),
+            clock.clone(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("open maintenance store");
+        initialize_fixture(&store)
+            .await
+            .expect("initialize maintenance store");
+        let result = std::panic::AssertUnwindSafe(async {
+            seed_roster_maintenance_retained(&store, start).await;
+            assert_roster_maintenance_without_ordinary_traffic(&store, &clock, start).await;
+        })
+        .catch_unwind()
+        .await;
+        store
+            .shutdown_unplanned()
+            .await
+            .expect("join maintenance fixture");
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     }
 
     async fn protected_roster_ingress_has_two_mutations_and_read_only_status_paths_case() {

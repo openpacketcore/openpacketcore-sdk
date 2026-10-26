@@ -141,6 +141,14 @@ impl Fleet {
     }
 
     fn new_with_mode(case: &'static str, native: bool) -> Self {
+        Self::new_with_mode_and_roster_root(case, native, None)
+    }
+
+    fn new_with_mode_and_roster_root(
+        case: &'static str,
+        native: bool,
+        root: Option<crate::fenced_mutation_roster::RosterAttestationTrustRootV1>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("private WAL SDK directory");
         let members = (0..3)
             .map(|index| {
@@ -156,7 +164,7 @@ impl Fleet {
             })
             .collect::<Vec<_>>();
         let placement = PlacementResiliencePolicy::AllowReducedResilience;
-        let identity = crate::derive_fixed_durable_quorum_consensus_identity(
+        let identity = crate::topology::derive_fixed_durable_quorum_consensus_identity_with_roster_attestation_root(
             ConsensusClusterId::new("private-wal-sdk-fixed").expect("cluster"),
             ConsensusConfigurationEpoch::new(1).expect("epoch"),
             &members
@@ -164,17 +172,21 @@ impl Fleet {
                 .map(QuorumReplicaDescriptor::configuration_fingerprint)
                 .collect::<Vec<_>>(),
             placement,
+            root.as_ref(),
         );
         let topologies = members
             .iter()
             .map(|member| {
+                let mut config = QuorumTopologyConfig::new_consensus(
+                    member.replica_id().clone(),
+                    members.clone(),
+                    identity,
+                );
+                if let Some(root) = root.as_ref() {
+                    config = config.with_roster_attestation_trust_root(root.clone());
+                }
                 ValidatedQuorumTopology::try_from_fixed_durable_quorum_with_placement_policy(
-                    QuorumTopologyConfig::new_consensus(
-                        member.replica_id().clone(),
-                        members.clone(),
-                        identity,
-                    ),
-                    placement,
+                    config, placement,
                 )
                 .expect("fixed topology")
             })
@@ -1246,4 +1258,39 @@ async fn quorum_authority_native_durable_cut_and_independent_sql_cold_reconstruc
             })
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_maintenance_native_reclaims_signed_roster_without_ordinary_traffic() {
+    use super::membership_tests::{
+        assert_roster_maintenance_without_ordinary_traffic, roster_ingress_test_root,
+        seed_roster_maintenance_retained, MutableClock,
+    };
+    use std::str::FromStr;
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let start = opc_types::Timestamp::from_str("2025-01-01T00:00:00Z").expect("test start");
+    let clock = Arc::new(MutableClock::new(start));
+    let mut fleet = Fleet::new_with_mode_and_roster_root(
+        "roster-maintenance",
+        true,
+        Some(roster_ingress_test_root()),
+    );
+    fleet.clock = Some(clock.clone());
+    fleet.open().await;
+    let result = AssertUnwindSafe(async {
+        let store = fleet
+            .stores
+            .iter()
+            .find(|store| {
+                store.inner.raft.metrics().borrow().current_leader
+                    == Some(store.inner.local_node_id)
+            })
+            .expect("native leader");
+        seed_roster_maintenance_retained(store, start).await;
+        assert_roster_maintenance_without_ordinary_traffic(store, &clock, start).await;
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }

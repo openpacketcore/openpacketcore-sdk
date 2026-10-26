@@ -158,12 +158,10 @@ fn roster_maintenance_submission_outcome<T, E>(submission: Result<T, E>) -> Opti
 /// Production lane over one store. It holds only a weak reference so the last
 /// store owner drops the lane instead of leaving an owner cycle or a task that
 /// outlives the store.
-#[cfg(not(test))]
 struct ConsensusStoreRosterMaintenanceLane {
     inner: Weak<ConsensusSessionStoreInner>,
 }
 
-#[cfg(not(test))]
 #[async_trait::async_trait]
 impl RosterMaintenanceLane for ConsensusStoreRosterMaintenanceLane {
     fn occupancy(&self) -> Option<ProtectedRosterConsensusDiagnosticSnapshot> {
@@ -209,11 +207,34 @@ impl RosterMaintenanceLane for ConsensusStoreRosterMaintenanceLane {
 }
 
 /// Start the production roster-maintenance lane for `inner`.
-#[cfg(not(test))]
-pub(super) fn start(inner: Weak<ConsensusSessionStoreInner>) {
-    tokio::spawn(run_roster_maintenance_lane(
-        ConsensusStoreRosterMaintenanceLane { inner },
-    ));
+pub(super) struct RosterMaintenanceTask {
+    worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[cfg(test)]
+impl RosterMaintenanceTask {
+    pub(super) async fn is_finished_for_test(&self) -> bool {
+        self.worker
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|task| task.is_finished())
+    }
+
+    pub(super) async fn abort_for_test(&self) {
+        if let Some(task) = self.worker.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+pub(super) fn start(inner: Weak<ConsensusSessionStoreInner>) -> RosterMaintenanceTask {
+    RosterMaintenanceTask {
+        worker: tokio::sync::Mutex::new(Some(tokio::spawn(run_roster_maintenance_lane(
+            ConsensusStoreRosterMaintenanceLane { inner },
+        )))),
+    }
 }
 
 #[cfg(test)]
