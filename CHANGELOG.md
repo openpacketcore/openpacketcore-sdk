@@ -1042,6 +1042,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Update vendored DTLS P-256/P-384/ECDSA dependencies above the
+  RUSTSEC-2026-0387 arithmetic floor and its standalone `time` dependency
+  above RUSTSEC-2026-0009. OS randomness failures propagate as errors;
+  uncompressed public points and wire signature formats remain unchanged.
+  The vendored minimum Rust version becomes 1.88, below the SDK's 1.89 floor.
+
 - Update Tokio to 1.53.3 for RUSTSEC-2026-0386. SCTP and timer registrations
   consume owned descriptors through one narrow boundary that prevents replacing
   them while registered. Boot-time timers transfer ownership without descriptor
@@ -1061,8 +1067,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - IKE cryptography uses `crypto-bigint` 0.7.10 and `ctutils` 0.4.6,
   including their constant-time fixes. All affected consumer/fuzz lockfiles
-  retain the patched versions. Older DTLS arithmetic and the Tokio advisory
-  remain separate remediation items; this does not waive either advisory.
+  retain the patched versions. Separate updates in this release address the
+  older DTLS arithmetic and Tokio advisories.
 
 - `opc-proto-pfcp`: accept parameter-only/empty modifications, references to
   existing rules in modification deltas, source-interface-only PDIs and FO

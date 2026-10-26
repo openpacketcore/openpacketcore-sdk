@@ -308,8 +308,8 @@ digests. Tests cover default-build RSA signing refusal as well as enabled
 signing, checkpoint corruption/replay, provider admission and full exchanges.
 
 The change also updates IKE's `crypto-bigint` to 0.7.10 and `ctutils` to 0.4.6
-with matching standalone lockfiles. This does not resolve or ignore the
-separate older DTLS arithmetic and Tokio advisories.
+with matching standalone lockfiles. The separate DTLS arithmetic and Tokio
+follow-ups are recorded in the integration-verification sections below.
 
 Witnesses: [signature boundary](../crates/opc-proto-ikev2/src/ike_auth_signature.rs),
 [DH boundary](../crates/opc-proto-ikev2/src/sa_init_crypto.rs),
@@ -411,4 +411,41 @@ Witnesses: [owned registration](../crates/opc-tokio-fd-sys/src/lib.rs),
 [the upstream advisory](https://rustsec.org/advisories/RUSTSEC-2026-0386.html).
 The full Linux workspace passes all-target/all-feature Clippy. The mechanical
 unsafe boundary, all committed lockfile metadata and test-shard coverage checks
-pass. The older DTLS arithmetic advisory remains separate tracked work.
+pass. The DTLS arithmetic follow-up is recorded below.
+
+## Integration verification: DTLS arithmetic and standalone time dependency
+
+The vendored RustCrypto provider now uses P-256/P-384 0.14 and ECDSA 0.17,
+with a manifest floor of crypto-bigint 0.7.10 for external consumers.
+Ephemeral-key generation propagates OS entropy failures and explicitly retains
+uncompressed SEC1 public points. Private-key decoding imports the matching
+PKCS#8 trait; the existing bounded certificate/SEC1 DER paths, cipher suites,
+key exchange groups and signature wire formats remain unchanged.
+
+The standalone vendor lock also exposed an older `time` advisory. Its manifest
+now requires at least 0.3.47 and the lock resolves 0.3.55. The vendor MSRV is
+1.88, below the SDK's 1.89 floor. The resulting Clippy suggestions only replace
+divisibility/chunk operations and nested conditions with equivalent standard
+operations and short-circuit let chains. Guards retain their evaluation order.
+
+After the final changes, all-feature coverage passes 636 tests and 11 doc tests;
+RustCrypto-only coverage passes 323 tests and nine doc tests. Both feature
+selections pass all-target Clippy and the stricter production panic lints.
+The two existing WolfSSL DTLS 1.3 omissions remain explicit: application-data
+MTU fragmentation and a HelloRetryRequest that the peer cannot be made to send.
+
+Linux SDK coverage passes 233 ordinary tests. All 11 ignored native RFC 6083
+cases run explicitly and pass, including stream delivery, path loss, restart,
+rekey, SNI and certificate policy. Rekey and SNI captures retain complete
+key-ID progression with zero capture drops. Independent RFC 5746/RFC 6066,
+certificate and CRL fixtures, external-consumer resolution/compilation,
+source invariants, formatting and every committed lockfile metadata check pass.
+Root and vendor dependency audits report no unignored vulnerabilities or
+warnings under the existing RSA-private-operation and unused-rkyv exceptions;
+neither exception is expanded by this change.
+
+Witnesses: [vendor patch and validation contract](../vendor/dimpl/UPSTREAM.md),
+[RustCrypto key exchange](../vendor/dimpl/src/crypto/rust_crypto/kx_group.rs),
+[native qualification](../ci/qualify-rfc6083-native.sh),
+[arithmetic advisory](https://rustsec.org/advisories/RUSTSEC-2026-0387.html), and
+[time advisory](https://rustsec.org/advisories/RUSTSEC-2026-0009.html).

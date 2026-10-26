@@ -27,6 +27,18 @@ tar -xOf dimpl-0.7.2.crate dimpl-0.7.2/.cargo_vcs_info.json
 OpenPacketCore carries a security-scoped patch with the following intentional
 changes:
 
+- The RustCrypto ECDSA/ECDH backend uses P-256/P-384 0.14 and ECDSA 0.17,
+  with an explicit `crypto-bigint >= 0.7.10` constraint for downstream resolution
+  (RUSTSEC-2026-0387). Ephemeral generation uses the fallible OS RNG interface;
+  public points remain uncompressed SEC1, and certificate parsing retains its
+  existing bounded DER path. TLS cipher suites, key exchange groups and wire
+  signature formats are unchanged.
+- The standalone lockfile also updates `time` past RUSTSEC-2026-0009, with a
+  manifest minimum of 0.3.47. The fork's MSRV is now 1.88, below the SDK's 1.89
+  floor. Equivalent divisibility/chunk operations and short-circuit let chains
+  retain strict Clippy checks at this MSRV; protocol guards and their evaluation
+  order are unchanged.
+
 - The explicit mutual-certificate SCTP profile supports a bounded RFC 6066
   server name. It emits and validates a single host_name/empty acknowledgement,
   keeps the configured name through rekey, and rejects missing, malformed,
