@@ -234,6 +234,33 @@ async fn native_public_dispatch_ignores_sql_lanes_and_rejects_retained_closed_ow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_consensus_restore_deadline_while_waiting_for_worker_is_retryable() {
+    let (_directory, backend, _core, wal) = backend(Arc::new(|_| Ok(()))).await;
+    let held_permit = Arc::clone(&backend.restore_scan_workers)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let result = backend
+        .consensus_scan_restore_records_at(
+            RestoreScanRequest::all(1),
+            timestamp(1),
+            tokio::time::Instant::now() + Duration::from_millis(25),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(StoreError::BackendUnavailable(
+            "native session state is unavailable".into()
+        ))
+    );
+    drop(held_permit);
+    assert!(backend.native_read_task(|_, _| Ok(())).await.is_ok());
+    tokio::task::spawn_blocking(move || wal.shutdown().unwrap())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_public_active_cancellation_and_restore_deadline_retire_without_fencing() {
     for deadline in [false, true] {
         let gate = Gate::new(Point::BeforeNativePublicRead, 1);

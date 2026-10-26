@@ -6089,6 +6089,109 @@ mod consensus_readiness_deadline_tests {
 mod restore_cancellation_tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn standalone_restore_admission_deadline_keeps_work_budget_contract() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let held_permit = Arc::clone(&backend.restore_scan_workers)
+            .acquire_owned()
+            .await
+            .expect("hold restore worker admission");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+        let result = backend
+            .run_restore_scan(
+                RestoreScanRequest::all(1),
+                backend.clock.now_utc(),
+                deadline,
+                RestoreScanValidationProfile::Standalone,
+            )
+            .await;
+        assert_eq!(result, Err(StoreError::RestoreScanWorkBudgetExceeded));
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        drop(held_permit);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consensus_restore_deadline_while_waiting_for_worker_is_retryable() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let held_permit = Arc::clone(&backend.restore_scan_workers)
+            .acquire_owned()
+            .await
+            .expect("hold restore worker admission");
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+        let result = backend
+            .consensus_scan_restore_records_at(
+                RestoreScanRequest::all(1),
+                backend.clock.now_utc(),
+                deadline,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::BackendUnavailable(_))),
+            "no scan work ran; admission contention is retryable: {result:?}"
+        );
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        drop(held_permit);
+        tokio::time::resume();
+        assert!(
+            backend
+                .scan_restore_records(RestoreScanRequest::all(1))
+                .await
+                .expect("admission recovers after deadline")
+                .complete
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consensus_restore_deadline_while_waiting_for_connection_is_retryable() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let held_connection = backend.conn.lock().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+        let result = backend
+            .consensus_scan_restore_records_at(
+                RestoreScanRequest::all(1),
+                backend.clock.now_utc(),
+                deadline,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::BackendUnavailable(_))),
+            "no scan work ran; connection contention is retryable: {result:?}"
+        );
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert_eq!(
+            backend.restore_scan_workers.available_permits(),
+            RESTORE_SCAN_BLOCKING_WORKERS,
+            "timed-out connection admission must release its worker permit"
+        );
+        drop(held_connection);
+        tokio::time::resume();
+        assert!(
+            backend
+                .scan_restore_records(RestoreScanRequest::all(1))
+                .await
+                .expect("connection admission recovers after deadline")
+                .complete
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_restore_deadline_before_query_is_retryable() {
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let conn = backend.conn.lock().await;
+        let result = ops::scan_restore_records_sync(
+            &conn,
+            RestoreScanRequest::all(1),
+            backend.clock.now_utc(),
+            Arc::new(AtomicBool::new(false)),
+            SqliteWorkDeadline::tokio(tokio::time::Instant::now()),
+            RestoreScanValidationProfile::Consensus,
+        );
+        assert!(
+            matches!(result, Err(StoreError::BackendUnavailable(_))),
+            "an expired caller budget is not exhausted scan work: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn queued_worker_admission_uses_the_restore_operation_deadline() {
         let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
