@@ -26,6 +26,21 @@ async fn unqualified_backends_report_exact_control_port_unsupported() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_control_port_requires_backend_socket_ownership() {
+    let device = GtpDevice {
+        name: "sensitive-synthetic-device".into(),
+        ifindex: 73,
+    };
+    let error = LinuxGtpuDataplaneBackend::new()
+        .open_gtpu_control_port(&device)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, GtpuError::UnsupportedFeature { feature: "gtpu_control_port", .. }));
+    assert!(!format!("{error:?} {error}").contains(&device.name));
+}
+
 #[test]
 fn external_consumer_fake_accepts_testkit_downlink_inputs() {
     use opc_gtpu_dataplane::{

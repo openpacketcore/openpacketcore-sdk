@@ -68,8 +68,12 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// Receive at most one datagram and process it against the backend's own
     /// authoritative forwarding state.
     ///
-    /// This is the production consumer for G-PDUs that the kernel delivers to
-    /// the backend-owned queues. The shared UDP/2152 queue carries
+    /// The Linux kernel-GTP backend returns validated G-PDUs from its retained
+    /// socket as unknown-tunnel observations, without forwarding or replying.
+    /// The caller must establish tunnel absence and peer admission.
+    ///
+    /// On the eBPF backend, this is the production consumer for G-PDUs that
+    /// the kernel delivers to the backend-owned queues. The shared UDP/2152 queue carries
     /// outer-fragmented downlink G-PDUs after kernel reassembly (TS 29.281
     /// clauses 4.2.4 and 4.2.5) and unknown-TEID handoffs, and is served
     /// first, for at most eight datagrams in a row. Two more queues carry
@@ -940,6 +944,11 @@ mod tests {
         let wire = [0x30, 253, 0, 4, 0, 0, 0x10, 1, 230, 0, 1, 1];
         let event = receive(&wire, 49152);
         assert_eq!(event.kind(), GtpuControlDatagramKind::TunnelStatus);
+        assert!(matches!(
+            downlink_event(receive(&wire, 49152)),
+            crate::GtpuDownlinkEvent::Control(event)
+                if event.kind() == GtpuControlDatagramKind::TunnelStatus
+        ));
         assert!(matches!(
             event.control,
             Some(GtpuControlMessage::TunnelStatus(_))

@@ -14372,15 +14372,25 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
         }
     };
     let mut received = [0_u8; 2048];
-    let mut required_count = 0;
-    // All endpoint-required unknown identifiers, including the SGW-only 0xc0
-    // exception, are required for this endpoint profile. PSC is known framing.
+    let extension_gpdu = |kind| {
+        let mut gpdu = build_extension_gpdu(LOCAL_TEID, &inner);
+        gpdu[11] = kind;
+        if matches!(kind, 0x03 | 0x82) {
+            // Both Long PDCP assignments require eight octets, including framing.
+            gpdu.splice(12..16, [2, 0, 1, 2, 0, 0, 0, 0]);
+            let length = u16::try_from(gpdu.len() - 8).unwrap();
+            gpdu[2..4].copy_from_slice(&length.to_be_bytes());
+        }
+        gpdu
+    };
+    let mut handed_off_count = 0;
+    // The forwarding profile supports PSC only. Codec-known RAN/PDCP formats
+    // are also handed off, but are not unknown extensions to the typed receiver.
     for kind in 128_u8..=255 {
         if kind == 0x85 {
             continue;
         }
-        let mut gpdu = build_extension_gpdu(LOCAL_TEID, &inner);
-        gpdu[11] = kind;
+        let gpdu = extension_gpdu(kind);
         let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
         send_raw_gtpu_frame(
             &net.pgw_ns,
@@ -14389,9 +14399,14 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
             RawChecksumMetadata::Unverified,
         );
         let event = receive_control();
+        let codec_known = matches!(kind, 0x81..=0x84 | 0xc0);
         assert_eq!(
             event.kind(),
-            GtpuControlDatagramKind::UnsupportedRequiredExtension
+            if codec_known {
+                GtpuControlDatagramKind::Gpdu
+            } else {
+                GtpuControlDatagramKind::UnsupportedRequiredExtension
+            }
         );
         assert_eq!(event.bytes(), gpdu);
         assert_eq!(event.peer(), std::net::SocketAddrV4::new(PGW_IP, GTPU_PORT));
@@ -14403,14 +14418,21 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
         let plan = event.extension_notification(
             GtpuExtensionHeaderTypeList::new([])?,
             GtpuControlResponseBudget::new(14, 1)?,
-        )?;
-        assert_eq!(control.send_control_response(plan)?, 14);
-        let (length, source) = peer.recv_from(&mut received)?;
-        assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
-        assert_eq!(
-            &received[..length],
-            &[0x32, 31, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0]
         );
+        if codec_known {
+            assert_eq!(
+                plan.unwrap_err(),
+                opc_gtpu_dataplane::control_port::GtpuControlPortError::WrongProcedure
+            );
+        } else {
+            assert_eq!(control.send_control_response(plan?)?, 14);
+            let (length, source) = peer.recv_from(&mut received)?;
+            assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+            assert_eq!(
+                &received[..length],
+                &[0x32, 31, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0]
+            );
+        }
 
         // The same committed IPv6 parser must hand the unchanged packet to
         // the host before any grouped owner lookup. IPv6 typed socket support
@@ -14432,9 +14454,9 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
         let (length, source) = control_v6.recv_from(&mut received)?;
         assert_eq!(source, SocketAddr::from((PGW_IPV6, GTPU_PORT)));
         assert_eq!(&received[..length], gpdu);
-        required_count += 1;
+        handed_off_count += 1;
     }
-    assert_eq!(required_count, 127);
+    assert_eq!(handed_off_count, 127);
     expect_no_datagram(&ue);
     let after_required = backend.datapath_snapshot(&device).await?;
     assert_eq!(
@@ -14453,8 +14475,7 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
     // Unknown optional types are skipped at this endpoint, with their next
     // pointer followed. The exact inner UDP packet still reaches the UE.
     for kind in 1_u8..=127 {
-        let mut gpdu = build_extension_gpdu(LOCAL_TEID, &inner);
-        gpdu[11] = kind;
+        let gpdu = extension_gpdu(kind);
         let frame = build_outer_gtpu_frame(destination_mac, source_mac, &[], &gpdu, true, 0);
         send_raw_gtpu_frame(
             &net.pgw_ns,

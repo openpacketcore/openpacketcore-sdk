@@ -166,9 +166,11 @@ requires exactly one executed test, its completion marker and zero ignored
 tests. The PR records guard-removal results and public base/head/tree.
 
 Separate native eBPF tests now obtain this same port through the public
-backend trait. They attach the committed classifier and check all 127 unknown
-required extension identifiers, original tuple/bytes, bounded notification
-responses, all 127 optional identifiers and malformed suffix rejection.
+backend trait. They attach the committed classifier and check all 127 required
+extension handoffs outside PSC: 122 unknown identifiers permit bounded
+notifications, and five codec-known RAN/PDCP formats remain unforwarded without
+claiming an unknown-extension response. Original tuple/bytes, all 127 optional
+identifiers and malformed suffix rejection are also checked.
 The IPv6 parser handoff still uses an ordinary UDP receiver and does not
 qualify IPv6 typed responses. A second native case checks dynamic-port Echo
 bytes, shared-queue behavior, external-listener exclusion, kernel-observed
