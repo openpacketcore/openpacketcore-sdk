@@ -1873,6 +1873,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn consensus_restore_real_row_budget_remains_terminal_when_caller_cancels() {
+        let backend = crate::sqlite::SqliteSessionBackend::in_memory().unwrap();
+        let conn = backend.conn.lock().await;
+        conn.execute(
+            "INSERT INTO session_records VALUES (?1, 'upf', 'pdu-session', ?2, \
+             1, 'owner', 1, 'critical', 'state', NULL, X'00', 0)",
+            rusqlite::params!["t".repeat(RESTORE_SCAN_TENANT_MAX_BYTES + 1), [0x22_u8; 16]],
+        )
+        .unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let hook_cancellation = Arc::clone(&cancellation);
+        // Cancellation arrives after the initial deadline check while SQLite
+        // prepares the real page query. This small query does not exhaust the
+        // VM budget; its oversized persisted field independently fails the
+        // metadata bound before any candidate is loaded.
+        conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                context.action,
+                rusqlite::hooks::AuthAction::Read {
+                    table_name: "session_records",
+                    ..
+                }
+            ) {
+                hook_cancellation.store(true, Ordering::Release);
+            }
+            rusqlite::hooks::Authorization::Allow
+        }))
+        .unwrap();
+        let result = scan_restore_records_sync(
+            &conn,
+            RestoreScanRequest::all(1),
+            Timestamp::from_str("2026-08-25T00:00:00Z").unwrap(),
+            Arc::clone(&cancellation),
+            SqliteWorkDeadline::tokio(tokio::time::Instant::now() + Duration::from_secs(5)),
+            RestoreScanValidationProfile::Consensus,
+        );
+        conn.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        )
+        .unwrap();
+        assert!(cancellation.load(Ordering::Acquire));
+        assert_eq!(result, Err(StoreError::RestoreScanWorkBudgetExceeded));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn consensus_restore_metadata_exhaustion_remains_terminal_after_caller_expiry() {
         for cancel in [false, true] {
