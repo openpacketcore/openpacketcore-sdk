@@ -571,6 +571,7 @@ class WorkflowTests(unittest.TestCase):
     ]
     NATIVE_GTPU_DATAPATH_MARKERS = [
         "OPC_GTPU_OFF_SLOT_GENERATION_GUARD_PROVEN",
+        "OPC_GTPU_MULTIHOMING_PROVEN",
         "OPC_GTPU_WRONG_CURRENT_GRAPH_GUARD_PROVEN",
         "OPC_GTPU_TFT_IPV4_LIVE_PROVEN",
         "OPC_GTPU_TFT_REMOVAL_FENCE_DEFAULT_PROVEN:",
@@ -680,7 +681,7 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(job=name, proof=check):
                     self.assertEqual([line.strip() for line in job.splitlines()].count(check),
                                      1 if name == "privileged-gtpu" else 0)
-        for name, minutes in [("privileged-gtpu", 30), ("privileged-gtpu-regressions", 20),
+        for name, minutes in [("privileged-gtpu", 30), ("privileged-gtpu-regressions", 45),
                               ("privileged-gtpu-resets", 20)]:
             self.assertIn(f"timeout-minutes: {minutes}\n", native[name])
             self.assertIn("runs-on: ubuntu-latest\n", native[name])
@@ -741,7 +742,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_native_gtpu_proof_checks_reject_incomplete_or_skipped_runs(self):
         jobs = workflow_jobs("gtpu-privileged.yml")
-        self.assertEqual(len(set(self.NATIVE_GTPU_DATAPATH_MARKERS)), 44)
+        self.assertEqual(len(set(self.NATIVE_GTPU_DATAPATH_MARKERS)), 45)
         leaf_markers = [f"OPC_GTPU_ATTACHMENT_LEAF_PASSED: kind={kind} case={case} "
                         for kind in ("macvlan", "ipvlan", "veth")
                         for case in ("plain", "vrf", "collision", "siblings")]
