@@ -2359,6 +2359,63 @@ mod production_tests {
     }
 
     #[test]
+    fn roster_capacity_completed_count_is_not_an_admission_limit() {
+        let profile = ChargeProfile::v1();
+        let completed = admission(1);
+        let mut retained = live(&completed, 1, profile);
+        retained
+            .terminalize(&terminal(&completed), profile)
+            .unwrap();
+        let retained_charge = production_record_charges(&retained, profile)
+            .unwrap()
+            .retained;
+        // An exact aggregate projection of equally sized terminal rows is
+        // sufficient to exercise the production admission boundary. No live
+        // work or terminal reservation is outstanding, and the real byte
+        // budget has ample room. This does not claim a storage/reopen proof.
+        let completed_count = MAX_RESERVED_AND_RETAINED;
+        let witness = GlobalChargeWitness::v1(
+            0,
+            0,
+            AggregateCounters {
+                materialized_charge_bytes: retained_charge
+                    .checked_mul(u64::try_from(completed_count).unwrap())
+                    .unwrap(),
+                retained_and_live_bindings: completed_count,
+                durable_epoch_bindings: completed_count,
+                ..zero_counters()
+            },
+        );
+        let budget = GlobalChargeBudget::production();
+        assert!(witness.admits(budget).is_ok());
+        assert_eq!(witness.roster.live_reservations(), 0);
+
+        let next = live(&admission(2), 1, profile);
+        let result = prepare_production_admission(ProductionAdmissionPreparation {
+            vacancy: &vacant(next.binding),
+            existing: None,
+            record: next,
+            existing_floor: None,
+            existing_retirement_cursor: None,
+            witness,
+            budget,
+            profile,
+        });
+        assert!(
+            result.is_ok(),
+            "completed roster count must not refuse an admission with live and byte capacity: {:?}",
+            result.err()
+        );
+        let admitted = result.unwrap().next_witness();
+        assert_eq!(admitted.roster.live_reservations(), 1);
+        assert_eq!(
+            admitted.roster.durable_epoch_bindings(),
+            completed_count + 1
+        );
+        assert!(admitted.admits(budget).is_ok());
+    }
+
+    #[test]
     fn exact_live_combined_and_durable_limits_are_enforced() {
         let profile = profile();
         let mut live_records = (0..MAX_LIVE_ROSTERS)

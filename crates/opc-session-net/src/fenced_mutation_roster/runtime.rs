@@ -7075,6 +7075,7 @@ mod production_runtime_cut_matrix_tests {
         next_admission_outcome_unknown: bool,
         lose_next_terminal_reply: bool,
         next_admission_not_transmitted: bool,
+        admission_capacity_rejection: Option<BackendRejection>,
         next_terminal_not_transmitted: bool,
         admission_mutation_calls: Vec<(Vec<u8>, Vec<u8>)>,
         terminal_mutation_calls: Vec<(Vec<u8>, Vec<u8>)>,
@@ -7204,6 +7205,9 @@ mod production_runtime_cut_matrix_tests {
                     .to_canonical_bytes()
                     .expect("canonical test admission request"),
             ));
+            if let Some(rejection) = state.admission_capacity_rejection {
+                return Ok(RegistrationDecision::Reject(rejection));
+            }
             if state.next_admission_not_transmitted {
                 state.next_admission_not_transmitted = false;
                 return Ok(RegistrationDecision::NotTransmitted);
@@ -8040,6 +8044,55 @@ mod production_runtime_cut_matrix_tests {
             CutAttestor::new(scope),
             NonZeroUsize::new(6).expect("provider capacity"),
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_capacity_admission_waits_for_release_without_provider_dispatch() {
+        use futures_util::poll;
+
+        for rejection in [
+            BackendRejection::LiveFull,
+            BackendRejection::AggregateBytesFull,
+        ] {
+            let request = request();
+            let provider = Arc::new(CutProvider::for_cut(Cut::BeforeAdmission));
+            let backend = Arc::new(CutBackend::default());
+            backend.state.lock().unwrap().admission_capacity_rejection = Some(rejection);
+            let executor = executor(
+                Arc::clone(&provider),
+                Arc::clone(&backend),
+                request.admission().scope(),
+            );
+            let mut waiting = std::pin::pin!(executor.register(request.clone()));
+            assert!(
+                poll!(&mut waiting).is_pending(),
+                "temporary admission capacity must wait rather than refuse: {rejection:?}"
+            );
+            assert_eq!(backend.admission_calls().len(), 1);
+            assert!(provider.calls.lock().unwrap().is_empty());
+            assert!(backend.state.lock().unwrap().admission.is_none());
+
+            backend.state.lock().unwrap().admission_capacity_rejection = None;
+            let registration = waiting
+                .await
+                .expect("released capacity admits the same request");
+            assert_eq!(registration.admission(), request.admission());
+            let attempts = backend.admission_calls();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(
+                attempts[0], attempts[1],
+                "waiting cannot change the admission"
+            );
+            assert!(provider.calls.lock().unwrap().is_empty());
+            assert_eq!(
+                executor
+                    .local_authority
+                    .inner
+                    .entry_count
+                    .load(Ordering::Acquire),
+                1
+            );
+        }
     }
 
     fn compensation_executor(
