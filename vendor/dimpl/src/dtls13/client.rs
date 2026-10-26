@@ -424,7 +424,7 @@ impl State {
             client
                 .engine
                 .config()
-                .kx_groups()
+                .dtls13_kx_groups()
                 .next()
                 .map(|g| g.name())
                 .ok_or(Error::CryptoError(
@@ -1267,7 +1267,11 @@ fn handshake_create_client_hello(
 
     // 2. supported_groups extension
     let sg_start = ext_buf.len();
-    let groups: ArrayVec<NamedGroup, 4> = engine.config().kx_groups().map(|g| g.name()).collect();
+    let groups: ArrayVec<NamedGroup, 4> = engine
+        .config()
+        .dtls13_kx_groups()
+        .map(|g| g.name())
+        .collect();
     let sg = SupportedGroupsExtension { groups };
     sg.serialize(&mut ext_buf);
     let sg_end = ext_buf.len();

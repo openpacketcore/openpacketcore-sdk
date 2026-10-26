@@ -33,6 +33,7 @@ rust-crypto = [
     "_crypto-common",
 ]
 _crypto-common = [
+    "dep:crypto-bigint",
     "dep:ring",
     "dep:der",
     "dep:pkcs8",
@@ -66,6 +67,9 @@ aws-lc-rs = { version = "^1.16", default-features = false, features = ["aws-lc-s
 aes-gcm = { version = "0.10", optional = true }
 p256 = { version = "0.13", optional = true, features = ["ecdh"] }
 p384 = { version = "0.13", optional = true, features = ["ecdh"] }
+# Keep external consumers above the RUSTSEC-2026-0387 arithmetic floor.
+crypto-bigint = { version = "0.7.10", default-features = false, features = ["alloc", "zeroize"], optional = true }
+getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 sha2 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }
 hkdf = { version = "0.12", optional = true }

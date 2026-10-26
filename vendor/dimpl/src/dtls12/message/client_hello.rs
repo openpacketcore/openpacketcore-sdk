@@ -58,7 +58,7 @@ impl ClientHello {
         let has_ecdh = config.crypto_provider().has_ecdh();
 
         // Add supported groups and EC point formats if using ECDH
-        if has_ecdh {
+        if has_ecdh || config.crypto_provider().has_dhe() {
             // Add supported groups extension from config
             let mut groups = super::NamedGroupVec::new();
             for kx_group in config.kx_groups() {
@@ -68,7 +68,8 @@ impl ClientHello {
             let start_pos = buf.len();
             supported_groups.serialize(buf);
             ranges.push((ExtensionType::SupportedGroups, start_pos, buf.len()));
-
+        }
+        if has_ecdh {
             // Add EC point formats extension
             let ec_point_formats = ECPointFormatsExtension::default();
             let start_pos = buf.len();

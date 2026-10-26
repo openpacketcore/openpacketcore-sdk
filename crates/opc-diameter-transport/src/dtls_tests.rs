@@ -270,6 +270,7 @@ async fn rsa_leaf_suites_carry_diameter_with_bound_identity_and_sctp_auth() {
     for cipher in [
         DtlsSctpCipher::EcdheRsaAes128GcmSha256,
         DtlsSctpCipher::EcdheRsaAes256GcmSha384,
+        DtlsSctpCipher::DheRsaAes128GcmSha256,
     ] {
         let material = rsa_dtls_material();
         let policy = DtlsSctpPolicy::default()
@@ -728,6 +729,7 @@ async fn kernel_loopback_completes_real_rfc6083_handshake_and_reciprocal_close()
         None,
         Some(DtlsSctpCipher::EcdheRsaAes128GcmSha256),
         Some(DtlsSctpCipher::EcdheRsaAes256GcmSha384),
+        Some(DtlsSctpCipher::DheRsaAes128GcmSha256),
     ] {
         kernel_rfc6083_handshake(cipher).await;
     }

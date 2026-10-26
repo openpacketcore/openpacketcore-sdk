@@ -77,10 +77,10 @@ impl Random {
 // Named Groups (Key Exchange)
 // ============================================================================
 
-/// Elliptic curves and key exchange groups (RFC 8422, RFC 8446).
+/// Elliptic curves and finite-field groups (RFC 8422, RFC 7919, RFC 8446).
 ///
-/// Used for Elliptic Curve Diffie-Hellman Ephemeral (ECDHE) key exchange.
-/// The same named groups are used in both DTLS 1.2 and DTLS 1.3.
+/// Used for ephemeral Diffie-Hellman key exchange.
+/// FFDHE groups are supported only in DTLS 1.2.
 #[repr(transparent)]
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct NamedGroup(u16);
@@ -142,6 +142,16 @@ impl NamedGroup {
     /// X448 (Curve448 for ECDHE).
     pub const X448: Self = Self(30);
 
+    /// RFC 7919 2048-bit finite-field group (DTLS 1.2 only).
+    pub const FFDHE2048: Self = Self(256);
+    /// RFC 7919 4096-bit finite-field group (DTLS 1.2 only).
+    pub const FFDHE4096: Self = Self(258);
+
+    /// Whether the codepoint is in the RFC 7919 finite-field range, including unknown groups.
+    pub const fn is_ffdhe(self) -> bool {
+        matches!(self.0, 256..=511)
+    }
+
     /// Convert a wire format u16 value to a `NamedGroup`.
     pub const fn from_u16(value: u16) -> Self {
         Self(value)
@@ -154,7 +164,7 @@ impl NamedGroup {
 
     /// Returns true if this is not a known TLS named group wire value.
     pub const fn is_unknown(&self) -> bool {
-        !matches!(*self, Self(1..=25 | 29..=30))
+        !matches!(*self, Self(1..=25 | 29..=30 | 256 | 258))
     }
 
     /// Parse a `NamedGroup` from wire format.
@@ -169,7 +179,7 @@ impl NamedGroup {
     }
 
     /// All recognized named groups (every non-`Unknown` variant).
-    pub const fn all() -> &'static [NamedGroup; 27] {
+    pub const fn all() -> &'static [NamedGroup; 29] {
         &[
             NamedGroup::Sect163k1,
             NamedGroup::Sect163r1,
@@ -198,16 +208,29 @@ impl NamedGroup {
             NamedGroup::Secp521r1,
             NamedGroup::X25519,
             NamedGroup::X448,
+            NamedGroup::FFDHE4096,
+            NamedGroup::FFDHE2048,
         ]
     }
 
-    /// Supported named groups in preference order.
-    pub const fn supported() -> &'static [NamedGroup; 4] {
+    pub(crate) const fn supported_dtls13() -> &'static [NamedGroup; 4] {
         &[
             NamedGroup::X25519,
             NamedGroup::Secp256r1,
             NamedGroup::Secp384r1,
             NamedGroup::Secp521r1,
+        ]
+    }
+
+    /// Supported named groups in preference order.
+    pub const fn supported() -> &'static [NamedGroup; 6] {
+        &[
+            NamedGroup::X25519,
+            NamedGroup::Secp256r1,
+            NamedGroup::Secp384r1,
+            NamedGroup::Secp521r1,
+            NamedGroup::FFDHE4096,
+            NamedGroup::FFDHE2048,
         ]
     }
 }
@@ -242,6 +265,8 @@ impl fmt::Debug for NamedGroup {
             NamedGroup::Secp521r1 => f.write_str("Secp521r1"),
             NamedGroup::X25519 => f.write_str("X25519"),
             NamedGroup::X448 => f.write_str("X448"),
+            NamedGroup::FFDHE4096 => f.write_str("FFDHE4096"),
+            NamedGroup::FFDHE2048 => f.write_str("FFDHE2048"),
             _ => f.debug_tuple("Unknown").field(&self.0).finish(),
         }
     }

@@ -107,7 +107,8 @@ for the exact crash cut, credential handling and remaining limits.
   is DTLS-1.2-only, disables datagram replay filtering and flight
   retransmission in favor of reliable SCTP, and admits the typed
   ECDHE-ECDSA AES-GCM and ChaCha20-Poly1305 suites by default. RSA leaf
-  certificates can use `EcdheRsaAes128GcmSha256` or `EcdheRsaAes256GcmSha384`
+  certificates can use `EcdheRsaAes128GcmSha256`, `EcdheRsaAes256GcmSha384`
+  or `DheRsaAes128GcmSha256` (FFDHE4096 preferred, FFDHE2048 fallback)
   through `with_allowed_ciphers`; RSA-PSS-RSAE is preferred over PKCS#1,
   with SHA-256/384 only. Connection evidence records the negotiated suite.
   The separate `NdsAfEcdsa` certificate profile remains ECDSA-only.

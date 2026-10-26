@@ -30,7 +30,7 @@ VECTORS = {
 LIFECYCLES = {
     "coordinated-rekey": (
         "rekey.rs",
-        "2aa4a2c17b9acf361532bd86eda3473865d8a96c516f876ea05623676d0f9e8a", [
+        "0abb8d99feec479cf125e083b28ddf4977ee404f3fbf0b939ea5d9966adf1ba5", [
         "coordinated_rekey_preserves_queued_streams_and_rotates_each_auth_boundary",
         "rekey_requires_opt_in_and_cancellation_closes_the_association",
         "rekey_never_renews_the_absolute_association_lifetime",

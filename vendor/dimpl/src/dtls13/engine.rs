@@ -2189,7 +2189,7 @@ impl Engine {
         &self,
         group: crate::types::NamedGroup,
     ) -> Option<&'static dyn SupportedKxGroup> {
-        self.config.kx_groups().find(|g| g.name() == group)
+        self.config.dtls13_kx_groups().find(|g| g.name() == group)
     }
 
     // =========================================================================

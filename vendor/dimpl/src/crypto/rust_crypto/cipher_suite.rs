@@ -314,6 +314,8 @@ impl SupportedDtls12CipherSuite for PskAes128Ccm8 {
 /// Static instances of supported DTLS 1.2 cipher suites.
 static AES_128_GCM_SHA256: Aes128GcmSha256 =
     Aes128GcmSha256(Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256);
+static DHE_RSA_AES_128_GCM_SHA256: Aes128GcmSha256 =
+    Aes128GcmSha256(Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256);
 static RSA_AES_128_GCM_SHA256: Aes128GcmSha256 =
     Aes128GcmSha256(Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256);
 static AES_256_GCM_SHA384: Aes256GcmSha384 =
@@ -330,6 +332,7 @@ pub(super) static ALL_CIPHER_SUITES: &[&dyn SupportedDtls12CipherSuite] = &[
     &CHACHA20_POLY1305_SHA256,
     &RSA_AES_128_GCM_SHA256,
     &RSA_AES_256_GCM_SHA384,
+    &DHE_RSA_AES_128_GCM_SHA256,
     &PSK_AES_128_CCM_8,
 ];
 

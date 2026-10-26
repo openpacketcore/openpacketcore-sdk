@@ -200,9 +200,13 @@ fn dtls_create_ctx_with_algorithms(
     ctx.set_options(options);
 
     // Enable DHE cipher suites by setting temporary DH parameters
-    if let Ok(dh) = Dh::get_2048_256() {
-        ctx.set_tmp_dh(dh.as_ref())?;
-    }
+    let params = if groups_list == Some("ffdhe2048") {
+        include_bytes!("ffdhe2048.pem").as_slice()
+    } else {
+        include_bytes!("ffdhe4096.pem").as_slice()
+    };
+    let dh = Dh::params_from_pem(params)?;
+    ctx.set_tmp_dh(dh.as_ref())?;
 
     let ctx = ctx.build();
 

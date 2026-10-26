@@ -465,7 +465,10 @@ impl State {
         // Parse extensions
         let mut supported_versions_ok = false;
         let mut client_key_shares: Option<
-            ArrayVec<(NamedGroup, std::ops::Range<usize>), { NamedGroup::supported().len() }>,
+            ArrayVec<
+                (NamedGroup, std::ops::Range<usize>),
+                { NamedGroup::supported_dtls13().len() },
+            >,
         > = None;
         let mut client_supported_groups: Option<ArrayVec<NamedGroup, 4>> = None;
         let mut client_srtp_profiles: Option<ArrayVec<crate::dtls13::message::SrtpProfileId, 3>> =
@@ -560,7 +563,7 @@ impl State {
         let our_groups: ArrayVec<NamedGroup, 4> = server
             .engine
             .config()
-            .kx_groups()
+            .dtls13_kx_groups()
             .map(|g| g.name())
             .collect();
         let key_shares = client_key_shares

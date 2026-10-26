@@ -70,6 +70,7 @@ pub struct Server {
 
     /// Client's offered supported_groups (if any)
     client_supported_groups: Option<NamedGroupVec>,
+    client_offered_ffdhe: bool,
 
     /// Client's offered signature_algorithms (if any)
     client_signature_algorithms: Option<SignatureAndHashAlgorithmVec>,
@@ -175,6 +176,7 @@ impl Server {
             extension_data: Buf::new(),
             negotiated_srtp_profile: None,
             client_supported_groups: None,
+            client_offered_ffdhe: false,
             client_signature_algorithms: None,
             client_random: None,
             client_certificates: Vec::with_capacity(3),
@@ -220,6 +222,7 @@ impl Server {
         self.defragment_buffer.clear();
         self.captured_session_hash = None;
         self.client_supported_groups = None;
+        self.client_offered_ffdhe = false;
         self.client_signature_algorithms = None;
         self.client_random = None;
         self.client_certificates.clear();
@@ -470,34 +473,9 @@ impl State {
 
         trace!("Accepted ClientHello cookie; proceeding with handshake");
 
-        // Client offered suites; we pick per client order intersecting allowed and server key compatibility
-        let mut selected: Option<Dtls12CipherSuite> = None;
-        for s in ch.cipher_suites.iter() {
-            let is_allowed = server.engine.is_cipher_suite_allowed(*s);
-            let is_compatible = server
-                .engine
-                .crypto_context()
-                .is_cipher_suite_compatible(*s);
-            if is_allowed && is_compatible {
-                selected = Some(*s);
-                break;
-            }
-        }
-
-        let Some(cs) = selected else {
-            return Err((Error::SecurityError(
-                crate::SecurityError::NoMutuallyAcceptableCipherSuite,
-            ))
-            .into());
-        };
-
-        server.engine.set_cipher_suite(cs)?;
-        server.client_random = Some(client_random);
-
-        debug!("Selected cipher suite: {:?}", cs);
-
         // Process client extensions: SRTP, EMS, SupportedGroups and SignatureAlgorithms
         let mut client_offers_ems = false;
+        let mut client_offered_ffdhe = false;
         let mut client_srtp_profiles: Option<SrtpProfileVec> = None;
         let mut client_supported_groups: Option<NamedGroupVec> = None;
         let mut client_signature_algorithms: Option<SignatureAndHashAlgorithmVec> = None;
@@ -516,6 +494,11 @@ impl State {
                     let ext_data = ext.extension_data(&server.defragment_buffer);
                     let (_, groups) =
                         SupportedGroupsExtension::parse(ext_data).map_err(InternalError::from)?;
+                    // Unknown FFDHE codepoints still prohibit the legacy fallback (RFC 7919 section 4).
+                    client_offered_ffdhe =
+                        ext_data[2..].as_chunks::<2>().0.iter().any(|g| {
+                            NamedGroup::from_u16(u16::from_be_bytes([g[0], g[1]])).is_ffdhe()
+                        });
                     client_supported_groups = Some(groups.groups);
                 }
                 ExtensionType::EcPointFormats => {
@@ -536,6 +519,42 @@ impl State {
                 _ => {}
             }
         }
+
+        // Client offered suites; we pick per client order intersecting allowed and server key compatibility
+        let mut selected: Option<Dtls12CipherSuite> = None;
+        for s in ch.cipher_suites.iter() {
+            let is_allowed = server.engine.is_cipher_suite_allowed(*s);
+            let is_compatible = server
+                .engine
+                .crypto_context()
+                .is_cipher_suite_compatible(*s);
+            if is_allowed
+                && is_compatible
+                && (s.is_psk()
+                    || select_key_exchange_group(
+                        server.engine.config(),
+                        *s,
+                        client_supported_groups.as_ref(),
+                        client_offered_ffdhe,
+                    )
+                    .is_some())
+            {
+                selected = Some(*s);
+                break;
+            }
+        }
+
+        let Some(cs) = selected else {
+            return Err((Error::SecurityError(
+                crate::SecurityError::NoMutuallyAcceptableCipherSuite,
+            ))
+            .into());
+        };
+
+        server.engine.set_cipher_suite(cs)?;
+        server.client_random = Some(client_random);
+
+        debug!("Selected cipher suite: {:?}", cs);
 
         // EMS is mandatory
         if !client_offers_ems {
@@ -569,6 +588,7 @@ impl State {
 
         // Store client's offers for later selection
         server.client_supported_groups = client_supported_groups;
+        server.client_offered_ffdhe = client_offered_ffdhe;
         server.client_signature_algorithms = client_signature_algorithms;
 
         // Proceed to send the server flight
@@ -647,27 +667,15 @@ impl State {
             crate::InvalidStateError::NoServerRandom,
         ))?;
 
-        // Select ECDHE group from the intersection of:
-        // - client offers, and
-        // - server-allowed DTLS 1.2 groups (provider + config filter)
-        // Preference follows Config::kx_groups() order.
-        let allowed_named_groups: Vec<NamedGroup> = server
-            .engine
-            .config()
-            .kx_groups()
-            .map(|g| g.name())
-            .collect();
-        let selected_named_group = select_named_group(
+        let selected_named_group = select_key_exchange_group(
+            server.engine.config(),
+            cs,
             server.client_supported_groups.as_ref(),
-            &allowed_named_groups,
+            server.client_offered_ffdhe,
         )
-        .ok_or_else(|| {
-            if server.client_supported_groups.is_some() {
-                Error::SecurityError(crate::SecurityError::NoCommonKeyExchangeGroup)
-            } else {
-                Error::CryptoError(crate::CryptoError::NoDtls12KeyExchangeGroupsConfigured)
-            }
-        })?;
+        .ok_or(Error::SecurityError(
+            crate::SecurityError::NoCommonKeyExchangeGroup,
+        ))?;
 
         // Select signature/hash for SKE by intersecting client's list
         // with our key type, preferring the key's native hash algorithm.
@@ -903,6 +911,7 @@ impl State {
             // Extract client's public key range before dropping handshake
             let public_key_range = match &ckx.exchange_keys {
                 ExchangeKeys::Ecdh(keys) => keys.public_key_range.clone(),
+                ExchangeKeys::Dhe(range) => range.clone(),
                 ExchangeKeys::Psk(_) => {
                     return Err(Error::UnexpectedMessage(
                         crate::UnexpectedMessageError::PskClientKeyExchangeInEcdhePath,
@@ -1412,69 +1421,68 @@ fn handshake_create_server_key_exchange(
     let key_exchange_algorithm = cipher_suite.as_key_exchange_algorithm();
     debug!("Using key exchange algorithm: {:?}", key_exchange_algorithm);
 
-    let hash_alg = algorithm.hash_algorithm();
-
-    match key_exchange_algorithm {
-        KeyExchangeAlgorithm::EECDH => {
-            let (curve_type, named_group) = (CurveType::NamedCurve, named_group);
-            let mut kx_buf = engine.pop_buffer();
-            let pubkey = engine
-                .crypto_context_mut()
-                .init_ecdh_server(named_group, &mut kx_buf)
-                .map_err(Error::CryptoError)?;
-
-            trace!(
-                "SKE ECDHE: group={:?}, pubkey_len={}",
-                named_group,
-                pubkey.len()
-            );
-
-            // Build signed_data = client_random || server_random || params(without signature)
-            let mut signed_data = Buf::new();
-            client_random.serialize(&mut signed_data);
-            server_random.serialize(&mut signed_data);
-            // Write params directly for signing
-            signed_data.push(curve_type.as_u8());
-            signed_data.extend_from_slice(&named_group.as_u16().to_be_bytes());
-            signed_data.push(pubkey.len() as u8);
-            signed_data.extend_from_slice(pubkey);
-
-            engine.push_buffer(kx_buf);
-
-            let mut signature = engine.pop_buffer();
-
-            trace!("SKE signature hash: {:?}", hash_alg);
-            engine
-                .crypto_context
-                .sign_data(&signed_data, algorithm, &mut signature)
-                .map_err(Error::CryptoError)?;
-
-            // unwrap: safe because init_ecdh_server() above sets key_exchange = Some(...).
-            // If that failed, we returned Err earlier and never reach this point.
-            let pubkey = engine
-                .crypto_context_mut()
-                .maybe_init_key_exchange()
-                .map_err(Error::CryptoError)?;
-
-            // For sending, we don't use DigitallySigned struct, just write the params and signature directly
-            body.push(curve_type.as_u8());
-            body.extend_from_slice(&named_group.as_u16().to_be_bytes());
-            body.push(pubkey.len() as u8);
-            body.extend_from_slice(pubkey);
-
-            // Write signature
-            body.extend_from_slice(&algorithm.as_u16().to_be_bytes());
-            body.extend_from_slice(&(signature.len() as u16).to_be_bytes());
-            body.extend_from_slice(&signature);
-
-            engine.push_buffer(signature);
-
-            Ok(())
-        }
-        _ => Err(Error::SecurityError(
+    if !matches!(
+        key_exchange_algorithm,
+        KeyExchangeAlgorithm::EECDH | KeyExchangeAlgorithm::DHE
+    ) {
+        return Err(Error::SecurityError(
             crate::SecurityError::UnsupportedKeyExchangeAlgorithm,
-        )),
+        ));
     }
+    let mut kx_buf = engine.pop_buffer();
+    let pubkey = engine
+        .crypto_context_mut()
+        .init_ecdh_server(named_group, &mut kx_buf)
+        .map_err(Error::CryptoError)?;
+    if key_exchange_algorithm == KeyExchangeAlgorithm::DHE {
+        let prime = crate::crypto::ffdhe::prime(named_group).ok_or(Error::CryptoError(
+            crate::CryptoError::UnsupportedKeyExchangeGroup(named_group),
+        ))?;
+        for value in [prime, &[2], pubkey] {
+            body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            body.extend_from_slice(value);
+        }
+    } else {
+        body.push(CurveType::NamedCurve.as_u8());
+        body.extend_from_slice(&named_group.as_u16().to_be_bytes());
+        body.push(pubkey.len() as u8);
+        body.extend_from_slice(pubkey);
+    }
+    engine.push_buffer(kx_buf);
+    let mut signed_data = Buf::new();
+    client_random.serialize(&mut signed_data);
+    server_random.serialize(&mut signed_data);
+    signed_data.extend_from_slice(body);
+    let mut signature = engine.pop_buffer();
+    engine
+        .crypto_context
+        .sign_data(&signed_data, algorithm, &mut signature)
+        .map_err(Error::CryptoError)?;
+    body.extend_from_slice(&algorithm.as_u16().to_be_bytes());
+    body.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+    body.extend_from_slice(&signature);
+    engine.push_buffer(signature);
+    Ok(())
+}
+
+fn select_key_exchange_group(
+    config: &Config,
+    suite: Dtls12CipherSuite,
+    client_groups: Option<&NamedGroupVec>,
+    client_offered_ffdhe: bool,
+) -> Option<NamedGroup> {
+    let groups: Vec<_> = config
+        .kx_groups()
+        .map(|g| g.name())
+        .filter(|g| g.is_ffdhe() == suite.has_dhe())
+        .collect();
+    // RFC 7919 allows legacy DHE only when no FFDHE codepoint was offered.
+    let offers = if suite.has_dhe() && !client_offered_ffdhe {
+        None
+    } else {
+        client_groups
+    };
+    select_named_group(offers, &groups)
 }
 
 fn handshake_serialize_certificate_request(
@@ -1588,6 +1596,101 @@ mod tests {
 
     use crate::PskResolver;
     use crate::dtls12::message::DTLSRecord;
+
+    #[test]
+    fn ffdhe_wire_offers_prevent_unsupported_group_downgrade() {
+        let config = Arc::new(
+            Config::builder()
+                .dtls13_cipher_suites(&[])
+                .use_server_cookie(false)
+                .build()
+                .unwrap(),
+        );
+        let key = openssl::rsa::Rsa::generate(2048)
+            .unwrap()
+            .private_key_to_der()
+            .unwrap();
+        let dhe = Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256;
+        let ecdhe = Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256;
+        for (groups, fallback, expected) in [
+            (None, false, Some((dhe, NamedGroup::FFDHE4096))),
+            (
+                Some(vec![0, 2, 0, 29]),
+                false,
+                Some((dhe, NamedGroup::FFDHE4096)),
+            ),
+            (
+                Some(vec![0, 2, 1, 0]),
+                false,
+                Some((dhe, NamedGroup::FFDHE2048)),
+            ),
+            (
+                Some(vec![0, 4, 1, 0, 1, 2]),
+                false,
+                Some((dhe, NamedGroup::FFDHE4096)),
+            ),
+            (Some(vec![0, 2, 1, 1]), false, None),
+            (Some(vec![0, 2, 1, 255]), false, None),
+            (
+                Some(vec![0, 4, 1, 255, 0, 29]),
+                true,
+                Some((ecdhe, NamedGroup::X25519)),
+            ),
+        ] {
+            // Negotiation-only fixture: no certificate is emitted or accepted by a peer.
+            let mut server = Server::new(
+                Arc::clone(&config),
+                crate::DtlsCertificate {
+                    certificate: vec![1],
+                    intermediates: vec![],
+                    private_key: key.clone(),
+                },
+                Instant::now(),
+            );
+            let mut extensions = vec![];
+            extension(ExtensionType::ExtendedMasterSecret, &[], &mut extensions);
+            extension(
+                ExtensionType::SignatureAlgorithms,
+                &[0, 2, 8, 4],
+                &mut extensions,
+            );
+            if let Some(groups) = groups.as_ref() {
+                extension(ExtensionType::SupportedGroups, groups, &mut extensions);
+            }
+            let mut body = client_hello_body(dhe, &extensions);
+            if fallback {
+                body.splice(36..40, [0, 4, 0, 0x9e, 0xc0, 0x2f]);
+            }
+            server
+                .engine
+                .parse_packet(&epoch0_handshake_packet(MessageType::ClientHello, 0, &body))
+                .unwrap();
+            let result = State::AwaitClientHello.await_client_hello(&mut server);
+            if let Some((suite, group)) = expected {
+                assert_eq!(result.unwrap(), State::SendServerHello, "{groups:?}");
+                assert_eq!(server.engine.cipher_suite(), Some(suite));
+                assert_eq!(
+                    select_key_exchange_group(
+                        &config,
+                        suite,
+                        server.client_supported_groups.as_ref(),
+                        server.client_offered_ffdhe
+                    ),
+                    Some(group)
+                );
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(InternalError::Fatal(Error::SecurityError(
+                            crate::SecurityError::NoMutuallyAcceptableCipherSuite
+                        )))
+                    ),
+                    "{groups:?}: {result:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn sni_server_checks_independently_encrypted_client_hello_name() {
