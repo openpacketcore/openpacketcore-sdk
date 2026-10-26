@@ -327,7 +327,7 @@ async fn replay_data_bearing_final_chunk(single_chunk: bool) {
     watchdog(async {
         let fleet = Fleet::open().await;
         for node in &fleet.nodes {
-            node.disable_automatic_elections_for_test();
+            node.inner.raft.runtime_config().elect(false);
         }
         let source = &fleet.nodes[0];
         let target = &fleet.nodes[1];
@@ -454,7 +454,7 @@ async fn snapshot_progress_failed_final_inspection_can_restart_from_zero() {
     watchdog(async {
         let fleet = Fleet::open().await;
         for node in &fleet.nodes {
-            node.disable_automatic_elections_for_test();
+            node.inner.raft.runtime_config().elect(false);
         }
         let source = &fleet.nodes[0];
         let target = &fleet.nodes[1];
@@ -680,7 +680,7 @@ async fn snapshot_progress_resent_final_chunk_joins_the_accepted_install() {
     watchdog(async {
         let fleet = Fleet::open().await;
         for node in &fleet.nodes {
-            node.disable_automatic_elections_for_test();
+            node.inner.raft.runtime_config().elect(false);
         }
         let source = &fleet.nodes[0];
         let target = fleet.nodes[1].clone();
@@ -839,7 +839,7 @@ async fn snapshot_progress_final_receipt_waits_for_the_definitive_engine_result(
     watchdog(async {
         let fleet = Fleet::open().await;
         for node in &fleet.nodes {
-            node.disable_automatic_elections_for_test();
+            node.inner.raft.runtime_config().elect(false);
         }
         let source = &fleet.nodes[0];
         let target = &fleet.nodes[1];
