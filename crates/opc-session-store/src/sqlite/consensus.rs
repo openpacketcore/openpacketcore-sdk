@@ -41284,6 +41284,7 @@ mod tests {
     mod descriptor_locks;
     mod lease_deferral;
     mod retired_admission;
+    mod roster_maintenance_cutover;
     #[path = "scope_authority.rs"]
     mod scope_authority_tests;
     #[path = "scope_batch.rs"]
