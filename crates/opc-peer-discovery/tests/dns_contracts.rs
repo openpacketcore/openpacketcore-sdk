@@ -511,6 +511,7 @@ fn abandoned_refresh_times_out_and_late_completion_cannot_replace_success() {
     ));
     let status = cache.lookup(&q.cache_key(), t(expired_at));
     assert_eq!(status.last_error, Some(DnsError::Timeout));
+    assert_eq!(status.fresh_until, Some(t(1_000)));
     assert!(
         matches!(status.result, DnsCachedResult::Stale { answer: retained, age }
         if retained == answer(1, 0) && age == Duration::from_millis(expired_at - 1_000))
