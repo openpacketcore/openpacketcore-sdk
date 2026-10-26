@@ -895,18 +895,47 @@ impl Clock for MutableTestClock {
     }
 }
 
-async fn commit_snapshot_triggering_commands(store: &ConsensusSessionStore) {
+async fn commit_snapshot_triggering_commands(store: &ConsensusSessionStore) -> usize {
     // Retain the production 4,096-log snapshot threshold and commit every
     // qualification command. Each request must finish before the next begins:
     // concurrent logical-time reads intentionally share one bounded consensus
     // proposal, whereas this helper must commit the full production snapshot
     // threshold without adding an application-visible effect.
+    let mut completed_commands = 0;
     for _ in 0..SNAPSHOT_CATCH_UP_COMMANDS {
         store
             .max_replication_sequence()
             .await
             .expect("advance committed logical time toward snapshot compaction");
+        completed_commands += 1;
     }
+    completed_commands
+}
+
+async fn commit_snapshot_triggering_commands_observed(
+    store: &ConsensusSessionStore,
+    phase: &'static str,
+) {
+    // Retain the preparation checks without sampling storage during the batch.
+    let initial = store.status();
+    let completed_commands = commit_snapshot_triggering_commands(store).await;
+    assert_eq!(
+        completed_commands, SNAPSHOT_CATCH_UP_COMMANDS,
+        "the {phase} preparation batch issues every unchanged snapshot command"
+    );
+    let completed = store.status();
+    assert!(
+        (
+            completed.applied_index,
+            completed.last_log_index,
+            completed.completed_snapshot_count,
+        ) != (
+            initial.applied_index,
+            initial.last_log_index,
+            initial.completed_snapshot_count,
+        ),
+        "the {phase} preparation batch advances the store's published state"
+    );
 }
 
 async fn snapshot_command_batch<F: std::future::Future>(
@@ -6655,7 +6684,8 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
     // phase. The later isolated voter keeps its selected predecessor P, but
     // has no retained P+1..S log interval from which it can catch up.
     snapshot_command_batch(async {
-        commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
+        commit_snapshot_triggering_commands_observed(&cluster.stores[initial_leader], "predecessor")
+            .await;
     })
     .await
     .unwrap_or_else(|error| {
@@ -6720,7 +6750,8 @@ async fn compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_
     .expect("surviving majority remains ready while predecessor voter is isolated");
 
     snapshot_command_batch(async {
-        commit_snapshot_triggering_commands(&cluster.stores[initial_leader]).await;
+        commit_snapshot_triggering_commands_observed(&cluster.stores[initial_leader], "successor")
+            .await;
     })
     .await
     .unwrap_or_else(|error| {

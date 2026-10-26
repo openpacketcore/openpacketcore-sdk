@@ -342,6 +342,18 @@
       "issue": 1407
     },
     {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_rejects_wrong_instances_and_invalid_nested_shapes",
+      "kind": "assertions-decreased",
+      "reason": "The four PCO rejection assertions moved to positive retention/ignore coverage for issue #1441 in new tests (issue payloads, request/response retention, nonzero instances, builder round-trip, framing). The negative test keeps its AMBR, bearer-context, instance-shape and malformed-cause assertions; only the PCO-specific local-helper assertions were removed because that behaviour intentionally stopped being a rejection.",
+      "issue": 1441
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=consensus_openraft::stepdown::superseded_leader_stops_replication_before_truncating_its_uncommitted_suffix",
+      "kind": "assertions-decreased",
+      "reason": "Issue #1208 replaces the two immediate status reads (higher term, non-leader) with one bounded wait_for_status_for_test predicate that checks the same two conditions; the static helper resolver attributes one fewer assertion to the test. Openraft publishes the successor term and non-leader state from its own engine task, so a single immediate read could observe the pre-stepdown snapshot. Every original property and the existing RECOVERY_TIMEOUT bound are preserved; no timeout was raised and no assertion was weakened.",
+      "issue": 1208
+    },
+    {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::forced_timeout_reports_datapath_state_fields",
       "kind": "disabled",
       "reason": "Forced-timeout diagnostics regression is marked #[ignore] because this target executes with the privileged GTP-U datapath lane (`--ignored --nocapture`), the only lane that runs it; the regression itself needs no privilege. It asserts the shared datapath timeout diagnostics render every required field (redirect delta, shared-peer iteration, measured counter/drop expected and observed values, tentative addresses, neighbour and route state) and only adds coverage.",
@@ -352,6 +364,41 @@
       "kind": "assertions-decreased",
       "reason": "Replace the ad-hoc redirect-IT timeout eprintln block (which called `ip -6 addr/neigh show` with an expect) with the shared DatapathTimeoutDiagnostics formatter. The timeout assertion and every behavioral assertion are unchanged; the removed diagnostic `expect` is now a failure-safe bounded renderer, so the static helper resolver attributes fewer assertions while failures report strictly more datapath state (redirect delta, shared-peer iteration, counter values, tentative addresses, neighbours, routes).",
       "issue": 1188
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::create_bearer_retains_a_well_formed_nested_pco_like_update_bearer",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::create_bearer_retains_a_well_formed_nested_pco",
+      "reason": "Rename only: remove the incorrect comparison with Update Bearer while preserving Create Bearer's compatibility behavior. The same nested PCO fixture, successful builder/decode/projection checks, empty-tail assertion and retained-PCO count remain unchanged.",
+      "issue": 1441
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_builders_round_trip_a_retained_pco",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_builders_reject_non_s2b_pco",
+      "reason": "TS 29.274 Tables 7.2.15/16 do not permit PCO in Update Bearer on S2b, so accepting it in canonical senders was incorrect. The replacement rejects top-level and nested PCO in both request and response builders and retains a successful legal request round trip with the same EBI and empty additional-IE assertions. The strict projection rejection cases are also restored in update_bearer_rejects_wrong_instances_and_invalid_nested_shapes; receive tolerance remains covered separately.",
+      "issue": 1441
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_duplicate_nested_pco_keeps_the_first",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_duplicate_nested_pco_discards_all_occurrences",
+      "reason": "TS 29.274 clause 7.7.9 discards unexpected Update Bearer PCO before clause 7.7.10 singleton bookkeeping; retaining its first value was incorrect. The same two-occurrence wire fixture now requires every PCO to be absent, no duplicate diagnostic for discarded IEs, and preservation of EBI and TFT. issue_1441_payloads_decode_and_preserve_bearer_policy additionally verifies byte-exact raw preservation and canonical omission.",
+      "issue": 1441
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_tolerates_and_retains_declared_pco_slots",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::test=dedicated_bearer::update_bearer_discards_non_s2b_pco_at_both_scopes",
+      "reason": "TS 29.274 clause 7.7.9 and Tables 7.2.15/16 require discarding non-S2b PCO, not retaining it in the typed Update Bearer projection. The replacement preserves successful request/response decoding and projection, both top-level and nested scopes, empty-tail checks, bearer count, EBI and TFT. Each former retained-PCO assertion now requires absence; the literal-payload regression separately proves canonical omission and raw-byte preservation.",
+      "issue": 1441
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=consensus_openraft::snapshot_preparation_progress_is_event_driven_not_total_runtime_bounded",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-store::test=consensus_openraft::snapshot_preparation_progress_keeps_the_original_aggregate_bound",
+      "reason": "Replace the unbounded-preparation model with the original 300-second aggregate contract while issue 1164 remains unresolved. The replacement proves that continuous five-second progress cannot extend the deadline, a one-second completion retains its value, and a stalled batch also expires at 300 seconds; it fails before the bound-restoring fix. The real compacted-successor snapshot test retains both 4,300-command batches, completion-count and published-progress assertions, snapshot/purge recovery and full restart checks. No runtime bound is raised.",
+      "issue": 1164
     }
   ]
 }
