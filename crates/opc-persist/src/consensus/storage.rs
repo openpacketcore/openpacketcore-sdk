@@ -1413,7 +1413,7 @@ impl RaftStateMachine<ConfigRaftTypeConfig> for SqliteConfigStateMachine {
                     sqlite::invalid_data("config consensus snapshot install gate timed out"),
                 )
             })?;
-            snapshot_io_step(snapshot.sync_all())
+            sync_received_snapshot(&mut snapshot)
                 .await
                 .map_err(|error| {
                     storage_error(
@@ -2002,6 +2002,18 @@ pub(crate) async fn verify_open_snapshot_envelope(
     Ok(verified)
 }
 
+/// Size the pinned descriptor before bounding its whole-file synchronization.
+/// Metadata admission stays bounded and physical I/O retains its directory owner.
+async fn sync_received_snapshot(snapshot: &mut ConfigSnapshotFile) -> io::Result<()> {
+    let bytes = snapshot_io_step(snapshot.metadata()).await?.len();
+    if bytes <= SNAPSHOT_FOOTER_BYTES || bytes > SNAPSHOT_MAX_ENVELOPE_BYTES {
+        return Err(sqlite::invalid_data(
+            "config consensus snapshot size is invalid",
+        ));
+    }
+    snapshot_sync_step(bytes, snapshot.sync_all()).await
+}
+
 async fn snapshot_sync_step<T>(
     bytes: u64,
     operation: impl std::future::Future<Output = io::Result<T>>,
@@ -2115,7 +2127,7 @@ pub(crate) async fn inspect_voter_snapshot(
             "config voter snapshot inspection deadline",
         ));
     }
-    snapshot_io_step(snapshot.sync_all()).await?;
+    sync_received_snapshot(snapshot).await?;
     core.snapshot_work_hooks
         .before_envelope_verification()
         .await;

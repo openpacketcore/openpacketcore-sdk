@@ -447,6 +447,339 @@ async fn snapshot_progress_single_chunk_replays_its_final_receipt() {
 async fn snapshot_progress_nonempty_final_chunk_replays_its_final_receipt() {
     replay_data_bearing_final_chunk(false).await;
 }
+async fn admission_timeout_allows_snapshot_restart(single_chunk: bool) {
+    use crate::consensus::snapshot_file::test_io::{watchdog, Latency, Phase};
+    use crate::consensus::storage::snapshot_progress_tests::large_commands;
+
+    watchdog(async {
+        let fleet = Fleet::open().await;
+        for node in &fleet.nodes {
+            node.inner.raft.runtime_config().elect(false);
+        }
+        let source = &fleet.nodes[0];
+        let target = &fleet.nodes[1];
+        let profile = target.inner.voter_profile.as_ref().unwrap();
+        fleet
+            .network
+            .paused_replication_to
+            .store(target.inner.local_node_id.get(), Ordering::SeqCst);
+        let command = large_commands(source.inner.identity, source.inner.backend.audit_key())
+            .into_iter()
+            .next()
+            .unwrap();
+        let applied = source.inner.raft.client_write(command).await.unwrap();
+        assert!(applied.data.result.is_ok());
+        let before = target.inner.raft.metrics().borrow().last_applied;
+        let vote = source
+            .inner
+            .raft
+            .with_raft_state(|state| *state.vote_ref())
+            .await
+            .unwrap();
+        let (mut snapshot, _, _) = source
+            .read_replacement_snapshot(applied.log_id.index, vote)
+            .await
+            .unwrap();
+        assert!(snapshot.meta.last_log_id > before);
+        let mut bytes = Vec::new();
+        snapshot.snapshot.read_to_end(&mut bytes).await.unwrap();
+        let complete = InstallSnapshotRequest {
+            vote,
+            meta: snapshot.meta.clone(),
+            offset: 0,
+            data: bytes.clone(),
+            done: true,
+        };
+        let final_chunk = if single_chunk {
+            complete.clone()
+        } else {
+            profile
+                .receive_snapshot(
+                    target,
+                    source.inner.local_node_id,
+                    InstallSnapshotRequest {
+                        done: false,
+                        ..complete.clone()
+                    },
+                    None,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await
+                .unwrap();
+            InstallSnapshotRequest {
+                offset: bytes.len() as u64,
+                data: Vec::new(),
+                ..complete.clone()
+            }
+        };
+        let table = Reader(profile.core.clone())
+            .read_voter_slot_state_now()
+            .await
+            .unwrap()
+            .table()
+            .clone();
+        let members = snapshot
+            .meta
+            .last_membership
+            .nodes()
+            .map(|(node, _)| *node)
+            .collect();
+        let admission = profile.admission.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let blocker = tokio::spawn(async move {
+            admission
+                .run_snapshot_to_completion(
+                    table,
+                    members,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                    move || async move {
+                        entered.send(()).unwrap();
+                        held.await.unwrap();
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        started.await.unwrap();
+        let mut latency = Latency::new(fleet.directories[1].path(), Phase::Read);
+        let first = latency
+            .run(
+                Duration::ZERO,
+                profile.receive_snapshot(
+                    target,
+                    source.inner.local_node_id,
+                    final_chunk.clone(),
+                    None,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ),
+            )
+            .await;
+        let after_timeout = target.inner.raft.metrics().borrow().last_applied;
+        release.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        let repeated = latency
+            .run(
+                Duration::ZERO,
+                profile.receive_snapshot(
+                    target,
+                    source.inner.local_node_id,
+                    final_chunk,
+                    None,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ),
+            )
+            .await;
+        let installed = latency
+            .run(
+                Duration::ZERO,
+                profile.receive_snapshot(
+                    target,
+                    source.inner.local_node_id,
+                    complete.clone(),
+                    None,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ),
+            )
+            .await;
+        let duplicate = latency
+            .run(
+                Duration::ZERO,
+                profile.receive_snapshot(
+                    target,
+                    source.inner.local_node_id,
+                    complete,
+                    None,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ),
+            )
+            .await;
+        let after_install = target.inner.raft.metrics().borrow().last_applied;
+        let verifications = latency.verifications();
+        drop(latency);
+        fleet.close().await;
+        assert_eq!(first, Err(VoterReplacementError::Deadline));
+        assert_eq!(
+            after_timeout, before,
+            "queued admission must not install anything"
+        );
+        if single_chunk {
+            assert!(repeated
+                .expect("an identical single chunk retries admission")
+                .result
+                .is_ok());
+        } else {
+            assert_eq!(
+                repeated,
+                Err(VoterReplacementError::InvalidTransition),
+                "a final-only replay must tell the sender to restart from zero"
+            );
+        }
+        assert!(installed
+            .as_ref()
+            .expect("released admission permits a fresh transfer")
+            .result
+            .is_ok());
+        assert_eq!(
+            duplicate, installed,
+            "the dispatched result remains idempotent"
+        );
+        assert_eq!(after_install, snapshot.meta.last_log_id);
+        assert_eq!(
+            verifications, 2,
+            "one failed admission and one installation, with no redispatch on replay"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn snapshot_progress_admission_timeout_restarts_single_chunk() {
+    admission_timeout_allows_snapshot_restart(true).await;
+}
+
+#[tokio::test]
+async fn snapshot_progress_admission_timeout_restarts_final_only_chunk() {
+    admission_timeout_allows_snapshot_restart(false).await;
+}
+
+async fn received_snapshot_inspection_sync_is_size_bounded(stalled: bool) {
+    use crate::consensus::snapshot_file::test_io::{watchdog, Latency, Phase};
+    use crate::consensus::snapshot_timing::snapshot_work_budget;
+    use crate::consensus::storage::snapshot_progress_tests::{large_commands, PAYLOAD_BYTES};
+    use opc_consensus::engine::storage::RaftStateMachine;
+    use opc_consensus::engine::{CommittedLeaderId, Entry, Membership, RaftSnapshotBuilder};
+
+    watchdog(async {
+        let table = genesis();
+        let identity = table
+            .current_configuration()
+            .identity(table.cluster_instance, table.manifest_digest)
+            .unwrap();
+        let members: BTreeSet<_> = table
+            .slots
+            .iter()
+            .map(|slot| slot.member.identity.node_id())
+            .collect();
+        let node = *members.first().unwrap();
+        let source_directory = tempfile::tempdir().unwrap();
+        let source_backend = SqliteBackend::open_with_audit_key(
+            source_directory.path().join("config.sqlite"),
+            true,
+            0,
+            crate::AuditKey::new([42; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (_, mut source, _) = storage::open_with_voter_slots(
+            &source_backend,
+            source_directory.path().join("snapshots"),
+            identity,
+            members.clone(),
+            table.clone(),
+        )
+        .await
+        .unwrap();
+        source
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, node), 0),
+                payload: EntryPayload::Membership(Membership::new(
+                    vec![members.clone()],
+                    members.clone(),
+                )),
+            }])
+            .await
+            .unwrap();
+        // Build the same valid large history directly through the storage
+        // adapter; network elections are unrelated to whole-file sync latency.
+        let entries = large_commands(identity, source_backend.audit_key())
+            .into_iter()
+            .enumerate()
+            .map(|(index, command)| Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, node), index as u64 + 1),
+                payload: EntryPayload::Normal(command),
+            })
+            .collect::<Vec<_>>();
+        let applied = source.apply(entries).await.unwrap();
+        assert_eq!(applied.len(), 16);
+        for response in applied {
+            assert!(response.result.is_ok());
+        }
+        let mut snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        snapshot.snapshot.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.len() as u64 > PAYLOAD_BYTES);
+        let target_directory = tempfile::tempdir().unwrap();
+        let target_backend = SqliteBackend::open_with_audit_key(
+            target_directory.path().join("config.sqlite"),
+            true,
+            0,
+            crate::AuditKey::new([42; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (target_log, mut target, _) = storage::open_with_voter_slots(
+            &target_backend,
+            target_directory.path().join("snapshots"),
+            identity,
+            members,
+            table.clone(),
+        )
+        .await
+        .unwrap();
+        let mut incoming = target.begin_receiving_snapshot().await.unwrap();
+        incoming.write_all(&bytes).await.unwrap();
+        let delay = if stalled {
+            snapshot_work_budget(bytes.len() as u64) + Duration::from_secs(1)
+        } else {
+            let delay = storage::SNAPSHOT_OPERATION_TIMEOUT + Duration::from_millis(500);
+            assert!(delay < snapshot_work_budget(bytes.len() as u64));
+            delay
+        };
+        let mut latency = Latency::new(target_directory.path(), Phase::Sync);
+        let started = tokio::time::Instant::now();
+        let result = latency
+            .run(
+                delay,
+                storage::inspect_voter_snapshot(
+                    &target_log.core,
+                    &mut incoming,
+                    &snapshot.meta,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        drop(incoming);
+        drop(latency);
+        if stalled {
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        } else {
+            assert_eq!(
+                result.expect("a healthy large received snapshot remains inspectable"),
+                table
+            );
+            assert!(elapsed > storage::SNAPSHOT_OPERATION_TIMEOUT);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn snapshot_progress_received_sync_inspection_follows_artifact_size() {
+    received_snapshot_inspection_sync_is_size_bounded(false).await;
+}
+
+#[tokio::test]
+async fn snapshot_progress_received_sync_inspection_stays_bounded() {
+    received_snapshot_inspection_sync_is_size_bounded(true).await;
+}
+
 #[tokio::test]
 async fn snapshot_progress_failed_final_inspection_can_restart_from_zero() {
     use crate::consensus::snapshot_file::test_io::{watchdog, Latency, Phase};

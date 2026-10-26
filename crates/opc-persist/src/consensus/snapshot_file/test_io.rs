@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     Read,
+    Sync,
     Envelope,
     Backup,
 }

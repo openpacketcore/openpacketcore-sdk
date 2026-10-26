@@ -187,6 +187,60 @@ async fn install_fixture() -> InstallFixture {
 }
 
 #[tokio::test]
+async fn snapshot_progress_received_sync_install_follows_artifact_size() {
+    watchdog(async {
+        let mut fixture = install_fixture().await;
+        let bytes = std::fs::metadata(fixture.incoming.path()).unwrap().len();
+        let delay = SNAPSHOT_OPERATION_TIMEOUT + Duration::from_millis(500);
+        assert!(delay < snapshot_work_budget(bytes));
+        let through = fixture.meta.last_log_id;
+        let mut latency = Latency::new(fixture.directory.path(), Phase::Sync);
+        let started = tokio::time::Instant::now();
+        latency
+            .run(
+                delay,
+                fixture
+                    .machine
+                    .install_snapshot(&fixture.meta, fixture.incoming),
+            )
+            .await
+            .expect("a whole-file sync within the artifact's size budget must finish");
+        assert!(started.elapsed() > SNAPSHOT_OPERATION_TIMEOUT);
+        assert_eq!(fixture.machine.applied_state().await.unwrap().0, through);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn snapshot_progress_received_sync_install_stays_bounded() {
+    watchdog(async {
+        let mut fixture = install_fixture().await;
+        let bytes = std::fs::metadata(fixture.incoming.path()).unwrap().len();
+        let mut latency = Latency::new(fixture.directory.path(), Phase::Sync);
+        let result = latency
+            .run(
+                snapshot_work_budget(bytes) + Duration::from_secs(1),
+                fixture
+                    .machine
+                    .install_snapshot(&fixture.meta, fixture.incoming),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "the size-derived sync budget remains finite"
+        );
+        assert_eq!(fixture.machine.applied_state().await.unwrap().0, None);
+        assert!(fixture
+            .machine
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn snapshot_progress_purge_waits_for_the_owned_large_install() {
     watchdog(async {
         let mut fixture = install_fixture().await;
@@ -654,4 +708,32 @@ async fn snapshot_progress_writes_invalidate_the_descriptors_verified_digest() {
         .await
         .is_err());
     assert!(received.verified_envelope().is_none());
+}
+
+#[tokio::test]
+async fn snapshot_progress_received_sync_rejects_invalid_lengths_before_io() {
+    watchdog(async {
+        for bytes in [0, SNAPSHOT_FOOTER_BYTES, SNAPSHOT_MAX_ENVELOPE_BYTES + 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("incoming.snapshot");
+            let mut incoming = ConfigSnapshotFile::create(path.clone()).await.unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+            let mut latency = Latency::new(directory.path(), Phase::Sync);
+            let result = sync_received_snapshot(&mut incoming).await;
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert!(
+                matches!(
+                    latency.progress.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "an invalid length must be rejected before whole-file synchronization"
+            );
+        }
+    })
+    .await;
 }

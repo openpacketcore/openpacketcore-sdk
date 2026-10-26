@@ -364,6 +364,95 @@
       "kind": "assertions-decreased",
       "reason": "Replace the ad-hoc redirect-IT timeout eprintln block (which called `ip -6 addr/neigh show` with an expect) with the shared DatapathTimeoutDiagnostics formatter. The timeout assertion and every behavioral assertion are unchanged; the removed diagnostic `expect` is now a failure-safe bounded renderer, so the static helper resolver attributes fewer assertions while failures report strictly more datapath state (redirect delta, shared-peer iteration, counter values, tentative addresses, neighbours, routes).",
       "issue": 1188
+    },
+    {
+      "test": "rust:crates/opc-consensus::lib=lib::profile::tests::fixed_timing_profile_has_exact_family_deadlines_and_valid_ordering",
+      "kind": "assertions-decreased",
+      "reason": "Removing the SDK quorum-authority and election watchdog policies under ADR 0019 removes seven assertions of their deleted lease, poll, stagger and 8200 ms constants (30 -> 23). The shared profile still checks every supported family deadline. Issue #1049's one-heartbeat route grace replaces the backlog-only 200 ms and below-heartbeat expectations with exact 2 s/equal-heartbeat checks; patience remains derived from the engine election lease plus that grace. Issues #1048 and #1037 remain engine work.",
+      "issue": 1048
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consensus::store::failover::tests::failover_bound_is_derived_from_the_declared_profile",
+      "kind": "removed",
+      "reason": "ADR 0019 assigns election and leader authority exclusively to Openraft. The SDK election watchdog, rank staggering and their adapter-only tests are removed; issue #1037 remains engine work. Main's engine-driven election and scripted failover coverage remains.",
+      "issue": 1037,
+      "behavior_deleted": true,
+      "deleting_change": "8fd7c1632 removes crates/opc-persist/src/consensus/store/failover.rs and tests/consensus_openraft/failover_acceleration.rs with the SDK watchdog."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consensus::store::failover::tests::failover_threshold_staggers_only_the_observed_rank",
+      "kind": "removed",
+      "reason": "ADR 0019 assigns election and leader authority exclusively to Openraft. The SDK election watchdog, rank staggering and their adapter-only tests are removed; issue #1037 remains engine work. Main's engine-driven election and scripted failover coverage remains.",
+      "issue": 1037,
+      "behavior_deleted": true,
+      "deleting_change": "8fd7c1632 removes crates/opc-persist/src/consensus/store/failover.rs and tests/consensus_openraft/failover_acceleration.rs with the SDK watchdog."
+    },
+    {
+      "test": "rust:crates/opc-persist::lib=lib::consensus::store::voter_slots::tests::snapshot_tests::shutdown_discards_partial_snapshot_and_reopens_with_old_handles_alive",
+      "kind": "assertions-decreased",
+      "reason": "The incoming receiver now distinguishes Receiving from Accepted. Replace incoming.as_ref().unwrap() with an explicit Receiving pattern whose else branch panics; this drops one counted unwrap (35 -> 34) while checking the state more precisely. File existence, bounded shutdown, receiver disposal, file removal, post-shutdown refusal and reopen with old handles all remain asserted.",
+      "issue": 1339
+    },
+    {
+      "test": "rust:crates/opc-persist::test=consensus_openraft::failover_acceleration::automatic_elections_disabled_store_never_requests_a_campaign",
+      "kind": "removed",
+      "reason": "ADR 0019 assigns election and leader authority exclusively to Openraft. The SDK election watchdog, rank staggering and their adapter-only tests are removed; issue #1037 remains engine work. Main's engine-driven election and scripted failover coverage remains.",
+      "issue": 1037,
+      "behavior_deleted": true,
+      "deleting_change": "8fd7c1632 removes crates/opc-persist/src/consensus/store/failover.rs and tests/consensus_openraft/failover_acceleration.rs with the SDK watchdog."
+    },
+    {
+      "test": "rust:crates/opc-persist::test=consensus_openraft::failover_acceleration::delayed_heartbeats_request_one_campaign_but_never_depose_a_healthy_leader",
+      "kind": "removed",
+      "reason": "ADR 0019 assigns election and leader authority exclusively to Openraft. The SDK election watchdog, rank staggering and their adapter-only tests are removed; issue #1037 remains engine work. Main's engine-driven election and scripted failover coverage remains.",
+      "issue": 1037,
+      "behavior_deleted": true,
+      "deleting_change": "8fd7c1632 removes crates/opc-persist/src/consensus/store/failover.rs and tests/consensus_openraft/failover_acceleration.rs with the SDK watchdog."
+    },
+    {
+      "test": "rust:crates/opc-persist::test=consensus_openraft::failover_acceleration::steady_healthy_cluster_never_requests_failover_acceleration",
+      "kind": "removed",
+      "reason": "ADR 0019 assigns election and leader authority exclusively to Openraft. The SDK election watchdog, rank staggering and their adapter-only tests are removed; issue #1037 remains engine work. Main's engine-driven election and scripted failover coverage remains.",
+      "issue": 1037,
+      "behavior_deleted": true,
+      "deleting_change": "8fd7c1632 removes crates/opc-persist/src/consensus/store/failover.rs and tests/consensus_openraft/failover_acceleration.rs with the SDK watchdog."
+    },
+    {
+      "test": "rust:crates/opc-persist::test=consensus_openraft::failover_acceleration::unplanned_leader_loss_requests_a_campaign_within_the_derived_bound",
+      "kind": "removed",
+      "reason": "ADR 0019 assigns election and leader authority exclusively to Openraft. The SDK election watchdog, rank staggering and their adapter-only tests are removed; issue #1037 remains engine work. Main's engine-driven election and scripted failover coverage remains.",
+      "issue": 1037,
+      "behavior_deleted": true,
+      "deleting_change": "8fd7c1632 removes crates/opc-persist/src/consensus/store/failover.rs and tests/consensus_openraft/failover_acceleration.rs with the SDK watchdog."
+    },
+    {
+      "test": "rust:crates/opc-persist::test=consensus_openraft::quorum_lease::leader_without_acknowledged_quorum_withholds_authority_until_renewed",
+      "kind": "removed",
+      "reason": "ADR 0019 assigns election, vote and leader authority exclusively to Openraft. The SDK-only quorum-authority adapter and these adapter-specific scenarios are removed; issue #1048 remains engine work. No test of main's supported engine behavior is removed.",
+      "issue": 1048,
+      "behavior_deleted": true,
+      "deleting_change": "8fd7c1632 removes the quorum-authority adapter and crates/opc-persist/tests/consensus_openraft/quorum_lease.rs under ADR 0019."
+    },
+    {
+      "test": "rust:crates/opc-persist::test=consensus_openraft::quorum_lease::steady_quorum_acknowledgements_never_withhold_leader_authority",
+      "kind": "removed",
+      "reason": "ADR 0019 assigns election, vote and leader authority exclusively to Openraft. The SDK-only quorum-authority adapter and these adapter-specific scenarios are removed; issue #1048 remains engine work. No test of main's supported engine behavior is removed.",
+      "issue": 1048,
+      "behavior_deleted": true,
+      "deleting_change": "8fd7c1632 removes the quorum-authority adapter and crates/opc-persist/tests/consensus_openraft/quorum_lease.rs under ADR 0019."
+    },
+    {
+      "test": "rust:crates/opc-persist::test=consensus_openraft::route_retirement::routed_write_rediscovers_the_successor_after_a_black_holed_lost_leader",
+      "kind": "assertions-decreased",
+      "reason": "Idempotent replay must reuse the original attested commit and audit bytes. Removing the second commit fixture invocation removes its three counted construction checks (76 -> 73); that invocation regenerated time/encryption fields and was not an exact replay. The original construction checks, all route/operation bounds, rediscovery, committed-head and duplicate-result assertions remain. Leader-to-survivor traffic is stopped before waiting for vote-lease expiry.",
+      "issue": 1049
+    },
+    {
+      "test": "rust:crates/opc-persist::test=consensus_openraft::member_repair::repair_transfer_verifies_once_and_derives_one_size_following_attempt_budget",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-persist::test=consensus_openraft::member_repair::repair_transfer_verifies_once_within_the_original_attempt_deadline",
+      "reason": "Rename the repair regression to describe the retained original attempt deadline after removal of the attempt-budget extension. The 2 MiB aggregate, single verification, multi-chunk transfer, repaired-head checks and every timeout remain unchanged.",
+      "issue": 1339
     }
   ]
 }

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-consensus`: expose `DURABLE_CONSENSUS_FAILOVER_PATIENCE`, derived from the
+  election lease plus stale-route grace; it schedules no election. Refs #1049.
+
 - `opc-gtpu-dataplane` / `opc-dataplane-observation`: add host-portable RED
   scale-limit evidence for the #720 traffic-proof subsystem (tests only; no
   production path, map, pin, object, ABI or proof-semantic change). The
@@ -279,10 +282,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `opc-persist`: remove the SDK-only quorum-authority fence and automatic
-  election accelerator. Openraft retains election, vote and leader authority
-  under ADR 0019; #1048 and #1037 remain open for engine changes. Remove the
-  adapter-specific wire variants and metrics with those adapters.
+- `opc-persist`: release snapshot receipts when admission fails before engine
+  dispatch, so an identical single-chunk retry or a restarted transfer can
+  recover after transient contention. Dispatched work keeps its owned receipt.
+  Size both received-artifact sync budgets from the bounded descriptor length,
+  preserving finite metadata admission and storage-worker ownership. Refs #1339.
 
 - `opc-session-store`: native key-removal business-change journal (partial
   #1252, PR2a). `BusinessChanges` can now stage an exact-predecessor key

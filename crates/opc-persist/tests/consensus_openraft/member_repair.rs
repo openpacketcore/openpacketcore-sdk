@@ -802,11 +802,10 @@ async fn cancelled_repair_requires_fresh_quorum_then_reopens_with_a_majority() {
     cluster.shutdown().await;
 }
 
-// Linux-only lane: needs CI/qualification run (real-time multi-chunk repair
-// fixture; the macOS analysis host cannot open the fixed-quorum fixture).
+// Multi-chunk repair requires Linux snapshot support and the test-hook feature.
 #[cfg(all(target_os = "linux", feature = "dangerous-test-hooks"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn repair_transfer_verifies_once_and_derives_one_size_following_attempt_budget() {
+async fn repair_transfer_verifies_once_within_the_original_attempt_deadline() {
     let mut cluster = ThreeNodeCluster::start().await;
     let tx = TxId::new();
     let payload_bytes = 2 * 1024 * 1024;
@@ -890,7 +889,7 @@ async fn repair_transfer_verifies_once_and_derives_one_size_following_attempt_bu
         cluster.stores[0].initialize_cluster(),
     )
     .await
-    .expect("one bounded size-derived repair attempt")
+    .expect("one repair attempt within the original deadline")
     .expect("single attempt repairs the large snapshot");
     let verifications =
         cluster.stores[leader].snapshot_envelope_verifications_for_test() - verifications_before;

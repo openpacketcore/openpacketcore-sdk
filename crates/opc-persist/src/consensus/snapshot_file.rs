@@ -142,7 +142,13 @@ impl ConfigSnapshotFile {
         self.cleanup_on_drop = false;
     }
 
+    pub(crate) async fn metadata(&mut self) -> io::Result<std::fs::Metadata> {
+        self.file.metadata().await
+    }
+
     pub(crate) async fn sync_all(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        test_io::step(&self.path, test_io::Phase::Sync).await;
         self.file.sync_all().await
     }
 }

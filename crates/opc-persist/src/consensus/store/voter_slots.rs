@@ -607,7 +607,7 @@ impl ConfigVoterProfile {
         // run_peer_request owns this future through inspection and installation.
         // Publish the engine result before candidate acknowledgement: a retry
         // joins/replays that result, but gets a fresh bounded acknowledgement.
-        let mut entered_admission = false;
+        let dispatched = Arc::new(AtomicBool::new(false));
         let result = async {
             let table = storage::inspect_voter_snapshot(
                 &self.core,
@@ -636,19 +636,22 @@ impl ConfigVoterProfile {
             // Inspection and accepted installation remain owned if the chunk's
             // caller times out. Give the verified artifact its own admission budget.
             let deadline = tokio::time::Instant::now() + admission_budget;
-            entered_admission = true;
+            let dispatch_started = dispatched.clone();
             let response = self
                 .admission
-                .run_snapshot_to_completion(table, members, deadline, move || async move {
-                    Ok(raft
-                        .install_full_snapshot(
-                            assembly.vote,
-                            Snapshot {
-                                meta: assembly.meta,
-                                snapshot: assembly.data,
-                            },
-                        )
-                        .await)
+                .run_snapshot_to_completion(table, members, deadline, move || {
+                    dispatch_started.store(true, Ordering::Release);
+                    async move {
+                        Ok(raft
+                            .install_full_snapshot(
+                                assembly.vote,
+                                Snapshot {
+                                    meta: assembly.meta,
+                                    snapshot: assembly.data,
+                                },
+                            )
+                            .await)
+                    }
                 })
                 .await?;
             let result: Result<
@@ -664,11 +667,11 @@ impl ConfigVoterProfile {
             )
         }
         .await;
-        if !entered_admission && result.is_err() {
-            // Inspection and authorization cannot install anything. Release
-            // their failed receipt so a temporary read failure can restart
-            // from offset zero. Joined waiters still receive this rejection.
-            // Once admission starts, retain the result: it may be ambiguous.
+        if !dispatched.load(Ordering::Acquire) && result.is_err() {
+            // Inspection, authorization and queued admission cannot install
+            // anything. Release a definitely undispatched failure so a fresh
+            // transfer can retry. Existing waiters still receive this result.
+            // Once dispatch starts, retain its possibly ambiguous receipt.
             let mut incoming = self.incoming.lock().await;
             if matches!(incoming.as_ref(), Some(IncomingSnapshotState::Accepted {
                 completion: retained, ..

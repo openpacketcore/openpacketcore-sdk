@@ -1,9 +1,6 @@
 //! Configuration-store leader-route rediscovery regressions (#1049).
 //!
-//! These fixtures form a real three-node consensus cluster and therefore run in
-//! the serial all-features e2e lane. They cannot run on the macOS analysis host:
-//! the existing consensus fixtures fail during store open with the pre-existing
-//! `StorageUnavailable` environment limitation there.
+//! These real three-node fixtures run in the serial all-features end-to-end lane.
 //!
 //! The configuration store previously waited for the complete operation
 //! deadline on a leader-routed call even after its own engine had already named

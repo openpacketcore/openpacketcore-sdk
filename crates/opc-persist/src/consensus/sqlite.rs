@@ -4174,12 +4174,7 @@ pub(crate) type CurrentSnapshot = (
 
 /// Byte size of the main SQLite database file, derived from page metadata.
 ///
-/// This is a cheap, read-only estimate used to derive a size-following
-/// snapshot build budget before the backup is captured. It is a point-in-time
-/// observation: concurrent writes can grow the file (and WAL/freelist) past
-/// this value, so the derived backup budget may be slightly short. Such an
-/// under-budget fails typed at the derived bound and is recoverable by retrying
-/// the build; it is never a durability or admission decision.
+/// Snapshot sizing and backup share one connection lease, excluding concurrent writes.
 pub(crate) fn database_storage_bytes_sync(conn: &Connection) -> io::Result<u64> {
     let page_count: i64 = conn
         .query_row("PRAGMA page_count", [], |row| row.get(0))
