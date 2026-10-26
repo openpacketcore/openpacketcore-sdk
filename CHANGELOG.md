@@ -374,27 +374,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout at a derived bound remains typed. Refs #1339.
 
 - `opc-session-store`: a store that receives only protected-roster commands now
-  reclaims retained roster history through a bounded leader-owned maintenance
-  lane. The lane observes the published authenticated retention occupancy
-  (retained terminal and tombstone reservations), re-checks local leadership
-  and the operation deadline, and proposes the existing ordinary
-  `AdvanceLogicalTime` intent so the existing deterministic reclaim/retire turn
-  runs on native and SQLite state machines. It keeps at most one proposal in
-  flight and backs off exponentially to a fixed 60 s ceiling while a turn makes
-  no retention progress (neither reclaims a retained row nor retires a
-  tombstone), so it cannot busy-loop; a reclaim that keeps the retained-plus-
-  tombstone total flat still counts as progress. Every transient submission
-  outcome (leadership loss, no-quorum/authority refusal, deadline expiry,
-  outcome-unknown or any other store error) is a bounded skip that keeps the
-  lane alive, and only dropping the store stops it. The 24 h `TERMINAL_RETENTION`
-  boundary, the fixed caps, the frozen Q1/Q2 protected-roster mutation width,
-  fencing, stale-guard and exactly-once semantics are unchanged: a roster-only
-  store no longer waits for unrelated ordinary traffic before reclaiming
-  capacity that is already eligible. Sustaining more than the fixed retained
-  cap within one 24 h window still yields the typed capacity refusal and remains
-  gated on the #1298 recovery-retirement API decision and #1306 automatic
-  discharge (caller-deadline capacity backpressure is a documented follow-up);
-  this change does not claim those acceptance items. Refs #1307.
+  reclaims eligible retained history through an owned local-leader maintenance
+  lane. Authenticated indexed eligibility prevents empty logical-time proposals
+  for young rows. Unknown occupancy is refreshed without overwriting a newer
+  admission projection. The lane keeps one proposal in flight, retains its
+  one-second cadence after applied work even when concurrent completions leave
+  occupancy flat, and backs off transient failures to 60 seconds. Leadership
+  changes wake observation promptly; shutdown stops and joins the lane before
+  handoff and Raft shutdown. Maintenance retains the 24-hour recovery boundary,
+  bounded mutation widths and existing authority checks. Completed history has
+  no count quota; ordinary live/byte capacity uses caller-deadline backpressure
+  with bounded jitter. Recovery-only retirement after provider loss (#1298)
+  and automatic unresolved-obligation discharge (#1306) remain separate work.
+  Refs #1307.
 
 - `opc-persist`: a configuration-consensus leader that cannot obtain a quorum
   acknowledgement within the fixed quorum-authority ceiling

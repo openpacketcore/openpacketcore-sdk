@@ -101,8 +101,9 @@ async fn run_roster_maintenance_lane<L: RosterMaintenanceLane>(lane: L) {
         // A successful due turn is progress even when concurrent Q2 completions
         // replace its reclaimed count. Gauges are only a fallback for an
         // indeterminate reply that nevertheless published a visible reduction.
-        let _ = outcome;
-        if roster_maintenance_progressed(&before, &after) {
+        if outcome != RosterMaintenanceOutcome::Retry
+            || roster_maintenance_progressed(&before, &after)
+        {
             backoff.reset();
         } else {
             backoff = backoff.grew();
