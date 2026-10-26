@@ -753,6 +753,30 @@ class QuiescentShardPlanTests(unittest.TestCase):
                 self.assertNotIn("--ignored", command)
                 self.assertEqual(TEST_SHARDS.moved_lib_names(plan).count(name), 1)
 
+    def test_roster_completion_congestion_proofs_run_once_in_checked_o1(self) -> None:
+        plan = TEST_SHARDS.load_plan()
+        targets = [plan["heavy"]["target"], *(f"fixture_{i}" for i in range(9))]
+        for engine in ("native", "sqlite"):
+            for outcome in ("does_not_delay_emergency_admission",
+                            "does_not_delay_emergency_completion", "consumes_normal_quota"):
+                name = ("consensus::store::sequential_wal_sdk_tests::roster_completion::"
+                        f"roster_completion_{engine}_ordinary_wave_{outcome}")
+                with self.subTest(engine=engine, outcome=outcome):
+                    owners = [(shard, command) for shard in TEST_SHARDS.shard_ids(plan)
+                              for command in TEST_SHARDS.commands(plan, shard, targets)
+                              if name in command and command[command.index(name) - 1] != "--skip"]
+                    self.assertEqual([owner for owner, _ in owners], ["quiescent-o1"])
+                    command = owners[0][1]
+                    self.assertEqual(command[:4], [
+                        "env", "CARGO_PROFILE_TEST_OPT_LEVEL=1",
+                        "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                        "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true",
+                    ])
+                    self.assertEqual(command[-3:], ["--test-threads=1", "--exact", name])
+                    self.assertIn("--all-features", command)
+                    self.assertNotIn("--ignored", command)
+                    self.assertEqual(TEST_SHARDS.moved_lib_names(plan).count(name), 1)
+
     def test_completed_roster_history_proof_has_one_dedicated_optimized_owner(self) -> None:
         name = TEST_SHARDS.native_log_bound.ROSTER_HISTORY_TEST
         shard = TEST_SHARDS.native_log_bound.ROSTER_HISTORY_SHARD
