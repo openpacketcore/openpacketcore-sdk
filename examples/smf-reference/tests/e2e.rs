@@ -393,7 +393,7 @@ async fn pfcp_association_session_lifecycle() {
     );
     assert!(find_cause(&del_resp, CauseValue::RequestAccepted));
 
-    // 6. Heartbeat exchange and timeout handling.
+    // 6. Heartbeat request/response; this fixture has no association timeout supervisor.
     let hb_req = opc_proto_pfcp::heartbeat_request(200);
     let (_, hb_resp) = send_recv(&upf, smf_addr, &hb_req).await;
     assert_eq!(

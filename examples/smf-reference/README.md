@@ -16,7 +16,9 @@ outside its own workspace and to surface every API friction point.
 - `opc-sbi`: NRF registration heartbeat and deregister-on-drain, plus the
   SBI testkit's mock NRF in tests.
 - `opc-proto-pfcp`: real PFCP/N4 bytes over UDP — association setup/release,
-  session establishment/modification/deletion, and heartbeat keepalive.
+  session establishment/modification/deletion, and heartbeat request/response
+  handling. It does not implement periodic PFCP liveness probes, retransmission
+  timers, or association failure/restart supervision.
 - `opc-session-store`: session-record create/get with leases and fencing.
 - `opc-alarm`: alarm manager wired into the runtime.
 - `opc-config-bus`: loaded at runtime (the reference uses an in-memory/SQLite

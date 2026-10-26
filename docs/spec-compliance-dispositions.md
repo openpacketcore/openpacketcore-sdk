@@ -74,9 +74,22 @@ including `procedure_families_discard_known_unexpected_types_and_preserve_unknow
 
 The cited PFCP `src/runtime.rs` does not exist. The
 [PFCP crate](../crates/opc-proto-pfcp/README.md) explicitly excludes UDP transport,
-retransmission, and node lifecycle. Responding to a Heartbeat Request is not
-an association supervision state machine. No timeout-state-machine repair is
-claimed; implementing such a supervisor remains separate runtime work.
+retransmission, and node lifecycle. The actual reference consumer's
+[`n4_worker` and `handle_n4_message`](../examples/smf-reference/src/lib.rs)
+exchange messages and answer Heartbeat Requests; they have no periodic
+heartbeat sender, pending-request table or association timeout transition.
+The [reference test](../examples/smf-reference/tests/e2e.rs) checks the response
+type and sequence, not timeout supervision. Its comment and README now state
+that boundary explicitly.
+
+[TS 29.244 V19.6.0 §§6.2.2 and 6.4](https://www.etsi.org/deliver/etsi_ts/129200_129299/129244/19.06.00_60/ts_129244v190600p.pdf)
+place heartbeat and retry behavior on communicating PFCP entities. A production
+endpoint needs that supervisor; a codec does not supply it. The reported broken
+state machine is therefore not reproduced in this repository. This is a scope
+disposition, not implementation or qualification of a production PFCP endpoint.
+Together with the two builder fixes and the verified default optional-IE
+behavior, all four #1359 findings have a fix or documented disposition, pending
+peer review.
 
 ## 5GS interworking work list #1357
 
