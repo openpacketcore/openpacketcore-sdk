@@ -16095,12 +16095,12 @@ fn protected_roster_retirement_accepts_floor_epoch(
     }
 }
 
-/// Run at most one protected-roster reclaim turn as part of an already
+/// Run at most one protected-roster maintenance turn as part of an already
 /// committed logical-time advance.  This is deliberately the same bounded
 /// maintenance seam that compacts ordinary consensus receipts: it never
 /// proposes another Raft command, never touches live rows, and only enters
-/// the bounded domain planner after the reclaim index proves that at least
-/// one retained row is due.
+/// the bounded domain planner when the reclaim or terminal index identifies
+/// an eligible retained row or tombstone prefix.
 fn maintain_due_protected_roster_reclaim_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
@@ -33307,10 +33307,10 @@ fn apply_entries_with_authority_and_diagnostics_and_hooks_sync(
         };
 
         // Retained protected-roster rows age solely against the replicated
-        // logical clock.  Fold one deterministic reclaim turn into every
+        // logical clock. Fold one deterministic maintenance turn into every
         // normal command that advances or observes that clock; the helper is
         // an indexed no-op unless an activated roster has an eligible row.
-        // Reclaim runs inside this Raft apply transaction and emits no watch
+        // Maintenance runs inside this Raft apply transaction and emits no watch
         // event. An idle store's retention lane can propose AdvanceLogicalTime
         // to trigger the same bounded turn when indexed work becomes eligible.
         if let Some(logical_time) = response.logical_time {
