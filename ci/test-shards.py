@@ -102,10 +102,18 @@ QUIESCENT_VOID_LIB_TESTS = (
 )
 # These three-minute arrival-rate proofs measure signed production work. Keep
 # their literal load and backlog bounds in the checked O1 timing profile.
+# The completion-congestion proofs also retain their literal operation budgets
+# while draining a deliberately held wave of signed requests.
 QUIESCENT_ROSTER_LIB_MODULE = "consensus::store::sequential_wal_sdk_tests"
 QUIESCENT_ROSTER_LIB_TESTS = (
     "roster_maintenance_native_keeps_up_with_ten_due_rows_per_second",
     "roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second",
+    "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_admission",
+    "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_completion",
+    "roster_completion::roster_completion_native_ordinary_wave_consumes_normal_quota",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_admission",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_completion",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_consumes_normal_quota",
 )
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",

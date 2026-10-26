@@ -410,7 +410,7 @@ class PartitionTests(unittest.TestCase):
         commands = [c for shard in FENCE.SHARDS for c in FENCE.plans(fixture(), shard)]
         exact = [c for c in commands if c["name"] in FENCE.SPECIAL]
         self.assertEqual({c["name"] for c in exact}, set(FENCE.SPECIAL))
-        self.assertEqual(len(exact), 16)
+        self.assertEqual(len(exact), 22)
         self.assertEqual(FENCE.plans(fixture(), FENCE.PROOF_SHARD), exact)
         self.assertTrue(all(FENCE.owner(c["name"]) == FENCE.PROOF_SHARD for c in exact))
         for command in exact:
@@ -421,7 +421,7 @@ class PartitionTests(unittest.TestCase):
             self.assertEqual(argv[-3:], ["--test-threads=1", "--exact", command["name"]])
             optimized = command["name"] in FENCE.OPTIMIZED_LIB
             profile = {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"} if optimized else {}
-            if command["name"] in FENCE.SUSTAINED_ROSTER_LIB:
+            if command["name"] in FENCE.ROSTER_TIMING_LIB:
                 profile.update(CARGO_PROFILE_TEST_DEBUG_ASSERTIONS="true",
                                CARGO_PROFILE_TEST_OVERFLOW_CHECKS="true")
             self.assertEqual(command["env"], profile)
