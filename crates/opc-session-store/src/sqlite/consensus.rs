@@ -48310,11 +48310,7 @@ mod tests {
         write_retirement_fixture_witness_for_identity(conn, identity(), records)
     }
 
-    fn write_retirement_fixture_witness_for_identity(
-        conn: &Connection,
-        identity: SessionConsensusIdentity,
-        records: &[ProductionReservationRecord],
-    ) -> GlobalChargeWitness {
+    fn activate_retirement_fixture_policy(conn: &Connection, identity: SessionConsensusIdentity) {
         let scope = read_membership_scope_sync(conn, identity).expect("fixture membership");
         activate_fenced_transition_scope_with_voter_digest_sync(
             conn,
@@ -48327,6 +48323,14 @@ mod tests {
             ),
         )
         .expect("activate fixture policy");
+    }
+
+    fn write_retirement_fixture_witness_for_identity(
+        conn: &Connection,
+        identity: SessionConsensusIdentity,
+        records: &[ProductionReservationRecord],
+    ) -> GlobalChargeWitness {
+        activate_retirement_fixture_policy(conn, identity);
         let mut counters = crate::fenced_mutation_roster_storage::validate_production_snapshot(
             records,
             ChargeProfile::v1(),
@@ -49339,6 +49343,7 @@ mod tests {
         let conn = backend.conn.blocking_lock();
         initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
         activate_protected_roster_schema_sync(&conn).expect("activate protected roster");
+        activate_retirement_fixture_policy(&conn, identity());
 
         let retained_at =
             Timestamp::from_str("2026-01-01T00:00:00Z").expect("retained logical time");
