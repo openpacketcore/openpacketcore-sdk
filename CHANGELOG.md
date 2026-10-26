@@ -572,6 +572,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-gtpv2c`: ARP pre-emption permission booleans now follow the
+  enabled-zero PCI/PVI wire convention. Priority level 1 remains highest;
+  `cmp_priority` compares that rank independently of permission flags. Remove
+  caller compensations for the old inverted booleans. (#1354)
+- S2b procedure-aware receive ignores unexpected Update Bearer PCO and other
+  interface-specific F-TEID/load-control entries before decoding their values.
+  Mandatory fields and framing remain enforced; canonical send omits discarded
+  IEs and raw-preserving send retains them. Bearer QoS accepts its defined
+  22-octet prefix plus future extension octets. (#1441, #1356)
+
 - GTP-U recognizes short/long PDCP and opaque RAN extension formats and adds
   `GtpuTypedExtension` encode/decode. Comprehension scans reject malformed fixed
   widths. N3 retains its PSC-only endpoint profile. (#1529)

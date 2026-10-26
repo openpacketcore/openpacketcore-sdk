@@ -144,3 +144,26 @@ fn preemption_flags_encode_zero_as_enabled() {
     assert_eq!(arp(2, true, true).to_octet(), 0x08);
     assert_eq!(arp(2, false, false).to_octet(), 0x49);
 }
+
+#[test]
+fn preemption_permissions_use_the_enabled_zero_wire_convention() {
+    for level in 1..=15 {
+        for capability in [false, true] {
+            for vulnerability in [false, true] {
+                let wire = (level << 2)
+                    | if capability { 0 } else { 0x40 }
+                    | if vulnerability { 0 } else { 1 };
+                let decoded = AllocationRetentionPriority::from_octet(wire).unwrap();
+                assert_eq!(decoded.priority_level(), level);
+                assert_eq!(decoded.preemption_capability(), capability);
+                assert_eq!(decoded.preemption_vulnerability(), vulnerability);
+                assert_eq!(
+                    AllocationRetentionPriority::new(level, capability, vulnerability)
+                        .unwrap()
+                        .to_octet(),
+                    wire
+                );
+            }
+        }
+    }
+}
