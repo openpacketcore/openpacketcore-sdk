@@ -181,7 +181,9 @@ pub(crate) async fn undo<K: SuccessorKernel>(
         return Ok(());
     }
     kernel.local()?;
-    if progress.move_started && kernel.outbound() {
+    if progress.sa_started && kernel.outbound() {
+        // An uncertain policy read before cutover is still insufficient proof
+        // that deleting the candidate preserves the selected protection.
         match (
             kernel.successor_policy().await?,
             kernel.predecessor_policy().await?,

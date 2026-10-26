@@ -403,8 +403,10 @@ impl Operations {
             ) {
                 entry.install_progress.undo = true;
             }
-            if let Some(observer) = entry.observer.take() {
-                let _ = observer.send(Err(uncertain()));
+            if entry.install_progress.undo || !matches!(result, Ok(Ok(Err(_)))) {
+                if let Some(observer) = entry.observer.take() {
+                    let _ = observer.send(Err(uncertain()));
+                }
             }
             entry.schedule.failed(rand::random());
             return;
@@ -475,6 +477,7 @@ impl Operations {
         &self,
         backend: &LinuxXfrmBackend,
         index: usize,
+        attempt: CleanupAttempt,
     ) -> Result<RetirementPlan, XfrmError> {
         let entry = &self.entries[index];
         let reservation = entry.reservation.as_ref().ok_or_else(uncertain)?;
@@ -499,9 +502,15 @@ impl Operations {
             return Ok(RetirementPlan::Keep(entry.protection.clone()));
         }
         for request in &others {
+            if !attempt.has_budget() {
+                return Err(uncertain());
+            }
             if backend.read_scoped_sa(request).await? == Readback::Exact {
                 return Ok(RetirementPlan::Restore(request.clone()));
             }
+        }
+        if !attempt.has_budget() {
+            return Err(uncertain());
         }
         if backend.read_scoped_sa(&entry.request).await? != Readback::Absent {
             return Err(not_live());
@@ -516,18 +525,25 @@ impl Operations {
     }
 
     async fn step_retirement_at(&mut self, backend: &LinuxXfrmBackend, index: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let Some(attempt) = self.entries[index].schedule.begin() else {
+            return;
+        };
         if self.entries[index]
             .retirement
             .as_ref()
             .is_some_and(|retirement| retirement.plan.is_none())
         {
-            match self.retirement_plan(backend, index).await {
-                Ok(plan) => {
+            let planning =
+                std::panic::AssertUnwindSafe(self.retirement_plan(backend, index, attempt))
+                    .catch_unwind();
+            match tokio::time::timeout_at(deadline, planning).await {
+                Ok(Ok(Ok(plan))) => {
                     if let Some(retirement) = &mut self.entries[index].retirement {
                         retirement.plan = Some(plan);
                     }
                 }
-                Err(error @ XfrmError::StateMismatch { .. }) => {
+                Ok(Ok(Err(error @ XfrmError::StateMismatch { .. }))) => {
                     let entry = &mut self.entries[index];
                     entry.retirement = None;
                     entry.guard = None;
@@ -536,16 +552,13 @@ impl Operations {
                     }
                     return;
                 }
-                Err(_) => {
+                _ => {
                     self.entries[index].schedule.failed(rand::random());
                     return;
                 }
             }
         }
         let entry = &mut self.entries[index];
-        let Some(attempt) = entry.schedule.begin() else {
-            return;
-        };
         let Some(guard) = entry.guard.as_ref() else {
             return;
         };
@@ -583,11 +596,9 @@ impl Operations {
                 }
             }
         };
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            std::panic::AssertUnwindSafe(work).catch_unwind(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout_at(deadline, std::panic::AssertUnwindSafe(work).catch_unwind())
+                .await;
         let selection = match &plan {
             RetirementPlan::Restore(replacement) if retirement.removal.restored => {
                 Some(replacement.clone())

@@ -539,6 +539,148 @@
       "replacements": [
         "rust:crates/opc-session-store::lib=lib::consensus::store::voter_slot_tests::lifecycle_tests::retained_store_owner_refuses_reopen_until_its_release"
       ]
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::linux::tests::tfc_tests::native_tfc_install_readback_and_ignored_update_are_reported_exactly",
+      "kind": "disabled",
+      "reason": "New native GETSA/UPDSA TFC regression requires CAP_NET_ADMIN in a private network namespace. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1344
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::native_scoped_successor_moves_policy_and_retires_only_the_predecessor",
+      "kind": "disabled",
+      "reason": "The existing native scoped rekey test was nested inside another test and could not execute. It is now a top-level native test with its original privileged requirements. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_abandonment_restores_traffic",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_cancel_after_policy",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_cancel_after_sa",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_exact_retry",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_expired_group_cleans_up_in_both_orders",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_fresh_status",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_inbound_overlap",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_outbound_atomic_selection",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_panic_forward_completion",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_repeated_generations",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_abandonment_restores_traffic",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_cancel_after_policy",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_cancel_after_sa",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_exact_retry",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_expired_group_cleans_up_in_both_orders",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_fresh_status",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_inbound_overlap",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_outbound_atomic_selection",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_panic_forward_completion",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_repeated_generations",
+      "kind": "disabled",
+      "reason": "New native scoped rekey regression requires CAP_NET_ADMIN, private network and mount namespaces, and the scoped lifecycle fixture. It is explicitly required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the local-kernel-lifecycle qualification runner. No pre-existing executable coverage is gated or removed.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::successor::tests::successor_removal_is_refused_until_the_predecessor_was_retired",
+      "kind": "removed",
+      "reason": "RFC 7296 section 2.8.1 permits abandoning a newly created Child SA while retaining its predecessor. The blanket retirement-order refusal was contrary to issue #1239. The replacement requires successful abandonment, exact predecessor SA and protective policy retention, candidate SA absence, and no policy deletion. The separate successor_abandonment_restores_live_predecessor_and_keeps_protection test also asserts restoration precedes candidate deletion; native abandonment tests verify continuous protected traffic.",
+      "issue": 1239,
+      "replacements": [
+        "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::successor::tests::successor_removal_restores_a_retained_predecessor_without_deleting_its_policy",
+        "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::successor::tests::successor_abandonment_restores_live_predecessor_and_keeps_protection"
+      ]
     }
   ]
 }

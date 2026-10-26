@@ -153,7 +153,7 @@ pub(super) fn packet(
     esp
 }
 
-pub(super) async fn install(
+pub(super) async fn install_initial_scoped(
     backend: &NamespaceBoundLinuxXfrmBackend,
     profile: &LocalXfrmProfile,
     authority: &TestAuthority,

@@ -66,8 +66,9 @@ impl ScopedXfrmRequest {
     ///
     /// A successor keeps the policy lookup key, outer endpoints, UDP
     /// encapsulation, selectors, mode, priority and packet-marking presentation.
-    /// It uses a fresh SPI and may replace keys and lifetimes. Outbound successors use a fresh
-    /// reqid and atomically repoint the existing policy; inbound successors
+    /// It uses a fresh SPI and may replace keys and lifetimes. Outbound
+    /// successors use a fresh reqid and atomically repoint the existing policy;
+    /// inbound successors
     /// share the predecessor reqid and leave the protective policy unchanged,
     /// so both authenticated inbound SAs remain acceptable during overlap.
     ///

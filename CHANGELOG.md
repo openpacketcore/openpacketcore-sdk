@@ -71,18 +71,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   built-in and a future external adapter. External adapters remain
   `Unsupported` until the RFC 016 §14.11 external-profile conformance harness
   and qualification evidence exist. Refs #671.
-  `NamespaceBoundLinuxXfrmBackend::install_scoped_successor` installs one
-  successor SA for a flow that already has a live scoped receipt, moves the
-  single protective policy to it with one `UPDPOLICY` update (no unprotected
-  interval), and keeps the predecessor SA until the caller retires it through
-  the existing `remove_scoped` (which then removes the predecessor SA only).
-  `scoped_successor_status` reports install/traffic-move/publication/
-  predecessor-retirement milestones for lost-reply and cancellation recovery.
-  A separate committed activation supplies the successor's own role use; the
-  request must keep the predecessor's exact policy/flow identity and bring a
-  distinct SPI and request ID. Ambiguous policy readback retains both objects
-  and is resolved by readback, never assumed. Rekey-trigger ownership and peer
-  signalling remain consumer policy. Refs #1239.
+
+- `NamespaceBoundLinuxXfrmBackend::install_scoped_successor` installs a fresh
+  scoped Child SA while retaining its predecessor. Outbound successors use a
+  distinct reqid and atomically update the existing protective policy;
+  inbound successors share the reqid and policy so both SAs remain acceptable.
+  Exact retries resume retained progress, and lost replies never undo a
+  completed traffic move. `scoped_successor_status` reads current SA and policy
+  state while retaining the publication milestone. Published successors can
+  themselves be rekeyed. `remove_scoped` retires an unselected SA only, restores
+  a retained live generation when abandoning the selected one, and removes the
+  shared policy only with the final member. Expired groups clean up in either
+  order without manual repair. Each new successor requires its own committed
+  activation. Rekey-trigger ownership and peer signalling remain consumer
+  policy. Refs #1239.
 
 - `opc-proto-ikev2`: the executable IKE_SA_INIT/IKE_AUTH transform surface now
   covers RFC 3526 MODP groups 15-18 (Transform IDs 15/16/17/18, 3072/4096/6144/

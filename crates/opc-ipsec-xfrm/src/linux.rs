@@ -8165,7 +8165,15 @@ mod tests {
         // zero value must not become a second spelling of absence.
         let mut zero_attr = encode_sa_info(&sa_parameters()).unwrap();
         append_attr(&mut zero_attr, XFRMA_TFCPAD, &0_u32.to_ne_bytes()).unwrap();
-        assert!(parse_sa_state(&zero_attr, None).is_err());
+        let error = parse_sa_state(&zero_attr, None).unwrap_err();
+        assert!(matches!(
+            error,
+            XfrmError::Io {
+                operation: "query_sa",
+                kind: std::io::ErrorKind::InvalidData,
+                ..
+            }
+        ));
     }
 
     #[test]

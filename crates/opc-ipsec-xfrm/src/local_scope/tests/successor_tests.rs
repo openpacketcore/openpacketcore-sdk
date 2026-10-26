@@ -1,5 +1,5 @@
 //! Real traffic, repeated rekeys and interrupted actor observations.
-use super::successor_traffic::{self as traffic, install, request, Traffic};
+use super::successor_traffic::{self as traffic, install_initial_scoped, request, Traffic};
 use super::*;
 use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
 use crate::*;
@@ -117,7 +117,7 @@ async fn overlap(
 ) {
     let old_request = request(145, direction);
     let next_request = candidate(&old_request, 1);
-    let old = install(
+    let old = install_initial_scoped(
         backend,
         profile,
         authority,
@@ -175,7 +175,7 @@ async fn generations(
 ) {
     for (id, retire_first) in [(150, false), (154, true)] {
         let first_request = request(id, XfrmDirection::Out);
-        let first = install(
+        let first = install_initial_scoped(
             backend,
             profile,
             authority,
@@ -245,7 +245,9 @@ async fn expired_group(
 ) {
     for (id, successor_first) in [(190, false), (194, true)] {
         let old_request = request(id, XfrmDirection::Out);
-        let old = install(backend, profile, authority, quorum, id, old_request.clone()).await;
+        let old =
+            install_initial_scoped(backend, profile, authority, quorum, id, old_request.clone())
+                .await;
         let next_request = candidate(&old_request, 1);
         let next = backend
             .install_scoped_successor(
@@ -289,7 +291,7 @@ async fn retry(
     quorum: &Quorum,
 ) {
     let old_request = request(160, XfrmDirection::Out);
-    let old = install(
+    let old = install_initial_scoped(
         backend,
         profile,
         authority,
@@ -331,7 +333,7 @@ async fn readback(
     quorum: &Quorum,
 ) {
     let old_request = request(165, XfrmDirection::Out);
-    let old = install(
+    let old = install_initial_scoped(
         backend,
         profile,
         authority,
@@ -386,7 +388,9 @@ async fn abandon(
 ) {
     for (id, direction) in [(170, XfrmDirection::Out), (174, XfrmDirection::In)] {
         let old_request = request(id, direction);
-        let old = install(backend, profile, authority, quorum, id, old_request.clone()).await;
+        let old =
+            install_initial_scoped(backend, profile, authority, quorum, id, old_request.clone())
+                .await;
         let next_request = candidate(&old_request, 1);
         let next = backend
             .install_scoped_successor(
@@ -431,7 +435,7 @@ async fn cancelled(
     after_selection: bool,
 ) {
     let old_request = request(180, XfrmDirection::Out);
-    let old = install(
+    let old = install_initial_scoped(
         backend,
         profile,
         authority,
@@ -444,7 +448,7 @@ async fn cancelled(
     let effect = grant(authority, quorum, 181).await;
     let other_effect = grant(authority, quorum, 182).await;
     let sibling_request = request(183, XfrmDirection::Out);
-    let sibling = install(
+    let sibling = install_initial_scoped(
         backend,
         profile,
         authority,
@@ -527,7 +531,9 @@ async fn panic_recovery(
         (189, operations::TestFault::DropSuccessorReply),
     ] {
         let old_request = request(id, XfrmDirection::Out);
-        let old = install(backend, profile, authority, quorum, id, old_request.clone()).await;
+        let old =
+            install_initial_scoped(backend, profile, authority, quorum, id, old_request.clone())
+                .await;
         let next_request = candidate(&old_request, 1);
         let effect = grant(authority, quorum, id + 1).await;
         backend.scoped_test_fault(fault).await;
