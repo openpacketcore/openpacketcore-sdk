@@ -71,67 +71,75 @@ fn process_ipv6(runtime: &FakeRuntime, context: &GtpPdpContext, inner: &[u8]) ->
 
 #[tokio::test]
 async fn ordinary_ipv6_packet_too_big_preserves_mtu_and_uses_the_default_bearer() {
-    let (backend, runtime) = backend_with_fake();
-    backend.create_device(create_request()).await.unwrap();
-    let default = ipv6_context(None);
-    backend.install_pdp_context(default.clone()).await.unwrap();
-    runtime
-        .state()
-        .traffic_observation_gate
-        .insert(S2BU_IFINDEX, 3);
-    runtime.state().grouped_map_ready.insert(S2BU_IFINDEX);
+    for peer_teid in [0x2000_0001, 0] {
+        let (backend, runtime) = backend_with_fake();
+        backend.create_device(create_request()).await.unwrap();
+        let mut default = ipv6_context(None);
+        default.peer_teid = crate::PeerTeid::new(peer_teid);
+        backend.install_pdp_context(default.clone()).await.unwrap();
+        runtime
+            .state()
+            .traffic_observation_gate
+            .insert(S2BU_IFINDEX, 3);
+        runtime.state().grouped_map_ready.insert(S2BU_IFINDEX);
 
-    for mark in [None, Some(7)] {
-        let context = ipv6_context(mark);
-        if mark.is_some() {
-            backend.install_pdp_context(context.clone()).await.unwrap();
+        for mark in [None, Some(7)] {
+            let context = if mark.is_none() {
+                default.clone()
+            } else {
+                ipv6_context(mark)
+            };
+            if mark.is_some() {
+                backend.install_pdp_context(context.clone()).await.unwrap();
+            }
+            let selector = crate::PdpContextSelector::LocalTeid(
+                crate::PdpContextLocalTeidSelector::from_context(&context).unwrap(),
+            );
+            assert_eq!(
+                backend.read_pdp_context(selector).await.unwrap(),
+                crate::PdpContextReadback::Present(context.clone()),
+                "readback must retain the exact IPv6 MTU opt-in"
+            );
+
+            let fitting = invoking(1_300);
+            let ProcessedDownlink::Event(crate::GtpuDownlinkEvent::Decapsulated(packet)) =
+                process_ipv6(&runtime, &context, &fitting)
+            else {
+                panic!("the exact-MTU IPv6 packet must be forwarded");
+            };
+            assert_eq!(packet.inner_packet(), fitting);
+            assert_eq!(packet.family(), GtpAddressFamily::Ipv6);
+            assert_eq!(packet.bearer_mark(), context.bearer_mark);
+
+            let oversized = invoking(1_400);
+            let ProcessedDownlink::PacketTooBig(plan) =
+                process_ipv6(&runtime, &context, &oversized)
+            else {
+                panic!("an oversized IPv6 packet must become an in-tunnel PTB plan");
+            };
+            assert_eq!(plan.mtu(), 1_300);
+            assert_eq!(plan.family(), GtpAddressFamily::Ipv6);
+            assert_eq!(plan.session(), context.local_teid.get().to_be_bytes());
+            let (gpdu, local, peer) = plan.build_uplink_gpdu().unwrap();
+            assert_eq!((local, peer), (LOCAL, PEER));
+            assert_eq!(&gpdu[..4], &[0x30, 0xff, 0x05, 0x00]);
+            assert_eq!(&gpdu[4..8], &default.peer_teid.get().to_be_bytes());
+            let error = &gpdu[8..];
+            // RFC 4443 sections 2.3, 2.4(c), and 3.2: exact type, MTU,
+            // maximum quote, addresses, and IPv6 pseudo-header checksum.
+            assert_eq!(error.len(), 1_280);
+            assert_eq!(&error[..8], &[0x60, 0, 0, 0, 0x04, 0xd8, 58, 64]);
+            assert_eq!(&error[8..24], &oversized[24..40]);
+            assert_eq!(&error[24..40], &oversized[8..24]);
+            assert_eq!(&error[40..42], &[2, 0]);
+            assert_eq!(&error[44..48], &1_300_u32.to_be_bytes());
+            assert_eq!(&error[48..], &oversized[..1_232]);
+            let mut checksum = error[8..40].to_vec();
+            checksum.extend_from_slice(&1_240_u32.to_be_bytes());
+            checksum.extend_from_slice(&[0, 0, 0, 58]);
+            checksum.extend_from_slice(&error[40..]);
+            assert_eq!(internet_checksum(&checksum), 0);
         }
-        let selector = crate::PdpContextSelector::LocalTeid(
-            crate::PdpContextLocalTeidSelector::from_context(&context).unwrap(),
-        );
-        assert_eq!(
-            backend.read_pdp_context(selector).await.unwrap(),
-            crate::PdpContextReadback::Present(context.clone()),
-            "readback must retain the exact IPv6 MTU opt-in"
-        );
-
-        let fitting = invoking(1_300);
-        let ProcessedDownlink::Event(crate::GtpuDownlinkEvent::Decapsulated(packet)) =
-            process_ipv6(&runtime, &context, &fitting)
-        else {
-            panic!("the exact-MTU IPv6 packet must be forwarded");
-        };
-        assert_eq!(packet.inner_packet(), fitting);
-        assert_eq!(packet.family(), GtpAddressFamily::Ipv6);
-        assert_eq!(packet.bearer_mark(), context.bearer_mark);
-
-        let oversized = invoking(1_400);
-        let ProcessedDownlink::PacketTooBig(plan) = process_ipv6(&runtime, &context, &oversized)
-        else {
-            panic!("an oversized IPv6 packet must become an in-tunnel PTB plan");
-        };
-        assert_eq!(plan.mtu(), 1_300);
-        assert_eq!(plan.family(), GtpAddressFamily::Ipv6);
-        assert_eq!(plan.session(), context.local_teid.get().to_be_bytes());
-        let (gpdu, local, peer) = plan.build_uplink_gpdu().unwrap();
-        assert_eq!((local, peer), (LOCAL, PEER));
-        assert_eq!(&gpdu[..4], &[0x30, 0xff, 0x05, 0x00]);
-        assert_eq!(&gpdu[4..8], &default.peer_teid.get().to_be_bytes());
-        let error = &gpdu[8..];
-        // RFC 4443 sections 2.3, 2.4(c), and 3.2: exact type, MTU,
-        // maximum quote, addresses, and IPv6 pseudo-header checksum.
-        assert_eq!(error.len(), 1_280);
-        assert_eq!(&error[..8], &[0x60, 0, 0, 0, 0x04, 0xd8, 58, 64]);
-        assert_eq!(&error[8..24], &oversized[24..40]);
-        assert_eq!(&error[24..40], &oversized[8..24]);
-        assert_eq!(&error[40..42], &[2, 0]);
-        assert_eq!(&error[44..48], &1_300_u32.to_be_bytes());
-        assert_eq!(&error[48..], &oversized[..1_232]);
-        let mut checksum = error[8..40].to_vec();
-        checksum.extend_from_slice(&1_240_u32.to_be_bytes());
-        checksum.extend_from_slice(&[0, 0, 0, 58]);
-        checksum.extend_from_slice(&error[40..]);
-        assert_eq!(internet_checksum(&checksum), 0);
     }
 }
 
@@ -270,6 +278,92 @@ async fn ipv6_packet_too_big_requires_the_default_bearers_own_active_authority()
         };
         assert!(plan.build_uplink_gpdu().is_none(), "default fault {fault}");
     }
+}
+
+#[tokio::test]
+async fn ipv6_packet_too_big_requires_the_default_uplink_index_for_both_bearers() {
+    let mut unauthorized = Vec::new();
+    for mark in [None, Some(7)] {
+        for fault in [
+            "missing",
+            "malformed",
+            "stale-generation",
+            "missing-authority",
+        ] {
+            let (backend, runtime) = backend_with_fake();
+            backend.create_device(create_request()).await.unwrap();
+            let default = ipv6_context(None);
+            backend.install_pdp_context(default.clone()).await.unwrap();
+            let context = ipv6_context(mark);
+            if mark.is_some() {
+                backend.install_pdp_context(context.clone()).await.unwrap();
+            }
+            runtime
+                .state()
+                .traffic_observation_gate
+                .insert(S2BU_IFINDEX, 3);
+            runtime.state().grouped_map_ready.insert(S2BU_IFINDEX);
+            let oversized = invoking(1_400);
+            let ProcessedDownlink::PacketTooBig(valid) =
+                process_ipv6(&runtime, &context, &oversized)
+            else {
+                panic!("valid context must produce a PTB plan");
+            };
+            assert!(
+                valid.build_uplink_gpdu().is_some(),
+                "positive control {mark:?}/{fault}"
+            );
+            {
+                let mut state = runtime.state();
+                let downlink_before = state.session_downlink_index.clone();
+                let authority_before = state.session_groups.clone();
+                let key = state
+                    .session_uplink_index
+                    .keys()
+                    .find(|(_, key)| key[20..24] == [0; 4])
+                    .copied()
+                    .unwrap();
+                if fault == "missing" {
+                    state.session_uplink_index.remove(&key);
+                } else {
+                    let reference = state.session_uplink_index.get_mut(&key).unwrap();
+                    match fault {
+                        "malformed" => reference[25] = 1,
+                        "stale-generation" => {
+                            let generation =
+                                u64::from_be_bytes(reference[16..24].try_into().unwrap());
+                            reference[16..24]
+                                .copy_from_slice(&generation.checked_add(1).unwrap().to_be_bytes());
+                            assert!(GtpuSessionGroupRef::decode(reference).is_some());
+                        }
+                        "missing-authority" => reference[15] ^= 0x80,
+                        _ => unreachable!(),
+                    }
+                }
+                assert_eq!(state.session_downlink_index, downlink_before);
+                assert_eq!(state.session_groups, authority_before);
+            }
+            let fitting = invoking(1_300);
+            let ProcessedDownlink::Event(crate::GtpuDownlinkEvent::Decapsulated(packet)) =
+                process_ipv6(&runtime, &context, &fitting)
+            else {
+                panic!("uplink-only fault must leave downlink forwarding valid: {mark:?}/{fault}");
+            };
+            assert_eq!(packet.inner_packet(), fitting);
+            let ProcessedDownlink::PacketTooBig(plan) =
+                process_ipv6(&runtime, &context, &oversized)
+            else {
+                panic!("oversized downlink must remain a PTB plan: {mark:?}/{fault}");
+            };
+            if plan.build_uplink_gpdu().is_some() {
+                unauthorized.push((mark, fault));
+            }
+        }
+    }
+    assert!(
+        unauthorized.is_empty(),
+        "unauthorized uplink plans: {unauthorized:?}"
+    );
 }
 
 #[tokio::test]
