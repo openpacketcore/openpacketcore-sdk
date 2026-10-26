@@ -115,9 +115,11 @@ async fn unplanned_leader_loss_requests_a_campaign_within_the_derived_bound() {
     );
     let silent = survivors_of(old_leader)
         .into_iter()
-        .filter_map(|node| match cluster.stores[node].failover_status().state {
-            ConfigFailoverState::LeaderSilent { .. } => Some(node),
-            _ => None,
+        .filter(|node| {
+            matches!(
+                cluster.stores[*node].failover_status().state,
+                ConfigFailoverState::LeaderSilent { .. }
+            )
         })
         .count();
     assert!(

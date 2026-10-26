@@ -619,48 +619,58 @@ async fn repair_source_retriggers_after_a_duplicate_cut_swallows_its_request() {
 #[tokio::test(start_paused = true)]
 async fn slow_healthy_build_stages_follow_size_instead_of_one_shared_budget() {
     tokio::time::resume();
-    let (_directory, store, hooks) = published_build_source().await;
-    tokio::time::pause();
-    let started = tokio::time::Instant::now();
+    published_build_watchdog(async {
+        let (_directory, store, hooks) = published_build_source().await;
+        let _release = PublishedBuildRelease(Arc::clone(&hooks));
+        let started = tokio::time::Instant::now();
 
-    hooks.pause_captured_build.store(true, Ordering::Release);
-    store.trigger_snapshot().await.expect("second build");
-    hooks.build_captured.notified().await;
-    // Spend more than half of the old single 60 s budget after the SQLite
-    // backup stage has completed. A single shared deadline cannot survive this.
-    tokio::time::sleep(Duration::from_secs(40)).await;
-    hooks.pause_captured_build.store(false, Ordering::Release);
-    hooks.resume_captured_build.notify_one();
+        hooks.pause_captured_build.store(true, Ordering::Release);
+        store.trigger_snapshot().await.expect("second build");
+        hooks.build_captured.notified().await;
+        // Spend more than half of the old single 60 s budget after the SQLite
+        // backup stage has completed. A single shared deadline cannot survive this.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(40)).await;
+        tokio::time::resume();
+        hooks.pause_published_build.store(true, Ordering::Release);
+        hooks.pause_captured_build.store(false, Ordering::Release);
+        hooks.resume_captured_build.notify_one();
 
-    hooks.pause_published_build.store(true, Ordering::Release);
-    hooks.build_published.notified().await;
-    tokio::time::sleep(Duration::from_secs(40)).await;
-    hooks.pause_published_build.store(false, Ordering::Release);
+        hooks.build_published.notified().await;
+        // An active blocking worker prevents automatic time advancement. Drive
+        // the same delay explicitly while its committed result is held, then
+        // let the remaining filesystem work run on real time.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(40)).await;
+        tokio::time::resume();
+        hooks.pause_published_build.store(false, Ordering::Release);
 
-    let completed = tokio::time::timeout(Duration::from_secs(120), async {
-        while hooks.builds_returned_ok.load(Ordering::Acquire) < 2 {
-            hooks.build_returned_ok.notified().await;
-        }
+        let completed = tokio::time::timeout(Duration::from_secs(120), async {
+            while hooks.builds_returned_ok.load(Ordering::Acquire) < 2 {
+                hooks.build_returned_ok.notified().await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "size-derived build stages must finish even when total time exceeds the old shared 60 s budget"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed > crate::consensus::storage::SNAPSHOT_OPERATION_TIMEOUT,
+            "the regression must exceed the old shared build budget: {elapsed:?}"
+        );
+        let snapshot = store
+            .inner
+            .raft
+            .get_snapshot()
+            .await
+            .expect("healthy read")
+            .expect("published snapshot");
+        assert!(snapshot.meta.last_log_id.is_some());
+        let running = store.inner.raft.metrics().borrow().running_state.clone();
+        store.shutdown().await.expect("shutdown control");
+        assert!(running.is_ok());
     })
     .await;
-    assert!(
-        completed.is_ok(),
-        "size-derived build stages must finish even when total time exceeds the old shared 60 s budget"
-    );
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed > crate::consensus::storage::SNAPSHOT_OPERATION_TIMEOUT,
-        "the regression must exceed the old shared build budget: {elapsed:?}"
-    );
-    let snapshot = store
-        .inner
-        .raft
-        .get_snapshot()
-        .await
-        .expect("healthy read")
-        .expect("published snapshot");
-    assert!(snapshot.meta.last_log_id.is_some());
-    let running = store.inner.raft.metrics().borrow().running_state.clone();
-    store.shutdown().await.expect("shutdown control");
-    assert!(running.is_ok());
 }
