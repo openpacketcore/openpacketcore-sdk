@@ -177,6 +177,7 @@ enum SqliteWorkDeadline {
         at: tokio::time::Instant,
         clock: tokio::runtime::Handle,
     },
+    #[cfg(any(target_os = "linux", test))]
     RealTime(std::time::Instant),
 }
 
@@ -196,6 +197,7 @@ impl SqliteWorkDeadline {
                 let _entered = clock.enter();
                 tokio::time::Instant::now() >= *at
             }
+            #[cfg(any(target_os = "linux", test))]
             Self::RealTime(at) => std::time::Instant::now() >= *at,
         }
     }
@@ -837,6 +839,7 @@ where
 }
 
 /// Provision consensus schema without starting an engine, listener or voter.
+#[cfg(target_os = "linux")]
 pub(crate) fn provision_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
@@ -857,6 +860,7 @@ pub(crate) fn provision_retained_schema(
 }
 
 /// Read existing schema and authenticated history without any initialization.
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_retained_schema(
     conn: &Connection,
     topology: &super::ConfigConsensusTopology,
@@ -873,6 +877,7 @@ pub(crate) fn validate_retained_schema(
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn initialize_schema(
     conn: &Connection,
     identity: ConsensusIdentity,

@@ -7,48 +7,53 @@
 use std::fmt;
 #[cfg(test)]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
+#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 use hmac::{Hmac, KeyInit, Mac};
-use rand::{rngs::SysRng, TryRng};
+#[cfg(any(target_os = "linux", all(test, unix)))]
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[cfg(unix)]
+use crate::local_sqlite::FileAdmission;
+use crate::local_sqlite::{completion_path, lock_path};
+#[cfg(target_os = "linux")]
 use crate::local_sqlite::{
-    file_identity, identity_for_path, open_file, open_sqlite, AdmissionFileLock, FileAdmission,
+    file_identity, identity_for_path, open_sqlite, reject_symlink_components,
 };
-use crate::local_sqlite::{lock_path, reject_symlink_components};
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use crate::local_sqlite::{open_file, AdmissionFileLock};
 use crate::{AuditKey, ConfigConsensusTopology, SqliteBackend};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 
 mod operation;
+mod provisioning;
 pub use operation::{RetainedConfigOpen, RetainedConfigOpenRetirement};
+pub use provisioning::RetainedConfigProvisionRequest;
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const RECORD_MAGIC: &[u8; 8] = b"OPCRET01";
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const RECORD_DOMAIN: &[u8] = b"openpacketcore/config-retained-admission/v1\0";
 const BINDING_DOMAIN: &[u8] = b"openpacketcore/config-retained-scope/v1\0";
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const RECORD_BYTES: usize = 8 + 32 + 32 + 1 + 6 * 8 + 32;
 const MAX_VALIDATION_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
 const BINDING_SCHEMA: &str = "CREATE TABLE consensus_retained_binding (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), record BLOB NOT NULL CHECK(length(record) = 153))";
-// SDK-owned non-authority provisioning intent. It authenticates that a partial
-// artifact prefix belongs to one exact provisioning request so a retry can
-// abort it automatically. It is never a capability or configuration authority
-// and it does not change the established database or admission-record formats.
-const INTENT_MAGIC: &[u8; 8] = b"OPCRETI1";
-const INTENT_DOMAIN: &[u8] = b"openpacketcore/config-retained-intent/v1\0";
-const INTENT_BYTES: usize = 8 + 32 + 32 + 1 + 32;
-const INTENT_NEW_AUTHORITY: u8 = 0;
-const INTENT_REPAIR_MEMBER: u8 = 1;
 // Bounds concurrent startup work, including cancelled blocking operations.
 static ADMISSION_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
@@ -56,7 +61,10 @@ static ADMISSION_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_ne
 enum OpenIntent {
     NewAuthority,
     RepairMember,
+    ResumeAuthority,
+    ResumeRepair,
     Reopen,
+    Transaction(RetainedConfigProvisionRequest, provisioning::OpenMode),
 }
 
 /// Exact caller-admitted configuration authority and local storage/key scope.
@@ -133,6 +141,8 @@ pub enum RetainedConfigDurability {
 
 /// Bounded retained-store admission options, with no automatic create fallback.
 #[derive(Clone)]
+// Keep the same public options on unsupported targets; only Linux executes them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct RetainedConfigOptions {
     path: PathBuf,
     binding: RetainedConfigBinding,
@@ -223,7 +233,7 @@ struct AdmissionWork {
     #[cfg(test)]
     completion_hook: Option<AdmissionCompletionTestHook>,
     #[cfg(test)]
-    fault: Option<AdmissionFaultTestHook>,
+    provision_fault: Option<AdmissionProvisionFault>,
 }
 
 #[cfg(test)]
@@ -233,25 +243,16 @@ type AdmissionTestHook = Arc<dyn Fn(&AdmissionWork, &str) + Send + Sync>;
 type AdmissionLockTestHook = Arc<dyn Fn(&File) + Send + Sync>;
 
 #[cfg(test)]
-type AdmissionCompletionTestHook = Arc<dyn Fn(&SqliteBackend) + Send + Sync>;
+type AdmissionProvisionFault = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 #[cfg(test)]
-type AdmissionFaultTestHook = Arc<dyn Fn(&str) -> Option<RetainedConfigError> + Send + Sync>;
+type AdmissionCompletionTestHook = Arc<dyn Fn(&SqliteBackend) + Send + Sync>;
 
 impl AdmissionWork {
     #[cfg(test)]
     fn stage(&self, name: &str) {
         if let Some(hook) = &self.hook {
             hook(self, name);
-        }
-    }
-
-    /// Inject one named filesystem/I/O failure in tests.
-    #[cfg(test)]
-    fn fault(&self, name: &str) -> Result<(), RetainedConfigError> {
-        match &self.fault {
-            Some(hook) => hook(name).map_or(Ok(()), Err),
-            None => Ok(()),
         }
     }
 
@@ -263,6 +264,7 @@ impl AdmissionWork {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn mutation(&self) -> Result<(), RetainedConfigError> {
         self.check()?;
         self.mutated.store(true, Ordering::Release);
@@ -281,20 +283,24 @@ impl Drop for CancelOnDrop {
 /// Returns only a denial predicate. Presence is never admission authority.
 pub(crate) fn requires_retained_lifecycle(path: &Path) -> bool {
     std::fs::symlink_metadata(lock_path(path)).is_ok()
+        || std::fs::symlink_metadata(completion_path(path)).is_ok()
+        || std::fs::symlink_metadata(obsolete_intent_path(path)).is_ok()
+}
+
+// An earlier-format intent is only a denial signal, never recovery authority.
+fn obsolete_intent_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".opc-retained.intent");
+    PathBuf::from(name)
 }
 
 impl SqliteBackend {
     /// Explicitly provision conclusively new retained configuration storage.
     ///
     /// This is an operator-authorized provisioning operation, never a restart
-    /// fallback. The SDK publishes a durable authenticated intent for this
-    /// request (identity is the authenticated binding digest plus the operation
-    /// class) before the first artifact mutation. Retrying the same request
-    /// after an interruption finishes a committed operation exactly once, or
-    /// removes its authenticated partial prefix under the exclusive lock and
-    /// runs one fresh attempt. Existing established storage, foreign data, a
-    /// different request and an unverifiable partial record are never adopted,
-    /// overwritten or deleted.
+    /// fallback. Existing or interrupted artifacts are preserved and rejected.
+    /// Resume an interrupted request with `begin_resume_config_authority` and
+    /// the same authorization; invoking provision again never overwrites it.
     pub async fn provision_config_authority(
         options: RetainedConfigOptions,
         audit_key: AuditKey,
@@ -308,9 +314,7 @@ impl SqliteBackend {
     /// the authenticated existing quorum. Its persisted repair disposition
     /// forbids local genesis, including after reopening. Loss of the complete
     /// quorum therefore requires a separately approved new authority, never
-    /// repeated member repair. Existing established artifacts are never
-    /// overwritten; an interrupted attempt of this same repair request resumes
-    /// through the same authenticated-intent path as initial provisioning. The
+    /// repeated member repair. Existing artifacts are not overwritten. The
     /// consensus store restores a quorum-authorized snapshot before the empty
     /// replacement can vote or answer replication requests under its node ID.
     pub async fn provision_config_member_repair(
@@ -362,656 +366,53 @@ fn begin_open_authority(
         #[cfg(test)]
         completion_hook: None,
         #[cfg(test)]
-        fault: None,
+        provision_fault: None,
     });
     RetainedConfigOpen::start(options, audit_key, intent, work)
 }
 
-#[cfg(unix)]
-fn provision_intent_path(path: &Path) -> PathBuf {
-    let mut name = lock_path(path).into_os_string();
-    name.push(".intent");
-    PathBuf::from(name)
-}
-
-#[cfg(unix)]
-fn intent_disposition(intent: OpenIntent) -> Result<u8, RetainedConfigError> {
-    match intent {
-        OpenIntent::NewAuthority => Ok(INTENT_NEW_AUTHORITY),
-        OpenIntent::RepairMember => Ok(INTENT_REPAIR_MEMBER),
-        OpenIntent::Reopen => Err(RetainedConfigError::InvalidRequest),
-    }
-}
-
-#[cfg(unix)]
-/// Build one intent publication. `publication_entropy` is fresh entropy per
-/// publication so each intent HMAC is unique; it is not a caller request id and
-/// is not compared for identity (resume identity is binding digest + class).
-fn make_intent(
-    binding: &RetainedConfigBinding,
-    key: &AuditKey,
-    publication_entropy: [u8; 32],
-    disposition: u8,
-) -> Result<[u8; INTENT_BYTES], RetainedConfigError> {
-    let mut intent = [0; INTENT_BYTES];
-    intent[..8].copy_from_slice(INTENT_MAGIC);
-    intent[8..40].copy_from_slice(&binding.digest(key));
-    intent[40..72].copy_from_slice(&publication_entropy);
-    intent[72] = disposition;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
-        .map_err(|_| RetainedConfigError::Rejected)?;
-    mac.update(INTENT_DOMAIN);
-    mac.update(&intent[..INTENT_BYTES - 32]);
-    intent[INTENT_BYTES - 32..].copy_from_slice(&mac.finalize().into_bytes());
-    Ok(intent)
-}
-
-#[cfg(unix)]
-fn intent_is_authentic(intent: &[u8; INTENT_BYTES], key: &AuditKey) -> bool {
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key.as_bytes()) else {
-        return false;
-    };
-    mac.update(INTENT_DOMAIN);
-    mac.update(&intent[..INTENT_BYTES - 32]);
-    mac.verify_slice(&intent[INTENT_BYTES - 32..]).is_ok() && &intent[..8] == INTENT_MAGIC
-}
-
-#[cfg(unix)]
-fn validate_intent(
-    intent: &[u8; INTENT_BYTES],
-    binding: &RetainedConfigBinding,
-    key: &AuditKey,
-) -> Result<(u8, [u8; 32]), RetainedConfigError> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
-        .map_err(|_| RetainedConfigError::Rejected)?;
-    mac.update(INTENT_DOMAIN);
-    mac.update(&intent[..INTENT_BYTES - 32]);
-    mac.verify_slice(&intent[INTENT_BYTES - 32..])
-        .map_err(|_| RetainedConfigError::Rejected)?;
-    if &intent[..8] != INTENT_MAGIC
-        || intent[8..40] != binding.digest(key)
-        || intent[72] > INTENT_REPAIR_MEMBER
-    {
-        return Err(RetainedConfigError::Rejected);
-    }
-    let mut publication_entropy = [0; 32];
-    publication_entropy.copy_from_slice(&intent[40..72]);
-    Ok((intent[72], publication_entropy))
-}
-
-#[cfg(unix)]
-fn read_intent_file(path: &Path) -> Result<Option<[u8; INTENT_BYTES]>, RetainedConfigError> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(RetainedConfigError::Rejected),
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(RetainedConfigError::Rejected);
-            }
-            let file = open_file(path, false, false)?;
-            if file
-                .metadata()
-                .map_err(|_| RetainedConfigError::Unavailable)?
-                .len()
-                != INTENT_BYTES as u64
-            {
-                // A crash while publishing the first intent leaves a torn file
-                // before any artifact mutation; recovery decides from artifacts.
-                return Err(RetainedConfigError::RecoveryRequired);
-            }
-            let mut intent = [0; INTENT_BYTES];
-            (&file)
-                .read_exact(&mut intent)
-                .map_err(|_| RetainedConfigError::RecoveryRequired)?;
-            Ok(Some(intent))
-        }
-    }
-}
-
-#[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), RetainedConfigError> {
-    let parent = path.parent().ok_or(RetainedConfigError::InvalidRequest)?;
-    open_file(parent, false, true)?
-        .sync_all()
-        .map_err(|_| RetainedConfigError::Unavailable)
-}
-
-#[cfg(unix)]
-fn create_intent_file(
-    path: &Path,
-    binding: &RetainedConfigBinding,
-    key: &AuditKey,
-    disposition: u8,
-    work: &Arc<AdmissionWork>,
-) -> Result<(), RetainedConfigError> {
-    #[cfg(test)]
-    work.fault("intent_create")?;
-    // A durable intent is already a possible effect, so a deadline must be
-    // rechecked before publishing it and failures after publication are
-    // classified as indeterminate rather than pre-effect rejections.
-    work.check()?;
-    let mut publication_entropy = [0; 32];
-    SysRng
-        .try_fill_bytes(&mut publication_entropy)
-        .map_err(|_| RetainedConfigError::Unavailable)?;
-    let intent = make_intent(binding, key, publication_entropy, disposition)?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                RetainedConfigError::AlreadyExists
-            } else {
-                RetainedConfigError::Unavailable
-            }
-        })?;
-    work.mutated.store(true, Ordering::Release);
-    file.write_all(&intent)
-        .map_err(|_| RetainedConfigError::Unavailable)?;
-    file.sync_all()
-        .map_err(|_| RetainedConfigError::Unavailable)?;
-    sync_parent(path)?;
-    #[cfg(test)]
-    work.stage("intent_published");
-    Ok(())
-}
-
-#[cfg(unix)]
-fn remove_intent_file(path: &Path, work: &Arc<AdmissionWork>) -> Result<(), RetainedConfigError> {
-    #[cfg(not(test))]
-    let _ = work;
-    #[cfg(test)]
-    work.fault("intent_remove")?;
-    // The intent is SDK-owned, but hold it to the same foreign-type bar as
-    // committed artifacts: never unlink a symlink, non-regular file, hard-link
-    // alias or group/other-writable file at this path.
-    remove_sdk_artifact(path)?;
-    sync_parent(path)?;
-    #[cfg(test)]
-    work.stage("intent_removed");
-    Ok(())
-}
-
-#[cfg(unix)]
-fn provision_artifact_present(path: &Path) -> bool {
-    let mut candidates = vec![path.to_path_buf(), lock_path(path)];
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        candidates.push(PathBuf::from(sidecar));
-    }
-    candidates.iter().any(|candidate| {
-        !matches!(
-            std::fs::symlink_metadata(candidate),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        )
-    })
-}
-
-#[cfg(unix)]
-fn read_lock_record(path: &Path) -> Result<Option<[u8; RECORD_BYTES]>, RetainedConfigError> {
-    let lock = lock_path(path);
-    match std::fs::symlink_metadata(&lock) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(RetainedConfigError::Rejected),
-        Ok(_) => {
-            let file = open_file(&lock, false, false)?;
-            if file
-                .metadata()
-                .map_err(|_| RetainedConfigError::Unavailable)?
-                .len()
-                != RECORD_BYTES as u64
-            {
-                return Ok(None);
-            }
-            let mut record = [0; RECORD_BYTES];
-            (&file)
-                .read_exact(&mut record)
-                .map_err(|_| RetainedConfigError::RecoveryRequired)?;
-            Ok(Some(record))
-        }
-    }
-}
-
-#[cfg(unix)]
-fn remove_sdk_artifact(candidate: &Path) -> Result<(), RetainedConfigError> {
-    match std::fs::symlink_metadata(candidate) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(RetainedConfigError::Unavailable),
-        Ok(metadata) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_file()
-                    || metadata.nlink() != 1
-                    || metadata.mode() & 0o022 != 0
-                {
-                    // Never delete foreign data that cannot be one of this
-                    // operation's regular, single-link, owner-only artifacts.
-                    return Err(RetainedConfigError::Rejected);
-                }
-            }
-            std::fs::remove_file(candidate).map_err(|_| RetainedConfigError::Unavailable)
-        }
-    }
-}
-
-#[cfg(unix)]
-enum LockedRecord {
-    /// Valid authenticated admission for this exact request/disposition.
-    CommittedSame,
-    /// Valid authenticated admission for another request or operation class.
-    CommittedOther,
-    /// Bytes without a valid authenticated admission commit.
-    Uncommitted,
-}
-
-#[cfg(unix)]
-fn classify_lock_record(
-    record: &[u8; RECORD_BYTES],
-    binding: &RetainedConfigBinding,
-    key: &AuditKey,
-    disposition: u8,
-) -> LockedRecord {
-    let mut mac = match Hmac::<Sha256>::new_from_slice(key.as_bytes()) {
-        Ok(mac) => mac,
-        Err(_) => return LockedRecord::Uncommitted,
-    };
-    mac.update(RECORD_DOMAIN);
-    mac.update(&record[..RECORD_BYTES - 32]);
-    if mac.verify_slice(&record[RECORD_BYTES - 32..]).is_err() || &record[..8] != RECORD_MAGIC {
-        return LockedRecord::Uncommitted;
-    }
-    if record[8..40] == binding.digest(key) && record[72] == disposition {
-        LockedRecord::CommittedSame
-    } else {
-        LockedRecord::CommittedOther
-    }
-}
-
-#[cfg(unix)]
-fn abort_partial_provision(
-    options: &RetainedConfigOptions,
-    work: &Arc<AdmissionWork>,
-) -> Result<(), RetainedConfigError> {
-    #[cfg(not(test))]
-    let _ = work;
-    // Hold the exclusive lifetime lock while removing the authenticated partial
-    // prefix. A live owner means another opener is running: never abort under it.
-    // If the lock does not exist yet, claim the slot atomically with create_new
-    // instead of racing a concurrent opener's fresh lock creation.
-    let lock = lock_path(&options.path);
-    let _lock = match open_file(&lock, true, false) {
-        Ok(file) => AdmissionFileLock::acquire(file)?,
-        Err(RetainedConfigError::RecoveryRequired) => {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&lock)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        RetainedConfigError::InUse
-                    } else {
-                        RetainedConfigError::Unavailable
-                    }
-                })?;
-            AdmissionFileLock::acquire(file)?
-        }
-        Err(error) => return Err(error),
-    };
-    remove_sdk_artifact(&options.path)?;
-    remove_sdk_artifact(&lock)?;
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = options.path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        remove_sdk_artifact(&PathBuf::from(sidecar))?;
-    }
-    sync_parent(&options.path)?;
-    #[cfg(test)]
-    work.stage("partial_aborted");
-    Ok(())
-}
-
-#[cfg(unix)]
-enum ProvisionResume {
-    Fresh,
-    Completed(Box<SqliteBackend>),
-}
-
-/// Resume one authenticated provisioning intent, or abort its partial prefix.
-///
-/// The intent exists before the first artifact mutation and binds the exact
-/// topology/backing/key scope plus the provisioning operation class. A valid
-/// complete admission record means this same request committed; a partial
-/// prefix without that record is aborted under the exclusive lock and the same
-/// request retries from clean state. A conflicting or unverifiable intent never
-/// adopts, aborts or overwrites anything.
-#[cfg(unix)]
-fn resume_or_abort_provision(
-    options: &RetainedConfigOptions,
-    key: &AuditKey,
-    intent: OpenIntent,
-    intent_path: &Path,
-    work: &Arc<AdmissionWork>,
-) -> Result<ProvisionResume, RetainedConfigError> {
-    let disposition = intent_disposition(intent)?;
-    #[cfg(test)]
-    work.fault("intent_read")?;
-    match read_intent_file(intent_path) {
-        Ok(None) => {
-            if provision_artifact_present(&options.path) {
-                return Err(RetainedConfigError::AlreadyExists);
-            }
-            create_intent_file(intent_path, &options.binding, key, disposition, work)?;
-            Ok(ProvisionResume::Fresh)
-        }
-        Ok(Some(stored)) => match validate_intent(&stored, &options.binding, key) {
-            Ok((stored_disposition, _publication_entropy)) => {
-                if stored_disposition != disposition {
-                    // A different provisioning operation for the same binding.
-                    // An existing established store or partial prefix is never
-                    // adopted, aborted or overwritten by a conflicting request.
-                    return Err(if provision_artifact_present(&options.path) {
-                        RetainedConfigError::RecoveryRequired
-                    } else {
-                        RetainedConfigError::Rejected
-                    });
-                }
-                if let Some(record) = read_lock_record(&options.path)? {
-                    match classify_lock_record(&record, &options.binding, key, disposition) {
-                        LockedRecord::CommittedSame => {
-                            // This same request committed before its caller
-                            // observed success; reconcile exactly once and
-                            // retire the intent.
-                            let backend = open_authority_sync(
-                                options.clone(),
-                                key.clone(),
-                                OpenIntent::Reopen,
-                                work,
-                            )?;
-                            remove_intent_file(intent_path, work)?;
-                            return Ok(ProvisionResume::Completed(Box::new(backend)));
-                        }
-                        LockedRecord::CommittedOther => {
-                            // A committed authority for another request or
-                            // operation class: never adopt, abort or overwrite.
-                            return Err(RetainedConfigError::RecoveryRequired);
-                        }
-                        LockedRecord::Uncommitted => {}
-                    }
-                }
-                abort_partial_provision(options, work)?;
-                Ok(ProvisionResume::Fresh)
-            }
-            Err(_) => {
-                if intent_is_authentic(&stored, key) {
-                    // Authentic intent for a different exact request: never
-                    // adopt, abort or overwrite another request's state.
-                    return Err(if provision_artifact_present(&options.path) {
-                        RetainedConfigError::RecoveryRequired
-                    } else {
-                        RetainedConfigError::Rejected
-                    });
-                }
-                if provision_artifact_present(&options.path) {
-                    // An unverifiable partial record beside real artifacts is
-                    // never deleted or adopted.
-                    return Err(RetainedConfigError::RecoveryRequired);
-                }
-                // Interrupted first intent publication: no artifact mutation
-                // can have happened yet, so replace this torn SDK-owned intent.
-                remove_intent_file(intent_path, work)?;
-                create_intent_file(intent_path, &options.binding, key, disposition, work)?;
-                Ok(ProvisionResume::Fresh)
-            }
-        },
-        Err(RetainedConfigError::RecoveryRequired) => {
-            if provision_artifact_present(&options.path) {
-                return Err(RetainedConfigError::RecoveryRequired);
-            }
-            remove_intent_file(intent_path, work)?;
-            create_intent_file(intent_path, &options.binding, key, disposition, work)?;
-            Ok(ProvisionResume::Fresh)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(not(unix))]
-fn open_authority_sync(
-    _options: RetainedConfigOptions,
-    _audit_key: AuditKey,
-    _intent: OpenIntent,
-    _work: &Arc<AdmissionWork>,
-) -> Result<SqliteBackend, RetainedConfigError> {
-    Err(RetainedConfigError::Unsupported)
-}
-
-#[cfg(unix)]
 fn open_authority_sync(
     options: RetainedConfigOptions,
     audit_key: AuditKey,
     intent: OpenIntent,
     work: &Arc<AdmissionWork>,
 ) -> Result<SqliteBackend, RetainedConfigError> {
-    let provision = !matches!(intent, OpenIntent::Reopen);
-    work.check()?;
-    reject_symlink_components(&options.path)?;
-    let intent_path = provision_intent_path(&options.path);
-    if provision {
-        match resume_or_abort_provision(&options, &audit_key, intent, &intent_path, work)? {
-            ProvisionResume::Fresh => {}
-            ProvisionResume::Completed(backend) => return Ok(*backend),
-        }
-    }
-    if provision && std::fs::symlink_metadata(&options.path).is_ok() {
-        return Err(RetainedConfigError::AlreadyExists);
-    }
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = options.path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        match std::fs::symlink_metadata(PathBuf::from(&sidecar)) {
-            Ok(_) if provision => return Err(RetainedConfigError::AlreadyExists),
-            Ok(_) => {
-                let _ = open_file(&PathBuf::from(sidecar), false, false)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(RetainedConfigError::Rejected),
-        }
-    }
-    let parent_path = options
-        .path
-        .parent()
-        .ok_or(RetainedConfigError::InvalidRequest)?;
-    let parent = open_file(parent_path, false, true)?;
-    let before_parent = identity_for_path(parent_path, true)?;
-    let lock = if provision {
-        #[cfg(test)]
-        work.fault("lock_create")?;
-        let result = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(lock_path(&options.path));
-        match result {
-            Ok(file) => {
-                work.mutated.store(true, Ordering::Release);
-                #[cfg(test)]
-                work.stage("lock_created");
-                file
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(RetainedConfigError::AlreadyExists);
-            }
-            Err(_) => return Err(RetainedConfigError::Unavailable),
-        }
-    } else {
-        open_file(&lock_path(&options.path), true, false)?
+    use provisioning::OpenMode;
+    let (request, mode) = match intent {
+        OpenIntent::Transaction(request, mode) => (request, mode),
+        OpenIntent::NewAuthority | OpenIntent::ResumeAuthority | OpenIntent::Reopen => (
+            RetainedConfigProvisionRequest::new_authority(options.binding.digest(&audit_key))?,
+            match intent {
+                OpenIntent::NewAuthority => OpenMode::Provision,
+                OpenIntent::ResumeAuthority => OpenMode::Resume,
+                _ => OpenMode::ReopenImplicit,
+            },
+        ),
+        OpenIntent::RepairMember | OpenIntent::ResumeRepair => (
+            RetainedConfigProvisionRequest::member_repair(options.binding.digest(&audit_key))?,
+            if matches!(intent, OpenIntent::RepairMember) {
+                OpenMode::Provision
+            } else {
+                OpenMode::Resume
+            },
+        ),
     };
-    let lock = AdmissionFileLock::acquire(lock)?;
-    #[cfg(test)]
-    if let Some(hook) = &work.lock_hook {
-        hook(&lock);
-    }
-    let mut record = [0u8; RECORD_BYTES];
-    if !provision {
-        if lock
-            .metadata()
-            .map_err(|_| RetainedConfigError::Unavailable)?
-            .len()
-            != RECORD_BYTES as u64
-        {
-            return Err(RetainedConfigError::RecoveryRequired);
-        }
-        (&*lock)
-            .read_exact(&mut record)
-            .map_err(|_| RetainedConfigError::RecoveryRequired)?;
-        validate_record(&record, &options.binding, &audit_key)?;
-    }
-    let database = if provision {
-        work.mutation()?;
-        #[cfg(test)]
-        work.fault("database_create")?;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&options.path)
-            .map_err(|_| RetainedConfigError::AlreadyExists)?
-    } else {
-        open_file(&options.path, false, false)?
-    };
-    #[cfg(test)]
-    if provision {
-        work.stage("database_created");
-    }
-    let identity = file_identity(&parent, &lock, &database)?;
-    if identity[0..2] != before_parent {
-        return Err(RetainedConfigError::Rejected);
-    }
-    if !provision && record_identity(&record)? != identity {
-        return Err(RetainedConfigError::Rejected);
-    }
-    let admission = Arc::new(FileAdmission {
-        path: options.path.clone(),
-        parent,
-        lock,
-        database,
-        identity,
-    });
-    admission.read_back()?;
+    provisioning::open(options, audit_key, request, mode, work)
+}
+
+#[cfg(target_os = "linux")]
+fn finish_open(
+    options: RetainedConfigOptions,
+    audit_key: AuditKey,
+    record: [u8; RECORD_BYTES],
+    admission: Arc<FileAdmission>,
+    work: &Arc<AdmissionWork>,
+    caps: crate::PersistCapabilities,
+) -> Result<SqliteBackend, RetainedConfigError> {
     let (ephemeral, min_free_bytes) = match options.durability {
         RetainedConfigDurability::Durable { min_free_bytes } => (false, min_free_bytes),
         RetainedConfigDurability::Ephemeral => (true, 0),
     };
-    let caps = retained_preflight(&admission, ephemeral, min_free_bytes);
-    if !ephemeral && !caps.is_safe_for_writes() {
-        return Err(RetainedConfigError::Rejected);
-    }
-    if provision {
-        let mut nonce = [0; 32];
-        SysRng
-            .try_fill_bytes(&mut nonce)
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        record = make_record(
-            &options.binding,
-            &audit_key,
-            identity,
-            nonce,
-            matches!(intent, OpenIntent::RepairMember),
-        )?;
-        #[cfg(test)]
-        work.fault("base_schema")?;
-        let conn = open_sqlite(&options.path)?;
-        crate::schema::apply_pragma_profile(&conn).map_err(|_| RetainedConfigError::Rejected)?;
-        crate::schema::initialize_schema(&conn).map_err(|_| RetainedConfigError::Rejected)?;
-        #[cfg(test)]
-        work.stage("base_initialized");
-        let digest = crate::schema::current_schema_digest(&conn)
-            .map_err(|_| RetainedConfigError::Rejected)?;
-        let transaction = conn
-            .unchecked_transaction()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        crate::schema::set_schema_version(&transaction, &digest)
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        transaction
-            .commit()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        #[cfg(test)]
-        work.fault("consensus_schema")?;
-        crate::consensus::provision_retained_schema(
-            &conn,
-            options.binding.topology(),
-            &audit_key,
-            work.deadline,
-        )
-        .map_err(|_| RetainedConfigError::Rejected)?;
-        #[cfg(test)]
-        work.stage("consensus_initialized");
-        #[cfg(test)]
-        work.fault("binding_write")?;
-        conn.execute_batch(BINDING_SCHEMA)
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        conn.execute(
-            "INSERT INTO consensus_retained_binding (singleton, record) VALUES (1, ?1)",
-            [record.as_slice()],
-        )
-        .map_err(|_| RetainedConfigError::Unavailable)?;
-        #[cfg(test)]
-        work.stage("binding_stored");
-        conn.close().map_err(|_| RetainedConfigError::Unavailable)?;
-        #[cfg(test)]
-        work.fault("database_sync")?;
-        admission
-            .database
-            .sync_all()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        #[cfg(test)]
-        work.fault("database_parent_sync")?;
-        admission
-            .parent
-            .sync_all()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        work.check()?;
-        #[cfg(test)]
-        work.stage("database_synced");
-        let mut record_file = &*admission.lock;
-        #[cfg(test)]
-        work.fault("record_write")?;
-        record_file
-            .write_all(&record)
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        #[cfg(test)]
-        work.stage("record_written");
-        #[cfg(test)]
-        work.fault("record_sync")?;
-        record_file
-            .sync_all()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-        #[cfg(test)]
-        work.fault("record_parent_sync")?;
-        admission
-            .parent
-            .sync_all()
-            .map_err(|_| RetainedConfigError::Unavailable)?;
-    }
-    #[cfg(test)]
-    if provision {
-        work.stage("record_synced");
-    }
-    validate_copy(&options, &record, &audit_key, &admission, work)?;
     #[cfg(test)]
     work.stage("before_original_open");
     admission.read_back()?;
@@ -1030,9 +431,6 @@ fn open_authority_sync(
     }))
     .map_err(|_| RetainedConfigError::Unavailable)?;
     work.check()?;
-    if provision {
-        remove_intent_file(&intent_path, work)?;
-    }
     Ok(SqliteBackend::from_retained_connection(
         options.path,
         ephemeral,
@@ -1076,6 +474,7 @@ pub(crate) fn retained_preflight(
     }
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn make_record(
     binding: &RetainedConfigBinding,
     key: &AuditKey,
@@ -1099,6 +498,7 @@ fn make_record(
     Ok(record)
 }
 
+#[cfg(target_os = "linux")]
 fn validate_record(
     record: &[u8; RECORD_BYTES],
     binding: &RetainedConfigBinding,
@@ -1116,6 +516,7 @@ fn validate_record(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn record_identity(record: &[u8; RECORD_BYTES]) -> Result<[u64; 6], RetainedConfigError> {
     let mut identity = [0; 6];
     for (i, value) in identity.iter_mut().enumerate() {
@@ -1128,7 +529,7 @@ fn record_identity(record: &[u8; RECORD_BYTES]) -> Result<[u64; 6], RetainedConf
     Ok(identity)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn validate_copy(
     options: &RetainedConfigOptions,
     record: &[u8; RECORD_BYTES],
@@ -1201,6 +602,7 @@ fn validate_copy(
     admission.read_back()
 }
 
+#[cfg(target_os = "linux")]
 fn validate_connection(
     conn: &Connection,
     options: &RetainedConfigOptions,
@@ -1255,7 +657,12 @@ fn validate_connection(
             |row| row.get(0),
         )
         .map_err(|_| RetainedConfigError::Rejected)?;
-    if stored.as_slice() != record {
+    let stored: &[u8; RECORD_BYTES] = stored
+        .as_slice()
+        .try_into()
+        .map_err(|_| RetainedConfigError::Rejected)?;
+    validate_record(stored, &options.binding, key)?;
+    if record_identity(stored)? != record_identity(record)? || stored != record {
         return Err(RetainedConfigError::Rejected);
     }
     crate::consensus::validate_retained_schema(
@@ -1272,3 +679,6 @@ fn validate_connection(
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod provisioning_tests;
