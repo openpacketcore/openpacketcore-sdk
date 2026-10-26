@@ -393,6 +393,7 @@ admission probe under containment must detect lockdown/redacted key readback
 and return typed unsupported after its own verified cleanup. Admission cannot
 defer that failure to every later undo. Serialize unresolved operations at the
 actual kernel deletion key, not merely at child ID or interface ID.
+Ordinary scoped installs also wait on an overlapping outbound SA selection identity.
 
 This restriction addresses a specific race: Linux's
 [ACQUIRE path](https://github.com/torvalds/linux/blob/v6.12/net/xfrm/xfrm_state.c#L940)

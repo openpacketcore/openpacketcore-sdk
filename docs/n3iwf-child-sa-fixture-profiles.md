@@ -23,7 +23,7 @@ schedules. The original records retain their original scope.
 
 The independent reference is
 `crates/opc-n3iwf-fixtures/oracles/child-sa-profiles.json`, SHA-256
-`76fee6c1a58eb38aa89ff39bf8fd4e0a29f8048e40a294abbef8639e9c9bbd97`.
+`95413a05dba9145e734f9cf3efeb39f9052b0741982ded2b89c06436384ab9b5`.
 It pins the complete relocation model, SHA-256
 `f3d39a95e5fc6f4fb29e25d847d9a3901b6d300cb566ab2efefab4ce7a3994af`,
 and six test sources. A projection identifies its exact source row, name and

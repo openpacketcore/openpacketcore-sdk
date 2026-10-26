@@ -84,7 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared policy only with the final member. Expired groups clean up in either
   order without manual repair. Each new successor requires its own committed
   activation. Rekey-trigger ownership and peer signalling remain consumer
-  policy. Refs #1239.
+  policy. Ordinary scoped installs also wait on an overlapping outbound SA
+  selection identity. Refs #1239.
 
 - `opc-proto-ikev2`: the executable IKE_SA_INIT/IKE_AUTH transform surface now
   covers RFC 3526 MODP groups 15-18 (Transform IDs 15/16/17/18, 3072/4096/6144/
