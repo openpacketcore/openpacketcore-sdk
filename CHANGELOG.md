@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- NRF registration/discovery now use standard JSON and query parameters.
+  `NfProfile` uses generated PLMN/S-NSSAI wrappers and `NfService` objects;
+  `DiscoveryQuery`/`CacheKey` require `requester_nf_type` and discovery results
+  carry `valid_for`. Server freshness caps stale reuse. Generated NRF models
+  omit absent optional fields and preserve digit-prefixed enum wire names.
+  See `opc-sbi/README.md` for migration details. (#1362)
+
 - `opc-sbi` adds `SbiAuthError::InsufficientScope` (403); invalid credentials
   return 401 with Bearer challenges and verifier failures return 503.
   Errors use `application/problem+json`. The client requires negotiated `h2`

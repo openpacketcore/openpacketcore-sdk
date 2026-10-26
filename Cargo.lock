@@ -3642,6 +3642,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "opc-api-nnrf",
  "opc-identity",
  "opc-redaction",
  "opc-runtime",
