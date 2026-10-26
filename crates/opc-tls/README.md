@@ -15,8 +15,11 @@ and instance metadata.
 - `with_policy` installs a `PeerPolicy`.
 - `allow_any_trusted_peer` is required before building with an unconstrained
   default policy.
-- `with_compat_mode(true)` enables TLS 1.2 compatibility; otherwise TLS 1.3 is
-  used.
+- `with_compat_mode(true)` enables TLS 1.2 compatibility with mandatory Extended
+  Master Secret. It adds DHE-RSA/AES-128-GCM over RFC 7919 FFDHE4096 (preferred)
+  and FFDHE2048 to ring's existing suites. TLS 1.3 remains preferred and its
+  groups are unchanged; the default disables TLS 1.2. The FFDHE software
+  implementation is not a validated crypto module.
 - `ReloadingClientCertResolver` and `ReloadingServerCertResolver` serve the
   current SVID certificate/key.
 - `SpiffeServerCertVerifier` and `SpiffeClientCertVerifier` validate peer SVIDs
