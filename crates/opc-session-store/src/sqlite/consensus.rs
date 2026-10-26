@@ -16154,8 +16154,10 @@ fn maintain_due_protected_roster_reclaim_sync(
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })?;
     // V2-only activation also creates the shared V1-format floor/witness
-    // tables. Require V1's certificate when its row namespace contributes,
-    // and independently require V2's certificate whenever V2 is activated.
+    // tables. Check V1's policy when its row namespace contributes and V2's
+    // independently whenever its namespace exists. Cutover clears current
+    // certificates while retaining history, so an inactive profile defers
+    // the whole turn. Still reject any present foreign policy before writes.
     let v1_rows: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM consensus_protected_roster_rows LIMIT 1)",
@@ -16165,29 +16167,54 @@ fn maintain_due_protected_roster_reclaim_sync(
         .map_err(|_| {
             StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
         })?;
-    let activation_matches = (|| -> io::Result<bool> {
-        Ok((!v1_rows
-            || protected_roster_profile_activation_matches_scope_sync(
+    let activation_ready = (|| -> io::Result<bool> {
+        let mut ready = true;
+        if v1_rows {
+            if fenced_transition_receipt_ledger_layout_sync(conn)?
+                != FencedTransitionReceiptLedgerLayout::Activated
+            {
+                return Err(invalid_data(
+                    "protected roster maintenance policy is invalid",
+                ));
+            }
+            if read_fenced_transition_activation_certificate_sync(conn, identity, false)?.is_none()
+            {
+                ready = false;
+            } else if !protected_roster_profile_activation_matches_scope_sync(
                 conn,
                 identity,
                 scope.current_identity,
                 &scope.current_members,
-            )?)
-            && (!v2_present
-                || protected_roster_profile_v2_activation_matches_scope_sync(
-                    conn,
-                    identity,
-                    scope.current_identity,
-                    &scope.current_members,
-                )?))
+            )? {
+                return Err(invalid_data(
+                    "protected roster maintenance policy is invalid",
+                ));
+            }
+        }
+        if v2_present {
+            if read_protected_roster_v2_activation_certificate_in_sync(conn, identity, false)?
+                .is_none()
+            {
+                validate_protected_roster_v2_activation_certificate_in_sync(conn, identity, false)?;
+                ready = false;
+            } else if !protected_roster_profile_v2_activation_matches_scope_sync(
+                conn,
+                identity,
+                scope.current_identity,
+                &scope.current_members,
+            )? {
+                return Err(invalid_data(
+                    "protected roster maintenance policy is invalid",
+                ));
+            }
+        }
+        Ok(ready)
     })()
     .map_err(|_| {
         StoreError::BackendUnavailable("protected roster maintenance unavailable".into())
     })?;
-    if !activation_matches {
-        return Err(StoreError::BackendUnavailable(
-            "protected roster maintenance unavailable".into(),
-        ));
+    if !activation_ready {
+        return Ok(false);
     }
     // Drain an eligible terminal prefix before reclaiming newer rows. The
     // retirement planner returns false when an older retained row blocks it;

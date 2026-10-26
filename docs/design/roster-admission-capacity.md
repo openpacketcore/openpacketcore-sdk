@@ -26,8 +26,11 @@ one retirement command spans admission epochs up to the existing 1,024-row
 bound. Each partition receives one floor/cursor action. Its floor advances only
 when no binding survives through the greatest selected epoch; otherwise both
 floor and cursor remain unchanged. Both engines check the activated policy
-before maintenance writes. Retirement creates no tombstones, so both phases
-progress under continuous arrivals. The leader runs at most two bounded commands
+before maintenance writes. When membership cutover clears a profile's
+certificate while preserving its history, SQLite defers maintenance until
+reactivation and lets unrelated apply proceed. Present incompatible policies
+still fail before maintenance writes. Retirement creates no tombstones, so both
+phases progress under continuous arrivals. The leader runs at most two bounded commands
 per maintenance tick,
 without changing the retention boundary or either phase's batch limit.
 An owned local-leader lane observes the existing ordered reclaim and terminal
