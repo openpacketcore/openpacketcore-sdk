@@ -120,7 +120,8 @@ jobs:
           # A clean automatic merge contains no resolution edits. Its parent
           # additions were already scanned, so do not give them new fingerprints.
           # Walk every merge, including nested merges on side branches.
-          git rev-list --merges $log_opts > "${RUNNER_TEMP}/gitleaks-merges.txt"
+          read -r -a log_args <<< "$log_opts"
+          git rev-list --merges "${log_args[@]}" > "${RUNNER_TEMP}/gitleaks-merges.txt"
           selected_merges=()
           while read -r merge; do
             merge_metadata="$(git show --no-patch --format='%T %P' "$merge")"

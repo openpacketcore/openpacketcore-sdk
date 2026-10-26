@@ -1024,7 +1024,7 @@ fn client_hello_extension(packet: &[u8], extension_type: u16) -> Option<&[u8]> {
         take(input, length)
     }
 
-    // RFC 9147 Sections 4 and 5.2: the first plaintext record must contain
+    // Helper scope (RFC 9147 Section 5.5): the first record must contain only
     // one complete ClientHello. Never borrow bytes from a following record.
     let mut packet = packet;
     let record_header = take(&mut packet, 11)?;
@@ -1062,7 +1062,7 @@ fn client_hello_extension(packet: &[u8], extension_type: u16) -> Option<&[u8]> {
     }
 
     // RFC 8446 Section 4.2: finish walking the extension vector before
-    // accepting a match, so a trailing malformed or duplicate entry fails.
+    // accepting a match; malformed tails or duplicates of the requested type fail.
     let mut found = None;
     while !extensions.is_empty() {
         let current_type = take(&mut extensions, 2)?;
@@ -1316,7 +1316,7 @@ fn dtls13_only_functional_signature_schemes_advertised() {
 fn structural_extension_walk_ignores_random_byte_pairs() {
     let extensions: &[u8] = &[
         // signature_algorithms (0x000D), body length 4.
-        0x00, 0x0d, 0x00, 0x04, // list length 2, one scheme: ECDSA_SECP256R1_SHA256.
+        0x00, 0x0d, 0x00, 0x04, // extension type and body length.
         0x00, 0x02, 0x04, 0x03,
     ];
     let mut body = Vec::new();
