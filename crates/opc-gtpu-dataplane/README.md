@@ -209,6 +209,7 @@ through installation, readback, reconciliation and restart. G-PDU and N3 End
 Marker encoding preserve it on the wire. `Teid` remains strictly nonzero for
 local allocation and receive/map keys. `ReceivedN3UplinkTnl::new` accepts both
 `PeerTeid` and existing nonzero `Teid` arguments.
+Before downgrading to an SDK without zero-peer support, remove zero-peer contexts or perform a fresh installation.
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.

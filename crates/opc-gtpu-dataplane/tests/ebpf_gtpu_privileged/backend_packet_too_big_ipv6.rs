@@ -3,8 +3,8 @@
 //!
 //! The UE-facing link is narrower than the oversized packet, so a
 //! decapsulation would make the host emit its own ICMPv6 Packet Too Big
-//! toward the originator, unencapsulated. The contract is exactly one
-//! well-formed error inside the session's in-tunnel G-PDU and no
+//! toward the originator, unencapsulated. With the opt-in installed, the
+//! contract is exactly one well-formed error inside the session's G-PDU and no
 //! host-generated ICMPv6 anywhere.
 
 use super::*;
@@ -200,6 +200,7 @@ pub(super) async fn qualify() -> Result<(), Box<dyn std::error::Error>> {
     let net = TestNet::provision();
     // The access-side link is narrower than the oversized packet, so a
     // decapsulation would make the host emit its own ICMPv6 PTB.
+    run("ip", &["link", "set", "ue0", "mtu", "1300"]);
     run(
         "ip",
         &["-n", &net.ue_ns, "link", "set", "ue1", "mtu", "1300"],

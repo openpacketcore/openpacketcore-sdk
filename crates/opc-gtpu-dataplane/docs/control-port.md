@@ -1233,11 +1233,13 @@ the consumer sends exactly one in-tunnel RFC 4443 Packet Too Big:
   unencapsulated.
 - **Quote.** As much of the invoking packet as fits in the minimum IPv6 MTU:
   1,232 octets after the outer IPv6 and ICMPv6 headers.
-- **Never answered** (RFC 4443 section 2.4), checked before any rate-limit
+- **Never answered** (RFC 4443 section 2.4(e)), checked before any rate-limit
   token is taken: an unspecified, multicast, loopback or known subnet-router
-  anycast source; a multicast or subnet-router anycast destination; an
-  ICMPv6 error (type below 128) or Redirect (type 137), including behind
-  extension headers. The subnet-router anycast address has a zero interface
+  anycast source; an ICMPv6 error (type below 128) or Redirect (type 137),
+  including behind extension headers. A multicast or subnet-router anycast
+  destination is also refused because this proxy uses it as the error's
+  source, which must be unicast (RFC 4443 section 2.2).
+  The subnet-router anycast address has a zero interface
   identifier (RFC 4291 section 2.6.1). Other informational ICMPv6 messages,
   such as Echo, are answered.
 - **Header validation.** A truncated or inconsistent invoking IPv6 packet is

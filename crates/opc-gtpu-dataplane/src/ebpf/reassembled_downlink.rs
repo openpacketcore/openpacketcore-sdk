@@ -375,9 +375,8 @@ fn default_bearer_uplink(
 
 /// Resolve the default-bearer uplink tunnel of a family-tagged entry.
 ///
-/// An entry that is itself the default bearer uses its own committed tunnel.
-/// A dedicated-bearer entry has its error carried on the same PAA's
-/// default-bearer uplink, exactly as the IPv4 path does, because a dedicated
+/// Both default and dedicated entries independently resolve the same PAA's
+/// authorized default-bearer uplink, exactly as the IPv4 path does. A dedicated
 /// TFT may discard the error. The error can only be injected over an IPv4
 /// S2b-U endpoint here; grouped IPv6 outer endpoints remain unsendable.
 fn family_tagged_default_uplink(
@@ -392,13 +391,6 @@ fn family_tagged_default_uplink(
         || entry.uplink_source_port() != opc_gtpu_ebpf_common::GTPU_UDP_PORT
     {
         return None;
-    }
-    if entry.bearer_mark() == [0; 4] {
-        return ipv4_default_uplink(
-            entry.peer_outer_wire(),
-            entry.local_outer_wire(),
-            entry.peer_teid(),
-        );
     }
     let key = GtpuSessionUplinkKey::new(entry.inner_paa()?, [0; 4]).encode();
     let reference = runtime.session_uplink_get(ifindex, key).ok()??;

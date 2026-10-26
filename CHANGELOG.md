@@ -494,7 +494,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the rebuilt tc datapath and software G-PDU/End Marker encoders transmit
   the peer TEID as zero. Locally allocated/received/map-key TEIDs remain
   strictly nonzero (`Teid::new(0)` still returns `None`), with Debug redaction
-  unchanged. Refs #1346.
+  unchanged. Before downgrading to an SDK without zero-peer support, remove zero-peer contexts or perform a fresh installation. Refs #1346.
 
 - `opc-proto-gtpv2c`: an S2b Update Bearer request or response carrying a
   Protocol Configuration Options (PCO) IE no longer rejects the rest of the
