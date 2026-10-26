@@ -351,14 +351,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested campaign; the accelerator stays inactive when automatic elections
   are disabled and never runs on the leader. Refs #1037.
 
-- `opc-session-store` / `opc-session-testkit`: a survivor restore scan whose
-  caller deadline is consumed by the logical-time fence or the backend scan
-  phase now reports a retryable availability outcome instead of the terminal
-  `RestoreScanWorkBudgetExceeded`, so the bounded qualification recovery
-  episode retries it and accepts the later exact page. No deadline is raised and
-  no restore authority or exactly-once behavior changes; genuine fixed
-  scan-work-budget exhaustion remains terminal and is now recorded as its own
-  closed qualification error class instead of opaque `Other`. Refs #1160.
+- `opc-session-store` / `opc-session-testkit`: consensus restore-scan caller
+  deadlines remain retryable across logical-time fencing, worker and connection
+  admission, and page scanning. Actual scan-work exhaustion and other terminal
+  errors keep their original class even if delivery is late. Standalone SQLite
+  retains its existing deadline contract. Tracing records the exact error
+  variant, phase and elapsed time without error payloads; qualification records
+  work exhaustion as its own terminal class. Server transport deadlines remain
+  retryable. No operation deadline, work limit or authority check changes.
+  Refs #1160.
 
 - `opc-persist`: configuration snapshot build, install and repair deadlines now
   derive from the bytes each stage moves instead of one fixed wall-clock budget
@@ -526,15 +527,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation are unchanged, and Create Bearer behaviour is unchanged.
   Refs #1441.
 
-- `opc-session-store`: a cancelled Dynamic-authority current-snapshot
-  admission no longer releases publication exclusion, its namespace lease or
-  its shutdown evidence while the detached descriptor scan still reads the
-  selected snapshot. Dynamic admission now runs the bounded envelope scan on a
-  blocking worker that retains the serving gate and the admitted
-  snapshot-directory lease (the existing Fixed-admission retention) and
-  additionally takes a shutdown child, so shutdown tracks the detached scan
-  through its last read. Fixed admission, snapshot bytes, admission deadlines
-  and published artifacts are unchanged. Refs #1371.
+- `opc-session-store`: cancelled current-snapshot admission retains publication
+  exclusion, the namespace lease and shutdown ownership through descriptor
+  opening, verification, metadata reads and rewind in both Dynamic and Fixed
+  profiles. Snapshot bytes, integrity checks and operation deadlines are
+  unchanged. Refs #1371.
 
 - `opc-session-net`: prepared protected V2 transition status no longer caches
   a transient local recovery-preflight failure as the handle's final

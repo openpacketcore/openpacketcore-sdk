@@ -368,7 +368,9 @@ async fn native_public_active_cancellation_and_restore_deadline_retire_without_f
         if deadline {
             assert_eq!(
                 task.await.unwrap(),
-                Err(StoreError::RestoreScanWorkBudgetExceeded)
+                Err(StoreError::BackendUnavailable(
+                    "native session state is unavailable".into()
+                ))
             );
         } else {
             task.abort();

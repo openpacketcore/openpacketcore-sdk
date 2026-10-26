@@ -11170,6 +11170,36 @@ impl ConsensusSessionStore {
         Ok(status)
     }
 
+    async fn restore_scan_logical_time_before(
+        &self,
+        required_consumer_scope: Option<SessionConsensusIdentity>,
+        deadline: tokio::time::Instant,
+        started: std::time::Instant,
+    ) -> Result<Timestamp, StoreError> {
+        #[cfg(feature = "test-control")]
+        let delay = self
+            .inner
+            .restore_scan_fence_delay_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let fence = async {
+            #[cfg(feature = "test-control")]
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.logical_read_time_before(required_consumer_scope, deadline)
+                .await
+        };
+        tokio::time::timeout_at(deadline, fence)
+            .await
+            .map_err(|_| restore_scan_availability())
+            .and_then(|result| result)
+            .inspect_err(|error| {
+                crate::restore::record_scan_failure(error, "logical_time_fence", started);
+            })
+    }
+
     async fn consumer_scan_restore_records(
         &self,
         scope: SessionConsumerScope,
@@ -11177,21 +11207,19 @@ impl ConsensusSessionStore {
         deadline: tokio::time::Instant,
     ) -> Result<RestoreScanPage, StoreError> {
         request.validate()?;
-        // Same phase rule as the primary restore scan: a fence-phase timeout is
-        // slow consensus progress (retryable availability), not fixed
-        // work-budget exhaustion.
-        let logical_time = tokio::time::timeout_at(
-            deadline,
-            self.logical_read_time_before(Some(scope.consensus_identity()), deadline),
-        )
-        .await
-        .map_err(|_| restore_scan_availability())??;
+        let started = std::time::Instant::now();
+        let logical_time = self
+            .restore_scan_logical_time_before(Some(scope.consensus_identity()), deadline, started)
+            .await?;
         let _admission = self
             .admit_consumer_scope(scope, deadline)
             .await
             .map_err(|rejection| match rejection {
                 SessionConsumerRejection::ScopeMismatch => StoreError::TopologyAuthorityRevoked,
                 _ => consensus_unavailable(),
+            })
+            .inspect_err(|error| {
+                crate::restore::record_scan_failure(error, "scope_admission", started);
             })?;
         let mut page = self
             .inner
@@ -11205,7 +11233,10 @@ impl ConsensusSessionStore {
         page.excluded_count += before - page.loaded_count;
         // Keep the backend cursor and completion bit even for an empty page.
         self.require_application_traffic_authority_before(deadline)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                crate::restore::record_scan_failure(error, "authority_readback", started);
+            })?;
         Ok(page)
     }
 }
@@ -16815,30 +16846,13 @@ impl SessionBackend for ConsensusSessionStore {
         request: RestoreScanRequest,
     ) -> Result<RestoreScanPage, StoreError> {
         request.validate()?;
+        let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.operation_timeout)
             .ok_or_else(restore_scan_availability)?;
-        // Phase 1 is the logical-time fence: one committed proposal plus local
-        // apply. Slow consensus progress in this phase is a retryable
-        // availability outcome, not evidence that the fixed scan work budget is
-        // exhausted. Callers keep their single absolute operation deadline.
-        #[cfg(feature = "test-control")]
-        let fence_delay = self
-            .inner
-            .restore_scan_fence_delay_for_test
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let fence = async {
-            #[cfg(feature = "test-control")]
-            if let Some(delay) = fence_delay {
-                tokio::time::sleep(delay).await;
-            }
-            self.logical_read_time_before(None, deadline).await
-        };
-        let logical_time = tokio::time::timeout_at(deadline, fence)
-            .await
-            .map_err(|_| restore_scan_availability())??;
+        let logical_time = self
+            .restore_scan_logical_time_before(None, deadline, started)
+            .await?;
         #[cfg(feature = "test-control")]
         if self
             .inner
@@ -16862,7 +16876,10 @@ impl SessionBackend for ConsensusSessionStore {
         page.excluded_count += before - page.loaded_count;
         // Keep the backend cursor and completion bit even for an empty page.
         self.require_application_traffic_authority_before(deadline)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                crate::restore::record_scan_failure(error, "authority_readback", started);
+            })?;
         Ok(page)
     }
 

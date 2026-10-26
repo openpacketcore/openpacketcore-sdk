@@ -557,6 +557,15 @@ impl RestoreScanValidationProfile {
         matches!(self, Self::Standalone)
     }
 
+    fn operation_deadline_error(self) -> StoreError {
+        match self {
+            Self::Standalone => StoreError::RestoreScanWorkBudgetExceeded,
+            Self::Consensus => StoreError::BackendUnavailable(
+                "session restore scan operation deadline exceeded".into(),
+            ),
+        }
+    }
+
     const fn max_payload_bytes(self) -> usize {
         match self {
             Self::Standalone => crate::RESTORE_SCAN_MAX_LOCAL_PAGE_PAYLOAD_BYTES,
@@ -1061,12 +1070,6 @@ fn fixed_quorum_application_traffic_authority_is_exact_sync(
     tx.commit()
         .map_err(|_| StoreError::BackendUnavailable("session store read failed".into()))?;
     Ok(authority_is_exact)
-}
-
-/// Retryable availability outcome for a restore scan that exhausted the
-/// caller's absolute operation deadline. The deadline itself is unchanged.
-pub(crate) fn restore_scan_deadline_unavailable() -> StoreError {
-    StoreError::BackendUnavailable("session restore scan deadline exceeded".into())
 }
 
 impl SqliteSessionBackend {
@@ -3901,6 +3904,7 @@ impl SqliteSessionBackend {
         #[cfg(target_os = "linux")]
         if self.native_enabled() {
             request.validate()?;
+            let started = std::time::Instant::now();
             let result = self
                 .native_read_task_at(
                     deadline,
@@ -3908,11 +3912,17 @@ impl SqliteSessionBackend {
                     move |state, check| state.scan_restore_records(request, logical_time, check),
                 )
                 .await;
-            return if tokio::time::Instant::now() >= deadline {
-                Err(restore_scan_deadline_unavailable())
-            } else {
-                result
-            };
+            // Preserve a concrete work-budget failure even if delivery was
+            // delayed. Only an otherwise successful late page is unavailable.
+            return match result {
+                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                    Err(RestoreScanValidationProfile::Consensus.operation_deadline_error())
+                }
+                result => result,
+            }
+            .inspect_err(|error| {
+                crate::restore::record_scan_failure(error, "native_scan", started);
+            });
         }
         self.run_restore_scan(
             request,
@@ -3930,6 +3940,7 @@ impl SqliteSessionBackend {
         deadline: tokio::time::Instant,
         profile: RestoreScanValidationProfile,
     ) -> Result<RestoreScanPage, StoreError> {
+        let started = std::time::Instant::now();
         let operation_deadline = SqliteWorkDeadline::tokio(deadline);
         let cancellation = Arc::new(AtomicBool::new(false));
         // Admission happens before `spawn_blocking` and the owned permit stays
@@ -3941,14 +3952,20 @@ impl SqliteSessionBackend {
             Arc::clone(&self.restore_scan_workers).acquire_owned(),
         )
         .await
-        .map_err(|_| restore_scan_deadline_unavailable())?
+        .map_err(|_| profile.operation_deadline_error())
+        .inspect_err(|error| {
+            crate::restore::record_scan_failure(error, "worker_admission", started);
+        })?
         .map_err(|_| StoreError::BackendUnavailable("session restore scan unavailable".into()))?;
         // Acquire the async connection guard before entering the blocking
         // pool so a busy connection is part of the same absolute operation
         // deadline and never strands a blocking thread waiting on a mutex.
         let conn = tokio::time::timeout_at(deadline, Arc::clone(&self.conn).lock_owned())
             .await
-            .map_err(|_| restore_scan_deadline_unavailable())?;
+            .map_err(|_| profile.operation_deadline_error())
+            .inspect_err(|error| {
+                crate::restore::record_scan_failure(error, "connection_admission", started);
+            })?;
         let task_cancellation = Arc::clone(&cancellation);
         let queued_job = Arc::new(StdMutex::new(Some((conn, worker_permit, request))));
         let task_job = Arc::clone(&queued_job);
@@ -3961,7 +3978,7 @@ impl SqliteSessionBackend {
                 .take()?;
             let _worker_permit = worker_permit;
             if task_cancellation.load(Ordering::Acquire) {
-                return Some(Err(restore_scan_deadline_unavailable()));
+                return Some(Err(profile.operation_deadline_error()));
             }
             let read = || {
                 let tx = if profile.is_standalone() {
@@ -3989,7 +4006,7 @@ impl SqliteSessionBackend {
                     Err(error) => return Some(Err(error)),
                 };
                 if task_cancellation.load(Ordering::Acquire) {
-                    return Some(Err(restore_scan_deadline_unavailable()));
+                    return Some(Err(profile.operation_deadline_error()));
                 }
                 if tx.commit().is_err() {
                     return Some(Err(StoreError::BackendUnavailable(
@@ -4027,7 +4044,7 @@ impl SqliteSessionBackend {
             armed: true,
         };
         match tokio::time::timeout_at(deadline, task).await {
-            Err(_) => Err(restore_scan_deadline_unavailable()),
+            Err(_) => Err(profile.operation_deadline_error()),
             Ok(Err(_)) => {
                 cancel_on_drop.disarm();
                 Err(StoreError::BackendUnavailable(
@@ -4036,16 +4053,16 @@ impl SqliteSessionBackend {
             }
             Ok(Ok(Some(result))) => {
                 cancel_on_drop.disarm();
-                // `scan_restore_records_sync` owns the deadline/cancellation vs
-                // fixed-work-budget classification with the progress-handler
-                // evidence; do not re-demote a genuine budget error here.
                 result
             }
             Ok(Ok(None)) => {
                 cancel_on_drop.disarm();
-                Err(restore_scan_deadline_unavailable())
+                Err(profile.operation_deadline_error())
             }
         }
+        .inspect_err(|error| {
+            crate::restore::record_scan_failure(error, "sqlite_scan", started);
+        })
     }
 
     /// Read the committed application-journal head after the caller has
@@ -6281,14 +6298,7 @@ mod restore_cancellation_tests {
                 )
                 .await
                 .expect_err("queued scan must stop at its absolute deadline");
-            assert!(
-                matches!(
-                    error,
-                    StoreError::BackendUnavailable(message)
-                        if message == "session restore scan deadline exceeded"
-                ),
-                "a queued worker timeout is retryable availability, not terminal work-budget exhaustion"
-            );
+            assert_eq!(error, StoreError::RestoreScanWorkBudgetExceeded);
         }
         drop(held_permit);
 
@@ -6313,14 +6323,7 @@ mod restore_cancellation_tests {
             )
             .await
             .expect_err("connection admission must stop at the operation deadline");
-        assert!(
-            matches!(
-                error,
-                StoreError::BackendUnavailable(message)
-                    if message == "session restore scan deadline exceeded"
-            ),
-            "a connection-admission timeout is retryable availability"
-        );
+        assert_eq!(error, StoreError::RestoreScanWorkBudgetExceeded);
         assert_eq!(
             backend.restore_scan_workers.available_permits(),
             RESTORE_SCAN_BLOCKING_WORKERS,

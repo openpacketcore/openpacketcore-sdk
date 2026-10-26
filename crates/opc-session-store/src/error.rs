@@ -178,6 +178,8 @@ pub enum StoreError {
     RestoreScanCursorStale,
     /// A backend stopped a restore scan after reaching its fixed work budget.
     /// The request performed no partial externally visible mutation.
+    /// Consensus caller-deadline expiry is instead `BackendUnavailable`;
+    /// contention and a slow logical-time fence do not consume query work.
     #[error("restore scan work budget was exceeded")]
     RestoreScanWorkBudgetExceeded,
     /// A restore-scan response could not fit within the configured response
@@ -271,6 +273,58 @@ pub enum StoreError {
     KeyCapacityExhausted,
 }
 
+impl StoreError {
+    /// The exact closed variant name, without error text or caller values.
+    pub(crate) const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::NotFound => "NotFound",
+            Self::StaleFence => "StaleFence",
+            Self::CasConflict => "CasConflict",
+            Self::CasIdempotencyConflict => "CasIdempotencyConflict",
+            Self::CasIdempotencyOutcomeUnavailable => "CasIdempotencyOutcomeUnavailable",
+            Self::BackendOperationOutcomeUnavailable => "BackendOperationOutcomeUnavailable",
+            Self::TopologyAuthorityRevoked => "TopologyAuthorityRevoked",
+            Self::CapabilityNotSupported(..) => "CapabilityNotSupported",
+            Self::BackendUnavailable(..) => "BackendUnavailable",
+            Self::InvalidKey(..) => "InvalidKey",
+            Self::InvalidReplicationSequence => "InvalidReplicationSequence",
+            Self::InvalidReplicationLogRange => "InvalidReplicationLogRange",
+            Self::ReplicationLogPageTooLarge { .. } => "ReplicationLogPageTooLarge",
+            Self::ReplicationLogCursorCompacted { .. } => "ReplicationLogCursorCompacted",
+            Self::ReplicationWatchCatchUpRequired => "ReplicationWatchCatchUpRequired",
+            Self::ReplicationOperationLimitExceeded => "ReplicationOperationLimitExceeded",
+            Self::InvalidSessionTtl => "InvalidSessionTtl",
+            Self::InvalidRecordExpiry => "InvalidRecordExpiry",
+            Self::RecordExpiryPreflightLimitExceeded => "RecordExpiryPreflightLimitExceeded",
+            Self::LeaseHeld => "LeaseHeld",
+            Self::LeaseExpired => "LeaseExpired",
+            Self::Crypto(..) => "Crypto",
+            Self::Serialization(..) => "Serialization",
+            Self::PayloadTooLarge { .. } => "PayloadTooLarge",
+            Self::InvalidRestoreScanRequest(..) => "InvalidRestoreScanRequest",
+            Self::InvalidRestoreScanResponse(..) => "InvalidRestoreScanResponse",
+            Self::RestoreScanPageTooLarge { .. } => "RestoreScanPageTooLarge",
+            Self::RestoreScanCursorStale => "RestoreScanCursorStale",
+            Self::RestoreScanWorkBudgetExceeded => "RestoreScanWorkBudgetExceeded",
+            Self::RestoreScanResponseTooLarge { .. } => "RestoreScanResponseTooLarge",
+            Self::FencedTransitionRequestConflict => "FencedTransitionRequestConflict",
+            Self::FencedTransitionOutcomeUnknown => "FencedTransitionOutcomeUnknown",
+            Self::FencedTransitionRequestExpired => "FencedTransitionRequestExpired",
+            Self::FencedTransitionHistoryFull => "FencedTransitionHistoryFull",
+            Self::FencedTransitionRetentionExhausted => "FencedTransitionRetentionExhausted",
+            Self::FencedTransitionStorageExhausted => "FencedTransitionStorageExhausted",
+            Self::FencedTransitionHistoryEpochRetired => "FencedTransitionHistoryEpochRetired",
+            Self::FencedTransitionHistoryEpochNotActive => "FencedTransitionHistoryEpochNotActive",
+            Self::SessionRecordReserved => "SessionRecordReserved",
+            Self::FencedTransitionVoided => "FencedTransitionVoided",
+            Self::FencedTransitionLeaseDeferred => "FencedTransitionLeaseDeferred",
+            Self::FencedTransitionRecoveryJournalUnavailable => {
+                "FencedTransitionRecoveryJournalUnavailable"
+            }
+        }
+    }
+}
+
 /// Error type for lease operations.
 #[derive(Debug, Clone, PartialEq, Eq, Error, serde::Serialize, serde::Deserialize)]
 pub enum LeaseError {
@@ -351,6 +405,32 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+
+    #[test]
+    fn restore_scan_diagnostic_variants_exclude_error_payloads() {
+        for (error, expected) in [
+            (StoreError::Crypto("private-sentinel".into()), "Crypto"),
+            (
+                StoreError::Serialization("private-sentinel".into()),
+                "Serialization",
+            ),
+            (
+                StoreError::BackendUnavailable("private-sentinel".into()),
+                "BackendUnavailable",
+            ),
+            (
+                StoreError::InvalidRestoreScanResponse("private-sentinel".into()),
+                "InvalidRestoreScanResponse",
+            ),
+            (
+                StoreError::RestoreScanWorkBudgetExceeded,
+                "RestoreScanWorkBudgetExceeded",
+            ),
+        ] {
+            assert_eq!(error.variant_name(), expected);
+            assert!(!error.variant_name().contains("private-sentinel"));
+        }
+    }
 
     #[derive(Clone, Serialize, Deserialize)]
     enum LegacyStoreError684 {

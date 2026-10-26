@@ -1675,8 +1675,11 @@ captured and verified offline. It excludes publication and predecessor
 retirement until descriptor admission finishes, so Openraft's shared
 snapshot-retrieval/application worker does not wait for the entire build.
 Builds, installation and recovery still retain one exclusive mutation owner;
-cancelled admission workers retain publication exclusion through their last
-read. Snapshot integrity checks and operation deadlines are unchanged.
+cancelled Dynamic and Fixed admission workers retain publication exclusion,
+the namespace lease and shutdown ownership through descriptor open,
+verification, rewind and transfer-handle construction. Shutdown waits for this
+work to retire even when its caller is cancelled. Snapshot integrity checks
+and operation deadlines are unchanged.
 
 The pinned Openraft implementation also retains the donor's required log
 suffix while a snapshot transfer owns it. Successful snapshot or log
@@ -1880,6 +1883,23 @@ receives the exact validated envelope key ID, while one current provider
 configuration atomically selects the active key only for future seals. The
 KMS/HKMS remains authoritative for historical retention/revocation; the SDK has
 no local history cache, retirement API, or enforcement gate.
+
+### Restore scan deadlines
+
+Consensus restore scans share one absolute caller deadline across the
+logical-time fence, worker and connection admission, page scan, and final
+authority check. Expiry of that deadline returns retryable
+`StoreError::BackendUnavailable`, including an empty page completed too late.
+It does not grant a new budget to a later phase. The same rule applies to
+consumer-scoped scans.
+
+The independent SQLite query limits (1,000 ms and 2,000,000 VM instructions)
+and native scan work bounds still return terminal
+`StoreError::RestoreScanWorkBudgetExceeded`. A delayed result retains the
+work-exhaustion classification observed by the query. Standalone SQLite keeps
+its existing work-budget deadline contract. Failure tracing reports the exact
+error variant, phase, and elapsed milliseconds without error text, record keys,
+or payloads.
 
 ### Replication-log range cursor contract
 

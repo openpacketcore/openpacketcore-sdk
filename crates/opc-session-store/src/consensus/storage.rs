@@ -2690,26 +2690,37 @@ async fn verify_admitted_snapshot(
 ) -> io::Result<PinnedSqliteFile> {
     tokio::task::spawn_blocking(move || {
         let _retention = retention;
-        let path = lease.namespace.sqlite_child_path(&name)?;
-        let mut pinned = PinnedSqliteFile::from_file_and_verify_in_namespace(
-            file,
-            Arc::clone(&lease.namespace),
-            &name,
-            policy,
-        )?;
-        let verified = pinned.verify_snapshot_envelope_and_bind_immutable_generation(
-            &path,
-            SNAPSHOT_FOOTER_MAGIC,
-            SNAPSHOT_FOOTER_BYTES,
-            SNAPSHOT_MAX_BYTES,
-            checksum,
-            length,
-        )?;
-        pinned.verify_bound_immutable_snapshot_envelope(&path, verified.total_length)?;
-        Ok(pinned)
+        verify_admitted_snapshot_sync(file, &lease, &name, policy, checksum, length)
     })
     .await
     .map_err(|_| io::Error::other("snapshot integrity worker unavailable"))?
+}
+
+fn verify_admitted_snapshot_sync(
+    file: std::fs::File,
+    lease: &SnapshotDirectoryLease,
+    name: &std::ffi::OsStr,
+    policy: SnapshotIntegrityPolicy,
+    checksum: [u8; 32],
+    length: u64,
+) -> io::Result<PinnedSqliteFile> {
+    let path = lease.namespace.sqlite_child_path(name)?;
+    let mut pinned = PinnedSqliteFile::from_file_and_verify_in_namespace(
+        file,
+        Arc::clone(&lease.namespace),
+        name,
+        policy,
+    )?;
+    let verified = pinned.verify_snapshot_envelope_and_bind_immutable_generation(
+        &path,
+        SNAPSHOT_FOOTER_MAGIC,
+        SNAPSHOT_FOOTER_BYTES,
+        SNAPSHOT_MAX_BYTES,
+        checksum,
+        length,
+    )?;
+    pinned.verify_bound_immutable_snapshot_envelope(&path, verified.total_length)?;
+    Ok(pinned)
 }
 
 #[cfg(target_os = "linux")]
@@ -5792,113 +5803,68 @@ impl RaftStateMachine<SessionRaftTypeConfig> for SqliteConsensusStateMachine {
                     error,
                 )
             })?;
-        let (mut snapshot, checksum, length) =
-            if self.core.authority_profile == ConsensusAuthorityProfile::FixedImmutable {
-                // Validate and return the measured descriptor itself. A pathname
-                // reopen after measurement could substitute an unsealed inode.
-                let file = open_snapshot_child_in_namespace(
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    std::ffi::OsString::from(&file_name),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
+        let lease = Arc::clone(&self._snapshot_directory_lease);
+        let integrity_work = SnapshotIntegrityWork {
+            _gate: SnapshotIntegrityGate::Serving {
+                _guard: Arc::clone(&serving_guard),
+            },
+            _lease: Arc::clone(&lease),
+        };
+        let shutdown = self.shutdown_guard.child();
+        let name = std::ffi::OsString::from(file_name);
+        // Opening can outlive its caller too. Hand the ownership through the
+        // open worker's result so every queued or active descriptor operation
+        // remains covered, including cancellation between the two workers.
+        let (file, lease, name, integrity_work, shutdown) =
+            tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
-                wait_before_current_snapshot_admission(&path).await;
-                let pinned = verify_admitted_snapshot(
+                block_current_snapshot_open(&lease.namespace.sqlite_child_path(&name)?);
+                let file = lease.namespace.open_read(&name)?;
+                Ok::<_, io::Error>((file, lease, name, integrity_work, shutdown))
+            })
+            .await
+            .map_err(|_| io::Error::other("snapshot namespace open worker failed"))
+            .and_then(|result| result)
+            .map_err(|error| {
+                storage_error(
+                    ErrorSubject::Snapshot(Some(meta.signature())),
+                    ErrorVerb::Read,
+                    error,
+                )
+            })?;
+        #[cfg(test)]
+        wait_before_current_snapshot_admission(&path).await;
+        let profile = self.core.authority_profile;
+        let policy = self.core.snapshot_integrity;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            let _retention = (integrity_work, shutdown);
+            if profile == ConsensusAuthorityProfile::FixedImmutable {
+                // Validate and return the measured descriptor itself. A
+                // pathname reopen could substitute an unsealed inode.
+                let pinned = verify_admitted_snapshot_sync(
                     file,
-                    Arc::clone(&self._snapshot_directory_lease),
-                    std::ffi::OsString::from(&file_name),
-                    self.core.snapshot_integrity,
+                    &lease,
+                    &name,
+                    policy,
                     expected_checksum,
                     expected_length,
-                    Some(SnapshotIntegrityWork {
-                        _gate: SnapshotIntegrityGate::Serving {
-                            _guard: Arc::clone(&serving_guard),
-                        },
-                        _lease: Arc::clone(&self._snapshot_directory_lease),
-                    }),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                let snapshot = SessionSnapshotFile::from_pinned(pinned, path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                (snapshot, expected_checksum, expected_length)
+                )?;
+                SessionSnapshotFile::from_pinned_rewound(pinned, path)
             } else {
-                let file = open_snapshot_child_in_namespace(
-                    Arc::clone(&self._snapshot_directory_lease.namespace),
-                    std::ffi::OsString::from(&file_name),
-                )
-                .await
-                .map_err(|error| {
-                    storage_error(
-                        ErrorSubject::Snapshot(Some(meta.signature())),
-                        ErrorVerb::Read,
-                        error,
-                    )
-                })?;
-                #[cfg(test)]
-                wait_before_current_snapshot_admission(&path).await;
-                // Dynamic authority streams the portable envelope, so its
-                // admission scan runs on a blocking worker that owns the
-                // serving/shutdown evidence itself. A dropped admission caller
-                // can then no longer release publication exclusion, the
-                // namespace lease or the shutdown barrier while the detached
-                // scan still reads the selected inode.
-                let work = DynamicSnapshotAdmissionWork {
-                    _gate: SnapshotIntegrityGate::Serving {
-                        _guard: Arc::clone(&serving_guard),
-                    },
-                    _lease: Arc::clone(&self._snapshot_directory_lease),
-                    _shutdown: self.shutdown_guard.child(),
-                };
-                let (file, checksum, length) =
-                    verify_dynamic_admitted_snapshot(file, path.clone(), work)
-                        .await
-                        .map_err(|error| {
-                            storage_error(
-                                ErrorSubject::Snapshot(Some(meta.signature())),
-                                ErrorVerb::Read,
-                                error,
-                            )
-                        })?;
-                let snapshot = SessionSnapshotFile::from_std(file, path.clone())
-                    .await
-                    .map_err(|error| {
-                        storage_error(
-                            ErrorSubject::Snapshot(Some(meta.signature())),
-                            ErrorVerb::Read,
-                            error,
-                        )
-                    })?;
-                (snapshot, checksum, length)
-            };
-        if checksum != expected_checksum || length != expected_length {
-            return Err(storage_error(
-                ErrorSubject::Snapshot(Some(meta.signature())),
-                ErrorVerb::Read,
-                consensus::invalid_data("session consensus snapshot metadata is inconsistent"),
-            ));
-        }
-        snapshot.rewind().await.map_err(|error| {
+                let mut file = file;
+                let (_, checksum, length) = verify_snapshot_envelope_sync(&mut file, &path)?;
+                if checksum != expected_checksum || length != expected_length {
+                    return Err(consensus::invalid_data(
+                        "session consensus snapshot metadata is inconsistent",
+                    ));
+                }
+                SessionSnapshotFile::from_std_rewound(file, path)
+            }
+        })
+        .await
+        .map_err(|_| io::Error::other("snapshot admission worker unavailable"))
+        .and_then(|result| result)
+        .map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Read,
@@ -8351,54 +8317,12 @@ pub(crate) async fn inspect_voter_snapshot(
     }
 }
 
-/// Retention ownership for one Dynamic-authority current-snapshot admission.
-///
-/// Fixed authority pins the selected descriptor and moves its
-/// [`SnapshotIntegrityWork`] bundle into the blocking verifier. Dynamic
-/// authority serves the portable envelope as a streaming file, so its bounded
-/// admission scan runs on a blocking worker that owns the same evidence:
-/// publication exclusion (the serving gate), the admitted namespace lease and
-/// a shutdown child. A cancelled admission caller therefore cannot release any
-/// of them while the detached scan still reads the selected inode.
-struct DynamicSnapshotAdmissionWork {
-    _gate: SnapshotIntegrityGate,
-    _lease: Arc<SnapshotDirectoryLease>,
-    _shutdown: ConsensusStorageShutdownGuard,
-}
-
-/// Run the Dynamic current-snapshot admission scan on a blocking worker while
-/// that worker owns `work`, then hand the rewound descriptor back for
-/// streaming. Server-side caller cancellation drops only the join handle; the
-/// worker and its retention bundle survive through the last read.
-async fn verify_dynamic_admitted_snapshot(
-    file: std::fs::File,
-    path: PathBuf,
-    work: DynamicSnapshotAdmissionWork,
-) -> io::Result<(std::fs::File, [u8; 32], u64)> {
-    tokio::task::spawn_blocking(move || {
-        let _work = work;
-        let mut file = file;
-        let (checksum, length) = scan_dynamic_snapshot_envelope(&mut file, &path)?;
-        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
-        Ok((file, checksum, length))
-    })
-    .await
-    .map_err(|_| io::Error::other("snapshot integrity worker unavailable"))?
-}
-
-/// Bounded synchronous counterpart of [`verify_snapshot_envelope_reader`] for
-/// Dynamic current-snapshot admission.
-///
-/// The scan must not be driven by cancellable Tokio file reads: owning the
-/// whole read inside one blocking closure is what lets the caller release its
-/// future without releasing the worker's retention evidence.
-// The path is only read by test-only admission-scan hooks; production builds
-// use the descriptor alone.
-#[cfg_attr(not(test), allow(unused_variables))]
-fn scan_dynamic_snapshot_envelope(
+// All seeks and reads stay on the admission worker. Per-operation Tokio file
+// jobs would otherwise outlive a cancelled future without its ownership.
+fn verify_snapshot_envelope_sync(
     file: &mut std::fs::File,
-    path: &Path,
-) -> io::Result<([u8; 32], u64)> {
+    _path: &Path,
+) -> io::Result<(u64, [u8; 32], u64)> {
     use std::io::{Read as _, Seek as _};
 
     let total_length = file.seek(io::SeekFrom::End(0))?;
@@ -8434,8 +8358,8 @@ fn scan_dynamic_snapshot_envelope(
     }
     file.seek(io::SeekFrom::Start(0))?;
     #[cfg(test)]
-    super::snapshot::block_fixed_prepublication_scan(path);
-    let mut limited = file.by_ref().take(payload_length);
+    super::snapshot::block_fixed_prepublication_scan(_path);
+    let mut limited = file.take(payload_length);
     let mut hasher = Sha256::new();
     let mut observed = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -8453,13 +8377,13 @@ fn scan_dynamic_snapshot_envelope(
     }
     let actual_checksum: [u8; 32] = hasher.finalize().into();
     #[cfg(test)]
-    super::snapshot::record_fixed_prepublication_scan(path, observed);
+    super::snapshot::record_fixed_prepublication_scan(_path, observed);
     if observed != payload_length || actual_checksum != expected_checksum {
         return Err(consensus::invalid_data(
             "session consensus snapshot checksum mismatch",
         ));
     }
-    Ok((actual_checksum, total_length))
+    Ok((payload_length, actual_checksum, total_length))
 }
 
 pub(crate) async fn verify_snapshot_envelope_reader(

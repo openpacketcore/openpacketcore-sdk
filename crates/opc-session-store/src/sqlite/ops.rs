@@ -61,26 +61,22 @@ const RESTORE_SCAN_PAYLOAD_SQL: &str = r#"
 
 struct RestoreScanProgressGuard<'a> {
     connection: &'a Connection,
-    hard_budget: Arc<AtomicBool>,
-    cancellation: Arc<AtomicBool>,
-    operation_deadline: SqliteWorkDeadline,
+    operation_interrupted: Arc<AtomicBool>,
 }
 
 impl RestoreScanProgressGuard<'_> {
     fn classify_result<T>(
         &self,
         result: Result<T, StoreError>,
-        _profile: RestoreScanValidationProfile,
+        profile: RestoreScanValidationProfile,
     ) -> Result<T, StoreError> {
         match result {
             Err(StoreError::RestoreScanWorkBudgetExceeded)
-                if !self.hard_budget.load(Ordering::Acquire)
-                    && (self.operation_deadline.is_elapsed()
-                        || self.cancellation.load(Ordering::Acquire)) =>
+                if self.operation_interrupted.load(Ordering::Acquire) =>
             {
-                Err(super::restore_scan_deadline_unavailable())
+                Err(profile.operation_deadline_error())
             }
-            other => other,
+            result => result,
         }
     }
 }
@@ -115,15 +111,10 @@ fn install_restore_scan_progress_budget(
     cancellation: Arc<AtomicBool>,
     operation_deadline: SqliteWorkDeadline,
 ) -> RestoreScanProgressGuard<'_> {
-    let guard_cancellation = Arc::clone(&cancellation);
-    let guard_deadline = operation_deadline.clone();
     let callbacks = Arc::new(AtomicUsize::new(0));
     let callback_count = Arc::clone(&callbacks);
-    // Set only for the fixed VM-work callback limit or the independent SQLite
-    // wall-clock cap. A set flag means a genuine fixed work-budget exhaustion
-    // even if the caller deadline or cancellation happened to elapse too.
-    let hard_budget = Arc::new(AtomicBool::new(false));
-    let hard_budget_progress = Arc::clone(&hard_budget);
+    let operation_interrupted = Arc::new(AtomicBool::new(false));
+    let callback_interrupted = Arc::clone(&operation_interrupted);
     let started = std::time::Instant::now();
     // The configured interval is a small positive compile-time constant.
     let progress_interval = RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL as usize;
@@ -135,21 +126,17 @@ fn install_restore_scan_progress_budget(
     conn.progress_handler(
         RESTORE_SCAN_SQLITE_PROGRESS_INTERVAL,
         Some(move || {
-            if cancellation.load(Ordering::Acquire) {
-                return true;
-            }
+            // Keep the reason observed by SQLite. A caller deadline expiring
+            // later must never relabel exhausted query work as retryable.
             if restore_scan_callback_limit_reached(
                 callback_count.fetch_add(1, Ordering::Relaxed),
                 max_callbacks,
-            ) {
-                hard_budget_progress.store(true, Ordering::Release);
+            ) || sqlite_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
                 return true;
             }
-            if operation_deadline.is_elapsed() {
-                return true;
-            }
-            if sqlite_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                hard_budget_progress.store(true, Ordering::Release);
+            if cancellation.load(Ordering::Acquire) || operation_deadline.is_elapsed() {
+                callback_interrupted.store(true, Ordering::Release);
                 return true;
             }
             false
@@ -158,9 +145,7 @@ fn install_restore_scan_progress_budget(
     .expect("restore scan owns its SQLite connection");
     RestoreScanProgressGuard {
         connection: conn,
-        hard_budget,
-        cancellation: guard_cancellation,
-        operation_deadline: guard_deadline,
+        operation_interrupted,
     }
 }
 
@@ -1236,18 +1221,18 @@ pub(crate) fn scan_restore_records_sync(
         Arc::clone(&cancellation),
         operation_deadline.clone(),
     );
-    let result = scan_restore_records_sync_body(
+    let result = scan_restore_records_with_progress_sync(
         conn,
         request,
         now,
-        Arc::clone(&cancellation),
-        operation_deadline.clone(),
+        cancellation,
+        operation_deadline,
         profile,
     );
     progress_guard.classify_result(result, profile)
 }
 
-fn scan_restore_records_sync_body(
+fn scan_restore_records_with_progress_sync(
     conn: &Connection,
     request: RestoreScanRequest,
     now: Timestamp,
@@ -1255,8 +1240,8 @@ fn scan_restore_records_sync_body(
     operation_deadline: SqliteWorkDeadline,
     profile: RestoreScanValidationProfile,
 ) -> Result<RestoreScanPage, StoreError> {
-    if cancellation.load(Ordering::Acquire) {
-        return Err(super::restore_scan_deadline_unavailable());
+    if cancellation.load(Ordering::Acquire) || operation_deadline.is_elapsed() {
+        return Err(profile.operation_deadline_error());
     }
     if profile.is_standalone() {
         prune_sync(conn, now)?;
@@ -1301,15 +1286,15 @@ fn scan_restore_records_sync_body(
     let mut records = Vec::with_capacity(selection.candidates.len());
     for candidate in std::mem::take(&mut selection.candidates) {
         if cancellation.load(Ordering::Acquire) || operation_deadline.is_elapsed() {
-            return Err(super::restore_scan_deadline_unavailable());
+            return Err(profile.operation_deadline_error());
         }
         let record = candidate.load_record(conn)?;
         profile.validate_record(&record)?;
         records.push(record);
     }
 
-    if cancellation.load(Ordering::Acquire) {
-        return Err(super::restore_scan_deadline_unavailable());
+    if cancellation.load(Ordering::Acquire) || operation_deadline.is_elapsed() {
+        return Err(profile.operation_deadline_error());
     }
 
     selection.finish(
