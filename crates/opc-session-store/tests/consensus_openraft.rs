@@ -4932,9 +4932,6 @@ async fn fenced_transition_expired_lease_is_rejected_at_committed_admission() {
             release: tokio::sync::Notify::new(),
         });
         cluster.paths[&(source, leader)].install(admission.clone());
-        // Admission checks lease time only when the command applies. Select the
-        // exact expired boundary without spending the operation's protocol budget.
-        clock.set(created.lease().expires_at());
         assert!(
             clock.now_utc() < created.lease().expires_at(),
             "the renewal starts while its lease is still live"
@@ -4960,6 +4957,9 @@ async fn fenced_transition_expired_lease_is_rejected_at_committed_admission() {
             "the forwarded renewal is live before leader admission"
         );
         std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+        // The actual renewal arrived while live. Cross the exact expiry
+        // boundary before leader admission, without spending protocol time.
+        clock.set(created.lease().expires_at());
         admission.release.notify_one();
         let result = renewal.await;
         assert!(
