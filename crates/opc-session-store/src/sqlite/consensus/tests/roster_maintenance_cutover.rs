@@ -12,6 +12,15 @@ fn command(
     now: Timestamp,
     intent: SessionMutationIntent,
 ) -> Entry<SessionRaftTypeConfig> {
+    let intent = match intent {
+        SessionMutationIntent::MarkTopologyLearnersReady { .. }
+        | SessionMutationIntent::FinalizeTopologyTransition { .. } => intent,
+        mutation => SessionMutationIntent::Authorized {
+            origin: node_id(),
+            authority_identity: authority,
+            mutation: Box::new(mutation),
+        },
+    };
     Entry {
         log_id: log_id(index),
         payload: EntryPayload::Normal(SessionConsensusCommand {
@@ -21,11 +30,7 @@ fn command(
                 (0xD000_u128 + u128::from(index)).to_be_bytes(),
             ),
             logical_time: now,
-            intent: SessionMutationIntent::Authorized {
-                origin: node_id(),
-                authority_identity: authority,
-                mutation: Box::new(intent),
-            },
+            intent,
         }),
     }
 }
@@ -124,7 +129,7 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
     let successor_identity = SessionConsensusIdentity::new(
         storage.cluster_id(),
         SessionConsensusConfigurationId::from_bytes([0xD7; 32]),
-        SessionConsensusConfigurationEpoch::new(2).unwrap(),
+        SessionConsensusConfigurationEpoch::new(storage.configuration_epoch().get() + 1).unwrap(),
     );
     let now = v2_persistence_logical_time();
     let due = now.add_seconds(24 * 60 * 60 + 1).unwrap();
