@@ -86,17 +86,33 @@ the ECDHE subset is not complete 3GPP profile support.
 
 The cited `src/apps/rfc7683.rs` and `src/routing.rs` do not exist in
 `opc-proto-diameter`. The SWm typed messages already parse and preserve DOIC,
-DRMP, and redirect AVPs. Queue admission, traffic abatement, realm routing,
-and redirect-cache ownership are separate runtime responsibilities. The
-[codec conformance scope](../crates/opc-proto-diameter/CONFORMANCE.md) and the
-transport adapters do not claim a complete Diameter routing agent.
+DRMP, and redirect AVPs. The actual
+[peer runtime](../crates/opc-diameter-transport/src/runtime.rs) handles bounded
+transport queues, correlated requests, watchdogs and disconnects. It does not
+generate DOIC offers or implement realm routing, a DRMP scheduler or a redirect
+cache. Those are documented application responsibilities, rather than a
+reported routing table whose expiry is broken. The
+[codec conformance scope](../crates/opc-proto-diameter/CONFORMANCE.md) and
+[transport boundary](../crates/opc-diameter-transport/README.md) do not claim a
+complete Diameter routing agent.
 
 RFC 8583 defines Diameter load information; the DRMP specification is
 [RFC 7944](https://www.rfc-editor.org/rfc/rfc7944.html). A runtime implementation
 must separately apply [RFC 7683](https://www.rfc-editor.org/rfc/rfc7683.html)
 overload reports and [RFC 6733 §6.1.7](https://www.rfc-editor.org/rfc/rfc6733.html#section-6.1.7)
-redirect usage/cache scope. Typed AVP tests do not establish that these runtime
-features exist. These runtime gaps remain open.
+redirect usage/cache scope. The documentation now explicitly requires an
+application to supply abatement before advertising DOIC; the optional codec
+fields do not assert a runtime capability. The SDK does not silently apply
+new route selection or queue priorities to caller-owned traffic.
+
+The existing [overload tests](../crates/opc-proto-diameter/tests/swm_diameter_eap_overload.rs)
+verify request-conditioned negotiation and effective report bounds. The
+[redirect tests](../crates/opc-proto-diameter/tests/swm_diameter_eap_routing.rs)
+verify request/connection correlation, absent/DONT_CACHE semantics, and
+required cache-time metadata. Together with agent-error and lifecycle cases,
+**85 tests pass**. Both #1358 findings are scope dispositions backed by those
+existing behaviors, pending review. No overload engine, priority scheduler,
+redirect-cache implementation or full routing-agent qualification is claimed.
 
 ## PFCP/GTPv2-C work list #1359
 
