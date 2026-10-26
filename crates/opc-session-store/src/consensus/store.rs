@@ -23030,10 +23030,102 @@ mod membership_tests {
         seed_roster_retained_with_saturation(store, start, None).await;
     }
 
+    pub(super) async fn hold_roster_policy_quotas_for_test(
+        stores: &[ConsensusSessionStore],
+        hold_resident: bool,
+    ) -> (
+        Vec<ScopeWorkPermit>,
+        Vec<crate::scope_scheduler::ScopeWorkReservation>,
+    ) {
+        // Hold both the ordinary quotas and the finite protected pools. A
+        // class change into another finite pool would not meet the contract.
+        let mut running = Vec::new();
+        let mut resident = Vec::new();
+        let budgets = crate::scope_scheduler::ScopeSchedulerBudgets::default();
+        for blocked in stores {
+            for pool in [
+                &blocked.inner.proposal_admission,
+                &blocked.inner.forward_admission,
+            ] {
+                for class in [
+                    ScopeWorkClass::Normal,
+                    ScopeWorkClass::Emergency,
+                    ScopeWorkClass::SafetyControl,
+                ] {
+                    let budget = budgets.class(class);
+                    if hold_resident {
+                        for _ in 0..budget.queued {
+                            resident.push(
+                                pool.reserve_for(ScopeSchedulerKey::INTERNAL, class)
+                                    .await
+                                    .unwrap(),
+                            );
+                        }
+                    } else {
+                        for _ in 0..budget.running {
+                            running.push(
+                                pool.acquire_for(ScopeSchedulerKey::INTERNAL, class)
+                                    .await
+                                    .unwrap(),
+                            );
+                        }
+                    }
+                }
+            }
+            let ordinary = ForwardMutationRequest {
+                request_id: SessionConsensusRequestId::new(),
+                intent: SessionMutationIntent::AdvanceLogicalTime,
+                required_consumer_scope: ForwardConsumerScope::Internal,
+                work_class: ForwardWorkClass::Inferred,
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+            if blocked.inner.raft.metrics().borrow().current_leader
+                == Some(blocked.inner.local_node_id)
+            {
+                assert!(
+                    matches!(
+                        blocked
+                            .apply_on_local_leader(ordinary, blocked.inner.local_node_id, deadline)
+                            .await,
+                        ForwardMutationReply::Unavailable
+                    ),
+                    "ordinary proposals still wait for their quota"
+                );
+            } else {
+                let leader = blocked
+                    .inner
+                    .raft
+                    .metrics()
+                    .borrow()
+                    .current_leader
+                    .unwrap();
+                assert!(
+                    matches!(
+                        blocked
+                            .forward_mutation_before(leader, &ordinary, deadline)
+                            .await,
+                        Err(ConsensusPeerCallFailure::BeforeTransmission)
+                    ),
+                    "ordinary forwarding still waits before transmission"
+                );
+            }
+        }
+        (running, resident)
+    }
+
     pub(super) async fn seed_roster_retained_with_saturation(
         store: &ConsensusSessionStore,
         start: Timestamp,
         saturation: Option<(&[ConsensusSessionStore], bool)>,
+    ) {
+        seed_roster_retained_case(store, start, saturation, 0).await;
+    }
+
+    async fn seed_roster_retained_case(
+        store: &ConsensusSessionStore,
+        start: Timestamp,
+        saturation: Option<(&[ConsensusSessionStore], bool)>,
+        sequence: u8,
     ) {
         let identity = store.current_scope().expect("roster scope").0;
         let root = roster_ingress_test_root();
@@ -23041,9 +23133,13 @@ mod membership_tests {
             tenant: TenantId::new("roster-ingress").expect("tenant"),
             nf_kind: NetworkFunctionKind::smf(),
             key_type: SessionKeyType::PduSession,
-            stable_id: Bytes::from_static(b"two-mutations")
-                .try_into()
-                .expect("stable ID"),
+            stable_id: if sequence == 0 {
+                Bytes::from_static(b"two-mutations")
+            } else {
+                Bytes::from(format!("two-mutations-{sequence}"))
+            }
+            .try_into()
+            .expect("stable ID"),
         };
         let owner = OwnerId::new("roster-ingress-owner").expect("owner");
         let lease = store
@@ -23064,7 +23160,14 @@ mod membership_tests {
             CompareAndSetResult::Success
         ));
 
-        let scope = store.consumer_scope().expect("consumer scope");
+        // The configured identity is stable; every operation below performs
+        // bounded asynchronous authority admission. A follower may still be
+        // publishing the preceding setup write at this synchronous instant.
+        let scope = if saturation.is_some() || sequence > 0 {
+            SessionConsumerScope::new(identity)
+        } else {
+            store.consumer_scope().expect("consumer scope")
+        };
         let consumer_identity = SessionConsumerIdentity::new(
             "spiffe://test.example/tenant/roster-ingress/ns/default/sa/store/nf/smf/instance/one",
         )
@@ -23086,13 +23189,15 @@ mod membership_tests {
         let activation_deadline = tokio::time::Instant::now()
             .checked_add(store.inner.operation_timeout)
             .expect("activation deadline");
-        assert!(matches!(
-            store
-                .require_protected_roster_profile_activation_before(activation_deadline)
-                .await,
-            Err(StoreError::CapabilityNotSupported(reason))
-                if reason == "protected_roster_profile_not_activated"
-        ));
+        if sequence == 0 {
+            assert!(matches!(
+                store
+                    .require_protected_roster_profile_activation_before(activation_deadline)
+                    .await,
+                Err(StoreError::CapabilityNotSupported(reason))
+                    if reason == "protected_roster_profile_not_activated"
+            ));
+        }
         store
             .activate_protected_roster_profile()
             .await
@@ -23102,7 +23207,14 @@ mod membership_tests {
         let admission = Admission::authenticate(
             AdmissionProposal::new(
                 Profile::v1(),
-                RosterId::from_bytes([0x51; 16]).expect("roster ID"),
+                RosterId::from_bytes({
+                    let mut id = [0x51; 16];
+                    if sequence > 0 {
+                        id[15] = sequence;
+                    }
+                    id
+                })
+                .expect("roster ID"),
                 (0..FRESH_ROSTER_MEMBERS)
                     .map(|ordinal| {
                         Member::new(
@@ -23154,7 +23266,13 @@ mod membership_tests {
             session_consumer_identity_commitment(authorization.identity());
         let service = store.consumer_service();
         let original_admission_capsule = admission_capsule(roster_scope, &admission, &authority);
-        let admission_request_id = SessionConsumerRequestId::from_bytes([0x55; 16]);
+        let admission_request_id = SessionConsumerRequestId::from_bytes({
+            let mut id = [0x55; 16];
+            if sequence > 0 {
+                id[15] = sequence;
+            }
+            id
+        });
         let admission_request = SessionConsumerRequest::new(
             scope,
             admission_request_id,
@@ -23187,85 +23305,11 @@ mod membership_tests {
             admission_subject_identity_commitment,
             &admission_provenance_input,
         );
-        // Hold both the ordinary quotas and the finite protected pools. A
-        // class change into another finite pool would not meet the contract.
-        let mut running = Vec::new();
-        let mut resident = Vec::new();
-        if let Some((stores, hold_resident)) = saturation {
-            let budgets = crate::scope_scheduler::ScopeSchedulerBudgets::default();
-            for blocked in stores {
-                for pool in [
-                    &blocked.inner.proposal_admission,
-                    &blocked.inner.forward_admission,
-                ] {
-                    for class in [
-                        ScopeWorkClass::Normal,
-                        ScopeWorkClass::Emergency,
-                        ScopeWorkClass::SafetyControl,
-                    ] {
-                        let budget = budgets.class(class);
-                        if hold_resident {
-                            for _ in 0..budget.queued {
-                                resident.push(
-                                    pool.reserve_for(ScopeSchedulerKey::INTERNAL, class)
-                                        .await
-                                        .unwrap(),
-                                );
-                            }
-                        } else {
-                            for _ in 0..budget.running {
-                                running.push(
-                                    pool.acquire_for(ScopeSchedulerKey::INTERNAL, class)
-                                        .await
-                                        .unwrap(),
-                                );
-                            }
-                        }
-                    }
-                }
-                let ordinary = ForwardMutationRequest {
-                    request_id: SessionConsensusRequestId::new(),
-                    intent: SessionMutationIntent::AdvanceLogicalTime,
-                    required_consumer_scope: ForwardConsumerScope::Internal,
-                    work_class: ForwardWorkClass::Inferred,
-                };
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
-                if blocked.inner.raft.metrics().borrow().current_leader
-                    == Some(blocked.inner.local_node_id)
-                {
-                    assert!(
-                        matches!(
-                            blocked
-                                .apply_on_local_leader(
-                                    ordinary,
-                                    blocked.inner.local_node_id,
-                                    deadline
-                                )
-                                .await,
-                            ForwardMutationReply::Unavailable
-                        ),
-                        "ordinary proposals still wait for their quota"
-                    );
-                } else {
-                    let leader = blocked
-                        .inner
-                        .raft
-                        .metrics()
-                        .borrow()
-                        .current_leader
-                        .unwrap();
-                    assert!(
-                        matches!(
-                            blocked
-                                .forward_mutation_before(leader, &ordinary, deadline)
-                                .await,
-                            Err(ConsensusPeerCallFailure::BeforeTransmission)
-                        ),
-                        "ordinary forwarding still waits before transmission"
-                    );
-                }
-            }
-        }
+        let (running, resident) = if let Some((stores, hold_resident)) = saturation {
+            hold_roster_policy_quotas_for_test(stores, hold_resident).await
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let admission_response = service
             .execute_roster_ingress(
                 &roster_authorization,
@@ -23352,7 +23396,13 @@ mod membership_tests {
             proof_bundle: &proof_bundle,
             terminal_evidence: &terminal_evidence,
         });
-        let terminal_request_id = SessionConsumerRequestId::from_bytes([0x56; 16]);
+        let terminal_request_id = SessionConsumerRequestId::from_bytes({
+            let mut id = [0x56; 16];
+            if sequence > 0 {
+                id[15] = sequence;
+            }
+            id
+        });
         let terminal_request = SessionConsumerRequest::new(
             scope,
             terminal_request_id,
@@ -23410,7 +23460,7 @@ mod membership_tests {
         let occupancy = observer.protected_roster_diagnostic_snapshot();
         assert_eq!(occupancy.occupancy_valid, 1);
         assert_eq!(occupancy.live_reservations, 0);
-        assert_eq!(occupancy.retained_reservations, 1);
+        assert_eq!(occupancy.retained_reservations, u64::from(sequence) + 1);
     }
 
     pub(super) async fn assert_roster_maintenance_without_ordinary_traffic(
@@ -23467,6 +23517,45 @@ mod membership_tests {
             terminal_log.map(|index| index + 2),
             "one bounded reclaim and one retirement command clear the sole terminal"
         );
+    }
+
+    pub(super) async fn assert_roster_maintenance_with_steady_due_rows(
+        store: &ConsensusSessionStore,
+        clock: &MutableClock,
+        start: Timestamp,
+    ) {
+        let at = |millis: i64| {
+            Timestamp::from_offset_datetime(
+                *start.as_offset_datetime() + time::Duration::milliseconds(millis),
+            )
+        };
+        for sequence in 0..16 {
+            let terminal_time = at(i64::from(sequence) * 500);
+            clock.set(terminal_time);
+            seed_roster_retained_case(store, terminal_time, None, sequence).await;
+        }
+        let retained = store.protected_roster_diagnostic_snapshot();
+        assert_eq!(retained.retained_reservations, 16);
+        let mut retired_during_arrivals = false;
+        // A new terminal reaches the unchanged 24-hour boundary every 0.5 s.
+        // Observe while more completions are still becoming due, never after
+        // a quiet gap that would let the old reclaim-first lane retire.
+        for step in 0..12 {
+            clock.set(at(86_400_000 + step * 500));
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let snapshot = store.protected_roster_diagnostic_snapshot();
+            assert_eq!(snapshot.occupancy_valid, 1);
+            assert_eq!(snapshot.live_reservations, 0);
+            if snapshot.retained_reservations + snapshot.tombstone_reservations < 16 {
+                retired_during_arrivals = true;
+            }
+        }
+        let snapshot = store.protected_roster_diagnostic_snapshot();
+        assert!(
+            snapshot.retained_reservations < 16,
+            "due rows are reclaimed during steady arrivals"
+        );
+        assert!(retired_during_arrivals, "signed history must retire while rows continuously become due: retained={}, tombstones={}", snapshot.retained_reservations, snapshot.tombstone_reservations);
     }
 
     #[tokio::test]

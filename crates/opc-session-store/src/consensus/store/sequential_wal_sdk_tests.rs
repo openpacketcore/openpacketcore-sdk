@@ -1371,3 +1371,202 @@ async fn assert_roster_emergency_policy_bypass(forwarded: bool, resident: bool) 
         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_emergency_v2_bypasses_local_running_policy_quotas() {
+    assert_roster_emergency_v2_policy_bypass(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_emergency_v2_bypasses_local_resident_policy_quotas() {
+    assert_roster_emergency_v2_policy_bypass(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_emergency_v2_bypasses_forwarded_running_policy_quotas() {
+    assert_roster_emergency_v2_policy_bypass(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_emergency_v2_bypasses_forwarded_resident_policy_quotas() {
+    assert_roster_emergency_v2_policy_bypass(true, true).await;
+}
+
+async fn assert_roster_emergency_v2_policy_bypass(forwarded: bool, resident: bool) {
+    use super::membership_tests::{hold_roster_policy_quotas_for_test, MutableClock};
+    use crate::consensus::types::{
+        roster_v2_persistence_fixture_for_class, roster_v2_persistence_fixture_for_store,
+        ConsensusRosterAdmissionCommand, ConsensusRosterAdmissionOutcome,
+        ConsensusRosterTerminalOutcome, SessionMutationIntent, SessionMutationOutcome,
+    };
+    use crate::consumer::{session_consumer_roster_scope_commitment, SessionConsumerScope};
+    use crate::fenced_mutation_roster::{AdmissionClass, Phase, Scope};
+    use crate::scope_scheduler::ScopeWorkClass;
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let seed =
+        roster_v2_persistence_fixture_for_class(Phase::Established, AdmissionClass::Emergency);
+    for native in [false, true] {
+        let clock = Arc::new(MutableClock::new(
+            opc_types::Timestamp::from_offset_datetime(
+                time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            ),
+        ));
+        let mut fleet = Fleet::new_with_mode_and_roster_root(
+            "roster-emergency-v2",
+            native,
+            Some(seed.root.clone()),
+        );
+        fleet.clock = Some(clock.clone());
+        fleet.open().await;
+        let result = AssertUnwindSafe(async {
+            let ingress = fleet
+                .stores
+                .iter()
+                .find(|store| {
+                    let local_leader = store.inner.raft.metrics().borrow().current_leader
+                        == Some(store.inner.local_node_id);
+                    local_leader != forwarded
+                })
+                .expect("selected V2 ingress role");
+            let identity = ingress.current_scope().unwrap().0;
+            let scope = Scope::from_digest(session_consumer_roster_scope_commitment(
+                SessionConsumerScope::new(identity),
+            ));
+            let signed = roster_v2_persistence_fixture_for_store(
+                identity,
+                scope,
+                1,
+                AdmissionClass::Emergency,
+            );
+            let lease = ingress
+                .acquire(
+                    signed.authority.key(),
+                    signed.authority.owner().clone(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .unwrap();
+            assert_eq!(lease.fence(), signed.authority.fence());
+            assert_eq!(lease.credential_id(), signed.authority.credential_id());
+            assert_eq!(lease.acquired_at(), signed.authority.acquired_at());
+            clock.set(opc_types::Timestamp::from_offset_datetime(
+                time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2),
+            ));
+            ingress
+                .activate_protected_roster_profile_v2()
+                .await
+                .unwrap();
+            let held = hold_roster_policy_quotas_for_test(&fleet.stores, resident).await;
+            let command =
+                ConsensusRosterAdmissionCommand::new_with_provenance_and_ingress_request_id_v2(
+                    signed.admission,
+                    signed.authority,
+                    signed.admission_ingress.request_id(),
+                    signed.admission_ingress,
+                    signed.admission_provenance,
+                )
+                .unwrap();
+            let response = ingress
+                .submit_request_before(
+                    command.request_id().unwrap(),
+                    SessionMutationIntent::RosterAdmissionV2(Box::new(command)),
+                    Some(identity),
+                    tokio::time::Instant::now() + ingress.inner.operation_timeout,
+                )
+                .await
+                .expect("emergency V2 admission bypasses policy quotas");
+            let epoch = match response.result {
+                Ok(SessionMutationOutcome::RosterAdmissionV2(
+                    ConsensusRosterAdmissionOutcome::Admitted {
+                        registration_request_id,
+                        ..
+                    },
+                )) => registration_request_id.history_epoch(),
+                other => panic!("signed V2 emergency admission must be recorded: {other:?}"),
+            };
+            let terminal = roster_v2_persistence_fixture_for_store(
+                identity,
+                scope,
+                epoch,
+                AdmissionClass::Emergency,
+            )
+            .terminal_command;
+            let response = ingress
+                .submit_request_before(
+                    terminal.request_id().unwrap(),
+                    SessionMutationIntent::RosterTerminalV2(Box::new(terminal)),
+                    Some(identity),
+                    tokio::time::Instant::now() + ingress.inner.operation_timeout,
+                )
+                .await
+                .expect("emergency V2 completion bypasses policy quotas");
+            assert!(matches!(
+                response.result,
+                Ok(SessionMutationOutcome::RosterTerminalV2(
+                    ConsensusRosterTerminalOutcome::Committed {
+                        replayed: false,
+                        ..
+                    }
+                ))
+            ));
+            if forwarded {
+                let classes: Vec<_> = fleet
+                    .peers
+                    .iter()
+                    .flat_map(|peer| peer.roster_classes.lock().unwrap().clone())
+                    .collect();
+                assert_eq!(
+                    classes,
+                    vec![ScopeWorkClass::Emergency, ScopeWorkClass::SafetyControl]
+                );
+            }
+            drop(held);
+        })
+        .catch_unwind()
+        .await;
+        fleet.close().await;
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_maintenance_sqlite_retires_signed_history_during_steady_due_arrivals() {
+    assert_signed_roster_steady_retirement(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_maintenance_native_retires_signed_history_during_steady_due_arrivals() {
+    assert_signed_roster_steady_retirement(true).await;
+}
+
+async fn assert_signed_roster_steady_retirement(native: bool) {
+    use super::membership_tests::{
+        assert_roster_maintenance_with_steady_due_rows, roster_ingress_test_root, MutableClock,
+    };
+    use std::str::FromStr;
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let start = opc_types::Timestamp::from_str("2025-01-01T00:00:00Z").unwrap();
+    let clock = Arc::new(MutableClock::new(start));
+    let mut fleet = Fleet::new_with_mode_and_roster_root(
+        "roster-steady-maintenance",
+        native,
+        Some(roster_ingress_test_root()),
+    );
+    fleet.clock = Some(clock.clone());
+    fleet.open().await;
+    let result = AssertUnwindSafe(async {
+        let leader = fleet
+            .stores
+            .iter()
+            .find(|store| {
+                store.inner.raft.metrics().borrow().current_leader
+                    == Some(store.inner.local_node_id)
+            })
+            .unwrap();
+        assert_roster_maintenance_with_steady_due_rows(leader, &clock, start).await;
+    })
+    .catch_unwind()
+    .await;
+    fleet.close().await;
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}

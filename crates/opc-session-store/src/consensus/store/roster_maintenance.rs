@@ -588,7 +588,7 @@ mod tests {
         }
 
         async fn propose(&self) -> Option<RosterMaintenanceOutcome> {
-            // Sixteen signed-history completions at half-second intervals
+            // Model sixteen history completions at half-second intervals
             // become eligible exactly 24 hours later, at the same rate. Model
             // both backends' existing reclaim-first, one-action command seam.
             let due = (self.start.elapsed().as_millis() / 500).min(16) as u64;

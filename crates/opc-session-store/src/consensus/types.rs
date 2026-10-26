@@ -228,6 +228,7 @@ pub(crate) use tests::{
     roster_v2_aborted_persistence_fixture_for_history,
     roster_v2_aborted_single_member_persistence_fixture_for_history,
     roster_v2_fresh_wal_persistence_fixture, roster_v2_persistence_fixture_for_class,
+    roster_v2_persistence_fixture_for_store,
 };
 
 /// Bind the exact voter scope to the immutable protected-roster profile.
@@ -3172,7 +3173,7 @@ pub(crate) mod tests {
         let mut certificate = RosterAttestationLeafCertificatePartsV1 {
             root_id: root.root_id(),
             role,
-            configuration_identity: identity,
+            configuration_identity,
             scope,
             subject_identity_commitment,
             leaf_epoch: 1,
@@ -3633,6 +3634,65 @@ pub(crate) mod tests {
         class: crate::fenced_mutation_roster::AdmissionClass,
         member_count: usize,
     ) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_with_scope(RosterV2FixtureInput {
+            phase,
+            roster_id,
+            epoch,
+            fence,
+            credential_id,
+            class,
+            member_count,
+            identity: legacy_identity(),
+            scope: Scope::from_digest([0x95; 32]),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn roster_v2_persistence_fixture_for_store(
+        identity: SessionConsensusIdentity,
+        scope: Scope,
+        epoch: u64,
+        class: crate::fenced_mutation_roster::AdmissionClass,
+    ) -> RosterV2PersistenceFixture {
+        roster_v2_persistence_fixture_with_scope(RosterV2FixtureInput {
+            phase: Phase::Established,
+            roster_id: [0x91; 16],
+            epoch,
+            fence: FenceToken::new(1),
+            credential_id: 1,
+            class,
+            member_count: FRESH_ROSTER_MEMBERS,
+            identity,
+            scope,
+        })
+    }
+
+    struct RosterV2FixtureInput {
+        phase: Phase,
+        roster_id: [u8; 16],
+        epoch: u64,
+        fence: FenceToken,
+        credential_id: u64,
+        class: crate::fenced_mutation_roster::AdmissionClass,
+        member_count: usize,
+        identity: SessionConsensusIdentity,
+        scope: Scope,
+    }
+
+    fn roster_v2_persistence_fixture_with_scope(
+        input: RosterV2FixtureInput,
+    ) -> RosterV2PersistenceFixture {
+        let RosterV2FixtureInput {
+            phase,
+            roster_id,
+            epoch,
+            fence,
+            credential_id,
+            class,
+            member_count,
+            identity,
+            scope,
+        } = input;
         let key = SessionKey {
             tenant: TenantId::from_static("v2-wire-tag-tenant"),
             nf_kind: NetworkFunctionKind::smf(),
@@ -3686,16 +3746,10 @@ pub(crate) mod tests {
             vec![0x94],
         )
         .expect("V2 proposal");
-        let admission = Admission::authenticate(
-            proposal,
-            key,
-            Scope::from_digest([0x95; 32]),
-            owner,
-            fence,
-            Generation::new(1),
-        )
-        .expect("V2 admission")
-        .with_admission_class(class);
+        let admission =
+            Admission::authenticate(proposal, key, scope, owner, fence, Generation::new(1))
+                .expect("V2 admission")
+                .with_admission_class(class);
         let authority = roster_digest_authority(&admission, credential_id, 1, 61);
         let root_key = SigningKey::from_bytes((&[0x96; 32]).into()).expect("V2 root key");
         let ingress_key = SigningKey::from_bytes((&[0x97; 32]).into()).expect("V2 ingress key");
@@ -3724,7 +3778,7 @@ pub(crate) mod tests {
             &root_key,
             RosterTestCertificateInput {
                 role: RosterAttestationCertificateRoleV1::TransportIngress,
-                identity: legacy_identity(),
+                identity,
                 scope: admission.scope().digest(),
                 subject_identity_commitment: ingress_input.peer_identity_commitment,
                 key_id: [0x9d; 32],
@@ -3743,7 +3797,7 @@ pub(crate) mod tests {
         .expect("V2 admission ingress");
         let provenance_input =
             RosterProfileV2CompactAdmissionProvenanceSigningInputV1::for_admission(
-                legacy_identity(),
+                identity,
                 &admission,
                 &authority,
                 &admission_ingress,
@@ -3808,7 +3862,7 @@ pub(crate) mod tests {
         .expect("V2 terminal record");
         let input_for = |member: &Member| RosterProfileV2TerminalAttestationSigningInputV1 {
             profile: Profile::v2(),
-            configuration_identity: legacy_identity(),
+            configuration_identity,
             certificate_subject_identity_commitment: [0xa3; 32],
             certificate_role: RosterAttestationCertificateRoleV1::Executor,
             admission_provenance_commitment: provenance
@@ -3866,7 +3920,7 @@ pub(crate) mod tests {
                     &root_key,
                     RosterTestCertificateInput {
                         role: RosterAttestationCertificateRoleV1::Provider,
-                        identity: legacy_identity(),
+                        identity,
                         scope: authority.ingress_scope().digest(),
                         subject_identity_commitment: [0xa4; 32],
                         key_id: [0xa5; 32],
@@ -3909,7 +3963,7 @@ pub(crate) mod tests {
                 &root_key,
                 RosterTestCertificateInput {
                     role: RosterAttestationCertificateRoleV1::Executor,
-                    identity: legacy_identity(),
+                    identity,
                     scope: authority.ingress_scope().digest(),
                     subject_identity_commitment: [0xa3; 32],
                     key_id: [0xa6; 32],
@@ -3943,7 +3997,7 @@ pub(crate) mod tests {
                 &root_key,
                 RosterTestCertificateInput {
                     role: RosterAttestationCertificateRoleV1::TransportIngress,
-                    identity: legacy_identity(),
+                    identity,
                     scope: admission.scope().digest(),
                     subject_identity_commitment: terminal_ingress_input.peer_identity_commitment,
                     key_id: [0xa2; 32],
@@ -3989,7 +4043,7 @@ pub(crate) mod tests {
         )
         .expect("V2 terminal command");
         RosterV2PersistenceFixture {
-            identity: legacy_identity(),
+            identity,
             root,
             admission,
             authority,
@@ -4166,7 +4220,7 @@ pub(crate) mod tests {
             ))),
             v2_digest_command(SessionMutationIntent::ActivateFencedTransitionV2 {
                 request: Box::new(request.clone()),
-                scope_identity: identity,
+                scope_identity,
                 voter_set_digest: [0xD4; 32],
                 profile_digest: [0xD5; 32],
             }),
@@ -4178,7 +4232,7 @@ pub(crate) mod tests {
             }),
             v2_digest_command(SessionMutationIntent::Authorized {
                 origin: SessionConsensusNodeId::new(9).expect("origin"),
-                authority_identity: identity,
+                authority_identity,
                 mutation: Box::new(SessionMutationIntent::FencedTransitionV2(Box::new(request))),
             }),
         ];
@@ -4244,16 +4298,16 @@ pub(crate) mod tests {
             ))),
             v2_digest_command(SessionMutationIntent::ActivateFencedTransitionV2 {
                 request: Box::new(request.clone()),
-                scope_identity: identity,
+                scope_identity,
                 voter_set_digest: [0xD4; 32],
                 profile_digest: [0xD5; 32],
             }),
             v2_digest_command(SessionMutationIntent::Authorized {
                 origin: SessionConsensusNodeId::new(9).expect("origin"),
-                authority_identity: identity,
+                authority_identity,
                 mutation: Box::new(SessionMutationIntent::ActivateFencedTransitionV2 {
                     request: Box::new(request),
-                    scope_identity: identity,
+                    scope_identity,
                     voter_set_digest: [0xD4; 32],
                     profile_digest: [0xD5; 32],
                 }),
@@ -4329,16 +4383,16 @@ pub(crate) mod tests {
             ))),
             v2_digest_command(SessionMutationIntent::ActivateFencedTransitionV2 {
                 request: Box::new(request.clone()),
-                scope_identity: identity,
+                scope_identity,
                 voter_set_digest: [0xD4; 32],
                 profile_digest: [0xD5; 32],
             }),
             v2_digest_command(SessionMutationIntent::Authorized {
                 origin: SessionConsensusNodeId::new(9).expect("origin"),
-                authority_identity: identity,
+                authority_identity,
                 mutation: Box::new(SessionMutationIntent::ActivateFencedTransitionV2 {
                     request: Box::new(request),
-                    scope_identity: identity,
+                    scope_identity,
                     voter_set_digest: [0xD4; 32],
                     profile_digest: [0xD5; 32],
                 }),
@@ -4381,7 +4435,7 @@ pub(crate) mod tests {
                 19,
                 SessionMutationIntent::ActivateFencedTransitionV2 {
                     request: Box::new(request.clone()),
-                    scope_identity: identity,
+                    scope_identity,
                     voter_set_digest: [0xD4; 32],
                     profile_digest: [0xD5; 32],
                 },
@@ -4536,14 +4590,14 @@ pub(crate) mod tests {
             SessionMutationIntent::PrepareTopologyTransition {
                 transition_id: [9; 16],
                 request_digest: [10; 32],
-                desired_identity: identity,
+                desired_identity,
                 desired_members: members.clone(),
                 desired_bindings: bindings.clone(),
             },
             LegacySessionMutationIntent684::PrepareTopologyTransition {
                 transition_id: [9; 16],
                 request_digest: [10; 32],
-                desired_identity: identity,
+                desired_identity,
                 desired_members: members,
                 desired_bindings: bindings,
             },
@@ -4596,12 +4650,12 @@ pub(crate) mod tests {
             "Authorized",
             SessionMutationIntent::Authorized {
                 origin: node,
-                authority_identity: identity,
+                authority_identity,
                 mutation: Box::new(SessionMutationIntent::AdvanceLogicalTime),
             },
             LegacySessionMutationIntent684::Authorized {
                 origin: node,
-                authority_identity: identity,
+                authority_identity,
                 mutation: Box::new(LegacySessionMutationIntent684::AdvanceLogicalTime),
             },
         );
@@ -4626,12 +4680,12 @@ pub(crate) mod tests {
             "ActivateFencedTransition",
             SessionMutationIntent::ActivateFencedTransition {
                 request: Box::new(fenced_request.clone()),
-                scope_identity: identity,
+                scope_identity,
                 voter_set_digest: [0x32; 32],
             },
             LegacySessionMutationIntent684::ActivateFencedTransition {
                 request: Box::new(fenced_request),
-                scope_identity: identity,
+                scope_identity,
                 voter_set_digest: [0x32; 32],
             },
         );

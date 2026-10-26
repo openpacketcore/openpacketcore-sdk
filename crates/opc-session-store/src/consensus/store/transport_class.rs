@@ -178,8 +178,8 @@ fn roster_emergency_v2_transport_uses_bound_class_and_rejects_declared_promotion
     use crate::consensus::types::roster_v2_persistence_fixture_for_class;
     use crate::fenced_mutation_roster::{AdmissionClass, Phase};
     for (class, expected) in [
-        (AdmissionClass::Ordinary, ScopeWorkClass::Normal),
         (AdmissionClass::Emergency, ScopeWorkClass::Emergency),
+        (AdmissionClass::Ordinary, ScopeWorkClass::Normal),
     ] {
         let signed = roster_v2_persistence_fixture_for_class(Phase::Established, class);
         let command =
