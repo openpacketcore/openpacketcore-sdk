@@ -44,22 +44,11 @@ fn keys(seed: u8) -> Arc<MemoryKeyProvider> {
     provider
 }
 
-/// Test-only checkpoint storage faults, scoped to one store path so parallel
+/// Test-only checkpoint failures, scoped to one store path so parallel
 /// unit tests cannot perturb each other through the blocking storage thread.
-enum StorageFault {
-    Latency(Duration),
-    Failure(ConsumerCheckpointError),
-}
-
-static STORAGE_FAULTS: Mutex<Vec<(PathBuf, &'static str, StorageFault)>> = Mutex::new(Vec::new());
+static STORAGE_FAULTS: Mutex<Vec<(PathBuf, &'static str, ConsumerCheckpointError)>> =
+    Mutex::new(Vec::new());
 static INDETERMINATE_STAGES: Mutex<Vec<(PathBuf, &'static str)>> = Mutex::new(Vec::new());
-
-pub(super) fn set_storage_latency(path: &Path, stage: &'static str, delay: Duration) {
-    STORAGE_FAULTS
-        .lock()
-        .expect("checkpoint storage fault registry")
-        .push((path.to_path_buf(), stage, StorageFault::Latency(delay)));
-}
 
 pub(super) fn inject_storage_failure(path: &Path, stage: &'static str) {
     STORAGE_FAULTS
@@ -68,7 +57,7 @@ pub(super) fn inject_storage_failure(path: &Path, stage: &'static str) {
         .push((
             path.to_path_buf(),
             stage,
-            StorageFault::Failure(ConsumerCheckpointError::Unavailable),
+            ConsumerCheckpointError::Unavailable,
         ));
 }
 
@@ -79,47 +68,17 @@ pub(super) fn clear_storage_faults(path: &Path) {
         .retain(|(registered, _, _)| registered != path);
 }
 
-/// Sleep for a configured injected latency when the exact store and stage run.
-pub(super) fn storage_latency(path: &Path, stage: &str) {
-    let delay = {
-        let faults = STORAGE_FAULTS
-            .lock()
-            .expect("checkpoint storage fault registry");
-        faults
-            .iter()
-            .find_map(|(registered, registered_stage, fault)| match fault {
-                StorageFault::Latency(delay)
-                    if registered == path && *registered_stage == stage =>
-                {
-                    Some(*delay)
-                }
-                _ => None,
-            })
-    };
-    if let Some(delay) = delay {
-        std::thread::sleep(delay);
-    }
-}
-
 /// Return one configured injected storage failure exactly once.
 pub(super) fn storage_failure(path: &Path, stage: &str) -> Result<(), ConsumerCheckpointError> {
     let mut faults = STORAGE_FAULTS
         .lock()
         .expect("checkpoint storage fault registry");
-    let Some(index) = faults
-        .iter()
-        .position(|(registered, registered_stage, fault)| {
-            registered == path
-                && *registered_stage == stage
-                && matches!(fault, StorageFault::Failure(_))
-        })
-    else {
+    let Some(index) = faults.iter().position(|(registered, registered_stage, _)| {
+        registered == path && *registered_stage == stage
+    }) else {
         return Ok(());
     };
-    match faults.remove(index).2 {
-        StorageFault::Failure(error) => Err(error),
-        StorageFault::Latency(_) => Ok(()),
-    }
+    Err(faults.remove(index).2)
 }
 
 /// Failure-only diagnostic: retain which stage produced an Indeterminate.
@@ -616,12 +575,12 @@ fn minimum_budget_options(path: &Path, maximum_payload: usize) -> ConsumerCheckp
     candidate(accepted).unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn maximum_payload_fits_the_minimum_accepted_storage_budget() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("checkpoint.sqlite");
     let maximum_payload = 16 * 1024 * 1024;
-    let options = minimum_budget_options(&path, maximum_payload);
+    let options = controlled_storage_clock(minimum_budget_options(&path, maximum_payload));
     let accepted = options.max_storage_bytes;
     let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x60))
         .await
@@ -633,7 +592,25 @@ async fn maximum_payload_fits_the_minimum_accepted_storage_budget() {
     {
         let generation = index as u64 + 1;
         let payload = Zeroizing::new(vec![generation as u8; size]);
-        let result = store.compare_and_set(generation, payload.clone()).await;
+        let result = if generation == 2 {
+            let held = HeldCheckpointIo::at("before-mutation");
+            store.options.io_hook = Some(held.hook);
+            let mut write = Box::pin(store.compare_and_set(generation, payload.clone()));
+            tokio::select! {
+                // The progress signal wins even if both branches are ready.
+                biased;
+                entered = held.entered => assert!(!entered.unwrap()),
+                result = &mut write => panic!("write completed before held storage: {result:?}"),
+            }
+            // Capacity depends on actual storage completion, not host speed.
+            // Deadline expiry is exercised separately while this same stage is held.
+            held.release.send(()).unwrap();
+            let result = write.await;
+            store.options.io_hook = None;
+            result
+        } else {
+            store.compare_and_set(generation, payload.clone()).await
+        };
         assert!(
             result.is_ok(),
             "accepted storage budget {accepted} cannot store maximum payload at generation {generation}: {result:?}"
@@ -651,41 +628,53 @@ async fn maximum_payload_fits_the_minimum_accepted_storage_budget() {
     reopened.shutdown().await.unwrap();
 }
 
-/// A replacement that durably commits before the injected post-commit latency
-/// must report its known success, not an ambiguous outcome, even though the
-/// slow post-commit settlement exceeds the store's operation budget.
-#[tokio::test]
-async fn slow_post_commit_checkpoint_settlement_reports_known_success() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("checkpoint.sqlite");
-    let template = options(&path);
-    let operation_budget = Duration::from_millis(200);
-    let options = ConsumerCheckpointOptions::new(
-        &path,
-        template.binding.clone(),
-        template.durability,
-        template.max_payload_bytes,
-        template.max_storage_bytes,
-        operation_budget,
-    )
-    .unwrap();
-    let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x61))
-        .await
-        .unwrap();
-    store.read_back().await.unwrap();
-    let payload = Zeroizing::new(vec![0x61; 64 * 1024]);
-    set_storage_latency(&path, "after-commit", operation_budget * 2);
-    let result = store.compare_and_set(1, payload.clone()).await;
-    clear_storage_faults(&path);
-    let read = result.expect("a slow but durably committed write reports known success");
-    assert_eq!(*read.into_parts().1, *payload);
-    assert_eq!(take_indeterminate_stage(&path), None);
-    assert_eq!(
-        store.read_back().await.unwrap().into_parts().0,
-        2,
-        "the committed replacement remains the verified generation"
-    );
-    store.shutdown().await.unwrap();
+/// A fully validated replacement retains its known success when the observer
+/// resumes after the unchanged operation budget.
+#[test]
+fn slow_post_commit_checkpoint_settlement_reports_known_success() {
+    checkpoint_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.sqlite");
+        let template = options(&path);
+        let operation_budget = Duration::from_millis(200);
+        let options = controlled_storage_clock(
+            ConsumerCheckpointOptions::new(
+                &path,
+                template.binding.clone(),
+                template.durability,
+                template.max_payload_bytes,
+                template.max_storage_bytes,
+                operation_budget,
+            )
+            .unwrap(),
+        );
+        let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x61))
+            .await
+            .unwrap();
+        store.read_back().await.unwrap();
+        let payload = Zeroizing::new(vec![0x61; 64 * 1024]);
+        let held = HeldCheckpointIo::at("readback-complete");
+        store.options.io_hook = Some(held.hook);
+        let mut write = Box::pin(store.compare_and_set(1, payload.clone()));
+        tokio::select! {
+            biased;
+            entered = held.entered => assert!(entered.unwrap()),
+            result = &mut write => panic!("write completed before held validation: {result:?}"),
+        }
+        tokio::time::advance(operation_budget * 2).await;
+        release_checkpoint_worker(held.release).await;
+        let result = write.await;
+        store.options.io_hook = None;
+        let read = result.expect("a slow but fully validated write reports known success");
+        assert_eq!(*read.into_parts().1, *payload);
+        assert_eq!(take_indeterminate_stage(&path), None);
+        assert_eq!(
+            store.read_back().await.unwrap().into_parts().0,
+            2,
+            "the committed replacement remains the verified generation"
+        );
+        store.shutdown().await.unwrap();
+    });
 }
 
 /// A failure after durable replacement work started but before commit keeps the
@@ -799,4 +788,302 @@ async fn cancellation_retains_owned_io_and_requires_readback_before_retry() {
         .shutdown()
         .await
         .unwrap();
+}
+
+struct HeldCheckpointIo {
+    hook: CheckpointIoHook,
+    entered: tokio::sync::oneshot::Receiver<bool>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl HeldCheckpointIo {
+    fn at(stage: &'static str) -> Self {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let entered_tx = Mutex::new(Some(entered_tx));
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let hook = Arc::new(move |work: &Work, current| {
+            if current == stage {
+                if let Some(entered) = entered_tx.lock().unwrap().take() {
+                    let _ = entered.send(work.mutated.load(Ordering::Acquire));
+                    // Sender drop also releases the worker if an assertion unwinds.
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+            }
+        });
+        Self {
+            hook,
+            entered,
+            release,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BlockedCheckpointWait {
+    CompareAndSet,
+    ReadBack,
+    Shutdown,
+}
+
+async fn assert_blocked_checkpoint_wait_keeps_its_deadline(operation: BlockedCheckpointWait) {
+    let dir = tempfile::tempdir().unwrap();
+    let options = options(&dir.path().join("checkpoint.sqlite"));
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x63))
+        .await
+        .unwrap();
+    store.read_back().await.unwrap();
+    let held = HeldCheckpointIo::at("before-mutation");
+    store.options.io_hook = Some(held.hook);
+    let mut write = Box::pin(store.compare_and_set(1, Zeroizing::new(vec![0x63])));
+    tokio::select! {
+        biased;
+        entered = held.entered => assert!(!entered.unwrap()),
+        result = &mut write => panic!("write completed before the owned worker was held: {result:?}"),
+    }
+
+    let observed = match operation {
+        BlockedCheckpointWait::CompareAndSet => {
+            tokio::time::advance(options.timeout).await;
+            let result = tokio::time::timeout(Duration::ZERO, &mut write).await;
+            drop(write);
+            result.map(|result| result.map(|_| ()))
+        }
+        BlockedCheckpointWait::ReadBack => {
+            drop(write);
+            assert!(store.pending.is_some());
+            let mut read = Box::pin(store.read_back());
+            assert!(futures_util::poll!(read.as_mut()).is_pending());
+            tokio::time::advance(options.timeout).await;
+            let result = tokio::time::timeout(Duration::ZERO, &mut read).await;
+            drop(read);
+            result.map(|result| result.map(|_| ()))
+        }
+        BlockedCheckpointWait::Shutdown => {
+            drop(write);
+            assert!(store.pending.is_some());
+            let mut shutdown = Box::pin(store.shutdown());
+            assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+            tokio::time::advance(options.timeout).await;
+            tokio::time::timeout(Duration::ZERO, &mut shutdown).await
+        }
+    };
+
+    // The worker stays held through deadline observation. Release before the
+    // assertion so a failing control never strands the blocking thread.
+    held.release.send(()).unwrap();
+    assert!(
+        matches!(observed, Ok(Err(ConsumerCheckpointError::Indeterminate))),
+        "{operation:?} must return at its original deadline while retaining unfinished I/O: {observed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_checkpoint_compare_and_set_keeps_its_deadline() {
+    assert_blocked_checkpoint_wait_keeps_its_deadline(BlockedCheckpointWait::CompareAndSet).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_checkpoint_read_back_keeps_its_deadline() {
+    assert_blocked_checkpoint_wait_keeps_its_deadline(BlockedCheckpointWait::ReadBack).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_checkpoint_shutdown_keeps_its_deadline() {
+    assert_blocked_checkpoint_wait_keeps_its_deadline(BlockedCheckpointWait::Shutdown).await;
+}
+
+// Keep the operation's original budget in one clock domain, including its
+// blocking SQLite progress handler. A paused Tokio clock does not auto-advance
+// while spawn_blocking is active: the actual worker wakes its waiting caller.
+fn controlled_storage_clock(mut options: ConsumerCheckpointOptions) -> ConsumerCheckpointOptions {
+    options.clock = Some(|| tokio::time::Instant::now().into_std());
+    options
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_checkpoint_write_still_times_out_and_requires_readback() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = controlled_storage_clock(options(&dir.path().join("checkpoint.sqlite")));
+    let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x59))
+        .await
+        .unwrap();
+    store.read_back().await.unwrap();
+    let held = HeldCheckpointIo::at("before-mutation");
+    store.options.io_hook = Some(held.hook);
+    let mut write = Box::pin(store.compare_and_set(1, Zeroizing::new(vec![1])));
+    tokio::select! {
+        biased;
+        entered = held.entered => assert!(!entered.unwrap()),
+        result = &mut write => panic!("write completed before held I/O: {result:?}"),
+    }
+    tokio::time::advance(options.timeout).await;
+    let result = tokio::time::timeout(Duration::ZERO, write).await;
+    // Release before assertions; the channel also releases on unwind.
+    held.release.send(()).unwrap();
+    let result = result.expect("unfinished storage returns at its original deadline");
+    assert_eq!(result.unwrap_err(), ConsumerCheckpointError::Indeterminate);
+    assert!(store.pending.is_some());
+    assert_eq!(
+        store
+            .compare_and_set(1, Zeroizing::new(vec![2]))
+            .await
+            .unwrap_err(),
+        ConsumerCheckpointError::Conflict
+    );
+    store.options.io_hook = None;
+    let (generation, payload) = store.read_back().await.unwrap().into_parts();
+    assert_eq!(generation, 1);
+    assert!(payload.is_empty());
+    store.shutdown().await.unwrap();
+}
+
+// The queued probe cannot run before the checkpoint worker on this pool.
+// This lets a late observer see an actually completed result, with no sleep.
+fn checkpoint_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+}
+
+async fn release_checkpoint_worker(release: std::sync::mpsc::Sender<()>) {
+    release.send(()).unwrap();
+    tokio::task::spawn_blocking(|| ()).await.unwrap();
+}
+
+#[test]
+fn completed_checkpoint_write_keeps_its_known_outcome_after_storage_latency() {
+    checkpoint_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.sqlite");
+        let maximum_payload = 16 * 1024 * 1024;
+        let options = controlled_storage_clock(minimum_budget_options(&path, maximum_payload));
+        let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x60))
+            .await
+            .unwrap();
+        store.read_back().await.unwrap();
+        store
+            .compare_and_set(1, Zeroizing::new(vec![1; maximum_payload]))
+            .await
+            .unwrap();
+
+        let held = HeldCheckpointIo::at("readback-complete");
+        store.options.io_hook = Some(held.hook);
+        let payload = Zeroizing::new(vec![2; maximum_payload / 2]);
+        let mut write = Box::pin(store.compare_and_set(2, payload.clone()));
+        tokio::select! {
+            biased;
+            entered = held.entered => assert!(entered.unwrap()),
+            result = &mut write => panic!("write completed before held readback: {result:?}"),
+        }
+        tokio::time::advance(options.timeout).await;
+        release_checkpoint_worker(held.release).await;
+        let result = write.await;
+        assert!(
+            result.is_ok(),
+            "completed checkpoint write lost its known outcome: {result:?}"
+        );
+        let (generation, stored) = result.unwrap().into_parts();
+        assert_eq!(generation, 3);
+        assert_eq!(*stored, *payload);
+        check_storage_size(&options).unwrap();
+
+        store.options.io_hook = None;
+        let final_payload = Zeroizing::new(vec![3; maximum_payload]);
+        let result = store
+            .compare_and_set(3, final_payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.into_parts().1, final_payload);
+        check_storage_size(&options).unwrap();
+        store.shutdown().await.unwrap();
+        let mut reopened = ConsumerCheckpointStore::reopen(options, keys(0x60))
+            .await
+            .unwrap();
+        let (generation, payload) = reopened.read_back().await.unwrap().into_parts();
+        assert_eq!(generation, 4);
+        assert_eq!(&**payload, vec![3; maximum_payload]);
+        reopened.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn committed_checkpoint_expiring_before_readback_requires_recovery() {
+    checkpoint_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let options = controlled_storage_clock(options(&dir.path().join("checkpoint.sqlite")));
+        let mut store = ConsumerCheckpointStore::provision(options.clone(), keys(0x61))
+            .await
+            .unwrap();
+        store.read_back().await.unwrap();
+        let held = HeldCheckpointIo::at("before-readback");
+        store.options.io_hook = Some(held.hook);
+        let payload = Zeroizing::new(vec![0x61]);
+        let mut write = Box::pin(store.compare_and_set(1, payload.clone()));
+        tokio::select! {
+            biased;
+            entered = held.entered => assert!(entered.unwrap()),
+            result = &mut write => panic!("write completed before held readback: {result:?}"),
+        }
+        tokio::time::advance(options.timeout).await;
+        release_checkpoint_worker(held.release).await;
+        assert_eq!(
+            write.await.unwrap_err(),
+            ConsumerCheckpointError::Indeterminate
+        );
+        assert_eq!(
+            store
+                .compare_and_set(1, Zeroizing::new(vec![2]))
+                .await
+                .unwrap_err(),
+            ConsumerCheckpointError::Conflict
+        );
+        store.options.io_hook = None;
+        let (generation, stored) = store.read_back().await.unwrap().into_parts();
+        assert_eq!(generation, 2);
+        assert_eq!(*stored, *payload);
+        store.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn completed_checkpoint_open_keeps_its_known_outcome_after_storage_latency() {
+    checkpoint_runtime().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let options = controlled_storage_clock(options(&dir.path().join("checkpoint.sqlite")));
+        let payload = Zeroizing::new(vec![0x62]);
+        for provision in [true, false] {
+            let held = HeldCheckpointIo::at("open-complete");
+            let mut opening_options = options.clone();
+            opening_options.io_hook = Some(held.hook);
+            let mut open = Box::pin(ConsumerCheckpointStore::open(opening_options, keys(0x62), provision));
+            tokio::select! {
+                biased;
+                entered = held.entered => assert!(entered.unwrap()),
+                result = &mut open => panic!("open completed before held validation: {result:?}"),
+            }
+            tokio::time::advance(options.timeout).await;
+            release_checkpoint_worker(held.release).await;
+            let result = open.await;
+            assert!(result.is_ok(), "completed checkpoint open lost its known outcome (provision={provision}): {result:?}");
+            let mut store = result.unwrap();
+            store.options.io_hook = None;
+            let (generation, stored) = store.read_back().await.unwrap().into_parts();
+            if provision {
+                assert_eq!(generation, 1);
+                assert!(stored.is_empty());
+                let read = store.compare_and_set(1, payload.clone()).await.unwrap();
+                let (generation, stored) = read.into_parts();
+                assert_eq!(generation, 2);
+                assert_eq!(*stored, *payload);
+            } else {
+                assert_eq!(generation, 2);
+                assert_eq!(*stored, *payload);
+            }
+            store.shutdown().await.unwrap();
+        }
+    });
 }
