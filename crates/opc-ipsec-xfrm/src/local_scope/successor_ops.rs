@@ -8,6 +8,10 @@
 //! receipt keeps its SA until the caller retires it; only the predecessor SA is
 //! removed then, never the policy the successor owns.
 
+#[cfg(test)]
+use super::operations::TestFault;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use futures_util::FutureExt;
@@ -169,6 +173,8 @@ impl Operations {
         }
         let receipt = ScopedXfrmReceipt::successor_receipt(&supplied, predecessor.clone());
         self.successors.push(SuccessorEntry {
+            #[cfg(test)]
+            fault: self.next_fault.take(),
             predecessor,
             request,
             receipt,
@@ -395,6 +401,8 @@ impl Operations {
                 SuccessorAction::Install
             };
             let mut kernel = NativeSuccessorKernel {
+                #[cfg(test)]
+                fault: &mut entry.fault,
                 backend,
                 guard,
                 effect: &entry.effect,
@@ -485,6 +493,11 @@ impl Operations {
                         );
                         primary.successor = Some(link);
                     }
+                    #[cfg(test)]
+                    if matches!(entry.fault, Some(TestFault::DropSuccessorReply)) {
+                        entry.fault = None;
+                        entry.observer = None;
+                    }
                     let _ = entry
                         .observer
                         .take()
@@ -548,6 +561,8 @@ impl Operations {
                 return;
             };
             let mut kernel = NativeSuccessorKernel {
+                #[cfg(test)]
+                fault: &mut entry.fault,
                 backend,
                 guard,
                 effect: &entry.effect,
@@ -600,6 +615,8 @@ impl Operations {
 }
 
 struct NativeSuccessorKernel<'a> {
+    #[cfg(test)]
+    fault: &'a mut Option<TestFault>,
     backend: &'a LinuxXfrmBackend,
     guard: &'a LocalOperation,
     effect: &'a CommittedScopeEffect,
@@ -625,7 +642,18 @@ impl NativeSuccessorKernel<'_> {
 
 #[async_trait::async_trait]
 impl SuccessorKernel for NativeSuccessorKernel<'_> {
+    fn outbound(&self) -> bool {
+        self.request.policy.direction == crate::XfrmDirection::Out
+    }
     fn local(&self) -> Result<(), XfrmError> {
+        #[cfg(test)]
+        if let Some(TestFault::HoldSuccessorSa(hold) | TestFault::HoldSuccessorSelection(hold)) =
+            self.fault
+        {
+            if hold.reached.load(Ordering::Acquire) && !hold.resume.load(Ordering::Acquire) {
+                return Err(uncertain());
+            }
+        }
         if !self.attempt.has_budget() {
             return Err(uncertain());
         }
@@ -664,19 +692,47 @@ impl SuccessorKernel for NativeSuccessorKernel<'_> {
     }
     async fn create_successor_sa(&mut self) -> Result<(), XfrmError> {
         self.local()?;
-        self.backend
+        let result = self
+            .backend
             .install_sa(InstallSaRequest {
                 parameters: self.request.sa.clone(),
             })
-            .await
+            .await;
+        #[cfg(test)]
+        match self.fault {
+            Some(TestFault::PanicAfterSuccessorSa) => {
+                *self.fault = None;
+                panic!("injected failure after successor SA installation");
+            }
+            Some(TestFault::HoldSuccessorSa(hold)) => {
+                hold.reached.store(true, Ordering::Release);
+                hold.entered.notify_one();
+            }
+            _ => {}
+        }
+        result
     }
     async fn move_policy_to_successor(&mut self) -> Result<(), XfrmError> {
         self.local()?;
-        self.backend
+        let result = self
+            .backend
             .rekey_policy(RekeyPolicyRequest {
                 parameters: self.request.policy.clone(),
             })
-            .await
+            .await;
+        #[cfg(test)]
+        match self.fault {
+            Some(TestFault::PanicAfterSuccessorSelection) => {
+                *self.fault = None;
+                panic!("injected failure after successor policy selection");
+            }
+            Some(TestFault::HoldSuccessorSelection(hold)) => {
+                hold.reached.store(true, Ordering::Release);
+                hold.entered.notify_one();
+            }
+            _ => {}
+        }
+        result
     }
     async fn restore_policy_to_predecessor(&mut self) -> Result<(), XfrmError> {
         self.local()?;

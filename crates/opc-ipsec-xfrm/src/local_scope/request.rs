@@ -348,4 +348,53 @@ mod tests {
             ));
         }
     }
+    #[test]
+    fn successor_reqid_preserves_inbound_overlap_and_outbound_selection() {
+        for direction in [XfrmDirection::In, XfrmDirection::Out] {
+            let (sa, mut policy) = fixture();
+            policy.direction = direction;
+            let previous = ScopedXfrmRequest::new(sa, policy).unwrap();
+            let mut candidate = successor_request(&previous);
+            if direction == XfrmDirection::In {
+                candidate.sa.request_id = previous.sa.request_id;
+                candidate.policy.templates[0].request_id = previous.sa.request_id;
+            }
+            let candidate = ScopedXfrmRequest::new(candidate.sa, candidate.policy).unwrap();
+            candidate.validate_successor_of(&previous).unwrap();
+            let mut wrong = candidate.clone();
+            wrong.sa.request_id = if direction == XfrmDirection::In {
+                crate::XfrmRequestId::new(100)
+            } else {
+                previous.sa.request_id
+            };
+            wrong.policy.templates[0].request_id = wrong.sa.request_id;
+            let wrong = ScopedXfrmRequest::new(wrong.sa, wrong.policy).unwrap();
+            assert!(matches!(
+                wrong.validate_successor_of(&previous),
+                Err(XfrmError::StateMismatch {
+                    operation: "local_scope_successor_identity"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn successor_cannot_change_the_outer_udp_encapsulation_path() {
+        let (mut sa, policy) = fixture();
+        sa.encap = Some(crate::UdpEncap::esp_in_udp(4500, 4500));
+        let previous = ScopedXfrmRequest::new(sa, policy).unwrap();
+        let candidate = successor_request(&previous);
+        candidate.validate_successor_of(&previous).unwrap();
+        for encap in [None, Some(crate::UdpEncap::esp_in_udp(4500, 62000))] {
+            let mut changed = candidate.sa.clone();
+            changed.encap = encap;
+            let changed = ScopedXfrmRequest::new(changed, candidate.policy.clone()).unwrap();
+            assert!(matches!(
+                changed.validate_successor_of(&previous),
+                Err(XfrmError::StateMismatch {
+                    operation: "local_scope_successor_flow"
+                })
+            ));
+        }
+    }
 }

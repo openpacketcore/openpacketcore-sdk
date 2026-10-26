@@ -299,4 +299,56 @@ mod tests {
         registry.retired(&successor).unwrap();
         assert!(!registry.contains(&successor));
     }
+    #[test]
+    fn successor_reservations_support_repeated_generations_before_and_after_retirement() {
+        for retire_first in [false, true] {
+            let mut registry = Registry::default();
+            let first = registry.reserve(request(1)).unwrap();
+            let second = registry
+                .reserve_successor(&first, successor_request_for(&first.request))
+                .unwrap();
+            if retire_first {
+                registry.retire_predecessor(&first).unwrap();
+            }
+            let mut third = (*successor_request_for(&second.request)).clone();
+            third.sa.request_id = crate::XfrmRequestId::new(101);
+            third.policy.templates[0].request_id = third.sa.request_id;
+            let third = registry
+                .reserve_successor(&second, Arc::new(third))
+                .unwrap();
+            assert!(registry.contains(&second));
+            assert!(registry.contains(&third));
+            assert!(registry.reserve(third.request.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn successor_reservation_excludes_other_flows_that_select_the_same_reqid() {
+        for successor_first in [false, true] {
+            let mut registry = Registry::default();
+            let first = registry.reserve(request(1)).unwrap();
+            let next = successor_request_for(&first.request);
+            let mut foreign = (*next).clone();
+            foreign.sa.id.spi += 1;
+            foreign.sa.selector.protocol = 17;
+            foreign.policy.selector = foreign.sa.selector.clone();
+            let foreign = Arc::new(ScopedXfrmRequest::new(foreign.sa, foreign.policy).unwrap());
+            if successor_first {
+                let next = registry.reserve_successor(&first, next).unwrap();
+                assert!(matches!(
+                    registry.reserve(foreign),
+                    Err(XfrmError::AlreadyExists)
+                ));
+                assert!(registry.contains(&next));
+            } else {
+                let foreign = registry.reserve(foreign).unwrap();
+                assert!(matches!(
+                    registry.reserve_successor(&first, next),
+                    Err(XfrmError::AlreadyExists)
+                ));
+                assert!(registry.contains(&foreign));
+            }
+            assert!(registry.contains(&first));
+        }
+    }
 }

@@ -222,7 +222,7 @@ impl Command {
 }
 pub(crate) struct Entry {
     #[cfg(test)]
-    fault: Option<TestFault>,
+    pub(crate) fault: Option<TestFault>,
     pub(crate) effect: CommittedScopeEffect,
     pub(crate) request: Arc<ScopedXfrmRequest>,
     pub(crate) receipt: ScopedXfrmReceipt,
@@ -243,6 +243,8 @@ pub(crate) struct SuccessorLink {
     pub(crate) receipt: ScopedXfrmReceipt,
 }
 pub(crate) struct SuccessorEntry {
+    #[cfg(test)]
+    pub(crate) fault: Option<TestFault>,
     pub(crate) predecessor: ScopedXfrmReceipt,
     pub(crate) request: Arc<ScopedXfrmRequest>,
     pub(crate) receipt: ScopedXfrmReceipt,
@@ -260,7 +262,7 @@ pub(crate) struct SuccessorEntry {
 #[derive(Default)]
 pub(crate) struct Operations {
     #[cfg(test)]
-    next_fault: Option<TestFault>,
+    pub(crate) next_fault: Option<TestFault>,
     pub(crate) registry: Registry,
     pub(crate) entries: Vec<Entry>,
     pub(crate) successors: Vec<SuccessorEntry>,
@@ -824,6 +826,18 @@ pub(crate) enum TestFault {
     PanicAfterSa,
     PauseAfterSa(Arc<TestPause>),
     DropPublishedReply,
+    PanicAfterSuccessorSa,
+    PanicAfterSuccessorSelection,
+    DropSuccessorReply,
+    HoldSuccessorSa(Arc<TestHold>),
+    HoldSuccessorSelection(Arc<TestHold>),
+}
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHold {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) reached: AtomicBool,
+    pub(crate) resume: AtomicBool,
 }
 #[cfg(test)]
 #[derive(Default)]

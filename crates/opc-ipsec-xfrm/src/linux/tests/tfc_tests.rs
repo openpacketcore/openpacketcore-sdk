@@ -133,3 +133,70 @@ async fn tfc_rekey_requires_matching_readback_including_absence() {
         ));
     }
 }
+
+#[test]
+#[ignore = "requires CAP_NET_ADMIN and private netns"]
+fn native_tfc_install_readback_and_ignored_update_are_reported_exactly() {
+    assert_eq!(std::env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let backend = LinuxXfrmBackend::new();
+            let mut parameters = sa_parameters();
+            parameters.tfc_pad = Some(1280);
+            backend
+                .install_sa(InstallSaRequest {
+                    parameters: parameters.clone(),
+                })
+                .await
+                .unwrap();
+            let query = QuerySaRequest {
+                destination: parameters.id.destination,
+                spi: parameters.id.spi,
+                protocol: parameters.id.protocol,
+                mark: parameters.mark,
+            };
+            assert_eq!(
+                backend.query_sa(query.clone()).await.unwrap().tfc_pad,
+                Some(1280)
+            );
+            backend
+                .rekey_sa(RekeySaRequest {
+                    parameters: parameters.clone(),
+                })
+                .await
+                .unwrap();
+            for target in [Some(1400), None] {
+                parameters.tfc_pad = target;
+                assert!(matches!(
+                    backend
+                        .rekey_sa(RekeySaRequest {
+                            parameters: parameters.clone()
+                        })
+                        .await,
+                    Err(XfrmError::StateIndeterminate {
+                        operation: "rekey_sa_tfc_readback"
+                    })
+                ));
+                assert_eq!(
+                    backend.query_sa(query.clone()).await.unwrap().tfc_pad,
+                    Some(1280)
+                );
+            }
+            backend
+                .remove_sa(RemoveSaRequest {
+                    destination: parameters.id.destination,
+                    spi: parameters.id.spi,
+                    protocol: parameters.id.protocol,
+                    mark: parameters.mark,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                backend.query_sa(query).await,
+                Err(XfrmError::NotFound)
+            ));
+        });
+}

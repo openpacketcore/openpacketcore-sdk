@@ -60,6 +60,9 @@ pub(crate) struct SuccessorRemovalProgress {
 
 #[async_trait::async_trait]
 pub(crate) trait SuccessorKernel: Send {
+    fn outbound(&self) -> bool {
+        true
+    }
     fn local(&self) -> Result<(), XfrmError>;
     fn publication(&self) -> Result<(), XfrmError> {
         self.local()
@@ -325,6 +328,7 @@ mod tests {
     struct Port {
         predecessor_sa: Readback,
         successor_sa: Readback,
+        inbound: bool,
         policy: Policy,
         fail_create_sa: bool,
         lose_move_ack: bool,
@@ -338,6 +342,7 @@ mod tests {
             Self {
                 predecessor_sa: Readback::Exact,
                 successor_sa: Readback::Absent,
+                inbound: false,
                 policy: Policy::Predecessor,
                 fail_create_sa: false,
                 lose_move_ack: false,
@@ -368,6 +373,9 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl SuccessorKernel for Port {
+        fn outbound(&self) -> bool {
+            !self.inbound
+        }
         fn local(&self) -> Result<(), XfrmError> {
             self.event("local");
             Ok(())
@@ -408,6 +416,9 @@ mod tests {
                     operation: "local_scope_successor_policy_read",
                 });
             }
+            if self.inbound {
+                return Ok(PolicyReadback::Exact);
+            }
             Ok(match self.policy {
                 Policy::Successor => PolicyReadback::Exact,
                 Policy::Predecessor => PolicyReadback::Other,
@@ -428,6 +439,10 @@ mod tests {
         }
         async fn move_policy_to_successor(&mut self) -> Result<(), XfrmError> {
             self.event("move-policy-to-successor");
+            assert!(
+                !self.inbound,
+                "inbound SAs share their unchanged protective policy"
+            );
             assert_eq!(self.successor_sa, Readback::Exact);
             assert_eq!(self.policy, Policy::Predecessor);
             self.policy = Policy::Successor;
@@ -464,7 +479,14 @@ mod tests {
         }
         async fn remove_predecessor_sa(&mut self) -> Result<(), XfrmError> {
             self.event("remove-predecessor-sa");
-            assert_eq!(self.policy, Policy::Successor);
+            assert_eq!(
+                self.policy,
+                if self.inbound {
+                    Policy::Predecessor
+                } else {
+                    Policy::Successor
+                }
+            );
             self.predecessor_sa = Readback::Absent;
             Ok(())
         }
@@ -651,5 +673,98 @@ mod tests {
         ));
         assert_eq!(port.successor_sa, Readback::Exact);
         assert_eq!(port.policy, Policy::Successor);
+    }
+    #[tokio::test]
+    async fn successor_resumes_interrupted_sa_and_policy_steps_without_reinstalling() {
+        for after_move in [false, true] {
+            let mut port = Port {
+                successor_sa: Readback::Exact,
+                policy: if after_move {
+                    Policy::Successor
+                } else {
+                    Policy::Predecessor
+                },
+                ..Port::default()
+            };
+            let mut progress = SuccessorProgress {
+                sa_started: true,
+                move_started: after_move,
+                ..SuccessorProgress::default()
+            };
+            install(&mut port, &mut progress).await.unwrap();
+            publish(&mut port, &mut progress, || false).await.unwrap();
+            assert!(progress.sa_installed && progress.moved && progress.published);
+            assert!(!port.events().contains(&"create-successor-sa"));
+            assert!(!port.events().contains(&"remove-successor-sa"));
+            port.assert_flow_invariants();
+        }
+    }
+
+    #[tokio::test]
+    async fn successor_publication_survives_lost_observer_after_traffic_moved() {
+        let mut port = Port::default();
+        let mut progress = SuccessorProgress::default();
+        install(&mut port, &mut progress).await.unwrap();
+        publish(&mut port, &mut progress, || true).await.unwrap();
+        assert!(progress.published);
+        assert_eq!(port.successor_sa, Readback::Exact);
+        assert_eq!(port.policy, Policy::Successor);
+        assert!(!port.events().contains(&"restore-policy-to-predecessor"));
+        assert!(!port.events().contains(&"remove-successor-sa"));
+    }
+
+    #[tokio::test]
+    async fn successor_publication_does_not_revoke_moved_traffic_on_store_outage() {
+        let mut port = Port::default();
+        let mut progress = SuccessorProgress::default();
+        install(&mut port, &mut progress).await.unwrap();
+        port.reject_current = true;
+        publish(&mut port, &mut progress, || false).await.unwrap();
+        assert!(progress.published);
+        port.assert_flow_invariants();
+    }
+
+    #[tokio::test]
+    async fn successor_abandonment_restores_live_predecessor_and_keeps_protection() {
+        let mut port = Port::default();
+        install_move_publish(&mut port).await;
+        let mut progress = SuccessorRemovalProgress::default();
+        remove_successor(&mut port, &mut progress, false)
+            .await
+            .unwrap();
+        assert!(progress.retired);
+        assert_eq!(port.predecessor_sa, Readback::Exact);
+        assert_eq!(port.successor_sa, Readback::Absent);
+        assert_eq!(port.policy, Policy::Predecessor);
+        assert!(!port.policy_removed);
+        let events = port.events();
+        let position = |name: &str| events.iter().position(|event| *event == name).unwrap();
+        assert!(position("restore-policy-to-predecessor") < position("remove-successor-sa"));
+        assert!(!events.contains(&"remove-successor-policy"));
+        port.assert_flow_invariants();
+    }
+
+    #[tokio::test]
+    async fn successor_inbound_overlap_never_replaces_its_shared_policy() {
+        let mut port = Port {
+            inbound: true,
+            ..Port::default()
+        };
+        let mut progress = SuccessorProgress::default();
+        install(&mut port, &mut progress).await.unwrap();
+        publish(&mut port, &mut progress, || false).await.unwrap();
+        assert!(progress.published && progress.sa_installed && progress.moved);
+        assert_eq!(port.predecessor_sa, Readback::Exact);
+        assert_eq!(port.successor_sa, Readback::Exact);
+        assert_eq!(port.policy, Policy::Predecessor);
+        let mut retirement = PredecessorRetirementProgress::default();
+        retire_predecessor(&mut port, &mut retirement)
+            .await
+            .unwrap();
+        assert_eq!(port.predecessor_sa, Readback::Absent);
+        assert_eq!(port.successor_sa, Readback::Exact);
+        assert_eq!(port.policy, Policy::Predecessor);
+        assert!(!port.events().contains(&"move-policy-to-successor"));
+        assert!(!port.events().contains(&"remove-successor-policy"));
     }
 }
