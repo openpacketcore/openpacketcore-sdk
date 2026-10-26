@@ -1343,6 +1343,51 @@ fn roster_capacity_policy_rejects_old_activation_certificates() {
     assert!(roster::validate_activation(state.identity, &state.members, &state.frontiers).is_ok());
 }
 
+fn assert_roster_maintenance_rejects_foreign_policy(v1: bool) {
+    let signed = crate::consensus::types::roster_v2_aborted_persistence_fixture();
+    let mut storage = configured(&signed);
+    apply(&mut storage, &[q1(&signed, 1), q2(&signed, 2)]);
+    let mut delta = storage.business.prepare(&[]).unwrap();
+    // Model a replica whose activation was admitted by another build with
+    // the same row/witness format and a different maintenance policy.
+    if v1 {
+        delta.frontiers.roster_v1_namespace = true;
+        delta.frontiers.v1_activation = Some(NativeV1Activation {
+            identity: signed.identity,
+            voters: [0xCE; 32],
+        });
+    } else {
+        delta
+            .frontiers
+            .roster_v2_activation
+            .as_mut()
+            .unwrap()
+            .voters = [0xCE; 32];
+    }
+    let before = delta.roster.clone();
+    let due = signed
+        .authority
+        .acquired_at()
+        .add_seconds(1 + 24 * 60 * 60)
+        .unwrap();
+    assert!(delta.maintain_roster(due, &|| Ok(())).is_err());
+    assert!(delta.roster.rows.ptr_eq(&before.rows));
+    assert!(delta.roster.partitions.ptr_eq(&before.partitions));
+    assert_eq!(delta.roster.witness, before.witness);
+    assert!(delta.keys.is_empty());
+    assert!(delta.responses.is_empty());
+}
+
+#[test]
+fn native_roster_maintenance_rejects_foreign_v1_policy_before_mutation() {
+    assert_roster_maintenance_rejects_foreign_policy(true);
+}
+
+#[test]
+fn native_roster_maintenance_rejects_foreign_v2_policy_before_mutation() {
+    assert_roster_maintenance_rejects_foreign_policy(false);
+}
+
 #[test]
 fn roster_capacity_emergency_signed_v1_survives_q1_q2_and_cold_reopen() {
     use crate::fenced_mutation_roster::AdmissionClass;

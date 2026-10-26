@@ -48317,6 +48317,18 @@ mod tests {
         identity: SessionConsensusIdentity,
         records: &[ProductionReservationRecord],
     ) -> GlobalChargeWitness {
+        let scope = read_membership_scope_sync(conn, identity).expect("fixture membership");
+        activate_fenced_transition_scope_with_voter_digest_sync(
+            conn,
+            identity,
+            scope.current_identity,
+            &scope.current_members,
+            protected_roster_profile_voter_set_digest(
+                scope.current_identity,
+                &scope.current_members,
+            ),
+        )
+        .expect("activate fixture policy");
         let mut counters = crate::fenced_mutation_roster_storage::validate_production_snapshot(
             records,
             ChargeProfile::v1(),
@@ -48369,6 +48381,79 @@ mod tests {
             .expect("decode witness")
             .roster
             .durable_epoch_bindings
+    }
+
+    #[test]
+    fn protected_roster_maintenance_rejects_foreign_v1_policy_before_mutation() {
+        let backend = SqliteSessionBackend::in_memory().unwrap();
+        let conn = backend.conn.blocking_lock();
+        initialize_schema(&conn, identity(), &expected_members()).unwrap();
+        activate_protected_roster_schema_sync(&conn).unwrap();
+        let retained_at = timestamp(10);
+        let record = retirement_fixture_retained(0x32, 1, 7, retained_at);
+        write_retirement_fixture_record(&conn, &record, retained_at);
+        write_retirement_fixture_floor(&conn, record.binding());
+        let witness = write_retirement_fixture_witness(&conn, std::slice::from_ref(&record));
+        conn.execute(
+            "UPDATE consensus_fenced_transition_activation SET voter_set_digest=?1",
+            [[0xCE_u8; 32].as_slice()],
+        )
+        .unwrap();
+        let before = conn.total_changes();
+        assert!(maintain_due_protected_roster_reclaim_sync(
+            &conn,
+            identity(),
+            retained_at.add_seconds(24 * 60 * 60).unwrap(),
+        )
+        .is_err());
+        assert_eq!(
+            conn.total_changes(),
+            before,
+            "no row, floor, cursor or witness write"
+        );
+        assert_eq!(
+            protected_roster_read_witness_sync(&conn, identity()).unwrap(),
+            Some(witness)
+        );
+    }
+
+    #[test]
+    fn protected_roster_maintenance_rejects_foreign_v2_policy_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("maintenance-policy.sqlite");
+        initialize_protected_roster_v2_recovery_fixture(
+            &path,
+            ProtectedRosterV2RecoveryFixtureState::Aborted,
+        )
+        .unwrap();
+        let conn = Connection::open(path).unwrap();
+        let signed = crate::consensus::types::roster_v2_aborted_persistence_fixture();
+        conn.execute(
+            "UPDATE consensus_protected_roster_v2_activation SET voter_set_digest=?1",
+            [[0xCE_u8; 32].as_slice()],
+        )
+        .unwrap();
+        let witness = protected_roster_read_witness_sync(&conn, signed.identity).unwrap();
+        let before = conn.total_changes();
+        assert!(maintain_due_protected_roster_reclaim_sync(
+            &conn,
+            signed.identity,
+            signed
+                .authority
+                .acquired_at()
+                .add_seconds(1 + 24 * 60 * 60)
+                .unwrap(),
+        )
+        .is_err());
+        assert_eq!(
+            conn.total_changes(),
+            before,
+            "no row, floor, cursor or witness write"
+        );
+        assert_eq!(
+            protected_roster_read_witness_sync(&conn, signed.identity).unwrap(),
+            witness
+        );
     }
 
     fn snapshot_monotonic_state(application_sequence: u64) -> SnapshotMonotonicState {
@@ -48896,6 +48981,15 @@ mod tests {
 
     #[test]
     fn protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch() {
+        assert_retirement_uses_bounded_prefix(false);
+    }
+
+    #[test]
+    fn protected_roster_retirement_spans_1024_distinct_epochs_then_final_partial_batch() {
+        assert_retirement_uses_bounded_prefix(true);
+    }
+
+    fn assert_retirement_uses_bounded_prefix(distinct_epochs: bool) {
         let backend = SqliteSessionBackend::in_memory().expect("backend");
         let conn = backend.conn.blocking_lock();
         initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
@@ -48905,7 +48999,14 @@ mod tests {
             .add_seconds(2 * 24 * 60 * 60)
             .expect("maintenance time");
         let records = (0_u16..1_025)
-            .map(|roster| retirement_fixture_retained(0x32, roster, 7, retained_at))
+            .map(|roster| {
+                let epoch = if distinct_epochs {
+                    u64::from(roster) + 7
+                } else {
+                    7
+                };
+                retirement_fixture_retained(0x32, roster, epoch, retained_at)
+            })
             .collect::<Vec<_>>();
         let mut bindings = records
             .iter()

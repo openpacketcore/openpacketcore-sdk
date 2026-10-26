@@ -769,7 +769,7 @@ fn native_roster_maintenance_matches_sql_at_retention_and_empty_partition_releas
 }
 
 #[test]
-fn native_roster_maintenance_streams_atomic_reclaim_and_stops_at_the_next_partition_epoch() {
+fn native_roster_maintenance_streams_atomic_reclaim_and_retires_across_partition_epochs() {
     let first = crate::consensus::types::roster_v2_aborted_persistence_fixture();
     let second =
         crate::consensus::types::roster_v2_aborted_persistence_fixture_for_history([0x92; 16], 3);
@@ -856,15 +856,14 @@ fn native_roster_maintenance_streams_atomic_reclaim_and_stops_at_the_next_partit
         |_| Ok(None),
     )
     .unwrap();
-    // Both tombstones are eligible, but the shared floor receives one epoch
-    // action per turn. The global terminal prefix cannot skip epoch three.
+    // One shared floor action covers both selected admission epochs.
     assert!(store.maintain_due(due).unwrap());
     assert!(!store.ledger.rows.contains_key(&first_binding));
-    assert!(store.ledger.rows.contains_key(&second_binding));
-    assert_eq!(store.ledger.partitions[&key].floor.retired_through(), 1);
-    assert_eq!(store.ledger.witness.unwrap().retired_terminal_sequence(), 2);
+    assert!(!store.ledger.rows.contains_key(&second_binding));
+    assert!(!store.ledger.partitions.contains_key(&key));
+    assert_eq!(store.ledger.witness.unwrap().retired_terminal_sequence(), 4);
     assert_eq!(store.ledger.index.epoch_count(key, 1), 0);
-    assert_eq!(store.ledger.index.epoch_count(key, 3), 1);
+    assert_eq!(store.ledger.index.epoch_count(key, 3), 0);
     Ledger::admit(
         &first.root,
         &fixed_scope(first.identity, &state.members),
@@ -880,7 +879,6 @@ fn native_roster_maintenance_streams_atomic_reclaim_and_stops_at_the_next_partit
         |_| Ok(None),
     )
     .unwrap();
-    assert!(store.maintain_due(due).unwrap());
     assert!(store.ledger.rows.is_empty());
     assert!(store.ledger.partitions.is_empty());
     assert_eq!(store.ledger.witness.unwrap().retired_terminal_sequence(), 4);
