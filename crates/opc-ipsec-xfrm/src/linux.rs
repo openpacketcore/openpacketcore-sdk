@@ -6912,6 +6912,7 @@ mod tests {
     mod child_sa_relocation_tests;
     mod installed_child_sa_tests;
     mod sa_key_snapshot_tests;
+    mod tfc_tests;
 
     #[tokio::test]
     async fn outbound_binding_backend_reads_policy_then_sa_and_rejects_key_substitution() {

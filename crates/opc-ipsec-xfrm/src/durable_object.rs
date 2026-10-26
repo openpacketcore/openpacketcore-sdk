@@ -3056,6 +3056,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tfc_durable_request_authentication_binds_padding_intent() {
+        let proof_key = key(9);
+        let mut request = golden_sa_request();
+        let disabled = authenticate_install_request(
+            proof_key.canonical_mac_key(),
+            INSTALL_REQUEST_AUTH_DOMAIN,
+            &request,
+        )
+        .unwrap();
+        let XfrmObjectInstallRequest::Sa(sa) = &mut request else {
+            panic!("SA fixture")
+        };
+        sa.parameters.tfc_pad = Some(1280);
+        let first = authenticate_install_request(
+            proof_key.canonical_mac_key(),
+            INSTALL_REQUEST_AUTH_DOMAIN,
+            &request,
+        )
+        .unwrap();
+        let XfrmObjectInstallRequest::Sa(sa) = &mut request else {
+            panic!("SA fixture")
+        };
+        sa.parameters.tfc_pad = Some(1400);
+        let second = authenticate_install_request(
+            proof_key.canonical_mac_key(),
+            INSTALL_REQUEST_AUTH_DOMAIN,
+            &request,
+        )
+        .unwrap();
+        assert_ne!(disabled, first);
+        assert_ne!(disabled, second);
+        assert_ne!(first, second);
+    }
+
     /// Byte-pinned canonical encodings for the object family.
     ///
     /// The three encoders are now shared with the roster family and take their

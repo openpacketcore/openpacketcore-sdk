@@ -871,6 +871,19 @@ mod tests {
     }
 
     #[test]
+    fn tfc_binding_fingerprint_distinguishes_disabled_and_each_target() {
+        let mut parameters = outbound_request().sa.parameters;
+        let disabled = fingerprint_sa(&parameters);
+        parameters.tfc_pad = Some(1280);
+        let first = fingerprint_sa(&parameters);
+        parameters.tfc_pad = Some(1400);
+        let second = fingerprint_sa(&parameters);
+        assert_ne!(disabled, first);
+        assert_ne!(disabled, second);
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn wide_window_explicit_false_snapshot_uses_canonical_esn_binding_identity() {
         let base = outbound_request();
         let base_expectation = validate_outbound_request(&base).unwrap();
