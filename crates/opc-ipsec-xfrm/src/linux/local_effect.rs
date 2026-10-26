@@ -129,6 +129,28 @@ fn validate_scoped_sa(
 mod tests {
     use super::*;
     #[test]
+    fn tfc_scoped_readback_and_removal_require_exact_padding_intent() {
+        for desired in [None, Some(1280)] {
+            let (mut sa, policy) = crate::local_scope::request::fixture();
+            sa.tfc_pad = desired;
+            let request = ScopedXfrmRequest::new(sa, policy).unwrap();
+            let expected = LinuxXfrmBackend::new()
+                .scoped_sa_identity(&request)
+                .unwrap();
+            for observed in [None, Some(1200), Some(1280)] {
+                let mut changed = request.sa.clone();
+                changed.tfc_pad = observed;
+                assert_eq!(
+                    validate_scoped_sa(&encode_sa_info(&changed).unwrap(), &request, &expected)
+                        .is_ok(),
+                    desired == observed,
+                    "desired={desired:?}, observed={observed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn scoped_sa_removal_refuses_every_changed_lifetime_limit() {
         let (sa, policy) = crate::local_scope::request::fixture();
         let request = ScopedXfrmRequest::new(sa, policy).unwrap();

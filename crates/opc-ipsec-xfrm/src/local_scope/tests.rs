@@ -1,3 +1,6 @@
+mod successor_tests;
+mod successor_traffic;
+
 use super::*;
 use crate::XfrmBackend;
 use opc_linux_gtpu_sys::tc::{
@@ -1255,85 +1258,101 @@ fn native_empty_startup_needs_no_containment_but_reset_covers_dscp_disabled_egre
                 2
             );
         });
+}
 
-    #[test]
-    #[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
-    fn native_scoped_successor_moves_policy_and_retires_only_the_predecessor() {
-        let (_cleanup, lifecycle) = scope();
-        let backend = backend(&lifecycle);
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
+#[test]
+#[ignore = "requires CAP_NET_ADMIN, private bpffs and private netns"]
+fn native_scoped_successor_moves_policy_and_retires_only_the_predecessor() {
+    let (_cleanup, lifecycle) = scope();
+    let backend = backend(&lifecycle);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use crate::local_scope_quorum::{child_key, Quorum, TestAuthority};
 
-                let quorum = Quorum::open(false).await;
-                let reset = lifecycle
-                    .reset(participants(&lifecycle, &backend))
-                    .await
-                    .unwrap();
-                let profile = backend.admit_scoped_profile(&reset).await.unwrap();
-                let authority = TestAuthority::new(lifecycle.clone(), &quorum)
-                    .await
-                    .unwrap();
-                let first = authority
-                    .commit_activation(quorum.create_request(20).await, child_key(20))
-                    .await
-                    .unwrap();
-                let (mut sa, mut policy) = request::fixture();
-                let predecessor = backend
-                    .install_scoped(
-                        &profile,
-                        first,
-                        ScopedXfrmRequest::new(sa.clone(), policy.clone()).unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert!(backend.read_scoped(&predecessor).await.unwrap());
+            let quorum = Quorum::open(false).await;
+            let reset = lifecycle
+                .reset(participants(&lifecycle, &backend))
+                .await
+                .unwrap();
+            let profile = backend.admit_scoped_profile(&reset).await.unwrap();
+            let authority = TestAuthority::new(lifecycle.clone(), &quorum)
+                .await
+                .unwrap();
+            let first = authority
+                .commit_activation(quorum.create_request(20).await, child_key(20))
+                .await
+                .unwrap();
+            let (mut sa, mut policy) = request::fixture();
+            let predecessor = backend
+                .install_scoped(
+                    &profile,
+                    first,
+                    ScopedXfrmRequest::new(sa.clone(), policy.clone()).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(backend.read_scoped(&predecessor).await.unwrap());
 
-                // Rekey successor: same flow identity, new SA SPI and request ID.
-                sa.id.spi = sa.id.spi.checked_add(1).unwrap();
-                sa.request_id = crate::XfrmRequestId::new(100).unwrap();
-                policy.templates[0].request_id = sa.request_id;
-                let successor_request = ScopedXfrmRequest::new(sa, policy).unwrap();
-                let second = authority
-                    .commit_activation(quorum.create_request(21).await, child_key(21))
-                    .await
-                    .unwrap();
-                let successor = backend
-                    .install_scoped_successor(&profile, second, &predecessor, successor_request)
-                    .await
-                    .unwrap();
-                let status = backend.scoped_successor_status(&successor).await.unwrap();
-                assert!(status.successor_sa_installed());
-                assert!(status.traffic_moved());
-                assert!(status.published());
-                assert!(!status.predecessor_retired());
-                assert!(backend.read_scoped(&successor).await.unwrap());
+            // Rekey successor: same flow identity, new SA SPI and request ID.
+            sa.id.spi = sa.id.spi.checked_add(1).unwrap();
+            sa.request_id = crate::XfrmRequestId::new(100);
+            policy.templates[0].request_id = sa.request_id;
+            let successor_request = ScopedXfrmRequest::new(sa, policy).unwrap();
+            let second = authority
+                .commit_activation(quorum.create_request(21).await, child_key(21))
+                .await
+                .unwrap();
+            let successor = backend
+                .install_scoped_successor(&profile, second, &predecessor, successor_request.clone())
+                .await
+                .unwrap();
+            let status = backend.scoped_successor_status(&successor).await.unwrap();
+            assert!(status.successor_sa_installed());
+            assert!(status.traffic_moved());
+            assert!(status.published());
+            assert!(!status.predecessor_retired());
+            assert!(backend.read_scoped(&successor).await.unwrap());
 
-                // A removal request for the successor before predecessor retirement
-                // is refused and leaves both live.
-                assert!(matches!(
-                    backend.remove_scoped(&successor).await,
-                    Err(XfrmError::StateMismatch {
-                        operation: "local_scope_successor_predecessor_live"
-                    })
-                ));
-                assert!(backend.read_scoped(&successor).await.unwrap());
+            // Abandonment restores the retained predecessor, then a distinct
+            // activation can install another fresh-SPI successor on that flow.
+            backend.remove_scoped(&successor).await.unwrap();
+            assert!(successor.is_retired());
+            assert!(!backend.read_scoped(&successor).await.unwrap());
+            assert!(backend.read_scoped(&predecessor).await.unwrap());
+            let mut sa = successor_request.sa.clone();
+            let mut policy = successor_request.policy.clone();
+            sa.id.spi += 1;
+            sa.request_id = crate::XfrmRequestId::new(101);
+            policy.templates[0].request_id = sa.request_id;
+            let third = authority
+                .commit_activation(quorum.create_request(22).await, child_key(22))
+                .await
+                .unwrap();
+            let successor = backend
+                .install_scoped_successor(
+                    &profile,
+                    third,
+                    &predecessor,
+                    ScopedXfrmRequest::new(sa, policy).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(backend.read_scoped(&successor).await.unwrap());
 
-                // Predecessor retirement removes the old SA only; the successor's
-                // SA and policy stay exact.
-                backend.remove_scoped(&predecessor).await.unwrap();
-                let status = backend.scoped_successor_status(&successor).await.unwrap();
-                assert!(status.predecessor_retired());
-                assert!(backend.read_scoped(&successor).await.unwrap());
+            // Predecessor retirement removes the old SA only; the successor's
+            // SA and policy stay exact.
+            backend.remove_scoped(&predecessor).await.unwrap();
+            let status = backend.scoped_successor_status(&successor).await.unwrap();
+            assert!(status.predecessor_retired());
+            assert!(backend.read_scoped(&successor).await.unwrap());
 
-                backend.remove_scoped(&successor).await.unwrap();
-                assert!(!backend.read_scoped(&successor).await.unwrap());
-                assert!(backend.local_namespace_empty().await.unwrap());
-                authority.close_execution().await;
-                quorum.close().await;
-            });
-    }
+            backend.remove_scoped(&successor).await.unwrap();
+            assert!(!backend.read_scoped(&successor).await.unwrap());
+            assert!(backend.local_namespace_empty().await.unwrap());
+            authority.close_execution().await;
+            quorum.close().await;
+        });
 }

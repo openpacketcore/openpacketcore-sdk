@@ -47,18 +47,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refs #671.
 
 - `opc-ipsec-xfrm`:
-  `NamespaceBoundLinuxXfrmBackend::install_scoped_successor` installs one
-  successor SA for a flow that already has a live scoped receipt, moves the
-  single protective policy to it with one `UPDPOLICY` update (no unprotected
-  interval), and keeps the predecessor SA until the caller retires it through
-  the existing `remove_scoped` (which then removes the predecessor SA only).
-  `scoped_successor_status` reports install/traffic-move/publication/
-  predecessor-retirement milestones for lost-reply and cancellation recovery.
-  A separate committed activation supplies the successor's own role use; the
-  request must keep the predecessor's exact policy/flow identity and bring a
-  distinct SPI and request ID. Ambiguous policy readback retains both objects
-  and is resolved by readback, never assumed. Rekey-trigger ownership and peer
-  signalling remain consumer policy. Refs #1239.
+  `NamespaceBoundLinuxXfrmBackend::install_scoped_successor` installs a fresh
+  scoped Child SA while retaining its predecessor. Outbound successors use a
+  distinct reqid and atomically update the existing protective policy;
+  inbound successors share the reqid and policy so both SAs remain acceptable.
+  Exact retries resume retained progress, and lost replies never undo a
+  completed traffic move. `scoped_successor_status` reads current SA and policy
+  state while retaining the publication milestone. Published successors can
+  themselves be rekeyed. `remove_scoped` retires an unselected SA only, restores
+  a retained live generation when abandoning the selected one, and removes the
+  shared policy only with the final member. Expired groups clean up in either
+  order without manual repair. Each new successor requires its own committed
+  activation. Rekey-trigger ownership and peer signalling remain consumer
+  policy. Ordinary scoped installs also wait on an overlapping outbound SA
+  selection identity. Refs #1239.
 
 - `opc-proto-ikev2`: the executable IKE_SA_INIT/IKE_AUTH transform surface now
   covers RFC 3526 MODP groups 15-18 (Transform IDs 15/16/17/18, 3072/4096/6144/
@@ -235,21 +237,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter fields are additive: both enums and the counter struct are
   `#[non_exhaustive]`. Refs #1018.
 
-- `opc-ipsec-xfrm`: SAs can request Linux Traffic Flow Confidentiality (TFC)
-  padding through the new `SaParameters::tfc_pad: Option<u32>`. A `Some(n)`
-  value serializes the `XFRMA_TFCPAD` attribute (UAPI attribute 22, `__u32`) on
-  install and rekey; Linux ESP output then pads the protected packet to at
-  least `n` bytes when shorter, capped at the path MTU. Validation rejects a
-  zero length, non-ESP SAs, and non-tunnel modes before any netlink mutation,
-  matching the kernel's `verify_newsa_info`. `SaState::tfc_pad` reports the
-  value from exact `GETSA` readback. `None` emits no attribute and keeps the
-  pre-TFC bytes exactly unchanged. The versioned durable install-request and
-  outbound-binding fingerprints do not cover `tfc_pad` in this revision
-  (in-memory request comparisons do); widening them needs its own
-  auth-domain-v2 and migration follow-up. Dummy-packet generation with Next
-  Header 59 (RFC 4303 §2.5/§2.7) is not part of this netlink model and remains
-  a tracked follow-up, so #1344 is only partially addressed by this change
-  (the configuration/encoding acceptance is met). Refs #1344.
+- `opc-ipsec-xfrm`: `SaParameters::tfc_pad` configures Linux ESP tunnel-mode
+  Traffic Flow Confidentiality padding through `XFRMA_TFCPAD` (UAPI 22).
+  Exact binding/scoped readback and durable object/roster authentication include
+  the target; disabled TFC retains its previous encoding and seals.
+  `rekey_sa` verifies GETSA even when clearing TFC and reports indeterminate
+  state if Linux acknowledges an ignored update. `esp_dummy_payload` builds
+  aligned dummy plaintext with Next Header 59 (RFC 4303 §§2.6–2.7), leaving
+  encryption, sequencing, transmission and peer capability policy to the caller.
+  Stored records with enabled TFC from builds that omitted it from authentication
+  require a fresh install when crossing this format change. Refs #1344.
 
 ### Fixed
 

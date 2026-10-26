@@ -945,6 +945,7 @@ impl LinuxXfrmBackend {
             || state.replay_window != parameters.replay_window
             || state.lifetime_config != parameters.lifetime
             || state.output_mark != expected_output_mark
+            || state.tfc_pad != parameters.tfc_pad
         {
             return Err(indeterminate());
         }
@@ -1544,19 +1545,18 @@ impl XfrmBackend for LinuxXfrmBackend {
             body,
         )
         .await?;
-        if request.parameters.output_mark.is_some() || request.parameters.egress_dscp.is_some() {
-            // An update replaces pre-existing state, and `SaState`
-            // intentionally excludes key material, so a safe automatic
-            // rollback cannot reconstruct the old SA. Any failed mandatory
-            // readback therefore remains explicitly indeterminate.
-            let operation = if request.parameters.egress_dscp.is_some() {
-                "rekey_sa_dscp_readback"
-            } else {
-                "rekey_sa_output_mark_readback"
-            };
-            self.verify_output_mark_readback(&request.parameters, profile, operation)
-                .await?;
-        }
+        // Linux can ACK UPDSA while retaining the old TFC target. Verify even
+        // None, since clearing an enabled target can be ignored too. A failed
+        // read cannot justify rolling back an update to pre-existing state.
+        let operation = if request.parameters.egress_dscp.is_some() {
+            "rekey_sa_dscp_readback"
+        } else if request.parameters.output_mark.is_some() {
+            "rekey_sa_output_mark_readback"
+        } else {
+            "rekey_sa_tfc_readback"
+        };
+        self.verify_output_mark_readback(&request.parameters, profile, operation)
+            .await?;
         Ok(())
     }
 
@@ -3861,6 +3861,7 @@ fn validate_outbound_sa_fixed_header(
         && (payload[60..72].iter().any(|octet| *octet != 0)
             || payload[84..96].iter().any(|octet| *octet != 0));
     if family != address_family(expected.id.destination)
+        || parse_tfc_pad_attr(payload)? != expected.tfc_pad
         || noncanonical_ipv4
         || payload[77..80].iter().any(|octet| *octet != 0)
         // The SDK does not model soft/hard use-time expiry and always installs
@@ -4656,12 +4657,9 @@ fn parse_if_id_attr(payload: &[u8]) -> Result<Option<u32>, XfrmError> {
     Ok(Some(read_u32_ne(if_id, 0)?))
 }
 
-/// Parse the optional Linux Traffic Flow Confidentiality padding attribute.
-///
-/// The kernel emits `XFRMA_TFCPAD` (`__u32`) only when the stored target
-/// length is nonzero, and an unset length is byte-identical to an absent
-/// attribute. A nonconforming zero value is therefore reported as absent
-/// rather than as a second spelling of the same kernel state.
+/// Parse the canonical Linux Traffic Flow Confidentiality padding attribute.
+/// Linux omits an unset target and accepts enabled targets only for ESP tunnel
+/// mode; other wire encodings cannot establish exact installed intent.
 fn parse_tfc_pad_attr(payload: &[u8]) -> Result<Option<u32>, XfrmError> {
     let Some(tfc_pad) = find_unique_attr_payload(
         payload,
@@ -4679,7 +4677,16 @@ fn parse_tfc_pad_attr(payload: &[u8]) -> Result<Option<u32>, XfrmError> {
         ));
     }
     let value = read_u32_ne(tfc_pad, 0)?;
-    Ok((value != 0).then_some(value))
+    if value == 0
+        || read_u8(payload, 76)? != IPPROTO_ESP
+        || read_u8(payload, 214)? != encode_mode(XfrmMode::Tunnel)
+    {
+        return Err(XfrmError::io(
+            "query_sa",
+            invalid_data("noncanonical TFC padding configuration"),
+        ));
+    }
+    Ok(Some(value))
 }
 
 fn parse_output_mark_attrs(payload: &[u8]) -> Result<Option<XfrmMark>, XfrmError> {
@@ -6912,6 +6919,7 @@ mod tests {
     mod child_sa_relocation_tests;
     mod installed_child_sa_tests;
     mod sa_key_snapshot_tests;
+    mod tfc_tests;
 
     #[tokio::test]
     async fn outbound_binding_backend_reads_policy_then_sa_and_rejects_key_substitution() {
@@ -8157,7 +8165,15 @@ mod tests {
         // zero value must not become a second spelling of absence.
         let mut zero_attr = encode_sa_info(&sa_parameters()).unwrap();
         append_attr(&mut zero_attr, XFRMA_TFCPAD, &0_u32.to_ne_bytes()).unwrap();
-        assert_eq!(parse_sa_state(&zero_attr, None).unwrap().tfc_pad, None);
+        let error = parse_sa_state(&zero_attr, None).unwrap_err();
+        assert!(matches!(
+            error,
+            XfrmError::Io {
+                operation: "query_sa",
+                kind: std::io::ErrorKind::InvalidData,
+                ..
+            }
+        ));
     }
 
     #[test]
