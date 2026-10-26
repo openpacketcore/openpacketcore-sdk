@@ -6,7 +6,9 @@ mod local_effect;
 mod local_netlink;
 mod local_profile;
 mod namespace_reset;
+mod tfc;
 pub(crate) use local_profile::LocalAdmissionProbe;
+pub use tfc::EspTfcDummySender;
 
 use std::fmt;
 use std::io;
@@ -2267,8 +2269,19 @@ fn receive_sad_state_count(
     operation: &'static str,
     expected_sequence: u32,
     config: LinuxXfrmBackendConfig,
-    mut receive: impl FnMut(&mut [u8]) -> io::Result<ReceiveMessageOutcome>,
+    receive: impl FnMut(&mut [u8]) -> io::Result<ReceiveMessageOutcome>,
 ) -> Result<u32, XfrmError> {
+    receive_sad_info(operation, config, receive, |datagram| {
+        parse_sad_state_count_reply(operation, datagram, expected_sequence)
+    })
+}
+
+fn receive_sad_info<T>(
+    operation: &'static str,
+    config: LinuxXfrmBackendConfig,
+    mut receive: impl FnMut(&mut [u8]) -> io::Result<ReceiveMessageOutcome>,
+    parse: impl Fn(&[u8]) -> Result<T, XfrmError>,
+) -> Result<T, XfrmError> {
     let mut buffer = Zeroizing::new(vec![0_u8; config.receive_buffer_len]);
     for _ in 0..config.receive_attempts {
         match receive(&mut buffer) {
@@ -2280,7 +2293,7 @@ fn receive_sad_state_count(
                         invalid_data("receive length exceeded bounded buffer"),
                     )
                 })?;
-                return parse_sad_state_count_reply(operation, datagram, expected_sequence);
+                return parse(datagram);
             }
             Ok(ReceiveMessageOutcome::ConsumedOversize {
                 buffer_bytes,

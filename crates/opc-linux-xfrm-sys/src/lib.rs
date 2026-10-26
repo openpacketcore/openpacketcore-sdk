@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
 mod linux;
+#[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
+mod tfc;
 #[cfg_attr(
     all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)),
     allow(dead_code)
@@ -32,6 +34,47 @@ pub const NETLINK_XFRM: i32 = 6;
 #[derive(Debug)]
 pub struct NetlinkSocket {
     inner: platform::NetlinkSocket,
+}
+
+/// A namespace-pinned raw IP protocol-59 socket with a mandatory XFRM policy.
+/// For tunnel mode, the safe wrapper must verify the OPCTFC01 kernel capability.
+#[derive(Debug)]
+pub struct TfcDummySocket {
+    #[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
+    inner: tfc::TfcDummySocket,
+}
+
+impl TfcDummySocket {
+    /// Open, install the complete per-socket policy, bind and connect.
+    /// This low-level boundary does not validate the policy's dummy semantics.
+    pub fn open(
+        source: std::net::IpAddr,
+        destination: std::net::IpAddr,
+        policy: &[u8],
+    ) -> io::Result<Self> {
+        #[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
+        {
+            tfc::open(source, destination, policy).map(|inner| Self { inner })
+        }
+        #[cfg(any(not(target_os = "linux"), opc_linux_xfrm_sys_force_unsupported))]
+        {
+            let _ = (source, destination, policy);
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+    }
+
+    /// Submit one datagram through the installed policy; success is local submission.
+    pub fn send(&self, payload: &[u8]) -> io::Result<usize> {
+        #[cfg(all(target_os = "linux", not(opc_linux_xfrm_sys_force_unsupported)))]
+        {
+            self.inner.send(payload)
+        }
+        #[cfg(any(not(target_os = "linux"), opc_linux_xfrm_sys_force_unsupported))]
+        {
+            let _ = payload;
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+    }
 }
 
 /// An open directory anchored inside the verified Linux BPF filesystem.

@@ -68,6 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytes, recovery fingerprints, and binding IDs. Configured padding is bound
   into authenticated recovery and kernel readback checks; it must be 1–65,535
   bytes and permitted by the peer. (#1344)
+  `EspTfcDummySender` additionally submits Next Header 59 dummies through the
+  same kernel SA as ordinary traffic. Transport mode uses stock Linux;
+  tunnel mode requires the included versioned kernel patch and rejects an
+  unsupported kernel before opening the sender. Caller-owned egress fencing
+  must stop the sender before recovery, relocation or SA replacement.
 
 - `opc-peer-discovery`: DNS stale reuse is bounded (one day by default,
   configurable with `with_stale_limit`). Authoritative negatives and service
