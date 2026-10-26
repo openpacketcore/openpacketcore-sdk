@@ -201,6 +201,187 @@ async fn truncated_udp_retries_tcp_and_binds_both_transports() {
 }
 
 #[tokio::test]
+async fn oversized_truncated_udp_response_retries_tcp_after_identity_checks() {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = bind_dns_pair(tcp).await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        let (len, peer) = udp.recv_from(&mut buffer).await.unwrap();
+        let mut truncated = reply(&buffer[..len], 0x8380, &[], &[]);
+        truncated.resize(2048, 0);
+        let mut wrong_id = truncated.clone();
+        wrong_id[0] ^= 1;
+        udp.send_to(&wrong_id, peer).await.unwrap();
+        let mut wrong_question = truncated.clone();
+        wrong_question[13] ^= 1;
+        udp.send_to(&wrong_question, peer).await.unwrap();
+        udp.send_to(&truncated, peer).await.unwrap();
+        let (mut stream, _) = tcp.accept().await.unwrap();
+        let len = stream.read_u16().await.unwrap() as usize;
+        stream.read_exact(&mut buffer[..len]).await.unwrap();
+        let bytes = reply(&buffer[..len], 0x8180, &[a(HOST, 20, 2)], &[]);
+        stream.write_u16(bytes.len() as u16).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    });
+    let mut cfg = config(vec![address]);
+    cfg.edns_payload_size = 512;
+    let client = DnsClient::new(cfg).unwrap();
+    let response = client.resolve(&query(), now).await;
+    server.abort();
+    assert!(response.result.is_ok());
+    assert_eq!(client.stats().oversized_responses, 3);
+    assert_eq!(client.stats().id_mismatches, 1);
+    assert_eq!(client.stats().question_mismatches, 1);
+}
+
+#[tokio::test]
+async fn dns_tcp_reuses_a_connection_for_successive_queries() {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = bind_dns_pair(tcp).await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        let mut stream: Option<tokio::net::TcpStream> = None;
+        let mut connections = 0;
+        for _ in 0..2 {
+            let (len, peer) = udp.recv_from(&mut buffer).await.unwrap();
+            udp.send_to(&reply(&buffer[..len], 0x8380, &[], &[]), peer)
+                .await
+                .unwrap();
+            let length = if let Some(stream) = &mut stream {
+                stream.read_u16().await.ok()
+            } else {
+                None
+            };
+            let length = match length {
+                Some(length) => length,
+                None => {
+                    connections += 1;
+                    let (mut fresh, _) = tcp.accept().await.unwrap();
+                    let length = fresh.read_u16().await.unwrap();
+                    stream = Some(fresh);
+                    length
+                }
+            } as usize;
+            let stream = stream.as_mut().unwrap();
+            stream.read_exact(&mut buffer[..length]).await.unwrap();
+            let bytes = reply(&buffer[..length], 0x8180, &[a(HOST, 20, 2)], &[]);
+            stream.write_u16(bytes.len() as u16).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        }
+        connections
+    });
+    let client = DnsClient::new(config(vec![address])).unwrap();
+    for _ in 0..2 {
+        client.resolve(&query(), now).await.result.unwrap();
+    }
+    assert_eq!(server.await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn dns_tcp_idle_connection_closes_without_another_query() {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = bind_dns_pair(tcp).await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        let (len, peer) = udp.recv_from(&mut buffer).await.unwrap();
+        udp.send_to(&reply(&buffer[..len], 0x8380, &[], &[]), peer)
+            .await
+            .unwrap();
+        let (mut stream, _) = tcp.accept().await.unwrap();
+        let len = stream.read_u16().await.unwrap() as usize;
+        stream.read_exact(&mut buffer[..len]).await.unwrap();
+        let bytes = reply(&buffer[..len], 0x8180, &[a(HOST, 20, 2)], &[]);
+        stream.write_u16(bytes.len() as u16).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        assert_eq!(stream.read(&mut buffer[..1]).await.unwrap(), 0);
+    });
+    let client = DnsClient::new(config(vec![address])).unwrap();
+    client.resolve(&query(), now).await.result.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_partial_tcp_response_is_never_reused() {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = bind_dns_pair(tcp).await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut ready_tx = Some(ready_tx);
+        let mut buffer = [0; 4096];
+        for attempt in 0..2 {
+            let (len, peer) = udp.recv_from(&mut buffer).await.unwrap();
+            udp.send_to(&reply(&buffer[..len], 0x8380, &[], &[]), peer)
+                .await
+                .unwrap();
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let len = stream.read_u16().await.unwrap() as usize;
+            stream.read_exact(&mut buffer[..len]).await.unwrap();
+            if attempt == 0 {
+                stream.write_all(&[0, 200, 0]).await.unwrap();
+                ready_tx.take().unwrap().send(()).unwrap();
+                match stream.read(&mut buffer[..1]).await {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => panic!("cancelled connection remained usable: {other:?}"),
+                }
+            } else {
+                let bytes = reply(&buffer[..len], 0x8180, &[a(HOST, 20, 2)], &[]);
+                stream.write_u16(bytes.len() as u16).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
+            }
+        }
+    });
+    let client = DnsClient::new(config(vec![address])).unwrap();
+    let first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.resolve(&query(), now).await });
+    tokio::time::timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    client.resolve(&query(), now).await.result.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn dns_tcp_reconnects_after_the_peer_closes_an_idle_connection() {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = bind_dns_pair(tcp).await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        for _ in 0..2 {
+            let (len, peer) = udp.recv_from(&mut buffer).await.unwrap();
+            udp.send_to(&reply(&buffer[..len], 0x8380, &[], &[]), peer)
+                .await
+                .unwrap();
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let len = stream.read_u16().await.unwrap() as usize;
+            stream.read_exact(&mut buffer[..len]).await.unwrap();
+            let bytes = reply(&buffer[..len], 0x8180, &[a(HOST, 20, 2)], &[]);
+            stream.write_u16(bytes.len() as u16).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        }
+    });
+    let client = DnsClient::new(config(vec![address])).unwrap();
+    for _ in 0..2 {
+        client.resolve(&query(), now).await.result.unwrap();
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn formerr_retries_once_without_edns() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let address = socket.local_addr().unwrap();
@@ -326,8 +507,8 @@ async fn high_bit_ttl_in_rrset_cannot_be_hidden_by_unsigned_minimum() {
     };
     assert!(cache.finish_refresh(token, Ok(answer), now()));
     let status = cache.lookup(&query().cache_key(), now());
-    assert_eq!(status.fresh_until, Some(now()));
-    assert!(matches!(status.result, DnsCachedResult::Stale { .. }));
+    assert_eq!(status.fresh_until, None);
+    assert_eq!(status.result, DnsCachedResult::Miss);
     // Success refresh uses the separate five-second interval with equal
     // jitter, even though this zero TTL is never fresh.
     let retry_at = status.retry_at.unwrap();

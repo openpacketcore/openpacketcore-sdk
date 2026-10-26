@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-peer-discovery`: DNS stale reuse is bounded (one day by default,
+  configurable with `with_stale_limit`). Authoritative negatives and service
+  withdrawals clear prior positive data; zero-TTL responses are not cached.
+  Oversized validated TC replies trigger TCP fallback; TCP connections are
+  reused and closed after 30 seconds idle. Address queries reject invalid
+  host labels while SRV/S-NAPTR owners retain underscore support. (#1355, #1360)
+
 - `opc-sbi` offers explicit `SbiTokenProfile::NrfAccessToken` validation for
   TS 29.510 UUID subjects and optional `nbf`, retaining signature, issuer,
   audience, expiry, scope and transport-peer binding. JWT-SVID remains the
