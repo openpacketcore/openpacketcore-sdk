@@ -23625,7 +23625,7 @@ mod membership_tests {
                 "every admission owns its distinct Raft-log history epoch"
             );
             previous_epoch = epoch;
-            if (sequence + 1) % 300 == 0 {
+            if (sequence + 1).is_multiple_of(300) {
                 eprintln!(
                     "roster sustained seed: {}/{ROWS}, last_epoch={epoch}",
                     sequence + 1
@@ -23654,7 +23654,7 @@ mod membership_tests {
             let backlog = due - reclaimed;
             peak_due = peak_due.max(backlog);
             peak_tombstones = peak_tombstones.max(snapshot.tombstone_reservations);
-            if second % 30 == 0 {
+            if second.is_multiple_of(30) {
                 eprintln!("roster sustained load: second={second}, due={due}, backlog={backlog}, tombstones={}", snapshot.tombstone_reservations);
             }
         }
