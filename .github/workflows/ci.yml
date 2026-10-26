@@ -625,6 +625,14 @@ jobs:
             --nocapture --test-threads=1 2>&1 | tee "${progress_log}"
           grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored;' "${progress_log}"
 
+      - name: Require native dual-stack SCTP multihoming
+        run: |
+          set -euo pipefail
+          cargo test --locked -p opc-sctp --lib -- \
+            --ignored --exact tests::loopback_dual_stack_multihoming_selects_both_families \
+            --nocapture --test-threads=1 2>&1 | tee "${RUNNER_TEMP}/sctp-dual-stack.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "${RUNNER_TEMP}/sctp-dual-stack.log"
+
       - name: Build cold SCTP multihoming regression fixture
         run: |
           set -euo pipefail

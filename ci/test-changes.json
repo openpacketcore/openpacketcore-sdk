@@ -457,6 +457,12 @@
       "kind": "disabled",
       "reason": "New privileged packet proof requires CAP_BPF/CAP_NET_ADMIN and an isolated network namespace. Executed in the compliance Linux VM: strict alternate-source rejection, opt-in delivery before and after backend restart, and rejection of wrong local address, UDP port, TEID and inner PAA. The complete ignored harness runs in privileged CI; host tests cover codecs, ownership and reassembly parity.",
       "issue": 1347
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::loopback_dual_stack_multihoming_selects_both_families",
+      "kind": "disabled",
+      "reason": "New native Linux SCTP test requires SCTP and IPv6 loopback. The required SCTP workflow executes it explicitly and checks one passing test. It exercises mixed bindx/connectx in both family orders, address readback, primary-path selection and payload delivery over IPv4 and IPv6. Portable configuration and path-identity tests run normally.",
+      "issue": 1351
     }
   ]
 }

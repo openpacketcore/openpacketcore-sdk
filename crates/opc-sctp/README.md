@@ -236,6 +236,14 @@ synthetic schedules, native checks and N2 support limits.
 
 ### Multihoming path events and health
 
+Bounded static address sets may mix IPv4 and IPv6. Every set still shares one
+port and cannot combine wildcard and concrete addresses. A configured local
+set must share at least one IP family with the remote set. Mixed sets select
+an explicitly dual-stack socket regardless of the first address or the host's
+`bindv6only` default; single-family socket policy remains unchanged. IPv4-mapped
+readback and notifications identify the same path as native IPv4, while port
+and nonzero IPv6 scope remain significant.
+
 `SctpAssociation::recv` returns notifications in wire order through
 `InboundMessage::event`. Linux `SCTP_PEER_ADDR_CHANGE` notifications decode to
 `SctpEvent::PeerAddrChange`, including the typed transition, kernel error, and

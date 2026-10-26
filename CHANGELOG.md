@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-libsctp-sys::AddressFamily` adds `Ipv6DualStack`; exhaustive matches
+  must handle it. `opc-sctp` selects it for mixed IPv4/IPv6 static multihoming
+  sets and preserves each set's port, wildcard and count limits. IPv4-mapped
+  notifications reconcile with native IPv4 paths without losing port/scope
+  checks. Existing single-family socket policy is retained. (#1351)
+
 - `opc-proto-ikev2`: extend DH and signature enums for MODP 15–18, ECDSA
   methods 9–11/P-521, RSA-PSS and Ed25519. Exhaustive caller matches must
   account for the new variants. SHA-512 and Identity offers now execute

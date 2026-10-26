@@ -49,6 +49,10 @@ let fd = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne)?;
 - Non-Linux builds return explicit unsupported-platform errors.
 - Bindx/connectx use the Linux packed-address socket UAPI directly, without a
   runtime `libsctp` dependency, and accept at most `MAX_SCTP_ADDRESSES` entries.
+- Mixed-family sets retain each concrete `sockaddr_in`/`sockaddr_in6` width;
+  use `AddressFamily::Ipv6DualStack` to disable IPv6-only binding and request
+  native IPv4 readback explicitly. Existing single-family socket policy stays
+  unchanged.
 - Address-list inspection is bounded to the same maximum and rejects malformed
   kernel responses before exposing them to the safe crate.
 - RTO, peer-path heartbeat/retransmission, and primary-address helpers bind the
