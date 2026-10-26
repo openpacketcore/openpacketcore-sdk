@@ -681,6 +681,18 @@
         "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::successor::tests::successor_removal_restores_a_retained_predecessor_without_deleting_its_policy",
         "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::successor::tests::successor_abandonment_restores_live_predecessor_and_keeps_protection"
       ]
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_scoped_successor_expiry_refusal_releases_reset",
+      "kind": "disabled",
+      "reason": "New native hard-expiry and reset-barrier regression requires CAP_NET_ADMIN in private network and mount namespaces. It verifies real kernel expiry, typed retirement refusal, retained predecessor SA, and immediate execution drain/reset without receipt cleanup masking a leaked guard. It is required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the native qualification runner; no existing executable coverage is gated.",
+      "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::local_scope::tests::successor_tests::native_transport_scoped_successor_expiry_refusal_releases_reset",
+      "kind": "disabled",
+      "reason": "New native hard-expiry and reset-barrier regression requires CAP_NET_ADMIN in private network and mount namespaces. It verifies real kernel expiry, typed retirement refusal, retained predecessor SA, and immediate execution drain/reset without receipt cleanup masking a leaked guard. It is required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the native qualification runner; no existing executable coverage is gated.",
+      "issue": 1239
     }
   ]
 }

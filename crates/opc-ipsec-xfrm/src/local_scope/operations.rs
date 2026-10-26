@@ -487,14 +487,7 @@ impl Operations {
             entry.progress.undo = true;
         }
         if entry.guard.is_none() {
-            match entry
-                .receipt
-                .binding
-                .profile
-                .binding
-                .epoch
-                .try_begin_operation()
-            {
+            match entry.receipt.profile().try_begin_operation() {
                 Ok(Some(guard)) => entry.guard = Some(guard),
                 Ok(None) => {
                     entry.schedule.failed(rand::random());

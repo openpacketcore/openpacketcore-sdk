@@ -158,10 +158,7 @@ fn native_tfc_install_readback_and_ignored_update_are_reported_exactly() {
                 protocol: parameters.id.protocol,
                 mark: parameters.mark,
             };
-            assert_eq!(
-                backend.query_sa(query.clone()).await.unwrap().tfc_pad,
-                Some(1280)
-            );
+            assert_eq!(backend.query_sa(query).await.unwrap().tfc_pad, Some(1280));
             backend
                 .rekey_sa(RekeySaRequest {
                     parameters: parameters.clone(),
@@ -180,10 +177,7 @@ fn native_tfc_install_readback_and_ignored_update_are_reported_exactly() {
                         operation: "rekey_sa_tfc_readback"
                     })
                 ));
-                assert_eq!(
-                    backend.query_sa(query.clone()).await.unwrap().tfc_pad,
-                    Some(1280)
-                );
+                assert_eq!(backend.query_sa(query).await.unwrap().tfc_pad, Some(1280));
             }
             backend
                 .remove_sa(RemoveSaRequest {

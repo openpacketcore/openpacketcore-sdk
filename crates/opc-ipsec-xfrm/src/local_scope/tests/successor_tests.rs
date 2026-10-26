@@ -543,12 +543,19 @@ async fn panic_recovery(
             .is_err());
         settle(backend).await;
         let next = backend
-            .install_scoped_successor(profile, effect, &old, next_request)
+            .install_scoped_successor(profile, effect, &old, next_request.clone())
             .await
             .unwrap();
-        assert!(backend.read_scoped(&old).await.unwrap());
+        // Full-intent readback reflects the new outbound selection while the
+        // retained predecessor SA is still independently queryable.
+        assert!(!backend.read_scoped(&old).await.unwrap());
+        assert_sa_live(backend, &old_request).await;
         assert!(backend.read_scoped(&next).await.unwrap());
+        let traffic = Traffic::start(&old_request, &next_request, old_request.sa.id.spi);
+        traffic.checkpoint(next_request.sa.id.spi);
         backend.remove_scoped(&old).await.unwrap();
+        traffic.checkpoint(next_request.sa.id.spi);
+        assert!(traffic.finish().1 >= 2);
         backend.remove_scoped(&next).await.unwrap();
     }
 }
