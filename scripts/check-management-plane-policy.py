@@ -6,8 +6,8 @@ human acceptance. It enforces two mechanical invariants:
 
 * `tonic`, `prost`, `prost-types`, and their codec/build adapters stay scoped to
   `opc-gnmi-server`.
-* Rust `unsafe` tokens stay scoped to explicitly reviewed Linux UAPI sys
-  crates, where each token must be documented by a nearby `SAFETY:` comment
+* Rust `unsafe` tokens stay scoped to explicitly allowlisted sys crates,
+  where each token must be documented by a nearby `SAFETY:` comment
   and a local unsafe lint policy must be declared.
 """
 
@@ -35,6 +35,7 @@ UNSAFE_ALLOWED_ROOTS = {
     "opc-linux-route-sys",
     "opc-linux-xfrm-sys",
     "opc-sqlite-file-control-sys",
+    "opc-tokio-fd-sys",
 }
 
 
@@ -164,7 +165,7 @@ def check_unsafe_boundary(metadata: dict) -> list[Violation]:
                 violations.append(
                     Violation(
                         f"{source}:{token.line}:{token.column}",
-                        "`unsafe` token is outside the ADR 0017 Linux UAPI sys-crate "
+                        "`unsafe` token is outside the ADR 0017 sys-crate "
                         "allow-list",
                     )
                 )
@@ -180,7 +181,7 @@ def check_sys_crate_unsafe_comments(root: Path) -> list[Violation]:
                 violations.append(
                     Violation(
                         f"{source}:{token.line}:{token.column}",
-                        "`unsafe` token in an allowed Linux UAPI sys crate must be "
+                        "`unsafe` token in an allowed sys crate must be "
                         "documented by an adjacent `SAFETY:` comment",
                     )
                 )

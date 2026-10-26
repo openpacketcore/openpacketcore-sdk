@@ -519,6 +519,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Linux accepted-socket HMAC defaults are not treated as negotiated policy.
   (#1351)
 
+- Update Tokio to 1.53.3 for RUSTSEC-2026-0386. SCTP and timer registrations
+  consume owned descriptors through one narrow boundary that prevents replacing
+  them while registered. Boot-time timers transfer ownership without descriptor
+  duplication. The session-store runtime remains exactly pinned and retains its
+  queue, cancellation and shutdown ownership contracts. (#1532)
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a
