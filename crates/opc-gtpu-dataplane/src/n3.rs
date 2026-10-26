@@ -179,9 +179,12 @@ impl ReceivedN3UplinkTnl {
     ///
     /// # Errors
     /// Returns [`N3PacketError::InvalidAddress`] for an unsuitable address.
-    pub fn new(address: IpAddr, teid: PeerTeid) -> Result<Self, N3PacketError> {
+    pub fn new(address: IpAddr, teid: impl Into<PeerTeid>) -> Result<Self, N3PacketError> {
         check_address(address)?;
-        Ok(Self { address, teid })
+        Ok(Self {
+            address,
+            teid: teid.into(),
+        })
     }
 
     /// Destination IP for uplink traffic; sensitive, never log it.

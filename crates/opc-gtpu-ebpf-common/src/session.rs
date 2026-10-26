@@ -46,8 +46,6 @@ const N3_ENTRY_FORMAT_VERSION: u8 = 2;
 /// Version carrying the opt-in downlink inner MTU in bytes 73..74 (byte 75
 /// stays reserved).
 const ENTRY_MTU_FORMAT_VERSION: u8 = 3;
-/// N3 entry version carrying the opt-in downlink inner MTU.
-const N3_ENTRY_MTU_FORMAT_VERSION: u8 = 4;
 const GROUP_FORMAT_VERSION: u8 = 1;
 const TRANSACTION_FORMAT_VERSION: u8 = 1;
 const CONFIG_FORMAT_VERSION: u8 = 1;
@@ -653,7 +651,8 @@ impl GtpuSessionEntry {
     /// Construct one canonical grouped family entry.
     ///
     /// Outer local and peer addresses must use the same family. Every address
-    /// and TEID must be nonzero; DSCP must be at most 63; and the uplink
+    /// and the local TEID must be nonzero; the peer TEID may be zero under
+    /// TS 29.281 section 5.1. DSCP must be at most 63, and the uplink
     /// source-port policy must have a canonical wire encoding.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -673,7 +672,6 @@ impl GtpuSessionEntry {
             || address_family(peer_outer_address) != address_family(local_outer_address)
             || inner_paa.contains(local_outer_address)
             || local_teid == [0; 4]
-            || peer_teid == [0; 4]
             || egress_dscp.is_some_and(|value| value > 63)
             || uplink_source_port_policy.map_value().is_none()
         {
@@ -702,6 +700,7 @@ impl GtpuSessionEntry {
     #[must_use]
     pub const fn with_n3_qfi(mut self, qfi: u8) -> Option<Self> {
         if qfi > 63
+            || self.downlink_inner_mtu.is_some()
             || !n3_outer_is_unicast(
                 self.peer_outer_address.family_wire(),
                 &self.peer_outer_address.encode_bytes(),
@@ -725,13 +724,27 @@ impl GtpuSessionEntry {
 
     /// Attach the session's opt-in downlink inner MTU.
     ///
-    /// The entry stores the canonical `DownlinkInnerMtu` wire field; for an
-    /// inner-IPv6 entry this is always the in-tunnel Packet Too Big opt-in,
-    /// because IPv6 has no in-network fragmentation (RFC 8200 section 4.5).
+    /// Only ordinary inner IPv6 over outer IPv4 supports this profile: an
+    /// in-tunnel Packet Too Big MTU of at least 1280, using the backend-owned
+    /// UDP/2152 response socket. IPv4, N3, selected source ports and inner
+    /// fragmentation have no family-entry enforcement path and are refused.
     #[must_use]
-    pub const fn with_downlink_inner_mtu(mut self, mtu: DownlinkInnerMtu) -> Self {
+    pub const fn with_downlink_inner_mtu(mut self, mtu: DownlinkInnerMtu) -> Option<Self> {
+        if !matches!(self.inner_paa.family(), GtpuSessionIpFamily::Ipv6)
+            || !matches!(self.peer_outer_address, GtpuEndpointAddress::Ipv4(_))
+            || !matches!(self.local_outer_address, GtpuEndpointAddress::Ipv4(_))
+            || self.n3_qfi.is_some()
+            || !matches!(
+                self.uplink_source_port_policy,
+                GtpuUplinkSourcePortPolicy::LegacyServicePort
+            )
+            || !mtu.is_packet_too_big()
+            || mtu.mtu() < 1280
+        {
+            return None;
+        }
         self.downlink_inner_mtu = Some(mtu);
-        self
+        Some(self)
     }
 
     /// The session's downlink inner MTU and oversized-packet policy, if set.
@@ -820,11 +833,8 @@ impl GtpuSessionEntry {
                 N3_ENTRY_FORMAT_VERSION
             }
             (None, None) => ENTRY_FORMAT_VERSION,
-            (Some(qfi), Some(mtu)) => {
-                out[72] = qfi;
-                out[73..75].copy_from_slice(&mtu.field().to_be_bytes());
-                N3_ENTRY_MTU_FORMAT_VERSION
-            }
+            // Public constructors exclude this unsupported combination.
+            (Some(_), Some(_)) => 0,
             (None, Some(mtu)) => {
                 out[73..75].copy_from_slice(&mtu.field().to_be_bytes());
                 ENTRY_MTU_FORMAT_VERSION
@@ -885,15 +895,13 @@ impl GtpuSessionEntry {
             uplink_policy,
         )?;
         let entry = match value[0] {
-            N3_ENTRY_FORMAT_VERSION | N3_ENTRY_MTU_FORMAT_VERSION => {
-                entry.with_n3_qfi(value[72])?
-            }
+            N3_ENTRY_FORMAT_VERSION => entry.with_n3_qfi(value[72])?,
             _ => entry,
         };
         match value[0] {
-            ENTRY_MTU_FORMAT_VERSION | N3_ENTRY_MTU_FORMAT_VERSION => {
+            ENTRY_MTU_FORMAT_VERSION => {
                 let field = u16::from_be_bytes([value[73], value[74]]);
-                Some(entry.with_downlink_inner_mtu(DownlinkInnerMtu::from_field(field)?))
+                entry.with_downlink_inner_mtu(DownlinkInnerMtu::from_field(field)?)
             }
             _ => Some(entry),
         }
@@ -904,7 +912,6 @@ impl GtpuSessionEntry {
 fn entry_profile_is_canonical(value: &[u8; GTPU_SESSION_ENTRY_LEN]) -> bool {
     let mtu_field = u16::from_be_bytes([value[73], value[74]]);
     let mtu_is_absent = mtu_field == 0;
-    let mtu_is_set = DownlinkInnerMtu::from_field(mtu_field).is_some();
     match value[0] {
         ENTRY_FORMAT_VERSION if value[72] == 0 => {
             if !mtu_is_absent {
@@ -917,12 +924,15 @@ fn entry_profile_is_canonical(value: &[u8; GTPU_SESSION_ENTRY_LEN]) -> bool {
             }
         }
         ENTRY_MTU_FORMAT_VERSION if value[72] == 0 => {
-            if !mtu_is_set {
+            let Some(mtu) = DownlinkInnerMtu::from_field(mtu_field) else {
                 return false;
-            }
-        }
-        N3_ENTRY_MTU_FORMAT_VERSION if value[72] <= 63 => {
-            if !mtu_is_set {
+            };
+            if value[1] != GtpuSessionIpFamily::Ipv6 as u8
+                || value[2] != GtpuSessionIpFamily::Ipv4 as u8
+                || u16::from_be_bytes([value[70], value[71]]) != crate::GTPU_UDP_PORT
+                || !mtu.is_packet_too_big()
+                || mtu.mtu() < 1280
+            {
                 return false;
             }
         }
@@ -1029,13 +1039,10 @@ fn entry_wire_is_canonical(
         || !wire_paa_is_canonical(value[1], inner_paa)
         || !wire_address_is_canonical(value[2], peer_outer)
         || !wire_address_is_canonical(value[2], local_outer)
-        || (matches!(
-            value[0],
-            N3_ENTRY_FORMAT_VERSION | N3_ENTRY_MTU_FORMAT_VERSION
-        ) && (!n3_outer_is_unicast(value[2], peer_outer)
-            || !n3_outer_is_unicast(value[2], local_outer)))
+        || (value[0] == N3_ENTRY_FORMAT_VERSION
+            && (!n3_outer_is_unicast(value[2], peer_outer)
+                || !n3_outer_is_unicast(value[2], local_outer)))
         || u32::from_ne_bytes([value[52], value[53], value[54], value[55]]) == 0
-        || u32::from_ne_bytes([value[56], value[57], value[58], value[59]]) == 0
         || !matches!(value[64], 0..=63 | 0xff)
     {
         return false;
@@ -1140,10 +1147,7 @@ impl<'a> GtpuSessionEntryWireView<'a> {
     /// Fixed-flow N3 QFI from the already validated atomic entry.
     #[must_use]
     pub const fn n3_qfi(self) -> Option<u8> {
-        if matches!(
-            self.wire[0],
-            N3_ENTRY_FORMAT_VERSION | N3_ENTRY_MTU_FORMAT_VERSION
-        ) {
+        if self.wire[0] == N3_ENTRY_FORMAT_VERSION {
             Some(self.wire[72])
         } else {
             None
@@ -1156,10 +1160,7 @@ impl<'a> GtpuSessionEntryWireView<'a> {
     #[must_use]
     #[inline(always)]
     pub const fn downlink_inner_mtu(self) -> Option<DownlinkInnerMtu> {
-        if matches!(
-            self.wire[0],
-            ENTRY_MTU_FORMAT_VERSION | N3_ENTRY_MTU_FORMAT_VERSION
-        ) {
+        if self.wire[0] == ENTRY_MTU_FORMAT_VERSION {
             DownlinkInnerMtu::from_field(u16::from_be_bytes([self.wire[73], self.wire[74]]))
         } else {
             None
@@ -3401,24 +3402,24 @@ mod tests {
     #[test]
     fn family_entries_round_trip_the_versioned_inner_mtu() {
         let mtu = DownlinkInnerMtu::in_tunnel_packet_too_big(1_300).expect("canonical MTU");
-        for entry in [
-            v4_entry().with_downlink_inner_mtu(mtu),
-            v6_entry().with_downlink_inner_mtu(mtu),
-            v4_entry()
-                .with_n3_qfi(7)
-                .unwrap()
-                .with_downlink_inner_mtu(mtu),
-            v6_entry()
-                .with_n3_qfi(63)
-                .unwrap()
-                .with_downlink_inner_mtu(mtu),
+        for original in [
+            v4_entry(),
+            v6_entry(),
+            v4_entry().with_n3_qfi(7).unwrap(),
+            v6_entry().with_n3_qfi(63).unwrap(),
         ] {
+            let configured = original.with_downlink_inner_mtu(mtu);
+            if original.inner_family() != GtpuSessionIpFamily::Ipv6 || original.n3_qfi().is_some() {
+                assert!(
+                    configured.is_none(),
+                    "unsupported profile must not be accepted"
+                );
+                continue;
+            }
+            let entry = configured.unwrap();
             let encoded = entry.encode();
             assert!(
-                matches!(
-                    encoded[0],
-                    ENTRY_MTU_FORMAT_VERSION | N3_ENTRY_MTU_FORMAT_VERSION
-                ),
+                encoded[0] == ENTRY_MTU_FORMAT_VERSION,
                 "the MTU is a versioned entry profile"
             );
             assert_eq!(encoded[73..75], mtu.field().to_be_bytes());
@@ -3451,7 +3452,7 @@ mod tests {
             );
         }
         // The wire view carries the same versioned accessor.
-        let entry = v6_entry().with_downlink_inner_mtu(mtu);
+        let entry = v6_entry().with_downlink_inner_mtu(mtu).unwrap();
         let authority = active(9, None, Some(entry)).encode();
         let reference = GtpuSessionGroupRef::single(group_id(), candidate(9, entry)).encode();
         let view = select_gtpu_session_entry_wire(
@@ -3487,7 +3488,8 @@ mod tests {
             assert!(GtpuSessionEntry::decode(&unversioned_mtu).is_none());
         }
         let current = v6_entry()
-            .with_downlink_inner_mtu(DownlinkInnerMtu::in_tunnel_packet_too_big(1_300).unwrap());
+            .with_downlink_inner_mtu(DownlinkInnerMtu::in_tunnel_packet_too_big(1_300).unwrap())
+            .unwrap();
         assert_eq!(current.encode()[0], 3);
         assert_eq!(GtpuSessionEntry::decode(&current.encode()), Some(current));
         assert!(!legacy_v6::entry_wire_is_canonical(
@@ -3499,39 +3501,57 @@ mod tests {
     #[test]
     fn inner_mtu_wire_refuses_unsupported_profiles() {
         let mtu = DownlinkInnerMtu::in_tunnel_packet_too_big(1_300).unwrap();
-        let valid = v6_entry().with_downlink_inner_mtu(mtu);
+        let valid = v6_entry().with_downlink_inner_mtu(mtu).unwrap();
         assert_eq!(GtpuSessionEntry::decode(&valid.encode()), Some(valid));
+        assert!(valid.with_n3_qfi(7).is_none());
+        let mut inner_v4 = valid;
+        inner_v4.inner_paa = v4_entry().inner_paa;
+        let mut n3 = valid;
+        n3.n3_qfi = Some(7);
         let mut outer_v6 = valid;
         outer_v6.peer_outer_address = v4_entry().peer_outer_address;
         outer_v6.local_outer_address = v4_entry().local_outer_address;
         let mut selected_port = valid;
         selected_port.uplink_source_port_policy = GtpuUplinkSourcePortPolicy::Selected(40_000);
+        let mut fragment_inner = valid;
+        fragment_inner.downlink_inner_mtu = DownlinkInnerMtu::fragment_inner(1_300);
+        let mut below_minimum = valid;
+        below_minimum.downlink_inner_mtu = DownlinkInnerMtu::in_tunnel_packet_too_big(1_279);
         for entry in [
-            v4_entry().with_downlink_inner_mtu(mtu),
-            valid.with_n3_qfi(7).unwrap(),
+            inner_v4,
+            n3,
             outer_v6,
             selected_port,
-            v6_entry().with_downlink_inner_mtu(DownlinkInnerMtu::fragment_inner(1_300).unwrap()),
-            v6_entry().with_downlink_inner_mtu(
-                DownlinkInnerMtu::in_tunnel_packet_too_big(1_279).unwrap(),
-            ),
+            fragment_inner,
+            below_minimum,
         ] {
-            assert!(
-                GtpuSessionEntry::decode(&entry.encode()).is_none(),
-                "{entry:?}"
-            );
-            let record = match entry.inner_family() {
-                GtpuSessionIpFamily::Ipv4 => active(9, Some(entry), None),
-                GtpuSessionIpFamily::Ipv6 => active(9, None, Some(entry)),
+            let mut plain = entry;
+            plain.downlink_inner_mtu = None;
+            assert!(plain
+                .with_downlink_inner_mtu(entry.downlink_inner_mtu.unwrap())
+                .is_none());
+            // Forge retained wire state independently of the refusing constructors.
+            let mut encoded = entry.encode();
+            if entry.n3_qfi.is_some() {
+                encoded[0] = 4;
+                encoded[72] = 7;
+                encoded[73..75].copy_from_slice(&mtu.field().to_be_bytes());
+            }
+            assert!(GtpuSessionEntry::decode(&encoded).is_none(), "{entry:?}");
+            let (mut record, slot) = match entry.inner_family() {
+                GtpuSessionIpFamily::Ipv4 => (active(9, Some(v4_entry()), None).encode(), 0),
+                GtpuSessionIpFamily::Ipv6 => (active(9, None, Some(v6_entry())).encode(), 1),
             };
-            assert!(GtpuSessionAuthorityWireView::decode(&record.encode()).is_none());
+            let offset = GROUP_HEADER_LEN + slot * GTPU_SESSION_ENTRY_LEN;
+            record[offset..offset + GTPU_SESSION_ENTRY_LEN].copy_from_slice(&encoded);
+            assert!(GtpuSessionAuthorityWireView::decode(&record).is_none());
         }
     }
 
     #[test]
     fn noncanonical_inner_mtu_profiles_are_rejected() {
         let mtu = DownlinkInnerMtu::in_tunnel_packet_too_big(1_300).expect("canonical MTU");
-        let mut encoded = v6_entry().with_downlink_inner_mtu(mtu).encode();
+        let mut encoded = v6_entry().with_downlink_inner_mtu(mtu).unwrap().encode();
         // An MTU profile must carry a canonical non-zero field.
         for field in [0_u16, 575, 0x7fff + 1] {
             let mut wrong = encoded;

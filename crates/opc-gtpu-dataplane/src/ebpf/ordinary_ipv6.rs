@@ -124,6 +124,12 @@ pub(super) fn ordinary_ipv6_plan(
                 "an IPv6 downlink inner MTU must be at least the IPv6 minimum MTU (1280)",
             ));
         }
+        if context.uplink_source_port_policy != crate::GtpuUplinkSourcePortPolicy::LegacyServicePort
+        {
+            return Err(GtpuError::UnsupportedFeature {
+                feature: "downlink_inner_mtu_with_selected_uplink_source_port",
+            });
+        }
     }
     let IpAddr::V6(ms_address) = context.ms_address else {
         return Err(GtpuError::invalid_config(
@@ -179,7 +185,12 @@ pub(super) fn ordinary_ipv6_plan(
         )
     })?;
     let entry = match context.downlink_inner_mtu.and_then(|mtu| mtu.to_wire()) {
-        Some(mtu) => entry.with_downlink_inner_mtu(mtu),
+        Some(mtu) => entry.with_downlink_inner_mtu(mtu).ok_or_else(|| {
+            GtpuError::invalid_config(
+                "pdp.downlink_inner_mtu",
+                "unsupported family-entry MTU profile",
+            )
+        })?,
         None => entry,
     };
     Ok(OrdinaryIpv6Plan {
@@ -361,7 +372,6 @@ impl EbpfGtpuDataplaneBackend {
             return Err(indeterminate());
         }
         let context = context_from_entry(entry, ifindex).ok_or_else(indeterminate)?;
-        crate::model::reject_unsupported_zero_peer_teid(context.peer_teid)?;
         Ok(context)
     }
 

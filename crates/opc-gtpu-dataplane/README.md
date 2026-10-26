@@ -173,7 +173,11 @@ carries the opt-in MTU in a versioned profile (2 bytes at 73..74; byte 75 is
 reserved; schema marker
 `OPC-GROUP-IP-v7`), tc steers an over-MTU packet to the same packet-too-big
 queue, and the consumer sends one in-tunnel RFC 4443 Packet Too Big quoting up
-to 1,232 octets. The MTU must be at least the IPv6 minimum 1,280.
+to 1,232 octets. The MTU must be at least the IPv6 minimum 1,280, the outer
+endpoints must be IPv4, and the uplink source-port policy must be
+`LegacyServicePort`. Grouped and N3 APIs refuse MTU policies. The consumer
+checks the default bearer's own active authority and source-port policy
+before sending; peer TEID zero remains a valid outgoing value.
 
 Under either policy, tc also steers every other inner IPv4 fragment of such
 a context (More Fragments set, or a non-zero fragment offset) to a second
@@ -198,6 +202,13 @@ packets and counts them (`downlink_missing_consumer`), so the host answers
 none of them with an ICMP error toward the peer, and they are not forwarded.
 MTU-bearing contexts must be drained before an SDK downgrade. See
 [control port](docs/control-port.md).
+
+`PeerTeid` represents the full outgoing peer-assigned domain, including zero
+as required by TS 29.281 section 5.1. Linux kernel-GTP and eBPF preserve zero
+through installation, readback, reconciliation and restart. G-PDU and N3 End
+Marker encoding preserve it on the wire. `Teid` remains strictly nonzero for
+local allocation and receive/map keys. `ReceivedN3UplinkTnl::new` accepts both
+`PeerTeid` and existing nonzero `Teid` arguments.
 
 - `GtpuDataplaneBackend`: async port for device and PDP lifecycle, typed PDP
   readback, classified installation, authority-safe exact removal, and probes.

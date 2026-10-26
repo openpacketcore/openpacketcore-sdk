@@ -594,7 +594,7 @@ impl EbpfGtpuDataplaneBackend {
         device: &GtpDevice,
         local: Ipv4Addr,
         peer: Ipv4Addr,
-        teid: crate::Teid,
+        teid: crate::PeerTeid,
         current: impl Fn() -> bool,
     ) -> Result<(), GtpuError> {
         let unavailable = || state_indeterminate("ebpf_n3_end_marker_socket");

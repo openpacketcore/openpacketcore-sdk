@@ -1397,7 +1397,7 @@ impl DownlinkPdr {
 /// FAR, endpoint binding, managed local address, and ingress attachment must
 /// form one canonical graph. This shared predicate keeps the production Aya
 /// loader and its deterministic fake from accepting different persisted
-/// state. It intentionally rejects zero TEIDs, zero peer TEIDs, unspecified UE
+/// state. It intentionally rejects zero local TEIDs, unspecified UE
 /// addresses, and a UE address equal to the managed local endpoint.
 #[must_use]
 pub fn default_bearer_graph_is_valid(
@@ -1413,7 +1413,6 @@ pub fn default_bearer_graph_is_valid(
         && pdr.ue_ip != managed_local_ip
         && far.peer_ip != [0; 4]
         && far.local_ip == managed_local_ip
-        && far.o_teid != [0; 4]
         && binding.is_valid()
         && binding.ingress_ifindex() == ingress_ifindex
         && binding.peer_address() == GtpuEndpointAddress::Ipv4(far.peer_ip)
@@ -1567,7 +1566,6 @@ impl MarkedBearerOwner {
             && self.local_teid != [0; 4]
             && self.uplink_far.peer_ip != [0; 4]
             && self.uplink_far.local_ip != [0; 4]
-            && self.uplink_far.o_teid != [0; 4]
             && (self.egress_dscp_wire <= 63 || self.egress_dscp_wire == 0xff)
             && self.downlink_binding.is_valid()
             && matches!(
@@ -1953,11 +1951,7 @@ fn bearer_owner_ipv4_wire_is_valid<const N: usize>(value: &[u8; N]) -> bool {
     if value[17] != 2 || !matches!(value[18], 1..=3) || value[19] != 0 {
         return false;
     }
-    if wire_u32(value, 0) == 0
-        || wire_u32(value, 4) == 0
-        || wire_u32(value, 8) == 0
-        || wire_u32(value, 12) == 0
-    {
+    if wire_u32(value, 0) == 0 || wire_u32(value, 4) == 0 || wire_u32(value, 8) == 0 {
         return false;
     }
     if value[16] > 63 && value[16] != 0xff {
@@ -2926,7 +2920,7 @@ mod tests {
         ));
         let mut zero_peer_teid = canonical_far;
         zero_peer_teid.o_teid = [0; 4];
-        assert!(!default_bearer_graph_is_valid(
+        assert!(default_bearer_graph_is_valid(
             local_teid,
             pdr,
             zero_peer_teid,
@@ -3581,11 +3575,23 @@ mod tests {
             malformed[offset] = replacement;
             assert!(!MarkedBearerOwner::decode(&malformed).is_valid());
         }
-        for range in [0..4, 4..8, 8..12, 12..16] {
+        for range in [0..4, 4..8, 8..12] {
             let mut malformed = encoded;
             malformed[range].fill(0);
             assert!(!MarkedBearerOwner::decode(&malformed).is_valid());
         }
+        // TS 29.281 section 5.1 permits zero only in the outgoing peer TEID.
+        let mut zero_peer = encoded;
+        zero_peer[12..16].fill(0);
+        let owner = MarkedBearerOwner::decode(&zero_peer);
+        assert!(owner.is_valid());
+        assert_eq!(owner.uplink_far.o_teid, [0; 4]);
+        assert!(owner.authorizes_uplink(&owner.uplink_far, owner.egress_dscp_wire()));
+        assert!(marked_owner_wire_authorizes_uplink(
+            &zero_peer,
+            &owner.uplink_far,
+            owner.egress_dscp_wire(),
+        ));
     }
 
     #[test]

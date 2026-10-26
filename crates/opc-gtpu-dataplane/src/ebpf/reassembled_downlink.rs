@@ -252,26 +252,24 @@ fn build_icmpv6_quote(inner: &[u8], mtu: u16) -> Option<Vec<u8>> {
     if 40 + usize::from(payload_length) != inner.len() {
         return None;
     }
+    if !ipv6_permits_error(inner) {
+        return None;
+    }
     let mut source = [0_u8; 16];
     source.copy_from_slice(&inner[8..24]);
     let mut destination = [0_u8; 16];
     destination.copy_from_slice(&inner[24..40]);
-    // Never answer an unspecified source, a multicast source, or a
-    // multicast destination.
-    if source == [0; 16] || source[0] == 0xff || destination[0] == 0xff {
+    // RFC 4443 section 2.4(e.6): the invoking source must identify one node.
+    // The zero interface identifier is the known subnet-router anycast
+    // address (RFC 4291 section 2.6.1); it cannot be the proxy source either.
+    if source == [0; 16]
+        || source[0] == 0xff
+        || std::net::Ipv6Addr::from(source).is_loopback()
+        || source[8..] == [0; 8]
+        || destination[0] == 0xff
+        || destination[8..] == [0; 8]
+    {
         return None;
-    }
-    // Never answer an ICMPv6 error (type < 128).
-    if inner[6] == 58 && inner.get(40).is_some_and(|kind| *kind < 128) {
-        return None;
-    }
-    // Never answer a non-initial fragment: the fragment header's offset field
-    // shares its first bytes with the upper-layer header.
-    if inner[6] == 44 {
-        let fragment = u16::from_be_bytes([*inner.get(42)?, *inner.get(43)?]);
-        if fragment & 0xfff8 != 0 {
-            return None;
-        }
     }
     // The error is sent from the subscriber (the invoking destination) to the
     // originator (the invoking source); the invoking order must not be copied
@@ -283,6 +281,57 @@ fn build_icmpv6_quote(inner: &[u8], mtu: u16) -> Option<Vec<u8>> {
         opc_gtpu_ebpf_common::GtpuPmtuSignal::Icmpv6PacketTooBig { inner_mtu: mtu },
         inner,
     )
+}
+
+/// RFC 4443 section 2.4(e.1-e.2): do not answer ICMPv6 errors or Redirects,
+/// including those behind extension headers. Unresolved chains and
+/// non-initial fragments are conservatively unsendable: their contents do
+/// not establish that generating another error is permitted.
+fn ipv6_permits_error(inner: &[u8]) -> bool {
+    let Some(&initial_next) = inner.get(6) else {
+        return false;
+    };
+    let mut next = initial_next;
+    let mut offset = 40_usize;
+    let mut seen_fragment = false;
+    for _ in 0..16 {
+        let length = match next {
+            0 | 43 | 60 => {
+                let Some(header) = inner.get(offset..offset + 2) else {
+                    return false;
+                };
+                (usize::from(header[1]) + 1) * 8
+            }
+            51 => {
+                let Some(header) = inner.get(offset..offset + 2) else {
+                    return false;
+                };
+                (usize::from(header[1]) + 2) * 4
+            }
+            44 => {
+                let Some(header) = inner.get(offset..offset + 8) else {
+                    return false;
+                };
+                if seen_fragment || u16::from_be_bytes([header[2], header[3]]) & 0xfff8 != 0 {
+                    return false;
+                }
+                seen_fragment = true;
+                8
+            }
+            58 => {
+                return inner
+                    .get(offset)
+                    .is_some_and(|kind| *kind >= 128 && *kind != 137);
+            }
+            _ => return true,
+        };
+        let Some(header) = inner.get(offset..offset + length) else {
+            return false;
+        };
+        next = header[0];
+        offset += length;
+    }
+    false
 }
 
 /// Resolve the UE's default-bearer uplink from its own complete Active graph,
@@ -338,7 +387,10 @@ fn family_tagged_default_uplink(
     entry: opc_gtpu_ebpf_common::GtpuSessionEntryWireView<'_>,
     inner_family: GtpuSessionIpFamily,
 ) -> Option<DefaultBearerUplink> {
-    if entry.outer_family() != GtpuSessionIpFamily::Ipv4 {
+    if entry.outer_family() != GtpuSessionIpFamily::Ipv4
+        || entry.n3_qfi().is_some()
+        || entry.uplink_source_port() != opc_gtpu_ebpf_common::GTPU_UDP_PORT
+    {
         return None;
     }
     if entry.bearer_mark() == [0; 4] {
@@ -363,6 +415,9 @@ fn family_tagged_default_uplink(
     if default_entry.bearer_mark() != [0; 4]
         || default_entry.inner_paa() != entry.inner_paa()
         || default_entry.outer_family() != GtpuSessionIpFamily::Ipv4
+        || default_entry.n3_qfi().is_some()
+        || default_entry.uplink_source_port() != opc_gtpu_ebpf_common::GTPU_UDP_PORT
+        || !default_entry.authorizes_uplink_key(&key)
     {
         return None;
     }
@@ -378,10 +433,7 @@ fn ipv4_default_uplink(
     local: [u8; 16],
     peer_teid: [u8; 4],
 ) -> Option<DefaultBearerUplink> {
-    if peer[4..].iter().any(|byte| *byte != 0)
-        || local[4..].iter().any(|byte| *byte != 0)
-        || peer_teid == [0; 4]
-    {
+    if peer[4..].iter().any(|byte| *byte != 0) || local[4..].iter().any(|byte| *byte != 0) {
         return None;
     }
     Some(DefaultBearerUplink {
