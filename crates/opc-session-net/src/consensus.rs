@@ -5046,7 +5046,11 @@ mod tests {
     ) -> SessionTopologyTransitionRequest {
         SessionTopologyTransitionRequest::try_new(
             transition_id,
-            SessionConsensusClusterId::new("consensus-membership-transition").expect("cluster"),
+            SessionConsensusClusterId::for_installation(
+                "consensus-membership-transition",
+                [0x5a; 32],
+            )
+            .expect("installation"),
             SessionConfigurationEpoch::new(expected_epoch).expect("expected epoch"),
             SessionConfigurationEpoch::new(desired_epoch).expect("desired epoch"),
             members.iter().copied().map(descriptor).collect(),

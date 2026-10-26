@@ -1047,7 +1047,8 @@ mod tests {
     ) -> SessionTopologyTransitionRequest {
         SessionTopologyTransitionRequest::try_new(
             transition_id,
-            SessionConsensusClusterId::new("membership-test").expect("test cluster"),
+            SessionConsensusClusterId::for_installation("membership-test", [0x5a; 32])
+                .expect("test installation"),
             SessionConfigurationEpoch::new(expected_epoch).expect("expected epoch"),
             SessionConfigurationEpoch::new(desired_epoch).expect("desired epoch"),
             members.iter().copied().map(descriptor).collect(),
@@ -1476,7 +1477,7 @@ mod tests {
         let changed_retained = manifest_with_descriptors(2, changed_retained_descriptors.clone());
         let changed_retained_request = SessionTopologyTransitionRequest::try_new(
             SessionTopologyTransitionId::from_bytes([30; 16]),
-            SessionConsensusClusterId::new("membership-test").expect("test cluster"),
+            changed_retained.consensus_identity().cluster_id(),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             changed_retained_descriptors,
@@ -1537,8 +1538,7 @@ mod tests {
         );
         let request = SessionTopologyTransitionRequest::try_new(
             SessionTopologyTransitionId::from_bytes([41; 16]),
-            SessionConsensusClusterId::new("different-membership-cluster")
-                .expect("different cluster"),
+            successor.consensus_identity().cluster_id(),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             (1..=5).map(descriptor).collect(),
@@ -1660,7 +1660,7 @@ mod tests {
         let successor = manifest_with_descriptors(2, desired.clone());
         let request = SessionTopologyTransitionRequest::try_new(
             SessionTopologyTransitionId::from_bytes([42; 16]),
-            SessionConsensusClusterId::new("membership-test").expect("test cluster"),
+            successor.consensus_identity().cluster_id(),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             desired,
@@ -1797,7 +1797,7 @@ mod tests {
             .expect("stage successor");
         let same_id_different_digest = SessionTopologyTransitionRequest::try_new(
             first,
-            SessionConsensusClusterId::new("membership-test").expect("test cluster"),
+            pending.consensus_identity().cluster_id(),
             SessionConfigurationEpoch::new(1).expect("expected epoch"),
             SessionConfigurationEpoch::new(2).expect("desired epoch"),
             (1..=5).map(descriptor).collect(),
