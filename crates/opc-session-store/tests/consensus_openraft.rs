@@ -652,6 +652,39 @@ impl SessionConsensusRpcHandler for HoldAppendEntriesForRequest {
     }
 }
 
+struct HoldFencedTransitionBeforeAdmission {
+    inner: Arc<dyn SessionConsensusRpcHandler>,
+    request_id: [u8; 16],
+    clock: Arc<MutableTestClock>,
+    received_at: StdMutex<Option<opc_types::Timestamp>>,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl fmt::Debug for HoldFencedTransitionBeforeAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HoldFencedTransitionBeforeAdmission(<redacted>)")
+    }
+}
+
+#[async_trait]
+impl SessionConsensusRpcHandler for HoldFencedTransitionBeforeAdmission {
+    async fn handle(
+        &self,
+        authenticated_sender: SessionConsensusNodeId,
+        request: SessionConsensusWireRequest,
+    ) -> SessionConsensusWireResponse {
+        if request.family == SessionConsensusRpcFamily::ForwardMutation
+            && contains_bytes(&request.payload, &self.request_id)
+        {
+            *self.received_at.lock().expect("admission arrival clock") = Some(self.clock.now_utc());
+            self.arrived.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.handle(authenticated_sender, request).await
+    }
+}
+
 struct Baseline36720ActivationProbeHandler {
     inner: Arc<dyn SessionConsensusRpcHandler>,
 }
@@ -4890,16 +4923,44 @@ async fn fenced_transition_expired_lease_is_rejected_at_committed_admission() {
             FencedTransitionMutation::delete(Generation::new(1)),
         )
         .expect("build expiry transition");
+        let admission = Arc::new(HoldFencedTransitionBeforeAdmission {
+            inner: cluster.stores[leader].rpc_handler(),
+            request_id: *expiry_request.request_id().as_bytes(),
+            clock: clock.clone(),
+            received_at: StdMutex::new(None),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        cluster.paths[&(source, leader)].install(admission.clone());
         // Admission checks lease time only when the command applies. Select the
         // exact expired boundary without spending the operation's protocol budget.
         clock.set(created.lease().expires_at());
+        assert!(
+            clock.now_utc() < created.lease().expires_at(),
+            "the renewal starts while its lease is still live"
+        );
         let renewal = store.fenced_transition(expiry_request.clone());
         tokio::pin!(renewal);
         assert!(
             futures_util::poll!(&mut renewal).is_pending(),
             "the renewal is admitted before the runtime stall"
         );
+        tokio::select! {
+            biased;
+            result = &mut renewal => panic!("renewal completed before leader admission was released: {result:?}"),
+            () = admission.arrived.notified() => {}
+        }
+        assert!(
+            admission
+                .received_at
+                .lock()
+                .expect("admission arrival clock")
+                .expect("the actual forwarded renewal reached the leader gate")
+                < created.lease().expires_at(),
+            "the forwarded renewal is live before leader admission"
+        );
         std::thread::sleep(OPERATION_TIMEOUT + Duration::from_millis(250));
+        admission.release.notify_one();
         let result = renewal.await;
         assert!(
             matches!(result, Err(StoreError::LeaseExpired)),
