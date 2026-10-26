@@ -71,6 +71,31 @@ fn activation(
     }
 }
 
+fn reactivate_v2(
+    conn: &Connection,
+    backend: &SqliteSessionBackend,
+    storage: SessionConsensusIdentity,
+    scope: SessionConsensusIdentity,
+    voters: &BTreeSet<SessionConsensusNodeId>,
+    now: Timestamp,
+) {
+    // Exercise the production activation step, including its current-scope,
+    // voter and profile checks. Log admission separately requires V2's scope
+    // to equal the storage anchor, so it cannot drive successor activation.
+    // This maintenance test does not bypass or change that validator.
+    let tx = conn.unchecked_transaction().unwrap();
+    let (outcome, replication) =
+        execute_application_intent_sync(&tx, &activation(false, scope, voters), &backend.caps, now)
+            .expect("activate V2 for the exact successor scope");
+    assert_eq!(outcome, SessionMutationOutcome::Unit);
+    assert!(replication.is_none());
+    tx.commit().unwrap();
+    assert!(protected_roster_profile_v2_activation_matches_scope_sync(
+        conn, storage, scope, voters
+    )
+    .unwrap());
+}
+
 fn roster_image(conn: &Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
     PROTECTED_ROSTER_TABLES
         .iter()
@@ -275,23 +300,33 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
     if v1 {
         // Restore V2 while all history is young, leaving only V1 inactive.
         // Otherwise a V2 failure could mask the independent V1 regression.
-        let restored = apply(
+        reactivate_v2(
             &conn,
             &backend,
             storage,
-            vec![command(
-                storage,
-                successor_identity,
-                next,
-                now,
-                activation(false, successor_identity, &successor),
-            )],
+            successor_identity,
+            &successor,
+            now,
         );
-        assert_eq!(
-            restored.responses[0].result,
-            Ok(SessionMutationOutcome::Unit)
+        // An inactive V1 profile must not hide a present foreign V2 policy.
+        conn.execute(
+            "UPDATE consensus_protected_roster_v2_activation SET voter_set_digest=?1",
+            [[0xCE_u8; 32].as_slice()],
+        )
+        .unwrap();
+        let foreign = roster_image(&conn);
+        let changes = conn.total_changes();
+        assert!(maintain_due_protected_roster_reclaim_sync(&conn, storage, due).is_err());
+        assert_eq!(conn.total_changes(), changes);
+        assert_eq!(roster_image(&conn), foreign);
+        reactivate_v2(
+            &conn,
+            &backend,
+            storage,
+            successor_identity,
+            &successor,
+            now,
         );
-        next += 1;
     }
     validate_existing_schema(&conn, storage).expect("post-cutover inactive layout is valid");
     validate_protected_roster_state_sync(&conn, storage).expect("inactive history remains valid");
@@ -357,17 +392,24 @@ fn assert_inactive_history_defers_until_reactivation(v1: bool, write_first: bool
         );
     }
 
+    let resume = if v1 {
+        activation(true, successor_identity, &successor)
+    } else {
+        reactivate_v2(
+            &conn,
+            &backend,
+            storage,
+            successor_identity,
+            &successor,
+            due,
+        );
+        SessionMutationIntent::AdvanceLogicalTime
+    };
     let activated = apply(
         &conn,
         &backend,
         storage,
-        vec![command(
-            storage,
-            successor_identity,
-            next,
-            due,
-            activation(v1, successor_identity, &successor),
-        )],
+        vec![command(storage, successor_identity, next, due, resume)],
     );
     assert_eq!(
         activated.responses[0].result,
