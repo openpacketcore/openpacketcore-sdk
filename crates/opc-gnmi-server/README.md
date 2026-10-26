@@ -79,6 +79,16 @@ sends a snapshot and `sync_response` only when that content changed. Requested
 SAMPLE and heartbeat intervals retain their cadence independently of excluded
 keys and values.
 
+`TARGET_DEFINED` chooses `ON_CHANGE` for configuration leaves backed by
+ConfigBus and `SAMPLE` for operational leaves, including mixed subtrees. The
+sample interval is `MgmtLimits::min_sample_interval`; clients must leave
+`sample_interval` zero in this mode. An explicit `SAMPLE` with zero interval
+also uses that minimum. Each subscription retains its own sampling, heartbeat
+and redundancy settings. A configuration event does not resample operational
+values, and a sample tick does not publish another subscription's paths.
+All schedules seed their comparison from the same authorized initial snapshot;
+overlapping paths are emitted once before `sync_response`.
+
 ## Async audit acknowledgement
 
 Capabilities, Get, Set, and Subscribe audit through
