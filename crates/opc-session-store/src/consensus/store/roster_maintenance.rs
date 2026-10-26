@@ -566,6 +566,103 @@ mod tests {
             .expect("lane joins");
     }
 
+    struct SteadyRosterLane {
+        start: tokio::time::Instant,
+        state: Arc<Mutex<(u64, u64, u64)>>,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl RosterMaintenanceLane for SteadyRosterLane {
+        fn occupancy(&self) -> Option<ProtectedRosterConsensusDiagnosticSnapshot> {
+            if !self.alive.load(Ordering::Relaxed) {
+                return None;
+            }
+            let (reclaimed, retired, _) = *self.state.lock().unwrap();
+            Some(ProtectedRosterConsensusDiagnosticSnapshot {
+                occupancy_valid: 1,
+                retained_reservations: 16 - reclaimed,
+                tombstone_reservations: reclaimed - retired,
+                ..Default::default()
+            })
+        }
+
+        async fn propose(&self) -> Option<RosterMaintenanceOutcome> {
+            // Sixteen signed-history completions at half-second intervals
+            // become eligible exactly 24 hours later, at the same rate. Model
+            // both backends' existing reclaim-first, one-action command seam.
+            let due = (self.start.elapsed().as_millis() / 500).min(16) as u64;
+            let mut state = self.state.lock().unwrap();
+            state.2 += 1;
+            if state.0 < due {
+                state.0 = due;
+            } else if state.1 < state.0 {
+                state.1 = state.0;
+            } else {
+                return Some(RosterMaintenanceOutcome::Idle);
+            }
+            Some(RosterMaintenanceOutcome::Applied)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_maintenance_retires_during_steady_half_second_arrivals() {
+        let state = Arc::new(Mutex::new((0, 0, 0)));
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let task = tokio::spawn(run_roster_maintenance_lane(SteadyRosterLane {
+            start: tokio::time::Instant::now(),
+            state: Arc::clone(&state),
+            alive: Arc::clone(&alive),
+        }));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let (reclaimed, retired, proposals) = *state.lock().unwrap();
+        alive.store(false, Ordering::Relaxed);
+        tokio::time::advance(ROSTER_MAINTENANCE_TICK).await;
+        task.await.unwrap();
+        assert_eq!(reclaimed, 16, "reclaim retains its existing throughput");
+        assert!(
+            retired >= 14,
+            "steady arrivals must not starve retirement: reclaimed={reclaimed}, retired={retired}"
+        );
+        assert!(
+            proposals <= 16,
+            "follow-up work is bounded to two commands per tick"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_maintenance_bounds_followups_when_applied_gauges_stay_flat() {
+        let observation = MockObservation::new(1, 1, None, false);
+        observation
+            .applies_without_count_reduction
+            .store(true, Ordering::Relaxed);
+        let (alive, task) = spawn_mock(Arc::clone(&observation));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..8 {
+            tokio::time::advance(ROSTER_MAINTENANCE_TICK).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(
+            (8..=16).contains(&proposals(&observation)),
+            "concurrent arrivals or predicate mismatch cannot cause a proposal storm"
+        );
+        alive.store(false, Ordering::Relaxed);
+        tokio::time::advance(ROSTER_MAINTENANCE_MAX_BACKOFF).await;
+        task.await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_dropped_store_stops_the_lane() {
         let observation = MockObservation::new(1, 0, None, false);

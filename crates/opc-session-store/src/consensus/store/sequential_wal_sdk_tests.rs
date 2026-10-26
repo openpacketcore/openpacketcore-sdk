@@ -63,6 +63,7 @@ struct Peer {
     handler: tokio::sync::RwLock<Option<Arc<dyn SessionConsensusRpcHandler>>>,
     profile_probe_behavior: AtomicU8,
     profile_probes: AtomicUsize,
+    roster_classes: std::sync::Mutex<Vec<crate::scope_scheduler::ScopeWorkClass>>,
     election_votes: std::sync::Mutex<Option<Arc<void_election::VoteGate>>>,
 }
 
@@ -88,6 +89,12 @@ impl SessionConsensusPeer for Peer {
         &self,
         request: SessionConsensusWireRequest,
     ) -> Result<SessionConsensusWireResponse, SessionConsensusPeerError> {
+        if request.family == crate::consensus::SessionConsensusRpcFamily::ForwardRosterMutation {
+            self.roster_classes
+                .lock()
+                .unwrap()
+                .push(super::session_consensus_work_class(&request)?);
+        }
         if request.family == crate::consensus::SessionConsensusRpcFamily::ReadBarrier
             && super::decode_bounded::<super::FencedTransitionV2CapabilityProbe>(&request.payload)
                 .is_ok()
@@ -200,6 +207,7 @@ impl Fleet {
                     handler: tokio::sync::RwLock::new(None),
                     profile_probe_behavior: AtomicU8::new(0),
                     profile_probes: AtomicUsize::new(0),
+                    roster_classes: std::sync::Mutex::new(Vec::new()),
                     election_votes: std::sync::Mutex::new(None),
                 })
             })
@@ -1293,4 +1301,73 @@ async fn roster_maintenance_native_reclaims_signed_roster_without_ordinary_traff
     .await;
     fleet.close().await;
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_emergency_bypasses_local_running_policy_quotas() {
+    assert_roster_emergency_policy_bypass(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_emergency_bypasses_local_resident_policy_quotas() {
+    assert_roster_emergency_policy_bypass(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_emergency_bypasses_forwarded_running_policy_quotas() {
+    assert_roster_emergency_policy_bypass(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_emergency_bypasses_forwarded_resident_policy_quotas() {
+    assert_roster_emergency_policy_bypass(true, true).await;
+}
+
+async fn assert_roster_emergency_policy_bypass(forwarded: bool, resident: bool) {
+    use super::membership_tests::{
+        roster_ingress_test_root, seed_roster_retained_with_saturation, MutableClock,
+    };
+    use crate::scope_scheduler::ScopeWorkClass;
+    use std::str::FromStr;
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let start = opc_types::Timestamp::from_str("2025-01-01T00:00:00Z").unwrap();
+    // Both durable engines must traverse the real proposal/forwarding paths.
+    for native in [false, true] {
+        let mut fleet = Fleet::new_with_mode_and_roster_root(
+            "roster-emergency",
+            native,
+            Some(roster_ingress_test_root()),
+        );
+        fleet.clock = Some(Arc::new(MutableClock::new(start)));
+        fleet.open().await;
+        let result = AssertUnwindSafe(async {
+            let ingress = fleet
+                .stores
+                .iter()
+                .find(|store| {
+                    let local_leader = store.inner.raft.metrics().borrow().current_leader
+                        == Some(store.inner.local_node_id);
+                    local_leader != forwarded
+                })
+                .expect("selected ingress role");
+            seed_roster_retained_with_saturation(ingress, start, Some((&fleet.stores, resident)))
+                .await;
+            if forwarded {
+                let classes: Vec<_> = fleet
+                    .peers
+                    .iter()
+                    .flat_map(|peer| peer.roster_classes.lock().unwrap().clone())
+                    .collect();
+                assert_eq!(
+                    classes,
+                    vec![ScopeWorkClass::Emergency, ScopeWorkClass::SafetyControl],
+                    "real Q1/Q2 forwarding selects isolated transport classes"
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
+        fleet.close().await;
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
 }

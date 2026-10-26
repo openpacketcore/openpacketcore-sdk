@@ -171,3 +171,60 @@ mod tests {
         .is_err());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn roster_emergency_v2_transport_uses_bound_class_and_rejects_declared_promotion() {
+    use crate::consensus::types::roster_v2_persistence_fixture_for_class;
+    use crate::fenced_mutation_roster::{AdmissionClass, Phase};
+    for (class, expected) in [
+        (AdmissionClass::Ordinary, ScopeWorkClass::Normal),
+        (AdmissionClass::Emergency, ScopeWorkClass::Emergency),
+    ] {
+        let signed = roster_v2_persistence_fixture_for_class(Phase::Established, class);
+        let command =
+            ConsensusRosterAdmissionCommand::new_with_provenance_and_ingress_request_id_v2(
+                signed.admission,
+                signed.authority,
+                signed.admission_ingress.request_id(),
+                signed.admission_ingress,
+                signed.admission_provenance,
+            )
+            .unwrap();
+        let request = ForwardMutationRequest {
+            request_id: command.request_id().unwrap(),
+            intent: SessionMutationIntent::RosterAdmissionV2(Box::new(command)),
+            required_consumer_scope: ForwardConsumerScope::Internal,
+            work_class: ForwardWorkClass::Inferred,
+        };
+        let wire = |request| {
+            SessionConsensusWireRequest::try_new(
+                signed.identity,
+                SessionConsensusNodeId::new(1).unwrap(),
+                SessionConsensusRpcFamily::ForwardRosterMutation,
+                encode_roster_bounded(&ForwardRequest::Mutation(request)).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            session_consensus_work_class(&wire(request.clone())),
+            Ok(expected)
+        );
+        let mut forged = request;
+        forged.work_class = ForwardWorkClass::Declared(ScopeWorkClass::Emergency);
+        assert_eq!(
+            session_consensus_work_class(&wire(forged)),
+            Err(SessionConsensusPeerError::Protocol)
+        );
+        let terminal = ForwardMutationRequest {
+            request_id: signed.terminal_command.request_id().unwrap(),
+            intent: SessionMutationIntent::RosterTerminalV2(Box::new(signed.terminal_command)),
+            required_consumer_scope: ForwardConsumerScope::Internal,
+            work_class: ForwardWorkClass::Inferred,
+        };
+        assert_eq!(
+            session_consensus_work_class(&wire(terminal)),
+            Ok(ScopeWorkClass::SafetyControl)
+        );
+    }
+}

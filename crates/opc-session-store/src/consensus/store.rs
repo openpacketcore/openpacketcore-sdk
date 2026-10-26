@@ -23027,6 +23027,14 @@ mod membership_tests {
         store: &ConsensusSessionStore,
         start: Timestamp,
     ) {
+        seed_roster_retained_with_saturation(store, start, None).await;
+    }
+
+    pub(super) async fn seed_roster_retained_with_saturation(
+        store: &ConsensusSessionStore,
+        start: Timestamp,
+        saturation: Option<(&[ConsensusSessionStore], bool)>,
+    ) {
         let identity = store.current_scope().expect("roster scope").0;
         let root = roster_ingress_test_root();
         let key = SessionKey {
@@ -23119,7 +23127,12 @@ mod membership_tests {
             lease.fence(),
             Generation::new(1),
         )
-        .expect("admission");
+        .expect("admission")
+        .with_admission_class(if saturation.is_some() {
+            crate::fenced_mutation_roster::AdmissionClass::Emergency
+        } else {
+            crate::fenced_mutation_roster::AdmissionClass::Ordinary
+        });
         let authority = AuthorityBinding::for_admission(
             &admission,
             lease.owner().clone(),
@@ -23174,6 +23187,85 @@ mod membership_tests {
             admission_subject_identity_commitment,
             &admission_provenance_input,
         );
+        // Hold both the ordinary quotas and the finite protected pools. A
+        // class change into another finite pool would not meet the contract.
+        let mut running = Vec::new();
+        let mut resident = Vec::new();
+        if let Some((stores, hold_resident)) = saturation {
+            let budgets = crate::scope_scheduler::ScopeSchedulerBudgets::default();
+            for blocked in stores {
+                for pool in [
+                    &blocked.inner.proposal_admission,
+                    &blocked.inner.forward_admission,
+                ] {
+                    for class in [
+                        ScopeWorkClass::Normal,
+                        ScopeWorkClass::Emergency,
+                        ScopeWorkClass::SafetyControl,
+                    ] {
+                        let budget = budgets.class(class);
+                        if hold_resident {
+                            for _ in 0..budget.queued {
+                                resident.push(
+                                    pool.reserve_for(ScopeSchedulerKey::INTERNAL, class)
+                                        .await
+                                        .unwrap(),
+                                );
+                            }
+                        } else {
+                            for _ in 0..budget.running {
+                                running.push(
+                                    pool.acquire_for(ScopeSchedulerKey::INTERNAL, class)
+                                        .await
+                                        .unwrap(),
+                                );
+                            }
+                        }
+                    }
+                }
+                let ordinary = ForwardMutationRequest {
+                    request_id: SessionConsensusRequestId::new(),
+                    intent: SessionMutationIntent::AdvanceLogicalTime,
+                    required_consumer_scope: ForwardConsumerScope::Internal,
+                    work_class: ForwardWorkClass::Inferred,
+                };
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+                if blocked.inner.raft.metrics().borrow().current_leader
+                    == Some(blocked.inner.local_node_id)
+                {
+                    assert!(
+                        matches!(
+                            blocked
+                                .apply_on_local_leader(
+                                    ordinary,
+                                    blocked.inner.local_node_id,
+                                    deadline
+                                )
+                                .await,
+                            ForwardMutationReply::Unavailable
+                        ),
+                        "ordinary proposals still wait for their quota"
+                    );
+                } else {
+                    let leader = blocked
+                        .inner
+                        .raft
+                        .metrics()
+                        .borrow()
+                        .current_leader
+                        .unwrap();
+                    assert!(
+                        matches!(
+                            blocked
+                                .forward_mutation_before(leader, &ordinary, deadline)
+                                .await,
+                            Err(ConsensusPeerCallFailure::BeforeTransmission)
+                        ),
+                        "ordinary forwarding still waits before transmission"
+                    );
+                }
+            }
+        }
         let admission_response = service
             .execute_roster_ingress(
                 &roster_authorization,
@@ -23305,7 +23397,17 @@ mod membership_tests {
                 SessionConsumerRosterTerminalMutationResponse::Recorded(_)
             )
         ));
-        let occupancy = store.protected_roster_diagnostic_snapshot();
+        drop(running);
+        drop(resident);
+        let observer = saturation
+            .and_then(|(stores, _)| {
+                stores.iter().find(|candidate| {
+                    candidate.inner.raft.metrics().borrow().current_leader
+                        == Some(candidate.inner.local_node_id)
+                })
+            })
+            .unwrap_or(store);
+        let occupancy = observer.protected_roster_diagnostic_snapshot();
         assert_eq!(occupancy.occupancy_valid, 1);
         assert_eq!(occupancy.live_reservations, 0);
         assert_eq!(occupancy.retained_reservations, 1);
