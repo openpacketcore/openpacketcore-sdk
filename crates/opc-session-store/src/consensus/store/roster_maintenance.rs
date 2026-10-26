@@ -323,6 +323,7 @@ mod tests {
         proposal_delay: Option<std::time::Duration>,
         clears_on_proposal: bool,
         applies_without_count_reduction: std::sync::atomic::AtomicBool,
+        retry_followups: std::sync::atomic::AtomicBool,
         /// Simulate the owning store disappearing immediately after this many
         /// proposals.
         drop_after: Mutex<Option<usize>>,
@@ -347,6 +348,7 @@ mod tests {
                 proposal_delay,
                 clears_on_proposal,
                 applies_without_count_reduction: std::sync::atomic::AtomicBool::new(false),
+                retry_followups: std::sync::atomic::AtomicBool::new(false),
                 drop_after: Mutex::new(None),
             })
         }
@@ -393,6 +395,11 @@ mod tests {
                 .is_some_and(|limit| *self.observation.proposals.lock().unwrap() >= limit);
             if drop_now {
                 self.alive.store(false, Ordering::Relaxed);
+            }
+            if self.observation.retry_followups.load(Ordering::Relaxed)
+                && *self.observation.proposals.lock().unwrap() % 2 == 0
+            {
+                return Some(RosterMaintenanceOutcome::Retry);
             }
             Some(
                 if self.observation.clears_on_proposal
@@ -673,6 +680,33 @@ mod tests {
         alive.store(false, Ordering::Relaxed);
         tokio::time::advance(ROSTER_MAINTENANCE_MAX_BACKOFF).await;
         task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn roster_maintenance_keeps_reclaim_cadence_after_followup_failure() {
+        let observation = MockObservation::new(1, 1, None, false);
+        observation
+            .applies_without_count_reduction
+            .store(true, Ordering::Relaxed);
+        observation.retry_followups.store(true, Ordering::Relaxed);
+        let (alive, task) = spawn_mock(Arc::clone(&observation));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..8 {
+            tokio::time::advance(ROSTER_MAINTENANCE_TICK).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let attempts = proposals(&observation);
+        alive.store(false, Ordering::Relaxed);
+        tokio::time::advance(ROSTER_MAINTENANCE_MAX_BACKOFF).await;
+        task.await.unwrap();
+        assert_eq!(
+            attempts, 16,
+            "a failed optional follow-up must not slow successful reclaim below one turn per tick"
+        );
     }
 
     #[tokio::test(start_paused = true)]

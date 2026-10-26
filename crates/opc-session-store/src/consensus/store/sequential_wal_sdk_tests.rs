@@ -126,6 +126,7 @@ impl SessionConsensusPeer for Peer {
 
 struct Fleet {
     case: &'static str,
+    sqlite: bool,
     incarnation: u64,
     directory: tempfile::TempDir,
     snapshot_root: Option<std::path::PathBuf>,
@@ -224,6 +225,7 @@ impl Fleet {
             .collect();
         Self {
             case,
+            sqlite: false,
             incarnation: 0,
             directory,
             snapshot_root: None,
@@ -237,6 +239,47 @@ impl Fleet {
         }
     }
 
+    fn new_roster_production(
+        case: &'static str,
+        native: bool,
+        root: crate::fenced_mutation_roster::RosterAttestationTrustRootV1,
+    ) -> Self {
+        let mut fleet = Self::new_with_mode_and_roster_root(case, native, Some(root.clone()));
+        if !native {
+            // The older private SQLite-WAL experiment does not publish roster
+            // occupancy. Exercise the regular SQLite consensus implementation,
+            // including its real diagnostics and autonomous maintenance lane.
+            fleet.sqlite = true;
+            let members = fleet.topologies[0].members().to_vec();
+            let identity = crate::topology::derive_durable_quorum_consensus_identity_with_roster_attestation_root(
+                ConsensusClusterId::new("roster-sqlite").unwrap(),
+                ConsensusConfigurationEpoch::new(1).unwrap(),
+                &members.iter().map(QuorumReplicaDescriptor::configuration_fingerprint).collect::<Vec<_>>(),
+                Some(&root),
+            );
+            fleet.topologies = members
+                .iter()
+                .map(|member| {
+                    ValidatedQuorumTopology::try_from(
+                        QuorumTopologyConfig::new_consensus(
+                            member.replica_id().clone(),
+                            members.clone(),
+                            identity,
+                        )
+                        .with_roster_attestation_trust_root(root.clone()),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            for (peer, topology) in fleet.peers.iter_mut().zip(&fleet.topologies) {
+                let peer = Arc::get_mut(peer).expect("unopened fixture uniquely owns each peer");
+                peer.identity = identity;
+                peer.node = topology.local_consensus_node_id().unwrap();
+            }
+        }
+        fleet
+    }
+
     async fn open(&mut self) {
         assert!(self.stores.is_empty());
         self.incarnation += 1;
@@ -245,7 +288,9 @@ impl Fleet {
                 self.directory.path().join(format!("node-{index}.sqlite")),
             )
             .expect("real SDK database");
-            backend.private_wal_test = Some(Arc::clone(&self.tests[index]));
+            if !self.sqlite {
+                backend.private_wal_test = Some(Arc::clone(&self.tests[index]));
+            }
             if let Some(limits) = self.scan_limits {
                 backend = backend.with_scope_scan_limits(limits);
             }
@@ -269,7 +314,19 @@ impl Fleet {
             } else {
                 SnapshotIntegrityPolicy::PortableVerified
             };
-            let result =
+            let result = if self.sqlite {
+                ConsensusSessionStore::open_with_clock(
+                    self.topologies[index].clone(),
+                    backend,
+                    snapshot_directory,
+                    peers,
+                    self.clock
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(crate::SystemClock)),
+                    super::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                )
+                .await
+            } else {
                 ConsensusSessionStore::open_fixed_durable_quorum_with_clock_and_snapshot_integrity(
                     self.topologies[index].clone(),
                     backend,
@@ -281,7 +338,8 @@ impl Fleet {
                     super::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
                     snapshot_integrity,
                 )
-                .await;
+                .await
+            };
             match result {
                 Ok(store) => self.stores.push(store),
                 Err(error) => {
@@ -292,10 +350,17 @@ impl Fleet {
         }
         for (peer, store) in self.peers.iter().zip(&self.stores) {
             *peer.handler.write().await = Some(store.rpc_handler());
-            assert!(
-                store.inner.private_wal.is_some(),
-                "actual SDK store selected the private WAL"
-            );
+            if self.sqlite {
+                assert!(
+                    store.inner.private_wal.is_none(),
+                    "regular SQLite consensus selected"
+                );
+            } else {
+                assert!(
+                    store.inner.private_wal.is_some(),
+                    "actual SDK store selected the private WAL"
+                );
+            }
         }
         // Every new store starts with local traffic admission disabled.
         // This existing API also verifies and admits nonpristine members;
@@ -313,18 +378,31 @@ impl Fleet {
         }
         let ready = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let reports = join_all(self.stores.iter().map(|store| async {
-                    store
-                        .probe_fixed_durable_quorum_readiness()
-                        .await
-                        .traffic_authority()
-                }))
-                .await;
-                if reports
-                    .iter()
-                    .all(|report| *report == FixedQuorumTrafficAuthority::Granted)
-                {
-                    break;
+                if self.sqlite {
+                    let reports = join_all(self.stores.iter().map(|store| {
+                        store.linearizable_barrier_before(
+                            tokio::time::Instant::now()
+                                + super::DEFAULT_SESSION_CONSENSUS_OPERATION_TIMEOUT,
+                        )
+                    }))
+                    .await;
+                    if reports.iter().all(Result::is_ok) {
+                        break;
+                    }
+                } else {
+                    let reports = join_all(self.stores.iter().map(|store| async {
+                        store
+                            .probe_fixed_durable_quorum_readiness()
+                            .await
+                            .traffic_authority()
+                    }))
+                    .await;
+                    if reports
+                        .iter()
+                        .all(|report| *report == FixedQuorumTrafficAuthority::Granted)
+                    {
+                        break;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -1333,11 +1411,8 @@ async fn assert_roster_emergency_policy_bypass(forwarded: bool, resident: bool) 
     let start = opc_types::Timestamp::from_str("2025-01-01T00:00:00Z").unwrap();
     // Both durable engines must traverse the real proposal/forwarding paths.
     for native in [false, true] {
-        let mut fleet = Fleet::new_with_mode_and_roster_root(
-            "roster-emergency",
-            native,
-            Some(roster_ingress_test_root()),
-        );
+        let mut fleet =
+            Fleet::new_roster_production("roster-emergency", native, roster_ingress_test_root());
         fleet.clock = Some(Arc::new(MutableClock::new(start)));
         fleet.open().await;
         let result = AssertUnwindSafe(async {
@@ -1411,11 +1486,8 @@ async fn assert_roster_emergency_v2_policy_bypass(forwarded: bool, resident: boo
                 time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
             ),
         ));
-        let mut fleet = Fleet::new_with_mode_and_roster_root(
-            "roster-emergency-v2",
-            native,
-            Some(seed.root.clone()),
-        );
+        let mut fleet =
+            Fleet::new_roster_production("roster-emergency-v2", native, seed.root.clone());
         fleet.clock = Some(clock.clone());
         fleet.open().await;
         let result = AssertUnwindSafe(async {
@@ -1547,10 +1619,10 @@ async fn assert_signed_roster_steady_retirement(native: bool) {
     let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
     let start = opc_types::Timestamp::from_str("2025-01-01T00:00:00Z").unwrap();
     let clock = Arc::new(MutableClock::new(start));
-    let mut fleet = Fleet::new_with_mode_and_roster_root(
+    let mut fleet = Fleet::new_roster_production(
         "roster-steady-maintenance",
         native,
-        Some(roster_ingress_test_root()),
+        roster_ingress_test_root(),
     );
     fleet.clock = Some(clock.clone());
     fleet.open().await;

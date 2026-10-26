@@ -3642,7 +3642,7 @@ pub(crate) mod tests {
             credential_id,
             class,
             member_count,
-            identity: legacy_identity(),
+            identity: None,
             scope: Scope::from_digest([0x95; 32]),
         })
     }
@@ -3662,7 +3662,7 @@ pub(crate) mod tests {
             credential_id: 1,
             class,
             member_count: FRESH_ROSTER_MEMBERS,
-            identity,
+            identity: Some(identity),
             scope,
         })
     }
@@ -3675,7 +3675,7 @@ pub(crate) mod tests {
         credential_id: u64,
         class: crate::fenced_mutation_roster::AdmissionClass,
         member_count: usize,
-        identity: SessionConsensusIdentity,
+        identity: Option<SessionConsensusIdentity>,
         scope: Scope,
     }
 
@@ -3778,7 +3778,7 @@ pub(crate) mod tests {
             &root_key,
             RosterTestCertificateInput {
                 role: RosterAttestationCertificateRoleV1::TransportIngress,
-                identity,
+                identity: roster_v2_fixture_identity(identity),
                 scope: admission.scope().digest(),
                 subject_identity_commitment: ingress_input.peer_identity_commitment,
                 key_id: [0x9d; 32],
@@ -3797,7 +3797,7 @@ pub(crate) mod tests {
         .expect("V2 admission ingress");
         let provenance_input =
             RosterProfileV2CompactAdmissionProvenanceSigningInputV1::for_admission(
-                identity,
+                roster_v2_fixture_identity(identity),
                 &admission,
                 &authority,
                 &admission_ingress,
@@ -3862,7 +3862,7 @@ pub(crate) mod tests {
         .expect("V2 terminal record");
         let input_for = |member: &Member| RosterProfileV2TerminalAttestationSigningInputV1 {
             profile: Profile::v2(),
-            configuration_identity: identity,
+            configuration_identity: roster_v2_fixture_identity(identity),
             certificate_subject_identity_commitment: [0xa3; 32],
             certificate_role: RosterAttestationCertificateRoleV1::Executor,
             admission_provenance_commitment: provenance
@@ -3920,7 +3920,7 @@ pub(crate) mod tests {
                     &root_key,
                     RosterTestCertificateInput {
                         role: RosterAttestationCertificateRoleV1::Provider,
-                        identity,
+                        identity: roster_v2_fixture_identity(identity),
                         scope: authority.ingress_scope().digest(),
                         subject_identity_commitment: [0xa4; 32],
                         key_id: [0xa5; 32],
@@ -3963,7 +3963,7 @@ pub(crate) mod tests {
                 &root_key,
                 RosterTestCertificateInput {
                     role: RosterAttestationCertificateRoleV1::Executor,
-                    identity,
+                    identity: roster_v2_fixture_identity(identity),
                     scope: authority.ingress_scope().digest(),
                     subject_identity_commitment: [0xa3; 32],
                     key_id: [0xa6; 32],
@@ -3997,7 +3997,7 @@ pub(crate) mod tests {
                 &root_key,
                 RosterTestCertificateInput {
                     role: RosterAttestationCertificateRoleV1::TransportIngress,
-                    identity,
+                    identity: roster_v2_fixture_identity(identity),
                     scope: admission.scope().digest(),
                     subject_identity_commitment: terminal_ingress_input.peer_identity_commitment,
                     key_id: [0xa2; 32],
@@ -4043,13 +4043,22 @@ pub(crate) mod tests {
         )
         .expect("V2 terminal command");
         RosterV2PersistenceFixture {
-            identity,
+            identity: roster_v2_fixture_identity(identity),
             root,
             admission,
             authority,
             admission_ingress,
             admission_provenance: provenance,
             terminal_command,
+        }
+    }
+
+    fn roster_v2_fixture_identity(
+        identity: Option<SessionConsensusIdentity>,
+    ) -> SessionConsensusIdentity {
+        match identity {
+            Some(identity) => identity,
+            None => legacy_identity(),
         }
     }
 
