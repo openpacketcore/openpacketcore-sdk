@@ -591,6 +591,10 @@ jobs:
       - name: Require kernel SCTP support and isolated network namespaces
         run: |
           set -euo pipefail
+          # The Azure HTTP mirror repeatedly stalled this job before any SCTP test ran.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
           sudo apt-get update
           sudo apt-get install -y iproute2 iptables kmod nftables
           if ! sudo modprobe sctp; then
