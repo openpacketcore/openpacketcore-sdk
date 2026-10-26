@@ -403,6 +403,10 @@ and numeric bounds, demonstrate the pre-fix failure, and retain a real-time chec
 
 Local runs default to the merge base of `HEAD` and `origin/main`. An explicit
 base must be an ancestor of both, so a branch-only base cannot hide the change.
+For a pull request into `backlog`, use `--base origin/backlog --head HEAD`:
+the fetched backlog base must precede the comparison head, and that head must
+be in the checked-out history. Equal revisions and arbitrary branch bases
+remain rejected; this mode qualifies only the delta into `backlog`.
 Fetch the remote history and commit the candidate before running the guard.
 
 See [the inventory guard documentation](ci/README.md#test-inventory-guard) for

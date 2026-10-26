@@ -324,13 +324,23 @@ origin/main` to `HEAD`. Fetch the remote history first; a missing `origin/main`
 fails with guidance to fetch it. An explicit `--base` must be an ancestor of
 both the checked-out `HEAD` and `origin/main`. For example, `--base HEAD` is
 rejected on a branch with unmerged commits. A main-only or unrelated base is
-also rejected. This applies even when `--head` is supplied.
+also rejected. This applies even when `--head` is supplied, except for the
+explicit backlog-target comparison below.
 When both `--base` and `--head` are explicitly supplied, they must resolve to
 different commits, including when different refs name the same commit.
 Default, base-only and event comparisons with identical revisions pass as
 "nothing to compare", including local runs on unchanged main and train pushes
 at main's tip. Their JSON report sets `nothing_to_compare` to `true` and uses
 null inventory counts because no inventory comparison is needed.
+
+For a pull request into the integration branch, run
+`ci/test-inventory.py --base origin/backlog --head HEAD`. This narrowly named
+mode resolves the fetched `refs/remotes/origin/backlog` ref, requires it to be
+an ancestor of the comparison head, and requires that head to be in the
+checked-out history, as PR CI does. The full ref name is also accepted. Equal
+revisions, bare branch-only SHAs, other branch names and base-only invocations
+do not gain this exception. This qualifies the delta into `backlog`; the
+default main comparison remains necessary when landing that branch on main.
 
 Commit the candidate before comparing: the guard reads committed trees, not the
 working tree. For a historical proof, supply both `--base BASE` and `--head HEAD`;
