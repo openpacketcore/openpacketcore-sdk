@@ -297,6 +297,15 @@ impl BackendControlPort {
 }
 
 impl GtpuControlPort for BackendControlPort {
+    fn send_echo_request(
+        &self,
+        source: std::net::SocketAddr,
+        peer: std::net::SocketAddr,
+        sequence: u16,
+    ) -> Result<usize, GtpuControlPortError> {
+        self.with_socket(|socket| socket.send_echo_request(source, peer, sequence))
+    }
+
     fn try_receive_datagram(
         &self,
         maximum_bytes: usize,

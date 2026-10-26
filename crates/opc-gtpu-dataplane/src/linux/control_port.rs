@@ -371,6 +371,24 @@ fn send_datagram(
 }
 
 impl GtpuControlPort for LinuxControlPort {
+    fn send_echo_request(
+        &self,
+        source: SocketAddr,
+        peer: SocketAddr,
+        sequence: u16,
+    ) -> Result<usize, GtpuControlPortError> {
+        with_binding(self, |_slot, local, fd| {
+            let (SocketAddr::V4(source), SocketAddr::V4(peer)) = (source, peer) else {
+                return Err(GtpuControlPortError::InvalidTuple);
+            };
+            if !local.ip().is_unspecified() && source != local {
+                return Err(GtpuControlPortError::InvalidTuple);
+            }
+            let bytes = crate::control_port::echo_request_bytes(source, peer, sequence)?;
+            send_datagram(fd, peer, *source.ip(), &bytes)
+        })
+    }
+
     fn try_receive_datagram(
         &self,
         maximum_bytes: usize,

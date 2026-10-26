@@ -912,6 +912,24 @@ impl GtpuReassemblySocket {
 
 #[cfg(target_os = "linux")]
 impl crate::control_port::GtpuControlPort for GtpuReassemblySocket {
+    fn send_echo_request(
+        &self,
+        source: std::net::SocketAddr,
+        peer: std::net::SocketAddr,
+        sequence: u16,
+    ) -> Result<usize, crate::control_port::GtpuControlPortError> {
+        use crate::control_port::{echo_request_bytes, GtpuControlPortError};
+        let (std::net::SocketAddr::V4(source), std::net::SocketAddr::V4(peer)) = (source, peer)
+        else {
+            return Err(GtpuControlPortError::InvalidTuple);
+        };
+        if *source.ip() != self.local_address || self.port != GTPU_PORT {
+            return Err(GtpuControlPortError::InvalidTuple);
+        }
+        let bytes = echo_request_bytes(source, peer, sequence)?;
+        self.send_control_bytes(peer, &bytes)
+    }
+
     fn try_receive_datagram(
         &self,
         maximum_bytes: usize,
