@@ -6090,6 +6090,76 @@ mod restore_cancellation_tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
+    async fn consensus_restore_failure_diagnostic_records_variant_phase_and_elapsed() {
+        use tracing::instrument::WithSubscriber as _;
+
+        type Fields = std::collections::BTreeMap<String, String>;
+        struct Capture(Arc<StdMutex<Vec<Fields>>>);
+        struct Visitor(Fields);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+        }
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut visitor = Visitor(Fields::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+
+        let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
+        let held_permit = Arc::clone(&backend.restore_scan_workers)
+            .acquire_owned()
+            .await
+            .expect("hold restore worker admission");
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let result = backend
+            .consensus_scan_restore_records_at(
+                RestoreScanRequest::all(1),
+                backend.clock.now_utc(),
+                tokio::time::Instant::now() + Duration::from_millis(25),
+            )
+            .with_subscriber(Capture(Arc::clone(&events)))
+            .await;
+        assert!(matches!(result, Err(StoreError::BackendUnavailable(_))));
+        drop(held_permit);
+        let events = events.lock().unwrap();
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|fields| fields.contains_key("failure_variant"))
+            .collect();
+        assert_eq!(failures.len(), 1, "one redaction-safe phase diagnostic");
+        let fields = failures[0];
+        assert_eq!(fields["failure_variant"], "BackendUnavailable");
+        assert_eq!(fields["phase"], "worker_admission");
+        assert!(fields["elapsed_millis"].parse::<u128>().is_ok());
+        assert_eq!(
+            fields.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["elapsed_millis", "failure_variant", "message", "phase"],
+            "diagnostics cannot contain error text, identifiers or payloads"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn standalone_restore_admission_deadline_keeps_work_budget_contract() {
         let backend = SqliteSessionBackend::in_memory().expect("in-memory SQLite");
         let held_permit = Arc::clone(&backend.restore_scan_workers)

@@ -59,13 +59,37 @@ const RESTORE_SCAN_PAYLOAD_SQL: &str = r#"
     WHERE tenant = ?1 AND nf_kind = ?2 AND key_type = ?3 AND stable_id = ?4
 "#;
 
-struct RestoreScanProgressGuard<'a>(&'a Connection);
+struct RestoreScanProgressGuard<'a> {
+    connection: &'a Connection,
+    hard_budget: Arc<AtomicBool>,
+    cancellation: Arc<AtomicBool>,
+    operation_deadline: SqliteWorkDeadline,
+}
+
+impl RestoreScanProgressGuard<'_> {
+    fn classify_result<T>(
+        &self,
+        result: Result<T, StoreError>,
+        _profile: RestoreScanValidationProfile,
+    ) -> Result<T, StoreError> {
+        match result {
+            Err(StoreError::RestoreScanWorkBudgetExceeded)
+                if !self.hard_budget.load(Ordering::Acquire)
+                    && (self.operation_deadline.is_elapsed()
+                        || self.cancellation.load(Ordering::Acquire)) =>
+            {
+                Err(super::restore_scan_deadline_unavailable())
+            }
+            other => other,
+        }
+    }
+}
 
 // Registration/removal can fail only for a borrowed raw SQLite handle. The
 // restore worker opens an owning connection and retains it through this guard.
 impl Drop for RestoreScanProgressGuard<'_> {
     fn drop(&mut self) {
-        self.0
+        self.connection
             .progress_handler(0, None::<fn() -> bool>)
             .expect("restore scan owns its SQLite connection");
     }
@@ -90,7 +114,9 @@ fn install_restore_scan_progress_budget(
     conn: &Connection,
     cancellation: Arc<AtomicBool>,
     operation_deadline: SqliteWorkDeadline,
-) -> (RestoreScanProgressGuard<'_>, Arc<AtomicBool>) {
+) -> RestoreScanProgressGuard<'_> {
+    let guard_cancellation = Arc::clone(&cancellation);
+    let guard_deadline = operation_deadline.clone();
     let callbacks = Arc::new(AtomicUsize::new(0));
     let callback_count = Arc::clone(&callbacks);
     // Set only for the fixed VM-work callback limit or the independent SQLite
@@ -130,7 +156,12 @@ fn install_restore_scan_progress_budget(
         }),
     )
     .expect("restore scan owns its SQLite connection");
-    (RestoreScanProgressGuard(conn), hard_budget)
+    RestoreScanProgressGuard {
+        connection: conn,
+        hard_budget,
+        cancellation: guard_cancellation,
+        operation_deadline: guard_deadline,
+    }
 }
 
 pub(crate) fn persisted_owner_id(value: String) -> Result<OwnerId, StoreError> {
@@ -1200,7 +1231,7 @@ pub(crate) fn scan_restore_records_sync(
     profile: RestoreScanValidationProfile,
 ) -> Result<RestoreScanPage, StoreError> {
     request.validate()?;
-    let (_progress_guard, hard_budget) = install_restore_scan_progress_budget(
+    let progress_guard = install_restore_scan_progress_budget(
         conn,
         Arc::clone(&cancellation),
         operation_deadline.clone(),
@@ -1213,18 +1244,7 @@ pub(crate) fn scan_restore_records_sync(
         operation_deadline.clone(),
         profile,
     );
-    // Prefer the terminal fixed-work-budget class whenever the progress
-    // handler actually observed the VM/wall cap. Otherwise a deadline or
-    // caller cancellation that interrupted the scan is retryable availability.
-    match result {
-        Err(StoreError::RestoreScanWorkBudgetExceeded)
-            if !hard_budget.load(Ordering::Acquire)
-                && (operation_deadline.is_elapsed() || cancellation.load(Ordering::Acquire)) =>
-        {
-            Err(super::restore_scan_deadline_unavailable())
-        }
-        other => other,
-    }
+    progress_guard.classify_result(result, profile)
 }
 
 fn scan_restore_records_sync_body(
@@ -1850,6 +1870,98 @@ mod tests {
             conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
                 .expect("progress handler is removed after the bounded scan"),
             1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consensus_restore_metadata_exhaustion_remains_terminal_after_caller_expiry() {
+        for cancel in [false, true] {
+            let conn = Connection::open_in_memory().expect("in-memory SQLite");
+            let cancellation = Arc::new(AtomicBool::new(false));
+            let budget = Duration::from_millis(20);
+            let guard = install_restore_scan_progress_budget(
+                &conn,
+                Arc::clone(&cancellation),
+                SqliteWorkDeadline::tokio(tokio::time::Instant::now() + budget),
+            );
+            // Metadata accounting can exhaust its own bound without a SQLite
+            // progress interrupt. A later clock or cancellation is not its cause.
+            let result = restore_scan_budget_from_lengths(
+                [RESTORE_SCAN_MAX_EXAMINED_METADATA_BYTES; 7],
+                0,
+                0,
+            )
+            .map(|_| ());
+            assert_eq!(result, Err(StoreError::RestoreScanWorkBudgetExceeded));
+            if cancel {
+                cancellation.store(true, Ordering::Release);
+            } else {
+                tokio::time::advance(budget).await;
+            }
+            assert_eq!(
+                guard.classify_result(result, RestoreScanValidationProfile::Consensus),
+                Err(StoreError::RestoreScanWorkBudgetExceeded),
+                "later cancellation={cancel} cannot relabel metadata exhaustion"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consensus_restore_deadline_during_sqlite_progress_is_retryable() {
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        let budget = Duration::from_millis(20);
+        let guard = install_restore_scan_progress_budget(
+            &conn,
+            Arc::new(AtomicBool::new(false)),
+            SqliteWorkDeadline::tokio(tokio::time::Instant::now() + budget),
+        );
+        tokio::time::advance(budget).await;
+        let result = conn
+            .query_row(
+                "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL \
+                 SELECT n + 1 FROM numbers WHERE n < 100000000) SELECT SUM(n) FROM numbers",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(restore_scan_sqlite_error);
+        assert!(matches!(
+            guard.classify_result(result, RestoreScanValidationProfile::Consensus),
+            Err(StoreError::BackendUnavailable(_))
+        ));
+        drop(guard);
+        assert_eq!(
+            conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)),
+            Ok(1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consensus_restore_deadline_after_fixed_work_exhaustion_keeps_terminal_error() {
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        let budget = Duration::from_secs(5);
+        let guard = install_restore_scan_progress_budget(
+            &conn,
+            Arc::new(AtomicBool::new(false)),
+            SqliteWorkDeadline::tokio(tokio::time::Instant::now() + budget),
+        );
+        let result = conn
+            .query_row(
+                "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL \
+                 SELECT n + 1 FROM numbers WHERE n < 100000000) SELECT SUM(n) FROM numbers",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(restore_scan_sqlite_error);
+        tokio::time::advance(budget).await;
+        assert_eq!(
+            guard.classify_result(result, RestoreScanValidationProfile::Consensus),
+            Err(StoreError::RestoreScanWorkBudgetExceeded),
+            "delayed delivery must preserve a real query-work failure"
+        );
+        drop(guard);
+        assert_eq!(
+            conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)),
+            Ok(1)
         );
     }
 
