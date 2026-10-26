@@ -291,7 +291,7 @@ fn lengths_truncations_and_decode_limits_are_enforced() {
             &DecodeErrorCode::IeCountExceeded
         );
     }
-    for n in [0, 1, 15, 17, 255] {
+    for n in [0, 1, 15] {
         let mut response = vec![0x2d, n];
         response.extend(vec![0; n as usize]);
         assert!(AuthenticationResponse::decode(&response, strict_context()).is_err());
@@ -520,7 +520,8 @@ fn review_default_decode_trims_extended_values_and_eap_padding() {
                 validation_level: level,
                 ..DecodeContext::default()
             };
-            assert!(decode_mm_message_body(kind, &padded, ctx).is_err());
+            let value = decode_mm_message_body(kind, &padded, ctx).unwrap();
+            assert_eq!(encoded(&value), canonical);
         }
     }
 }

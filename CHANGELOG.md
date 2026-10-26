@@ -522,6 +522,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   algorithm identifiers in the codec while the crypto providers continue to
   reject unimplemented algorithms. (#1515, #1526)
 
+- `opc-proto-nas`: apply first-occurrence selection to all optional-element
+  tables; accept framed extensions and non-critical unknown IEs at all
+  validation levels unless an explicit rejection policy is selected. Preserve
+  raw table-driven extensions while exposing the known value prefix, and trim
+  excess authentication value/padding bytes consistently. (#1255)
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a
