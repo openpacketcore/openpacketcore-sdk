@@ -1612,6 +1612,33 @@ mod tests {
     /// that reply, but only a genuinely wedged worker hits the watchdog.
     const WORKER_REPLY_WATCHDOG: Duration = Duration::from_secs(30);
 
+    #[test]
+    fn worker_observation_watchdog_precedes_hold_fallback() {
+        assert!(
+            WORKER_REPLY_WATCHDOG
+                .checked_mul(2)
+                .expect("watchdog bound")
+                <= DURABLE_AUDIT_TESTING_HOLD_MAX_DURATION,
+            "the reply observation must fail before a forgotten release can self-release"
+        );
+    }
+
+    fn observe_with_delayed_worker_release<T>(
+        held_worker: DurableAuditWorkerHold,
+        observe: impl FnOnce() -> T,
+    ) -> T {
+        // Exercise a completion later than the former 250 ms readback wait.
+        // Scoped ownership releases the hold and joins the helper even when
+        // the observer panics; the real append reply remains the evidence.
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                held_worker.release();
+            });
+            observe()
+        })
+    }
+
     #[tokio::test]
     async fn stalled_worker_bounds_acknowledgement_and_shutdown() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1662,14 +1689,15 @@ mod tests {
         // admitted append's outcome. Release the worker and observe its real
         // reply; the reply is the event, and WORKER_REPLY_WATCHDOG only guards
         // against a genuinely wedged worker (not a correctness deadline).
-        held_worker.release();
-        assert!(matches!(
-            admitted_reply
-                .recv_timeout(WORKER_REPLY_WATCHDOG)
-                .expect("observe the admitted append's final result")
-                .expect("the admitted append must complete successfully"),
-            WorkerReply::Appended
-        ));
+        observe_with_delayed_worker_release(held_worker, || {
+            assert!(matches!(
+                admitted_reply
+                    .recv_timeout(WORKER_REPLY_WATCHDOG)
+                    .expect("observe the admitted append's final result")
+                    .expect("the admitted append must complete successfully"),
+                WorkerReply::Appended
+            ));
+        });
         let reopened = open_sink(&path, 0x51, RETAIN_ALL).await;
         assert_eq!(
             reopened
@@ -1719,21 +1747,24 @@ mod tests {
             .try_recv()
             .expect("retain the real reply for the admitted timed-out append");
         drop(sink);
-        held_worker.release();
-        match admitted_reply
-            .recv_timeout(WORKER_REPLY_WATCHDOG)
-            .expect("observe the admitted append's final failure")
-        {
-            Err(DurableAuditSinkError::Store(ManagementAuditStoreError::Persistence(error))) => {
-                assert!(matches!(
-                    error.kind(),
-                    opc_persist::PersistErrorKind::Sqlite(message)
-                        if message.contains("injected append failure")
-                ));
+        observe_with_delayed_worker_release(held_worker, || {
+            match admitted_reply
+                .recv_timeout(WORKER_REPLY_WATCHDOG)
+                .expect("observe the admitted append's final failure")
+            {
+                Err(DurableAuditSinkError::Store(ManagementAuditStoreError::Persistence(
+                    error,
+                ))) => {
+                    assert!(matches!(
+                        error.kind(),
+                        opc_persist::PersistErrorKind::Sqlite(message)
+                            if message.contains("injected append failure")
+                    ));
+                }
+                Err(other) => panic!("unexpected admitted append failure: {other:?}"),
+                Ok(_) => panic!("the injected backend failure unexpectedly succeeded"),
             }
-            Err(other) => panic!("unexpected admitted append failure: {other:?}"),
-            Ok(_) => panic!("the injected backend failure unexpectedly succeeded"),
-        }
+        });
 
         Connection::open(&path)
             .expect("open failure control cleanup")
