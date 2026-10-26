@@ -1372,6 +1372,8 @@ For local RSA-PSS AUTH self-verification, use
 scheme; the existing hash-only helper retains its RSA PKCS#1 v1.5 selection.
 RSA verification is always available; RSA signing retains the opt-in
 `rsa-signing` feature and its documented timing-side-channel limitation.
+Opt-in RSA signing uses randomized private-operation blinding for both
+PKCS#1 v1.5 and PSS. This hardening does not eliminate the `rsa` timing advisory.
 See [reference-vector provenance](tests/data/crypto_vectors.md) for independent
 OpenSSL and published RFC evidence.
 

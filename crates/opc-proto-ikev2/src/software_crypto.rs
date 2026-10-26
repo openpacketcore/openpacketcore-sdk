@@ -1125,13 +1125,13 @@ impl IkeSignatureOperations for Ikev2SoftwareCryptoOperations {
                     })?;
                     let kind = match algorithm {
                         IkeSignatureAlgorithm::RsaPssSha2_256 => SoftwareSigningKeyKind::RsaPss256(
-                            Box::new(rsa::pss::SigningKey::new(private)),
+                            Box::new(rsa::pss::BlindedSigningKey::new(private)),
                         ),
                         IkeSignatureAlgorithm::RsaPssSha2_384 => SoftwareSigningKeyKind::RsaPss384(
-                            Box::new(rsa::pss::SigningKey::new(private)),
+                            Box::new(rsa::pss::BlindedSigningKey::new(private)),
                         ),
                         _ => SoftwareSigningKeyKind::RsaPss512(Box::new(
-                            rsa::pss::SigningKey::new(private),
+                            rsa::pss::BlindedSigningKey::new(private),
                         )),
                     };
                     Ok(Box::new(SoftwareIkeSigningKey { algorithm, kind }))
@@ -1360,11 +1360,11 @@ enum SoftwareSigningKeyKind {
     #[cfg(feature = "rsa-signing")]
     Rsa(Box<RsaPrivateKey>),
     #[cfg(feature = "rsa-signing")]
-    RsaPss256(Box<rsa::pss::SigningKey<rsa::sha2::Sha256>>),
+    RsaPss256(Box<rsa::pss::BlindedSigningKey<rsa::sha2::Sha256>>),
     #[cfg(feature = "rsa-signing")]
-    RsaPss384(Box<rsa::pss::SigningKey<rsa::sha2::Sha384>>),
+    RsaPss384(Box<rsa::pss::BlindedSigningKey<rsa::sha2::Sha384>>),
     #[cfg(feature = "rsa-signing")]
-    RsaPss512(Box<rsa::pss::SigningKey<rsa::sha2::Sha512>>),
+    RsaPss512(Box<rsa::pss::BlindedSigningKey<rsa::sha2::Sha512>>),
     EcdsaP256(Box<p256::ecdsa::SigningKey>),
     EcdsaP384(Box<p384::ecdsa::SigningKey>),
     EcdsaP521(Box<p521::ecdsa::SigningKey>),
@@ -1412,28 +1412,40 @@ impl IkeSigningKey for SoftwareIkeSigningKey {
                 }),
             #[cfg(feature = "rsa-signing")]
             SoftwareSigningKeyKind::RsaPss256(private) => {
-                use rsa::signature::Signer as RsaSigner;
-                let signature: rsa::pss::Signature = private.try_sign(message).map_err(|_| {
-                    CryptoOperationError::new(CryptoOperationErrorCode::SignatureComputationFailed)
-                })?;
+                use rsa::signature::RandomizedSigner as RsaSigner;
+                let signature: rsa::pss::Signature = private
+                    .try_sign_with_rng(&mut rsa::rand_core::OsRng, message)
+                    .map_err(|_| {
+                        CryptoOperationError::new(
+                            CryptoOperationErrorCode::SignatureComputationFailed,
+                        )
+                    })?;
                 let bytes: Box<[u8]> = signature.into();
                 Ok(bytes.to_vec())
             }
             #[cfg(feature = "rsa-signing")]
             SoftwareSigningKeyKind::RsaPss384(private) => {
-                use rsa::signature::Signer as RsaSigner;
-                let signature: rsa::pss::Signature = private.try_sign(message).map_err(|_| {
-                    CryptoOperationError::new(CryptoOperationErrorCode::SignatureComputationFailed)
-                })?;
+                use rsa::signature::RandomizedSigner as RsaSigner;
+                let signature: rsa::pss::Signature = private
+                    .try_sign_with_rng(&mut rsa::rand_core::OsRng, message)
+                    .map_err(|_| {
+                        CryptoOperationError::new(
+                            CryptoOperationErrorCode::SignatureComputationFailed,
+                        )
+                    })?;
                 let bytes: Box<[u8]> = signature.into();
                 Ok(bytes.to_vec())
             }
             #[cfg(feature = "rsa-signing")]
             SoftwareSigningKeyKind::RsaPss512(private) => {
-                use rsa::signature::Signer as RsaSigner;
-                let signature: rsa::pss::Signature = private.try_sign(message).map_err(|_| {
-                    CryptoOperationError::new(CryptoOperationErrorCode::SignatureComputationFailed)
-                })?;
+                use rsa::signature::RandomizedSigner as RsaSigner;
+                let signature: rsa::pss::Signature = private
+                    .try_sign_with_rng(&mut rsa::rand_core::OsRng, message)
+                    .map_err(|_| {
+                        CryptoOperationError::new(
+                            CryptoOperationErrorCode::SignatureComputationFailed,
+                        )
+                    })?;
                 let bytes: Box<[u8]> = signature.into();
                 Ok(bytes.to_vec())
             }

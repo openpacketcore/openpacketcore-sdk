@@ -291,6 +291,13 @@ and prehashed Ed25519 are explicitly unsupported. Certificate extraction
 still supplies a verification key, not certificate-chain trust. Startup
 PKCS#8 inspection supports P-521/Ed25519 without granting signing authority.
 
+A follow-up private-operation review replaced RSA-PSS's unblinded signer with
+the library's `BlindedSigningKey` and enabled the same randomized RSA blinding
+in the existing PKCS#1 helper. All 45 signature/provider tests pass on macOS
+and Linux, including unchanged PKCS#1 signature bytes and all PSS hashes.
+This reduces avoidable exposure but does not claim to resolve the underlying
+`rsa` timing advisory; the explicit signing feature restriction remains.
+
 The baseline public transform/offer regressions failed before implementation.
 Published RFC 4754 vectors exercise all three raw ECDSA widths, and RFC 8032
 test 2 proves exact pure Ed25519 output. OpenSSL independently verifies these

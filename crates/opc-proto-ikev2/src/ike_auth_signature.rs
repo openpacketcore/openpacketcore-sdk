@@ -1437,7 +1437,11 @@ pub(crate) fn rsa_pkcs1v15_sha256_sign(
 ) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
     let digest = Sha256::digest(signed_octets);
     private
-        .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+        .sign_with_rng(
+            &mut rsa::rand_core::OsRng,
+            Pkcs1v15Sign::new::<Sha256>(),
+            &digest,
+        )
         .map_err(|_| Ikev2IkeAuthVerificationError::SignatureComputationFailed)
 }
 

@@ -1042,6 +1042,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- IKE's opt-in RSA private operations use randomized blinding for PKCS#1 v1.5
+  and PSS. Wire algorithms and the existing RSA signing feature boundary are
+  unchanged; this is hardening, not a resolution of the `rsa` timing advisory.
+
 - `opc-sctp`: add explicit SHA-256-first SCTP-AUTH preference with the
   mandatory SHA-1 fallback. Verify endpoint preference before association
   setup and association-specific local chunk requirements after connect/accept.
