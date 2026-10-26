@@ -496,7 +496,7 @@ async fn standard_snapshot_rejects_incomparable_vote_before_staging() {
     )
     .await
     .unwrap();
-    store.disable_automatic_elections_for_test();
+    store.inner.raft.runtime_config().elect(false);
     let current_vote = Vote::new(5, local);
     store
         .inner

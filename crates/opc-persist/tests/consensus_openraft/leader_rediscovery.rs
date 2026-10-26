@@ -60,14 +60,6 @@ async fn rejection_after_a_lost_commit_reply_retains_unknown_outcome() {
     refusal_after_a_lost_commit_reply_retains_unknown_outcome(rejected_mutation()).await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn no_quorum_after_a_lost_commit_reply_retains_unknown_outcome() {
-    // Current postcard tag: ForwardMutationReply::NoQuorum (5).
-    let reply =
-        opc_consensus::encode_bounded(&(opc_persist::CONFIG_CONSENSUS_WIRE_VERSION, 5_u8)).unwrap();
-    refusal_after_a_lost_commit_reply_retains_unknown_outcome(reply).await;
-}
-
 async fn refusal_after_a_lost_commit_reply_retains_unknown_outcome(payload: Vec<u8>) {
     schedule::with_frozen_time(async {
         let cluster = ThreeNodeCluster::build([[0x55; 32]; 3]).await;
@@ -167,13 +159,16 @@ async fn redirected_call_retains_original_view(read: bool) {
             }))
             .await;
         let new_path = &cluster.paths[&(follower, redirected)];
+        let grace = opc_consensus::DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE;
+        let reply_after_grace = Duration::from_millis(300);
+        let reply_delay = grace + reply_after_grace;
         let completed = Arc::new(AtomicUsize::new(0));
         new_path
             .install(Arc::new(ApplicationReply {
                 inner: cluster.stores[redirected].rpc_handler(),
                 family,
                 payload: reply,
-                delay: Duration::from_millis(500),
+                delay: reply_delay,
                 completed: completed.clone(),
             }))
             .await;
@@ -192,11 +187,11 @@ async fn redirected_call_retains_original_view(read: bool) {
             };
             tokio::pin!(operation);
             assert!(futures_util::poll!(&mut operation).is_pending());
-            // Observe the old 200 ms retirement boundary before the reply is
+            // Poll at the declared retirement boundary before the reply is
             // ready, so a biased select cannot hide premature route retirement.
-            tokio::time::advance(Duration::from_millis(200)).await;
+            tokio::time::advance(grace).await;
             assert!(futures_util::poll!(&mut operation).is_pending());
-            tokio::time::advance(Duration::from_millis(300)).await;
+            tokio::time::advance(reply_after_grace).await;
             let outcome = futures_util::poll!(&mut operation);
             if outcome.is_pending() && completed.load(Ordering::SeqCst) == 1 {
                 // The read still joins real SQLite I/O after the barrier reply.
@@ -206,7 +201,7 @@ async fn redirected_call_retains_original_view(read: bool) {
                 outcome
             }
         };
-        assert_eq!(started.elapsed(), Duration::from_millis(500));
+        assert_eq!(started.elapsed(), reply_delay);
         let view_after_reply = cluster.stores[follower].status().leader_id;
         old_path.install(cluster.stores[leader].rpc_handler()).await;
         new_path

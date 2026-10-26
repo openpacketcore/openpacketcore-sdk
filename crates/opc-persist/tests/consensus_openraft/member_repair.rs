@@ -572,17 +572,22 @@ async fn repair_download_makes_progress_across_bounded_initialize_attempts() {
 }
 
 fn large_attested(tx: TxId) -> AttestedConfigCommit {
-    large_attested_with_plaintext(tx, 256 * 1024)
+    large_attested_with_plaintext(tx, None, 1, 256 * 1024)
 }
 
-fn large_attested_with_plaintext(tx: TxId, plaintext_bytes: usize) -> AttestedConfigCommit {
-    let mut record = commit(tx, None, 1, 0x41);
+fn large_attested_with_plaintext(
+    tx: TxId,
+    parent: Option<TxId>,
+    version: u64,
+    plaintext_bytes: usize,
+) -> AttestedConfigCommit {
+    let mut record = commit(tx, parent, version, 0x41);
     let aad = EnvelopeAad::config(
         opc_types::TenantId::from_static("tenant-a"),
         record.version.get(),
         ConfigAad::new(
             tx,
-            None,
+            parent,
             record.committed_at,
             &record.principal,
             record.schema_digest,
@@ -805,13 +810,27 @@ async fn repair_transfer_verifies_once_and_derives_one_size_following_attempt_bu
     let mut cluster = ThreeNodeCluster::start().await;
     let tx = TxId::new();
     let payload_bytes = 2 * 1024 * 1024;
-    cluster.stores[cluster.leader()]
-        .append_commit_idempotent(
-            ConfigConsensusRequestId::from_bytes([0x51; 16]),
-            large_attested_with_plaintext(tx, payload_bytes),
-        )
-        .await
-        .unwrap();
+    // Keep the same aggregate snapshot payload while each individual command
+    // fits the existing 1 MiB replication admission limit.
+    let mut parent = None;
+    for (index, transaction) in [TxId::new(), TxId::new(), TxId::new(), tx]
+        .into_iter()
+        .enumerate()
+    {
+        cluster.stores[cluster.leader()]
+            .append_commit_idempotent(
+                ConfigConsensusRequestId::from_bytes([0x51 + index as u8; 16]),
+                large_attested_with_plaintext(
+                    transaction,
+                    parent,
+                    index as u64 + 1,
+                    payload_bytes / 4,
+                ),
+            )
+            .await
+            .unwrap();
+        parent = Some(transaction);
+    }
     cluster.stores[0].shutdown().await.unwrap();
     let leader = cluster.leader();
     assert_ne!(leader, 0);
@@ -862,7 +881,7 @@ async fn repair_transfer_verifies_once_and_derives_one_size_following_attempt_bu
     }
     // Each whole-file verification costs a quarter second. Per-chunk
     // re-verification of this multi-chunk snapshot exceeds the 3 s operation
-    // deadline; one verification plus cheap chunk reads fits the size-derived
+    // deadline; one verification plus cheap chunk reads fits the original
     // transfer attempt.
     cluster.stores[leader].set_snapshot_verification_delay_for_test(Duration::from_millis(250));
     let verifications_before = cluster.stores[leader].snapshot_envelope_verifications_for_test();

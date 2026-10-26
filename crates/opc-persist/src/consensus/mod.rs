@@ -41,10 +41,8 @@ pub(crate) use sqlite::{provision_retained_schema, validate_retained_schema};
 pub use history::{ConfigHistoryLimits, ConfigHistoryRetention};
 
 pub use store::{
-    ConfigConsensusOpenError, ConfigConsensusStatus, ConfigFailoverState, ConfigFailoverStatus,
-    ConfigLocalAuthorityOutcome, ConfigQuorumLeaseState, ConsensusConfigStore,
-    CONFIG_CONSENSUS_UNPLANNED_FAILOVER_DETECTION_BOUND,
-    DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
+    ConfigConsensusOpenError, ConfigConsensusStatus, ConfigLocalAuthorityOutcome,
+    ConsensusConfigStore, DEFAULT_CONFIG_CONSENSUS_OPERATION_TIMEOUT,
 };
 pub use types::{
     ApprovedLegacyConfigRecovery, ConfigConsensusClock, ConfigConsensusClusterId,

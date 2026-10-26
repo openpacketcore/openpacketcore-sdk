@@ -9,7 +9,7 @@ async fn voter_retry_reports_pending_prepare_when_target_returns() {
     let survivor = member(2, 1).identity.node_id();
     let target = member(3, 1).identity.node_id();
     for node in &fleet.nodes {
-        node.disable_automatic_elections_for_test();
+        node.inner.raft.runtime_config().elect(false);
     }
     network.handlers.write().unwrap().remove(&target);
     old.shutdown().await.unwrap();
@@ -107,7 +107,7 @@ async fn voter_retry_reports_an_attempt_waiting_for_peer_drain() {
     let old = fleet.nodes[2].clone();
     let target = member(3, 1).identity.node_id();
     for node in &fleet.nodes {
-        node.disable_automatic_elections_for_test();
+        node.inner.raft.runtime_config().elect(false);
     }
     fleet.network.handlers.write().unwrap().remove(&target);
     old.shutdown().await.unwrap();

@@ -276,6 +276,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-persist`: remove the SDK-only quorum-authority fence and automatic
+  election accelerator. Openraft retains election, vote and leader authority
+  under ADR 0019; #1048 and #1037 remain open for engine changes. Remove the
+  adapter-specific wire variants and metrics with those adapters.
+
 - `opc-session-store`: native key-removal business-change journal (partial
   #1252, PR2a). `BusinessChanges` can now stage an exact-predecessor key
   retirement as one `after=None` change with the predecessor content stamp and
@@ -332,25 +337,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beyond the preemptive headroom and full consumer/batch backpressure coverage
   remain in that qualification. Refs #1377.
 
-- `opc-persist`: an unplanned configuration-consensus leader loss no longer
-  waits for the engine's committed-vote lease **plus** a full sampled election
-  timeout before survivors campaign. A follower that has observed no
-  authenticated leader traffic for one complete declared lease plus the existing
-  stale-route grace (8.2 s) now requests an ordinary Pre-Vote round through the
-  public engine trigger; peer leader leases still deny the inquiry for a live
-  leader and the engine still persists a real self-vote and requires real quorum
-  vote grants, so no vote is fabricated and no election, heartbeat, lease or
-  quorum budget changes. Requests are staggered deterministically by membership
-  rank; the derived conditional first-campaign bound is 9.05 s from the last
-  authenticated leader contact for the highest follower rank (rank 0: 8.7 s;
-  maximum membership 9) while the complete operation deadline remains
-  the outer typed bound for an in-flight mutation. The path is value-free
-  observable through `ConsensusConfigStore::failover_status()`, the
-  `opc_persist_failover_accelerated_total` and
-  `opc_persist_failover_trigger_failures_total` counters and one info log per
-  requested campaign; the accelerator stays inactive when automatic elections
-  are disabled and never runs on the leader. Refs #1037.
-
 - `opc-session-store` / `opc-session-testkit`: a survivor restore scan whose
   caller deadline is consumed by the logical-time fence or the backend scan
   phase now reports a retryable availability outcome instead of the terminal
@@ -394,32 +380,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gated on the #1298 recovery-retirement API decision and #1306 automatic
   discharge (caller-deadline capacity backpressure is a documented follow-up);
   this change does not claim those acceptance items. Refs #1307.
-
-- `opc-persist`: a configuration-consensus leader that cannot obtain a quorum
-  acknowledgement within the fixed quorum-authority ceiling
-  (`election_timeout_max` = 8 s; the engine exposes only the
-  acknowledgement-age metric and defines no application leader lease, and this
-  is not the SDK's 2 s read-lease reuse constant) now withholds leader
-  authority instead of holding clients: local proposals fail with a typed
-  retryable `PersistErrorKind::Unavailable` before any proposal is attempted,
-  `ensure_local_authority[_at_config_head]` reports
-  `ConfigLocalAuthorityOutcome::Retry { leader_hint: None }`, and forwarded
-  mutations/read barriers receive the additive `NoQuorum` reply, which the
-  forwarding replica converts to the same bounded retryable outcome. A withheld
-  call proposes/applies/commits nothing and callers retry the same request
-  identity, so exactly-once behavior is unchanged. The transition is typed and
-  value-free through `ConsensusConfigStore::quorum_lease_state()`, the
-  `opc_persist_quorum_lease_lost_total` / `_restored_total` counters and one
-  warning/info log per transition, and authority returns automatically after two
-  consecutive healthy observations (a one-flush recovery debounce that prevents
-  marginal acknowledgements from flapping the fence). The ceiling is the latest
-  safe point — it waits until every follower's 5–8 s election timer has expired,
-  so a leader that just lost its majority may still accept uncommittable
-  proposals for up to about 8 s of the 10 s operation budget before the typed
-  retryable rejection; fencing earlier could reject a merely slow quorum and is
-  deliberately not done. The engine's election, heartbeat, quorum and
-  committed-log semantics are unchanged; the majority side independently elects
-  a successor. Refs #1048.
 
 - `opc-session-store`: the deterministic in-memory backend no longer refuses new
   work for the process lifetime after a fixed number of keys or lab
@@ -480,14 +440,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-persist`: a configuration-consensus leader-routed call is now bounded by
   this replica's own leader view. Once the engine has observed a successor for
   a lost leader, an unanswered forwarded mutation or linearizable read barrier
-  is abandoned after `DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (200 ms) and
+  is abandoned after `DURABLE_CONSENSUS_STALE_LEADER_ROUTE_GRACE` (one heartbeat, 2 s) and
   re-offered through that successor, instead of occupying the complete
   operation deadline. A route with no observed successor keeps the existing
   operation deadline and its typed ambiguous outcome; an abandoned forwarded
   mutation is classified as possibly transmitted and retries on the same
   request identity, so the configuration store still applies it exactly once.
   Election, heartbeat and forwarded-mutation timing budgets are unchanged.
-  Refs #1049.
+  Redirects retain the local view under which they were chosen, changing or
+  unknown successor views do not renew retirement, and a later refusal cannot
+  erase an earlier transmitted attempt's unknown outcome. Refs #1049.
 - `opc-gtpu-dataplane`: the per-destination inner fragmentation budget and
   the per-session in-tunnel Packet Too Big error budget no longer evict a
   destination or session that was used within the last 255 seconds. The

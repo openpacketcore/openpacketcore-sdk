@@ -8,7 +8,7 @@ use opc_consensus::engine::{
 async fn voter_remote_survivor_live_target_veto_has_no_effect() {
     let fleet = Fleet::open().await;
     for node in &fleet.nodes {
-        node.disable_automatic_elections_for_test();
+        node.inner.raft.runtime_config().elect(false);
     }
     let leader = fleet.nodes[0].clone();
     let old = member(3, 1).identity.node_id();
@@ -377,7 +377,7 @@ async fn add_candidate(
 async fn voter_provisional_prepare_reinstalls_the_engine_fence_before_reopened_rpc_admission() {
     let mut fleet = Fleet::open().await;
     for node in &fleet.nodes {
-        node.disable_automatic_elections_for_test();
+        node.inner.raft.runtime_config().elect(false);
     }
     fleet
         .network
@@ -427,7 +427,7 @@ async fn voter_provisional_prepare_reinstalls_the_engine_fence_before_reopened_r
     )
     .await
     .unwrap();
-    reopened.disable_automatic_elections_for_test();
+    reopened.inner.raft.runtime_config().elect(false);
     assert_eq!(reopened.voter_slot_state().await.unwrap(), provisional);
     fleet
         .network
