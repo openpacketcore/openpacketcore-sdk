@@ -51,6 +51,12 @@ so when the record later catches up the issuer must refuse the retained key
 before staging anything and let the worker shut down and start a fresh boot.
 Only candidate startup sessions can carry a refusal; liveness sessions and
 already admitted workers keep their existing handling.
+The refusal must be the first and sole response, before any notice page.
+`StartupError::PlatformChanged` also covers opaque Pod resource-version changes:
+re-probe the same boot in that case. Only independently established changed boot
+facts that cannot reconcile the retained key justify `BootRefusalReason::PlatformChanged`.
+Prerequisite refusal is an explicit issuer decision to end an attempt; restarting
+a worker does not repair the issuer's discovery or key access.
 
 The issuer sends a bounded `IssuedTicketNotice` on the retained startup stream.
 Its generation and record reference are hints: `ScopeServer` independently reads

@@ -236,8 +236,10 @@ service-account name/UID claims. Require the trusted time interval wholly within
 only through the configured HTTPS/API-CA endpoint, never a JWT-selected URL or
 `jku`. Refresh keys on an unknown `kid` or a signature-verification failure,
 including a changed key under an existing ID. Both triggers share one refresh
-attempt per second and replace the published key set; unknown keys never grant
-admission. An exact-name,
+attempt per second. A failed or cancelled refresh retains its source failure
+classification through throttled retries; a successful refresh replaces the
+published key set and clears that failure. Already verified cached keys remain
+usable, and unknown keys never grant admission. An exact-name,
 consistent Pod GET (no `resourceVersion=0`, no informer snapshot) must match
 UID, owner, service account and current running container observation. Ticket
 and closure readers need only exact-name, namespaced read access. Check the
@@ -249,6 +251,10 @@ the current GET, issuer generation floor and local guard remain necessary.
 Pending Pods, missing addresses, containers still waiting to start, and
 terminated containers still shown in the Pod status return `Unavailable`;
 enrollment and controlling-owner mismatches remain invalid.
+Revalidation reports `PlatformChanged` for a changed opaque resource version as
+well as changed boot facts. A resource-version-only change requires a fresh
+probe of the same boot. It does not justify refusing the boot; the caller must
+independently establish incompatible boot facts before choosing that response.
 
 The retained issuer startup session keeps the verified JWT validity bounds,
 without retaining its bearer token. Recheck these bounds and TLS authentication

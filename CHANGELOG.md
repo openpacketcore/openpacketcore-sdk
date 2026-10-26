@@ -219,7 +219,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can carry it. The issuer-side observation-sandwich limit (two consistent
   workload-record reads around the proof do not establish that the platform has
   published the current container restart) is documented on the delivery API
-  and in the crate README. Refs #1245.
+  and in the crate README. A refusal after any ticket-notice page is invalid;
+  RFC 026 and independent revision-two vectors specify its exact 81-byte body.
+  Normal predecessor exit releases the exclusion guard so a fresh boot can
+  start without deleting retained records. Refs #1245.
 - `opc-gtpu-dataplane`: the native TFT fragment-affinity table now partitions
   its 16,384 buckets into 256 owner groups of 64 buckets selected by the
   attachment and subscriber PAA, so one classified subscriber can occupy at
@@ -586,13 +589,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-session-net`: `StartupError` adds `PlatformInvalid`,
   `PlatformChanged`, and `PrerequisiteRefused`. Issuer probe and retained-session
-  revalidation now preserve a definitively invalid or changed installed
+  revalidation now preserve an invalid or changed installed
   platform observation and a definitively refused discovery/key-set
   prerequisite instead of collapsing them into retryable `Unavailable`;
   transient reads and transport failures remain `Unavailable`. This is an
   error-classification change only: no read absence, closed connection or
   refusal becomes authority, evidence a worker ended, or an authenticated boot
-  refusal. Downstream exhaustive matches must handle the new variants.
+  refusal. Resource-version-only changes require re-probing the same boot.
+  Failed or cancelled key refreshes preserve their failure classification
+  through the shared one-second throttle and recover on a later successful
+  refresh. Downstream exhaustive matches must handle the new variants.
   Refs #1246.
 
 - `opc-session-store`: `StoreError` adds `KeyProviderUnavailable`. Key-provider

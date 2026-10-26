@@ -28,8 +28,8 @@ use std::fmt;
 /// Closed, value-free reason for an authenticated boot refusal.
 ///
 /// The classes mirror the SDK's definitive startup refusal vocabulary: a
-/// definitively invalid platform observation, a definitively changed platform
-/// observation (for example the workload record catching up with the current
+/// definitively invalid platform observation, independently changed boot
+/// facts (for example the workload record catching up with the current
 /// container after the proof), or a definitively refused issuer
 /// discovery/key-set prerequisite. Transient reads, transport failures,
 /// exclusion contention and missing authentication time are never refusal
@@ -40,11 +40,13 @@ use std::fmt;
 pub enum BootRefusalReason {
     /// The installed platform observation is definitively invalid.
     PlatformInvalid,
-    /// The platform observation changed and this boot can never reconcile it;
-    /// retrying the same boot key cannot succeed.
+    /// Independently observed boot facts cannot reconcile the retained key.
+    /// `StartupError::PlatformChanged` alone is insufficient: an opaque
+    /// resource-version update requires a fresh probe of the same boot.
     PlatformChanged,
     /// The trusted issuer discovery or key-set prerequisite was definitively
-    /// refused after activation.
+    /// refused after activation. The issuer explicitly chooses to end this
+    /// attempt; restarting a worker does not repair the issuer prerequisite.
     PrerequisiteRefused,
 }
 
@@ -180,6 +182,45 @@ mod tests {
                 Err(StartupError::Invalid),
                 "an unknown reason code is invalid"
             );
+        }
+    }
+
+    #[test]
+    fn refusal_bytes_match_the_independent_revision_two_vectors() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/rfc/026-scope-transport-revision2-vectors.json"
+        ))
+        .unwrap();
+        let v = &v["authority_startup"];
+        let bytes = |value: &serde_json::Value| -> Vec<u8> {
+            value
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect()
+        };
+        let binding = &v["refusal_binding"];
+        let nonce = bytes(&binding["attempt_nonce_hex"]).try_into().unwrap();
+        let process = bytes(&binding["process_nonce_hex"]).try_into().unwrap();
+        let key = bytes(&binding["boot_key_digest_hex"]).try_into().unwrap();
+        let frames = v["refusal_frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 3);
+        for (fixture, reason) in frames.iter().zip([
+            BootRefusalReason::PlatformInvalid,
+            BootRefusalReason::PlatformChanged,
+            BootRefusalReason::PrerequisiteRefused,
+        ]) {
+            let body = bytes(&fixture["payload_hex"]);
+            assert_eq!(body.len(), 81);
+            assert_eq!(encode_payload(&nonce, &process, &key, reason), body);
+            assert_eq!(decode_payload(&body, &nonce, &process, &key), Ok(reason));
+            let header = Header::decode(&bytes(&fixture["header_hex"])).unwrap();
+            assert_eq!(header.kind, FrameKind::BootRefusal);
+            assert_eq!(header.method, Method::Candidate);
         }
     }
 

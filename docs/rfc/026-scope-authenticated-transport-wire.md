@@ -29,7 +29,7 @@ credentials. Matching vectors is not runtime qualification.
 | Item | Revision 2 contract |
 | --- | --- |
 | Four scope-purpose ALPNs | `scope-request`, `scope-response`, `boot-liveness` and `boot-candidate` all use the exact ASCII `opc-scope/2` (hex `6f70632d73636f70652f32`) |
-| Header | Same 128-byte layout; offsets 4–5 become `00 02` on **every** Call, Challenge, Proof, Result and TicketNotice |
+| Header | Same 128-byte layout; offsets 4–5 become `00 02` on **every** Call, Challenge, Proof, Result, TicketNotice and BootRefusal |
 | Exporter context | Only the scope ALPN field changes: `LP16(ALPN) = 00 0b 6f 70 63 2d 73 63 6f 70 65 2f 32`. Therefore each scope-purpose context hash and binding changes |
 | Exporter label/purpose strings | Unchanged, including `EXPERIMENTAL-openpacketcore-channel-binding-v1`; voter-management and consensus ALPNs/bindings are unchanged |
 | Possession/response inputs | Existing domains, `U16(1)` input-version fields and directions remain unchanged. Embedded header and corresponding CB change, hence digests/signatures change |
@@ -37,7 +37,7 @@ credentials. Matching vectors is not runtime qualification.
 | Startup connection and notices | Issuer-to-worker liveness/candidate traffic and the retained connection carrying TicketNotice all use ALPN/frame 2. Startup Call still wraps its canonical body in `caller_nonce:B[32] || LP32(body)`. Notice page version remains 1; page/payload, notice ID/digest and redelivery bytes stay identical |
 | Immutable requests/digests | Methods 1–16 retain exact canonical bytes, domain literals and digests, including `…/scope/read/v1\0` and `…/scope/scan/v1\0`. Method 17 adds its distinct domain below |
 | Stored/profile bytes | Authority/profile, ticket, Pod-token, batch command/outcome/receipt/error, sealed envelope and closure-evidence formats/digests do not change |
-| Class/kind/flags/correlation | Existing values and binding remain unchanged; reads and errors always have zero own-execution digest |
+| Class/kind/flags/correlation | Existing values and binding remain unchanged; kind 6 adds the candidate-only BootRefusal below. Reads and errors always have zero own-execution digest |
 
 All scope roles cross revision 2 together at a **fresh installation**. No ALPN
 fallback or mixed revision-1/2 operation. No-common-ALPN failure on either TLS
@@ -320,7 +320,7 @@ untimed profile; negotiation cannot select the timed predecessor.
 | --- | --- | --- |
 | 0 | 4 | `remaining_length = 124 + payload_length`, U32 |
 | 4 | 2 | Wire version, U16 = 1 |
-| 6 | 1 | Kind: 1 Call, 2 Challenge, 3 Proof, 4 Result, 5 TicketNotice |
+| 6 | 1 | Kind: 1 Call, 2 Challenge, 3 Proof, 4 Result, 5 TicketNotice; revision 2 also permits 6 BootRefusal |
 | 7 | 1 | Class: 0 SafetyControl, 1 Emergency, 2 Normal, 3 Maintenance |
 | 8 | 1 | Emergency bucket: 0 none, 1 established, 2 classification |
 | 9 | 1 | Method: see the complete table above; 1–16 in revision 1, 1–17 in revision 2 |
@@ -434,6 +434,43 @@ Read/cancel request bodies have the 4 KiB authority-metadata bound. Apply keeps
 the native command bound. SafetyControl is forbidden for every batch method;
 controllers and observers may use only Normal, Maintenance or classification
 for batch reads and cannot call ApplyBatch or BatchCancel.
+
+## Candidate boot refusal before a notice
+
+Instead of a ticket notice, the authenticated issuer may send one `BootRefusal`
+(kind 6) as the **first and sole** response on the retained Candidate startup
+connection. It is invalid after any TicketNotice page, even an incomplete page
+sequence, and is invalid for Liveness. The header must exactly retain the
+Candidate call's class, method 8, installation, scope, request ID and digest.
+Its payload length is exactly 81 bytes:
+
+```text
+BootRefusal = caller_nonce:B[32] || process_nonce:B[16]
+           || boot_key_digest:B[32] || reason:U8
+```
+
+The configured issuer's live mTLS authentication and scope policy must remain
+valid. Check the attempt nonce against this connection and the process nonce
+and key digest against the worker's proved boot before exposing the reason.
+
+| Reason | Name | Issuer decision |
+| ---: | --- | --- |
+| 1 | PlatformInvalid | The installed platform observation is definitively invalid |
+| 2 | PlatformChanged | Independently observed boot facts cannot reconcile the retained boot key |
+| 3 | PrerequisiteRefused | The issuer explicitly ends this attempt after a definitive discovery/key prerequisite refusal |
+
+A resource-version-only change requires re-probing the same boot and never
+justifies reason 2. Restarting a worker does not repair the issuer prerequisite
+in reason 3. A complete valid refusal ends this candidate attempt with
+`BootRefused(reason)` and lets normal shutdown release its exclusion guard;
+the next boot uses a fresh process nonce and key. It carries no authority or
+closure evidence and never changes an admitted worker's drain/close duties.
+
+Unknown reason codes, extra bytes, wrong attempt/boot bindings and mixed notice
+sequences are `Invalid`. Loss or truncation while reading a frame is
+`Unavailable`, never a boot refusal. Revision-2 peers predating kind 6 reject it
+as `Invalid`; they cannot infer a refusal from connection closure. The
+revision-2 reference vectors pin all three codes and exact frame bytes.
 
 ## Ticket notice after durable issuance
 
