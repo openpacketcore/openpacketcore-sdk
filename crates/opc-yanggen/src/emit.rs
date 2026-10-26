@@ -218,6 +218,15 @@ pub fn schema_digest_from_canonical(canonical: &CanonicalInput) -> String {
             if !n.numeric_range.is_empty() {
                 node["numeric_range"] = serde_json::json!(n.numeric_range);
             }
+            if n.mandatory == Some(true) {
+                node["mandatory"] = serde_json::json!(true);
+            }
+            if n.min_elements.is_some_and(|min| min > 0) {
+                node["min_elements"] = serde_json::json!(n.min_elements);
+            }
+            if let Some(max) = n.max_elements {
+                node["max_elements"] = serde_json::json!(max);
+            }
             node
         })
         .collect();

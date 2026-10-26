@@ -862,6 +862,8 @@ fn validate_supported_node(
     input: &CanonicalInput,
     node: &SchemaNode,
 ) -> Result<(), RustGenerationError> {
+    node.validate_cardinality()
+        .map_err(RustGenerationError::new)?;
     if !node.path.starts_with('/') {
         return Err(RustGenerationError::new(format!(
             "node path {} is not absolute",

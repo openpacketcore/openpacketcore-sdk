@@ -137,3 +137,41 @@ and seven retained-audit integration tests. These tests establish the scoped
 subscription change; the YANG generation items in #1363 remain open.
 
 Specification: [gNMI 0.10.0 §3.5.1.5.2](https://github.com/openconfig/reference/blob/master/rpc/gnmi/gnmi-specification.md#35152-stream-subscriptions).
+
+## Management work list (#1363): YANG cardinality and NETCONF evidence
+
+YANG `mandatory`, `min-elements` and `max-elements` are now retained in the IR,
+validated during source ingestion and Rust generation, bound into the schema
+digest, and enforced by generated configuration validation. The compiled
+[cardinality fixture](../crates/opc-yanggen/tests/fixtures/cardinality_test.rs)
+checks absent non-presence containers, inactive presence containers, per-entry
+requirements, zero-valued mandatory booleans, sensitive leaf-lists and both
+cardinality boundaries. All four runtime tests failed before the fix.
+Source/IR regressions additionally check malformed statements, round trips,
+source mismatch and digest changes. The complete generator suite and its
+294-case generated-code lint/runtime matrix pass on Rust 1.99.1; unchanged
+legacy artifacts retain their full-file digest pins.
+
+The remaining non-decimal reports were checked against current code:
+
+| Report | Disposition and evidence |
+| --- | --- |
+| Unbounded revision index | `source::parse_module` retains one module revision (the first declaration) and the source text used for get-schema. It has no accumulating revision index. RFC 8525 §3 describes the served YANG library and does not mandate the claimed history-retention ceiling. No revision-retention feature is introduced. |
+| Missing edit-config operations | `edit_xml::parse_operation` already recognizes create, replace and delete, retains per-node operations and passes the parsed edit to the binding applicator. Generated applicators implement their existence and replacement semantics. The full server and generator suites pass. The cited `operations/edit_config.rs` does not exist. |
+| Missing notification subscription | `create_subscription_starts_live_config_change_notifications` exercises the real session, subscription RPC, configuration change and delivered notification. `notification_subscription_installs_retained_byte_budget` verifies bounded retention. These pass with the existing binding; replay and filter shapes remain explicitly unsupported by the advertised profile. |
+| Missing get-schema/session inventory | The existing monitoring binding serves `/netconf-state` and get-schema, with positive, authorization, absent/ambiguous module, provider-error and size-limit tests. `get_schema_returns_schema_content_when_monitoring_and_nacm_allow` passes. This operation is specified by RFC 6022 §3.1, not RFC 8525 §4. |
+| Boolean exactness | Generated JSON uses Rust `bool`; the new fixture verifies `false` is a present valid value while strings, numbers and absent required values are rejected. NETCONF scalar parsers also use the exact boolean parser. |
+
+The complete Linux NETCONF run passes 533 tests, including retained-audit
+recovery and process-loss cases. It runs with `umask 0077` so the test directories
+satisfy retained-storage admission; the initial group-writable VM directories
+were correctly rejected. No production check or test assertion was relaxed.
+Exact decimal64 representation remains in progress under #1363.
+
+Witnesses: [edit parser](../crates/opc-netconf-server/src/edit_xml.rs),
+[server and tests](../crates/opc-netconf-server/src/server.rs),
+[source ingestion](../crates/opc-yanggen/src/source.rs),
+[RFC 7950 §§7.6.5 and 7.7.5–7.7.6](https://www.rfc-editor.org/rfc/rfc7950.html#section-7.6.5),
+[RFC 6022 §3.1](https://www.rfc-editor.org/rfc/rfc6022.html#section-3.1),
+[RFC 5277 §2.1.1](https://www.rfc-editor.org/rfc/rfc5277.html#section-2.1.1),
+and [RFC 8525 §3](https://www.rfc-editor.org/rfc/rfc8525.html#section-3).

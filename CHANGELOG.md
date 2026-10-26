@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-yanggen`: `SchemaNode` retains optional `mandatory`, `min_elements`,
+  and `max_elements` fields. Initialize them explicitly or use
+  `..SchemaNode::default()` in Rust literals. Source ingestion rejects invalid
+  cardinality statements, and generated configuration validation enforces
+  required leaves and list bounds. Effective constraints enter the schema
+  digest. (#1363)
+
 - `opc-gtpu-dataplane`: outgoing peer TEIDs use `PeerTeid` and admit zero
   per TS 29.281 section 5.1, including Linux GTP and the rebuilt eBPF object.
   Migrate `GtpPdpContext.peer_teid` and `ReceivedN3UplinkTnl` callers with
