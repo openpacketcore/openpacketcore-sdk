@@ -37,7 +37,7 @@ fn insertion(qfi: u8) -> N3UplinkEncapsulation {
 #[test]
 fn ppi_receive_uses_ts_38415_high_bits() {
     // PPP=1, RQI=1, QFI=9; PPI=5 in bits 7..5, with spare bits set.
-    let wire = unhex("34ff000d11223344000000850200c9a300000000aa");
+    let wire = unhex("34ff000d11223344000000850200c9bc00000000aa");
     let view =
         N3PacketView::decode(&wire, N3Direction::Downlink, DecodeContext::default()).unwrap();
     assert_eq!(view.qos().ppi(), Some(5));
@@ -72,7 +72,7 @@ fn qos_monitoring_without_tpdu_has_a_specific_refusal() {
 fn independent_reference_packets() {
     assert_eq!(
         &Sha256::digest(REFERENCE.as_bytes())[..],
-        unhex("87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2")
+        unhex("3706c33835e665078c54ea2c3b37d6a31aa3d804b393a16165d711134d67db38")
     );
     let mut counts = [0, 0];
     for row in REFERENCE.lines().filter(|line| !line.starts_with('#')) {
@@ -109,7 +109,7 @@ fn independent_reference_packets() {
             assert!(result.is_err(), "synthetic case {} accepted", columns[0]);
         }
     }
-    assert_eq!(counts, [1511, 1093]);
+    assert_eq!(counts, [1487, 1117]);
 }
 
 #[test]

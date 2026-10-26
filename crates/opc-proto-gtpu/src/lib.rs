@@ -529,7 +529,7 @@ pub enum PduSessionContainerError {
     Misaligned,
     /// The PDU type was outside the supported downlink/uplink values.
     ReservedPduType,
-    /// A downlink QMP, SNP, or MSNP conditional-field flag was present.
+    /// A downlink QMP, SNP, MSNP, BSSI, or TTNBI conditional-field flag was present.
     UnsupportedDownlinkConditionalFields,
     /// The PPP flag was set without a Paging Policy Indicator octet.
     MissingPagingPolicyIndicator,
@@ -591,7 +591,7 @@ impl PduSessionContainerError {
             Self::Misaligned => "PDU Session Container is not extension-header aligned",
             Self::ReservedPduType => "reserved PDU Session Container type",
             Self::UnsupportedDownlinkConditionalFields => {
-                "DL PDU Session Container uses unsupported QMP/SNP/MSNP fields"
+                "DL PDU Session Container uses unsupported conditional fields"
             }
             Self::MissingPagingPolicyIndicator => {
                 "Paging Policy Indicator missing despite PPP flag"
@@ -631,6 +631,7 @@ impl Error for PduSessionContainerError {}
 /// containers whose presence flags require QoS-monitoring timestamps, QFI or
 /// MBS sequence numbers, delay results, or future-extension fields are rejected
 /// rather than partially decoded into this smaller model.
+/// Release 19 BSSI/TTNBI burst fields are also rejected, never treated as padding.
 ///
 /// @spec 3GPP TS29281 R18 5.2.2.7
 /// @req REQ-3GPP-TS29281-R18-5.2.2.7-001
@@ -786,6 +787,12 @@ impl PduSessionContainer {
                 if content.len() < 3 {
                     return Err((PduSessionContainerError::MissingPagingPolicyIndicator, 1));
                 }
+                if content[2] & 0x03 != 0 {
+                    return Err((
+                        PduSessionContainerError::UnsupportedDownlinkConditionalFields,
+                        2,
+                    ));
+                }
                 if content.len() != 6 {
                     return Err((
                         PduSessionContainerError::UnsupportedDownlinkExtensionFields,
@@ -864,7 +871,7 @@ impl PduSessionContainer {
             }
             content.push(octet3);
             if let Some(ppi) = self.ppi {
-                // TS 38.415 figure 5.5.2.1-1: PPI precedes five spare bits.
+                // TS 38.415 figure 5.5.2.1-1: PPI precedes spare and R19 burst flags.
                 content.push(ppi << 5);
             }
         } else {

@@ -237,6 +237,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-proto-gtpu`: reject unsupported downlink BSSI/TTNBI fields from
+  TS 38.415 V19.1.0 instead of silently discarding them as PPI spare bits
+  and padding; update the independent N3 reference vectors. (#1520)
+
 - `opc-session-net`: preserve configured reconnect admission for the first
   prepared-request warm flight, before shared prewarm permits and DNS. `FailOver`
   immediately selects another voter when cooldown or existing setup prevents
