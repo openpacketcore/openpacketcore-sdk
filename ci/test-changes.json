@@ -1049,6 +1049,13 @@
       "kind": "assertions-decreased",
       "reason": "Remove sbi_value_to_generated, whose assertion-bearing normalization helper concealed invalid NRF wire JSON. Both tests now deserialize the actual serialized SBI payload directly into the generated TS 29.510 schema; existing identity, PLMN, slice and service field assertions remain. Literal wire-format regressions in opc-sbi cover the corrected representation.",
       "issue": 1362
+    },
+    {
+      "test": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_mscc_rejects_excessive_nesting_depth",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-diameter::test=app_dictionaries::rf_grouped_service_data_rejects_excessive_nesting_depth",
+      "reason": "Replace the nonconforming online MSCC shape in Rf with Service-Information / PS-Information / Service-Data-Container. Retains the nesting-limit assertion and checks the exact DepthExceeded category at the offline container boundary.",
+      "issue": 1361
     }
   ]
 }

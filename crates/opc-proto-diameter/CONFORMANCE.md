@@ -1872,3 +1872,25 @@ The following are outside the current crate scope:
   cross-connection correlation, live at-most-once completion, and the
   versioned sensitive snapshot form) is in scope; see section 5. Unencrypted
   persistence backends and consumer-side idempotency remain out of scope.
+
+## Rf charging corrections (#1361)
+
+The Rf encoder and parser use the hierarchy in
+[TS 32.299 V18.0.0](https://www.etsi.org/deliver/etsi_ts/132200_132299/132299/18.00.00_60/ts_132299v180000p.pdf),
+sections 6.2.2, 7.2.158, 7.2.189 and 7.2.192:
+Subscription-Id and PS-Information are children of Service-Information (873).
+Per-service usage is carried by Service-Data-Container (2040) in PS-Information,
+with Accounting-Input/Output-Octets (363/364), Time-Usage (2045), Rating-Group
+and Service-Identifier. MSCC and Used-Service-Unit are online charging shapes
+and are no longer exposed by this Rf subset. Separate directional counters
+replace the former total-octet field; the codec never guesses their split.
+SGSN-Address is 1228 and GGSN-Address is 847. Charging-Id/PDP-Type metadata
+and M bits follow TS 29.061 section 16.4.7.
+
+`tests/app_dictionaries.rs` checks independent literal nesting/codepoints,
+Start/Interim/Stop values, counter widths, repeated usage groups, misplaced
+mandatory groups, duplicates and depth limits. Subscription child validation
+continues at its corrected nesting. Interim support predated this audit.
+Service-Information remains absent when no supported service fields are
+provided, as permitted by the ACR grammar. Other service-specific containers,
+charging policy and CDF delivery remain outside this bounded codec profile.
