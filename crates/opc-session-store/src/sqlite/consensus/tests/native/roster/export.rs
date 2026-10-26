@@ -737,18 +737,9 @@ fn retired_admission_witness_mixed_native_sqlite_removals_preserve_one_shared_ma
             count(&snapshot, "consensus_protected_roster_v2_admissions"),
             0
         );
-        assert_eq!(
-            count(&snapshot, "consensus_protected_roster_rows"),
-            0
-        );
-        assert_eq!(
-            count(&snapshot, "consensus_protected_roster_admissions"),
-            0
-        );
-        assert_eq!(
-            count(&snapshot, "consensus_protected_roster_floors"),
-            0
-        );
+        assert_eq!(count(&snapshot, "consensus_protected_roster_rows"), 0);
+        assert_eq!(count(&snapshot, "consensus_protected_roster_admissions"), 0);
+        assert_eq!(count(&snapshot, "consensus_protected_roster_floors"), 0);
         observed.push(witness_fence(
             protected_roster_read_witness_sync(&snapshot, signed.identity)
                 .unwrap()
