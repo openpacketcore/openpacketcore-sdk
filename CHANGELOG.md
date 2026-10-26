@@ -239,6 +239,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `opc-proto-ngap`: retain combined IPv4/IPv6 GTP transport addresses in
+  Setup/Modify transfers and additional tunnels. The directional address
+  getter now returns `TransportLayerAddress`; existing single-IP constructors
+  remain available. (#1357)
+
 - `opc-gtpu-dataplane`: expose unknown-tunnel observations and bounded Error
   Indication plans through the ordinary Linux GTP attachment’s retained IPv4
   UDP/2152 socket. Check live interface and socket identity, retire old control

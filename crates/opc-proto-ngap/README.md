@@ -40,6 +40,13 @@ literals. Modify responses expose up to three `DownlinkQosTunnel` associations
 in `additional`; use `Vec::new()` for existing response literals. See the
 [additional tunnel contract](CONFORMANCE.md#additional-request-tunnels-and-modify-associations).
 
+GTP transport endpoints retain IPv4, IPv6, or both in the TS 38.414 160-bit
+form. `UplinkTransport::address()` and `DownlinkTransport::address()` now return
+`resource_fields::TransportLayerAddress`; match its variants to select an
+address. Existing `new(IpAddr, teid)` constructors remain available, and
+`with_address` accepts the combined form without selecting a family.
+Setup/Modify transfers and additional tunnel lists preserve both addresses.
+
 The [N3IWF subset acceptance record](N3IWF-ACCEPTANCE.md) maps the original
 codec task to implemented evidence, exact public field revisions and real fuzz
 campaigns. The 23 admitted subsets and 17 disabled handler outcomes retain
