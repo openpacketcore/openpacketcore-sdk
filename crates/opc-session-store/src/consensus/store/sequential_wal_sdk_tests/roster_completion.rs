@@ -103,11 +103,74 @@ async fn complete(store: &ConsensusSessionStore, terminal: ConsensusRosterTermin
     );
 }
 
+async fn reject_reclassified_terminal(
+    store: &ConsensusSessionStore,
+    original: &ConsensusRosterTerminalCommandV2,
+) {
+    use crate::consensus::types::{ConsensusRosterRejection, ConsensusRosterTerminalCommandInput};
+    use sha2::{Digest, Sha256};
+    // Rebuild both public checksums. Only the unchanged admission and signed
+    // evidence can refuse this forgery; malformed framing is not the test.
+    let mut record = original.record_bytes().to_vec();
+    let body_end = record.len() - 32;
+    let mut terminal_hash = Sha256::new();
+    terminal_hash.update(b"opc/session-store/protected-roster/emergency-terminal/v1\0");
+    terminal_hash.update(&record[body_end - 32..body_end]);
+    record[body_end - 32..body_end].copy_from_slice(&terminal_hash.finalize());
+    record[..8].copy_from_slice(b"OPCRTE1\0");
+    let mut frame_hash = Sha256::new();
+    frame_hash.update(b"opc/session-store/protected-roster/emergency-terminal-frame/v1\0");
+    frame_hash.update(&record[..body_end]);
+    record[body_end..].copy_from_slice(&frame_hash.finalize());
+    let (registration_handle, registration_request_id, registration_terminal_slot) =
+        original.registration_parts();
+    let forged =
+        ConsensusRosterTerminalCommandV2::new_with_proof_bundle_evidence_and_ingress_request_id(
+            ConsensusRosterTerminalCommandInput {
+                binding: original.binding(),
+                registration_handle,
+                registration_request_id,
+                registration_terminal_slot,
+                authority: original.authority().clone(),
+                record,
+            },
+            original.proof_bundle().unwrap(),
+            original.terminal_evidence().unwrap(),
+            original.ingress_request_id(),
+            original.ingress_attestation().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(forged.admission_class(), AdmissionClass::Emergency);
+    let response = store
+        .submit_request_before(
+            forged.request_id().unwrap(),
+            SessionMutationIntent::RosterTerminalV2(Box::new(forged)),
+            Some(store.current_scope().unwrap().0),
+            tokio::time::Instant::now() + store.inner.operation_timeout,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            response.result,
+            Ok(SessionMutationOutcome::RosterTerminalV2(
+                ConsensusRosterTerminalOutcome::Rejected {
+                    rejection: ConsensusRosterRejection::TerminalConflict,
+                    ..
+                }
+            ))
+        ),
+        "apply rejects the signed admission/terminal class mismatch: {:?}",
+        response.result
+    );
+}
+
 #[derive(Clone, Copy)]
 enum Check {
     Admission,
     Completion,
     NormalQuota,
+    ClassMismatch,
 }
 
 async fn ordinary_completion_congestion(native: bool, check: Check) {
@@ -181,6 +244,15 @@ async fn ordinary_completion_congestion(native: bool, check: Check) {
         let ordinary_admission = admission(ordinary);
         let ordinary_epoch = admit(ingress, ordinary_admission.clone()).await;
         let ordinary_terminal = fixture(ordinary_epoch, AdmissionClass::Ordinary).terminal_command;
+        if matches!(check, Check::ClassMismatch) {
+            reject_reclassified_terminal(ingress, &ordinary_terminal).await;
+            complete(ingress, ordinary_terminal.clone()).await;
+            reject_reclassified_terminal(ingress, &ordinary_terminal).await;
+            let snapshot = fleet.stores[leader].protected_roster_diagnostic_snapshot();
+            assert_eq!(snapshot.live_reservations, 0);
+            assert_eq!(snapshot.retained_reservations, 1);
+            return;
+        }
         complete(ingress, ordinary_terminal.clone()).await;
         let emergency_admission = admission(fixture(1, AdmissionClass::Emergency));
         let emergency_epoch = if matches!(check, Check::Completion) {
@@ -210,6 +282,7 @@ async fn ordinary_completion_congestion(native: bool, check: Check) {
         .await
         .expect("two ordinary completions hold their decoded transport lanes");
         match check {
+            Check::ClassMismatch => unreachable!("checked before congestion"),
             Check::Admission => {
                 let epoch = admit(ingress, emergency_admission).await;
                 complete(
@@ -317,4 +390,13 @@ async fn roster_completion_sqlite_ordinary_wave_consumes_normal_quota() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn roster_completion_native_ordinary_wave_consumes_normal_quota() {
     ordinary_completion_congestion(true, Check::NormalQuota).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_completion_sqlite_apply_rejects_reclassified_terminal() {
+    ordinary_completion_congestion(false, Check::ClassMismatch).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_completion_native_apply_rejects_reclassified_terminal() {
+    ordinary_completion_congestion(true, Check::ClassMismatch).await;
 }

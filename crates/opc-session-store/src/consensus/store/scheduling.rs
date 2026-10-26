@@ -54,10 +54,10 @@ impl ForwardMutationRequest {
         Ok((key, class))
     }
 
-    /// Emergency admission uses physical capacity without a policy quota.
-    /// Completion consumes an existing admission's reservation; its compact
-    /// command need not rehydrate an admission body to release that capacity.
-    /// Neither path gains authority from this scheduling decision.
+    /// Emergency admission and completion use physical capacity without a
+    /// policy quota. Both carry their class in the authenticated immutable
+    /// command. An ordinary completion is metered but needs no new roster
+    /// reservation. Scheduling never substitutes for apply authorization.
     pub(super) fn bypasses_roster_policy_quota(&self) -> bool {
         self.work_class == ForwardWorkClass::Inferred
             && match &self.intent {
@@ -66,8 +66,14 @@ impl ForwardMutationRequest {
                     command.admission().admission_class()
                         == crate::fenced_mutation_roster::AdmissionClass::Emergency
                 }
-                SessionMutationIntent::RosterTerminal(_)
-                | SessionMutationIntent::RosterTerminalV2(_) => true,
+                SessionMutationIntent::RosterTerminal(command) => {
+                    command.admission_class()
+                        == crate::fenced_mutation_roster::AdmissionClass::Emergency
+                }
+                SessionMutationIntent::RosterTerminalV2(command) => {
+                    command.admission_class()
+                        == crate::fenced_mutation_roster::AdmissionClass::Emergency
+                }
                 _ => false,
             }
     }
@@ -107,8 +113,11 @@ fn inferred_class(intent: &SessionMutationIntent) -> ScopeWorkClass {
                 }
             }
         }
-        SessionMutationIntent::RosterTerminal(_) | SessionMutationIntent::RosterTerminalV2(_) => {
-            ScopeWorkClass::SafetyControl
+        SessionMutationIntent::RosterTerminal(command) => {
+            roster_work_class(command.admission_class())
+        }
+        SessionMutationIntent::RosterTerminalV2(command) => {
+            roster_work_class(command.admission_class())
         }
         // Unclassified read APIs, including both logical-read supervisors,
         // use Normal. Explicit record-expiry floors acquire Maintenance at
@@ -133,6 +142,13 @@ fn inferred_class(intent: &SessionMutationIntent) -> ScopeWorkClass {
         | SessionMutationIntent::ActivateVoidFencedTransitionV2 { .. }
         | SessionMutationIntent::ScopeBatch(_)
         | SessionMutationIntent::ScopeBatchCancel(_) => ScopeWorkClass::Normal,
+    }
+}
+
+fn roster_work_class(class: crate::fenced_mutation_roster::AdmissionClass) -> ScopeWorkClass {
+    match class {
+        crate::fenced_mutation_roster::AdmissionClass::Ordinary => ScopeWorkClass::Normal,
+        crate::fenced_mutation_roster::AdmissionClass::Emergency => ScopeWorkClass::Emergency,
     }
 }
 
@@ -355,14 +371,14 @@ impl ConsensusSessionStore {
 
     /// Observational proposal counts by class. Accepted proposals retain their
     /// running credits until Openraft resolves, even after caller cancellation.
-    /// Emergency roster admission and reserved completion bypass these quotas.
+    /// Emergency roster admission and emergency completion bypass these quotas.
     pub fn scope_proposal_scheduling_snapshot(&self) -> ScopeSchedulerSnapshot {
         self.inner.proposal_admission.snapshot()
     }
 
     /// Observational outbound mutation counts by class, independent from local
     /// proposal admission. The transport must also preserve class isolation.
-    /// Emergency roster admission and reserved completion bypass these quotas.
+    /// Emergency roster admission and emergency completion bypass these quotas.
     pub fn scope_forward_scheduling_snapshot(&self) -> ScopeSchedulerSnapshot {
         self.inner.forward_admission.snapshot()
     }

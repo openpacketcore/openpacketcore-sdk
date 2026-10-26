@@ -110,6 +110,11 @@ const EMERGENCY_ADMISSION_FRAME_DOMAIN: &[u8] =
 const EMERGENCY_ADMISSION_FRAME_MAGIC: [u8; 8] = *b"OPCRAE1\0";
 const DESCRIPTOR_DOMAIN: &[u8] = b"opc/session-store/protected-roster/descriptor/v1\0";
 const TERMINAL_DOMAIN: &[u8] = b"opc/session-store/protected-roster/terminal/v1\0";
+const EMERGENCY_TERMINAL_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/emergency-terminal/v1\0";
+const EMERGENCY_TERMINAL_FRAME_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/emergency-terminal-frame/v1\0";
+const EMERGENCY_TERMINAL_FRAME_MAGIC: [u8; 8] = *b"OPCRTE1\0";
 const TERMINAL_SLOT_DOMAIN: &[u8] = b"opc/session-store/protected-roster/terminal-slot/v1\0";
 const SESSION_KEY_BINDING_DOMAIN: &[u8] =
     b"opc/session-store/protected-roster/session-key-binding/v1\0";
@@ -498,6 +503,7 @@ const CAPACITY_POLICY_DESCRIPTOR: &[u8] = concat!(
     "emergency=authenticated-immutable-class,bypass-admission-policy-quotas\n",
     "accounting=reserve-terminal-peak,q2-converts,checked-exact-reopen\n",
     "class=ordinary-frame-unchanged,emergency-distinct-frame-and-body-commitment\n",
+    "completion=class-bound-signed-terminal-body-and-frame,ordinary-normal-metered,emergency-quota-exempt-emergency-lane,no-new-admission-slot\n",
     "local=emergency-bypasses-authority-and-provider-shares,terminal-reads-have-no-count-quota\n",
     "retention=preserve-terminal-recovery-evidence,oldest-bounded-maintenance\n",
     "maintenance=eligible-oldest-tombstone-prefix-before-new-reclaim,one-bounded-phase-per-command\n"
@@ -513,6 +519,9 @@ pub(crate) fn capacity_policy_digest() -> [u8; 32] {
     h.update(EMERGENCY_ADMISSION_FRAME_MAGIC);
     h.update(EMERGENCY_ADMISSION_FRAME_DOMAIN);
     h.update(EMERGENCY_ADMISSION_DOMAIN);
+    h.update(EMERGENCY_TERMINAL_FRAME_MAGIC);
+    h.update(EMERGENCY_TERMINAL_FRAME_DOMAIN);
+    h.update(EMERGENCY_TERMINAL_DOMAIN);
     h.finalize().into()
 }
 
@@ -1956,7 +1965,10 @@ impl TerminalRecord {
             protected_result: admission.terminal_result().to_vec(),
             body_commitment: [0; 32],
         };
-        value.body_commitment = value.calculate_body_commitment();
+        value.body_commitment = class_bound_terminal_commitment(
+            admission.admission_class(),
+            value.calculate_body_commitment(),
+        );
         value.validate_for(admission)?;
         Ok(value)
     }
@@ -1968,7 +1980,11 @@ impl TerminalRecord {
             || self.proof_commitments.contains(&[0; 32])
             || self.protected_checkpoint != admission.terminal_checkpoint()
             || self.protected_result != admission.terminal_result()
-            || self.body_commitment != self.calculate_body_commitment()
+            || self.body_commitment
+                != class_bound_terminal_commitment(
+                    admission.admission_class(),
+                    self.calculate_body_commitment(),
+                )
         {
             return Err(Error::InvalidTerminal);
         }
@@ -1989,20 +2005,12 @@ impl TerminalRecord {
     }
     pub(crate) fn to_canonical_bytes(&self, admission: &Admission) -> Result<Vec<u8>, Error> {
         self.validate_for(admission)?;
-        encode_frame(
-            TERMINAL_FRAME_MAGIC,
-            TERMINAL_FRAME_DOMAIN,
-            self,
-            MAX_TERMINAL_CODEC_BYTES,
-        )
+        let (magic, domain) = terminal_frame_encoding(admission.admission_class());
+        encode_frame(magic, domain, self, MAX_TERMINAL_CODEC_BYTES)
     }
     pub(crate) fn from_canonical_bytes(bytes: &[u8], admission: &Admission) -> Result<Self, Error> {
-        let value: Self = decode_frame(
-            bytes,
-            TERMINAL_FRAME_MAGIC,
-            TERMINAL_FRAME_DOMAIN,
-            MAX_TERMINAL_CODEC_BYTES,
-        )?;
+        let (magic, domain) = terminal_frame_encoding(admission.admission_class());
+        let value: Self = decode_frame(bytes, magic, domain, MAX_TERMINAL_CODEC_BYTES)?;
         value.validate_for(admission)?;
         if value.to_canonical_bytes(admission)? != bytes {
             return Err(Error::InvalidEncoding);
@@ -2020,23 +2028,30 @@ impl TerminalRecord {
     /// separately authenticate the retained binding, current lease, original
     /// provenance, registration parts, and tombstone commitment.
     pub(crate) fn canonical_body_commitment(bytes: &[u8]) -> Result<[u8; 32], Error> {
-        let value: Self = decode_frame(
-            bytes,
-            TERMINAL_FRAME_MAGIC,
-            TERMINAL_FRAME_DOMAIN,
-            MAX_TERMINAL_CODEC_BYTES,
-        )?;
-        value.validate_self_contained()?;
-        if encode_frame(
-            TERMINAL_FRAME_MAGIC,
-            TERMINAL_FRAME_DOMAIN,
-            &value,
-            MAX_TERMINAL_CODEC_BYTES,
-        )? != bytes
-        {
+        Self::canonical_record_and_class(bytes).map(|(record, _)| record.body_commitment)
+    }
+
+    /// The terminal body commitment signs this class even after compaction
+    /// removes the admission. A caller declaration cannot change it.
+    pub(crate) fn canonical_admission_class(bytes: &[u8]) -> Result<AdmissionClass, Error> {
+        Self::canonical_record_and_class(bytes).map(|(_, class)| class)
+    }
+
+    fn canonical_record_and_class(bytes: &[u8]) -> Result<(Self, AdmissionClass), Error> {
+        let class = if bytes.starts_with(&EMERGENCY_TERMINAL_FRAME_MAGIC) {
+            AdmissionClass::Emergency
+        } else {
+            AdmissionClass::Ordinary
+        };
+        let (magic, domain) = terminal_frame_encoding(class);
+        let value: Self = decode_frame(bytes, magic, domain, MAX_TERMINAL_CODEC_BYTES)?;
+        if value.validate_self_contained_class()? != class {
             return Err(Error::InvalidTerminal);
         }
-        Ok(value.body_commitment)
+        if encode_frame(magic, domain, &value, MAX_TERMINAL_CODEC_BYTES)? != bytes {
+            return Err(Error::InvalidTerminal);
+        }
+        Ok((value, class))
     }
 
     /// Validate the commitment-bound fields available without an admission.
@@ -2046,17 +2061,29 @@ impl TerminalRecord {
     /// the exact canonical body named by the originating consensus command;
     /// full recovery still validates the body against the immutable admission.
     pub(crate) fn validate_self_contained(&self) -> Result<(), Error> {
+        self.validate_self_contained_class().map(|_| ())
+    }
+
+    fn validate_self_contained_class(&self) -> Result<AdmissionClass, Error> {
         Scope::from_digest(self.scope).validate()?;
         if self.proof_commitments.is_empty()
             || self.proof_commitments.len() > MAX_MEMBERS
             || self.proof_commitments.contains(&[0; 32])
             || self.body_commitment == [0; 32]
-            || self.body_commitment != self.calculate_body_commitment()
             || Phase::from_tag(self.phase_tag).is_err()
         {
             return Err(Error::InvalidTerminal);
         }
-        Ok(())
+        let ordinary = self.calculate_body_commitment();
+        if self.body_commitment == ordinary {
+            Ok(AdmissionClass::Ordinary)
+        } else if self.body_commitment
+            == class_bound_terminal_commitment(AdmissionClass::Emergency, ordinary)
+        {
+            Ok(AdmissionClass::Emergency)
+        } else {
+            Err(Error::InvalidTerminal)
+        }
     }
     fn calculate_body_commitment(&self) -> [u8; 32] {
         let mut h = Sha256::new();
@@ -2074,6 +2101,31 @@ impl TerminalRecord {
         h.finalize().into()
     }
 }
+// Ordinary terminal bodies and frames retain their frozen encoding. The
+// emergency domain is included in executor signatures and compact tombstones,
+// so relabeling an ordinary frame cannot promote even a compacted replay.
+fn class_bound_terminal_commitment(class: AdmissionClass, ordinary: [u8; 32]) -> [u8; 32] {
+    match class {
+        AdmissionClass::Ordinary => ordinary,
+        AdmissionClass::Emergency => {
+            let mut hasher = Sha256::new();
+            hasher.update(EMERGENCY_TERMINAL_DOMAIN);
+            hasher.update(ordinary);
+            hasher.finalize().into()
+        }
+    }
+}
+
+fn terminal_frame_encoding(class: AdmissionClass) -> ([u8; 8], &'static [u8]) {
+    match class {
+        AdmissionClass::Ordinary => (TERMINAL_FRAME_MAGIC, TERMINAL_FRAME_DOMAIN),
+        AdmissionClass::Emergency => (
+            EMERGENCY_TERMINAL_FRAME_MAGIC,
+            EMERGENCY_TERMINAL_FRAME_DOMAIN,
+        ),
+    }
+}
+
 impl fmt::Debug for TerminalRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("TerminalRecord(<redacted>)")
@@ -9776,6 +9828,25 @@ mod tests {
     }
 
     #[test]
+    fn roster_completion_class_requires_matching_activation_policy() {
+        let previous = Profile {
+            schema: SCHEMA_V2,
+            consumer_revision: CONSUMER_REVISION_V2,
+            digest: [
+                0xb5, 0xd8, 0xda, 0xc5, 0x70, 0x69, 0xb2, 0xa0, 0x6e, 0x69, 0x78, 0xa6, 0x48, 0xd4,
+                0x26, 0x0e, 0x86, 0x75, 0xed, 0x74, 0x76, 0x25, 0x52, 0x02, 0x9a, 0x7d, 0xa1, 0x58,
+                0x22, 0x80, 0xd4, 0x5a,
+            ],
+        };
+        assert!(
+            previous.validate().is_err(),
+            "the previous terminal-class policy cannot authorize this build"
+        );
+        assert!(CAPACITY_POLICY_DESCRIPTOR.split(|byte| *byte == b'\n').any(|line|
+            line == b"completion=class-bound-signed-terminal-body-and-frame,ordinary-normal-metered,emergency-quota-exempt-emergency-lane,no-new-admission-slot"));
+    }
+
+    #[test]
     fn profile_v2_descriptor_commits_absent_predecessor_contract() {
         let lines: BTreeSet<&[u8]> = PROFILE_DESCRIPTOR_V2.split(|byte| *byte == b'\n').collect();
         for expected in [
@@ -9807,9 +9878,9 @@ mod tests {
         assert_eq!(
             profile_v2_digest(),
             [
-                0xb5, 0xd8, 0xda, 0xc5, 0x70, 0x69, 0xb2, 0xa0, 0x6e, 0x69, 0x78, 0xa6, 0x48, 0xd4,
-                0x26, 0x0e, 0x86, 0x75, 0xed, 0x74, 0x76, 0x25, 0x52, 0x02, 0x9a, 0x7d, 0xa1, 0x58,
-                0x22, 0x80, 0xd4, 0x5a,
+                0x12, 0x6e, 0x5f, 0xbf, 0xa2, 0xdc, 0x32, 0xa0, 0x91, 0x9e, 0x59, 0x58, 0x54, 0x13,
+                0xbe, 0x8d, 0xc2, 0x64, 0xe4, 0xda, 0xdc, 0x25, 0x84, 0xbb, 0xb5, 0x1c, 0xa5, 0x57,
+                0x7e, 0x71, 0x6c, 0x16,
             ]
         );
         assert_eq!(profile_v2_descriptor(), PROFILE_DESCRIPTOR_V2);
@@ -10078,9 +10149,9 @@ mod tests {
         assert_eq!(
             v2.digest().expect("V2 ingress preimage"),
             [
-                0xd9, 0x8d, 0x59, 0x2f, 0x2a, 0x2e, 0x09, 0xb9, 0x2c, 0xb6, 0x5a, 0x88, 0x5d, 0xa2,
-                0xed, 0xab, 0xe2, 0xef, 0x97, 0xdc, 0x12, 0x0b, 0xd6, 0xdd, 0x14, 0x36, 0xe6, 0xa0,
-                0x16, 0xaf, 0x14, 0x96,
+                0x02, 0x56, 0xbc, 0x98, 0x15, 0xf1, 0xf4, 0x5e, 0x5f, 0x85, 0xfa, 0xfa, 0x75, 0x5c,
+                0xec, 0x8e, 0xfb, 0x6d, 0xe1, 0x27, 0x56, 0xbb, 0x2a, 0x68, 0x9f, 0x0c, 0xf7, 0x83,
+                0xf2, 0x1c, 0xe5, 0x5b,
             ],
             "literal V2 digest golden freezes the capacity-and-retirement-bound /4 preimage"
         );
@@ -10480,6 +10551,71 @@ mod tests {
         )
         .is_ok());
     }
+    #[test]
+    fn roster_completion_class_is_bound_to_terminal_body_before_and_after_compaction() {
+        for class in [AdmissionClass::Ordinary, AdmissionClass::Emergency] {
+            let admission = admission().with_admission_class(class);
+            let request_id = RequestId::bind(4, &admission).unwrap();
+            let terminal = TerminalRecord::new(
+                &admission,
+                request_id,
+                Phase::Established,
+                vec![[1; 32]; FRESH_ROSTER_MEMBERS],
+            )
+            .unwrap();
+            let bytes = terminal.to_canonical_bytes(&admission).unwrap();
+            assert_eq!(TerminalRecord::canonical_admission_class(&bytes), Ok(class));
+            assert_eq!(
+                TerminalRecord::from_canonical_bytes(&bytes, &admission).unwrap(),
+                terminal
+            );
+            assert_eq!(
+                TerminalRecord::canonical_body_commitment(&bytes),
+                Ok(terminal.body_commitment())
+            );
+            let other = match class {
+                AdmissionClass::Ordinary => AdmissionClass::Emergency,
+                AdmissionClass::Emergency => AdmissionClass::Ordinary,
+            };
+            let (magic, domain) = terminal_frame_encoding(other);
+            let relabeled =
+                encode_frame(magic, domain, &terminal, MAX_TERMINAL_CODEC_BYTES).unwrap();
+            assert!(
+                TerminalRecord::canonical_body_commitment(&relabeled).is_err(),
+                "a rechecksummed header cannot change the signed class"
+            );
+            assert!(TerminalRecord::from_canonical_bytes(&relabeled, &admission).is_err());
+            let mut forged = terminal.clone();
+            forged.body_commitment =
+                class_bound_terminal_commitment(other, forged.calculate_body_commitment());
+            let forged_bytes =
+                encode_frame(magic, domain, &forged, MAX_TERMINAL_CODEC_BYTES).unwrap();
+            assert_eq!(
+                TerminalRecord::canonical_admission_class(&forged_bytes),
+                Ok(other)
+            );
+            assert!(
+                TerminalRecord::from_canonical_bytes(&forged_bytes, &admission).is_err(),
+                "even a recomputed body cannot change the replicated admission's class"
+            );
+            let tombstone = TerminalConflictTombstone::new(&admission, &terminal).unwrap();
+            let binding = admission.binding_key(4).unwrap();
+            let terminal_slot = *request_id.terminal_slot_id(&admission).unwrap().as_bytes();
+            assert_eq!(
+                tombstone.validate_compacted_terminal(
+                    binding,
+                    request_id,
+                    terminal_slot,
+                    FenceToken::new(2),
+                    admission.expected_generation(),
+                    TerminalRecord::canonical_body_commitment(&forged_bytes).unwrap(),
+                ),
+                Err(Error::RequestConflict),
+                "the compacted signed commitment also rejects relabeling"
+            );
+        }
+    }
+
     #[test]
     fn compacted_terminal_tombstone_never_reopens_changed_body() {
         let original_admission = admission();

@@ -960,6 +960,8 @@ pub struct ConsensusRosterTerminalCommand {
     registration_terminal_slot: [u8; 32],
     authority: AuthorityBinding,
     record: BoundedRosterCapsule<MAX_TERMINAL_CODEC_BYTES>,
+    // Derived from the validated signed record; never caller-supplied metadata.
+    admission_class: crate::fenced_mutation_roster::AdmissionClass,
     proof_bundle: BoundedRosterCapsule<MAX_EXECUTOR_PROOF_BUNDLE_BYTES>,
     terminal_evidence: BoundedRosterCapsule<MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES>,
     ingress_request_id: [u8; 16],
@@ -979,6 +981,10 @@ pub(crate) struct ConsensusRosterTerminalCommandInput {
 }
 
 impl ConsensusRosterTerminalCommand {
+    pub(crate) const fn admission_class(&self) -> crate::fenced_mutation_roster::AdmissionClass {
+        self.admission_class
+    }
+
     fn new_from_parts(
         input: ConsensusRosterTerminalCommandInput,
         proof_bundle: BoundedRosterCapsule<MAX_EXECUTOR_PROOF_BUNDLE_BYTES>,
@@ -1004,7 +1010,7 @@ impl ConsensusRosterTerminalCommand {
         // A terminal command does not carry the retained admission required
         // for full authorization, but this canonical self-contained check
         // makes malformed record bytes unable to acquire a cached digest.
-        TerminalRecord::canonical_body_commitment(&record)
+        let admission_class = TerminalRecord::canonical_admission_class(&record)
             .map_err(|_| roster_command_rejected())?;
         let record = BoundedRosterCapsule::new(record)?;
         let digest_cache = roster_terminal_digest_cache(RosterTerminalDigestCacheInput {
@@ -1021,6 +1027,7 @@ impl ConsensusRosterTerminalCommand {
         })?;
         Ok(Self {
             binding,
+            admission_class,
             registration_handle,
             registration_request_id,
             registration_terminal_slot,
@@ -1264,6 +1271,8 @@ pub struct ConsensusRosterTerminalCommandV2 {
     registration_terminal_slot: [u8; 32],
     authority: AuthorityBinding,
     record: BoundedRosterCapsule<MAX_TERMINAL_CODEC_BYTES>,
+    // Derived from the validated signed record; never caller-supplied metadata.
+    admission_class: crate::fenced_mutation_roster::AdmissionClass,
     proof_bundle: BoundedRosterCapsule<MAX_EXECUTOR_PROOF_BUNDLE_BYTES>,
     terminal_evidence: BoundedRosterCapsule<MAX_PROFILE_V2_COMPACT_TERMINAL_EVIDENCE_BYTES>,
     ingress_request_id: [u8; 16],
@@ -1286,6 +1295,10 @@ struct ConsensusRosterTerminalWireV2 {
 }
 
 impl ConsensusRosterTerminalCommandV2 {
+    pub(crate) const fn admission_class(&self) -> crate::fenced_mutation_roster::AdmissionClass {
+        self.admission_class
+    }
+
     /// Construct the only V2 terminal command form from V2-only sealed
     /// evidence.  Neither the frozen V1 proof bundle nor V1 terminal evidence
     /// can be encoded through this constructor.
@@ -1313,7 +1326,7 @@ impl ConsensusRosterTerminalCommandV2 {
         {
             return Err(roster_command_rejected());
         }
-        TerminalRecord::canonical_body_commitment(&record)
+        let admission_class = TerminalRecord::canonical_admission_class(&record)
             .map_err(|_| roster_command_rejected())?;
         let proof_bundle = BoundedRosterCapsule::new(
             proof_bundle
@@ -1344,6 +1357,7 @@ impl ConsensusRosterTerminalCommandV2 {
         })?;
         Ok(Self {
             binding,
+            admission_class,
             registration_handle,
             registration_request_id,
             registration_terminal_slot,
@@ -5200,6 +5214,23 @@ pub(crate) mod tests {
                 .expect("changed-evidence terminal roster digest"),
             "the exact terminal compact evidence is part of the inner digest"
         );
+    }
+
+    #[test]
+    fn roster_completion_v1_command_roundtrip_derives_class_from_the_record() {
+        use crate::fenced_mutation_roster::AdmissionClass;
+        for class in [AdmissionClass::Ordinary, AdmissionClass::Emergency] {
+            let admission = roster_digest_admission(0x76).with_admission_class(class);
+            let command = roster_production_terminal_command(
+                &admission,
+                roster_digest_authority(&admission, 11, 1, 61),
+            );
+            let bytes = postcard::to_allocvec(&command).unwrap();
+            let decoded: ConsensusRosterTerminalCommand = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.admission_class(), class);
+            assert_eq!(decoded, command);
+            assert_eq!(postcard::to_allocvec(&decoded).unwrap(), bytes);
+        }
     }
 
     #[test]

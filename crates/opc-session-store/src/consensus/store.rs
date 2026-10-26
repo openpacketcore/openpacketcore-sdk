@@ -9719,10 +9719,11 @@ impl ConsensusSessionStore {
             .pop_front();
         #[cfg(test)]
         let accepted_receiver_test_local_node_id = self.inner.local_node_id;
-        // A detached supervisor owns the proposal permit until Openraft
-        // resolves the receiver, so caller cancellation, peer EOF, or a
-        // response deadline cannot admit an unbounded queue of detached
-        // mutations behind the still-running command.
+        // A detached supervisor retains any proposal permit until Openraft
+        // resolves the receiver. Cancellation, peer EOF and deadlines cannot
+        // free a metered command's quota while it is still running. Emergency
+        // roster admission and completion are intentionally quota-exempt;
+        // their supervisors still join through the same shutdown boundary.
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             #[cfg(test)]

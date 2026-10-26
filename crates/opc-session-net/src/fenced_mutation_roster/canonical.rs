@@ -75,6 +75,11 @@ const EMERGENCY_ADMISSION_FRAME_DOMAIN: &[u8] =
 const EMERGENCY_ADMISSION_FRAME_MAGIC: [u8; 8] = *b"OPCRAE1\0";
 const DESCRIPTOR_DOMAIN: &[u8] = b"opc/session-store/protected-roster/descriptor/v1\0";
 const TERMINAL_DOMAIN: &[u8] = b"opc/session-store/protected-roster/terminal/v1\0";
+const EMERGENCY_TERMINAL_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/emergency-terminal/v1\0";
+const EMERGENCY_TERMINAL_FRAME_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/emergency-terminal-frame/v1\0";
+const EMERGENCY_TERMINAL_FRAME_MAGIC: [u8; 8] = *b"OPCRTE1\0";
 const TERMINAL_SLOT_DOMAIN: &[u8] = b"opc/session-store/protected-roster/terminal-slot/v1\0";
 const SESSION_KEY_BINDING_DOMAIN: &[u8] =
     b"opc/session-store/protected-roster/session-key-binding/v1\0";
@@ -1447,7 +1452,10 @@ impl TerminalRecord {
             protected_result: admission.terminal_result().to_vec(),
             body_commitment: [0; 32],
         };
-        value.body_commitment = value.calculate_body_commitment();
+        value.body_commitment = class_bound_terminal_commitment(
+            admission.admission_class(),
+            value.calculate_body_commitment(),
+        );
         value.validate_for(admission)?;
         Ok(value)
     }
@@ -1459,7 +1467,11 @@ impl TerminalRecord {
             || self.proof_commitments.contains(&[0; 32])
             || self.protected_checkpoint != admission.terminal_checkpoint()
             || self.protected_result != admission.terminal_result()
-            || self.body_commitment != self.calculate_body_commitment()
+            || self.body_commitment
+                != class_bound_terminal_commitment(
+                    admission.admission_class(),
+                    self.calculate_body_commitment(),
+                )
         {
             return Err(Error::InvalidTerminal);
         }
@@ -1489,12 +1501,8 @@ impl TerminalRecord {
     }
     pub(crate) fn to_canonical_bytes(&self, admission: &Admission) -> Result<Vec<u8>, Error> {
         self.validate_for(admission)?;
-        encode_frame(
-            TERMINAL_FRAME_MAGIC,
-            TERMINAL_FRAME_DOMAIN,
-            self,
-            MAX_TERMINAL_CODEC_BYTES,
-        )
+        let (magic, domain) = terminal_frame_encoding(admission.admission_class());
+        encode_frame(magic, domain, self, MAX_TERMINAL_CODEC_BYTES)
     }
     fn calculate_body_commitment(&self) -> [u8; 32] {
         let mut h = Sha256::new();
@@ -1512,6 +1520,31 @@ impl TerminalRecord {
         h.finalize().into()
     }
 }
+// Ordinary terminal bodies and frames retain their frozen encoding. The
+// emergency domain is included in executor signatures and compact tombstones,
+// so relabeling an ordinary frame cannot promote even a compacted replay.
+fn class_bound_terminal_commitment(class: AdmissionClass, ordinary: [u8; 32]) -> [u8; 32] {
+    match class {
+        AdmissionClass::Ordinary => ordinary,
+        AdmissionClass::Emergency => {
+            let mut hasher = Sha256::new();
+            hasher.update(EMERGENCY_TERMINAL_DOMAIN);
+            hasher.update(ordinary);
+            hasher.finalize().into()
+        }
+    }
+}
+
+fn terminal_frame_encoding(class: AdmissionClass) -> ([u8; 8], &'static [u8]) {
+    match class {
+        AdmissionClass::Ordinary => (TERMINAL_FRAME_MAGIC, TERMINAL_FRAME_DOMAIN),
+        AdmissionClass::Emergency => (
+            EMERGENCY_TERMINAL_FRAME_MAGIC,
+            EMERGENCY_TERMINAL_FRAME_DOMAIN,
+        ),
+    }
+}
+
 impl fmt::Debug for TerminalRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("TerminalRecord(<redacted>)")
@@ -3325,6 +3358,39 @@ mod frozen_cross_crate_goldens {
                         .iter()
                         .all(|member| member.expected_version() == expected_version));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn roster_completion_net_terminal_class_changes_signed_body_and_frame() {
+        for class in [AdmissionClass::Ordinary, AdmissionClass::Emergency] {
+            let admission = admission().with_admission_class(class);
+            let terminal = TerminalRecord::new(
+                &admission,
+                RequestId::bind(4, &admission).unwrap(),
+                Phase::Established,
+                vec![[1; 32]; FRESH_ROSTER_MEMBERS],
+            )
+            .unwrap();
+            let frame = terminal.to_canonical_bytes(&admission).unwrap();
+            let (magic, domain) = terminal_frame_encoding(class);
+            assert_eq!(&frame[..8], &magic);
+            let decoded: TerminalRecord =
+                decode_frame(&frame, magic, domain, MAX_TERMINAL_CODEC_BYTES).unwrap();
+            assert_eq!(decoded, terminal);
+            decoded.validate_for(&admission).unwrap();
+            let ordinary = terminal.calculate_body_commitment();
+            assert_eq!(
+                terminal.body_commitment(),
+                class_bound_terminal_commitment(class, ordinary)
+            );
+            if class == AdmissionClass::Emergency {
+                assert_ne!(
+                    terminal.body_commitment(),
+                    ordinary,
+                    "executor signatures include the emergency class"
+                );
             }
         }
     }
