@@ -2,6 +2,7 @@
 //! SCTP message seam. These tests prove the RFC 6733 direct-protection
 //! sequencing and RFC 6083 PPID-47 carriage without requiring kernel SCTP.
 
+mod diameter_streams;
 pub(crate) mod generic;
 #[cfg(target_os = "linux")]
 mod wire_abort;
@@ -701,6 +702,27 @@ async fn kernel_loopback_completes_real_rfc6083_handshake_and_reciprocal_close()
             .header,
         request.header
     );
+    for stream in [1, 7, 15] {
+        let (sent, received) = tokio::join!(
+            client.send_message_on_stream(&request, stream, deadline),
+            server.receive_message(deadline),
+        );
+        assert!(sent
+            .expect("send on negotiated kernel stream")
+            .is_protected());
+        assert_eq!(received.expect("receive selected stream").0, request);
+        let (sent, received) = tokio::join!(
+            server.send_message_on_stream(&request, stream, deadline),
+            client.receive_message(deadline),
+        );
+        assert!(sent
+            .expect("send reverse negotiated kernel stream")
+            .is_protected());
+        assert_eq!(
+            received.expect("receive reverse selected stream").0,
+            request
+        );
+    }
     let (closed, peer) = tokio::join!(client.close(deadline), server.receive_message(deadline));
     closed.expect("complete reciprocal close_notify over kernel SCTP");
     assert!(

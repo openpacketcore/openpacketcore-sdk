@@ -89,15 +89,22 @@ for the exact crash cut, credential handling and remaining limits.
   Diameter byte. The in-band typestates permit exactly one canonical
   cleartext CER/CEA, seal that prelude, and complete DTLS on the same SCTP
   association before application traffic. Exactly one DTLS record travels
-  per ordered stream-0 SCTP user message with PPID 47 (RFC 6083 sections 4.1
+  per SCTP user message with PPID 47 (RFC 6083 sections 4.1
   and 4.4; PPID 47 is registered by RFC 6733 section 11.5). Any cleartext or
   foreign-PPID input after the prelude fails closed.
+- Diameter receives authenticated application records on any negotiated SCTP
+  stream, ordered or unordered, as required by RFC 6733 section 2.1.1. DTLS
+  Handshake, CCS and Alert records remain ordered on stream zero. Sequential
+  `send_message_on_stream` selects an application stream; the kernel enforces
+  its negotiated range. Default sends and the concurrent peer runtime use
+  ordered stream zero and retain its head-of-line blocking tradeoff. The
+  generic RFC 6083 API retains its explicitly configured ordered-stream policy.
 - The DTLS engine is the audited workspace-vendored `dimpl` fork, compiled
   only with its pure-Rust `rust-crypto` provider. The transport selects that
   provider explicitly, so a process-global `dimpl` default installed by
   unrelated code cannot replace its crypto authority. Its RFC 6083 profile
   is DTLS-1.2-only, disables datagram replay filtering and flight
-  retransmission in favor of reliable ordered SCTP, and admits the typed
+  retransmission in favor of reliable SCTP, and admits the typed
   ECDHE-ECDSA AES-GCM and ChaCha20-Poly1305 suites reported in connection
   evidence.
 - Complete peer certificate chains are bounded, checked for leaf-to-root

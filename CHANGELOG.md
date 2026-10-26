@@ -525,6 +525,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplication. The session-store runtime remains exactly pinned and retains its
   queue, cancellation and shutdown ownership contracts. (#1532)
 
+- `opc-diameter-transport`: receive protected Diameter application records on
+  any negotiated SCTP stream, including unordered delivery, in sequential and
+  concurrent connections. Add `send_message_on_stream`; preserve ordered
+  stream-zero DTLS control, exact-generation admission and bounded record
+  correlation. (#1351)
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a
