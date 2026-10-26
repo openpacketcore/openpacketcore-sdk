@@ -377,6 +377,39 @@ Witnesses: [safe authentication boundary](../crates/opc-sctp/src/lib.rs),
 [RFC 6458 §§8.1.17, 8.2.4](https://www.rfc-editor.org/rfc/rfc6458.html#section-8.1.17), and
 [Linux endpoint/association readback](https://github.com/torvalds/linux/blob/v6.8/net/sctp/socket.c).
 
+## SCTP work list #1351: Diameter stream admission
+
+RFC 6083 section 4.4 permits sending application records solely on stream zero.
+However, RFC 6733 section 2.1.1 requires Diameter receivers to accept messages
+on any negotiated stream, including peer-selected unordered delivery. The
+Diameter facade now applies that receiver contract in both sequential and
+concurrent operation. Its selected-stream send method retains exact-generation
+command admission. SCTP remains responsible for negotiating and enforcing the
+available stream range; stream 65535 is rejected locally.
+
+The existing bounded epoch/record-number correlation tracks authenticated
+carrier metadata. Handshake, CCS and Alert records remain ordered on stream
+zero. Cleartext, foreign PPIDs, malformed records, truncated metadata and
+notifications still fail closed. The separately configured generic RFC 6083
+ordered-stream policy retains its original restrictions. Default Diameter
+sends and the concurrent runtime still choose ordered stream zero, with its
+head-of-line blocking tradeoff; this change does not implement a stream scheduler.
+
+The old implementation fails the new peer-stream regression. The fixed
+selection passes 236 tests on each host and Linux, covering both roles and
+both runtime forms, highest usable stream ID, unordered application delivery,
+protected selected-stream sends and terminal metadata/control refusals. The
+existing native Diameter qualification additionally sends in both directions
+over negotiated streams 1, 7 and 15, preserving its original stream-zero and
+reciprocal-close assertions. All 11 native RFC 6083 cases and Linux strict
+all-target/all-feature Clippy pass.
+
+Witnesses: [Diameter transport](../crates/opc-diameter-transport/src/dtls.rs),
+[regressions](../crates/opc-diameter-transport/src/dtls_tests/diameter_streams.rs),
+[native proof](../crates/opc-diameter-transport/src/dtls_tests.rs), and
+[RFC 6733 section 2.1.1](https://www.rfc-editor.org/rfc/rfc6733.html#section-2.1.1).
+The other #1351 lifecycle and optional-extension claims remain separately tracked.
+
 ## Integration verification: Tokio descriptor ownership
 
 The branch updates every Tokio lock to 1.53.3 and keeps the storage consumer's

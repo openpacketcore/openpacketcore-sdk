@@ -11,10 +11,11 @@
 //! `dimpl` fork with its explicitly selected pure-Rust `rust-crypto` provider
 //! and admits only typed ECDHE-ECDSA AEAD suites. An unrelated process-global
 //! `dimpl` provider cannot replace that authority. The profile disables DTLS
-//! record replay filtering and flight retransmission because reliable, ordered
-//! SCTP owns those properties. Every DTLS record is carried as one ordered SCTP
-//! user message on stream 0 with [`DIAMETER_DTLS_SCTP_PPID`] (47); cleartext or
-//! foreign-PPID input after the in-band prelude fails the association closed.
+//! record replay filtering and flight retransmission because reliable
+//! SCTP owns those properties. Each DTLS record occupies one SCTP user message
+//! with [`DIAMETER_DTLS_SCTP_PPID`] (47). Control uses ordered stream zero;
+//! applications may use any negotiated stream and receive unordered records.
+//! Cleartext or foreign-PPID input after the in-band prelude fails the association closed.
 //! The maximum Diameter plaintext is 16,347 bytes, the conservative
 //! single-record budget across all admitted suites.
 //!
@@ -101,10 +102,9 @@ use crate::{
 /// PPID for "Diameter in a DTLS/SCTP DATA chunk" (RFC 6733 section 11.5).
 pub const DIAMETER_DTLS_SCTP_PPID: u32 = 47;
 
-/// SCTP stream carrying every record of one DTLS connection. RFC 6083
-/// section 4.4 requires ordered stream-0 delivery for Handshake, CCS, and
-/// Alert records; this transport uses ordered stream-0 delivery for
-/// ApplicationData too.
+/// SCTP stream for DTLS control and default application sends. RFC 6083
+/// section 4.4 requires ordered stream-0 Handshake, CCS and Alert records.
+/// Application sends may select another negotiated stream.
 pub const DIAMETER_DTLS_SCTP_STREAM: u16 = 0;
 
 const ENGINE_POLL_BUFFER: usize = 16 * 1024;
@@ -2144,26 +2144,19 @@ pub fn parse_dtls_record_bounds(frame: &[u8]) -> Option<DtlsRecordBounds> {
 
 #[cfg(test)]
 fn validate_received_dtls_record(message: &SctpUserMessage) -> Result<&[u8], DiameterTlsError> {
-    validate_received_record_for(message, DIAMETER_DTLS_SCTP_PPID)
-}
-
-fn validate_received_record_for(
-    message: &SctpUserMessage,
-    protected_ppid: u32,
-) -> Result<&[u8], DiameterTlsError> {
-    validate_received_record_on_streams(message, protected_ppid, 1)
+    validate_received_record_on_streams(message, DIAMETER_DTLS_SCTP_PPID, 1, false)
 }
 
 fn validate_received_record_on_streams(
     message: &SctpUserMessage,
     protected_ppid: u32,
     stream_count: u16,
+    allow_unordered_application: bool,
 ) -> Result<&[u8], DiameterTlsError> {
     if message.ppid() != protected_ppid {
         return Err(DiameterTlsError::CleartextInput);
     }
     if message.stream_id() >= stream_count
-        || message.order() != SctpDeliveryOrder::Ordered
         || message.truncated()
         || message.control_truncated()
         || message.notification()
@@ -2174,7 +2167,9 @@ fn validate_received_record_on_streams(
     let bounds = parse_dtls_record_bounds(message.payload()).ok_or(DiameterTlsError::Transport)?;
     if bounds.record_bytes != message.payload().len()
         || (message.stream_id() != 0 && (bounds.content_type != Some(23) || bounds.epoch == 0))
-        // This opt-in profile uses DTLS 1.2 record identities. Initial
+        || (message.order() != SctpDeliveryOrder::Ordered
+            && (!allow_unordered_application || bounds.content_type != Some(23) || bounds.epoch == 0))
+        // Multistream profiles use DTLS 1.2 record identities. Initial
         // handshakes may use the DTLS 1.0 compatibility version, but protected
         // records must carry the negotiated DTLS 1.2 version on the wire.
         || (stream_count > 1
@@ -2194,8 +2189,12 @@ fn handle_received_record(
     protected_ppid: u32,
     packet_error: DiameterTlsError,
 ) -> Result<(), DiameterTlsError> {
-    let record =
-        validate_received_record_on_streams(message, protected_ppid, state.streams.count())?;
+    let record = validate_received_record_on_streams(
+        message,
+        protected_ppid,
+        state.streams.count(),
+        state.streams.allows_unordered_application(),
+    )?;
     state.streams.remember(message)?;
     engine.handle_packet(record).map_err(|_| packet_error)
 }
@@ -2373,7 +2372,14 @@ async fn run_transport_handshake(
     validation: &HandshakeValidation,
     deadline: Instant,
 ) -> Result<CompletedHandshake, DiameterTlsError> {
-    run_transport_handshake_with_streams(engine, io, validation, deadline, Default::default()).await
+    run_transport_handshake_with_streams(
+        engine,
+        io,
+        validation,
+        deadline,
+        rfc6083::streams::RecordStreams::diameter(MAX_DTLS_SCTP_RECEIVE_QUEUE_MESSAGES),
+    )
+    .await
 }
 
 async fn run_transport_handshake_with_streams(
@@ -3489,6 +3495,9 @@ fn finish_association(
         // with the handshake's own state.
         pump_state: PumpState {
             connected: true,
+            streams: rfc6083::streams::RecordStreams::diameter(
+                MAX_DTLS_SCTP_RECEIVE_QUEUE_MESSAGES,
+            ),
             ..PumpState::default()
         },
         poll_buffer: vec![0_u8; ENGINE_POLL_BUFFER],
@@ -3648,6 +3657,7 @@ async fn run_dtls_runtime_actor(
 ) {
     let mut state = PumpState {
         connected: true,
+        streams: rfc6083::streams::RecordStreams::diameter(max_buffered_frames),
         ..PumpState::default()
     };
     let mut buffer = vec![0_u8; ENGINE_POLL_BUFFER];
@@ -3754,10 +3764,10 @@ async fn run_dtls_runtime_actor(
             tokio::select! {
                 message = io.receive_message() => {
                     let message = message?.ok_or(DiameterTlsError::Transport)?;
-                    let record = validate_received_record_for(&message, io.protected_ppid())?;
-                    engine
-                        .handle_packet(record)
-                        .map_err(|_| DiameterTlsError::Transport)?;
+                    handle_received_record(
+                        &mut engine, &mut state, &message, io.protected_ppid(),
+                        DiameterTlsError::Transport,
+                    )?;
                 }
                 command = sends.recv() => {
                     let Some(command) = command else {
@@ -3774,6 +3784,7 @@ async fn run_dtls_runtime_actor(
                         &mut buffer,
                         command.limits,
                         &command.wire,
+                        0,
                         command.deadline,
                     ).await;
                     let failed = result.is_err();
@@ -3911,7 +3922,7 @@ impl DiameterDtlsSctpConnection {
             .capabilities_request_sent_on(self.generation, &message.header)
             .map_err(|_| DiameterTlsError::CapabilitiesExchangeFailed)?;
         self.ensure_active()?;
-        self.write_protected_message(&message, deadline).await?;
+        self.write_protected_message(&message, 0, deadline).await?;
         Ok(admission)
     }
 
@@ -3990,6 +4001,7 @@ impl DiameterDtlsSctpConnection {
             poll_buffer,
             *frame_limits,
             emission.as_bytes(),
+            0,
             deadline,
         )
         .await
@@ -4087,6 +4099,19 @@ impl DiameterDtlsSctpConnection {
         message: &OwnedMessage,
         deadline: Instant,
     ) -> Result<PeerCommandAdmission, DiameterTlsError> {
+        self.send_message_on_stream(message, 0, deadline).await
+    }
+
+    /// Admit and emit an application message on a selected reliable ordered stream.
+    /// SCTP checks the negotiated outbound range; DTLS control stays on stream zero.
+    /// Peers may send replies on a different stream. Failure or cancellation
+    /// during emission closes the association, as with [`Self::send_message`].
+    pub async fn send_message_on_stream(
+        &mut self,
+        message: &OwnedMessage,
+        stream_id: u16,
+        deadline: Instant,
+    ) -> Result<PeerCommandAdmission, DiameterTlsError> {
         self.ensure_active()?;
         if PeerCommandClass::from_header(&message.header) != PeerCommandClass::Application {
             return Err(DiameterTlsError::CommandNotAdmitted);
@@ -4100,7 +4125,8 @@ impl DiameterDtlsSctpConnection {
             )
             .map_err(|_| DiameterTlsError::CommandNotAdmitted)?;
         self.ensure_active()?;
-        self.write_protected_message(message, deadline).await?;
+        self.write_protected_message(message, stream_id, deadline)
+            .await?;
         Ok(admission)
     }
 
@@ -4262,6 +4288,7 @@ impl DiameterDtlsSctpConnection {
     async fn write_protected_message(
         &mut self,
         message: &OwnedMessage,
+        stream_id: u16,
         deadline: Instant,
     ) -> Result<(), DiameterTlsError> {
         self.ensure_active()?;
@@ -4290,6 +4317,7 @@ impl DiameterDtlsSctpConnection {
             poll_buffer,
             *frame_limits,
             &wire,
+            stream_id,
             deadline,
         )
         .await
@@ -4446,6 +4474,7 @@ async fn close_transport_via(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_wire_frame_via(
     engine: &mut dimpl::Dtls,
     io: &mut Box<dyn SctpMessageIo>,
@@ -4453,21 +4482,20 @@ async fn write_wire_frame_via(
     poll_buffer: &mut Vec<u8>,
     frame_limits: DiameterFrameLimits,
     wire: &[u8],
+    stream_id: u16,
     deadline: Instant,
 ) -> Result<(), DiameterTlsError> {
     validate_wire_frame(wire, frame_limits)?;
-    write_application_via(engine, io, pump_state, poll_buffer, wire, deadline).await
-}
-
-async fn write_application_via(
-    engine: &mut dimpl::Dtls,
-    io: &mut Box<dyn SctpMessageIo>,
-    pump_state: &mut PumpState,
-    poll_buffer: &mut Vec<u8>,
-    wire: &[u8],
-    deadline: Instant,
-) -> Result<(), DiameterTlsError> {
-    write_application_on_stream_via(engine, io, pump_state, poll_buffer, wire, 0, deadline).await
+    write_application_on_stream_via(
+        engine,
+        io,
+        pump_state,
+        poll_buffer,
+        wire,
+        stream_id,
+        deadline,
+    )
+    .await
 }
 
 async fn write_application_on_stream_via(

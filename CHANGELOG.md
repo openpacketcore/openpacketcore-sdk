@@ -1042,6 +1042,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-diameter-transport`: receive protected Diameter application records on
+  any negotiated SCTP stream, including unordered delivery, in sequential and
+  concurrent connections. Add `send_message_on_stream`; preserve ordered
+  stream-zero DTLS control, exact-generation admission and bounded record
+  correlation. (#1351)
+
 - Update vendored DTLS P-256/P-384/ECDSA dependencies above the
   RUSTSEC-2026-0387 arithmetic floor and its standalone `time` dependency
   above RUSTSEC-2026-0009. OS randomness failures propagate as errors;
