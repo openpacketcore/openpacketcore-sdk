@@ -1974,7 +1974,14 @@ impl GtpuSocketHandle {
         if let Some(socket) = &self._test_socket {
             return Some(std::os::fd::AsFd::as_fd(socket));
         }
-        self._socket.as_ref().map(GtpuUdpSocket::as_fd)
+        #[cfg(not(opc_linux_gtpu_sys_force_unsupported))]
+        {
+            self._socket.as_ref().map(GtpuUdpSocket::as_fd)
+        }
+        #[cfg(opc_linux_gtpu_sys_force_unsupported)]
+        {
+            None
+        }
     }
 }
 
