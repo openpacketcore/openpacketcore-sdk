@@ -493,7 +493,8 @@ See [ADR 0002](../../docs/adr/0002-config-store-consensus-ha.md),
   `PlannedShutdownFallback::Unplanned` reports this route: preparation was
   suppressed, or an in-flight preparation was cancelled and joined (RPCs
   already sent cannot be retracted, so a successor may already be campaigning).
-  Completed reports remain unchanged. Caller cancellation
+  Already published reports remain unchanged; a result racing the unplanned
+  request is reported as `Unplanned`. Caller cancellation
   or timeout cannot reopen admission or abandon the drain. Config bus adapters
   use this route through `RaftManagedDatastore::consensus_store()`; they own no
   separate consensus lifecycle. Surviving voters use ordinary elections, and

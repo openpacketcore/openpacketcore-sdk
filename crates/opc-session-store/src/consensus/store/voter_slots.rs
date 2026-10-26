@@ -14,29 +14,6 @@ use opc_consensus::engine::{
 use opc_consensus::voter_slots::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Test-only injection for the transient voter-store reopen class. The hook
-/// exists only in test builds; production opening never consults it.
-#[cfg(test)]
-pub(crate) mod transient_open_test_hook {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static REMAINING: AtomicUsize = AtomicUsize::new(0);
-
-    /// Require the next `count` opening attempts to report the transient
-    /// `StorageUnavailable` class before any real work starts.
-    pub(crate) fn inject(count: usize) {
-        REMAINING.store(count, Ordering::SeqCst);
-    }
-
-    pub(crate) fn take() -> bool {
-        REMAINING
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-    }
-}
-
 pub(crate) type SessionVoterAdmission =
     VoterAdmission<RaftVoterResponseFence<SessionRaftTypeConfig>>;
 pub(crate) type SessionVoterTransport =
@@ -111,7 +88,7 @@ struct IncomingSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-enum ControlRequest {
+pub(super) enum ControlRequest {
     LossProbe {
         target: SessionConsensusNodeId,
         request_digest: [u8; 32],
@@ -140,7 +117,7 @@ pub(super) enum ControlReply {
 }
 
 impl SessionVoterProfile {
-    async fn control(
+    pub(super) async fn control(
         &self,
         store: &ConsensusSessionStore,
         request: ControlRequest,
@@ -163,10 +140,8 @@ impl SessionVoterProfile {
                 evidence,
             } => {
                 let local = store.inner.local_node_id;
-                // `deadline` is the operation budget captured when this
-                // control request was admitted; the publication wait must not
-                // restart it.
-                let state = Reader(self.core.clone()).state_until(deadline).await?;
+                let published = Reader(self.core.clone()).append_state(0, deadline).await?;
+                let state = published.state;
                 let operation = state
                     .table()
                     .replacement
@@ -183,8 +158,8 @@ impl SessionVoterProfile {
                 {
                     return Err(VoterReplacementError::InvalidTransition);
                 }
-                let snapshot = Reader(self.core.clone())
-                    .snapshot()?
+                let snapshot = published
+                    .snapshot
                     .ok_or(VoterReplacementError::InvalidTransition)?;
                 let cut = snapshot
                     .0
@@ -208,10 +183,8 @@ impl SessionVoterProfile {
                 marker,
             } => {
                 let local = store.inner.local_node_id;
-                // `deadline` is the operation budget captured when this
-                // control request was admitted; the publication wait must not
-                // restart it.
-                let state = Reader(self.core.clone()).state_until(deadline).await?;
+                let published = Reader(self.core.clone()).append_state(0, deadline).await?;
+                let state = published.state;
                 let operation = state
                     .table()
                     .replacement
@@ -226,7 +199,7 @@ impl SessionVoterProfile {
                 let applied = operation.attestation.request_digest == request_digest
                     && selected.member.identity.node_id() == local
                     && operation.phase >= VoterReplacementPhase::LearnerAdded
-                    && Reader(self.core.clone()).before(0)?.0.is_some_and(|cut| {
+                    && published.applied.is_some_and(|cut| {
                         cut.leader_id.term == marker.term && cut.index >= marker.index
                     });
                 if !applied {
@@ -245,10 +218,8 @@ impl SessionVoterProfile {
         // The recovered committed table replaces the manifest as authority.
         // Refuse a retired/rebound local key before attaching an engine or
         // enabling any election, heartbeat, or authenticated RPC service.
-        // Opening has no request budget: read the current strict publication
-        // without starting a wait, as before.
         let retained = Reader(core.clone())
-            .read_voter_slot_state_now()
+            .read_voter_slot_state()
             .await
             .map_err(|_| ConsensusSessionStoreOpenError::StorageUnavailable)?;
         if retained.table().cluster_instance != signer.cluster_instance()
@@ -314,7 +285,7 @@ impl SessionVoterProfile {
             && table == *state.table()
     }
 
-    async fn wait_candidate_ack(
+    pub(super) async fn wait_candidate_ack(
         &self,
         raft: &SessionRaft,
         local: SessionConsensusNodeId,
@@ -341,8 +312,6 @@ impl SessionVoterProfile {
         loop {
             // Never await admission's serial coordinator while holding the
             // incoming request guard; publication has its own independent task.
-            // Wait only for strict publication, within the request's original
-            // budget.
             let state = Reader(self.core.clone()).state_until(deadline).await?;
             if state.table().slots.iter().any(|slot| {
                 slot.member.identity.node_id() == local && slot.phase == VoterSlotPhase::Voting
@@ -364,8 +333,7 @@ impl SessionVoterProfile {
         replacement: Option<[u8; 32]>,
         deadline: tokio::time::Instant,
     ) -> Result<SessionConsensusWireResponse, VoterReplacementError> {
-        let admission_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if admission_budget.is_zero() {
+        if tokio::time::Instant::now() >= deadline {
             return Err(VoterReplacementError::Deadline);
         }
         let unavailable = |_| VoterReplacementError::Unavailable;
@@ -494,9 +462,8 @@ impl SessionVoterProfile {
             .map(|(node, _)| *node)
             .collect();
         let raft = store.inner.raft.clone();
-        // Inspection and accepted installation remain owned if the chunk's
-        // caller times out. Give the verified artifact its own admission budget.
-        let deadline = tokio::time::Instant::now() + admission_budget;
+        // Admission shares the chunk's original deadline. Once installation
+        // is dispatched, the verified artifact stays owned until it completes.
         let response = self
             .admission
             .run_snapshot(table, members, deadline, move || async move {
@@ -684,10 +651,6 @@ impl ConsensusSessionStore {
         resolver: Arc<dyn VoterPeerResolver>,
         snapshot_integrity: super::super::SnapshotIntegrityPolicy,
     ) -> Result<Self, ConsensusSessionStoreOpenError> {
-        #[cfg(test)]
-        if transient_open_test_hook::take() {
-            return Err(ConsensusSessionStoreOpenError::StorageUnavailable);
-        }
         let genesis = topology
             .voter_slot_genesis()
             .cloned()
@@ -757,17 +720,23 @@ impl ConsensusSessionStore {
 
     /// Read one atomically published bounded table and provisional intent.
     ///
-    /// This observer read does not wait for a pending strict publication; a
-    /// caller with a request budget must use a bounded path.
+    /// Waits for a pending strict publication for at most this store's operation
+    /// timeout. Terminal writer failure and other storage errors remain refusals.
     pub async fn voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError> {
+        self.voter_slot_state_before(tokio::time::Instant::now() + self.inner.operation_timeout)
+            .await
+    }
+
+    async fn voter_slot_state_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
         let profile = self
             .inner
             .voter_profile
             .as_ref()
             .ok_or(VoterReplacementError::IncompatibleProfile)?;
-        Reader(profile.core.clone())
-            .read_voter_slot_state_now()
-            .await
+        Reader(profile.core.clone()).state_until(deadline).await
     }
 
     /// Resolve an accepted request using current controller authorization and a
@@ -833,6 +802,7 @@ impl ConsensusSessionStore {
         &self,
         verified: VerifiedVoterReplacement,
     ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+        let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         let profile = self
             .inner
             .voter_profile
@@ -844,10 +814,7 @@ impl ConsensusSessionStore {
             .transport
             .validate_candidate_route(&request)
             .map_err(|_| VoterReplacementError::UnauthorizedReplacement)?;
-        // One original budget covers the initial read, the quorum proof,
-        // the liveness probe, dispatch and the final read.
-        let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
-        let state = Reader(profile.core.clone()).state_until(deadline).await?;
+        let state = self.voter_slot_state_before(deadline).await?;
         let retained = state
             .table()
             .replacement
@@ -902,9 +869,15 @@ impl ConsensusSessionStore {
                 },
             )
             .await?;
-        // Resolve the accepted write within the same original budget: no
-        // restart after the quorum proof, liveness probe or dispatch.
-        Reader(profile.core.clone()).state_until(deadline).await
+        self.voter_slot_state_before(deadline)
+            .await
+            .map_err(|error| {
+                if error == VoterReplacementError::Deadline {
+                    VoterReplacementError::OutcomeUnknown
+                } else {
+                    error
+                }
+            })
     }
 
     async fn write_slot_control(
@@ -996,8 +969,7 @@ impl ConsensusSessionStore {
             return Err(VoterReplacementError::TargetStillLive);
         }
         profile.admission.check_target_absent(target)?;
-        // Strict publication read within the leader intent's original budget.
-        let state = Reader(profile.core.clone()).state_until(deadline).await?;
+        let state = self.voter_slot_state_before(deadline).await?;
         let configuration = state.table().current_configuration();
         let voters: BTreeSet<_> = configuration
             .members
@@ -1069,11 +1041,6 @@ impl ConsensusSessionStore {
         &self,
         progress: &mut ReplacementProgress,
     ) -> Result<(), VoterReplacementError> {
-        let profile = self
-            .inner
-            .voter_profile
-            .as_ref()
-            .ok_or(VoterReplacementError::IncompatibleProfile)?;
         let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         let cut = tokio::time::timeout_at(deadline, self.inner.raft.ensure_linearizable())
             .await
@@ -1093,7 +1060,7 @@ impl ConsensusSessionStore {
         }
         loop {
             let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
-            let state = Reader(profile.core.clone()).state_until(deadline).await?;
+            let state = self.voter_slot_state_before(deadline).await?;
             let Some(operation) = state.table().replacement.clone() else {
                 *progress = ReplacementProgress::default();
                 return Ok(());
@@ -1336,6 +1303,7 @@ impl ConsensusSessionStore {
             }
         }
         loop {
+            let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
             // Recheck the actual engine vote and committed operation before
             // each chunk. Losing leadership or supersession discards this work
             // only when the coordinator observes that different operation key.
@@ -1345,7 +1313,7 @@ impl ConsensusSessionStore {
                 .with_raft_state(|state| *state.vote_ref())
                 .await
                 .map_err(|_| VoterReplacementError::Unavailable)?;
-            let state = self.voter_slot_state().await?;
+            let state = self.voter_slot_state_before(deadline).await?;
             if current_vote != vote
                 || state.table().replacement.as_ref().is_none_or(|current| {
                     current.attestation.request_digest != operation.attestation.request_digest
@@ -1355,7 +1323,6 @@ impl ConsensusSessionStore {
             {
                 return Err(VoterReplacementError::NoSurvivingQuorum);
             }
-            let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
             tokio::io::AsyncSeekExt::seek(
                 &mut delivery.artifact.snapshot,
                 std::io::SeekFrom::Start(delivery.offset),
@@ -1459,7 +1426,12 @@ pub(super) fn start_coordinator(store: &ConsensusSessionStore) {
             let store = ConsensusSessionStore { inner };
             let leader = metrics.borrow().current_leader == Some(store.inner.local_node_id);
             let pending = if leader {
-                match store.voter_slot_state().await {
+                let Some(profile) = store.inner.voter_profile.as_ref() else {
+                    return;
+                };
+                // Lifecycle reconciliation is notification-driven and must
+                // not retain this store awaiting a fresh request timeout.
+                match Reader(profile.core.clone()).read_voter_slot_state().await {
                     Ok(state) => {
                         if state.table().replacement.is_some() {
                             true
@@ -1809,19 +1781,7 @@ impl std::fmt::Debug for Reader {
 }
 #[async_trait]
 impl VoterSlotStateReader for Reader {
-    async fn read_voter_slot_state(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
-        // `state_until` subscribes before its first read, waits only for a
-        // strict-publication `WouldBlock`, and maps a spent caller budget to
-        // `Deadline` without starting a new timeout.
-        self.state_until(deadline).await
-    }
-
-    async fn read_voter_slot_state_now(
-        &self,
-    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+    async fn read_voter_slot_state(&self) -> Result<VoterSlotDurableState, VoterReplacementError> {
         #[cfg(target_os = "linux")]
         {
             self.wal()?
@@ -1833,6 +1793,13 @@ impl VoterSlotStateReader for Reader {
             let _core = &self.0;
             Err(VoterReplacementError::IncompatibleProfile)
         }
+    }
+
+    async fn read_voter_slot_state_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<VoterSlotDurableState, VoterReplacementError> {
+        self.state_until(deadline).await
     }
 }
 
@@ -1900,38 +1867,5 @@ impl Reader {
             .private_wal
             .as_ref()
             .ok_or(VoterReplacementError::IncompatibleProfile)
-    }
-
-    fn before(
-        &self,
-        end: u64,
-    ) -> Result<(Option<LogId<SessionConsensusNodeId>>, VoterSlotTable), VoterReplacementError>
-    {
-        #[cfg(target_os = "linux")]
-        {
-            self.wal()?
-                .native_voter_slots_before(end)
-                .map_err(|_| VoterReplacementError::Unavailable)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = end;
-            Err(VoterReplacementError::IncompatibleProfile)
-        }
-    }
-
-    fn snapshot(
-        &self,
-    ) -> Result<Option<crate::sqlite::consensus::CurrentSnapshot>, VoterReplacementError> {
-        #[cfg(target_os = "linux")]
-        {
-            self.wal()?
-                .native_voter_snapshot()
-                .map_err(|_| VoterReplacementError::Unavailable)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(VoterReplacementError::IncompatibleProfile)
-        }
     }
 }
