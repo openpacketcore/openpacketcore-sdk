@@ -104,9 +104,21 @@ Decodes IE *content* (caller strips IEI/length framing):
 
 ### 5. IE-Level Message Bodies And Dispatch (v2)
 
+The registration, algorithm and message-type registries are checked against
+[TS 24.501 V19.8.0](https://www.etsi.org/deliver/etsi_ts/124500_124599/124501/19.08.00_60/ts_124501v190800p.pdf),
+Tables 9.11.3.7.1, 9.11.3.34.1 and 9.7.1/2 (#1515, #1526, #1527).
+NSSAA, relay, service-level authentication and remote-UE message codes have
+names; their bodies retain the existing raw `Unknown` dispatch. This does not
+claim implementation of those procedures or complete Release 19 support.
+Downstream exhaustive enum matches must handle the added variants.
+
 #### 5.1 Registration Request (§8.2.6)
 - Mandatory IEs decoded: 5GS registration type, follow-on-request pending
   bit, ngKSI, and 5GS mobile identity (via the existing identity decoder).
+- Registration types 1–7 are named, including SNPN onboarding and disaster
+  roaming. Received unused value 0 means initial registration at every
+  validation level (§9.11.3.7). `raw_first_octet` retains the received value
+  for byte-exact forwarding; typed `InitialRegistration` has sender value 1.
 - All remaining bytes are parsed as optional IEs and preserved raw so that
   unknown or future IEs round-trip byte-exactly when the context permits them.
 - Its own table registers all 42 optional elements, with type-1, fixed-length
@@ -118,6 +130,9 @@ Decodes IE *content* (caller strips IEI/length framing):
 
 #### 5.3 Security Mode Command (§8.2.25)
 - Mandatory selected NAS security algorithms decoded into NIA/NEA enums.
+- Defined NIA/NEA identifiers 0–7 decode; reserved identifiers 8–15 fail.
+  Naming 4–7 does not enable cryptography: the bundled providers return
+  `NasSecurityError::UnsupportedAlgorithm` for unimplemented identifiers.
 - Mandatory ngKSI decoded and raw-preserved.
 - Mandatory replayed UE security capability LV decoded and raw-preserved;
   zero-length capabilities and truncated LV values are rejected.

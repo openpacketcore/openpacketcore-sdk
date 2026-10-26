@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-proto-nas`: add the defined SNPN/disaster-roaming registration types,
+  NIA/NEA identifiers 4–7, and twelve NSSAA/relay/service-level-authentication/
+  remote-UE message names. Exhaustive matches must handle the new variants.
+  Naming algorithms does not make them available for cryptography. (#1515,
+  #1526, #1527)
+
 - `opc-proto-pfcp`: correct the `UeIpAddress` wire model. Remove `ipv4d`,
   `ipv4_prefix_length`, and `ch` from struct literals; use `ipv6d` with
   `ipv6_prefix_delegation_bits` for delegation and `ip6pl` with
@@ -908,6 +914,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without changing any public API or behavior.
 
 ### Fixed
+
+- `opc-proto-nas`: interpret unused received registration type 0 as initial
+  registration and retain its raw octet for forwarding. Accept all defined
+  algorithm identifiers in the codec while the crypto providers continue to
+  reject unimplemented algorithms. (#1515, #1526)
 
 - `opc-proto-pfcp`: align Cause codes, UE IP Address flags and IPv6 prefix
   fields, and F-TEID CHOOSE encoding with TS 29.244. Reject inconsistent
