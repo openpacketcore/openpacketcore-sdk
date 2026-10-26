@@ -112,3 +112,20 @@ The local cache TTL remains an additional limit; server lifetime also caps
 stale-if-error. Fresh authoritative absence evicts a stale positive. A 404
 without explicit freshness is not stored. These are bounded discovery helpers,
 not a complete HTTP caching proxy or full NRF data model.
+
+## NRF access tokens
+
+The validator defaults to the SDK JWT-SVID profile. To accept TS 29.510
+6.3.5.2.4 access tokens, select
+`SbiTokenProfile::NrfAccessToken` with `with_token_profile`. Configure the NRF
+UUID as expected issuer and the local producer NF type or instance ID as
+expected audience. RS256 signatures, issuer, audience, expiry and service
+scope are enforced. `nbf` is optional but enforced when present. NRF scope
+claims must use the standard space-delimited grammar.
+
+NRF consumer UUID subjects must match the authenticated transport peer's NF
+instance. Tenant and NF type are retained from that peer, never invented from
+token or unsigned HTTP fields. This profile requires peer binding even outside
+production and does not allow the mock-token bypass. Resource/operation-level
+authorization remains the consuming service's policy; the generic validator
+requires the invoked service scope.

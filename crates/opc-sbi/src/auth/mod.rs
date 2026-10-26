@@ -11,8 +11,8 @@ pub mod jwt;
 
 pub use context::{ErasedAuthContext, SbiAuthContext, SbiPeer};
 pub use jwt::{
-    ClientTokenCache, Jwk, Jwks, JwksCache, JwksResolver, SbiJwtValidator, SvidClaims,
-    TokenProvider,
+    ClientTokenCache, Jwk, Jwks, JwksCache, JwksResolver, SbiJwtValidator, SbiTokenProfile,
+    SvidClaims, TokenProvider,
 };
 
 use crate::headers::{BearerToken, SbiHeaders};

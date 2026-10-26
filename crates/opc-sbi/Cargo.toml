@@ -19,6 +19,7 @@ testkit = []
 runtime-hooks = ["dep:opc-runtime"]
 
 [dependencies]
+uuid.workspace = true
 opc-api-nnrf = { path = "../opc-api-nnrf", version = "0.2.0" }
 async-trait = { workspace = true }
 http = "1"

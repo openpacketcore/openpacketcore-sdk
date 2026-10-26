@@ -872,6 +872,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   omit absent optional fields and preserve digit-prefixed enum wire names.
   See `opc-sbi/README.md` for migration details. (#1362)
 
+- `opc-sbi` offers explicit `SbiTokenProfile::NrfAccessToken` validation for
+  TS 29.510 UUID subjects and optional `nbf`, retaining signature, issuer,
+  audience, expiry, scope and transport-peer binding. JWT-SVID remains the
+  default. NRF mode never accepts mock-token bypasses. (#1362)
+
 ### Added
 
 - `opc-session-net`: `scope::PlatformAuthenticationTimeSource` is the supported
