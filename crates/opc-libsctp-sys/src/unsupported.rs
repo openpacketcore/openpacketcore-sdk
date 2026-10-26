@@ -172,6 +172,10 @@ pub fn shutdown_both(_fd: BorrowedFd<'_>) -> io::Result<()> {
     Err(unsupported())
 }
 
+pub fn set_abort_on_close(_fd: BorrowedFd<'_>) -> io::Result<()> {
+    Err(unsupported())
+}
+
 pub fn send_msg(_fd: BorrowedFd<'_>, _payload: &[u8], _info: SendInfo) -> io::Result<usize> {
     Err(unsupported())
 }

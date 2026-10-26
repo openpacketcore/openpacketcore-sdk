@@ -253,6 +253,11 @@ pub(crate) trait SctpTransportClose: Send + Sync {
     /// Close the transport and interrupt in-flight operations.
     fn close(&self);
 
+    /// Abort a compromised association without graceful delivery.
+    fn abort(&self) {
+        self.close();
+    }
+
     /// Whether the sealed carrier has observed a terminal transition.
     fn is_closed(&self) -> bool;
 
@@ -980,10 +985,21 @@ struct KernelSctpClose {
 
 impl SctpTransportClose for KernelSctpClose {
     fn close(&self) {
-        self.terminal.store(true, Ordering::Release);
+        if self.terminal.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.abort.abort();
         #[cfg(test)]
         self.terminal_changed.send_replace(());
-        self.abort.abort();
+    }
+
+    fn abort(&self) {
+        if self.terminal.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.abort.abort_on_wire();
+        #[cfg(test)]
+        self.terminal_changed.send_replace(());
     }
 
     fn is_closed(&self) -> bool {
@@ -3552,6 +3568,10 @@ impl ProtectedFrameTransportClose for DtlsRuntimeClose {
     fn close(&self) {
         self.close.close();
     }
+
+    fn abort(&self) {
+        self.close.abort();
+    }
 }
 
 struct DtlsRuntimeSend {
@@ -3695,6 +3715,9 @@ async fn run_dtls_runtime_actor(
                         .payload;
                     let result = validate_wire_frame(&wire, request.limits).map(|()| wire);
                     let failed = result.is_err();
+                    if failed {
+                        close.abort();
+                    }
                     let _ = request.result.send(result);
                     if failed {
                         return Err(DiameterTlsError::Transport);
@@ -3811,12 +3834,12 @@ async fn run_dtls_runtime_actor(
         }
     }
     .await;
+    close.close();
     if let Some(request) = pending_receive {
         let _ = request
             .result
             .send(Err(outcome.err().unwrap_or(DiameterTlsError::Transport)));
     }
-    close.close();
 }
 
 /// An admitted mutually authenticated DTLS/SCTP association bound to one peer
@@ -4340,6 +4363,9 @@ impl DiameterDtlsSctpConnection {
             {
                 Ok(message) => message,
                 Err(error) => {
+                    if error == DiameterTlsError::InvalidFrame {
+                        close.abort();
+                    }
                     return Err(
                         if retirement_required(
                             material_status,

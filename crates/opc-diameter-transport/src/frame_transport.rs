@@ -65,6 +65,11 @@ pub(crate) trait ProtectedFrameSender: Send {
 /// payload details.
 pub(crate) trait ProtectedFrameTransportClose: Send + Sync {
     fn close(&self);
+
+    /// Abort an unparseable stream (RFC 6733 section 2.1).
+    fn abort(&self) {
+        self.close();
+    }
 }
 
 /// Independently owned receive, send, and full-close capabilities for one

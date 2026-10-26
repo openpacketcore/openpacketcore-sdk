@@ -452,6 +452,12 @@ pub fn shutdown_both(fd: BorrowedFd<'_>) -> io::Result<()> {
     platform::shutdown_both(fd)
 }
 
+/// Select abortive close for a one-to-one SCTP socket using zero SO_LINGER.
+/// The caller must then deregister and close its owned descriptor.
+pub fn set_abort_on_close(fd: BorrowedFd<'_>) -> io::Result<()> {
+    platform::set_abort_on_close(fd)
+}
+
 /// Send one SCTP message with stream/PPID metadata.
 pub fn send_msg(fd: BorrowedFd<'_>, payload: &[u8], info: SendInfo) -> io::Result<usize> {
     platform::send_msg(fd, payload, info)

@@ -3,6 +3,8 @@
 //! sequencing and RFC 6083 PPID-47 carriage without requiring kernel SCTP.
 
 pub(crate) mod generic;
+#[cfg(target_os = "linux")]
+mod wire_abort;
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
