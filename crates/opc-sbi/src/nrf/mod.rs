@@ -296,7 +296,10 @@ mod tests {
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
-            service_names: vec!["nsmf-pdusession".into(), "nsmf-eventexposure".into()],
+            service_names: vec![
+                "nsmf-pdusession".into(),
+                services::NSMF_EVENTEXPOSURE.into(),
+            ],
         };
         let q2 = DiscoveryQuery {
             target_nf_type: NfType::smf(),
@@ -304,7 +307,10 @@ mod tests {
             requester_nf_instance_id: None,
             plmn: None,
             s_nssai: None,
-            service_names: vec!["nsmf-eventexposure".into(), "nsmf-pdusession".into()],
+            service_names: vec![
+                services::NSMF_EVENTEXPOSURE.into(),
+                "nsmf-pdusession".into(),
+            ],
         };
 
         assert_eq!(

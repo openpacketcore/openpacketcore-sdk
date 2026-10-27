@@ -320,9 +320,9 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
     // #1269 authorized projection and #1270 canonical gNMI key literals. Every
     // generated file remains covered by its complete-file assertion.
     // All pins also include #1274 generated-lint repairs and shared statement formatting.
-    // #1363 pins follow byte-verified 63440381b baselines: exact decimal64 codecs/types
+    // #1363 pins follow byte-verified baselines: exact decimal64 codecs/types
     // and RFC 6243 trim semantics. All complete-file assertions remain.
-    // RFC 6241 existence-error pins were reverified at 8121730ada; only
+    // RFC 6241 existence-error pins were reverified before the correction; only
     // netconf_xml_edit.rs changes, with all thirteen full-file checks retained.
     let expected = [
         (

@@ -171,7 +171,11 @@ impl NrfOperations for BlockedDiscovery {
     }
 }
 
-async fn stale_refresh_result(invalidate: bool, expire: bool) -> Result<Vec<NfProfile>, String> {
+async fn stale_refresh_result(
+    valid_for: Duration,
+    invalidate: bool,
+    expire: bool,
+) -> Result<Vec<NfProfile>, String> {
     use opc_sbi::nrf::{CacheLookup, CachedDiscoveryClient, DiscoveryCache};
     use std::{
         sync::{Arc, Mutex},
@@ -191,7 +195,6 @@ async fn stale_refresh_result(invalidate: bool, expire: bool) -> Result<Vec<NfPr
     let query = query();
     let key = query.to_cache_key();
     let start = Instant::now();
-    let valid_for = Duration::from_millis(200);
     cache
         .lock()
         .unwrap()
@@ -220,18 +223,26 @@ async fn stale_refresh_result(invalidate: bool, expire: bool) -> Result<Vec<NfPr
 
 #[tokio::test]
 async fn review_nrf_refresh_cannot_return_profiles_after_validity_deadline() {
-    assert!(stale_refresh_result(false, true).await.is_err());
+    assert!(
+        stale_refresh_result(Duration::from_millis(200), false, true)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
 async fn review_nrf_refresh_cannot_return_profiles_after_config_invalidation() {
-    assert!(stale_refresh_result(true, false).await.is_err());
+    assert!(stale_refresh_result(Duration::from_secs(60), true, false)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn review_nrf_refresh_failure_preserves_still_authorized_stale_profiles() {
     assert_eq!(
-        stale_refresh_result(false, false).await.unwrap(),
+        stale_refresh_result(Duration::from_secs(60), false, false)
+            .await
+            .unwrap(),
         vec![profile()]
     );
 }

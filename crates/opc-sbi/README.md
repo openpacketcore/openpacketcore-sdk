@@ -149,7 +149,11 @@ Servers using `with_auth_policy` must also register each protected API with
 such as `https://nrf.example.test/nnrf-disc/v1`, and individual scope tokens.
 The URI supplies the Bearer realm; the longest matching path prefix selects
 the API. Request Host headers cannot change the realm or advertised scopes.
-Missing/invalid credentials return 401; insufficient scope returns 403 and
-includes the configured scope list. The installed policy enforces those scopes.
-Unconfigured paths fail closed with 503; malformed or duplicate Authorization
-headers return 400. Invalid configuration is rejected at startup.
+Missing credentials return 401 with the realm. Malformed Bearer credentials
+return 401 with `error="invalid_token"` (TS 29.500 §6.7.3); duplicate
+Authorization headers return 400 with `error="invalid_request"` (RFC 6750 §3.1).
+Both replies include the configured API realm and never reflect header content.
+Insufficient scope returns 403 and includes the configured scope list. The
+installed policy enforces those scopes. Unconfigured paths fail closed with 503;
+invalid configuration is rejected at startup. Without an auth policy, the
+middleware leaves Authorization headers to the application.

@@ -598,7 +598,23 @@ fn rf_decodes_literal_service_information_group() {
             DecodeContext::conservative(),
             DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()]),
         )
-        .expect("Rf reused RADIUS AVPs carry the mandatory flag");
+        .expect("normative Rf structure and cardinality");
+    let service = message
+        .avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|avp| avp.header.code.get() == 873)
+        .expect("Service-Information");
+    let ps = service
+        .grouped_avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|avp| avp.header.code.get() == 874)
+        .expect("PS-Information");
+    let charging_id = ps
+        .grouped_avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|avp| avp.header.code.get() == 2)
+        .expect("3GPP-Charging-Id");
+    assert!(charging_id.header.flags.is_mandatory());
     let parsed = apps::rf::parse_rf_accounting_request(&message, DecodeContext::default())
         .expect("normative Service-Information nesting");
     assert_eq!(parsed.ps_information.unwrap().charging_id, Some(0x12345678));

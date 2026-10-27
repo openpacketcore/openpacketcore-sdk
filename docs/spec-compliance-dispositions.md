@@ -102,7 +102,7 @@ claims live-peer or kernel migration qualification.
 | Raw IPv4 checksum | Injection accepts validated packets rather than assembling a zero-checksum header. `Header::parse` calls `valid_ipv4_header`, which rejects an incorrect checksum; the fragmenter and ICMP builders compute new checksums. Linux raw `IP_HDRINCL` also fills the checksum. `whole_batch_is_validated_before_its_first_send` proves a corrupted fragment prevents any send. No missing checksum computation was reproduced. |
 | IPv6 fragment cache cleanup | The cited `model.rs` location has no fragment cache or timer. Outer reassembly belongs to the Linux kernel; the SDK does not own the reported IPv6 reassembly cache. Inner fragments are handled by the documented forwarding profile. No cache-expiry repair is claimed, and this disposition does not qualify full IPv6 outer reassembly. |
 | NAI SASLprep | RFC 7542 does not prescribe SASLprep in a Diameter AVP parser. It assigns normalization primarily to the edge with locale information and cautions AAA intermediaries against normalization. Preserve the received identity bytes; automatic parser rewriting could break exact EAP/User-Name correlation. |
-| DNS hostname syntax | Fixed in `b37d5cf84`: address queries validate RFC 1123 hostnames while SRV/S-NAPTR service-owner syntax remains separate. |
+| DNS hostname syntax | Address queries validate RFC 1123 hostnames while SRV/S-NAPTR service-owner syntax remains separate (#1355). |
 | ICMP quote length | The IPv4 PTB builder already quotes the IPv4 header plus eight payload octets; `icmpv4_ptb_matches_rfc1191_layout_and_verifies_checksums` verifies the exact quote and both checksums. IPv6 uses its separate minimum-MTU quote rule. Moreover, RFC 1812 §4.3.2.3 recommends retaining more original IPv4 data within a 576-byte response; eight octets are not a universal maximum. |
 | IPv6 scope ID | The cited `opc-net-util` crate does not exist. The SCTP socket boundary already copies `scope_id` into native `sin6_scope_id` and restores it on readback. The new `link_local_scopes_survive_raw_and_packed_addresses` regression verifies three nonzero scope values, including `u32::MAX`, against literal packed offsets and native byte order. No production change is needed for this address conversion. The session TCP helper passes the complete `SocketAddr` to Tokio. |
 
@@ -178,8 +178,7 @@ The remaining non-decimal reports were checked against current code:
 | Boolean exactness | Generated JSON uses Rust `bool`; the new fixture verifies `false` is a present valid value while strings, numbers and absent required values are rejected. NETCONF scalar parsers also use the exact boolean parser. |
 
 Retained-storage tests require private disk-backed temporary directories and
-`umask 0077`; these admission requirements remain enforced. The exact revision,
-commands and results are recorded in the validation handover. The decimal64
+`umask 0077`; these admission requirements remain enforced. The decimal64
 correction and its verification are described below.
 
 Witnesses: [edit parser](../crates/opc-netconf-server/src/edit_xml.rs),
@@ -223,7 +222,7 @@ now apply value-based omission, with exact decimal comparison. Existing
 authorization assertions are preserved using a non-default boolean fixture;
 separate tests check trim and explicit reporting of the same default value.
 
-All 78 generated-file pins were first reproduced from commit `63440381b`.
+All 78 generated-file pins were first reproduced before the #1363 decimal64 correction.
 Only the decimal codec/type/scale-digest changes and RFC 6243 trim changes
 appeared in the reviewed generated output; the complete-file assertions remain.
 The subsequent RFC 6241 correction reverified all 78 current pins and changed
@@ -286,9 +285,9 @@ this change does not alter emergency behavior.
 | --- | --- |
 | NRF registration and heartbeat | Registration includes the supported NF profile fields. A returned heartBeatTimer replaces the remembered interval; 204 and responses without that attribute retain it. Initial registration without a timer uses the documented default. |
 | Discovery validity | Query encoding preserves the discovery parameters. Cache reuse is bounded by server validityPeriod. After a failed refresh the cache is looked up again, so an expired or invalidated entry cannot be returned through a saved stale snapshot. |
-| Priority and extensible metadata | NfPriority validates 0–31. NF status preserves CANARY_RELEASE and unknown string extensions instead of rejecting an otherwise usable profile. |
+| Priority and extensible metadata | The `3gpp-Sbi-Message-Priority` header accepts 0–31 (TS 29.500 §5.2.3.2.2). NF status preserves CANARY_RELEASE and unknown string extensions instead of rejecting an otherwise usable profile. |
 | Access-token claims | Explicit NRF token configuration accepts the producer NF type as a string or an audience UUID array containing the local producer instance. Signature, issuer/subject UUIDs, time, scope and peer binding remain checked. JWT-SVID retains its separate SPIFFE and audience policy. |
-| OAuth response challenge | Trusted API URI and scope configuration supplies the realm on 401/403 and scope on insufficient-scope responses. Host headers do not set challenge values. Malformed or duplicate authorization headers receive 400; protected paths without matching challenge configuration fail closed. Problem responses use application/problem+json. |
+| OAuth response challenge | Trusted API URI and scope configuration supplies the realm on every challenge and scope on insufficient-scope responses. Malformed Bearer credentials receive 401 with `error="invalid_token"` (TS 29.500 §6.7.3); duplicate Authorization headers receive 400 with `error="invalid_request"` (RFC 6750 §3.1). Both include the configured API realm, never request header content. Protected paths without matching challenge configuration fail closed. Problem responses use application/problem+json. |
 | HTTP transport and breaker | Cleartext defaults to port 80; TLS requires negotiated h2 and accepts IPv4/IPv6 address identities. Circuit-breaker failures remain scoped to transport/timeout and 5xx outcomes, rather than ordinary 4xx application responses. |
 | Service identifiers and metadata URL | The SMF event exposure identifier is nsmf-event-exposure. The console design records RFC 8414 metadata discovery with the well-known component before the issuer path. |
 

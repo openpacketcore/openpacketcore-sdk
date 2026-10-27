@@ -577,8 +577,100 @@ async fn auth_challenges_select_trusted_api_and_scope_without_reflecting_request
             assert!(!response.headers().contains_key("www-authenticate"));
         }
     }
+    let mut responses = Vec::new();
+    let mut expected = Vec::new();
+    for path in ["/nnrf-disc/v1", "/nnrf-nfm/v1"] {
+        for (values, status, error) in [
+            (vec!["Bearer"], StatusCode::UNAUTHORIZED, "invalid_token"),
+            (
+                vec!["Bearer private-token!"],
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+            ),
+            (
+                vec!["Bearer private-token extra"],
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+            ),
+            (
+                vec!["Bearer one", "Bearer two"],
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
+            (
+                vec!["Bearer", "Bearer private-token", "Bearer three"],
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
+        ] {
+            let mut request = http::Request::builder()
+                .uri(format!("http://{addr}{path}/test"))
+                .header("host", "untrusted.example");
+            for value in values {
+                request = request.header("authorization", value);
+            }
+            let response = client
+                .send(request.body(Vec::new()).unwrap())
+                .await
+                .unwrap();
+            responses.push((
+                response.status(),
+                response
+                    .headers()
+                    .get("www-authenticate")
+                    .map(|value| value.to_str().unwrap().to_owned()),
+            ));
+            expected.push((
+                status,
+                Some(format!(
+                    "Bearer realm=\"https://nrf.example.test{path}\", error=\"{error}\""
+                )),
+            ));
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+            assert!(!String::from_utf8_lossy(response.body()).contains("private-token"));
+        }
+    }
+    task.abort();
+    let _ = task.await;
+    assert_eq!(
+        responses
+            .iter()
+            .map(|(_, challenge)| challenge)
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(_, challenge)| challenge)
+            .collect::<Vec<_>>(),
+        "authentication replies: {responses:?}"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .map(|(status, _)| status)
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|(status, _)| status)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn unprotected_paths_do_not_interpret_authorization_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = SbiServerBuilder::new(addr);
+    let app = axum::Router::new().fallback(|| async { "public response" });
+    let task = tokio::spawn(server.run_with_listener(listener, app));
+    let client = SbiClientBuilder::new()
+        .with_http2_only(false)
+        .build()
+        .unwrap();
     for values in [vec!["Bearer"], vec!["Bearer one", "Bearer two"]] {
-        let mut request = http::Request::builder().uri(format!("http://{addr}/nnrf-disc/v1/test"));
+        let mut request = http::Request::builder().uri(format!("http://{addr}/public"));
         for value in values {
             request = request.header("authorization", value);
         }
@@ -586,8 +678,9 @@ async fn auth_challenges_select_trusted_api_and_scope_without_reflecting_request
             .send(request.body(Vec::new()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(!response.headers().contains_key("www-authenticate"));
+        assert_eq!(response.body().as_ref(), b"public response");
     }
     task.abort();
     let _ = task.await;

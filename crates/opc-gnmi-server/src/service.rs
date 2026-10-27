@@ -5688,12 +5688,26 @@ mod tests {
         // so unrelated successful subscriptions cannot change its baseline.
         const CHILD: &str = "OPC_GNMI_MALFORMED_SUBSCRIBE_METRIC_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "service::tests::subscribe_malformed_first_request_records_failure_without_success", "--nocapture"])
                 .env(CHILD, "1")
-                .status()
+                .output()
                 .expect("isolated metric regression process");
-            assert!(status.success(), "isolated metric regression failed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "isolated metric regression failed:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.lines().any(|line| line == "running 1 test"),
+                "isolated metric regression did not run exactly one test:\n{stdout}"
+            );
+            assert!(
+                stdout.lines().any(|line| line
+                    .starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")),
+                "isolated metric regression did not pass exactly one test:\n{stdout}"
+            );
             return;
         }
         let service =

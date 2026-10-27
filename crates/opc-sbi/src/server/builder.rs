@@ -404,16 +404,14 @@ async fn auth_middleware(
                 )
             })?;
         let headers = req.headers();
+        // Classify credentials before the common-header parser can turn an
+        // Authorization failure into a generic, unchallenged 400 response.
+        let bearer_token = crate::headers::extract_bearer_token_from_headers(headers)
+            .map_err(|error| auth_header_failure_response(error, service))?;
         let sbi_headers = crate::headers::SbiHeaders::parse(headers).map_err(|_| {
             let details = ProblemDetails::new(StatusCode::BAD_REQUEST);
             problem_response(StatusCode::BAD_REQUEST, &details, None)
         })?;
-
-        let bearer_token =
-            crate::headers::extract_bearer_token_from_headers(headers).map_err(|_| {
-                let details = ProblemDetails::new(StatusCode::BAD_REQUEST);
-                problem_response(StatusCode::BAD_REQUEST, &details, None)
-            })?;
 
         let peer = match req.extensions().get::<crate::auth::SbiPeer>().cloned() {
             Some(peer) => peer,
@@ -504,12 +502,36 @@ fn quoted_challenge_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn auth_failure_response(error: crate::auth::SbiAuthError, service: &AuthService) -> Response {
-    use crate::auth::SbiAuthError;
-    let realm = format!(
+fn bearer_realm(service: &AuthService) -> String {
+    format!(
         "Bearer realm=\"{}\"",
         quoted_challenge_value(&service.api_uri.to_string())
-    );
+    )
+}
+
+fn auth_header_failure_response(
+    error: crate::headers::HeaderParseError,
+    service: &AuthService,
+) -> Response {
+    let (status, code) = match error {
+        // RFC 6750 section 3.1 distinguishes repeated credentials from an
+        // invalid token; both cases still require the configured API realm.
+        crate::headers::HeaderParseError::Duplicate { .. } => {
+            (StatusCode::BAD_REQUEST, "invalid_request")
+        }
+        // TS 29.500 section 6.7.3 includes malformed credentials among the
+        // invalid tokens that receive 401 and an invalid_token challenge.
+        _ => (StatusCode::UNAUTHORIZED, "invalid_token"),
+    };
+    auth_problem_response(
+        status,
+        Some(format!("{}, error=\"{code}\"", bearer_realm(service))),
+    )
+}
+
+fn auth_failure_response(error: crate::auth::SbiAuthError, service: &AuthService) -> Response {
+    use crate::auth::SbiAuthError;
+    let realm = bearer_realm(service);
     let (status, challenge) = match error {
         SbiAuthError::MissingBearerToken => (StatusCode::UNAUTHORIZED, Some(realm)),
         SbiAuthError::InsufficientScope => (
@@ -525,6 +547,10 @@ fn auth_failure_response(error: crate::auth::SbiAuthError, service: &AuthService
             Some(format!("{realm}, error=\"invalid_token\"")),
         ),
     };
+    auth_problem_response(status, challenge)
+}
+
+fn auth_problem_response(status: StatusCode, challenge: Option<String>) -> Response {
     let mut details = ProblemDetails::new(status);
     details.detail = Some("authorization failed".to_string());
     let mut response = problem_response(status, &details, None);
