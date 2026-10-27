@@ -23604,19 +23604,12 @@ mod membership_tests {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) async fn assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second(
+    async fn seed_roster_maintenance_arrival_history(
         store: &ConsensusSessionStore,
         clock: &MutableClock,
         start: Timestamp,
-        ticks: &[roster_maintenance::RosterMaintenanceTickDriver],
     ) {
-        const RATE: u16 = 10;
-        const SECONDS: u16 = 180;
-        const ROWS: u16 = RATE * SECONDS;
-        // Preserve the original four-bucket backlog bound. Explicit scheduling
-        // removes host jitter; the stronger per-tick checks below still catch
-        // the old one-epoch retirement without relying on wall-clock pacing.
-        const STEADY_BOUND: u64 = RATE as u64 * 4;
+        const ROWS: u16 = 10 * 180;
         let at = |millis: i64| {
             Timestamp::from_offset_datetime(
                 *start.as_offset_datetime() + time::Duration::milliseconds(millis),
@@ -23638,22 +23631,127 @@ mod membership_tests {
             previous_epoch = epoch;
             if (sequence + 1).is_multiple_of(300) {
                 eprintln!(
-                    "roster sustained seed: {}/{ROWS}, last_epoch={epoch}",
+                    "roster history seed: {}/{ROWS}, last_epoch={epoch}",
                     sequence + 1
                 );
             }
         }
         let before = store.protected_roster_diagnostic_snapshot();
         assert_eq!(before.retained_reservations, u64::from(ROWS));
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) async fn assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second(
+        store: &ConsensusSessionStore,
+        clock: &MutableClock,
+        start: Timestamp,
+    ) {
+        const RATE: u16 = 10;
+        const SECONDS: u16 = 180;
+        const ROWS: u16 = RATE * SECONDS;
+        const STEADY_BOUND: u64 = RATE as u64 * 4;
+        seed_roster_maintenance_arrival_history(store, clock, start).await;
         let first_log = store.inner.raft.metrics().borrow().last_log_index.unwrap();
         let mut peak_due = 0;
         let mut peak_tombstones = 0;
-        // Drive 180 logical one-second ticks. Physical proposal service must
-        // complete before the next ten rows become due, so host scheduling
-        // cannot manufacture arrivals. The paused-time lane test separately
-        // proves the one-second cadence. No unrelated mutation donates turns.
+        let mut sample = |due: u64| {
+            let snapshot = store.protected_roster_diagnostic_snapshot();
+            assert_eq!(snapshot.occupancy_valid, 1);
+            assert_eq!(snapshot.live_reservations, 0);
+            let reclaimed = u64::from(ROWS) - snapshot.retained_reservations;
+            assert!(
+                reclaimed <= due,
+                "young rows remain retained until their exact boundary"
+            );
+            peak_due = peak_due.max(due - reclaimed);
+            peak_tombstones = peak_tombstones.max(snapshot.tombstone_reservations);
+            snapshot
+        };
+        let arrivals_started = tokio::time::Instant::now();
+        let mut maximum_boundary_lateness = Duration::ZERO;
+        // This clock never waits for maintenance or an acknowledgement. Each
+        // absolute boundary creates ten due rows and samples before awaiting
+        // anything else, including while the production lane is in flight.
+        // Catch up every boundary if the executor is late; never slow arrivals
+        // to match the storage service time or reset the next deadline.
         for second in 1..=SECONDS {
-            clock.set(at(86_400_000 + i64::from(second) * 1000));
+            let boundary = arrivals_started + Duration::from_secs(u64::from(second));
+            tokio::time::sleep_until(boundary).await;
+            maximum_boundary_lateness = maximum_boundary_lateness
+                .max(tokio::time::Instant::now().saturating_duration_since(boundary));
+            clock.set(Timestamp::from_offset_datetime(
+                *start.as_offset_datetime()
+                    + time::Duration::milliseconds(86_400_000 + i64::from(second) * 1000),
+            ));
+            let due = u64::from(second * RATE);
+            let snapshot = sample(due);
+            if second.is_multiple_of(30) {
+                let backlog = due - (u64::from(ROWS) - snapshot.retained_reservations);
+                eprintln!("roster independent arrivals: second={second}, due={due}, backlog={backlog}, tombstones={}", snapshot.tombstone_reservations);
+            }
+        }
+        // Stop arrivals, then require a full drain within the existing public
+        // operation budget. No command or logical-time advance donates work.
+        let arrivals_ended = arrivals_started + Duration::from_secs(u64::from(SECONDS));
+        let deadline = arrivals_ended + store.inner.operation_timeout;
+        let mut boundary = arrivals_ended;
+        let after = loop {
+            let snapshot = sample(u64::from(ROWS));
+            if (snapshot.retained_reservations == 0 && snapshot.tombstone_reservations == 0)
+                || tokio::time::Instant::now() >= deadline
+            {
+                break snapshot;
+            }
+            boundary += Duration::from_secs(1);
+            tokio::time::sleep_until(boundary.min(deadline)).await;
+        };
+        let commands = store.inner.raft.metrics().borrow().last_log_index.unwrap() - first_log;
+        let reclaimed = u64::from(ROWS) - after.retained_reservations;
+        let retired = reclaimed - after.tombstone_reservations;
+        eprintln!("roster independent arrival qualification: seconds={SECONDS}, rows={ROWS}, peak_due={peak_due}, peak_tombstones={peak_tombstones}, bound={STEADY_BOUND}, final_due={}, final_tombstones={}, commands={commands}, elapsed={:?}, maximum_boundary_lateness={maximum_boundary_lateness:?}",
+            after.retained_reservations, after.tombstone_reservations, arrivals_started.elapsed());
+        assert!(
+            reclaimed + retired <= commands * crate::fenced_mutation_roster::RECLAIM_BATCH as u64,
+            "the lane retains the existing per-command row bound"
+        );
+        assert!(peak_due <= STEADY_BOUND && peak_tombstones <= STEADY_BOUND,
+            "ten independent due rows/second must stay bounded through {SECONDS}s: peak_due={peak_due}, peak_tombstones={peak_tombstones}, bound={STEADY_BOUND}, final_due={}, final_tombstones={}, commands={commands}",
+            after.retained_reservations, after.tombstone_reservations);
+        assert_eq!(after.retained_reservations, 0, "all due history drains");
+        assert_eq!(
+            after.tombstone_reservations, 0,
+            "all distinct epochs retire"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) async fn assert_roster_maintenance_progress_per_controlled_turn(
+        store: &ConsensusSessionStore,
+        clock: &MutableClock,
+        start: Timestamp,
+        ticks: &[roster_maintenance::RosterMaintenanceTickDriver],
+    ) {
+        const ROWS_PER_TURN: u16 = 10;
+        const TURNS: u16 = 180;
+        const ROWS: u16 = ROWS_PER_TURN * TURNS;
+        // Retain the existing assertion as extra functional coverage. Exact
+        // per-turn checks below imply zero backlog; this is not a rate proof.
+        const BACKLOG_BOUND: u64 = ROWS_PER_TURN as u64 * 4;
+        let at = |millis: i64| {
+            Timestamp::from_offset_datetime(
+                *start.as_offset_datetime() + time::Duration::milliseconds(millis),
+            )
+        };
+        seed_roster_maintenance_arrival_history(store, clock, start).await;
+        let first_log = store.inner.raft.metrics().borrow().last_log_index.unwrap();
+        let mut peak_due = 0;
+        let mut peak_tombstones = 0;
+        // Supply 180 controlled turns, each with ten newly due signed rows.
+        // Arrivals deliberately wait for the preceding pair to complete. This
+        // checks exact progress, distinct epochs and bounded commands only;
+        // independent-arrival tests separately qualify the rate and backlog.
+        for turn in 1..=TURNS {
+            clock.set(at(86_400_000 + i64::from(turn) * 1000));
             let before_tick = store.inner.raft.metrics().borrow().last_log_index.unwrap();
             futures_util::future::join_all(ticks.iter().map(|driver| driver.tick())).await;
             let after_tick = store.inner.raft.metrics().borrow().last_log_index.unwrap();
@@ -23665,7 +23763,7 @@ mod membership_tests {
             assert_eq!(snapshot.occupancy_valid, 1);
             assert_eq!(snapshot.live_reservations, 0);
             let reclaimed = u64::from(ROWS) - snapshot.retained_reservations;
-            let due = u64::from(second * RATE);
+            let due = u64::from(turn * ROWS_PER_TURN);
             assert!(
                 reclaimed <= due,
                 "young rows remain retained until their exact boundary"
@@ -23678,8 +23776,8 @@ mod membership_tests {
             let backlog = due - reclaimed;
             peak_due = peak_due.max(backlog);
             peak_tombstones = peak_tombstones.max(snapshot.tombstone_reservations);
-            if second.is_multiple_of(30) {
-                eprintln!("roster sustained load: second={second}, due={due}, backlog={backlog}, tombstones={}", snapshot.tombstone_reservations);
+            if turn.is_multiple_of(30) {
+                eprintln!("roster controlled turn: turn={turn}, due={due}, backlog={backlog}, tombstones={}", snapshot.tombstone_reservations);
             }
         }
         let after = store.protected_roster_diagnostic_snapshot();
@@ -23690,8 +23788,8 @@ mod membership_tests {
             reclaimed + retired <= commands * crate::fenced_mutation_roster::RECLAIM_BATCH as u64,
             "the lane retains the existing per-command row bound"
         );
-        assert!(peak_due <= STEADY_BOUND && peak_tombstones <= STEADY_BOUND,
-            "ten due rows/second must stay bounded through {SECONDS}s: peak_due={peak_due}, peak_tombstones={peak_tombstones}, bound={STEADY_BOUND}, final_due={}, final_tombstones={}, commands={commands}",
+        assert!(peak_due <= BACKLOG_BOUND && peak_tombstones <= BACKLOG_BOUND,
+            "controlled-turn history retains its backlog assertions for {TURNS} turns: peak_due={peak_due}, peak_tombstones={peak_tombstones}, bound={BACKLOG_BOUND}, final_due={}, final_tombstones={}, commands={commands}",
             after.retained_reservations, after.tombstone_reservations);
     }
 

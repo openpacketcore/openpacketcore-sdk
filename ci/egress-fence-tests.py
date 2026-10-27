@@ -48,6 +48,10 @@ SUSTAINED_ROSTER_LIB = (
     "consensus::store::sequential_wal_sdk_tests::roster_maintenance_native_keeps_up_with_ten_due_rows_per_second",
     "consensus::store::sequential_wal_sdk_tests::roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second",
 )
+CONTROLLED_ROSTER_LIB = (
+    "consensus::store::sequential_wal_sdk_tests::roster_maintenance_native_controlled_turn_reclaims_and_retires_each_epoch",
+    "consensus::store::sequential_wal_sdk_tests::roster_maintenance_sqlite_controlled_turn_reclaims_and_retires_each_epoch",
+)
 COMPLETION_ROSTER_LIB = (
     "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_admission",
     "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_completion",
@@ -56,7 +60,7 @@ COMPLETION_ROSTER_LIB = (
     "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_completion",
     "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_sqlite_ordinary_wave_consumes_normal_quota",
 )
-ROSTER_TIMING_LIB = (*SUSTAINED_ROSTER_LIB, *COMPLETION_ROSTER_LIB)
+ROSTER_TIMING_LIB = (*SUSTAINED_ROSTER_LIB, *CONTROLLED_ROSTER_LIB, *COMPLETION_ROSTER_LIB)
 OPTIMIZED_LIB = (
     "sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch",
     "sqlite::consensus::tests::due_protected_roster_maintenance_reclaims_the_oldest_bounded_prefix_only",

@@ -410,7 +410,7 @@ class PartitionTests(unittest.TestCase):
         commands = [c for shard in FENCE.SHARDS for c in FENCE.plans(fixture(), shard)]
         exact = [c for c in commands if c["name"] in FENCE.SPECIAL]
         self.assertEqual({c["name"] for c in exact}, set(FENCE.SPECIAL))
-        self.assertEqual(len(exact), 22)
+        self.assertEqual(len(exact), 24)
         self.assertEqual(FENCE.plans(fixture(), FENCE.PROOF_SHARD), exact)
         self.assertTrue(all(FENCE.owner(c["name"]) == FENCE.PROOF_SHARD for c in exact))
         for command in exact:
@@ -434,6 +434,31 @@ class PartitionTests(unittest.TestCase):
         for engine in ("native", "sqlite"):
             name = ("consensus::store::sequential_wal_sdk_tests::"
                     f"roster_maintenance_{engine}_keeps_up_with_ten_due_rows_per_second")
+            with self.subTest(engine=engine):
+                self.assertIn(name, FENCE.OPTIMIZED_LIB)
+                commands = [(shard, command) for shard in FENCE.SHARDS
+                            for command in FENCE.plans(fixture(), shard)
+                            if command["name"] == name]
+                self.assertEqual([shard for shard, _ in commands], [FENCE.PROOF_SHARD])
+                command = commands[0][1]
+                self.assertEqual(command["env"], {
+                    "CARGO_PROFILE_TEST_OPT_LEVEL": "1",
+                    "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS": "true",
+                    "CARGO_PROFILE_TEST_OVERFLOW_CHECKS": "true",
+                })
+                self.assertEqual(command["argv"][-3:], ["--test-threads=1", "--exact", name])
+                self.assertIn("--all-features", command["argv"])
+                for shard in FENCE.ORDINARY_SHARDS:
+                    self.assertIn(name, skips(ordinary(FENCE.plans(fixture(), shard))))
+                ignored = fixture()
+                next(row for row in ignored if row["name"] == name)["ignored"] = True
+                with self.assertRaises(ValueError):
+                    FENCE.verify(ignored)
+
+    def test_controlled_roster_turns_run_once_in_the_checked_o1_profile(self):
+        for engine in ("native", "sqlite"):
+            name = ("consensus::store::sequential_wal_sdk_tests::"
+                    f"roster_maintenance_{engine}_controlled_turn_reclaims_and_retires_each_epoch")
             with self.subTest(engine=engine):
                 self.assertIn(name, FENCE.OPTIMIZED_LIB)
                 commands = [(shard, command) for shard in FENCE.SHARDS

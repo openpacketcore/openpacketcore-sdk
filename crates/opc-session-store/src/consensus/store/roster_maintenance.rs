@@ -325,9 +325,9 @@ impl RosterMaintenanceTask {
     }
 }
 
-// The signed rate proof uses explicit tick boundaries so physical I/O cannot
-// advance its logical arrival clock. Only scheduling is controlled: the same
-// lane loop, occupancy reads and real proposals run once per supplied tick.
+// Extra signed functional coverage supplies one turn at a time to check exact
+// reclamation, epoch retirement and command counts. It deliberately pauses
+// arrivals during service and makes no arrival-rate or latency claim.
 #[cfg(all(test, target_os = "linux"))]
 struct ScheduledRosterMaintenanceLane<L> {
     lane: L,
@@ -454,6 +454,9 @@ pub(super) fn start(inner: Weak<ConsensusSessionStoreInner>) -> RosterMaintenanc
         worker: tokio::sync::Mutex::new(Some(tokio::spawn(run_roster_maintenance_lane(lane)))),
     }
 }
+
+#[cfg(test)]
+mod arrival_tests;
 
 #[cfg(test)]
 mod tests {

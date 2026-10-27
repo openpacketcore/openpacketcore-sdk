@@ -62,17 +62,36 @@ adding another full idle interval or replaying a burst of missed turns. Failed
 observations retain the existing bounded retry delay. Shutdown starts its automatic
 handoff deadline before joining maintenance, so that join cannot restart the budget
 reserved for handoff and consume the final engine/storage drain interval.
-The signed arrival-rate regression drives 180 logical one-second ticks, with ten
-independently signed completions becoming due per tick. Its scheduler supplies
-exactly one turn to each real store lane and waits for that turn's bounded phases
-before advancing the arrival clock. This removes host pacing from the backlog
-assertion without retrying extra turns until a count passes. Each tick must reclaim
-all ten due rows and retire their distinct epochs in at most two commands; the
-original 40-row backlog bound remains. A separate paused-time regression proves
-the one-second cadence including service time, and a held-service regression proves
-that elapsed host time cannot inject another logical arrival. Consensus, backend
-I/O, authentication and operation deadlines remain real. This is a deterministic
-cadence and progress proof, not a wall-clock throughput benchmark.
+The signed arrival-rate qualification makes ten completions due at each absolute
+one-second boundary for 180 seconds, independently of maintenance completion.
+It runs the real native and SQLite maintenance lanes with their production wait
+and cadence. Every boundary samples the due and tombstone backlogs, including
+while service is in flight. Both peaks must remain at most 40 rows, followed by
+a full drain within the existing operation budget. Physical consensus and disk
+latency remain part of this qualification; slow service can fail the bound.
+
+A separate paused-time proof drives the production loop and its default sleep
+with explicit proposal-completion gates. Its conditional bound assumes a healthy
+lane, one partition with distinct admission epochs, two phases per turn, at most
+1.25 seconds per phase and at most 0.25 seconds of dispatch jitter per turn.
+Because successful service consumes the one-second tick and overruns coalesce,
+reclaim snapshots are at most `max(1, 2 * 1.25) + 0.25 = 2.75` seconds apart.
+An arrival just after a snapshot waits at most another 1.25 seconds for the next
+reclaim to commit: four seconds, or 40 rows at ten per second. Retirement finishes
+before another reclaim and holds at most the three buckets between snapshots.
+The initial tick plus jitter plus service is also below four seconds. The proof
+samples all 180 boundaries before coincident completions, and after each
+completion. A six-second-service negative control breaches the same bound before
+the first proposal completes. There are no retries, authority changes or deferred-profile barriers in this
+model. The service assumptions are not guaranteed by the ten-second operation
+deadline; the real-backend qualification measures the resulting backlog under
+physical I/O.
+
+Additional controlled-turn tests deliberately pause arrivals until each real
+store finishes one supplied turn. They require exact reclamation of ten due rows,
+retirement across distinct epochs, and at most two commands per turn. They make
+no arrival-rate or physical latency claim. All tests retain the original signed
+workload, retention boundary and command batch limits.
 
 Earlier reclamation is a separate semantic choice: a terminal commit alone
 does not prove that every external recovery obligation is settled. Do not

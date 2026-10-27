@@ -100,15 +100,17 @@ QUIESCENT_VOID_LIB_TESTS = (
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
     "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap",
 )
-# These 180-tick arrival-rate proofs measure signed production work with
-# controlled logical arrivals, independent of host pacing. Keep
-# their literal load and backlog bounds in the checked O1 timing profile.
+# The 180-second arrival-rate proofs advance arrivals independently of service.
+# Their separate controlled-turn cases check exact signed progress per turn.
+# Keep both workloads and their literal bounds in the checked O1 profile.
 # The completion-congestion proofs also retain their literal operation budgets
 # while draining a deliberately held wave of signed requests.
 QUIESCENT_ROSTER_LIB_MODULE = "consensus::store::sequential_wal_sdk_tests"
 QUIESCENT_ROSTER_LIB_TESTS = (
     "roster_maintenance_native_keeps_up_with_ten_due_rows_per_second",
     "roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second",
+    "roster_maintenance_native_controlled_turn_reclaims_and_retires_each_epoch",
+    "roster_maintenance_sqlite_controlled_turn_reclaims_and_retires_each_epoch",
     "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_admission",
     "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_completion",
     "roster_completion::roster_completion_native_ordinary_wave_consumes_normal_quota",
