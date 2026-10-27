@@ -58,11 +58,8 @@ impl<P: RecoveryProfile> Window<P> {
     ///
     /// Supply `pending_inbound` for admitted state-changing work whose result is
     /// not committed. No effects may have escaped its ordinary preparation. Pending
-    /// outbound work and a pending volatile empty-INFORMATIONAL probe are detected
-    /// from the window. Neither kind waits for network replies: the cutover records
-    /// OutcomeUncertain and scoped IKE/Child cleanup. A probe abandoned before its
-    /// send-ID advance was persisted is instead folded into the advertised and
-    /// committed counters, never committing a floor below the burned ID.
+    /// outbound work is detected from the window. Neither kind waits for network
+    /// replies: the cutover records OutcomeUncertain and scoped IKE/Child cleanup.
     /// That terminal state has no Delete preparation path yet; local cleanup alone
     /// leaves the peer to its own liveness/expiry or base-protocol invalid-SPI handling.
     /// First fence/settle uncertain storage writes; an unresolved ordinary commit
@@ -85,6 +82,7 @@ impl<P: RecoveryProfile> Window<P> {
         pending: Option<&Pending>,
         pending_inbound: Option<&Ordinary<P>>,
     ) -> Result<Ikev2AdmittedSyncResponse<'_, P>, Error> {
+        self.send.check_terminal()?;
         if self.quiescent {
             return Err(Error::CommitUncertain);
         }
@@ -113,12 +111,10 @@ impl<P: RecoveryProfile> Window<P> {
         let pending = durable_pending.as_ref().or(pending);
         let opened = sync_packet::open_request(&self.record.domain, profile, keys, wire)?;
         let mut counters = Counters::new(
-            // Mirror the initiating path: advertise the volatile empty-probe
-            // advance so the negotiated maximum never drops below a burned ID.
-            self.effective_next_send().unwrap_or(u32::MAX),
+            self.next_send().unwrap_or(u32::MAX),
             self.next_receive().unwrap_or(u32::MAX),
         );
-        counters.highest_local_request = state.highest_local_request;
+        counters.highest_local_request = state.highest_local_request.max(self.send.highest_probe());
         counters.highest_peer_request = state
             .highest_peer_request
             .max(self.observed_peer_request.get());
@@ -151,7 +147,6 @@ impl<P: RecoveryProfile> Window<P> {
             })?;
         let uncertain = pending_inbound.is_some()
             || self.receive.pending.borrow().is_some()
-            || self.probe.pending.is_some()
             || self
                 .record
                 .outbound
@@ -165,15 +160,10 @@ impl<P: RecoveryProfile> Window<P> {
             Disposition::Continue
         };
         let mut record = self.record.clone();
+        self.fold_live_send(&mut record);
         record.generation = record.generation.checked_add(1).ok_or(Error::Exhausted)?;
         P::retain_local_evidence(self, &mut record)?;
-        // Never commit a floor below a probe ID burned in this runtime. The
-        // advertised counters already include the advance; this fold is the
-        // durable backstop for the same invariant.
-        record.next_send = Some(match self.probe.next_send {
-            Some(volatile) => next.next_send.max(volatile),
-            None => next.next_send,
-        });
+        record.next_send = Some(next.next_send);
         record.next_receive = Some(next.next_receive);
         // Retired ordinary bytes cannot bypass the declared receive window, act as
         // new probes or cause a historical outcome to be applied again.
@@ -191,10 +181,6 @@ impl<P: RecoveryProfile> Window<P> {
         sync.validate(&record)?;
         record.sync = Some(sync);
         if disposition == Disposition::OutcomeUncertain {
-            // A pending probe is fenced with the other unresolved outbound work:
-            // its response can no longer be admitted and the terminal cutover
-            // owns the burned ID (folded into `next_send` above).
-            self.probe.pending = None;
             if let Some(recovery) = &mut record.recovery {
                 recovery.status = super::Ikev2SyncRecoveryStatus::Closed;
             }
@@ -294,6 +280,7 @@ impl<P: RecoveryProfile> Ikev2PreparedSyncResponse<'_, P> {
         self.window.witness = None;
         let disposition = self.record.sync.ok_or(Error::InvalidRecord)?.disposition;
         self.window.record = self.record;
+        self.window.send.adopt(&self.window.record, true);
         self.window.observed_peer_request.set(None);
         self.window.quiescent = false;
         self.window.adopt_receive_boundary()?;

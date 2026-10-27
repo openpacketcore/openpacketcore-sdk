@@ -14,11 +14,11 @@
 //! first nonempty result commits the repaired floor and ends reconstruction.
 //! Replay probes are old bytes, not fresh liveness or new outcome evidence.
 //!
-//! An opt-in volatile empty-INFORMATIONAL probe sends a liveness request without
-//! a durable write: its Message-ID advance is folded into the next committed
-//! record and is lost on a crash as a bounded lead (RFC 6311 §5.1). The caller
-//! owns the idleness decision, including authenticated ESP traffic, and the
-//! retransmission budget; retransmitting a probe replays its exact sealed bytes.
+//! Originating liveness probes use a durably enabled bound on unwritten send
+//! IDs, exact retransmissions and a fixed deadline. They consume already reserved
+//! ordinary GCM IVs or fresh admitted CBC IVs. Restart requires synchronization
+//! beyond the entire possible lead, or automatic scoped SA retirement. Idleness
+//! remains consumer-owned and includes authenticated IKE and Child-SA ESP traffic.
 
 use std::{cell::Cell, error::Error as StdError, fmt, sync::Arc};
 
@@ -32,7 +32,9 @@ mod cbc_epoch;
 #[cfg(test)]
 pub(crate) mod cbc_test_fixtures;
 mod empty;
+mod liveness;
 mod packet;
+#[cfg(test)]
 mod probe;
 pub(crate) mod profile;
 use profile::{Ikev2GcmRecoveryProfile as Gcm, RecoveryProfile};
@@ -47,8 +49,8 @@ mod sync_recovery_record;
 mod sync_responder;
 pub use cbc_epoch::{Ikev2CbcEpochInputs, Ikev2CbcEpochRecord};
 pub use empty::{Ikev2EmptyReply, Ikev2EmptyReplyObservation};
+pub use liveness::{Ikev2EmptyProbe, Ikev2LivenessProbePolicy, Ikev2LivenessRecord};
 pub use packet::Ikev2AuthenticatedOrdinary;
-pub use probe::{Ikev2EmptyRequest, Ikev2EmptyRequestCompletion};
 pub use profile::{Ikev2CbcRecoveryProfile, Ikev2GcmRecoveryProfile};
 pub use record::{
     Ikev2CommittedExchangeRecord, Ikev2CommittedWindowDomain, Ikev2CommittedWindowRecord,
@@ -102,6 +104,20 @@ pub enum Ikev2WindowError {
     NoDurableWork,
     /// Enable the qualified canonical handler before admitting empty-request traffic.
     EmptyRepliesDisabled,
+    /// Persist a positive unwritten-send bound before originating probes.
+    LivenessDisabled,
+    /// Checkpoint the live send floor before issuing another unwritten probe.
+    LivenessLeadExhausted,
+    /// The positive exponentially increasing retransmission delay has not elapsed.
+    LivenessBackoff,
+    /// The transmission budget is spent; a response may still arrive before expiry.
+    LivenessRetryLimit,
+    /// The fixed probe deadline expired; automatically retire this scoped SA.
+    LivenessExpired,
+    /// The monotone probe clock moved backward or overflowed; retire this SA.
+    LivenessClock,
+    /// Process loss may have forgotten probes; synchronize or automatically retire.
+    LivenessRecoveryRequired,
     /// Canonical policy, ledger or output checks refused; there is no fallback.
     Canonical(crate::canonical::Ikev2CanonicalError),
     /// Completion belongs to another runtime or an older commit generation.
@@ -140,6 +156,13 @@ impl fmt::Display for Ikev2WindowError {
             Self::Exhausted => "ike_committed_window_exhausted",
             Self::NoDurableWork => "ike_committed_window_no_durable_work",
             Self::EmptyRepliesDisabled => "ike_committed_window_empty_replies_disabled",
+            Self::LivenessDisabled => "ike_committed_window_liveness_disabled",
+            Self::LivenessLeadExhausted => "ike_committed_window_liveness_lead_exhausted",
+            Self::LivenessBackoff => "ike_committed_window_liveness_backoff",
+            Self::LivenessRetryLimit => "ike_committed_window_liveness_retry_limit",
+            Self::LivenessExpired => "ike_committed_window_liveness_expired",
+            Self::LivenessClock => "ike_committed_window_liveness_clock",
+            Self::LivenessRecoveryRequired => "ike_committed_window_liveness_recovery_required",
             Self::Canonical(_) => "ike_committed_window_canonical_refused",
             Self::StaleCompletion => "ike_committed_window_stale_completion",
             Self::SyncInProgress => "ike_committed_window_sync_in_progress",
@@ -252,7 +275,7 @@ pub struct Ikev2CommittedWindow<P: RecoveryProfile = Gcm> {
     reconcile_terminal: bool,
     observed_peer_request: Cell<Option<u32>>,
     receive: empty::ReceiveState<P>,
-    probe: probe::ProbeState,
+    send: liveness::SendState,
     sync_live: bool,
     sync_closed: bool,
     sync_last_observed_unix_ms: Option<u64>,
@@ -279,6 +302,10 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     /// Rejects mismatching domains, unauthentic packets, wrong directions/classes,
     /// response correlation failures, counters inconsistent with retained history,
     /// or an IV high-water below the required retained sending-IV end.
+    /// A probe-enabled settled row conservatively advances beyond its unwritten
+    /// bound and requires synchronization before ordinary traffic. Without
+    /// negotiated synchronization, the consumer automatically retires the SA.
+    /// Unsettled durable requests remain replayable: they prevented later probes.
     /// Every failure permanently revokes canonical state for the supplied bindings;
     /// discard the failed SA, its stored records, keys and copied replies.
     pub fn restore(
@@ -314,7 +341,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             reconcile_terminal: false,
             observed_peer_request: Cell::new(None),
             receive: empty::ReceiveState::new(record.next_receive),
-            probe: probe::ProbeState::default(),
+            send: liveness::SendState::restore(record)?,
             sync_live: false,
             sync_closed: false,
             sync_last_observed_unix_ms: record
@@ -342,6 +369,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         if let Some(recovery) = record.sync_recovery() {
             recovery.validate_packets(record, profile, keys, epoch)?;
         }
+        let probe_id = liveness::validate_record(record, profile, keys, epoch)?;
         for (entry, peer, next) in [
             (&record.outbound, false, record.next_send),
             (&record.inbound, true, record.next_receive),
@@ -350,9 +378,12 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
                 let request = packet::open(expected, profile, keys, &entry.request, peer)
                     .map_err(|_| Error::InvalidRecord)?;
                 request.require_work().map_err(|_| Error::InvalidRecord)?;
-                if request.header.flags.response()
-                    || next != request.header.message_id.checked_add(1)
-                {
+                let highest = if !peer && entry.response.is_some() {
+                    request.header.message_id.max(probe_id.unwrap_or(0))
+                } else {
+                    request.header.message_id
+                };
+                if request.header.flags.response() || next != highest.checked_add(1) {
                     return Err(Error::InvalidRecord);
                 }
                 if !peer {
@@ -456,6 +487,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
         if self.sync_closed {
             return Err(Ikev2WindowError::SyncClosed);
         }
+        self.send.ready()?;
         match self.record.sync_state().map(|state| state.disposition()) {
             None | Some(Ikev2SyncDisposition::Continue) => Ok(()),
             Some(Ikev2SyncDisposition::AwaitLocalSync) => Err(Ikev2WindowError::SyncInProgress),
@@ -470,23 +502,10 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             .generation
             .checked_add(1)
             .ok_or(Ikev2WindowError::Exhausted)?;
-        // Fold a volatile empty-probe send-ID advance into the next durable
-        // record. IDs consumed by probes are never reused inside this runtime,
-        // even across a crash that loses the uncommitted high-water mark only
-        // after this record commits.
-        if let (Some(durable), Some(volatile)) = (record.next_send, self.probe.next_send) {
-            record.next_send = Some(durable.max(volatile));
-        }
+        self.fold_live_send(&mut record);
         Ok(record)
     }
 
-    /// Next local request Message ID including volatile empty-probe advances.
-    pub(crate) fn effective_next_send(&self) -> Option<u32> {
-        match (self.record.next_send, self.probe.next_send) {
-            (Some(durable), Some(volatile)) => Some(durable.max(volatile)),
-            (next, _) => next,
-        }
-    }
     fn prepared(
         &mut self,
         record: Ikev2CommittedWindowRecord<P>,
@@ -522,7 +541,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
             .outbound
             .as_ref()
             .is_some_and(|request| request.response.is_none())
-            || self.probe.pending.is_some()
+            || self.send.outstanding.is_some()
         {
             return Err(Ikev2WindowError::RequestOutstanding);
         }
@@ -673,7 +692,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindow<P> {
     ///
     /// No request or a settled exchange yields `None`. A peer may forget its
     /// settled response, so replay is never a local liveness probe. A fresh
-    /// liveness exchange uses [`Self::send_empty_request`] instead.
+    /// liveness exchange uses [`Self::start_empty_probe`] instead.
     /// # Errors
     /// Quiescent runtimes must resolve readback first.
     pub fn replay_request(&self) -> Result<Option<Ikev2ExactReplay<'_>>, Ikev2WindowError> {
@@ -778,6 +797,7 @@ impl<P: RecoveryProfile> Ikev2PreparedWindow<'_, P> {
         }
         self.window.witness = None;
         self.window.record = self.record;
+        self.window.send.adopt(&self.window.record, false);
         self.window.quiescent = false;
         if self.receive_boundary {
             self.window.adopt_receive_boundary()?;
@@ -820,6 +840,8 @@ redacted_debug!(
     Ikev2SyncRecoveryPolicy,
     Ikev2SyncInitiatorCommit,
     Ikev2SyncInitiatorAction,
+    Ikev2LivenessRecord,
+    Ikev2LivenessProbePolicy,
 );
 
 macro_rules! profile_redacted_debug {
@@ -853,7 +875,8 @@ profile_lifetime_redacted_debug!(
     Ikev2AdmittedSyncResponse,
     Ikev2PreparedSyncResponse,
     Ikev2AdmittedSyncInitiation,
-    Ikev2PreparedSyncInitiation
+    Ikev2PreparedSyncInitiation,
+    Ikev2EmptyProbe
 );
 
 impl Ikev2CommittedWindow<Gcm> {
@@ -861,7 +884,7 @@ impl Ikev2CommittedWindow<Gcm> {
     ///
     /// The caller reserves IVs only for genuine state-changing work or for an
     /// already committed probe block, never for a per-probe liveness write.
-    /// Empty liveness probes use [`Self::send_empty_request`] instead: their
+    /// Empty liveness probes use [`Self::start_empty_probe`] instead: their
     /// retained bytes are volatile and issue no store command. A failed call
     /// burns its supplied allocation but changes no Message-ID state.
     /// The last representable ID should be reserved for rekey/closure by policy.
@@ -903,7 +926,7 @@ impl Ikev2CommittedWindow<Gcm> {
 impl Ikev2CommittedWindow<Ikev2CbcRecoveryProfile> {
     /// Seal with one fresh admitted random CBC IV; no reservation is used.
     /// Persist the exact candidate before transmission. Empty liveness probes
-    /// use [`Self::send_empty_request`] and are never admitted here.
+    /// use [`Self::start_empty_probe`] and are never admitted here.
     /// # Errors
     /// Refuses unresolved/pending work, exhausted IDs, invalid payloads or sealing failure.
     pub fn prepare_request(

@@ -55,11 +55,13 @@ const PROTOCOL_ID_IKE: u8 = 1;
 const ENCR_NULL: u16 = 11;
 const ENCR_AES_CBC: u16 = 12;
 const ENCR_AES_GCM_16: u16 = 20;
+const ENCR_AES_CCM_8: u16 = 14;
+const ENCR_CHACHA20_POLY1305: u16 = 28;
 const PRF_HMAC_SHA1: u16 = 2;
+const PRF_AES128_XCBC: u16 = 4;
 const PRF_HMAC_SHA2_256: u16 = 5;
 const PRF_HMAC_SHA2_384: u16 = 6;
 const PRF_HMAC_SHA2_512: u16 = 7;
-const PRF_AES128_XCBC: u16 = 4;
 const INTEG_HMAC_SHA1_96: u16 = 2;
 const INTEG_HMAC_SHA2_256_128: u16 = 12;
 const INTEG_HMAC_SHA2_384_192: u16 = 13;
@@ -68,9 +70,17 @@ const DH_MODP_768: u16 = 1;
 const DH_MODP_1024: u16 = 2;
 const DH_MODP_2048: u16 = 14;
 const DH_MODP_3072: u16 = 15;
+const MODP_3072_PUBLIC_VALUE_LEN: usize = 384;
+const MODP_3072_SHARED_SECRET_LEN: usize = 384;
 const DH_MODP_4096: u16 = 16;
+const MODP_4096_PUBLIC_VALUE_LEN: usize = 512;
+const MODP_4096_SHARED_SECRET_LEN: usize = 512;
 const DH_MODP_6144: u16 = 17;
+const MODP_6144_PUBLIC_VALUE_LEN: usize = 768;
+const MODP_6144_SHARED_SECRET_LEN: usize = 768;
 const DH_MODP_8192: u16 = 18;
+const MODP_8192_PUBLIC_VALUE_LEN: usize = 1024;
+const MODP_8192_SHARED_SECRET_LEN: usize = 1024;
 const DH_ECP_256: u16 = 19;
 const DH_ECP_384: u16 = 20;
 const DH_ECP_521: u16 = 21;
@@ -87,20 +97,12 @@ const AES_GCM_256_KEY_BITS: u16 = 256;
 const MODP_768_PUBLIC_VALUE_LEN: usize = 96;
 const MODP_1024_PUBLIC_VALUE_LEN: usize = 128;
 const MODP_2048_PUBLIC_VALUE_LEN: usize = 256;
-const MODP_3072_PUBLIC_VALUE_LEN: usize = 384;
-const MODP_4096_PUBLIC_VALUE_LEN: usize = 512;
-const MODP_6144_PUBLIC_VALUE_LEN: usize = 768;
-const MODP_8192_PUBLIC_VALUE_LEN: usize = 1024;
 const ECP_256_PUBLIC_VALUE_LEN: usize = 64;
 const ECP_384_PUBLIC_VALUE_LEN: usize = 96;
 const ECP_521_PUBLIC_VALUE_LEN: usize = 132;
 const MODP_768_SHARED_SECRET_LEN: usize = 96;
 const MODP_1024_SHARED_SECRET_LEN: usize = 128;
 const MODP_2048_SHARED_SECRET_LEN: usize = 256;
-const MODP_3072_SHARED_SECRET_LEN: usize = 384;
-const MODP_4096_SHARED_SECRET_LEN: usize = 512;
-const MODP_6144_SHARED_SECRET_LEN: usize = 768;
-const MODP_8192_SHARED_SECRET_LEN: usize = 1024;
 const ECP_256_SHARED_SECRET_LEN: usize = 32;
 const ECP_384_SHARED_SECRET_LEN: usize = 48;
 const ECP_521_SHARED_SECRET_LEN: usize = 66;
@@ -184,6 +186,7 @@ const MODP_2048_PRIME_HEX: &str = concat!(
     "15728E5A8AACAA68FFFFFFFFFFFFFFFF"
 );
 
+// RFC 3526 section 4, group 15.
 const MODP_3072_PRIME_HEX: &str = concat!(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
@@ -203,6 +206,7 @@ const MODP_3072_PRIME_HEX: &str = concat!(
     "43DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF",
 );
 
+// RFC 3526 section 5, group 16.
 const MODP_4096_PRIME_HEX: &str = concat!(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
@@ -228,6 +232,7 @@ const MODP_4096_PRIME_HEX: &str = concat!(
     "FFFFFFFFFFFFFFFF",
 );
 
+// RFC 3526 section 6, group 17.
 const MODP_6144_PRIME_HEX: &str = concat!(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
@@ -263,6 +268,7 @@ const MODP_6144_PRIME_HEX: &str = concat!(
     "12BF2D5B0B7474D6E694F91E6DCC4024FFFFFFFFFFFFFFFF",
 );
 
+// RFC 3526 section 7, group 18.
 const MODP_8192_PRIME_HEX: &str = concat!(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
@@ -324,17 +330,13 @@ pub enum Ikev2DhGroup {
     Modp1024,
     /// 2048-bit MODP group, IKEv2 Transform ID 14.
     Modp2048,
-    /// 3072-bit MODP group, IKEv2 Transform ID 15 (RFC 3526 section 4).
-    ///
-    /// Preferred over the 768/1024/2048-bit groups when the peer offers it
-    /// alongside them; this is a caller-selected proposal alternative, not an
-    /// automatic policy.
+    /// 3072-bit MODP group, IKEv2 Transform ID 15 (RFC 3526).
     Modp3072,
-    /// 4096-bit MODP group, IKEv2 Transform ID 16 (RFC 3526 section 5).
+    /// 4096-bit MODP group, IKEv2 Transform ID 16 (RFC 3526).
     Modp4096,
-    /// 6144-bit MODP group, IKEv2 Transform ID 17 (RFC 3526 section 6).
+    /// 6144-bit MODP group, IKEv2 Transform ID 17 (RFC 3526).
     Modp6144,
-    /// 8192-bit MODP group, IKEv2 Transform ID 18 (RFC 3526 section 7).
+    /// 8192-bit MODP group, IKEv2 Transform ID 18 (RFC 3526).
     Modp8192,
     /// NIST P-256 ECP group, IKEv2 Transform ID 19.
     Ecp256,
@@ -356,10 +358,10 @@ impl Ikev2DhGroup {
             DH_MODP_768 => Ok(Self::Modp768),
             DH_MODP_1024 => Ok(Self::Modp1024),
             DH_MODP_2048 => Ok(Self::Modp2048),
-            DH_MODP_3072 => Ok(Self::Modp3072),
-            DH_MODP_4096 => Ok(Self::Modp4096),
-            DH_MODP_6144 => Ok(Self::Modp6144),
             DH_MODP_8192 => Ok(Self::Modp8192),
+            DH_MODP_6144 => Ok(Self::Modp6144),
+            DH_MODP_4096 => Ok(Self::Modp4096),
+            DH_MODP_3072 => Ok(Self::Modp3072),
             DH_ECP_256 => Ok(Self::Ecp256),
             DH_ECP_384 => Ok(Self::Ecp384),
             DH_ECP_521 => Ok(Self::Ecp521),
@@ -373,10 +375,10 @@ impl Ikev2DhGroup {
             Self::Modp768 => DH_MODP_768,
             Self::Modp1024 => DH_MODP_1024,
             Self::Modp2048 => DH_MODP_2048,
-            Self::Modp3072 => DH_MODP_3072,
-            Self::Modp4096 => DH_MODP_4096,
-            Self::Modp6144 => DH_MODP_6144,
             Self::Modp8192 => DH_MODP_8192,
+            Self::Modp6144 => DH_MODP_6144,
+            Self::Modp4096 => DH_MODP_4096,
+            Self::Modp3072 => DH_MODP_3072,
             Self::Ecp256 => DH_ECP_256,
             Self::Ecp384 => DH_ECP_384,
             Self::Ecp521 => DH_ECP_521,
@@ -389,10 +391,10 @@ impl Ikev2DhGroup {
             Self::Modp768 => "MODP-768",
             Self::Modp1024 => "MODP-1024",
             Self::Modp2048 => "MODP-2048",
-            Self::Modp3072 => "MODP-3072",
-            Self::Modp4096 => "MODP-4096",
-            Self::Modp6144 => "MODP-6144",
             Self::Modp8192 => "MODP-8192",
+            Self::Modp6144 => "MODP-6144",
+            Self::Modp4096 => "MODP-4096",
+            Self::Modp3072 => "MODP-3072",
             Self::Ecp256 => "ECP-256",
             Self::Ecp384 => "ECP-384",
             Self::Ecp521 => "ECP-521",
@@ -405,10 +407,10 @@ impl Ikev2DhGroup {
             Self::Modp768 => MODP_768_PUBLIC_VALUE_LEN,
             Self::Modp1024 => MODP_1024_PUBLIC_VALUE_LEN,
             Self::Modp2048 => MODP_2048_PUBLIC_VALUE_LEN,
-            Self::Modp3072 => MODP_3072_PUBLIC_VALUE_LEN,
-            Self::Modp4096 => MODP_4096_PUBLIC_VALUE_LEN,
-            Self::Modp6144 => MODP_6144_PUBLIC_VALUE_LEN,
             Self::Modp8192 => MODP_8192_PUBLIC_VALUE_LEN,
+            Self::Modp6144 => MODP_6144_PUBLIC_VALUE_LEN,
+            Self::Modp4096 => MODP_4096_PUBLIC_VALUE_LEN,
+            Self::Modp3072 => MODP_3072_PUBLIC_VALUE_LEN,
             Self::Ecp256 => ECP_256_PUBLIC_VALUE_LEN,
             Self::Ecp384 => ECP_384_PUBLIC_VALUE_LEN,
             Self::Ecp521 => ECP_521_PUBLIC_VALUE_LEN,
@@ -424,10 +426,10 @@ impl Ikev2DhGroup {
             Self::Modp768 => MODP_768_SHARED_SECRET_LEN,
             Self::Modp1024 => MODP_1024_SHARED_SECRET_LEN,
             Self::Modp2048 => MODP_2048_SHARED_SECRET_LEN,
-            Self::Modp3072 => MODP_3072_SHARED_SECRET_LEN,
-            Self::Modp4096 => MODP_4096_SHARED_SECRET_LEN,
-            Self::Modp6144 => MODP_6144_SHARED_SECRET_LEN,
             Self::Modp8192 => MODP_8192_SHARED_SECRET_LEN,
+            Self::Modp6144 => MODP_6144_SHARED_SECRET_LEN,
+            Self::Modp4096 => MODP_4096_SHARED_SECRET_LEN,
+            Self::Modp3072 => MODP_3072_SHARED_SECRET_LEN,
             Self::Ecp256 => ECP_256_SHARED_SECRET_LEN,
             Self::Ecp384 => ECP_384_SHARED_SECRET_LEN,
             Self::Ecp521 => ECP_521_SHARED_SECRET_LEN,
@@ -451,14 +453,14 @@ pub enum Ikev2PrfAlgorithm {
     /// This algorithm is available only for an explicitly selected
     /// compatibility profile; the SDK has no implicit proposal policy.
     HmacSha1,
+    /// PRF_AES128_XCBC, IKEv2 Transform ID 4 (RFC 4434).
+    Aes128Xcbc,
     /// PRF_HMAC_SHA2_256, IKEv2 Transform ID 5.
     HmacSha2_256,
     /// PRF_HMAC_SHA2_384, IKEv2 Transform ID 6.
     HmacSha2_384,
     /// PRF_HMAC_SHA2_512, IKEv2 Transform ID 7.
     HmacSha2_512,
-    /// PRF_AES128_XCBC, IKEv2 Transform ID 4 (RFC 4434).
-    Aes128Xcbc,
 }
 
 impl Ikev2PrfAlgorithm {
@@ -471,10 +473,10 @@ impl Ikev2PrfAlgorithm {
     pub const fn from_transform_id(transform_id: u16) -> Result<Self, Ikev2SaInitCryptoError> {
         match transform_id {
             PRF_HMAC_SHA1 => Ok(Self::HmacSha1),
+            PRF_AES128_XCBC => Ok(Self::Aes128Xcbc),
             PRF_HMAC_SHA2_256 => Ok(Self::HmacSha2_256),
             PRF_HMAC_SHA2_384 => Ok(Self::HmacSha2_384),
             PRF_HMAC_SHA2_512 => Ok(Self::HmacSha2_512),
-            PRF_AES128_XCBC => Ok(Self::Aes128Xcbc),
             _ => Err(Ikev2SaInitCryptoError::UnsupportedPrf { transform_id }),
         }
     }
@@ -483,10 +485,10 @@ impl Ikev2PrfAlgorithm {
     pub const fn transform_id(self) -> u16 {
         match self {
             Self::HmacSha1 => PRF_HMAC_SHA1,
+            Self::Aes128Xcbc => PRF_AES128_XCBC,
             Self::HmacSha2_256 => PRF_HMAC_SHA2_256,
             Self::HmacSha2_384 => PRF_HMAC_SHA2_384,
             Self::HmacSha2_512 => PRF_HMAC_SHA2_512,
-            Self::Aes128Xcbc => PRF_AES128_XCBC,
         }
     }
 
@@ -494,10 +496,10 @@ impl Ikev2PrfAlgorithm {
     pub const fn output_len(self) -> usize {
         match self {
             Self::HmacSha1 => 20,
+            Self::Aes128Xcbc => 16,
             Self::HmacSha2_256 => 32,
             Self::HmacSha2_384 => 48,
             Self::HmacSha2_512 => 64,
-            Self::Aes128Xcbc => 16,
         }
     }
 
@@ -505,10 +507,10 @@ impl Ikev2PrfAlgorithm {
     pub const fn name(self) -> &'static str {
         match self {
             Self::HmacSha1 => "HMAC-SHA1",
+            Self::Aes128Xcbc => "AES128-XCBC",
             Self::HmacSha2_256 => "HMAC-SHA2-256",
             Self::HmacSha2_384 => "HMAC-SHA2-384",
             Self::HmacSha2_512 => "HMAC-SHA2-512",
-            Self::Aes128Xcbc => "AES128-XCBC",
         }
     }
 }
@@ -541,6 +543,14 @@ pub enum Ikev2EncryptionAlgorithm {
     AesGcm16_192,
     /// ENCR_AES_GCM_16 with a 256-bit AES key and 4-octet salt.
     AesGcm16_256,
+    /// ENCR_AES_CCM_8 with a 128-bit AES key and 3-octet salt.
+    AesCcm8_128,
+    /// ENCR_AES_CCM_8 with a 192-bit AES key and 3-octet salt.
+    AesCcm8_192,
+    /// ENCR_AES_CCM_8 with a 256-bit AES key and 3-octet salt.
+    AesCcm8_256,
+    /// ENCR_CHACHA20_POLY1305 with a 256-bit key and 4-octet salt.
+    ChaCha20Poly1305,
 }
 
 impl Ikev2EncryptionAlgorithm {
@@ -549,7 +559,7 @@ impl Ikev2EncryptionAlgorithm {
     /// # Errors
     ///
     /// Returns an unsupported encryption error for unsupported Transform IDs,
-    /// prohibited ENCR_NULL Key Length attributes, or unsupported/missing AES
+    /// prohibited ENCR_NULL/ChaCha20-Poly1305 Key Length attributes, or unsupported/missing AES
     /// key lengths.
     pub const fn from_transform_id(
         transform_id: u16,
@@ -561,6 +571,22 @@ impl Ikev2EncryptionAlgorithm {
                 transform_id,
                 key_bits: other,
             }),
+            (ENCR_CHACHA20_POLY1305, None) => Ok(Self::ChaCha20Poly1305),
+            (ENCR_CHACHA20_POLY1305, other) => {
+                Err(Ikev2SaInitCryptoError::UnsupportedEncryptionKeyLength {
+                    transform_id,
+                    key_bits: other,
+                })
+            }
+            (ENCR_AES_CCM_8, Some(AES_128_KEY_BITS)) => Ok(Self::AesCcm8_128),
+            (ENCR_AES_CCM_8, Some(AES_192_KEY_BITS)) => Ok(Self::AesCcm8_192),
+            (ENCR_AES_CCM_8, Some(AES_256_KEY_BITS)) => Ok(Self::AesCcm8_256),
+            (ENCR_AES_CCM_8, other) => {
+                Err(Ikev2SaInitCryptoError::UnsupportedEncryptionKeyLength {
+                    transform_id,
+                    key_bits: other,
+                })
+            }
             (ENCR_AES_CBC, Some(AES_128_KEY_BITS)) => Ok(Self::AesCbc128),
             (ENCR_AES_CBC, Some(AES_192_KEY_BITS)) => Ok(Self::AesCbc192),
             (ENCR_AES_CBC, Some(AES_256_KEY_BITS)) => Ok(Self::AesCbc256),
@@ -605,6 +631,8 @@ impl Ikev2EncryptionAlgorithm {
             Self::Null => ENCR_NULL,
             Self::AesCbc128 | Self::AesCbc192 | Self::AesCbc256 => ENCR_AES_CBC,
             Self::AesGcm16_128 | Self::AesGcm16_192 | Self::AesGcm16_256 => ENCR_AES_GCM_16,
+            Self::AesCcm8_128 | Self::AesCcm8_192 | Self::AesCcm8_256 => ENCR_AES_CCM_8,
+            Self::ChaCha20Poly1305 => ENCR_CHACHA20_POLY1305,
         }
     }
 
@@ -616,16 +644,18 @@ impl Ikev2EncryptionAlgorithm {
     pub const fn key_bits(self) -> u16 {
         match self {
             Self::Null => 0,
-            Self::AesCbc128 | Self::AesGcm16_128 => AES_128_KEY_BITS,
-            Self::AesCbc192 | Self::AesGcm16_192 => AES_192_KEY_BITS,
-            Self::AesCbc256 | Self::AesGcm16_256 => AES_256_KEY_BITS,
+            Self::AesCbc128 | Self::AesGcm16_128 | Self::AesCcm8_128 => AES_128_KEY_BITS,
+            Self::AesCbc192 | Self::AesGcm16_192 | Self::AesCcm8_192 => AES_192_KEY_BITS,
+            Self::AesCbc256 | Self::AesGcm16_256 | Self::AesCcm8_256 | Self::ChaCha20Poly1305 => {
+                AES_256_KEY_BITS
+            }
         }
     }
 
     /// Key Length transform attribute value, when the transform permits one.
     pub const fn key_length_attribute_bits(self) -> Option<u16> {
         match self {
-            Self::Null => None,
+            Self::Null | Self::ChaCha20Poly1305 => None,
             _ => Some(self.key_bits()),
         }
     }
@@ -637,10 +667,13 @@ impl Ikev2EncryptionAlgorithm {
 
     /// Per-direction salt length in octets.
     pub const fn salt_len(self) -> usize {
-        if self.is_aead() {
-            AES_GCM_SALT_LEN
-        } else {
-            0
+        match self {
+            Self::AesCcm8_128 | Self::AesCcm8_192 | Self::AesCcm8_256 => 3,
+            Self::AesGcm16_128
+            | Self::AesGcm16_192
+            | Self::AesGcm16_256
+            | Self::ChaCha20Poly1305 => AES_GCM_SALT_LEN,
+            _ => 0,
         }
     }
 
@@ -653,15 +686,34 @@ impl Ikev2EncryptionAlgorithm {
     /// integrity transform.
     pub const fn is_aead(self) -> bool {
         match self {
-            Self::AesGcm16_128 | Self::AesGcm16_192 | Self::AesGcm16_256 => true,
+            Self::AesGcm16_128
+            | Self::AesGcm16_192
+            | Self::AesGcm16_256
+            | Self::AesCcm8_128
+            | Self::AesCcm8_192
+            | Self::AesCcm8_256
+            | Self::ChaCha20Poly1305 => true,
             Self::Null | Self::AesCbc128 | Self::AesCbc192 | Self::AesCbc256 => false,
+        }
+    }
+
+    /// AEAD authentication tag length in octets, or zero for a non-AEAD cipher.
+    pub const fn aead_tag_len(self) -> usize {
+        match self {
+            Self::AesCcm8_128 | Self::AesCcm8_192 | Self::AesCcm8_256 => 8,
+            Self::AesGcm16_128
+            | Self::AesGcm16_192
+            | Self::AesGcm16_256
+            | Self::ChaCha20Poly1305 => 16,
+            _ => 0,
         }
     }
 
     /// Directional key-material length in octets.
     ///
-    /// AES-GCM includes the 4-octet RFC 4106 salt. AES-CBC is the raw cipher
-    /// key length only, and ENCR_NULL is zero.
+    /// AEAD includes the per-direction salt: three octets for AES-CCM and four
+    /// for AES-GCM/ChaCha20-Poly1305. AES-CBC is the raw cipher key length only,
+    /// and ENCR_NULL is zero.
     pub const fn key_material_len(self) -> usize {
         self.encryption_key_len() + self.salt_len()
     }
@@ -676,6 +728,10 @@ impl Ikev2EncryptionAlgorithm {
             Self::AesGcm16_128 => "AES-GCM-16-128",
             Self::AesGcm16_192 => "AES-GCM-16-192",
             Self::AesGcm16_256 => "AES-GCM-16-256",
+            Self::AesCcm8_128 => "AES-CCM-8-128",
+            Self::AesCcm8_192 => "AES-CCM-8-192",
+            Self::AesCcm8_256 => "AES-CCM-8-256",
+            Self::ChaCha20Poly1305 => "CHACHA20-POLY1305",
         }
     }
 }
@@ -1161,7 +1217,7 @@ impl Ikev2SaInitCryptoProfile {
     /// Build a profile from explicit IKEv2 Transform IDs.
     ///
     /// `encryption_key_bits` is the Key Length transform attribute for AES
-    /// transforms. `integrity_transform_id` must be `None` for AES-GCM and the
+    /// transforms. `integrity_transform_id` must be `None` for AEAD and the
     /// negotiated typed integrity Transform ID for AES-CBC.
     ///
     /// # Errors
@@ -1480,18 +1536,14 @@ pub(crate) struct SoftwareEphemeralDhKey {
     secret: SoftwareEphemeralDhSecret,
 }
 
-// The RFC 3526 group 18 private exponent is 1024 octets inline while ECP
-// scalars are small. Boxing would move secret material onto a second heap
-// allocation; the private, zeroizing enum is kept inline deliberately.
-#[allow(clippy::large_enum_variant)]
 enum SoftwareEphemeralDhSecret {
     Modp768(Zeroizing<U768>),
     Modp1024(Zeroizing<U1024>),
     Modp2048(Zeroizing<U2048>),
-    Modp3072(Zeroizing<U3072>),
-    Modp4096(Zeroizing<U4096>),
-    Modp6144(Zeroizing<U6144>),
-    Modp8192(Zeroizing<U8192>),
+    Modp8192(Box<Zeroizing<U8192>>),
+    Modp6144(Box<Zeroizing<U6144>>),
+    Modp4096(Box<Zeroizing<U4096>>),
+    Modp3072(Box<Zeroizing<U3072>>),
     Ecp256(P256SecretKey),
     Ecp384(P384SecretKey),
     Ecp521(P521SecretKey),
@@ -1510,10 +1562,10 @@ impl SoftwareEphemeralDhKey {
             Ikev2DhGroup::Modp768 => generate_modp768_key(),
             Ikev2DhGroup::Modp1024 => generate_modp1024_key(),
             Ikev2DhGroup::Modp2048 => generate_modp2048_key(),
-            Ikev2DhGroup::Modp3072 => generate_modp3072_key(),
-            Ikev2DhGroup::Modp4096 => generate_modp4096_key(),
-            Ikev2DhGroup::Modp6144 => generate_modp6144_key(),
             Ikev2DhGroup::Modp8192 => generate_modp8192_key(),
+            Ikev2DhGroup::Modp6144 => generate_modp6144_key(),
+            Ikev2DhGroup::Modp4096 => generate_modp4096_key(),
+            Ikev2DhGroup::Modp3072 => generate_modp3072_key(),
             Ikev2DhGroup::Ecp256 => {
                 let scalar = Zeroizing::new(
                     p256::NonZeroScalar::try_generate()
@@ -1703,12 +1755,12 @@ impl Ikev2SaInitKeyMaterial {
         &self.sk_ar
     }
 
-    /// SK_ei key material, including AEAD salt for AES-GCM profiles.
+    /// SK_ei key material, including the salt for AEAD profiles.
     pub fn sk_ei(&self) -> &[u8] {
         &self.sk_ei
     }
 
-    /// SK_er key material, including AEAD salt for AES-GCM profiles.
+    /// SK_er key material, including the salt for AEAD profiles.
     pub fn sk_er(&self) -> &[u8] {
         &self.sk_er
     }
@@ -2103,7 +2155,16 @@ pub fn derive_ike_sa_init_key_material_with_nonce_policy(
     let mut nonce_seed = Vec::with_capacity(initiator_nonce.len() + responder_nonce.len());
     nonce_seed.extend_from_slice(initiator_nonce);
     nonce_seed.extend_from_slice(responder_nonce);
-    let skeyseed = prf(profile.prf, &nonce_seed, dh_shared_secret)?;
+    // RFC 4434 section 1.1 retains RFC 7296 section 2.14 fixed-key
+    // semantics for SKEYSEED only; PRF+ below uses the complete nonces.
+    let skeyseed = if profile.prf == Ikev2PrfAlgorithm::Aes128Xcbc {
+        let mut key = Zeroizing::new([0u8; 16]);
+        key[..8].copy_from_slice(&initiator_nonce[..8]);
+        key[8..].copy_from_slice(&responder_nonce[..8]);
+        prf(profile.prf, key.as_ref(), dh_shared_secret)?
+    } else {
+        prf(profile.prf, &nonce_seed, dh_shared_secret)?
+    };
 
     let mut key_seed = Vec::with_capacity(nonce_seed.len() + IKE_SPI_LEN + IKE_SPI_LEN);
     key_seed.extend_from_slice(&nonce_seed);
@@ -2482,12 +2543,12 @@ pub(crate) fn software_prf(
     }
     match algorithm {
         Ikev2PrfAlgorithm::HmacSha1 => Ok(hmac_sha1(key, &[data])),
-        Ikev2PrfAlgorithm::HmacSha2_256 => Ok(hmac_sha2_256(key, &[data])),
-        Ikev2PrfAlgorithm::HmacSha2_384 => Ok(hmac_sha2_384(key, &[data])),
-        Ikev2PrfAlgorithm::HmacSha2_512 => Ok(hmac_sha2_512(key, &[data])),
         Ikev2PrfAlgorithm::Aes128Xcbc => Ok(Zeroizing::new(
             crate::xcbc::aes_xcbc_prf_128(key, data).to_vec(),
         )),
+        Ikev2PrfAlgorithm::HmacSha2_256 => Ok(hmac_sha2_256(key, &[data])),
+        Ikev2PrfAlgorithm::HmacSha2_384 => Ok(hmac_sha2_384(key, &[data])),
+        Ikev2PrfAlgorithm::HmacSha2_512 => Ok(hmac_sha2_512(key, &[data])),
     }
 }
 
@@ -2598,6 +2659,7 @@ macro_rules! define_modp_group {
         $uint:ty,
         $group:path,
         $secret_variant:ident,
+        $storage:expr,
         $prime_hex:ident
     ) => {
         fn $generate() -> Result<SoftwareEphemeralDhKey, Ikev2SaInitCryptoError> {
@@ -2623,7 +2685,7 @@ macro_rules! define_modp_group {
                 return Ok(SoftwareEphemeralDhKey {
                     group,
                     public_value,
-                    secret: SoftwareEphemeralDhSecret::$secret_variant(candidate),
+                    secret: SoftwareEphemeralDhSecret::$secret_variant(($storage)(candidate)),
                 });
             }
 
@@ -2688,6 +2750,7 @@ define_modp_group!(
     U768,
     Ikev2DhGroup::Modp768,
     Modp768,
+    core::convert::identity,
     MODP_768_PRIME_HEX
 );
 define_modp_group!(
@@ -2699,6 +2762,7 @@ define_modp_group!(
     U1024,
     Ikev2DhGroup::Modp1024,
     Modp1024,
+    core::convert::identity,
     MODP_1024_PRIME_HEX
 );
 define_modp_group!(
@@ -2710,8 +2774,10 @@ define_modp_group!(
     U2048,
     Ikev2DhGroup::Modp2048,
     Modp2048,
+    core::convert::identity,
     MODP_2048_PRIME_HEX
 );
+
 define_modp_group!(
     generate_modp3072_key,
     agree_modp3072,
@@ -2721,8 +2787,10 @@ define_modp_group!(
     U3072,
     Ikev2DhGroup::Modp3072,
     Modp3072,
+    Box::new,
     MODP_3072_PRIME_HEX
 );
+
 define_modp_group!(
     generate_modp4096_key,
     agree_modp4096,
@@ -2732,8 +2800,10 @@ define_modp_group!(
     U4096,
     Ikev2DhGroup::Modp4096,
     Modp4096,
+    Box::new,
     MODP_4096_PRIME_HEX
 );
+
 define_modp_group!(
     generate_modp6144_key,
     agree_modp6144,
@@ -2743,8 +2813,10 @@ define_modp_group!(
     U6144,
     Ikev2DhGroup::Modp6144,
     Modp6144,
+    Box::new,
     MODP_6144_PRIME_HEX
 );
+
 define_modp_group!(
     generate_modp8192_key,
     agree_modp8192,
@@ -2754,6 +2826,7 @@ define_modp_group!(
     U8192,
     Ikev2DhGroup::Modp8192,
     Modp8192,
+    Box::new,
     MODP_8192_PRIME_HEX
 );
 
@@ -2799,15 +2872,9 @@ pub(crate) fn validate_dh_public_value(
                 peer_public_value.len(),
             )?;
         }
-        Ikev2DhGroup::Modp3072 => {
-            validate_modp3072_public(
-                &U3072::from_be_slice(peer_public_value),
-                peer_public_value.len(),
-            )?;
-        }
-        Ikev2DhGroup::Modp4096 => {
-            validate_modp4096_public(
-                &U4096::from_be_slice(peer_public_value),
+        Ikev2DhGroup::Modp8192 => {
+            validate_modp8192_public(
+                &U8192::from_be_slice(peer_public_value),
                 peer_public_value.len(),
             )?;
         }
@@ -2817,9 +2884,15 @@ pub(crate) fn validate_dh_public_value(
                 peer_public_value.len(),
             )?;
         }
-        Ikev2DhGroup::Modp8192 => {
-            validate_modp8192_public(
-                &U8192::from_be_slice(peer_public_value),
+        Ikev2DhGroup::Modp4096 => {
+            validate_modp4096_public(
+                &U4096::from_be_slice(peer_public_value),
+                peer_public_value.len(),
+            )?;
+        }
+        Ikev2DhGroup::Modp3072 => {
+            validate_modp3072_public(
+                &U3072::from_be_slice(peer_public_value),
                 peer_public_value.len(),
             )?;
         }
@@ -3064,22 +3137,6 @@ mod tests {
             Ikev2DhGroup::Modp2048
         );
         assert_eq!(
-            must_ok(Ikev2DhGroup::from_transform_id(15)),
-            Ikev2DhGroup::Modp3072
-        );
-        assert_eq!(
-            must_ok(Ikev2DhGroup::from_transform_id(16)),
-            Ikev2DhGroup::Modp4096
-        );
-        assert_eq!(
-            must_ok(Ikev2DhGroup::from_transform_id(17)),
-            Ikev2DhGroup::Modp6144
-        );
-        assert_eq!(
-            must_ok(Ikev2DhGroup::from_transform_id(18)),
-            Ikev2DhGroup::Modp8192
-        );
-        assert_eq!(
             must_ok(Ikev2DhGroup::from_transform_id(19)),
             Ikev2DhGroup::Ecp256
         );
@@ -3113,13 +3170,6 @@ mod tests {
         assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.transform_id(), 7);
         assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.output_len(), 64);
         assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.name(), "HMAC-SHA2-512");
-        assert_eq!(
-            must_ok(Ikev2PrfAlgorithm::from_transform_id(4)),
-            Ikev2PrfAlgorithm::Aes128Xcbc
-        );
-        assert_eq!(Ikev2PrfAlgorithm::Aes128Xcbc.transform_id(), 4);
-        assert_eq!(Ikev2PrfAlgorithm::Aes128Xcbc.output_len(), 16);
-        assert_eq!(Ikev2PrfAlgorithm::Aes128Xcbc.name(), "AES128-XCBC");
         assert_eq!(
             must_ok(Ikev2EncryptionAlgorithm::from_transform_id(11, None)),
             Ikev2EncryptionAlgorithm::Null
@@ -3553,10 +3603,6 @@ mod tests {
             Ikev2DhGroup::Modp768,
             Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
-            Ikev2DhGroup::Modp3072,
-            Ikev2DhGroup::Modp4096,
-            Ikev2DhGroup::Modp6144,
-            Ikev2DhGroup::Modp8192,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
             Ikev2DhGroup::Ecp521,
@@ -3580,10 +3626,6 @@ mod tests {
             Ikev2DhGroup::Modp768,
             Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
-            Ikev2DhGroup::Modp3072,
-            Ikev2DhGroup::Modp4096,
-            Ikev2DhGroup::Modp6144,
-            Ikev2DhGroup::Modp8192,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
             Ikev2DhGroup::Ecp521,
@@ -3608,7 +3650,7 @@ mod tests {
 
         // Synthetic exponents. A/B/shared outputs were reproduced with both
         // Python bigint and Node.js bigint implementations using the RFC 2409
-        // group 1/2 and RFC 3526 group 14-18 primes.
+        // group 1/2 and RFC 3526 group 14 primes.
         const X: &str = "123456789abcdef0fedcba98765432100123456789abcdef0fedcba987654321";
         const Y: &str = "fedcba98765432100123456789abcdef112233445566778899aabbccddeeff00";
 
@@ -3662,26 +3704,6 @@ mod tests {
             modp2048_pow,
             "df148e68b72c2f6baba85a92162761d75ad2964f1c4194980ace133f54e9145b"
         );
-        assert_group_vector!(
-            U3072,
-            modp3072_pow,
-            "56d083e0d41b34cca4d8dc24daca0cbfc8ac7c3d8425eb0ef1f4a9ecd7faefbd"
-        );
-        assert_group_vector!(
-            U4096,
-            modp4096_pow,
-            "4f52d96f075fc1579580f965c556559a28a3ad9afc0568cd7663ddaaac34f1af"
-        );
-        assert_group_vector!(
-            U6144,
-            modp6144_pow,
-            "54c7547fdf8efae65deaedc3307f67fffd2b7c59b63927c9a039a83f21b78877"
-        );
-        assert_group_vector!(
-            U8192,
-            modp8192_pow,
-            "6e9df5280b9ff84611eaf17977ba044c45b1c247f4145eaac2aeae4c0b2f7b87"
-        );
     }
 
     #[test]
@@ -3725,56 +3747,6 @@ mod tests {
         assert_group_boundaries!(Ikev2DhGroup::Modp768, U768, modp768_prime);
         assert_group_boundaries!(Ikev2DhGroup::Modp1024, U1024, modp1024_prime);
         assert_group_boundaries!(Ikev2DhGroup::Modp2048, U2048, modp2048_prime);
-        assert_group_boundaries!(Ikev2DhGroup::Modp3072, U3072, modp3072_prime);
-        assert_group_boundaries!(Ikev2DhGroup::Modp4096, U4096, modp4096_prime);
-        assert_group_boundaries!(Ikev2DhGroup::Modp6144, U6144, modp6144_prime);
-        assert_group_boundaries!(Ikev2DhGroup::Modp8192, U8192, modp8192_prime);
-    }
-
-    #[test]
-    fn aes128_xcbc_prf_matches_rfc4434_vectors() {
-        crate::test_support::ensure_ike_crypto();
-        let message = hex_to_bytes("000102030405060708090a0b0c0d0e0f10111213");
-        for (key_hex, expected) in [
-            (
-                "000102030405060708090a0b0c0d0e0f",
-                "47f51b4564966215b8985c63055ed308",
-            ),
-            ("00010203040506070809", "0fa087af7d866e7653434e602fdde835"),
-            (
-                "000102030405060708090a0b0c0d0e0fedcb",
-                "8cd3c93ae598a9803006ffb67c40e9e4",
-            ),
-        ] {
-            let actual = must_ok(prf(
-                Ikev2PrfAlgorithm::Aes128Xcbc,
-                &hex_to_bytes(key_hex),
-                &message,
-            ));
-            assert_eq!(&*actual, hex_to_bytes(expected).as_slice());
-        }
-    }
-
-    #[test]
-    fn aes128_xcbc_profile_derives_key_material() {
-        crate::test_support::ensure_ike_crypto();
-        let profile = must_ok(Ikev2SaInitCryptoProfile::new_aead(
-            Ikev2PrfAlgorithm::Aes128Xcbc,
-            Ikev2DhGroup::Modp2048,
-            Ikev2EncryptionAlgorithm::AesGcm16_128,
-        ));
-        let material = must_ok(derive_ike_sa_init_key_material(
-            crate::Ikev2NonceLocalRole::Responder,
-            profile,
-            [1, 2, 3, 4, 5, 6, 7, 8],
-            [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18],
-            &[0x33; 32],
-            &[0x44; 32],
-            &[0x55; 32],
-            None,
-        ));
-        assert_eq!(material.sk_ei().len(), 20);
-        assert_eq!(material.sk_d().len(), 16);
     }
 
     #[test]
@@ -5230,5 +5202,50 @@ mod tests {
         }
         assert!(rendered.contains("public_value_len"));
         assert!(rendered.contains("skeyseed_len"));
+    }
+    #[test]
+    fn aes128_xcbc_prf_matches_rfc4434_vectors() {
+        crate::test_support::ensure_ike_crypto();
+        let message = hex_to_bytes("000102030405060708090a0b0c0d0e0f10111213");
+        for (key_hex, expected) in [
+            (
+                "000102030405060708090a0b0c0d0e0f",
+                "47f51b4564966215b8985c63055ed308",
+            ),
+            ("00010203040506070809", "0fa087af7d866e7653434e602fdde835"),
+            (
+                "000102030405060708090a0b0c0d0e0fedcb",
+                "8cd3c93ae598a9803006ffb67c40e9e4",
+            ),
+        ] {
+            let actual = must_ok(prf(
+                Ikev2PrfAlgorithm::Aes128Xcbc,
+                &hex_to_bytes(key_hex),
+                &message,
+            ));
+            assert_eq!(&*actual, hex_to_bytes(expected).as_slice());
+        }
+    }
+
+    #[test]
+    fn aes128_xcbc_profile_derives_key_material() {
+        crate::test_support::ensure_ike_crypto();
+        let profile = must_ok(Ikev2SaInitCryptoProfile::new_aead(
+            Ikev2PrfAlgorithm::Aes128Xcbc,
+            Ikev2DhGroup::Modp2048,
+            Ikev2EncryptionAlgorithm::AesGcm16_128,
+        ));
+        let material = must_ok(derive_ike_sa_init_key_material(
+            crate::Ikev2NonceLocalRole::Responder,
+            profile,
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18],
+            &[0x33; 32],
+            &[0x44; 32],
+            &[0x55; 32],
+            None,
+        ));
+        assert_eq!(material.sk_ei().len(), 20);
+        assert_eq!(material.sk_d().len(), 16);
     }
 }

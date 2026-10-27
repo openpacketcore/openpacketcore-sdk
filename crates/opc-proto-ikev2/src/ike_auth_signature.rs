@@ -1,11 +1,9 @@
-//! Signature-based IKE_AUTH authentication (methods 1, 9-11 and 14).
+//! Signature-based IKE_AUTH authentication (methods 1, 9–11, and 14).
 //!
 //! These helpers compute and verify the AUTH payload for RSA Digital Signature
-//! (method 1, RFC 7296), ECDSA Digital Signature (methods 9-11, RFC 4754) and
-//! Digital Signature (method 14, RFC 7427) over the same RFC 7296
-//! signed-octets transcript used by the shared-key MIC path. RFC 4754 methods
-//! 9-11 carry fixed-width raw `r || s` AUTH data; method 14 keeps its RFC 7427
-//! AlgorithmIdentifier plus DER `ECDSA-Sig-Value`.
+//! (method 1, RFC 7296), ECDSA (methods 9–11, RFC 4754), and Digital Signature
+//! (method 14, RFC 7427) over the
+//! same RFC 7296 signed-octets transcript used by the shared-key MIC path.
 //!
 //! Trust scope: the verifier checks only that a signature made by the supplied
 //! public key covers the transcript-bound signed octets. Extracting a public
@@ -15,30 +13,31 @@
 //! must supply a key it already trusts (a pinned SPKI or a chain-validated
 //! end-entity certificate).
 //!
-//! Signing defaults to ECDSA only. RSA *signing* (method 1, and RSA under
+//! Signing defaults to ECDSA and EdDSA. RSA *signing* (method 1, and RSA under
 //! method 14) is compiled in only with the `rsa-signing` cargo feature, so a
 //! default build performs no RSA private-key operations and stays outside the
 //! practical scope of RUSTSEC-2023-0071 (Marvin timing sidechannel in the
 //! `rsa` crate). RSA *verification* of peer signatures uses public-key
-//! operations only and is always available. Deploy ECDSA (P-256/P-384)
-//! responder certificates unless a peer population forces RSA.
+//! operations only and is always available. RSA-PSS supports SHA-256/384/512,
+//! matching MGF1 hashes and hash-length salts. Ed25519/Ed448 use the full
+//! transcript and require the RFC 8420 Identity hash authority.
 //!
-//! @spec IETF RFC7296 2.15, 3.8; IETF RFC7427
+//! @spec IETF RFC7296 2.15, 3.8; IETF RFC4754 7; IETF RFC7427; IETF RFC8420 2
 //! @req REQ-IETF-RFC7427-IKE-AUTH-SIGNATURE-001
 
-use std::{error::Error, fmt};
+use std::{borrow::Cow, error::Error, fmt};
 
 use opc_crypto_provider::{CryptoOperationErrorCode, IkeSignatureAlgorithm, IkeSigningKey};
 use p256::pkcs8::EncodePublicKey as EcEncodePublicKey;
-
 #[cfg(feature = "rsa-signing")]
 use rsa::RsaPrivateKey;
 use rsa::{
     pkcs8::{DecodePublicKey, EncodePublicKey as RsaEncodePublicKey},
-    Pkcs1v15Sign, RsaPublicKey,
+    Pkcs1v15Sign, Pss, RsaPublicKey,
 };
 // RSA 0.9 exposes digest 0.10 traits; keep this adapter on its re-export.
-use rsa::sha2::{Digest, Sha256};
+use rsa::pkcs8::der::{Decode as RsaDerDecode, Encode as RsaDerEncode};
+use rsa::sha2::{Digest, Sha256, Sha384, Sha512};
 use x509_parser::prelude::{FromDer, SubjectPublicKeyInfo, X509Certificate};
 
 use crate::{
@@ -67,14 +66,15 @@ use crate::{
 /// method 1 are not supported.
 pub const IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE: u8 = 1;
 
-/// IKEv2 AUTH Method 9, ECDSA with SHA-256 (RFC 4754).
-pub const IKEV2_AUTH_METHOD_ECDSA_SHA2_256: u8 = 9;
-/// IKEv2 AUTH Method 10, ECDSA with SHA-384 (RFC 4754).
-pub const IKEV2_AUTH_METHOD_ECDSA_SHA2_384: u8 = 10;
-/// IKEv2 AUTH Method 11, ECDSA with SHA-512 (RFC 4754).
-pub const IKEV2_AUTH_METHOD_ECDSA_SHA2_512: u8 = 11;
 /// IKEv2 AUTH Method 14, Digital Signature (RFC 7427).
 pub const IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE: u8 = 14;
+
+/// RFC 4754 AUTH Method 9: ECDSA P-256 with SHA-256 and fixed-width r||s.
+pub const IKEV2_AUTH_METHOD_ECDSA_SHA2_256: u8 = 9;
+/// RFC 4754 AUTH Method 10: ECDSA P-384 with SHA-384 and fixed-width r||s.
+pub const IKEV2_AUTH_METHOD_ECDSA_SHA2_384: u8 = 10;
+/// RFC 4754 AUTH Method 11: ECDSA P-521 with SHA-512 and fixed-width r||s.
+pub const IKEV2_AUTH_METHOD_ECDSA_SHA2_512: u8 = 11;
 
 /// DER `AlgorithmIdentifier` for `sha256WithRSAEncryption`
 /// (OID 1.2.840.113549.1.1.11 with NULL parameters).
@@ -94,40 +94,41 @@ pub const RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384: [u8; 12] = [
     0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03,
 ];
 
-/// DER `AlgorithmIdentifier` for `ecdsa-with-SHA512`
-/// (OID 1.2.840.10045.4.3.4, absent parameters per RFC 5758).
+/// DER AlgorithmIdentifier for ECDSA with SHA-512 (RFC 7427).
 pub const RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_512: [u8; 12] = [
     0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04,
 ];
-
-/// DER `AlgorithmIdentifier` for RSASSA-PSS with SHA-256, MGF1-SHA-256 and a
-/// 32-octet salt (RFC 7427 / RFC 8017 RSASSA-PSS-params).
-pub const RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256: [u8; 69] = [
-    0x30, 0x43, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30, 0x36, 0xa0,
+/// DER AlgorithmIdentifier for pure Ed25519, with absent parameters (RFC 8420).
+pub const RFC8420_ALGORITHM_IDENTIFIER_ED25519: [u8; 7] =
+    [0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70];
+/// DER AlgorithmIdentifier for pure Ed448, with absent parameters (RFC 8420).
+pub const RFC8420_ALGORITHM_IDENTIFIER_ED448: [u8; 7] = [0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71];
+/// DER AlgorithmIdentifier for RSA-PSS with SHA-256, matching MGF1 hash
+/// and a 32-octet salt. The default trailerField is omitted per DER.
+pub const RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256: [u8; 67] = [
+    0x30, 0x41, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30, 0x34, 0xa0,
     0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00,
-    0xa1, 0x1e, 0x30, 0x1c, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08, 0xa0,
-    0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00,
-    0xa2, 0x03, 0x02, 0x01, 0x20,
+    0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08, 0x30,
+    0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0xa2, 0x03,
+    0x02, 0x01, 0x20,
 ];
-
-/// DER `AlgorithmIdentifier` for RSASSA-PSS with SHA-384, MGF1-SHA-384 and a
-/// 48-octet salt.
-pub const RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384: [u8; 69] = [
-    0x30, 0x43, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30, 0x36, 0xa0,
+/// DER AlgorithmIdentifier for RSA-PSS with SHA-384, matching MGF1 hash
+/// and a 48-octet salt. The default trailerField is omitted per DER.
+pub const RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384: [u8; 67] = [
+    0x30, 0x41, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30, 0x34, 0xa0,
     0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00,
-    0xa1, 0x1e, 0x30, 0x1c, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08, 0xa0,
-    0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00,
-    0xa2, 0x03, 0x02, 0x01, 0x30,
+    0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08, 0x30,
+    0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0xa2, 0x03,
+    0x02, 0x01, 0x30,
 ];
-
-/// DER `AlgorithmIdentifier` for RSASSA-PSS with SHA-512, MGF1-SHA-512 and a
-/// 64-octet salt.
-pub const RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512: [u8; 69] = [
-    0x30, 0x43, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30, 0x36, 0xa0,
+/// DER AlgorithmIdentifier for RSA-PSS with SHA-512, matching MGF1 hash
+/// and a 64-octet salt. The default trailerField is omitted per DER.
+pub const RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512: [u8; 67] = [
+    0x30, 0x41, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30, 0x34, 0xa0,
     0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00,
-    0xa1, 0x1e, 0x30, 0x1c, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08, 0xa0,
-    0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00,
-    0xa2, 0x03, 0x02, 0x01, 0x40,
+    0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08, 0x30,
+    0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0xa2, 0x03,
+    0x02, 0x01, 0x40,
 ];
 
 const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
@@ -135,6 +136,8 @@ const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
 const OID_NAMED_CURVE_P256: &str = "1.2.840.10045.3.1.7";
 const OID_NAMED_CURVE_P384: &str = "1.3.132.0.34";
 const OID_NAMED_CURVE_P521: &str = "1.3.132.0.35";
+const OID_ED25519: &str = "1.3.101.112";
+const OID_ED448: &str = "1.3.101.113";
 
 /// AUTH method selector for signature-based IKE_AUTH.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,9 +173,8 @@ impl Ikev2SignatureAuthMethod {
 
 /// Responder or initiator signing key plus chosen AUTH method.
 ///
-/// Construct through the `rsa_pkcs8_der` / `ecdsa_p256_pkcs8_der` /
-/// `ecdsa_p384_pkcs8_der` constructors, which reject method/key combinations
-/// that IKEv2 does not allow. The wrapped RustCrypto key types zeroize their
+/// Construct through the RSA, ECDSA, or EdDSA PKCS#8 constructors, which
+/// reject method/key combinations that IKEv2 does not allow. The wrapped RustCrypto key types zeroize their
 /// key material on drop, and `Debug` never prints key bytes.
 pub struct Ikev2SignatureAuthKey {
     method: Ikev2SignatureAuthMethod,
@@ -196,6 +198,13 @@ impl Ikev2SignatureAuthKey {
         method: Ikev2SignatureAuthMethod,
         pkcs8_der: &[u8],
     ) -> Result<Self, Ikev2SignatureKeyError> {
+        if !matches!(
+            method,
+            Ikev2SignatureAuthMethod::RsaDigitalSignature
+                | Ikev2SignatureAuthMethod::DigitalSignature
+        ) {
+            return Err(Ikev2SignatureKeyError::UnsupportedSignatureAlgorithm);
+        }
         let algorithm = IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256;
         let key = load_admitted_signing_key(
             algorithm,
@@ -249,124 +258,147 @@ impl Ikev2SignatureAuthKey {
         })
     }
 
-    /// Load an ECDSA P-256 private key for RFC 4754 AUTH method 9.
-    ///
-    /// The key is used with SHA-256 and the AUTH data is the raw DER
-    /// `ECDSA-Sig-Value`, without an RFC 7427 AlgorithmIdentifier.
+    /// Load an ECDSA P-521 key for method 14 with SHA-512.
     ///
     /// # Errors
-    ///
-    /// Returns [`Ikev2SignatureKeyError`] when the DER is not a valid PKCS#8
-    /// P-256 private key.
-    pub fn ecdsa_p256_sha256_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
-        let algorithm = IkeSignatureAlgorithm::EcdsaP256Sha2_256;
-        let key = load_admitted_signing_key(
-            algorithm,
+    /// Returns an error for invalid PKCS#8 or a key not admitted by the module.
+    pub fn ecdsa_p521_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
+        Self::from_algorithm(
+            Ikev2SignatureAuthMethod::DigitalSignature,
+            IkeSignatureAlgorithm::EcdsaP521Sha2_512,
             pkcs8_der,
             Ikev2SignatureKeyError::EcdsaPrivateKeyParse,
-        )?;
-        Ok(Self {
-            method: Ikev2SignatureAuthMethod::EcdsaSha2_256,
-            algorithm,
-            signing_key: key,
-        })
+        )
     }
 
-    /// Load an ECDSA P-384 private key for RFC 4754 AUTH method 10.
+    /// Load an ECDSA key for RFC 4754 method 9, 10, or 11.
     ///
-    /// The key is used with SHA-384 and the AUTH data is the raw DER
-    /// `ECDSA-Sig-Value`, without an RFC 7427 AlgorithmIdentifier.
+    /// These methods use fixed-width r||s and do not require RFC 7427 authority.
+    /// The key must match the curve selected by `method`.
     ///
     /// # Errors
-    ///
-    /// Returns [`Ikev2SignatureKeyError`] when the DER is not a valid PKCS#8
-    /// P-384 private key.
-    pub fn ecdsa_p384_sha384_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
-        let algorithm = IkeSignatureAlgorithm::EcdsaP384Sha2_384;
-        let key = load_admitted_signing_key(
-            algorithm,
-            pkcs8_der,
-            Ikev2SignatureKeyError::EcdsaPrivateKeyParse,
-        )?;
-        Ok(Self {
-            method: Ikev2SignatureAuthMethod::EcdsaSha2_384,
-            algorithm,
-            signing_key: key,
-        })
-    }
-
-    /// Load an ECDSA P-521 private key for RFC 4754 AUTH method 11.
-    ///
-    /// The key is used with SHA-512 and the AUTH data is the raw DER
-    /// `ECDSA-Sig-Value`, without an RFC 7427 AlgorithmIdentifier.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Ikev2SignatureKeyError`] when the DER is not a valid PKCS#8
-    /// P-521 private key.
-    pub fn ecdsa_p521_sha512_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
-        let algorithm = IkeSignatureAlgorithm::EcdsaP521Sha2_512;
-        let key = load_admitted_signing_key(
-            algorithm,
-            pkcs8_der,
-            Ikev2SignatureKeyError::EcdsaPrivateKeyParse,
-        )?;
-        Ok(Self {
-            method: Ikev2SignatureAuthMethod::EcdsaSha2_512,
-            algorithm,
-            signing_key: key,
-        })
-    }
-
-    /// Load an RSA private key for RFC 7427 method 14 with RSASSA-PSS/SHA-256.
-    ///
-    /// Available only with the `rsa-signing` cargo feature; see the module
-    /// documentation for the RUSTSEC-2023-0071 trade-off. PSS signing uses a
-    /// random salt of the digest length; verification is always available.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Ikev2SignatureKeyError`] when the DER is not a valid PKCS#8
-    /// RSA private key.
-    #[cfg(feature = "rsa-signing")]
-    pub fn rsa_pss_sha256_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
-        Self::rsa_pss_pkcs8_der(IkeSignatureAlgorithm::RsaPssSha2_256, pkcs8_der)
-    }
-
-    /// Load an RSA private key for method 14 with RSASSA-PSS/SHA-384.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::rsa_pss_sha256_pkcs8_der`].
-    #[cfg(feature = "rsa-signing")]
-    pub fn rsa_pss_sha384_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
-        Self::rsa_pss_pkcs8_der(IkeSignatureAlgorithm::RsaPssSha2_384, pkcs8_der)
-    }
-
-    /// Load an RSA private key for method 14 with RSASSA-PSS/SHA-512.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::rsa_pss_sha256_pkcs8_der`].
-    #[cfg(feature = "rsa-signing")]
-    pub fn rsa_pss_sha512_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
-        Self::rsa_pss_pkcs8_der(IkeSignatureAlgorithm::RsaPssSha2_512, pkcs8_der)
-    }
-
-    #[cfg(feature = "rsa-signing")]
-    fn rsa_pss_pkcs8_der(
-        algorithm: IkeSignatureAlgorithm,
+    /// Returns an error for any other method, invalid key, or module rejection.
+    pub fn ecdsa_rfc4754_pkcs8_der(
+        method: Ikev2SignatureAuthMethod,
         pkcs8_der: &[u8],
     ) -> Result<Self, Ikev2SignatureKeyError> {
-        let key = load_admitted_signing_key(
+        let algorithm = legacy_ecdsa_algorithm(method.as_u8())
+            .ok_or(Ikev2SignatureKeyError::UnsupportedSignatureAlgorithm)?;
+        Self::from_algorithm(
+            method,
+            algorithm,
+            pkcs8_der,
+            Ikev2SignatureKeyError::EcdsaPrivateKeyParse,
+        )
+    }
+
+    /// Load an RSA-PSS key for method 14 with SHA-256, SHA-384, or SHA-512.
+    ///
+    /// MGF1 uses the same hash and the salt has the hash output length.
+    /// Available only with `rsa-signing`.
+    ///
+    /// # Errors
+    /// Returns an error for another hash, invalid PKCS#8, or module rejection.
+    #[cfg(feature = "rsa-signing")]
+    pub fn rsa_pss_pkcs8_der(
+        hash: Ikev2SignatureHashAlgorithm,
+        pkcs8_der: &[u8],
+    ) -> Result<Self, Ikev2SignatureKeyError> {
+        let algorithm = match hash {
+            Ikev2SignatureHashAlgorithm::Sha2_256 => IkeSignatureAlgorithm::RsaPssSha2_256,
+            Ikev2SignatureHashAlgorithm::Sha2_384 => IkeSignatureAlgorithm::RsaPssSha2_384,
+            Ikev2SignatureHashAlgorithm::Sha2_512 => IkeSignatureAlgorithm::RsaPssSha2_512,
+            _ => return Err(Ikev2SignatureKeyError::UnsupportedSignatureAlgorithm),
+        };
+        Self::from_algorithm(
+            Ikev2SignatureAuthMethod::DigitalSignature,
             algorithm,
             pkcs8_der,
             Ikev2SignatureKeyError::RsaPrivateKeyParse,
-        )?;
+        )
+    }
+
+    /// Load a pure Ed25519 key for method 14 with the Identity hash (RFC 8420).
+    ///
+    /// # Errors
+    /// Returns an error for invalid PKCS#8 or module rejection.
+    pub fn ed25519_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
+        Self::from_algorithm(
+            Ikev2SignatureAuthMethod::DigitalSignature,
+            IkeSignatureAlgorithm::Ed25519,
+            pkcs8_der,
+            Ikev2SignatureKeyError::EdDsaPrivateKeyParse,
+        )
+    }
+
+    /// Load a pure Ed448 key for method 14 with the Identity hash (RFC 8420).
+    ///
+    /// # Errors
+    /// Returns an error for invalid PKCS#8 or module rejection.
+    pub fn ed448_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
+        Self::from_algorithm(
+            Ikev2SignatureAuthMethod::DigitalSignature,
+            IkeSignatureAlgorithm::Ed448,
+            pkcs8_der,
+            Ikev2SignatureKeyError::EdDsaPrivateKeyParse,
+        )
+    }
+
+    /// Load a P-256 key for RFC 4754 method 9 using fixed-width r||s.
+    /// # Errors
+    /// Refuses an invalid key or a key not admitted by the installed module.
+    pub fn ecdsa_p256_sha256_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
+        Self::ecdsa_rfc4754_pkcs8_der(Ikev2SignatureAuthMethod::EcdsaSha2_256, pkcs8_der)
+    }
+
+    /// Load a P-384 key for RFC 4754 method 10 using fixed-width r||s.
+    /// # Errors
+    /// Refuses an invalid key or a key not admitted by the installed module.
+    pub fn ecdsa_p384_sha384_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
+        Self::ecdsa_rfc4754_pkcs8_der(Ikev2SignatureAuthMethod::EcdsaSha2_384, pkcs8_der)
+    }
+
+    /// Load a P-521 key for RFC 4754 method 11 using fixed-width r||s.
+    /// # Errors
+    /// Refuses an invalid key or a key not admitted by the installed module.
+    pub fn ecdsa_p521_sha512_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
+        Self::ecdsa_rfc4754_pkcs8_der(Ikev2SignatureAuthMethod::EcdsaSha2_512, pkcs8_der)
+    }
+
+    /// Load an RSA-PSS key for method 14 with SHA-256 and matching MGF1/salt length.
+    /// # Errors
+    /// Refuses an invalid key or a key not admitted by the installed module.
+    #[cfg(feature = "rsa-signing")]
+    pub fn rsa_pss_sha256_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
+        Self::rsa_pss_pkcs8_der(Ikev2SignatureHashAlgorithm::Sha2_256, pkcs8_der)
+    }
+
+    /// Load an RSA-PSS key for method 14 with SHA-384 and matching MGF1/salt length.
+    /// # Errors
+    /// Refuses an invalid key or a key not admitted by the installed module.
+    #[cfg(feature = "rsa-signing")]
+    pub fn rsa_pss_sha384_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
+        Self::rsa_pss_pkcs8_der(Ikev2SignatureHashAlgorithm::Sha2_384, pkcs8_der)
+    }
+
+    /// Load an RSA-PSS key for method 14 with SHA-512 and matching MGF1/salt length.
+    /// # Errors
+    /// Refuses an invalid key or a key not admitted by the installed module.
+    #[cfg(feature = "rsa-signing")]
+    pub fn rsa_pss_sha512_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Ikev2SignatureKeyError> {
+        Self::rsa_pss_pkcs8_der(Ikev2SignatureHashAlgorithm::Sha2_512, pkcs8_der)
+    }
+
+    fn from_algorithm(
+        method: Ikev2SignatureAuthMethod,
+        algorithm: IkeSignatureAlgorithm,
+        pkcs8_der: &[u8],
+        parse_error: Ikev2SignatureKeyError,
+    ) -> Result<Self, Ikev2SignatureKeyError> {
         Ok(Self {
-            method: Ikev2SignatureAuthMethod::DigitalSignature,
+            method,
             algorithm,
-            signing_key: key,
+            signing_key: load_admitted_signing_key(algorithm, pkcs8_der, parse_error)?,
         })
     }
 
@@ -422,13 +454,17 @@ pub enum Ikev2SignaturePublicKey {
     EcdsaP384(p384::ecdsa::VerifyingKey),
     /// ECDSA P-521 public key.
     EcdsaP521(p521::ecdsa::VerifyingKey),
+    /// Pure Ed25519 public key.
+    Ed25519(ed25519_dalek::VerifyingKey),
+    /// Pure Ed448 public key.
+    Ed448(ed448_goldilocks_plus::VerifyingKey),
 }
 
 impl Ikev2SignaturePublicKey {
     /// Parse a DER SubjectPublicKeyInfo into a typed verification key.
     ///
-    /// Supports `rsaEncryption`, and `id-ecPublicKey` with the P-256 or P-384
-    /// named curve.
+    /// Supports RSA, ECDSA P-256/P-384/P-521 and Ed25519/Ed448. EdDSA
+    /// parameters must be absent and every SPKI must have zero unused bits.
     ///
     /// # Errors
     ///
@@ -468,6 +504,9 @@ impl Ikev2SignaturePublicKey {
         spki_der: &[u8],
         spki: &SubjectPublicKeyInfo<'_>,
     ) -> Result<Self, Ikev2SignatureKeyError> {
+        if spki.subject_public_key.unused_bits != 0 {
+            return Err(Ikev2SignatureKeyError::SpkiParse);
+        }
         let algorithm_oid = spki.algorithm.algorithm.to_id_string();
         match algorithm_oid.as_str() {
             OID_RSA_ENCRYPTION => {
@@ -497,6 +536,31 @@ impl Ikev2SignaturePublicKey {
                     _ => Err(Ikev2SignatureKeyError::UnsupportedEcCurve),
                 }
             }
+            OID_ED25519 | OID_ED448 => {
+                if spki.algorithm.parameters.is_some() {
+                    return Err(Ikev2SignatureKeyError::SpkiParse);
+                }
+                let bytes = spki.subject_public_key.data.as_ref();
+                if algorithm_oid == OID_ED25519 {
+                    let encoded = <&[u8; 32]>::try_from(bytes)
+                        .map_err(|_| Ikev2SignatureKeyError::EdDsaPublicKeyParse)?;
+                    let public = ed25519_dalek::VerifyingKey::from_bytes(encoded)
+                        .map_err(|_| Ikev2SignatureKeyError::EdDsaPublicKeyParse)?;
+                    if public.is_weak() {
+                        return Err(Ikev2SignatureKeyError::EdDsaPublicKeyParse);
+                    }
+                    Ok(Self::Ed25519(public))
+                } else {
+                    let encoded = <&[u8; 57]>::try_from(bytes)
+                        .map_err(|_| Ikev2SignatureKeyError::EdDsaPublicKeyParse)?;
+                    let public = ed448_goldilocks_plus::VerifyingKey::from_bytes(encoded)
+                        .map_err(|_| Ikev2SignatureKeyError::EdDsaPublicKeyParse)?;
+                    if !bool::from(public.to_edwards().is_torsion_free()) {
+                        return Err(Ikev2SignatureKeyError::EdDsaPublicKeyParse);
+                    }
+                    Ok(Self::Ed448(public))
+                }
+            }
             _ => Err(Ikev2SignatureKeyError::UnsupportedPublicKeyAlgorithm),
         }
     }
@@ -512,6 +576,8 @@ impl fmt::Debug for Ikev2SignaturePublicKey {
                     Self::EcdsaP256(_) => "ecdsa_p256",
                     Self::EcdsaP384(_) => "ecdsa_p384",
                     Self::EcdsaP521(_) => "ecdsa_p521",
+                    Self::Ed25519(_) => "ed25519",
+                    Self::Ed448(_) => "ed448",
                 },
             )
             .finish()
@@ -547,6 +613,63 @@ impl fmt::Debug for Ikev2LocalAuthSelfVerificationAuthorization<'_> {
 }
 
 impl Ikev2SignatureHashSigningAuthority {
+    /// Bind local method-14 self-verification to the selected signing algorithm.
+    ///
+    /// Use this variant when a key/hash pair permits several schemes, such as
+    /// RSA-PSS and PKCS#1 v1.5 with SHA-256. The signature scheme and public
+    /// credential are fixed in the returned one-operation authorization.
+    ///
+    /// # Errors
+    /// Returns an error for a non-method-14 key, a mismatched transcript,
+    /// unauthorized hash, incompatible public key, or unadmitted algorithm.
+    pub fn authorize_local_auth_self_verification_with_signing_key<'a>(
+        &'a self,
+        request: &'a [u8],
+        response: &'a [u8],
+        signed_octets: Ikev2IkeAuthSignedOctets<'a>,
+        signing_key: &Ikev2SignatureAuthKey,
+        local_public_credential: &'a Ikev2SignaturePublicKey,
+    ) -> Result<Ikev2LocalAuthSelfVerificationAuthorization<'a>, Ikev2IkeAuthVerificationError>
+    {
+        validate_signed_octets(signed_octets)?;
+        if signing_key.method != Ikev2SignatureAuthMethod::DigitalSignature {
+            return Err(
+                Ikev2IkeAuthVerificationError::UnsupportedAuthenticationMethod {
+                    method: signing_key.method.as_u8(),
+                },
+            );
+        }
+        let selected_hash = signature_hash_for_algorithm(signing_key.algorithm)?;
+        let hash_authorization = self
+            .for_exchange(request, response)
+            .map_err(|_| Ikev2IkeAuthVerificationError::SignatureHashAuthorityExchangeMismatch)?;
+        hash_authorization
+            .validate(selected_hash, signed_octets)
+            .map_err(map_signature_hash_authority_error)?;
+        let signature_algorithm = signature_algorithm_for_public_key_and_identifier(
+            local_public_credential,
+            signature_identifier(signing_key.algorithm)?,
+            selected_hash,
+        )?;
+        if signature_algorithm != signing_key.algorithm {
+            return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
+        }
+        let generation_admitted = signature_generation_algorithm_admitted(signature_algorithm)
+            .map_err(|error| Ikev2IkeAuthVerificationError::CryptoModuleFailure { error })?;
+        let verification_admitted = signature_verification_algorithm_admitted(signature_algorithm)
+            .map_err(|error| Ikev2IkeAuthVerificationError::CryptoModuleFailure { error })?;
+        if !generation_admitted || !verification_admitted {
+            return Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported);
+        }
+        Ok(Ikev2LocalAuthSelfVerificationAuthorization {
+            hash_authorization,
+            signed_octets,
+            selected_hash,
+            signature_algorithm,
+            local_public_credential,
+        })
+    }
+
     /// Bind one local AUTH self-verification operation to exact inputs.
     ///
     /// This is intentionally separate from peer verification authority. The
@@ -608,17 +731,18 @@ impl Ikev2SignatureHashSigningAuthority {
 /// Compute signature AUTH data over the RFC 7296 signed octets.
 ///
 /// For method 1 the returned AUTH data is the raw RSASSA-PKCS1-v1_5 SHA-256
-/// signature. For method 14 it is the RFC 7427 framing:
+/// signature. For methods 9–11 it is fixed-width r||s. For method 14 it is
+/// the RFC 7427 framing:
 /// `len(AlgorithmIdentifier) || DER(AlgorithmIdentifier) || signature`, where
-/// the signature is PKCS#1 v1.5 for RSA and a DER-encoded `ECDSA-Sig-Value`
-/// for ECDSA, matching X.509 signature formats as RFC 7427 requires.
+/// the signature uses the selected PKCS#1 v1.5, RSA-PSS, DER ECDSA, or
+/// pure EdDSA encoding, matching X.509 formats as RFC 7427 requires.
 ///
 /// Feed the result into `build_ike_auth_authentication_payload` with
 /// `key.method().as_u8()` as the AUTH method.
 /// RFC 7427 method 14 requires a one-operation
 /// `signature_hash_authorization` bound to both peers' exact `IKE_SA_INIT`
-/// messages and the opposite message's validated Nonce payload; method 1
-/// ignores this argument.
+/// messages and the opposite message's validated Nonce payload; methods 1
+/// and 9–11 ignore this argument.
 ///
 /// # Errors
 ///
@@ -646,25 +770,14 @@ pub fn compute_ike_auth_signature(
         return Ok(signature);
     }
 
-    match key.method {
-        Ikev2SignatureAuthMethod::EcdsaSha2_256
-        | Ikev2SignatureAuthMethod::EcdsaSha2_384
-        | Ikev2SignatureAuthMethod::EcdsaSha2_512 => {
-            let expected = match key.method {
-                Ikev2SignatureAuthMethod::EcdsaSha2_256 => IkeSignatureAlgorithm::EcdsaP256Sha2_256,
-                Ikev2SignatureAuthMethod::EcdsaSha2_384 => IkeSignatureAlgorithm::EcdsaP384Sha2_384,
-                _ => IkeSignatureAlgorithm::EcdsaP521Sha2_512,
-            };
-            if key.algorithm != expected {
-                return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
-            }
-            let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
-            let der = execute_signing_key(key.algorithm, key.signing_key.as_ref(), &signed)
-                .map_err(map_signature_module_error)?;
-            // RFC 4754 sections 3/7: methods 9-11 carry fixed-width r || s.
-            return ecdsa_der_to_raw(key.method.as_u8(), &der);
+    if let Some(algorithm) = legacy_ecdsa_algorithm(key.method.as_u8()) {
+        if key.algorithm != algorithm {
+            return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
         }
-        _ => {}
+        let signed = build_signed_octets(profile.prf(), key_material, signed_octets)?;
+        let signature = execute_signing_key(algorithm, key.signing_key.as_ref(), &signed)
+            .map_err(map_signature_module_error)?;
+        return ecdsa_signature_to_fixed(algorithm, &signature);
     }
 
     let signature_hash = signature_hash_for_algorithm(key.algorithm)?;
@@ -673,18 +786,7 @@ pub fn compute_ike_auth_signature(
     let signature = execute_signing_key(key.algorithm, key.signing_key.as_ref(), &signed)
         .map_err(map_signature_module_error)?;
 
-    let algorithm_identifier: &[u8] = match key.algorithm {
-        IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256 => &RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256,
-        IkeSignatureAlgorithm::RsaPssSha2_256 => &RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256,
-        IkeSignatureAlgorithm::RsaPssSha2_384 => &RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384,
-        IkeSignatureAlgorithm::RsaPssSha2_512 => &RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512,
-        IkeSignatureAlgorithm::EcdsaP256Sha2_256 | IkeSignatureAlgorithm::EcdsaP384Sha2_256 => {
-            &RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256
-        }
-        IkeSignatureAlgorithm::EcdsaP384Sha2_384 => &RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384,
-        IkeSignatureAlgorithm::EcdsaP521Sha2_512 => &RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_512,
-        _ => return Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported),
-    };
+    let algorithm_identifier = signature_identifier(key.algorithm)?;
     let algorithm_identifier_len = u8::try_from(algorithm_identifier.len())
         .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?;
     let mut auth_data = Vec::with_capacity(1 + algorithm_identifier.len() + signature.len());
@@ -694,16 +796,16 @@ pub fn compute_ike_auth_signature(
     Ok(auth_data)
 }
 
-/// Verify a signature AUTH payload (method 1 or 14) over the signed octets.
+/// Verify a signature AUTH payload (method 1, 9–11, or 14) over the signed octets.
 ///
 /// The supplied public key is the caller's trust decision — a pinned SPKI or a
 /// key extracted from a certificate the product layer already validated. Any
-/// AUTH method other than 1 or 14 (including the shared-key method 2, which
+/// AUTH method other than 1, 9–11, or 14 (including shared-key method 2, which
 /// [`crate::verify_ike_auth_shared_key_mic`] owns) fails with
 /// `UnsupportedAuthenticationMethod`.
 /// RFC 7427 method 14 additionally requires direction-specific
 /// `signature_hash_authorization` bound to both exact SA_INIT messages and the
-/// opposite message's validated Nonce payload; method 1 ignores that argument.
+/// opposite message's validated Nonce payload; methods 1 and 9–11 ignore it.
 ///
 /// # Errors
 ///
@@ -726,55 +828,33 @@ pub fn verify_ike_auth_signature(
         IKEV2_AUTH_METHOD_RSA_DIGITAL_SIGNATURE => match public_key {
             Ikev2SignaturePublicKey::Rsa(_) => (
                 IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256,
-                std::borrow::Cow::Borrowed(authentication.auth_data),
-                None,
-            ),
-            _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
-        },
-        IKEV2_AUTH_METHOD_ECDSA_SHA2_256 => match public_key {
-            Ikev2SignaturePublicKey::EcdsaP256(_) => (
-                IkeSignatureAlgorithm::EcdsaP256Sha2_256,
-                std::borrow::Cow::Owned(ecdsa_raw_to_der(
-                    IKEV2_AUTH_METHOD_ECDSA_SHA2_256,
-                    authentication.auth_data,
-                )?),
-                None,
-            ),
-            _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
-        },
-        IKEV2_AUTH_METHOD_ECDSA_SHA2_384 => match public_key {
-            Ikev2SignaturePublicKey::EcdsaP384(_) => (
-                IkeSignatureAlgorithm::EcdsaP384Sha2_384,
-                std::borrow::Cow::Owned(ecdsa_raw_to_der(
-                    IKEV2_AUTH_METHOD_ECDSA_SHA2_384,
-                    authentication.auth_data,
-                )?),
-                None,
-            ),
-            _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
-        },
-        IKEV2_AUTH_METHOD_ECDSA_SHA2_512 => match public_key {
-            Ikev2SignaturePublicKey::EcdsaP521(_) => (
-                IkeSignatureAlgorithm::EcdsaP521Sha2_512,
-                std::borrow::Cow::Owned(ecdsa_raw_to_der(
-                    IKEV2_AUTH_METHOD_ECDSA_SHA2_512,
-                    authentication.auth_data,
-                )?),
+                Cow::Borrowed(authentication.auth_data),
                 None,
             ),
             _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
         },
         IKEV2_AUTH_METHOD_DIGITAL_SIGNATURE => {
-            let (algorithm, signature, signature_hash) =
+            let (algorithm, signature, hash) =
                 decode_method14_signature(public_key, authentication.auth_data)?;
-            (
-                algorithm,
-                std::borrow::Cow::Borrowed(signature),
-                Some(signature_hash),
-            )
+            (algorithm, Cow::Borrowed(signature), Some(hash))
         }
         method => {
-            return Err(Ikev2IkeAuthVerificationError::UnsupportedAuthenticationMethod { method });
+            let algorithm = legacy_ecdsa_algorithm(method)
+                .ok_or(Ikev2IkeAuthVerificationError::UnsupportedAuthenticationMethod { method })?;
+            let hash = signature_hash_for_algorithm(algorithm)?;
+            let selected = signature_algorithm_for_public_key_and_identifier(
+                public_key,
+                signature_identifier(algorithm)?,
+                hash,
+            )?;
+            if selected != algorithm {
+                return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
+            }
+            (
+                algorithm,
+                Cow::Owned(ecdsa_signature_to_der(algorithm, authentication.auth_data)?),
+                None,
+            )
         }
     };
     if let Some(signature_hash) = signature_hash {
@@ -790,7 +870,7 @@ pub fn verify_ike_auth_signature(
         signed_octets,
         public_key,
         algorithm,
-        signature.as_ref(),
+        &signature,
     )
 }
 
@@ -804,7 +884,7 @@ pub fn verify_ike_auth_signature(
 /// identity body, the selected signature hash, and the local public
 /// credential.
 ///
-/// Method 1 and every non-signature AUTH method are rejected. The ordinary
+/// Every AUTH method other than method 14 is rejected. The ordinary
 /// [`verify_ike_auth_signature`] boundary continues to require the remote-peer
 /// verification authority and cannot consume this local authorization.
 ///
@@ -853,142 +933,6 @@ pub fn verify_local_ike_auth_signature(
     )
 }
 
-/// RFC 4754 section 7 methods 9-11 carry the fixed-width raw `r || s`
-/// concatenation, not a DER `ECDSA-Sig-Value`.
-fn ecdsa_auth_algorithm_and_field_len(method: u8) -> Option<(IkeSignatureAlgorithm, usize)> {
-    match method {
-        IKEV2_AUTH_METHOD_ECDSA_SHA2_256 => Some((IkeSignatureAlgorithm::EcdsaP256Sha2_256, 32)),
-        IKEV2_AUTH_METHOD_ECDSA_SHA2_384 => Some((IkeSignatureAlgorithm::EcdsaP384Sha2_384, 48)),
-        IKEV2_AUTH_METHOD_ECDSA_SHA2_512 => Some((IkeSignatureAlgorithm::EcdsaP521Sha2_512, 66)),
-        _ => None,
-    }
-}
-
-fn ecdsa_raw_to_der(method: u8, raw: &[u8]) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
-    let (_, field_len) = ecdsa_auth_algorithm_and_field_len(method)
-        .ok_or(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported)?;
-    if raw.len() != field_len * 2 {
-        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
-    }
-    let integer = |bytes: &[u8]| {
-        let first = bytes
-            .iter()
-            .position(|byte| *byte != 0)
-            .ok_or(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?;
-        let value = &bytes[first..];
-        let mut encoded = Vec::with_capacity(value.len() + 2);
-        encoded.push(0x02);
-        let leading = usize::from(value[0] & 0x80 != 0);
-        encoded.push(
-            u8::try_from(value.len() + leading)
-                .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?,
-        );
-        if leading == 1 {
-            encoded.push(0);
-        }
-        encoded.extend_from_slice(value);
-        Ok(encoded)
-    };
-    let r = integer(&raw[..field_len])?;
-    let s = integer(&raw[field_len..])?;
-    let body = r.len() + s.len();
-    if body > 255 {
-        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
-    }
-    let mut der = Vec::with_capacity(body + 3);
-    der.push(0x30);
-    if body < 0x80 {
-        der.push(
-            u8::try_from(body)
-                .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?,
-        );
-    } else {
-        // P-521 r || s produces a SEQUENCE body above 127 octets, which needs
-        // DER long-form length encoding.
-        der.push(0x81);
-        der.push(
-            u8::try_from(body)
-                .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?,
-        );
-    }
-    der.extend_from_slice(&r);
-    der.extend_from_slice(&s);
-    Ok(der)
-}
-
-fn ecdsa_der_to_raw(method: u8, der: &[u8]) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
-    let (_, field_len) = ecdsa_auth_algorithm_and_field_len(method)
-        .ok_or(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported)?;
-    fn take_length(
-        input: &[u8],
-        index: &mut usize,
-    ) -> Result<usize, Ikev2IkeAuthVerificationError> {
-        let first = *input
-            .get(*index)
-            .ok_or(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?;
-        *index += 1;
-        if first & 0x80 == 0 {
-            return Ok(usize::from(first));
-        }
-        let bytes = usize::from(first & 0x7f);
-        if bytes == 0 || bytes > 2 {
-            return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
-        }
-        let mut length = 0_usize;
-        for _ in 0..bytes {
-            let byte = *input
-                .get(*index)
-                .ok_or(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?;
-            *index += 1;
-            length = (length << 8) | usize::from(byte);
-        }
-        Ok(length)
-    }
-    fn take_integer(
-        input: &[u8],
-        index: &mut usize,
-        field_len: usize,
-    ) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
-        if input.get(*index) != Some(&0x02) {
-            return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
-        }
-        *index += 1;
-        let length = take_length(input, index)?;
-        let value = input
-            .get(*index..*index + length)
-            .ok_or(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)?;
-        *index += length;
-        let value = match value {
-            [0x00, rest @ ..] if rest.first().is_some_and(|byte| byte & 0x80 != 0) => rest,
-            [first, ..] if first & 0x80 == 0 => value,
-            _ => return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid),
-        };
-        if value.is_empty() || value.len() > field_len || value.iter().all(|byte| *byte == 0) {
-            return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
-        }
-        let mut padded = vec![0_u8; field_len];
-        padded[field_len - value.len()..].copy_from_slice(value);
-        Ok(padded)
-    }
-    if der.first() != Some(&0x30) {
-        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
-    }
-    let mut index = 1;
-    let body_len = take_length(der, &mut index)?;
-    if der.len() != index + body_len {
-        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
-    }
-    let r = take_integer(der, &mut index, field_len)?;
-    let s = take_integer(der, &mut index, field_len)?;
-    if index != der.len() {
-        return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
-    }
-    let mut raw = Vec::with_capacity(field_len * 2);
-    raw.extend_from_slice(&r);
-    raw.extend_from_slice(&s);
-    Ok(raw)
-}
-
 fn verify_signature_bytes(
     profile: Ikev2SaInitCryptoProfile,
     key_material: &Ikev2SaInitKeyMaterial,
@@ -1017,23 +961,7 @@ fn decode_method14_signature<'a>(
         return Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid);
     }
 
-    let signature_hash = if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256 {
-        Ikev2SignatureHashAlgorithm::Sha2_256
-    } else if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384 {
-        Ikev2SignatureHashAlgorithm::Sha2_384
-    } else if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512 {
-        Ikev2SignatureHashAlgorithm::Sha2_512
-    } else if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256
-        || algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256
-    {
-        Ikev2SignatureHashAlgorithm::Sha2_256
-    } else if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384 {
-        Ikev2SignatureHashAlgorithm::Sha2_384
-    } else if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_512 {
-        Ikev2SignatureHashAlgorithm::Sha2_512
-    } else {
-        return Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported);
-    };
+    let signature_hash = signature_hash_for_identifier(algorithm_identifier)?;
     let algorithm = signature_algorithm_for_public_key_and_identifier(
         public_key,
         algorithm_identifier,
@@ -1050,6 +978,12 @@ fn signature_algorithm_for_public_key_and_hash(
         (Ikev2SignaturePublicKey::Rsa(_), Ikev2SignatureHashAlgorithm::Sha2_256) => {
             Ok(IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256)
         }
+        (Ikev2SignaturePublicKey::Rsa(_), Ikev2SignatureHashAlgorithm::Sha2_384) => {
+            Ok(IkeSignatureAlgorithm::RsaPssSha2_384)
+        }
+        (Ikev2SignaturePublicKey::Rsa(_), Ikev2SignatureHashAlgorithm::Sha2_512) => {
+            Ok(IkeSignatureAlgorithm::RsaPssSha2_512)
+        }
         (Ikev2SignaturePublicKey::EcdsaP256(_), Ikev2SignatureHashAlgorithm::Sha2_256) => {
             Ok(IkeSignatureAlgorithm::EcdsaP256Sha2_256)
         }
@@ -1062,49 +996,64 @@ fn signature_algorithm_for_public_key_and_hash(
         (Ikev2SignaturePublicKey::EcdsaP521(_), Ikev2SignatureHashAlgorithm::Sha2_512) => {
             Ok(IkeSignatureAlgorithm::EcdsaP521Sha2_512)
         }
+        (Ikev2SignaturePublicKey::Ed25519(_), Ikev2SignatureHashAlgorithm::Identity) => {
+            Ok(IkeSignatureAlgorithm::Ed25519)
+        }
+        (Ikev2SignaturePublicKey::Ed448(_), Ikev2SignatureHashAlgorithm::Identity) => {
+            Ok(IkeSignatureAlgorithm::Ed448)
+        }
         _ => Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
     }
 }
 
 fn signature_algorithm_for_public_key_and_identifier(
     public_key: &Ikev2SignaturePublicKey,
-    algorithm_identifier: &[u8],
+    identifier: &[u8],
     signature_hash: Ikev2SignatureHashAlgorithm,
 ) -> Result<IkeSignatureAlgorithm, Ikev2IkeAuthVerificationError> {
-    match public_key {
-        Ikev2SignaturePublicKey::Rsa(_)
-            if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256 =>
-        {
-            signature_algorithm_for_public_key_and_hash(public_key, signature_hash)
+    let algorithm = match public_key {
+        Ikev2SignaturePublicKey::Rsa(_) => {
+            if identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256 {
+                IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256
+            } else if pss_identifier_matches(
+                identifier,
+                &RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256,
+            ) {
+                IkeSignatureAlgorithm::RsaPssSha2_256
+            } else if pss_identifier_matches(
+                identifier,
+                &RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384,
+            ) {
+                IkeSignatureAlgorithm::RsaPssSha2_384
+            } else if pss_identifier_matches(
+                identifier,
+                &RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512,
+            ) {
+                IkeSignatureAlgorithm::RsaPssSha2_512
+            } else {
+                return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch);
+            }
         }
-        Ikev2SignaturePublicKey::Rsa(_)
-            if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256 =>
+        Ikev2SignaturePublicKey::EcdsaP256(_)
+        | Ikev2SignaturePublicKey::EcdsaP384(_)
+        | Ikev2SignaturePublicKey::EcdsaP521(_)
+            if identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256
+                || identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384
+                || identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_512 =>
         {
-            Ok(IkeSignatureAlgorithm::RsaPssSha2_256)
+            signature_algorithm_for_public_key_and_hash(public_key, signature_hash)?
         }
-        Ikev2SignaturePublicKey::Rsa(_)
-            if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384 =>
+        Ikev2SignaturePublicKey::Ed25519(_)
+            if identifier == RFC8420_ALGORITHM_IDENTIFIER_ED25519 =>
         {
-            Ok(IkeSignatureAlgorithm::RsaPssSha2_384)
+            IkeSignatureAlgorithm::Ed25519
         }
-        Ikev2SignaturePublicKey::Rsa(_)
-            if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512 =>
-        {
-            Ok(IkeSignatureAlgorithm::RsaPssSha2_512)
+        Ikev2SignaturePublicKey::Ed448(_) if identifier == RFC8420_ALGORITHM_IDENTIFIER_ED448 => {
+            IkeSignatureAlgorithm::Ed448
         }
-        Ikev2SignaturePublicKey::EcdsaP256(_) | Ikev2SignaturePublicKey::EcdsaP384(_)
-            if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256
-                || algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384 =>
-        {
-            signature_algorithm_for_public_key_and_hash(public_key, signature_hash)
-        }
-        Ikev2SignaturePublicKey::EcdsaP521(_)
-            if algorithm_identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_512 =>
-        {
-            signature_algorithm_for_public_key_and_hash(public_key, signature_hash)
-        }
-        _ => Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
-    }
+        _ => return Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch),
+    };
+    Ok(algorithm)
 }
 
 fn signature_hash_for_algorithm(
@@ -1112,14 +1061,175 @@ fn signature_hash_for_algorithm(
 ) -> Result<Ikev2SignatureHashAlgorithm, Ikev2IkeAuthVerificationError> {
     match algorithm {
         IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256
+        | IkeSignatureAlgorithm::RsaPssSha2_256
         | IkeSignatureAlgorithm::EcdsaP256Sha2_256
         | IkeSignatureAlgorithm::EcdsaP384Sha2_256 => Ok(Ikev2SignatureHashAlgorithm::Sha2_256),
-        IkeSignatureAlgorithm::EcdsaP384Sha2_384 => Ok(Ikev2SignatureHashAlgorithm::Sha2_384),
-        IkeSignatureAlgorithm::RsaPssSha2_256 => Ok(Ikev2SignatureHashAlgorithm::Sha2_256),
-        IkeSignatureAlgorithm::RsaPssSha2_384 => Ok(Ikev2SignatureHashAlgorithm::Sha2_384),
-        IkeSignatureAlgorithm::RsaPssSha2_512 => Ok(Ikev2SignatureHashAlgorithm::Sha2_512),
+        IkeSignatureAlgorithm::EcdsaP384Sha2_384 | IkeSignatureAlgorithm::RsaPssSha2_384 => {
+            Ok(Ikev2SignatureHashAlgorithm::Sha2_384)
+        }
+        IkeSignatureAlgorithm::EcdsaP521Sha2_512 | IkeSignatureAlgorithm::RsaPssSha2_512 => {
+            Ok(Ikev2SignatureHashAlgorithm::Sha2_512)
+        }
+        IkeSignatureAlgorithm::Ed25519 | IkeSignatureAlgorithm::Ed448 => {
+            Ok(Ikev2SignatureHashAlgorithm::Identity)
+        }
         _ => Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported),
     }
+}
+
+fn signature_identifier(
+    algorithm: IkeSignatureAlgorithm,
+) -> Result<&'static [u8], Ikev2IkeAuthVerificationError> {
+    match algorithm {
+        IkeSignatureAlgorithm::RsaPkcs1V15Sha2_256 => {
+            Ok(&RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256)
+        }
+        IkeSignatureAlgorithm::RsaPssSha2_256 => Ok(&RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256),
+        IkeSignatureAlgorithm::RsaPssSha2_384 => Ok(&RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384),
+        IkeSignatureAlgorithm::RsaPssSha2_512 => Ok(&RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512),
+        IkeSignatureAlgorithm::EcdsaP256Sha2_256 | IkeSignatureAlgorithm::EcdsaP384Sha2_256 => {
+            Ok(&RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256)
+        }
+        IkeSignatureAlgorithm::EcdsaP384Sha2_384 => {
+            Ok(&RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384)
+        }
+        IkeSignatureAlgorithm::EcdsaP521Sha2_512 => {
+            Ok(&RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_512)
+        }
+        IkeSignatureAlgorithm::Ed25519 => Ok(&RFC8420_ALGORITHM_IDENTIFIER_ED25519),
+        IkeSignatureAlgorithm::Ed448 => Ok(&RFC8420_ALGORITHM_IDENTIFIER_ED448),
+        _ => Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported),
+    }
+}
+
+fn signature_hash_for_identifier(
+    identifier: &[u8],
+) -> Result<Ikev2SignatureHashAlgorithm, Ikev2IkeAuthVerificationError> {
+    if identifier == RFC7427_ALGORITHM_IDENTIFIER_RSA_SHA2_256
+        || identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_256
+        || pss_identifier_matches(identifier, &RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256)
+    {
+        Ok(Ikev2SignatureHashAlgorithm::Sha2_256)
+    } else if identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_384
+        || pss_identifier_matches(identifier, &RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384)
+    {
+        Ok(Ikev2SignatureHashAlgorithm::Sha2_384)
+    } else if identifier == RFC7427_ALGORITHM_IDENTIFIER_ECDSA_SHA2_512
+        || pss_identifier_matches(identifier, &RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512)
+    {
+        Ok(Ikev2SignatureHashAlgorithm::Sha2_512)
+    } else if identifier == RFC8420_ALGORITHM_IDENTIFIER_ED25519
+        || identifier == RFC8420_ALGORITHM_IDENTIFIER_ED448
+    {
+        Ok(Ikev2SignatureHashAlgorithm::Identity)
+    } else {
+        Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported)
+    }
+}
+
+fn pss_identifier_matches(identifier: &[u8], canonical: &[u8; 67]) -> bool {
+    let Some(mut actual) = parse_pss_parameters(identifier) else {
+        return false;
+    };
+    let Some(mut expected) = parse_pss_parameters(canonical) else {
+        return false;
+    };
+    // RFC 4055 permits SHA-2 AlgorithmIdentifiers with absent or NULL
+    // parameters, including the MGF1 digest. No other parameters are allowed.
+    normalize_pss_hash_parameters(&mut actual)
+        && normalize_pss_hash_parameters(&mut expected)
+        && actual == expected
+}
+
+fn parse_pss_parameters(identifier: &[u8]) -> Option<rsa::pkcs1::RsaPssParams<'_>> {
+    let identifier = rsa::pkcs8::spki::AlgorithmIdentifierRef::from_der(identifier).ok()?;
+    if identifier.oid.as_bytes() != [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a] {
+        return None;
+    }
+    let encoded = identifier.parameters?;
+    let parameters = encoded.decode_as::<rsa::pkcs1::RsaPssParams<'_>>().ok()?;
+    let original = encoded.to_der().ok()?;
+    let canonical = parameters.to_der().ok()?;
+    // Reject duplicate, unknown, reordered, or trailing parameter fields even
+    // if an extensible ASN.1 reader can skip them. The RFC 7427 A.4.3 example
+    // also permits one explicit default trailerField after the other fields.
+    let canonical_length = canonical.len();
+    let explicit_trailer = original.len() == canonical_length + 5
+        && (2..128).contains(&canonical_length)
+        && original[0] == 0x30
+        && original[1] == canonical[1] + 5
+        && original[2..canonical_length] == canonical[2..]
+        && original[canonical_length..] == [0xa3, 3, 2, 1, 1];
+    if original != canonical && !explicit_trailer {
+        return None;
+    }
+    Some(parameters)
+}
+
+fn normalize_pss_hash_parameters(parameters: &mut rsa::pkcs1::RsaPssParams<'_>) -> bool {
+    if parameters
+        .hash
+        .parameters
+        .is_some_and(|value| !value.is_null())
+    {
+        return false;
+    }
+    let Some(mask_hash) = parameters.mask_gen.parameters.as_mut() else {
+        return false;
+    };
+    if mask_hash.parameters.is_some_and(|value| !value.is_null()) {
+        return false;
+    }
+    parameters.hash.parameters = None;
+    mask_hash.parameters = None;
+    true
+}
+
+const fn legacy_ecdsa_algorithm(method: u8) -> Option<IkeSignatureAlgorithm> {
+    match method {
+        IKEV2_AUTH_METHOD_ECDSA_SHA2_256 => Some(IkeSignatureAlgorithm::EcdsaP256Sha2_256),
+        IKEV2_AUTH_METHOD_ECDSA_SHA2_384 => Some(IkeSignatureAlgorithm::EcdsaP384Sha2_384),
+        IKEV2_AUTH_METHOD_ECDSA_SHA2_512 => Some(IkeSignatureAlgorithm::EcdsaP521Sha2_512),
+        _ => None,
+    }
+}
+
+fn ecdsa_signature_to_der(
+    algorithm: IkeSignatureAlgorithm,
+    signature: &[u8],
+) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
+    match algorithm {
+        IkeSignatureAlgorithm::EcdsaP256Sha2_256 => {
+            p256::ecdsa::Signature::from_slice(signature).map(|s| s.to_der().as_bytes().to_vec())
+        }
+        IkeSignatureAlgorithm::EcdsaP384Sha2_384 => {
+            p384::ecdsa::Signature::from_slice(signature).map(|s| s.to_der().as_bytes().to_vec())
+        }
+        IkeSignatureAlgorithm::EcdsaP521Sha2_512 => {
+            p521::ecdsa::Signature::from_slice(signature).map(|s| s.to_der().as_bytes().to_vec())
+        }
+        _ => return Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported),
+    }
+    .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
+}
+
+fn ecdsa_signature_to_fixed(
+    algorithm: IkeSignatureAlgorithm,
+    signature: &[u8],
+) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
+    match algorithm {
+        IkeSignatureAlgorithm::EcdsaP256Sha2_256 => {
+            p256::ecdsa::Signature::from_der(signature).map(|s| s.to_bytes().to_vec())
+        }
+        IkeSignatureAlgorithm::EcdsaP384Sha2_384 => {
+            p384::ecdsa::Signature::from_der(signature).map(|s| s.to_bytes().to_vec())
+        }
+        IkeSignatureAlgorithm::EcdsaP521Sha2_512 => {
+            p521::ecdsa::Signature::from_der(signature).map(|s| s.to_bytes().to_vec())
+        }
+        _ => return Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported),
+    }
+    .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
 }
 
 fn require_signing_hash_authority(
@@ -1156,9 +1266,12 @@ mod rfc4754_encoding_tests {
         let mut raw = vec![0_u8; 132];
         raw[65] = 1;
         raw[131] = 2;
-        let der = ecdsa_raw_to_der(11, &raw).unwrap();
+        let der = ecdsa_signature_to_der(legacy_ecdsa_algorithm(11).unwrap(), &raw).unwrap();
         assert_eq!(der, vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02]);
-        assert_eq!(ecdsa_der_to_raw(11, &der).unwrap(), raw);
+        assert_eq!(
+            ecdsa_signature_to_fixed(legacy_ecdsa_algorithm(11).unwrap(), &der).unwrap(),
+            raw
+        );
     }
 
     #[test]
@@ -1166,12 +1279,15 @@ mod rfc4754_encoding_tests {
         let mut raw = vec![0_u8; 64];
         raw[31] = 0x80;
         raw[63] = 0x7f;
-        let der = ecdsa_raw_to_der(9, &raw).unwrap();
+        let der = ecdsa_signature_to_der(legacy_ecdsa_algorithm(9).unwrap(), &raw).unwrap();
         assert_eq!(
             der,
             vec![0x30, 0x07, 0x02, 0x02, 0x00, 0x80, 0x02, 0x01, 0x7f]
         );
-        assert_eq!(ecdsa_der_to_raw(9, &der).unwrap(), raw);
+        assert_eq!(
+            ecdsa_signature_to_fixed(legacy_ecdsa_algorithm(9).unwrap(), &der).unwrap(),
+            raw
+        );
     }
 
     #[test]
@@ -1186,20 +1302,25 @@ mod rfc4754_encoding_tests {
         let digest = Sha512::digest(message);
         let signature: p521::ecdsa::Signature = signing_key.sign_prehash(&digest).expect("sign");
         let der = signature.to_der();
-        let raw = ecdsa_der_to_raw(11, der.as_bytes()).expect("der to raw");
+        let raw = ecdsa_signature_to_fixed(legacy_ecdsa_algorithm(11).unwrap(), der.as_bytes())
+            .expect("der to raw");
         assert_eq!(raw.len(), 132);
-        let roundtrip = ecdsa_raw_to_der(11, &raw).expect("raw to der");
+        let roundtrip =
+            ecdsa_signature_to_der(legacy_ecdsa_algorithm(11).unwrap(), &raw).expect("raw to der");
         p521::ecdsa::Signature::from_der(&roundtrip).expect("roundtripped DER parses");
     }
 
     #[test]
     fn wrong_width_and_non_minimal_der_fail_closed() {
         assert_eq!(
-            ecdsa_raw_to_der(9, &[0_u8; 63]),
+            ecdsa_signature_to_der(legacy_ecdsa_algorithm(9).unwrap(), &[0_u8; 63]),
             Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
         );
         assert_eq!(
-            ecdsa_der_to_raw(9, &[0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x01]),
+            ecdsa_signature_to_fixed(
+                legacy_ecdsa_algorithm(9).unwrap(),
+                &[0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x01]
+            ),
             Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
         );
     }
@@ -1210,11 +1331,13 @@ mod rfc4754_encoding_tests {
         let nonminimal = [0x30, 0x07, 0x02, 0x02, 0x00, 0x05, 0x02, 0x01, 0x01];
         for method in [9, 10, 11] {
             assert_eq!(
-                ecdsa_der_to_raw(method, &nonminimal),
+                ecdsa_signature_to_fixed(legacy_ecdsa_algorithm(method).unwrap(), &nonminimal),
                 Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
             );
             let minimal = [0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x01];
-            assert!(ecdsa_der_to_raw(method, &minimal).is_ok());
+            assert!(
+                ecdsa_signature_to_fixed(legacy_ecdsa_algorithm(method).unwrap(), &minimal).is_ok()
+            );
         }
     }
 }
@@ -1249,6 +1372,14 @@ fn encode_public_key_spki(
             .map(|document| document.as_bytes().to_vec())
             .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid),
         Ikev2SignaturePublicKey::EcdsaP521(public) => public
+            .to_public_key_der()
+            .map(|document| document.as_bytes().to_vec())
+            .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid),
+        Ikev2SignaturePublicKey::Ed25519(public) => public
+            .to_public_key_der()
+            .map(|document| document.as_bytes().to_vec())
+            .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid),
+        Ikev2SignaturePublicKey::Ed448(public) => public
             .to_public_key_der()
             .map(|document| document.as_bytes().to_vec())
             .map_err(|_| Ikev2IkeAuthVerificationError::SignatureEncodingInvalid),
@@ -1309,6 +1440,51 @@ pub(crate) fn rsa_pkcs1v15_sha256_verify(
         .map_err(|_| Ikev2IkeAuthVerificationError::SignatureVerificationFailed)
 }
 
+fn rsa_pss_parameters(
+    algorithm: IkeSignatureAlgorithm,
+    message: &[u8],
+) -> Result<(Pss, Vec<u8>), Ikev2IkeAuthVerificationError> {
+    match algorithm {
+        IkeSignatureAlgorithm::RsaPssSha2_256 => Ok((
+            Pss::new_with_salt::<Sha256>(32),
+            Sha256::digest(message).to_vec(),
+        )),
+        IkeSignatureAlgorithm::RsaPssSha2_384 => Ok((
+            Pss::new_with_salt::<Sha384>(48),
+            Sha384::digest(message).to_vec(),
+        )),
+        IkeSignatureAlgorithm::RsaPssSha2_512 => Ok((
+            Pss::new_with_salt::<Sha512>(64),
+            Sha512::digest(message).to_vec(),
+        )),
+        _ => Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported),
+    }
+}
+
+pub(crate) fn rsa_pss_verify(
+    public: &RsaPublicKey,
+    algorithm: IkeSignatureAlgorithm,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), Ikev2IkeAuthVerificationError> {
+    let (padding, digest) = rsa_pss_parameters(algorithm, message)?;
+    public
+        .verify(padding, &digest, signature)
+        .map_err(|_| Ikev2IkeAuthVerificationError::SignatureVerificationFailed)
+}
+
+#[cfg(feature = "rsa-signing")]
+pub(crate) fn rsa_pss_sign(
+    private: &RsaPrivateKey,
+    algorithm: IkeSignatureAlgorithm,
+    message: &[u8],
+) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
+    let (padding, digest) = rsa_pss_parameters(algorithm, message)?;
+    private
+        .sign_with_rng(&mut rsa::rand_core::OsRng, padding, &digest)
+        .map_err(|_| Ikev2IkeAuthVerificationError::SignatureComputationFailed)
+}
+
 /// Error returned while loading signature AUTH keys or certificates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ikev2SignatureKeyError {
@@ -1316,6 +1492,10 @@ pub enum Ikev2SignatureKeyError {
     RsaPrivateKeyParse,
     /// PKCS#8 DER was not a valid ECDSA private key for the requested curve.
     EcdsaPrivateKeyParse,
+    /// PKCS#8 DER was not a valid EdDSA private key of the selected kind.
+    EdDsaPrivateKeyParse,
+    /// The requested signing method, hash, or key combination is unsupported.
+    UnsupportedSignatureAlgorithm,
     /// SubjectPublicKeyInfo DER was malformed.
     SpkiParse,
     /// SubjectPublicKeyInfo DER contained bytes after the parsed value.
@@ -1328,9 +1508,11 @@ pub enum Ikev2SignatureKeyError {
     RsaPublicKeyParse,
     /// SPKI point was not a valid ECDSA public key for its named curve.
     EcdsaPublicKeyParse,
-    /// SPKI algorithm is neither rsaEncryption nor id-ecPublicKey.
+    /// SPKI was not a valid EdDSA public key of the selected kind.
+    EdDsaPublicKeyParse,
+    /// SPKI algorithm is not a supported RSA, ECDSA, or EdDSA algorithm.
     UnsupportedPublicKeyAlgorithm,
-    /// id-ecPublicKey named curve is not P-256 or P-384.
+    /// id-ecPublicKey named curve is not P-256, P-384, or P-521.
     UnsupportedEcCurve,
     /// The admitted process crypto module was absent, withdrawn, or failed.
     CryptoModuleFailure {
@@ -1345,6 +1527,9 @@ impl Ikev2SignatureKeyError {
         match self {
             Self::RsaPrivateKeyParse => "ike_auth_signature_rsa_private_key_parse",
             Self::EcdsaPrivateKeyParse => "ike_auth_signature_ecdsa_private_key_parse",
+            Self::EdDsaPrivateKeyParse => "ike_auth_signature_eddsa_private_key_parse",
+            Self::EdDsaPublicKeyParse => "ike_auth_signature_eddsa_public_key_parse",
+            Self::UnsupportedSignatureAlgorithm => "ike_auth_signature_unsupported_algorithm",
             Self::SpkiParse => "ike_auth_signature_spki_parse",
             Self::SpkiTrailingData => "ike_auth_signature_spki_trailing_data",
             Self::CertificateParse => "ike_auth_signature_certificate_parse",

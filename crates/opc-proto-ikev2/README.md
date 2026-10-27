@@ -448,32 +448,69 @@ for settled exchanges, as specified in
 may have forgotten an old response, and replies to old bytes establish no fresh
 liveness; a settled exchange is never an artificial probe.
 
-The opt-in send-side twin of `reply_empty` is the volatile empty-INFORMATIONAL
-probe. `send_empty_request` seals one fresh empty request at the volatile next
-send ID and issues no store command; `retransmit_empty_request` replays the
-exact sealed bytes with the same Message ID and IV; a matching authenticated
-empty response completes it through `complete_empty_request`; and
-`abandon_empty_request` ends the caller's retransmission budget. The caller
-owns the complete liveness decision: [RFC 7296 §2.4](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.4)
-and 3GPP TS 24.302 §7.4.1A cover IKE **and** IPsec, so the caller must establish
-that no authenticated protected traffic arrived on the IKE SA or any Child SA
-for the period; NAT keepalives
-([RFC 3948 §4](https://www.rfc-editor.org/rfc/rfc3948.html#section-4)) never
-count and the primitive never decides idleness itself. While a probe is
-outstanding it occupies the single local request slot (ordinary preparation and
-sync initiation are refused with `RequestOutstanding`), while peer requests in
-the independent receive direction remain admissible.
+### Outbound empty INFORMATIONAL probes
 
-The probe's send-ID advance is volatile: the next committed window operation
-folds it into the durable `next_send`, and a crash before that commit loses it
-as a bounded lead
-([RFC 6311 §5.1](https://www.rfc-editor.org/rfc/rfc6311.html#section-5.1)) that
-the consumer must synchronize before relying on the peer's receive expectation.
-An answered probe is caller-owned liveness evidence only; it is never durable
-work, an outcome or replay evidence. GCM sealing requires an
-`Ikev2AesGcmIvAllocation` from an already committed reservation block (a
-per-probe reservation would be a periodic liveness write); CBC uses its admitted
-random IV and needs no allocation.
+`start_empty_probe` sends a fresh empty INFORMATIONAL at the live next
+send ID. The caller decides when the peer is idle from the last authenticated
+IKE **and ESP** traffic on the IKE SA and its Child SAs. Receiving only NAT
+keepalives does not establish liveness (RFC 3948 section 4). The SDK does not
+read a network clock or schedule probes.
+
+Before enabling this path, acknowledge `prepare_liveness(max_unwritten)` as part
+of the atomic SA record. This records a bound on Message IDs that may be used
+without another window write. The bound is separate from the peer's window,
+which remains one. Starting and completing probes never publish a store
+command. Each later ordinary commit folds the live send floor into its record;
+`prepare_liveness` can also checkpoint the floor explicitly. Exhausting the
+unwritten-ID bound refuses another probe until such a commit succeeds. A
+cancelled or uncertain checkpoint cannot refund IDs or retry budget.
+
+The GCM API consumes an ordinary IV from the supplied live allocator, after
+checking admission. It does not reserve a block or consume the control reserve.
+CBC obtains one fresh IV through the admitted entropy provider. If no GCM IV is
+already available, the probe cannot initiate an IV-reservation write. The
+existing bounded reservation policy still applies to genuine state-changing
+work. The final Message ID remains available for rekey or Delete.
+
+`Ikev2LivenessProbePolicy` sets a fixed elapsed-time deadline, a maximum total
+number of transmissions, and an initial retry interval. `retry_empty_probe`
+returns the same packet bytes, including Message ID and IV, with exponentially
+increasing retry intervals. A retry-limit refusal does not extend the deadline;
+a matching response can still arrive before it. Schedule
+`check_empty_probe_deadline` even when no packet arrives. A backward clock or
+expiry latches a non-accepting state; the consumer retains that terminal
+knowledge and performs its automatic scoped SA cleanup. No operator repair or
+node action is required.
+
+Open a peer packet through `open_peer`, then
+call `complete_empty_probe` with the complete authenticated response. Only the
+current ID, response direction, INFORMATIONAL exchange and empty body complete
+the probe, once. This provides liveness evidence, never a durable outcome. A
+bad MAC, wrong ID/class or nonempty reply cannot settle the probe. During a
+probe, peer requests remain independent; local rekey or Delete preparation
+waits for the outstanding request to complete. An empty acknowledgement of a
+nonempty durable request still belongs to `prepare_completion`.
+
+The returned packet holds an exclusive borrow of the window. Submit it while
+retaining the external fenced SA/send authority. Copying the bytes does not
+copy that authority; dropping the return value cannot refund a used ID.
+
+After process loss, the last stored floor may omit answered or outstanding
+probes. A restored probe-enabled window therefore requires recovery and uses
+the stored floor plus the complete unwritten bound as its conservative next
+send lower bound. RFC 6311 synchronization must communicate that bound before
+ordinary traffic resumes. If synchronization was not negotiated, the consumer
+automatically retires this SA and establishes a fresh one. It must never guess
+that an unwritten probe was absent, resend lost probe bytes with a new IV, or
+reuse that ID for different work. A retained unsettled durable request is safe
+to replay because no probe can have been issued after its committed boundary;
+pending synchronization retains its existing persisted event and budget.
+
+Persist the liveness metadata and its retained last-probe evidence atomically
+with the window, keys, epoch and other optional fields. Consumers own a
+versioned storage encoding and must reject missing or unknown format fields,
+not interpret them as disabled support. Crossing this stored-record change
+requires a fresh install.
 
 ### Zero-write empty requests and restart reconstruction
 
@@ -873,8 +910,8 @@ This does not close #786 or establish external interoperability. See
   type as exactly one octet or the accepted non-zero group as exactly two
   big-endian octets. These failures are mutually exclusive, so the builder
   rejects a multi-Notify response rather than emitting ambiguity.
-- `protected_payload_crypto` provides caller-keyed AES-GCM-16 and
-  AES-CBC/HMAC encrypt-then-MAC `SK`/`SKF` open/seal helpers for
+- `protected_payload_crypto` provides caller-keyed AES-GCM-16, AES-CCM-8,
+  ChaCha20-Poly1305 and AES-CBC/HMAC encrypt-then-MAC `SK`/`SKF` open/seal helpers for
   already-derived SA_INIT key material. Production CBC sealing obtains a fresh
   16-octet IV from the admitted module's `ApprovedEntropy` operation; callers
   cache the complete already-sealed response for retransmission.
@@ -954,6 +991,23 @@ This does not close #786 or establish external interoperability. See
   expose RFC-specific mechanism helpers without owning product state.
 
 ## RFC 7427 signature-hash negotiation
+
+Signature AUTH supports RFC 4754 methods 9/10/11 with P-256/SHA-256,
+P-384/SHA-384, and P-521/SHA-512. Those methods encode fixed-width `r || s`
+(64/96/132 octets) and need no RFC 7427 authority. Use
+`Ikev2SignatureAuthKey::ecdsa_rfc4754_pkcs8_der` to select one explicitly.
+
+Method 14 additionally supports P-521/SHA-512, RSA-PSS with SHA-256/384/512,
+and pure Ed25519/Ed448. RSA-PSS requires the matching MGF1 hash, a salt equal
+to the hash output length, and trailer field 1. EdDSA signs the full RFC 7296
+signed-octets transcript and requires negotiated RFC 8420 `Identity` authority in the applicable direction;
+its AlgorithmIdentifier parameters must be absent. SHA-512 and Identity offers
+are admitted only when the selected module supports the corresponding operation.
+RSA signing remains behind `rsa-signing`; verification is always available.
+For RSA-PSS local self-verification, use
+`authorize_local_auth_self_verification_with_signing_key` to bind the exact
+scheme as well as the hash. The original hash-only SHA-256/RSA helper selects
+PKCS#1 v1.5.
 
 `Ikev2SignatureHashLocalOffer` encodes a canonical type-16431 Notify and
 preflights every advertised hash against the installed process crypto module's
@@ -1240,8 +1294,9 @@ operation executes, including reuse of already-created opaque DH or signing
 handles. Successful hash, PRF/PRF+, integrity, AEAD/CBC, and DH results are
 checked immediately against their algorithm-derived widths. AEAD output must
 retain the requested explicit IV; ECDSA output must be valid DER with scalars
-in range for the selected curve; and RSA output must match the opaque handle's
-public modulus width. DH public values are semantically validated and
+in range for the selected curve; EdDSA output must have valid point/scalar
+encodings and the exact 64/114-octet width; and RSA output must match the opaque
+handle's public modulus width. DH public values are semantically validated and
 snapshotted, and opaque DH/signing handles are rechecked when used. A module
 contract violation fails with
 `ike_crypto_module_invalid_output` before malformed bytes reach protocol
@@ -1379,11 +1434,20 @@ The executable IKE-SA matrix is:
 
 | Mechanism | Transform IDs and sizes | Key/material contract |
 | --- | --- | --- |
-| PRF | HMAC-SHA1 (2, compatibility), HMAC-SHA2-256 (5), HMAC-SHA2-384 (6), HMAC-SHA2-512 (7) | 20, 32, 48, or 64 octets for each of `SK_d`, `SK_pi`, and `SK_pr` |
-| DH | MODP-768 (1, compatibility), MODP-1024 (2, compatibility), MODP-2048 (14), ECP-256 (19), ECP-384 (20), ECP-521 (21) | Exact public/shared widths: MODP 96/96, 128/128, 256/256; ECP public 64/96/132 and shared 32/48/66 octets |
+| PRF | HMAC-SHA1 (2, compatibility), AES128-XCBC (4), HMAC-SHA2-256 (5), HMAC-SHA2-384 (6), HMAC-SHA2-512 (7) | 20, 16, 32, 48, or 64 octets for each of `SK_d`, `SK_pi`, and `SK_pr`, respectively |
+| DH | MODP-768 (1, compatibility), MODP-1024 (2, compatibility), MODP-2048/3072/4096/6144/8192 (14–18), ECP-256 (19), ECP-384 (20), ECP-521 (21) | Exact public/shared widths: MODP 96/128/256/384/512/768/1024 octets; ECP public 64/96/132 and shared 32/48/66 octets |
 | AES-GCM-16 | ENCR 20 with 128, 192, or 256-bit key; no INTEG | AES key plus four-octet salt; eight-octet explicit IV and 16-octet tag on the wire |
+| AES-CCM-8 | ENCR 14 with 128, 192, or 256-bit key; no INTEG | AES key plus three-octet salt; eight-octet explicit IV and eight-octet tag on the wire |
+| ChaCha20-Poly1305 | ENCR 28 with no Key Length attribute; no INTEG | 32-octet key plus four-octet salt; eight-octet explicit IV and 16-octet tag on the wire |
 | AES-CBC | ENCR 12 with 128, 192, or 256-bit key | Raw 16, 24, or 32-octet `SK_e*`; fresh 16-octet IV per newly sealed message |
 | Integrity | AUTH-HMAC-SHA1-96 (2, compatibility) or AUTH-HMAC-SHA2-256-128 (12), 384-192 (13), or 512-256 (14) | 20/32/48/64-octet `SK_a*`; 12/16/24/32-octet ICV |
+
+PRF-AES128-XCBC uses the first eight octets of each nonce for the initial
+SKEYSEED key, as specified by RFC 4434; PRF+ retains the complete nonces.
+`ikev2_aead_protected_body_len` and `ikev2_aead_protected_payload_len` account
+for each AEAD tag length. The AES-GCM-specific length helpers retain their
+AES-GCM contract. Canonical recovery profiles retain their explicitly qualified
+algorithm set; ordinary transform support does not expand that set.
 
 Every CBC key size may be paired with each supported integrity
 algorithm. `validate_executable()` is the explicit startup check, although all
@@ -2098,3 +2162,15 @@ cargo run -p opc-proto-ikev2 --example dedicated_bearer_qos_mapping
 (cd crates/opc-proto-ikev2 && cargo +nightly fuzz list)
 (cd crates/opc-proto-ikev2 && cargo +nightly fuzz run dedicated_bearer -- -runs=1000)
 ```
+
+### Additional crypto dependencies
+
+The concrete software provider uses `ccm` for RFC 5282 AES-CCM-8 and
+`chacha20poly1305` for RFC 7634, matching the existing RustCrypto cipher APIs.
+`ed25519-dalek` and `ed448-goldilocks-plus` supply the pure RFC 8420 signature
+algorithms, key decoding and verification; reimplementing these primitives in
+the protocol crate would duplicate security-sensitive cryptography. They are
+required for the advertised verification surface. RSA signing remains optional.
+The root, fuzz and standalone consumer lockfiles pin the same dependency set.
+The additional suites do not expand the frozen canonical-reply qualification
+set or the GCM/CBC committed recovery profiles.

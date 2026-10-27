@@ -112,7 +112,8 @@ impl RecoveryProfile for Gcm {
                 .iter()
                 .map(|attempt| attempt.request_bytes())
         });
-        for wire in ordinary.chain(attempts) {
+        let probe = source.send.latest_probe.iter().map(bytes::Bytes::as_ref);
+        for wire in ordinary.chain(attempts).chain(probe) {
             sync.packet_evidence.minimum_send_iv_end = sync
                 .packet_evidence
                 .minimum_send_iv_end

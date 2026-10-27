@@ -1,5 +1,6 @@
 //! Regression vectors for initial XCBC derivation and signature/AEAD admission.
 use opc_proto_ikev2::*;
+#[cfg(feature = "rsa-signing")]
 use opc_protocol::DecodeContext;
 mod support;
 
@@ -81,10 +82,11 @@ fn rsa_constructor_refuses_each_ecdsa_auth_method() {
         Ikev2SignatureAuthMethod::EcdsaSha2_384,
         Ikev2SignatureAuthMethod::EcdsaSha2_512,
     ] {
-        assert!(
-            Ikev2SignatureAuthKey::rsa_pkcs8_der(method, include_bytes!("data/rsa2048_pkcs8.der"))
-                .is_err()
-        );
+        assert!(Ikev2SignatureAuthKey::rsa_pkcs8_der(
+            method,
+            include_bytes!("data/rsa2048_pkcs8.der")
+        )
+        .is_err());
     }
 }
 
@@ -141,7 +143,9 @@ fn local_pss(
     .unwrap();
     let authorization = authorities
         .signing()
-        .authorize_local_auth_self_verification(&request, &response, octets, hash, &public)
+        .authorize_local_auth_self_verification_with_signing_key(
+            &request, &response, octets, &key, &public,
+        )
         .unwrap();
     verify_local_ike_auth_signature(
         profile,
