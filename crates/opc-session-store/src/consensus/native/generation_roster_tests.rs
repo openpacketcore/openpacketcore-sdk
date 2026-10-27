@@ -1624,6 +1624,128 @@ fn capacity_history_complete(
     timings.record("entry_assertions", assertions.elapsed());
 }
 
+struct CapacityHistoryBatch {
+    files: Files,
+    relocations: crate::consensus::native::generation::Relocations,
+    completed: u64,
+    prepare_elapsed: std::time::Duration,
+    append_elapsed: std::time::Duration,
+}
+
+struct CapacityHistoryPersistence {
+    files: Option<Files>,
+    pending: Option<std::thread::JoinHandle<CapacityHistoryBatch>>,
+}
+
+impl CapacityHistoryPersistence {
+    fn new(files: Files) -> Self {
+        Self {
+            files: Some(files),
+            pending: None,
+        }
+    }
+
+    fn join(&mut self, storage: &mut NativeStorage, timings: &mut CapacityHistoryTimings) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let mut batch = pending.join().unwrap();
+        timings.record("batch_prepare", batch.prepare_elapsed);
+        timings.record("batch_append", batch.append_elapsed);
+        let version = Version::capture(storage).unwrap();
+        let witness = storage.business.roster.witness;
+        let rows = storage.business.roster.rows.len();
+        timings.measure("batch_relocate", || {
+            while !batch.relocations.is_empty() {
+                drop(batch.relocations.publish_step(storage).unwrap());
+            }
+        });
+        version.require_current(storage).unwrap();
+        assert!(storage.business.roster.witness == witness);
+        assert_eq!(storage.business.roster.rows.len(), rows);
+        assert_eq!(
+            storage
+                .business
+                .roster
+                .rows
+                .values()
+                .filter(|row| row.is_cold())
+                .count(),
+            batch.completed as usize,
+            "every completed capture is cold while only the next batch may remain hot",
+        );
+        eprintln!(
+            "roster history footprint: completed={}, spool_bytes={}",
+            batch.completed,
+            std::fs::metadata(&batch.files.path).unwrap().len(),
+        );
+        self.files = Some(batch.files);
+    }
+
+    fn submit(
+        &mut self,
+        storage: &mut NativeStorage,
+        completed: u64,
+        timings: &mut CapacityHistoryTimings,
+    ) {
+        self.join(storage, timings);
+        let mut files = self.files.take().unwrap();
+        let capture = storage.take_changes().unwrap();
+        // At most one immutable 1,024-row capture and the next working batch
+        // coexist. The existing verifier budget and every append/readback check
+        // remain active; serial Q1/Q2 can proceed while that capture is written.
+        self.pending = Some(std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let checkpoint = files.owner.current().identity().checkpoint_epoch + 1;
+            let prepared = PreparedDelta::prepare(
+                files.owner.current(),
+                &files.version,
+                checkpoint,
+                18 + 2 * completed,
+                [checkpoint as u8; 32],
+                capture,
+                &|| Ok(()),
+            )
+            .unwrap();
+            let prepare_elapsed = started.elapsed();
+            let started = std::time::Instant::now();
+            let (_, relocations) = prepared
+                .append_with_relocations(&mut files.owner, &|| Ok(()))
+                .unwrap();
+            let append_elapsed = started.elapsed();
+            files.version = prepared.target_version();
+            files.cut = prepared.header.cut_binding;
+            drop(prepared);
+            CapacityHistoryBatch {
+                files,
+                relocations,
+                completed,
+                prepare_elapsed,
+                append_elapsed,
+            }
+        }));
+    }
+
+    fn finish(
+        mut self,
+        storage: &mut NativeStorage,
+        timings: &mut CapacityHistoryTimings,
+    ) -> Files {
+        self.join(storage, timings);
+        self.files.take().unwrap()
+    }
+}
+
+impl Drop for CapacityHistoryPersistence {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            // Retain the writer on assertion failure too, before temp extents
+            // or the test runtime can disappear.
+            let _ = pending.join();
+        }
+    }
+}
+
 fn capacity_history_progress_and_reopen(completed: u64) {
     let started = std::time::Instant::now();
     let mut timings = CapacityHistoryTimings::default();
@@ -1634,43 +1756,32 @@ fn capacity_history_progress_and_reopen(completed: u64) {
     // would test exhaustion of the unchanged 128 MiB verifier, not the roster
     // admission contract. Relocation preserves every logical row and revision.
     let maximum = crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES;
-    let (mut files, catalog) = timings.measure("setup_persistence", || {
+    let (files, catalog) = timings.measure("setup_persistence", || {
         Files::with_maximum(&storage, maximum)
     });
     drop(catalog);
+    let mut persistence = CapacityHistoryPersistence::new(files);
     storage.begin_changes().unwrap();
     for ordinal in 1..=completed {
         capacity_history_complete(&mut storage, ordinal, &mut timings);
         if ordinal == 1 || ordinal % 1024 == 0 || ordinal == completed {
-            let witness = storage.business.roster.witness;
-            let version = Version::capture(&storage).unwrap();
-            let prepared = timings.measure("batch_prepare", || {
-                files.prepare(&mut storage, 18 + 2 * ordinal)
+            // These are temporary carrier extents, never a selected recovery
+            // catalog. The fixture supplies the exact applied snapshot basis
+            // to the ordinary log purge; the final complete base below is the
+            // independently admitted cold image. All roster rows remain young.
+            timings.measure("batch_purge_log", || {
+                let through = storage.business.applied().unwrap();
+                storage
+                    .business
+                    .publish_snapshot_metadata(snapshot(&storage, through.index, "history"))
+                    .unwrap();
+                storage
+                    .log
+                    .project(&Operation::Purge(through), &storage.business, Some(through))
+                    .unwrap();
+                assert!(storage.log.entries.is_empty());
             });
-            let (_, mut relocations) = timings
-                .measure("batch_append", || {
-                    prepared.append_with_relocations(&mut files.owner, &|| Ok(()))
-                })
-                .unwrap();
-            files.version = prepared.target_version();
-            files.cut = prepared.header.cut_binding;
-            drop(prepared);
-            timings.measure("batch_relocate", || {
-                while !relocations.is_empty() {
-                    drop(relocations.publish_step(&mut storage).unwrap());
-                }
-            });
-            let assertions = std::time::Instant::now();
-            version.require_current(&storage).unwrap();
-            assert!(storage.business.roster.witness == witness);
-            assert_eq!(storage.business.roster.rows.len(), ordinal as usize);
-            assert!(storage
-                .business
-                .roster
-                .rows
-                .values()
-                .all(|row| row.is_cold()));
-            timings.record("batch_assertions", assertions.elapsed());
+            persistence.submit(&mut storage, ordinal, &mut timings);
         }
         if ordinal % 4096 == 0 {
             eprintln!(
@@ -1680,9 +1791,8 @@ fn capacity_history_progress_and_reopen(completed: u64) {
             timings.report(ordinal);
         }
     }
-    timings
-        .measure("final_validate_populated", || storage.validate_image())
-        .unwrap();
+    let files = persistence.finish(&mut storage, &mut timings);
+    let spool_bytes = std::fs::metadata(&files.path).unwrap().len();
     let before = timings.measure("final_context_before", || {
         Version::capture(&storage)
             .unwrap()
@@ -1698,35 +1808,49 @@ fn capacity_history_progress_and_reopen(completed: u64) {
         .create_new(true)
         .open(&path)
         .unwrap();
-    // This is the production physical snapshot bound, not a test count quota.
-    let prepared = timings
-        .measure("final_prepare_base", || {
-            PreparedBase::prepare(
-                &storage,
-                crate::consensus::native::generation::BaseParameters {
-                    binding: ROOT,
-                    file_epoch: 4,
-                    checkpoint_epoch: 11,
-                    operation_sequence: 18,
-                    cut_binding: CUT,
-                    block_bytes: BLOCK,
-                    maximum,
-                },
-                &|| Ok(()),
-            )
-        })
-        .unwrap();
-    let identity = timings
-        .measure("final_write_base", || {
-            prepared.write_to(&mut file, &|| Ok(()))
-        })
-        .unwrap();
+    let identity = std::thread::scope(|scope| {
+        let validation = scope.spawn(|| {
+            let started = std::time::Instant::now();
+            let result = storage.validate_image();
+            (result, started.elapsed())
+        });
+        // This is the production physical snapshot bound, not a test count quota.
+        let prepared = timings
+            .measure("final_prepare_base", || {
+                PreparedBase::prepare(
+                    &storage,
+                    crate::consensus::native::generation::BaseParameters {
+                        binding: ROOT,
+                        file_epoch: 4,
+                        checkpoint_epoch: 11,
+                        operation_sequence: 18,
+                        cut_binding: CUT,
+                        block_bytes: BLOCK,
+                        maximum,
+                    },
+                    &|| Ok(()),
+                )
+            })
+            .unwrap();
+        let identity = timings
+            .measure("final_write_base", || {
+                prepared.write_to(&mut file, &|| Ok(()))
+            })
+            .unwrap();
+        drop(prepared);
+        let (result, elapsed) = validation.join().unwrap();
+        timings.record("final_validate_populated", elapsed);
+        result.unwrap();
+        identity
+    });
     timings
         .measure("final_sync_base", || file.sync_all())
         .unwrap();
+    let base_bytes = file.metadata().unwrap().len();
+    let peak_bytes = spool_bytes.checked_add(base_bytes).unwrap();
+    eprintln!("roster history peak footprint: completed={completed}, spool_bytes={spool_bytes}, base_bytes={base_bytes}, peak_bytes={peak_bytes}");
     let dropping = std::time::Instant::now();
     drop(file);
-    drop(prepared);
     let members = storage.business.members.clone();
     drop(storage);
     drop(files);
@@ -1752,7 +1876,7 @@ fn capacity_history_progress_and_reopen(completed: u64) {
             )
         })
         .unwrap();
-    let mut restored = timings
+    let restored = timings
         .measure("final_into_storage", || catalog.into_storage(&|| Ok(())))
         .unwrap();
     let assertions = std::time::Instant::now();
@@ -1775,18 +1899,29 @@ fn capacity_history_progress_and_reopen(completed: u64) {
         .values()
         .all(|row| row.is_cold()));
     timings.record("final_reopen_assertions", assertions.elapsed());
-    timings
-        .measure("final_validate_reopened", || restored.validate_image())
-        .unwrap();
-    // Reopen is followed by another authenticated admission and completion,
-    // still without advancing the clock, retiring a row, or changing a lease.
-    capacity_history_complete(&mut restored, completed + 1, &mut timings);
-    timings
-        .measure("final_validate_continued", || restored.validate_image())
-        .unwrap();
+    // Persistent roots share immutable cold carriers. Validate the reopened
+    // image and the next completed roster independently and concurrently;
+    // both complete validators must pass before this proof can finish.
+    let mut continued = restored.clone();
+    std::thread::scope(|scope| {
+        let validation = scope.spawn(|| {
+            let started = std::time::Instant::now();
+            let result = restored.validate_image();
+            (result, started.elapsed())
+        });
+        // Reopen is followed by another authenticated admission and completion,
+        // still without advancing the clock, retiring a row, or changing a lease.
+        capacity_history_complete(&mut continued, completed + 1, &mut timings);
+        timings
+            .measure("final_validate_continued", || continued.validate_image())
+            .unwrap();
+        let (result, elapsed) = validation.join().unwrap();
+        timings.record("final_validate_reopened", elapsed);
+        result.unwrap();
+    });
     timings.report(completed + 1);
     eprintln!(
-        "roster completed history and cold reopen: {completed}, elapsed={:?}",
+        "roster completed history and cold reopen: {completed}, peak_bytes={peak_bytes}, elapsed={:?}",
         started.elapsed()
     );
 }

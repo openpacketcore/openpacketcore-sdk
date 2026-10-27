@@ -100,7 +100,8 @@ QUIESCENT_VOID_LIB_TESTS = (
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
     "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap",
 )
-# These three-minute arrival-rate proofs measure signed production work. Keep
+# These 180-tick arrival-rate proofs measure signed production work with
+# controlled logical arrivals, independent of host pacing. Keep
 # their literal load and backlog bounds in the checked O1 timing profile.
 # The completion-congestion proofs also retain their literal operation budgets
 # while draining a deliberately held wave of signed requests.

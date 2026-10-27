@@ -56,7 +56,24 @@ An owned local-leader lane observes the existing ordered reclaim and terminal
 indexes and proposes `AdvanceLogicalTime` only when a bounded turn is eligible.
 It refreshes unknown occupancy, wakes on leadership changes, and joins before
 shutdown handoff. A successful turn keeps its base cadence even if concurrent
-terminal completions mask progress in the occupancy gauges.
+terminal completions mask progress in the occupancy gauges. Proposal service time
+counts toward the one-second tick; a slow turn coalesces missed ticks rather than
+adding another full idle interval or replaying a burst of missed turns. Failed
+observations retain the existing bounded retry delay. Shutdown starts its automatic
+handoff deadline before joining maintenance, so that join cannot restart the budget
+reserved for handoff and consume the final engine/storage drain interval.
+The signed arrival-rate regression drives 180 logical one-second ticks, with ten
+independently signed completions becoming due per tick. Its scheduler supplies
+exactly one turn to each real store lane and waits for that turn's bounded phases
+before advancing the arrival clock. This removes host pacing from the backlog
+assertion without retrying extra turns until a count passes. Each tick must reclaim
+all ten due rows and retire their distinct epochs in at most two commands; the
+original 40-row backlog bound remains. A separate paused-time regression proves
+the one-second cadence including service time, and a held-service regression proves
+that elapsed host time cannot inject another logical arrival. Consensus, backend
+I/O, authentication and operation deadlines remain real. This is a deterministic
+cadence and progress proof, not a wall-clock throughput benchmark.
+
 Earlier reclamation is a separate semantic choice: a terminal commit alone
 does not prove that every external recovery obligation is settled. Do not
 invent a settlement acknowledgement or erase unresolved evidence to make a
@@ -152,19 +169,25 @@ The [store cap inventory](store-cumulative-cap-inventory.md) records related
 limits separately so this change does not silently expand into other protocols.
 
 The sustained-history regression uses 131,073 independently signed, one-member
-V2 admissions and terminal records at a fixed logical time. It writes a native
-generation in bounded batches using the production verified-append and cold
-relocation path, then writes a complete base, drops the resident state and old
-generation, reopens every authenticated carrier and admits one additional
-roster. This keeps the existing verifier-memory budget while preserving every
-retained row. The test neither advances retention nor deletes history.
-Its optimized, isolated CI profile keeps the full boundary affordable; the
-ordinary smoke test exercises the same path with three records.
+V2 admissions and terminal records at a fixed logical time. It retains every roster
+carrier. The fixture purges duplicate Raft command payloads after supplying their
+exact applied snapshot frontier, while a single owned writer persists temporary
+carrier extents with production verified append, readback and relocation. At most
+one 1,024-row capture overlaps the next working batch. These temporary extents are
+not selected recovery catalogs: a complete final base remains the cold-reopen
+boundary. The populated image is fully validated, all process-local owners and
+old extents are dropped, every carrier is reopened and validated, and one additional
+roster is admitted, completed and fully validated. Independent immutable validation
+passes run concurrently; none is omitted. The proof reports both temporary and
+final file bytes at their simultaneous peak. It never advances retention, deletes
+a roster row, expands the verifier budget or changes the literal history boundary.
+The ordinary three-row smoke test follows the same path.
 
 Profile digest computation depends only on compiled protocol descriptors and
 domain constants. Memoize each public V1/V2 digest once per process, preserving
 every input, the frozen known-answer digests and all per-carrier validation.
 Parameterized digest helpers remain uncached so descriptor-mutation checks
 still exercise each input. The history proof uses test O3 with debug assertions
-and overflow checks enabled, and reports stage timings without changing the
-fixed history count, logical time, persistence operations or assertions.
+and overflow checks enabled, and reports stage timings. Frame encoding retains one
+fully authenticated hydration while counting and writing that frame; readback and
+cold admission still perform their complete independent validation.

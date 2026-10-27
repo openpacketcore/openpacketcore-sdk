@@ -11050,6 +11050,20 @@ fn ensure_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
 fn activate_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
     let identity = read_storage_identity_sync(conn)
         .map_err(|_| invalid_data("protected roster storage identity is invalid"))?;
+    // V2 provisions the shared witness even before V1 is admitted. Its
+    // presence makes the common namespace operational, but cannot authorize
+    // this V1 activation fast path or bypass the higher-format downgrade fence.
+    if persisted_schema_version_in_sync(conn, false)? == PROTECTED_ROSTER_V2_DATABASE_FORMAT {
+        let scope = read_membership_scope_sync(conn, identity)?;
+        if !protected_roster_profile_activation_matches_scope_sync(
+            conn,
+            identity,
+            scope.current_identity,
+            &scope.current_members,
+        )? {
+            return Err(invalid_data("protected roster V1 activation is missing"));
+        }
+    }
     match protected_roster_layout_in_sync(conn, false)? {
         ProtectedRosterLayout::Activated => {
             initialize_protected_roster_witness_sync(conn, identity, false)
@@ -54953,6 +54967,42 @@ mod tests {
             )
             .expect("independent V1 activation certificate"),
             "activating V2 must not mint the V1 certificate",
+        );
+    }
+
+    #[test]
+    fn protected_roster_shared_witness_does_not_authorize_v1_activation() {
+        let backend = SqliteSessionBackend::in_memory().unwrap();
+        let conn = backend.conn.blocking_lock();
+        let identity = identity();
+        let members = expected_members();
+        initialize_schema(&conn, identity, &members).unwrap();
+        activate_protected_roster_profile_v2_scope_sync(
+            &conn,
+            identity,
+            identity,
+            &members,
+            crate::fenced_mutation_roster::Profile::v2().digest(),
+        )
+        .unwrap();
+        assert!(protected_roster_read_witness_sync(&conn, identity)
+            .unwrap()
+            .is_some());
+        assert!(activate_protected_roster_schema_sync(&conn).is_err());
+        // A separately admitted V1 certificate still permits mixed-profile
+        // traffic, without changing the higher durable format.
+        activate_fenced_transition_scope_with_voter_digest_sync(
+            &conn,
+            identity,
+            identity,
+            &members,
+            protected_roster_profile_voter_set_digest(identity, &members),
+        )
+        .unwrap();
+        activate_protected_roster_schema_sync(&conn).unwrap();
+        assert_eq!(
+            persisted_schema_version_in_sync(&conn, false).unwrap(),
+            PROTECTED_ROSTER_V2_DATABASE_FORMAT,
         );
     }
 

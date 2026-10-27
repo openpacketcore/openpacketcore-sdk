@@ -260,6 +260,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `opc-session-store`: preserve V1 roster activation refusal when V2 has only
+  provisioned the shared witness, while keeping separately authorized mixed
+  profiles operational. Count successful maintenance service toward its existing
+  one-second cadence and keep the automatic shutdown handoff within its original
+  budget after joining maintenance. Drive signed arrival proofs with explicit
+  logical ticks and preserve their workload and bounds on slow runners. Reduce
+  duplicate history-proof persistence
+  and frame authentication work while retaining the full 131,073-row cold reopen,
+  all validators, and existing capacity, retention and deadline bounds. Refs #1307.
+
 - `opc-session-store` and `opc-persist`: retain the `Unplanned` shutdown reason
   when an unplanned request races admission fencing or preparation completion.
   Already published reports remain unchanged. (#1376)

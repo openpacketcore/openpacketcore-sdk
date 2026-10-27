@@ -81,10 +81,12 @@ trait RosterMaintenanceLane: Sync {
 
 async fn run_roster_maintenance_lane<L: RosterMaintenanceLane>(lane: L) {
     let mut backoff = RosterMaintenanceBackoff::default();
+    let mut delay = backoff.delay();
     loop {
-        if !lane.wait(backoff.delay()).await {
+        if !lane.wait(delay).await {
             return;
         }
+        let started = tokio::time::Instant::now();
         // Recheck once after reclaim or retirement leaves work in the other
         // phase. Each proposal keeps the unchanged backend batch bound, and
         // even flat gauges can produce at most two turns per tick.
@@ -125,6 +127,15 @@ async fn run_roster_maintenance_lane<L: RosterMaintenanceLane>(lane: L) {
                 break;
             }
         }
+        // Successful service belongs to this tick. Adding a complete sleep
+        // after both phases makes the cadence depend on their I/O latency.
+        // Coalesce an overrun into one next turn; never replay missed ticks.
+        // Failed observations retain the full bounded retry delay.
+        delay = if applied_this_tick {
+            backoff.delay().saturating_sub(started.elapsed())
+        } else {
+            backoff.delay()
+        };
     }
 }
 
@@ -274,6 +285,16 @@ pub(super) struct RosterMaintenanceTask {
 }
 
 impl RosterMaintenanceTask {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) async fn delay_join_for_test(&self, delay: Duration) {
+        let mut worker = self.worker.lock().await;
+        let prior = worker.take().expect("maintenance worker");
+        *worker = Some(tokio::spawn(async move {
+            prior.await.expect("maintenance task joins");
+            tokio::time::sleep(delay).await;
+        }));
+    }
+
     pub(super) async fn shutdown(&self) {
         self.stop.send_replace(true);
         let mut worker = self.worker.lock().await;
@@ -301,6 +322,123 @@ impl RosterMaintenanceTask {
             task.abort();
             let _ = task.await;
         }
+    }
+}
+
+// The signed rate proof uses explicit tick boundaries so physical I/O cannot
+// advance its logical arrival clock. Only scheduling is controlled: the same
+// lane loop, occupancy reads and real proposals run once per supplied tick.
+#[cfg(all(test, target_os = "linux"))]
+struct ScheduledRosterMaintenanceLane<L> {
+    lane: L,
+    stop: tokio::sync::watch::Receiver<bool>,
+    state: tokio::sync::Mutex<ScheduledRosterMaintenanceState>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct ScheduledRosterMaintenanceState {
+    requests: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
+    completed: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct RosterMaintenanceTickDriver {
+    requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl RosterMaintenanceTickDriver {
+    pub(super) async fn tick(&self) {
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        self.requests
+            .send(completed)
+            .await
+            .expect("maintenance lane owns its tick");
+        completion
+            .await
+            .expect("maintenance completes exactly one scheduled tick");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn scheduled_roster_maintenance_lane<L>(
+    lane: L,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> (
+    ScheduledRosterMaintenanceLane<L>,
+    RosterMaintenanceTickDriver,
+) {
+    let (requests, receiver) = tokio::sync::mpsc::channel(1);
+    (
+        ScheduledRosterMaintenanceLane {
+            lane,
+            stop,
+            state: tokio::sync::Mutex::new(ScheduledRosterMaintenanceState {
+                requests: receiver,
+                completed: None,
+            }),
+        },
+        RosterMaintenanceTickDriver { requests },
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[async_trait::async_trait]
+impl<L: RosterMaintenanceLane> RosterMaintenanceLane for ScheduledRosterMaintenanceLane<L> {
+    fn occupancy(&self) -> Option<ProtectedRosterConsensusDiagnosticSnapshot> {
+        self.lane.occupancy()
+    }
+
+    async fn propose(&self) -> Option<RosterMaintenanceOutcome> {
+        self.lane.propose().await
+    }
+
+    async fn wait(&self, _delay: Duration) -> bool {
+        let mut state = self.state.lock().await;
+        // Acknowledge only after the common loop has finished both bounded
+        // phases. The driver never pumps extra turns until a count passes.
+        if let Some(completed) = state.completed.take() {
+            let _ = completed.send(());
+        }
+        let mut stop = self.stop.clone();
+        if *stop.borrow() {
+            return false;
+        }
+        let request = tokio::select! {
+            biased;
+            _ = stop.changed() => None,
+            request = state.requests.recv() => request,
+        };
+        let Some(completed) = request else {
+            return false;
+        };
+        state.completed = Some(completed);
+        true
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl ConsensusSessionStore {
+    pub(super) async fn schedule_roster_maintenance_ticks_for_test(
+        &self,
+    ) -> RosterMaintenanceTickDriver {
+        let task = self
+            .inner
+            .roster_maintenance
+            .get()
+            .expect("owned maintenance lane");
+        // Join the old lane before replacing only its scheduler. Shutdown still
+        // owns and joins the replacement through the same task and stop signal.
+        task.shutdown().await;
+        task.stop.send_replace(false);
+        let lane = ConsensusStoreRosterMaintenanceLane {
+            inner: Arc::downgrade(&self.inner),
+            stop: task.stop.subscribe(),
+            leadership: std::sync::Mutex::new(None),
+        };
+        let (lane, driver) = scheduled_roster_maintenance_lane(lane, task.stop.subscribe());
+        *task.worker.lock().await = Some(tokio::spawn(run_roster_maintenance_lane(lane)));
+        driver
     }
 }
 
@@ -588,6 +726,96 @@ mod tests {
             .await
             .expect("dropped owner stops the lane")
             .expect("lane joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_turn_service_time_counts_toward_the_tick() {
+        let observation = MockObservation::new(1, 1, Some(Duration::from_millis(400)), false);
+        observation
+            .applies_without_count_reduction
+            .store(true, Ordering::Relaxed);
+        let (alive, task) = spawn_mock(Arc::clone(&observation));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..80 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let attempts = proposals(&observation);
+        alive.store(false, Ordering::Relaxed);
+        tokio::time::advance(ROSTER_MAINTENANCE_MAX_BACKOFF).await;
+        task.await.unwrap();
+        // At t=1..7 both 400ms phases fit in the tick. At t=8 the next
+        // reclaim starts. Service time must not add a second idle interval.
+        assert_eq!(attempts, 15, "seven complete pairs and one in-flight turn");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_ticks_wait_for_slow_service_and_do_not_invent_arrivals() {
+        let observation = MockObservation::new(1, 1, Some(Duration::from_secs(6)), false);
+        observation
+            .applies_without_count_reduction
+            .store(true, Ordering::Relaxed);
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let (lane, driver) = scheduled_roster_maintenance_lane(
+            MockLane {
+                observation: Arc::clone(&observation),
+                alive,
+            },
+            stopped,
+        );
+        let worker = tokio::spawn(run_roster_maintenance_lane(lane));
+        let tick = tokio::spawn(async move {
+            driver.tick().await;
+            driver
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(proposals(&observation), 1);
+        assert!(
+            !tick.is_finished(),
+            "a wall-clock delay cannot finish the logical tick"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(proposals(&observation), 2);
+        assert!(
+            !tick.is_finished(),
+            "the second bounded phase is still in flight"
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tick.is_finished(),
+            "both phases complete the one supplied tick"
+        );
+        let driver = tick.await.unwrap();
+        tokio::time::advance(Duration::from_secs(600)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            proposals(&observation),
+            2,
+            "no unsupplied tick or logical arrival"
+        );
+        stop.send_replace(true);
+        worker.await.unwrap();
+        drop(driver);
     }
 
     struct SteadyRosterLane {

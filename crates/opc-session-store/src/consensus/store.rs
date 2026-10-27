@@ -2234,8 +2234,11 @@ impl ConsensusShutdownCoordinator {
         }
         let (sender, receiver) = tokio::sync::watch::channel(ConsensusShutdownCompletion::Running);
         *completion = Some(receiver.clone());
+        let handoff_deadline = tokio::time::Instant::now()
+            + opc_consensus::planned_shutdown_timeout(inner.operation_timeout);
         tokio::spawn(async move {
-            let result = shutdown_consensus_session_store(inner, allow_closed_proof).await;
+            let result =
+                shutdown_consensus_session_store(inner, allow_closed_proof, handoff_deadline).await;
             sender.send_replace(ConsensusShutdownCompletion::Finished(result));
         });
         receiver
@@ -2245,10 +2248,12 @@ impl ConsensusShutdownCoordinator {
 async fn shutdown_consensus_session_store(
     inner: Arc<ConsensusSessionStoreInner>,
     allow_closed_proof: bool,
+    handoff_deadline: tokio::time::Instant,
 ) -> Result<(), StoreError> {
     // Stop new retention proposals and join the current turn before selecting
     // a handoff prefix or asking Raft to stop. The shared coordinator owns this
-    // join even when an observing caller times out.
+    // join even when an observing caller times out. It consumes the original
+    // automatic handoff budget, preserving the remainder for the final drain.
     if let Some(lane) = inner.roster_maintenance.get() {
         lane.shutdown().await;
     }
@@ -2256,7 +2261,9 @@ async fn shutdown_consensus_session_store(
         let store = ConsensusSessionStore {
             inner: Arc::clone(&inner),
         };
-        let outcome = store.prepare_shutdown_for_stop().await;
+        let outcome = store
+            .prepare_shutdown_for_stop_before(handoff_deadline)
+            .await;
         *inner
             .shutdown
             .handoff
@@ -23601,12 +23608,14 @@ mod membership_tests {
         store: &ConsensusSessionStore,
         clock: &MutableClock,
         start: Timestamp,
+        ticks: &[roster_maintenance::RosterMaintenanceTickDriver],
     ) {
         const RATE: u16 = 10;
         const SECONDS: u16 = 180;
         const ROWS: u16 = RATE * SECONDS;
-        // Four tick buckets permit scheduler jitter, but cannot hide the
-        // eight-row-per-second growth caused by one-epoch retirement.
+        // Preserve the original four-bucket backlog bound. Explicit scheduling
+        // removes host jitter; the stronger per-tick checks below still catch
+        // the old one-epoch retirement without relying on wall-clock pacing.
         const STEADY_BOUND: u64 = RATE as u64 * 4;
         let at = |millis: i64| {
             Timestamp::from_offset_datetime(
@@ -23639,11 +23648,19 @@ mod membership_tests {
         let first_log = store.inner.raft.metrics().borrow().last_log_index.unwrap();
         let mut peak_due = 0;
         let mut peak_tombstones = 0;
-        // This is three minutes of real maintenance-lane time. No unrelated
-        // mutations can donate extra turns; only signed history becomes due.
+        // Drive 180 logical one-second ticks. Physical proposal service must
+        // complete before the next ten rows become due, so host scheduling
+        // cannot manufacture arrivals. The paused-time lane test separately
+        // proves the one-second cadence. No unrelated mutation donates turns.
         for second in 1..=SECONDS {
             clock.set(at(86_400_000 + i64::from(second) * 1000));
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let before_tick = store.inner.raft.metrics().borrow().last_log_index.unwrap();
+            futures_util::future::join_all(ticks.iter().map(|driver| driver.tick())).await;
+            let after_tick = store.inner.raft.metrics().borrow().last_log_index.unwrap();
+            assert!(
+                after_tick - before_tick <= 2,
+                "at most two bounded commands per tick"
+            );
             let snapshot = store.protected_roster_diagnostic_snapshot();
             assert_eq!(snapshot.occupancy_valid, 1);
             assert_eq!(snapshot.live_reservations, 0);
@@ -23652,6 +23669,11 @@ mod membership_tests {
             assert!(
                 reclaimed <= due,
                 "young rows remain retained until their exact boundary"
+            );
+            assert_eq!(reclaimed, due, "the scheduled pair reclaims every due row");
+            assert_eq!(
+                snapshot.tombstone_reservations, 0,
+                "the scheduled pair retires across all ten distinct epochs"
             );
             let backlog = due - reclaimed;
             peak_due = peak_due.max(backlog);

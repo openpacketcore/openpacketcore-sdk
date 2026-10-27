@@ -449,6 +449,11 @@ impl Fleet {
         }
     }
 
+    async fn close_after_test<T>(&mut self, result: std::thread::Result<T>) -> (T, Vec<Arc<Wal>>) {
+        let shutdown = AssertUnwindSafe(self.close()).catch_unwind().await;
+        test_result_after_shutdown(result, shutdown)
+    }
+
     async fn close(&mut self) -> Vec<Arc<Wal>> {
         let wals = self
             .stores
@@ -477,6 +482,34 @@ impl Fleet {
         }
         wals
     }
+}
+
+fn test_result_after_shutdown<T, U>(
+    result: std::thread::Result<T>,
+    shutdown: std::thread::Result<U>,
+) -> (T, U) {
+    // Cleanup has already completed or reported its own panic. Preserve the
+    // workload failure as the test result when both operations failed.
+    let value = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let closed = shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    (value, closed)
+}
+
+#[test]
+fn workload_failure_survives_an_orderly_shutdown_failure() {
+    let panic = std::panic::catch_unwind(|| {
+        test_result_after_shutdown::<(), ()>(
+            Err(Box::new("workload failure")),
+            Err(Box::new("shutdown failure")),
+        )
+    })
+    .unwrap_err();
+    assert_eq!(*panic.downcast::<&str>().unwrap(), "workload failure");
+    let panic = std::panic::catch_unwind(|| {
+        test_result_after_shutdown(Ok(()), Err::<(), _>(Box::new("shutdown failure")))
+    })
+    .unwrap_err();
+    assert_eq!(*panic.downcast::<&str>().unwrap(), "shutdown failure");
 }
 
 fn tenant() -> TenantId {
@@ -611,8 +644,7 @@ async fn fixed_three_voter_public_lease_cas_reads_and_orderly_reopen() {
     })
     .catch_unwind()
     .await;
-    let initial_wals = fleet.close().await;
-    let requests = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let (requests, initial_wals) = fleet.close_after_test(result).await;
 
     // The retained test token supplies the original binding. This proves
     // orderly SDK reopen without claiming on-disk migration selection.
@@ -678,8 +710,7 @@ async fn fixed_three_voter_public_lease_cas_reads_and_orderly_reopen() {
     })
     .catch_unwind()
     .await;
-    fleet.close().await;
-    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    fleet.close_after_test(result).await;
 }
 
 async fn v2_create_request(
@@ -790,8 +821,7 @@ async fn fixed_three_voter_public_eight_item_v2_batches_with_full_activation() {
         }
         fleet.observe_costs("all_voter_results_verified");
     }).catch_unwind().await;
-    fleet.close().await;
-    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    fleet.close_after_test(result).await;
 }
 
 mod native_flow;
@@ -1304,8 +1334,7 @@ async fn quorum_authority_native_durable_cut_and_independent_sql_cold_reconstruc
             }
             (retained, live, sql)
         }).catch_unwind().await;
-        let closed = fleet.close().await;
-        let (retained, live, sql) = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let ((retained, live, sql), closed) = fleet.close_after_test(result).await;
         assert_eq!(
             closed.len(),
             3,
@@ -1386,8 +1415,7 @@ async fn roster_maintenance_native_reclaims_signed_roster_without_ordinary_traff
     })
     .catch_unwind()
     .await;
-    fleet.close().await;
-    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    fleet.close_after_test(result).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1451,8 +1479,7 @@ async fn assert_roster_emergency_policy_bypass(forwarded: bool, resident: bool) 
         })
         .catch_unwind()
         .await;
-        fleet.close().await;
-        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        fleet.close_after_test(result).await;
     }
 }
 
@@ -1605,8 +1632,7 @@ async fn assert_roster_emergency_v2_policy_bypass(forwarded: bool, resident: boo
         })
         .catch_unwind()
         .await;
-        fleet.close().await;
-        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        fleet.close_after_test(result).await;
     }
 }
 
@@ -1648,8 +1674,7 @@ async fn assert_signed_roster_steady_retirement(native: bool) {
     })
     .catch_unwind()
     .await;
-    fleet.close().await;
-    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    fleet.close_after_test(result).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1660,6 +1685,36 @@ async fn roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn roster_maintenance_native_keeps_up_with_ten_due_rows_per_second() {
     assert_signed_roster_sustained_retirement(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_join_does_not_restart_shutdown_preparation_budget() {
+    let _timing_permit = crate::acquire_consensus_timing_test_permit().await;
+    let mut fleet = Fleet::new_roster_production(
+        "roster-shutdown-budget",
+        true,
+        super::membership_tests::roster_ingress_test_root(),
+    );
+    fleet.open().await;
+    for store in &fleet.stores {
+        store
+            .inner
+            .roster_maintenance
+            .get()
+            .expect("automatic roster maintenance")
+            .delay_join_for_test(Duration::from_secs(8))
+            .await;
+    }
+    // The unchanged ten-second operation deadline includes this owned join.
+    // Starting a fresh five-second handoff afterwards exceeds that budget.
+    let results = join_all(fleet.stores.iter().map(ConsensusSessionStore::shutdown)).await;
+    // Reap the same owned drain on the failing implementation as well. This
+    // later observation cannot turn the first operation's timeout into success.
+    fleet.close().await;
+    assert!(
+        results.iter().all(Result::is_ok),
+        "the maintenance join must consume the original preparation budget: {results:?}",
+    );
 }
 
 async fn assert_signed_roster_sustained_retirement(native: bool) {
@@ -1679,6 +1734,13 @@ async fn assert_signed_roster_sustained_retirement(native: bool) {
     fleet.clock = Some(clock.clone());
     fleet.open().await;
     let result = AssertUnwindSafe(async {
+        let ticks = join_all(
+            fleet
+                .stores
+                .iter()
+                .map(ConsensusSessionStore::schedule_roster_maintenance_ticks_for_test),
+        )
+        .await;
         let leader = fleet
             .stores
             .iter()
@@ -1687,11 +1749,12 @@ async fn assert_signed_roster_sustained_retirement(native: bool) {
                     == Some(store.inner.local_node_id)
             })
             .unwrap();
-        assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second(leader, &clock, start)
-            .await;
+        assert_roster_maintenance_keeps_up_with_ten_due_rows_per_second(
+            leader, &clock, start, &ticks,
+        )
+        .await;
     })
     .catch_unwind()
     .await;
-    fleet.close().await;
-    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    fleet.close_after_test(result).await;
 }
