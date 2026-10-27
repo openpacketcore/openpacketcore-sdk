@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Privileged packet tests in disposable namespaces; keys are public test fixtures."""
 
 import argparse
@@ -182,6 +183,9 @@ def case(sender, version, mode, algorithm, scenario, index):
         else ("2001:db8::10", "2001:db8::20")
     )
     c = dict(
+        capture_version=1,
+        path_mtu=1500,
+        tfc_padding=256 if mode == "tunnel" else 0,
         family=2 if version == 4 else 10,
         src=src,
         dst=dst,
@@ -223,7 +227,7 @@ def case(sender, version, mode, algorithm, scenario, index):
                 link,
                 *([] if version == 4 else ["nodad"]),
             )
-            run("ip", "-n", ns, "link", "set", link, "up")
+            run("ip", "-n", ns, "link", "set", link, "mtu", str(c["path_mtu"]), "up")
             state = [
                 "ip",
                 "-n",
@@ -258,7 +262,7 @@ def case(sender, version, mode, algorithm, scenario, index):
                 ]
             state += ["replay-window", "128" if scenario == "esn" else "32"]
             if mode == "tunnel":
-                state += ["tfcpad", "256"]
+                state += ["tfcpad", str(c["tfc_padding"])]
             if scenario == "esn":
                 state += [
                     "flag",

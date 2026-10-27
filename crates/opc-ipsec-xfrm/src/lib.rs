@@ -278,7 +278,6 @@ mod observation;
 mod outbound_binding;
 pub mod staged;
 pub mod staged_object;
-mod tfc;
 pub mod unsupported;
 
 pub use backend::XfrmBackend;
@@ -408,7 +407,6 @@ pub use staged_object::{
     XfrmObjectInstallRecoveryPlan, XfrmObjectInstallRequest, XfrmObjectRemovalRequest,
     XfrmStagedObjectInstall, XfrmStagedObjectInstallRunError,
 };
-pub use tfc::esp_dummy_payload;
 pub use unsupported::UnsupportedXfrmBackend;
 
 #[cfg(test)]

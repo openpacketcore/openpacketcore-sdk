@@ -74,6 +74,8 @@ jobs:
             cpio busybox iproute2 qemu-system-x86 python3-cryptography
       - name: Build the SDK dummy sender
         run: cargo build --locked -p opc-ipsec-xfrm --example esp_tfc_dummy
+      - name: Check the independent wire verifier rejects missing TFC padding
+        run: python3 -m unittest discover -s kernel/xfrm-tfc-dummy -p test_verify_wire.py -v
       - name: Qualify the transport sender on the stock kernel
         run: |
           set -euo pipefail

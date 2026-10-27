@@ -12,14 +12,16 @@ const MAX_PAYLOAD: usize = 65_495;
 /// Each packet requires the exact ESP template supplied at construction. Linux
 /// owns sequence/nonce allocation, encryption and lifetime enforcement on that
 /// same SA, including when ordinary traffic uses it concurrently. The sender
-/// never reads keys or sequence counters and installs no global policy or SA.
+/// exports no keys or sequence counters and installs no global policy or SA.
+/// Opening reads the installed SA metadata; its netlink buffer is zeroized.
 /// Dropping it removes its private socket policy.
 ///
 /// Transport mode works on stock Linux. Tunnel mode requires the versioned
 /// OPCTFC01 capability from `kernel/xfrm-tfc-dummy/linux.patch`; absence is
 /// rejected before opening the raw socket. This is a maintained kernel patch,
-/// not an upstream Linux capability. Hardware-offloaded and stacked transforms
-/// are outside that patch's profile and fail closed.
+/// not an upstream Linux capability. Opening rejects hardware-offloaded SAs in
+/// both modes. The tunnel patch additionally refuses stacked transforms at send;
+/// stock transport mode retains normal Linux transform lookup behavior.
 ///
 /// The template uses lookup mark zero and interface ID zero; callers must keep
 /// its public tuple unique, including overlapping mark masks. Its selector must
@@ -50,22 +52,7 @@ impl EspTfcDummySender {
         destination: IpAddress,
         sa: XfrmTemplate,
     ) -> Result<Self, XfrmError> {
-        let policy = encode_dummy_policy(source, destination, sa)?;
-        if sa.mode == XfrmMode::Tunnel {
-            let mut session = NetlinkXfrmTransport.open_session(OPERATION)?;
-            session.send(&encode_netlink_message(
-                XFRM_MSG_GETSADINFO,
-                NLM_F_REQUEST,
-                1,
-                &0_u32.to_ne_bytes(),
-            )?)?;
-            receive_sad_info(
-                OPERATION,
-                LinuxXfrmBackendConfig::default(),
-                |buffer| session.receive(buffer),
-                |datagram| validate_dummy_capability(datagram, source, sa.id.destination),
-            )?;
-        }
+        let policy = prepare_dummy_policy(&NetlinkXfrmTransport, source, destination, sa)?;
         let socket =
             opc_linux_xfrm_sys::TfcDummySocket::open(std_ip(source), std_ip(destination), &policy)
                 .map_err(|error| map_open_error(OPERATION, error))?;
@@ -92,6 +79,66 @@ impl EspTfcDummySender {
         }
         Ok(())
     }
+}
+
+fn prepare_dummy_policy(
+    transport: &impl LinuxXfrmTransport,
+    source: IpAddress,
+    destination: IpAddress,
+    sa: XfrmTemplate,
+) -> Result<SensitiveBuffer, XfrmError> {
+    let policy = encode_dummy_policy(source, destination, sa)?;
+    if sa.mode == XfrmMode::Tunnel {
+        let mut session = transport.open_session(OPERATION)?;
+        session.send(&encode_netlink_message(
+            XFRM_MSG_GETSADINFO,
+            NLM_F_REQUEST,
+            1,
+            &0_u32.to_ne_bytes(),
+        )?)?;
+        receive_sad_info(
+            OPERATION,
+            LinuxXfrmBackendConfig::default(),
+            |buffer| session.receive(buffer),
+            |datagram| validate_dummy_capability(datagram, source, sa.id.destination),
+        )?;
+    }
+    let body = encode_sa_id(sa.id.destination, sa.id.protocol, sa.id.spi, None)?;
+    let request = encode_netlink_message(XFRM_MSG_GETSA, NLM_F_REQUEST | NLM_F_ACK, 1, &body)?;
+    let response = transport
+        .transact(
+            OPERATION,
+            NetlinkOperationClass::ReadOnly,
+            &request,
+            1,
+            LinuxXfrmBackendConfig::default(),
+        )?
+        .ok_or_else(|| XfrmError::io(OPERATION, invalid_data("missing getsa response")))?;
+    if unique_route_attribute(
+        &response,
+        XFRM_USER_SA_INFO_LEN,
+        XFRMA_OFFLOAD_DEV,
+        OPERATION,
+    )?
+    .is_some()
+    {
+        return Err(XfrmError::UnsupportedFeature {
+            feature: "esp_tfc_dummy_xfrm_offload",
+        });
+    }
+    let snapshot = parse_sa_relocation_snapshot(&response)?;
+    if snapshot.state.id != sa.id
+        || snapshot.state.source_address != sa.source_address
+        || snapshot.state.request_id != sa.request_id
+        || snapshot.state.mode != sa.mode
+        || snapshot.identity.if_id.unwrap_or(0) != 0
+        || snapshot.identity.mark.is_some_and(|mark| mark.value() != 0)
+    {
+        return Err(XfrmError::StateMismatch {
+            operation: OPERATION,
+        });
+    }
+    Ok(policy)
 }
 
 fn validate_payload_len(length: usize) -> Result<(), XfrmError> {
@@ -197,6 +244,7 @@ fn validate_dummy_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AeadAlgorithm, KeyMaterial};
 
     fn addresses() -> (IpAddress, IpAddress, XfrmTemplate) {
         let source = IpAddress::Ipv4([192, 0, 2, 10]);
@@ -224,6 +272,138 @@ mod tests {
             append_attr(&mut body, DUMMY_CAPABILITY_ATTRIBUTE, value).unwrap();
         }
         encode_netlink_message(XFRM_MSG_NEWSADINFO, 0, 1, &body).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct SaTransport {
+        response: SensitiveBuffer,
+        queries: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LinuxXfrmTransport for SaTransport {
+        fn transact(
+            &self,
+            _: &'static str,
+            class: NetlinkOperationClass,
+            request: &[u8],
+            sequence: u32,
+            _: LinuxXfrmBackendConfig,
+        ) -> Result<Option<SensitiveBuffer>, XfrmError> {
+            assert_eq!(class, NetlinkOperationClass::ReadOnly);
+            assert_eq!(read_u16_ne(request, 4).unwrap(), XFRM_MSG_GETSA);
+            assert_eq!(read_u32_ne(request, 8).unwrap(), sequence);
+            self.queries.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(self.response.clone()))
+        }
+
+        fn probe(&self, _: LinuxXfrmBackendConfig) -> XfrmProbe {
+            XfrmProbe::unsupported()
+        }
+
+        fn open_session(&self, _: &'static str) -> Result<Box<dyn LinuxXfrmSession>, XfrmError> {
+            struct Capability;
+            impl LinuxXfrmSession for Capability {
+                fn send(&mut self, request: &[u8]) -> Result<(), XfrmError> {
+                    assert_eq!(read_u16_ne(request, 4).unwrap(), XFRM_MSG_GETSADINFO);
+                    Ok(())
+                }
+                fn receive(&mut self, buffer: &mut [u8]) -> io::Result<ReceiveMessageOutcome> {
+                    let mut value = b"OPCTFC01".to_vec();
+                    value.extend_from_slice(&3_u32.to_ne_bytes());
+                    let message = reply(Some(&value));
+                    buffer[..message.len()].copy_from_slice(&message);
+                    Ok(ReceiveMessageOutcome::Complete {
+                        bytes_received: message.len(),
+                    })
+                }
+            }
+            Ok(Box::new(Capability))
+        }
+    }
+
+    fn sa_readback(sa: XfrmTemplate) -> SensitiveBuffer {
+        encode_sa_info(&SaParameters {
+            selector: XfrmSelector::new(sa.source_address, sa.id.destination, 59),
+            id: sa.id,
+            source_address: sa.source_address,
+            request_id: sa.request_id,
+            auth: None,
+            crypt: None,
+            aead: Some((
+                AeadAlgorithm::rfc4106_gcm_aes(128),
+                KeyMaterial::new(vec![0; 20]),
+            )),
+            mode: sa.mode,
+            lifetime: LifetimeConfig::default(),
+            replay_window: 32,
+            replay_state: None,
+            encap: None,
+            mark: None,
+            output_mark: None,
+            if_id: None,
+            egress_dscp: None,
+            tfc_pad: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn dummy_sender_refuses_crypto_offload_in_transport_and_tunnel_modes() {
+        let (source, destination, mut sa) = addresses();
+        let mut refused = Vec::new();
+        for mode in [XfrmMode::Transport, XfrmMode::Tunnel] {
+            sa.mode = mode;
+            let mut response = sa_readback(sa);
+            append_attr(&mut response, XFRMA_OFFLOAD_DEV, &[0; 8]).unwrap();
+            let transport = SaTransport {
+                response,
+                queries: std::sync::atomic::AtomicUsize::new(0),
+            };
+            refused.push(matches!(
+                prepare_dummy_policy(&transport, source, destination, sa),
+                Err(XfrmError::UnsupportedFeature {
+                    feature: "esp_tfc_dummy_xfrm_offload"
+                })
+            ));
+        }
+        assert_eq!(refused, [true, true]);
+    }
+
+    #[test]
+    fn dummy_sender_reads_the_exact_software_sa_before_accepting_either_mode() {
+        let (source, destination, mut sa) = addresses();
+        for mode in [XfrmMode::Transport, XfrmMode::Tunnel] {
+            sa.mode = mode;
+            let transport = SaTransport {
+                response: sa_readback(sa),
+                queries: std::sync::atomic::AtomicUsize::new(0),
+            };
+            assert_eq!(
+                prepare_dummy_policy(&transport, source, destination, sa).unwrap(),
+                encode_dummy_policy(source, destination, sa).unwrap()
+            );
+            assert_eq!(transport.queries.load(Ordering::Relaxed), 1);
+            let mut foreign = sa;
+            foreign.request_id = XfrmRequestId::new(43);
+            let transport = SaTransport {
+                response: sa_readback(foreign),
+                queries: std::sync::atomic::AtomicUsize::new(0),
+            };
+            assert!(matches!(
+                prepare_dummy_policy(&transport, source, destination, sa),
+                Err(XfrmError::StateMismatch {
+                    operation: OPERATION
+                })
+            ));
+            let transport = SaTransport {
+                response: Zeroizing::new(vec![0; XFRM_USER_SA_INFO_LEN - 1]),
+                queries: std::sync::atomic::AtomicUsize::new(0),
+            };
+            assert!(matches!(
+                prepare_dummy_policy(&transport, source, destination, sa),
+                Err(XfrmError::Io { .. })
+            ));
+        }
     }
 
     #[test]

@@ -89,7 +89,7 @@ fn answered_probe_is_exact_no_write_and_advances_only_the_live_send_floor() {
             assert_eq!(retry, request);
             assert_eq!(peer.receive(&retry), Ok(Event::Replay(response.clone())));
             let response = f.window.open_peer(f.profile, &f.keys, &response).unwrap();
-            assert_eq!(f.window.complete_empty_probe(&response, 111), Ok(()));
+            assert_eq!(f.window.complete_empty_probe(&response, 111), Ok(empty()));
             assert_eq!(
                 f.window.complete_empty_probe(&response, 112),
                 Err(Error::Drop)
@@ -215,7 +215,7 @@ fn a_pending_probe_allows_peer_requests_but_serializes_local_rekey_and_delete() 
 }
 
 #[test]
-fn wrong_id_wrong_class_nonempty_and_bad_mac_never_complete_a_probe() {
+fn wrong_id_wrong_class_and_bad_mac_never_complete_a_probe() {
     support::ensure_ike_crypto();
     let mut f = Fixture::new(410_101, ALGORITHMS[0], DIRECTIONS[1]);
     enable(&mut f.window, 4);
@@ -231,7 +231,6 @@ fn wrong_id_wrong_class_nonempty_and_bad_mac_never_complete_a_probe() {
         (1, true, 37, empty()),
         (0, false, 37, empty()),
         (0, true, 36, empty()),
-        (0, true, 37, delete()),
     ] {
         let incoming = wire.seal(id, response, exchange, payload);
         let incoming = f.window.open_peer(f.profile, &f.keys, &incoming).unwrap();
@@ -252,7 +251,7 @@ fn wrong_id_wrong_class_nonempty_and_bad_mac_never_complete_a_probe() {
         .window
         .open_peer(f.profile, &f.keys, &wire.seal(0, true, 37, empty()))
         .unwrap();
-    assert_eq!(f.window.complete_empty_probe(&response, 111), Ok(()));
+    assert_eq!(f.window.complete_empty_probe(&response, 111), Ok(empty()));
 }
 
 #[test]
@@ -312,9 +311,15 @@ fn fixed_timeout_and_exponential_retries_never_create_a_new_request() {
         backwards.window.retry_empty_probe(110),
         Err(Error::LivenessClock)
     ));
-    assert!(ProbePolicy::new(0, 3, 10).is_err());
-    assert!(ProbePolicy::new(100, 0, 10).is_err());
-    assert!(ProbePolicy::new(100, 3, 0).is_err());
+    assert_eq!(ProbePolicy::new(0, 3, 10).err(), Some(Error::InvalidRecord));
+    assert_eq!(
+        ProbePolicy::new(100, 0, 10).err(),
+        Some(Error::InvalidRecord)
+    );
+    assert_eq!(
+        ProbePolicy::new(100, 3, 0).err(),
+        Some(Error::InvalidRecord)
+    );
 }
 
 #[test]
@@ -770,7 +775,10 @@ fn persisted_probe_shape_authentication_and_iv_coverage_are_checked() {
             ));
         }
     }
-    assert!(LivenessRecord::from_persisted(0, None).is_err());
+    assert_eq!(
+        LivenessRecord::from_persisted(0, None),
+        Err(Error::InvalidRecord)
+    );
 }
 
 #[test]

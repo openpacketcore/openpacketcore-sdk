@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ids_nonempty_shapes_and_failed_integrity_do_not_complete() {
+    fn unknown_ids_wrong_exchange_and_failed_integrity_do_not_complete() {
         let mut f = fixture(91_003);
         let (id, _) = send_probe(&mut f);
 
@@ -127,16 +127,19 @@ mod tests {
         );
         assert_eq!(f.window.pending_empty_request_message_id(), Some(id));
 
-        // The right Message ID with inner payloads is not a liveness response.
-        let nonempty = f.peer(
+        // The right Message ID in another exchange cannot settle this probe.
+        let wrong_exchange = f.peer(
             id,
             true,
-            Ikev2ExchangeKind::Informational.as_u8(),
+            Ikev2ExchangeKind::CreateChildSa.as_u8(),
             delete(),
             0,
             0x2101,
         );
-        let opened = f.window.open_peer(f.profile, &f.keys, &nonempty).unwrap();
+        let opened = f
+            .window
+            .open_peer(f.profile, &f.keys, &wrong_exchange)
+            .unwrap();
         assert_eq!(
             f.window.complete_empty_probe(&opened, 101),
             Err(Error::Drop)
@@ -155,7 +158,10 @@ mod tests {
             )
             .to_vec();
         *tampered.last_mut().unwrap() ^= 0x01;
-        assert!(f.window.open_peer(f.profile, &f.keys, &tampered).is_err());
+        assert_eq!(
+            f.window.open_peer(f.profile, &f.keys, &tampered).err(),
+            Some(Error::Drop)
+        );
         assert_eq!(f.window.pending_empty_request_message_id(), Some(id));
     }
 
@@ -575,7 +581,7 @@ mod tests {
             &f.iv,
         )
         .unwrap();
-        assert!(
+        assert_eq!(
             restored
                 .prepare_request(
                     f.profile,
@@ -584,7 +590,8 @@ mod tests {
                     Ikev2ExchangeKind::Informational,
                     delete()
                 )
-                .is_err(),
+                .err(),
+            Some(Error::LivenessRecoveryRequired),
             "restart must synchronize or retire before reusing the probe's ID for durable work"
         );
     }
@@ -597,8 +604,9 @@ mod tests {
             f.window.check_empty_probe_deadline(1_100),
             Err(Error::LivenessExpired)
         );
-        assert!(
-            f.window.ready().is_err(),
+        assert_eq!(
+            f.window.ready(),
+            Err(Error::LivenessExpired),
             "exhausted liveness must retire the scoped SA"
         );
     }
@@ -611,10 +619,11 @@ mod tests {
             Encryption::AesGcm16_128,
             Direction::InitiatorToResponder,
         );
-        assert!(
+        assert_eq!(
             f.window
                 .start_empty_probe(f.profile, &f.keys, &mut f.allocator, policy(), 100)
-                .is_err(),
+                .err(),
+            Some(Error::LivenessDisabled),
             "an unconfigured SA has no safe crash bound for unwritten probes"
         );
     }

@@ -19,6 +19,12 @@ use opc_proto_ikev2::{
 
 #[path = "support/canonical.rs"]
 mod canonical_fixtures;
+#[allow(dead_code, reason = "shared independent peer packet adapter")]
+#[path = "recovery_profile/wire.rs"]
+mod fragment_wire;
+#[allow(dead_code, reason = "shared fragmentation wire fixtures")]
+#[path = "support/fragmentation.rs"]
+mod fragmentation_fixtures;
 mod support;
 use canonical_fixtures::{delete, empty, Fixture, ALGORITHMS, DIRECTIONS};
 
@@ -102,6 +108,107 @@ fn sync_wire(f: &Fixture, reply: bool, nonce: [u8; 4], send: u32, receive: u32) 
 
 fn policy() -> RecoveryPolicy {
     RecoveryPolicy::new(1, Clock::new(100, 7), 200, 3, 10).unwrap()
+}
+
+fn partial_fragment(f: &Fixture, window: &mut Window) {
+    let prepared = window
+        .prepare_fragmentation(
+            f.profile,
+            &f.keys,
+            &fragmentation_fixtures::offers(f.spis, false, true),
+            &fragmentation_fixtures::offers(f.spis, true, true),
+            std::num::NonZeroU32::new(50).unwrap(),
+        )
+        .unwrap();
+    let record = prepared.record().clone();
+    let _commit = prepared.commit_after_durable(&record).unwrap();
+    let peer = fragment_wire::Wire::new(
+        f.profile,
+        &f.keys,
+        f.spis,
+        canonical_fixtures::opposite(f.direction),
+    );
+    let fragment = peer.seal_fragment(
+        0,
+        false,
+        37,
+        (1, 2),
+        PayloadChain::new(PayloadType::Delete, &canonical_fixtures::DELETE[..4]),
+    );
+    assert!(matches!(
+        window.receive_peer_packet(f.profile, &f.keys, &fragment, 10),
+        Ok(opc_proto_ikev2::recovery::Ikev2FragmentReceive::Incomplete)
+    ));
+    assert_eq!(window.fragment_deadline_ms(), Some(60));
+}
+
+#[test]
+fn reconciled_initiator_sync_discards_pretransition_fragment_queues() {
+    each(32_000, |mut f| {
+        let mut window = start(&f, 0, true);
+        partial_fragment(&f, &mut window);
+        let prepared = window
+            .begin_sync(policy(), Clock::new(100, 7), None)
+            .unwrap()
+            .prepare(
+                f.profile,
+                &f.keys,
+                f.allocator.allocate(Purpose::Ordinary).unwrap(),
+            )
+            .unwrap();
+        let candidate = prepared.record().clone();
+        drop(prepared);
+        window
+            .reconcile(f.profile, &f.keys, &candidate, &f.iv)
+            .unwrap();
+        assert_eq!(window.fragment_deadline_ms(), None);
+        assert_eq!(window.ready(), Err(Error::SyncInProgress));
+    });
+}
+
+#[test]
+fn reconciled_responder_sync_discards_pretransition_fragment_queues() {
+    each(32_010, |mut f| {
+        let mut window = start(&f, 0, true);
+        partial_fragment(&f, &mut window);
+        let prepared = window
+            .begin_sync_response(
+                f.profile,
+                &f.keys,
+                &sync_wire(&f, false, [1; 4], 8, 0),
+                None,
+                None,
+            )
+            .unwrap()
+            .prepare(
+                f.profile,
+                &f.keys,
+                f.allocator.allocate(Purpose::Ordinary).unwrap(),
+            )
+            .unwrap();
+        let candidate = prepared.record().clone();
+        drop(prepared);
+        window
+            .reconcile(f.profile, &f.keys, &candidate, &f.iv)
+            .unwrap();
+        assert_eq!(window.fragment_deadline_ms(), None);
+        assert_eq!(window.ready(), Ok(()));
+    });
+}
+
+#[test]
+fn terminal_reconcile_failure_discards_partial_fragment_queues() {
+    each(32_020, |f| {
+        let mut window = start(&f, 0, true);
+        partial_fragment(&f, &mut window);
+        let unrelated = initial(&f, 0, true);
+        assert_eq!(
+            window.reconcile(f.profile, &f.keys, &unrelated, &f.iv),
+            Err(Error::InvalidRecord)
+        );
+        assert_eq!(window.fragment_deadline_ms(), None);
+        assert_eq!(window.ready(), Err(Error::CommitUncertain));
+    });
 }
 
 fn terminal(window: &mut Window, f: &Fixture, old: &Record, floor: Option<u32>) {

@@ -80,6 +80,99 @@ fn enable(f: &mut Fixture) {
     );
 }
 
+#[test]
+fn fragmentation_offers_ignore_empty_spi_protocol_id_in_both_original_roles() {
+    support::ensure_ike_crypto();
+    let mut cases = 0;
+    for (role, direction) in DIRECTIONS.into_iter().enumerate() {
+        for (index, protocol) in [1, 2, 3, 255].into_iter().enumerate() {
+            let mut f = Fixture::new(124400 + (role * 4 + index) as u64, ALGORITHMS[0], direction);
+            let mut request = offers(f.spis, false, true);
+            let mut response = offers(f.spis, true, true);
+            // RFC 7296 section 3.10: the sender emits zero; the receiver ignores it.
+            assert_eq!(request[32], 0);
+            assert_eq!(response[32], 0);
+            if role == 0 {
+                response[32] = protocol;
+            } else {
+                request[32] = protocol;
+            }
+            let prepared = f
+                .window
+                .prepare_fragmentation(
+                    f.profile,
+                    &f.keys,
+                    &request,
+                    &response,
+                    NonZeroU32::new(50).unwrap(),
+                )
+                .unwrap();
+            let record = prepared.record().clone();
+            let _commit = prepared.commit_after_durable(&record).unwrap();
+            assert!(f.window.record().fragmentation().is_some());
+            cases += 1;
+        }
+    }
+    assert_eq!(cases, 8);
+}
+
+#[test]
+fn cached_empty_fragment_replay_requires_one_empty_identical_packet() {
+    use opc_proto_ikev2::canonical::Ikev2CanonicalPolicy;
+    support::ensure_ike_crypto();
+    for (role, direction) in DIRECTIONS.into_iter().enumerate() {
+        for fragmented in [false, true] {
+            let mut f = Fixture::new(
+                124420 + (role * 2 + usize::from(fragmented)) as u64,
+                ALGORITHMS[0],
+                direction,
+            );
+            enable(&mut f);
+            f.window
+                .enable_empty_replies(Ikev2CanonicalPolicy::default())
+                .unwrap();
+            let keys = f.keys.clone();
+            let peer = wire::Wire::new(f.profile, &keys, f.spis, opposite(direction));
+            let original = if fragmented {
+                peer.seal_fragment(0, false, 37, (1, 1), empty())
+            } else {
+                peer.seal(0, false, 37, empty())
+            };
+            let Receive::Message(request) = receive(&mut f, &original, 0).unwrap() else {
+                panic!("complete empty request");
+            };
+            let response = f.window.reply_empty(&request).unwrap().bytes().to_vec();
+            for changed in [
+                peer.seal_fragment(0, false, 37, (1, 2), empty()),
+                peer.seal_fragment(
+                    0,
+                    false,
+                    37,
+                    (1, 1),
+                    PayloadChain::new(PayloadType::Delete, DELETE),
+                ),
+                peer.seal_fragment(
+                    0,
+                    false,
+                    37,
+                    (1, 1),
+                    PayloadChain::new(PayloadType::Delete, &[]),
+                ),
+                peer.seal_fragment(0, false, 37, (1, 1), empty()),
+                peer.seal_fragment(0, false, 37, (2, 2), empty()),
+            ] {
+                assert_ne!(changed, original);
+                assert!(matches!(receive(&mut f, &changed, 1), Err(Error::Drop)));
+                assert_eq!(f.window.next_receive(), Some(1));
+            }
+            let Receive::Message(repeated) = receive(&mut f, &original, 2).unwrap() else {
+                panic!("exact original request replays");
+            };
+            assert_eq!(f.window.reply_empty(&repeated).unwrap().bytes(), response);
+        }
+    }
+}
+
 fn receive<'a>(f: &'a mut Fixture, packet: &[u8], now: u64) -> Result<Receive<'a>, Error> {
     f.window
         .receive_peer_packet(f.profile, &f.keys, packet, now)

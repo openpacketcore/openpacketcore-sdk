@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # ESP dummy transmission on an existing Linux SA
 
 The SDK's `EspTfcDummySender` sends zero-filled protocol-59 packets through a
@@ -12,7 +13,11 @@ It must be built into the deployment kernel to enable tunnel dummies. The
 SDK detects its version before opening the raw socket and refuses unsupported
 kernels. The patch does not install a second SA, change a live SA's mode,
 reserve counters through netlink, export keys, or implement userspace ESP.
-The source files retain their Linux kernel licenses.
+The patch is GPL-2.0-only. The patched source files retain their existing
+Linux SPDX identifiers, including GPL-2.0-or-later in `esp6.c` and
+GPL-2.0 WITH Linux-syscall-note in the UAPI header. The qualification scripts
+and this documentation are Apache-2.0. The patch is not a Cargo dependency;
+no workspace dependency-license exception is needed.
 
 ## Supported profile and lifetime
 
@@ -23,6 +28,15 @@ unique, including overlapping mark masks. The SA selector must admit protocol
 59 and the selected inner endpoints. Both IP families, software transport and
 tunnel modes, and ESP-in-UDP are qualified. Scoped IPv6 endpoints, hardware
 offload, stacked transforms and GSO are outside this profile.
+Opening reads the selected SA metadata with GETSA and rejects hardware offload
+in both modes. The tunnel patch also enforces its transform restrictions at
+send time. The SDK zeroizes the metadata buffer after the check.
+
+The matrix covers matching inner and outer address families. Mixed-family
+tunnels accepted by the API have not been qualified. Do not install NAT rules
+in the sender namespace that rewrite protocol-59 flows: `nf_xfrm_me_harder`
+can reroute them outside the per-socket policy. ESP-in-UDP qualification does
+not qualify such local NAT rewriting.
 
 `send(n)` supplies 1–65,495 zero filler bytes, excluding IP/ESP overhead and
 configured TFC padding. The native path-MTU and SA limits still apply, so the
@@ -66,6 +80,9 @@ profile: commit `fd73f4a6659897191fa0d40695fe370925dd3780` (7.3.0-rc3), archive
 SHA-256 `1846a6d56bda7798cdff7b743d54975f1e96cbcf89cb48d5f92b2b863cdf262f`.
 The patch also compiled and passed an initial IPv4 wire experiment against
 Ubuntu source 7.0.0-38.38 (7.0.14); the full CI profile targets the pinned source.
+Tunnel dummies are qualified only on that pinned patched kernel. Other kernels,
+including vendor kernels, require their own port and qualification; their
+`xfrm_state_find` and per-CPU ACQUIRE paths can differ.
 
 On Linux, install the build and test dependencies from the `tfc-kernel` job in
 `.github/workflows/ipsec-xfrm.yml`, then run:
@@ -105,6 +122,13 @@ Headers, payloads, padding and IP/UDP framing, and rejects a modified tag for
 every packet. Its primitives first pass published GCM, CBC and HMAC known-answer
 checks. CI also runs all 18 transport cases on the stock host kernel and proves
 that both tunnel families reject the absent capability.
+
+Capture format version 1 records the configured TFC target and path MTU.
+Every tunnel packet, including ordinary application traffic, must have a
+decrypted body at least 256 octets long, capped by the pinned Linux
+`xfrm_state_mtu` calculation. The verifier rejects missing or unknown capture
+versions and its regression authenticates deliberately unpadded packets to
+prove that zero-length padding cannot satisfy the length check.
 
 Normative and reference material: [RFC4303 §2.6](https://www.rfc-editor.org/rfc/rfc4303.html#section-2.6),
 [NIST SP800-38A](https://doi.org/10.6028/NIST.SP.800-38A),

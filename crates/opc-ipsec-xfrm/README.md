@@ -890,14 +890,11 @@ and value with the requested configuration. Linux may acknowledge an in-place
 `UPDSA` without changing TFC, so `rekey_sa` verifies the target (including
 absence) and reports `StateIndeterminate` when readback does not match.
 
-`esp_dummy_payload(tfc_data, alignment)` constructs dummy ESP plaintext with
-separate encryption padding, Pad Length and Next Header 59, as specified in
-[RFC 4303 §§2.4–2.7](https://www.rfc-editor.org/rfc/rfc4303.html#section-2.6).
-The caller supplies the TFC bytes and transform alignment and owns sequence
-allocation, IVs, encryption, authentication, transmission and scheduling. The
-caller must honor the peer's direction-specific `ESP_TFC_PADDING_NOT_SUPPORTED`
-notification ([RFC 7296 §1.3.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-1.3.1));
-this helper does not inject traffic through a kernel-owned SA.
+`EspTfcDummySender` transmits dummy packets through the installed kernel SA;
+see the [sender contract](#esp-dummy-sender). The caller must honor the peer's
+direction-specific `ESP_TFC_PADDING_NOT_SUPPORTED` notification
+([RFC 7296 §1.3.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-1.3.1)).
+Peer negotiation and the decision to enable TFC padding remain caller-owned.
 
 Durable object/roster authentication and outbound-binding IDs include enabled
 TFC targets as a tagged extension; absent targets retain all pre-TFC bytes and
@@ -1918,6 +1915,11 @@ success is not a delivery acknowledgement.
 
 Transport mode works on stock Linux. Tunnel mode requires the included
 [versioned kernel patch and qualification profile](../../kernel/xfrm-tfc-dummy/README.md).
+Tunnel dummies are qualified only on the pinned patched kernel; other kernels
+need their own port and qualification. The matrix covers matching inner and
+outer families; mixed-family tunnels have not been qualified. NAT rules in the
+sender namespace must not rewrite protocol-59 flows, because rerouting can
+bypass the per-socket policy. ESP-in-UDP support does not qualify local NAT.
 It fails with `UnsupportedFeature { feature: "esp_tunnel_tfc_dummy_v1" }`
 on an unpatched kernel before opening a raw sender. Sending an inner IP
 protocol-59 packet through an ordinary tunnel SA produces ESP Next Header
@@ -1930,7 +1932,9 @@ a fixed ESP SPI, and supports software transport/tunnel transforms. Keep the
 selected public tuple unique, including overlapping mark masks. The SA
 selector must admit the inner addresses and protocol 59. Scoped IPv6
 addresses, hardware offload and stacked transforms are outside the qualified
-profile. The caller owns SA lifecycle, negotiation, rate and scheduling.
+profile. Opening checks the installed SA with GETSA and rejects offload in both
+modes; the metadata buffer is zeroized. The tunnel patch also checks offload and
+stacked transforms on each send. The caller owns SA lifecycle, negotiation, rate and scheduling.
 Fence this producer along with other egress before counter recovery,
 relocation or SA replacement, then recreate it against the new SA. A sender
 is an ephemeral socket, not durable installation or incarnation authority.

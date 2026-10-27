@@ -538,9 +538,11 @@ node action is required.
 
 Open a peer packet through `open_peer`, then
 call `complete_empty_probe` with the complete authenticated response. Only the
-current ID, response direction, INFORMATIONAL exchange and empty body complete
-the probe, once. This provides liveness evidence, never a durable outcome. A
-bad MAC, wrong ID/class or nonempty reply cannot settle the probe. During a
+current ID, response direction and INFORMATIONAL exchange complete the probe,
+once. RFC 7296 §1.4 permits nonempty responses; the returned payload chain lets
+the caller perform semantic processing under its existing effect authority.
+This provides liveness evidence, never a durable outcome. A bad MAC or wrong
+ID/class cannot settle the probe. During a
 probe, peer requests remain independent; local rekey or Delete preparation
 waits for the outstanding request to complete. An empty acknowledgement of a
 nonempty durable request still belongs to `prepare_completion`.

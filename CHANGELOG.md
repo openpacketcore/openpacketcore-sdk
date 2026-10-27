@@ -75,7 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RSA-PSS plus RFC 8420 pure Ed25519/Ed448 signatures. RSA-PSS parameters are
   parsed structurally and local self-verification can bind the actual signing
   scheme. RSA/PSS verification is always available; signing retains its existing
-  `rsa-signing` feature. Newly executable groups participate in existing proposal
+  `rsa-signing` feature. PKCS#1 v1.5 and PSS signing blind the RSA private operation
+  with OS randomness; this hardening does not resolve RUSTSEC-2023-0071.
+  Newly executable groups participate in existing proposal
   ordering, which prefers other admitted groups over group 1 without imposing a
   strength ranking among the remaining groups. Every algorithm uses admitted
   provider capability checks. Refs #1352, #1345.
@@ -574,6 +576,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-ipsec-xfrm`: remove the unused `esp_dummy_payload` plaintext builder.
+  Use `EspTfcDummySender` to transmit through an existing kernel ESP SA;
+  the kernel retains encryption, sequence allocation and lifetime ownership.
+  (#1344)
+
 - `opc-proto-ikev2`: added variants to the exhaustive DH, PRF, encryption,
   signature-method, signature-public-key and key-error enums require downstream matches to
   be updated.
@@ -587,6 +594,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window records; the strict test consumer row format is version 4. Negotiated
   consumers use `receive_peer_packet`, with bounded reassembly, scheduled expiry,
   and authenticated fragment-1 response replay. (#1242)
+- `opc-proto-ikev2`: `complete_empty_probe` now returns the authenticated
+  `PayloadChain` for caller processing. A matching INFORMATIONAL response may
+  carry payloads and still completes the probe, as RFC 7296 section 1.4 permits.
+  (#1241)
 
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned

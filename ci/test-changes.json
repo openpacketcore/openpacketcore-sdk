@@ -618,7 +618,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel",
       "kind": "assertions-decreased",
-      "reason": "Restore main’s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
+      "reason": "Restore main\u2019s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
       "issue": 1018,
       "replacements": [
         "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::rate_budget_retention_preserves_lifetime_bound_across_limit_replacement"
@@ -1030,6 +1030,43 @@
       "renamed_to": "rust:crates/opc-proto-nas::test=nas_optional_elements::half_octet_duplicates_preserve_the_first_wire_value_for_both_receiver_policies",
       "reason": "Correct receiver expectations per TS 24.501 7.6.3 and TS 24.007 11.4.2: first duplicate wins and extra octets are ignored; retain minimum-length, raw preservation and per-table assertions.",
       "issue": 1255
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::tfc::tests::tfc_dummy_payload_has_rfc4303_trailer_and_separate_alignment_padding",
+      "kind": "removed",
+      "reason": "Remove the unused plaintext-only esp_dummy_payload API and its dedicated construction tests. Kernel-SA dummy transmission is provided by EspTfcDummySender and qualified by the independent encrypted-wire matrix; the deleted plaintext API had no repository consumer.",
+      "issue": 1344,
+      "behavior_deleted": true,
+      "deleting_change": "Remove crates/opc-ipsec-xfrm/src/tfc.rs and its public export; Breaking CHANGELOG entry for #1344."
+    },
+    {
+      "test": "rust:crates/opc-ipsec-xfrm::lib=lib::tfc::tests::tfc_dummy_payload_rejects_invalid_alignment",
+      "kind": "removed",
+      "reason": "Remove the unused plaintext-only esp_dummy_payload API and its dedicated construction tests. Kernel-SA dummy transmission is provided by EspTfcDummySender and qualified by the independent encrypted-wire matrix; the deleted plaintext API had no repository consumer.",
+      "issue": 1344,
+      "behavior_deleted": true,
+      "deleting_change": "Remove crates/opc-ipsec-xfrm/src/tfc.rs and its public export; Breaking CHANGELOG entry for #1344."
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::unknown_ids_nonempty_shapes_and_failed_integrity_do_not_complete",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::unknown_ids_wrong_exchange_and_failed_integrity_do_not_complete",
+      "reason": "RFC 7296 section 1.4 permits payloads in an authenticated INFORMATIONAL response to an empty probe. Replace the nonempty-response refusal with positive completion and returned-payload coverage across all profiles, roles and recovery modes; retain wrong ID, direction, exchange, integrity and duplicate refusals with exact errors.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::test=liveness_probes::wrong_id_wrong_class_nonempty_and_bad_mac_never_complete_a_probe",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::test=liveness_probes::wrong_id_wrong_class_and_bad_mac_never_complete_a_probe",
+      "reason": "RFC 7296 section 1.4 permits payloads in an authenticated INFORMATIONAL response to an empty probe. Replace the nonempty-response refusal with positive completion and returned-payload coverage across all profiles, roles and recovery modes; retain wrong ID, direction, exchange, integrity and duplicate refusals with exact errors.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::test=recovery_profile::liveness_tests::probes_are_fresh_zero_write_and_exactly_retransmitted_for_every_profile_role_and_mode",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::test=recovery_profile::liveness_tests::probes_are_fresh_zero_write_exactly_retransmitted_and_require_authenticated_matching_responses",
+      "reason": "RFC 7296 section 1.4 permits payloads in an authenticated INFORMATIONAL response to an empty probe. Replace the nonempty-response refusal with positive completion and returned-payload coverage across all profiles, roles and recovery modes; retain wrong ID, direction, exchange, integrity and duplicate refusals with exact errors.",
+      "issue": 1241
     }
   ]
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Independently authenticate/decrypt the public-fixture ESP captures using OpenSSL."""
 
 import argparse
@@ -65,6 +66,10 @@ def ip_body(packet):
 
 
 def verify(record):
+    assert record["capture_version"] == 1
+    assert record["tfc_padding"] == (256 if record["mode"] == "tunnel" else 0)
+    path_mtu = record["path_mtu"]
+    assert isinstance(path_mtu, int) and path_mtu >= 68
     count = record["expected_dummy"] + record["expected_control"]
     assert len(record["wire"]) == count
     assert record["udp"] == [b"control".hex()] * record["expected_control"]
@@ -81,6 +86,7 @@ def verify(record):
         packet = bytes.fromhex(encoded)
         protocol, esp, length = ip_body(packet)
         assert length == len(packet)
+        assert length <= path_mtu
         if record["scenario"] == "natt":
             assert protocol == 17 and esp[:4] == struct.pack("!HH", 4500, 4500)
             assert int.from_bytes(esp[4:6], "big") == len(esp)
@@ -130,6 +136,15 @@ def verify(record):
         headers.append(header)
         if record["mode"] == "tunnel":
             inner_protocol, payload, inner_length = ip_body(body)
+            # The pinned Linux xfrm_state_mtu caps tfcpad at the inner MTU:
+            # remove outer IP, optional UDP, ESP header, IV and ICV; align the
+            # remaining cipher input and reserve the two-byte ESP trailer.
+            outer_ip = 20 if record["family"] == 2 else 40
+            iv_length, block = (8, 4) if record["algorithm"] == "gcm" else (16, 16)
+            overhead = outer_ip + (8 if record["scenario"] == "natt" else 0) + 8 + iv_length + 16
+            inner_mtu = max(1, ((path_mtu - overhead) // block) * block - 2)
+            minimum_body = min(record["tfc_padding"], inner_mtu)
+            assert len(body) >= minimum_body, (len(body), minimum_body)
             assert body[inner_length:] == bytes(len(body) - inner_length)
             assert inner_protocol == (59 if header == 59 else 17)
             assert header in (59, 4 if record["family"] == 2 else 41)

@@ -1,4 +1,5 @@
 Subject: [PATCH] xfrm: submit RFC 4303 dummies through a socket policy
+SPDX-License-Identifier: GPL-2.0-only
 
 Generate tunnel-mode ESP Next Header 59 on an existing SA while
 retaining normal kernel sequence allocation, encryption and lifetime

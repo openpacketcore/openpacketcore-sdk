@@ -10,13 +10,13 @@ use opc_proto_ikev2::{
 };
 
 use super::{
-    authority::{EpochOwners, Transport},
+    authority::{self, EpochOwners, Transport},
     driver::{self, Cut, Error, Runtime, State},
     envelope::Provider,
     lifecycle::{child_delete, matrix},
     peer::{Event, PeerModel, Sync},
     row::{Row, WindowImage},
-    store::{CasStore, Command},
+    store::{self, CasStore, Command},
     sync_driver::Start,
     sync_tests::policy,
     wire::Wire,
@@ -200,7 +200,8 @@ pub(super) fn recover(
 }
 
 #[test]
-fn probes_are_fresh_zero_write_and_exactly_retransmitted_for_every_profile_role_and_mode() {
+fn probes_are_fresh_zero_write_exactly_retransmitted_and_require_authenticated_matching_responses()
+{
     matrix(4_100_000, |row| {
         let (provider, mut store, _owners, _initial, mut runtime) = setup(&row);
         enable(&mut runtime, &provider, &mut store, 4, Cut::Complete);
@@ -220,15 +221,23 @@ fn probes_are_fresh_zero_write_and_exactly_retransmitted_for_every_profile_role_
                 peer.wire.seal(id + 1, true, 37, empty()),
                 peer.wire.seal(id, false, 37, empty()),
                 peer.wire.seal(id, true, 36, empty()),
-                peer.wire.seal(id, true, 37, child_delete()),
             ] {
-                assert!(complete(&mut runtime, &bad).is_err());
+                assert_eq!(
+                    complete(&mut runtime, &bad),
+                    Err(Error::Window(WindowError::Drop))
+                );
             }
             let mut corrupt = response.to_vec();
             *corrupt.last_mut().unwrap() ^= 0x80;
-            assert!(complete(&mut runtime, &corrupt).is_err());
+            assert_eq!(
+                complete(&mut runtime, &corrupt),
+                Err(Error::Window(WindowError::Drop))
+            );
             assert_eq!(complete(&mut runtime, &response), Ok(id));
-            assert!(complete(&mut runtime, &response).is_err());
+            assert_eq!(
+                complete(&mut runtime, &response),
+                Err(Error::Window(WindowError::Drop))
+            );
             assert!(!retransmit(&mut runtime, &mut transport).unwrap());
             assert_eq!(runtime.row.window.next_send, Some(0));
             assert_eq!(window!(runtime, window, window.next_send()), Some(id + 1));
@@ -246,6 +255,29 @@ fn probes_are_fresh_zero_write_and_exactly_retransmitted_for_every_profile_role_
             peer.receive(transport.submitted.last().unwrap()),
             Ok(Event::NewRequest(4))
         );
+    });
+}
+
+#[test]
+fn authenticated_nonempty_probe_responses_complete_without_writes() {
+    matrix(4_190_000, |row| {
+        let (provider, mut store, _owners, _initial, mut runtime) = setup(&row);
+        enable(&mut runtime, &provider, &mut store, 4, Cut::Complete);
+        let peer = peer(&row);
+        let durable = store.encrypted_snapshot();
+        let envelope_calls = provider.calls();
+        let id = send(&mut runtime, &mut Transport::default()).unwrap();
+        let wire = peer.wire.seal(id, true, 37, child_delete());
+        window!(runtime, window, {
+            let response = window.open_peer(row.profile, &row.keys, &wire).unwrap();
+            assert_eq!(
+                window.complete_empty_probe(&response, u64::from(id) * 10_000 + 100),
+                Ok(child_delete())
+            );
+            assert_eq!(window.pending_empty_request_message_id(), None);
+        });
+        assert_eq!(store.encrypted_snapshot(), durable);
+        assert_eq!(provider.calls(), envelope_calls);
     });
 }
 
@@ -277,19 +309,31 @@ fn cold_restore_never_reuses_unwritten_probe_ids_or_accepts_old_liveness() {
             window!(runtime, window, window.ready()),
             Err(WindowError::LivenessRecoveryRequired)
         );
-        assert!(complete(&mut runtime, &old_response).is_err());
-        assert!(send(&mut runtime, &mut transport).is_err());
-        assert!(runtime
-            .publish_request(
-                &provider,
-                &mut store,
-                Exchange::Informational,
-                child_delete(),
-                |_| {},
-                Cut::Complete
-            )
-            .is_err());
-        assert!(window!(runtime, window, window.prepare_liveness(1).map(|_| ())).is_err());
+        assert_eq!(
+            complete(&mut runtime, &old_response),
+            Err(Error::Window(WindowError::Drop))
+        );
+        assert_eq!(
+            send(&mut runtime, &mut transport),
+            Err(Error::Window(WindowError::LivenessRecoveryRequired))
+        );
+        assert_eq!(
+            runtime
+                .publish_request(
+                    &provider,
+                    &mut store,
+                    Exchange::Informational,
+                    child_delete(),
+                    |_| {},
+                    Cut::Complete
+                )
+                .map(|_| ()),
+            Err(Error::Window(WindowError::LivenessRecoveryRequired))
+        );
+        assert_eq!(
+            window!(runtime, window, window.prepare_liveness(1).map(|_| ())),
+            Err(WindowError::LivenessRecoveryRequired)
+        );
         if row.mode == Mode::Negotiated {
             recover(&mut runtime, &provider, &mut store, &mut peer);
             runtime
@@ -305,7 +349,10 @@ fn cold_restore_never_reuses_unwritten_probe_ids_or_accepts_old_liveness() {
                 .unwrap();
             let next = send(&mut runtime, &mut transport).unwrap();
             assert!(next >= 4);
-            assert!(complete(&mut runtime, &old_response).is_err());
+            assert_eq!(
+                complete(&mut runtime, &old_response),
+                Err(Error::Window(WindowError::Drop))
+            );
             assert_eq!(
                 peer.receive(transport.submitted.last().unwrap()),
                 Ok(Event::NewRequest(next))
@@ -315,17 +362,22 @@ fn cold_restore_never_reuses_unwritten_probe_ids_or_accepts_old_liveness() {
                 Ok(next)
             );
         } else {
-            assert!(window!(
-                runtime,
-                window,
-                window
-                    .begin_sync(policy(9), Clock::new(100, 9), None)
-                    .map(|_| ())
-            )
-            .is_err());
+            assert_eq!(
+                window!(
+                    runtime,
+                    window,
+                    window
+                        .begin_sync(policy(9), Clock::new(100, 9), None)
+                        .map(|_| ())
+                ),
+                Err(WindowError::Drop)
+            );
             // Base IKE has no safe counter-resynchronization path: retire this epoch.
             runtime.revoke();
-            assert!(retransmit(&mut runtime, &mut transport).is_err());
+            assert_eq!(
+                retransmit(&mut runtime, &mut transport),
+                Err(Error::Owner(authority::Error::Revoked))
+            );
         }
     });
 }
@@ -429,22 +481,36 @@ fn deadline_expiry_never_skips_a_missing_request_at_the_peer() {
             window!(runtime, window, window.check_empty_probe_deadline(4_000)),
             Err(WindowError::LivenessExpired)
         );
-        assert!(send(&mut runtime, &mut transport).is_err());
-        assert!(retransmit(&mut runtime, &mut transport).is_err());
-        assert!(complete(&mut runtime, &peer.wire.seal(0, true, 37, empty())).is_err());
+        assert_eq!(
+            send(&mut runtime, &mut transport),
+            Err(Error::Window(WindowError::LivenessExpired))
+        );
+        assert_eq!(
+            retransmit(&mut runtime, &mut transport),
+            Err(Error::Window(WindowError::LivenessExpired))
+        );
+        assert_eq!(
+            complete(&mut runtime, &peer.wire.seal(0, true, 37, empty())),
+            Err(Error::Window(WindowError::LivenessExpired))
+        );
         assert_eq!(store.encrypted_snapshot(), durable);
         // RFC 7296 section 2.4 requires deleting the IKE SA after failed
         // liveness. A local deadline is terminal, including for negotiated sync.
-        assert!(window!(
-            runtime,
-            window,
-            window
-                .begin_sync(policy(9), Clock::new(4_000, 9), None)
-                .map(|_| ())
-        )
-        .is_err());
+        assert_eq!(
+            window!(
+                runtime,
+                window,
+                window
+                    .begin_sync(policy(9), Clock::new(4_000, 9), None)
+                    .map(|_| ())
+            ),
+            Err(WindowError::LivenessExpired)
+        );
         runtime.revoke();
-        assert!(send(&mut runtime, &mut transport).is_err());
+        assert_eq!(
+            send(&mut runtime, &mut transport),
+            Err(Error::Owner(authority::Error::Revoked))
+        );
     });
 }
 
@@ -533,7 +599,10 @@ fn activation_cannot_escape_an_uncertain_write_and_readback_preserves_its_actual
             let (provider, mut store, _owners, initial, mut runtime) = setup(&row);
             let command = enable(&mut runtime, &provider, &mut store, 4, cut);
             let mut transport = Transport::default();
-            assert!(send(&mut runtime, &mut transport).is_err());
+            assert_eq!(
+                send(&mut runtime, &mut transport),
+                Err(Error::Window(WindowError::CommitUncertain))
+            );
             assert!(transport.submitted.is_empty());
             if cut == Cut::BeforeDispatch {
                 // The owner has joined the undispatched preparation; no write can still arrive.
@@ -545,7 +614,10 @@ fn activation_cannot_escape_an_uncertain_write_and_readback_preserves_its_actual
                 enable(&mut runtime, &provider, &mut store, 4, Cut::Complete);
             } else {
                 if cut == Cut::Dispatched {
-                    assert!(runtime.resolve(&provider, &store, &command).is_err());
+                    assert_eq!(
+                        runtime.resolve(&provider, &store, &command),
+                        Err(Error::Store(store::Error::PriorMayStillApply))
+                    );
                     store.apply(command.request()).unwrap();
                 }
                 runtime.resolve(&provider, &store, &command).unwrap();
@@ -612,7 +684,10 @@ fn folding_probes_preserves_the_settled_outcome_and_keeps_the_row_restorable() {
             )
             .unwrap();
         let command = runtime.pending.clone().unwrap();
-        assert!(retransmit(&mut runtime, &mut transport).is_err());
+        assert_eq!(
+            retransmit(&mut runtime, &mut transport),
+            Err(Error::Window(WindowError::CommitUncertain))
+        );
         runtime.resolve(&provider, &store, &command).unwrap();
         assert_eq!(runtime.row.window.next_send, Some(2));
         // RFC 7296 section 2.2 separates the two request directions. This
@@ -765,7 +840,10 @@ pub fn run_process(root: &std::path::Path, stage: &str, provider: &Provider) {
             );
             assert_eq!(peer.receive(&read(root, &packet)), Ok(Event::NewRequest(0)));
             let old_response = peer.respond(0, empty()).unwrap();
-            assert!(complete(&mut runtime, &old_response).is_err());
+            assert_eq!(
+                complete(&mut runtime, &old_response),
+                Err(Error::Window(WindowError::Drop))
+            );
             assert_eq!(
                 window!(runtime, window, window.ready()),
                 Err(WindowError::LivenessRecoveryRequired)
@@ -785,7 +863,10 @@ pub fn run_process(root: &std::path::Path, stage: &str, provider: &Provider) {
                     .unwrap();
                 let next = send(&mut runtime, &mut transport).unwrap();
                 assert!(next >= 4);
-                assert!(complete(&mut runtime, &old_response).is_err());
+                assert_eq!(
+                    complete(&mut runtime, &old_response),
+                    Err(Error::Window(WindowError::Drop))
+                );
                 assert_eq!(
                     peer.receive(transport.submitted.last().unwrap()),
                     Ok(Event::NewRequest(next))
@@ -793,7 +874,10 @@ pub fn run_process(root: &std::path::Path, stage: &str, provider: &Provider) {
                 complete(&mut runtime, &peer.respond(next, empty()).unwrap()).unwrap();
             } else {
                 runtime.revoke();
-                assert!(send(&mut runtime, &mut transport).is_err());
+                assert_eq!(
+                    send(&mut runtime, &mut transport),
+                    Err(Error::Owner(authority::Error::Revoked))
+                );
             }
         }
     }

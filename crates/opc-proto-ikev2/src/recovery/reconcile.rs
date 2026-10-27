@@ -94,6 +94,8 @@ impl<P: RecoveryProfile> Window<P> {
             crate::canonical::invalidate_profile(&P::from_epoch(epoch));
             self.receive.discard_replies();
             self.send.discard();
+            self.fragments.cutover();
+            self.packet_evidence = P::SyncEvidence::default();
             self.witness = None;
             self.reconcile_terminal = true;
             return Err(error);
@@ -154,6 +156,8 @@ impl<P: RecoveryProfile> Window<P> {
         }
         if kind == Some(Kind::Sync) {
             self.observed_peer_request.set(None);
+            self.fragments.cutover();
+            self.packet_evidence = P::SyncEvidence::default();
         }
         self.sync_last_observed_unix_ms = self.sync_last_observed_unix_ms.max(
             record

@@ -96,11 +96,8 @@ fn offered(wire: &[u8], spis: (u64, u64), response: bool) -> Result<bool, Error>
         }
         let notify = Ikev2NotifyPayload::decode(payload).map_err(|_| Error::Drop)?;
         if notify.notify_message_type == crate::IKEV2_FRAGMENTATION_SUPPORTED_NOTIFY_TYPE {
-            if support
-                || notify.protocol_id != 0
-                || notify.spi_size != 0
-                || !notify.notification_data.is_empty()
-            {
+            // RFC 7296 §3.10: ignore Protocol ID when the SPI is empty.
+            if support || notify.spi_size != 0 || !notify.notification_data.is_empty() {
                 return Err(Error::Drop);
             }
             support = true;
@@ -309,7 +306,7 @@ impl<P: RecoveryProfile> Window<P> {
         use super::packet;
         self.fragments.advance(now_ms)?;
         let frame = packet::open_frame(&self.record.domain, profile, keys, wire, true)?;
-        let Some((number, _)) = frame.fragment else {
+        let Some((number, total)) = frame.fragment else {
             let queue = if frame.header.flags.response() {
                 &mut self.fragments.response
             } else {
@@ -331,7 +328,12 @@ impl<P: RecoveryProfile> Window<P> {
         if !frame.header.flags.response() && frame.header.exchange_type == 37 {
             if let Some(cached) = self.receive.cached_empty_request(frame.header.message_id) {
                 self.ready_for_cached_response()?;
-                if number != 1 {
+                if number != 1
+                    || total != 1
+                    || frame.first != PayloadType::NoNext
+                    || !frame.cleartext.is_empty()
+                    || cached.single_packet()? != wire
+                {
                     return Err(Error::Drop);
                 }
                 // Reuse the complete authenticated empty request, never partial new content.
