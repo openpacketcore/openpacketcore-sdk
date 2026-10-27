@@ -764,17 +764,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TIME_OOP` and kernel/PPS faults. Unsupported platforms fail explicitly with
   no wall-clock fallback. Refs #1244.
 
-- `opc-session-net`: prepared V2 fenced-transition handles expose
-  `execute_once_with_failure_diagnostic`, an additive diagnostic wrapper around
-  the unchanged `execute_once` effect classification. A `NotTransmitted` or
-  `OutcomeUnknown` failure now carries a value-free
-  `SessionConsumerPreparedFencedTransitionV2FailureDiagnostic` with a closed
-  `setup`/`send`/`awaiting_reply`/`reply_lost` stage and the remaining original
-  caller budget in milliseconds, so a cold setup expiry, a held refusal and
-  reply loss can be told apart in logs and metrics. Dispatch authority,
-  ownership, effect classification, request identity and wire format are
-  unchanged; `into_error` recovers exactly the previous error. Resolved
-  rejections and lease deferrals carry no diagnostic. Refs #1129.
 - `opc-gtpu-dataplane`: expose `control_port::GtpuControlPort::downlink_readiness`,
   an SDK-owned readiness source for the backend-owned downlink queues. The
   returned `GtpuControlReadiness` owns a private epoll instance in which the

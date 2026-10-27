@@ -107,161 +107,6 @@ pub enum SessionConsumerFencedTransitionV2AbandonError {
     Unavailable,
 }
 
-/// Value-free stage at which one prepared V2 fenced-transition execution
-/// failed.
-///
-/// The vocabulary is closed, fixed-label and bounded. It carries no request
-/// ID, endpoint, identity, scope, owner, fence, credential, key or payload
-/// value, so it is safe for logs and low-cardinality metrics. It explains a
-/// failure that the effect classification cannot distinguish: a cold setup
-/// that never dispatched, a physical attempt that was admitted but wrote
-/// nothing, a request whose reply was still outstanding when the attempt
-/// budget expired, or a reply path that ended without an exact completion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SessionConsumerPreparedFencedTransitionV2FailureStage {
-    /// No physical attempt was admitted: local preflight/journal state,
-    /// dispatch authority, or the attempt budget expired before dispatch.
-    Setup,
-    /// A physical attempt was admitted, but no request byte was accepted for
-    /// transmission.
-    Send,
-    /// Request bytes were accepted and the physical attempt budget expired
-    /// while awaiting a matching reply (for example a held or late refusal).
-    AwaitingReply,
-    /// The reply path ended, or a reply arrived that was not an exact
-    /// completion, before the physical attempt budget expired.
-    ReplyLost,
-}
-
-impl SessionConsumerPreparedFencedTransitionV2FailureStage {
-    /// Fixed, value-free label for logs and metrics.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Setup => "setup",
-            Self::Send => "send",
-            Self::AwaitingReply => "awaiting_reply",
-            Self::ReplyLost => "reply_lost",
-        }
-    }
-}
-
-/// Value-free diagnostic attached to one failed prepared V2 execution.
-///
-/// It contains only the closed failure stage and the remaining original
-/// caller budget in milliseconds. No value, request ID, identity, scope,
-/// endpoint, owner, fence, credential, key or payload byte is retained.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SessionConsumerPreparedFencedTransitionV2FailureDiagnostic {
-    stage: SessionConsumerPreparedFencedTransitionV2FailureStage,
-    remaining_budget_millis: u64,
-}
-
-impl SessionConsumerPreparedFencedTransitionV2FailureDiagnostic {
-    const fn new(
-        stage: SessionConsumerPreparedFencedTransitionV2FailureStage,
-        remaining_budget_millis: u64,
-    ) -> Self {
-        Self {
-            stage,
-            remaining_budget_millis,
-        }
-    }
-
-    /// The closed, value-free stage of the failed execution attempt.
-    pub const fn stage(&self) -> SessionConsumerPreparedFencedTransitionV2FailureStage {
-        self.stage
-    }
-
-    /// Remaining original caller budget when the failure was observed,
-    /// truncated to whole milliseconds and never negative.
-    pub const fn remaining_budget_millis(&self) -> u64 {
-        self.remaining_budget_millis
-    }
-
-    /// Fixed, value-free stage label, identical to [`Self::stage`]'s label.
-    pub const fn as_str(self) -> &'static str {
-        self.stage.as_str()
-    }
-}
-
-/// Diagnostic-only wrapper around one failed prepared V2 execution.
-///
-/// The effect-boundary classification, dispatch authority and ownership are
-/// exactly those of [`SessionConsumerPreparedFencedTransitionV2::execute_once`].
-/// [`Self::into_error`] yields precisely the [`opc_session_store::FencedTransitionExecuteError`]
-/// that method would have returned, so a caller may treat the result exactly
-/// as before and use the diagnostic for logging and metrics only. The
-/// diagnostic is present for a `NotTransmitted` or `OutcomeUnknown` result
-/// and absent for a resolved rejection or deferral.
-#[derive(Clone, PartialEq, Eq)]
-pub struct SessionConsumerPreparedFencedTransitionV2Failure {
-    error: FencedTransitionExecuteError,
-    diagnostic: Option<SessionConsumerPreparedFencedTransitionV2FailureDiagnostic>,
-}
-
-impl SessionConsumerPreparedFencedTransitionV2Failure {
-    /// Exact existing effect-boundary classification for this failed call.
-    pub const fn error(&self) -> &FencedTransitionExecuteError {
-        &self.error
-    }
-
-    /// Value-free diagnostic for a `NotTransmitted` or `OutcomeUnknown`
-    /// result. `None` means the outcome was a resolved rejection or deferral,
-    /// for which no transport stage exists.
-    pub const fn diagnostic(
-        &self,
-    ) -> Option<&SessionConsumerPreparedFencedTransitionV2FailureDiagnostic> {
-        self.diagnostic.as_ref()
-    }
-
-    /// Discard the diagnostic and recover today's exact error result.
-    pub fn into_error(self) -> FencedTransitionExecuteError {
-        self.error
-    }
-
-    fn error_kind(&self) -> &'static str {
-        match &self.error {
-            FencedTransitionExecuteError::NotTransmitted => "not_transmitted",
-            FencedTransitionExecuteError::OutcomeUnknown { .. } => "outcome_unknown",
-            FencedTransitionExecuteError::Rejected(_) => "rejected",
-            FencedTransitionExecuteError::LeaseDeferred => "lease_deferred",
-            // The store crate owns this non-exhaustive classification; an
-            // unknown future variant stays a value-free fixed label here.
-            _ => "other",
-        }
-    }
-}
-
-impl fmt::Debug for SessionConsumerPreparedFencedTransitionV2Failure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut debug = formatter.debug_struct("SessionConsumerPreparedFencedTransitionV2Failure");
-        debug.field("error_kind", &self.error_kind());
-        match &self.diagnostic {
-            Some(diagnostic) => debug
-                .field("stage", &diagnostic.stage().as_str())
-                .field(
-                    "remaining_budget_millis",
-                    &diagnostic.remaining_budget_millis(),
-                )
-                .finish_non_exhaustive(),
-            None => debug.field("stage", &"none").finish_non_exhaustive(),
-        }
-    }
-}
-
-impl fmt::Display for SessionConsumerPreparedFencedTransitionV2Failure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.error, formatter)
-    }
-}
-
-impl std::error::Error for SessionConsumerPreparedFencedTransitionV2Failure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
 /// Fixed numeric result of one bounded reclamation sweep.
 ///
 /// It contains no identity, epoch, key, or payload value.
@@ -521,10 +366,6 @@ struct PreparedFencedTransitionV2Route {
     // including a complete, correlated pre-dispatch refusal. A handle cancelled
     // while this is set may have sent.
     dispatch_admitted: AtomicBool,
-    // Value-free stage of the most recent failed execution observation. Per
-    // handle: the public handle's `&mut` execution/status methods serialize
-    // access, and the net-private adapter shares only this allocation.
-    failure_stage: StdMutex<Option<SessionConsumerPreparedFencedTransitionV2FailureStage>>,
 }
 
 impl PreparedFencedTransitionV2Route {
@@ -534,29 +375,7 @@ impl PreparedFencedTransitionV2Route {
             status_cursor: AtomicUsize::new(origin.wrapping_add(1)),
             attempt_deadline: StdMutex::new(None),
             dispatch_admitted: AtomicBool::new(false),
-            failure_stage: StdMutex::new(None),
         }
-    }
-
-    fn clear_failure_stage(&self) {
-        *self
-            .failure_stage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    }
-
-    fn record_failure_stage(&self, stage: SessionConsumerPreparedFencedTransitionV2FailureStage) {
-        *self
-            .failure_stage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stage);
-    }
-
-    fn failure_stage(&self) -> Option<SessionConsumerPreparedFencedTransitionV2FailureStage> {
-        *self
-            .failure_stage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn mutation_voter(&self, voter_count: usize) -> usize {
@@ -606,44 +425,6 @@ impl PreparedFencedTransitionV2Route {
 
     fn may_have_dispatched(&self) -> bool {
         self.dispatch_admitted.load(Ordering::Acquire)
-    }
-}
-
-/// Classify one physical-attempt failure into the closed diagnostic stage.
-///
-/// Diagnostic-only: the effect classification is derived from the same
-/// response by the caller and is never changed here. `deadline_reached`
-/// records whether the installed physical-attempt budget had expired when the
-/// failure was observed; a request whose reply was still outstanding then is
-/// `AwaitingReply`, while a reply path that ended earlier is `ReplyLost`.
-/// Revoked authority is a resolved classification and returns no stage.
-fn prepared_fenced_v2_effect_failure_stage(
-    deadline_reached: bool,
-    response: &Result<SessionConsumerV2Response, PersistentSessionConsumerV2ExecuteError>,
-) -> Option<SessionConsumerPreparedFencedTransitionV2FailureStage> {
-    use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
-    match response {
-        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
-            cause: SessionConsumerClientError::Scope | SessionConsumerClientError::AuthorityRevoked,
-        }) => None,
-        Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { .. }) => Some(Stage::Send),
-        Err(_) if deadline_reached => Some(Stage::AwaitingReply),
-        Err(_) => Some(Stage::ReplyLost),
-        Ok(_) => Some(Stage::ReplyLost),
-    }
-}
-
-/// Best-effort stage for an ambiguous effect result when the physical boundary
-/// did not record a more precise observation (for example an in-process
-/// scripted backend). The attempt deadline is the only fixed fact available.
-fn prepared_fenced_v2_ambiguous_failure_stage(
-    attempt_deadline: Option<tokio::time::Instant>,
-) -> SessionConsumerPreparedFencedTransitionV2FailureStage {
-    use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
-    if attempt_deadline.is_none_or(|deadline| tokio::time::Instant::now() >= deadline) {
-        Stage::AwaitingReply
-    } else {
-        Stage::ReplyLost
     }
 }
 
@@ -1012,15 +793,8 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
         request: FencedTransitionV2Request,
     ) -> FencedTransitionV2Effect<Result<FencedTransitionOutcome, StoreError>> {
         let Some(deadline) = self.attempt_deadline() else {
-            // No physical attempt could be admitted within the immutable
-            // caller budget: this is the diagnostic-only `setup` stage.
-            self.route
-                .record_failure_stage(SessionConsumerPreparedFencedTransitionV2FailureStage::Setup);
             return FencedTransitionV2Effect::NotTransmitted(prepared_fenced_v2_deadline());
         };
-        // The decisive observation is the attempt that resolves the call, so
-        // discard any stage recorded for an earlier rotated attempt.
-        self.route.clear_failure_stage();
         let voter = self.route.mutation_voter(self.voter_count());
         let client = &self.router.clients[voter];
         let wire = SessionConsumerV2Request::new(
@@ -1061,11 +835,6 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
             }
             Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted { .. }) => {
                 self.route.prove_not_transmitted();
-                // The attempt was admitted but proved that no request byte
-                // crossed the boundary.
-                self.route.record_failure_stage(
-                    SessionConsumerPreparedFencedTransitionV2FailureStage::Send,
-                );
                 FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(
                     "prepared fenced transition V2 was not transmitted".into(),
                 ))
@@ -1074,17 +843,9 @@ impl SessionBackend for ActivatedFencedTransitionV2Backend {
             // recorded deterministic error that the client does not accept
             // as an exact completion, and any post-write loss, may have
             // crossed the effect boundary.
-            response => {
-                let deadline_reached = tokio::time::Instant::now() >= deadline;
-                if let Some(stage) =
-                    prepared_fenced_v2_effect_failure_stage(deadline_reached, &response)
-                {
-                    self.route.record_failure_stage(stage);
-                }
-                FencedTransitionV2Effect::OutcomeUnknown {
-                    request_ids: vec![request.request_id()],
-                }
-            }
+            _ => FencedTransitionV2Effect::OutcomeUnknown {
+                request_ids: vec![request.request_id()],
+            },
         }
     }
 
@@ -2235,43 +1996,6 @@ impl SessionConsumerPreparedFencedTransitionV2 {
         self.inner.execute_once().await
     }
 
-    /// Dispatch the retained mutation once and report a value-free failure
-    /// diagnostic for an ambiguous transport result.
-    ///
-    /// This performs exactly the same operation as [`Self::execute_once`]:
-    /// effect classification, dispatch authority and ownership are unchanged,
-    /// and [`SessionConsumerPreparedFencedTransitionV2Failure::into_error`]
-    /// yields precisely the error `execute_once` would have returned. The
-    /// attached diagnostic explains the failure stage that the effect
-    /// classification cannot distinguish: a cold setup that never dispatched,
-    /// an admitted attempt that wrote nothing, a request whose reply was still
-    /// outstanding when the physical attempt budget expired, or a reply path
-    /// that ended without an exact completion. It contains only those closed
-    /// labels and the remaining original budget in milliseconds; it never
-    /// carries a value, request ID, identity, scope, endpoint, owner, fence,
-    /// credential, key or payload byte. A resolved rejection or lease deferral
-    /// carries no diagnostic.
-    pub async fn execute_once_with_failure_diagnostic(
-        &mut self,
-    ) -> Result<FencedTransitionOutcome, SessionConsumerPreparedFencedTransitionV2Failure> {
-        match self.inner.execute_once().await {
-            Ok(outcome) => Ok(outcome),
-            Err(error) => {
-                let ambiguous = matches!(
-                    &error,
-                    FencedTransitionExecuteError::NotTransmitted
-                        | FencedTransitionExecuteError::OutcomeUnknown { .. }
-                );
-                let diagnostic = if ambiguous {
-                    self.inner.failure_diagnostic()
-                } else {
-                    None
-                };
-                Err(SessionConsumerPreparedFencedTransitionV2Failure { error, diagnostic })
-            }
-        }
-    }
-
     /// Try one read-only receipt lookup on the next deterministic voter.
     pub async fn status_once(
         &mut self,
@@ -2622,7 +2346,6 @@ impl PersistentPreparedFencedTransitionV2Token {
     }
 
     async fn execute_once(&self) -> Result<FencedTransitionOutcome, FencedTransitionExecuteError> {
-        self.route.clear_failure_stage();
         match self.dispatch_authority.compare_exchange(
             V2_DISPATCH_UNUSED,
             V2_EXECUTION_STARTED,
@@ -2630,12 +2353,7 @@ impl PersistentPreparedFencedTransitionV2Token {
             Ordering::Acquire,
         ) {
             Ok(_) | Err(V2_EXECUTION_STARTED) => {}
-            Err(_) => {
-                self.route.record_failure_stage(
-                    SessionConsumerPreparedFencedTransitionV2FailureStage::Setup,
-                );
-                return Err(FencedTransitionExecuteError::NotTransmitted);
-            }
+            Err(_) => return Err(FencedTransitionExecuteError::NotTransmitted),
         }
         if let Some(FencedTransitionV2Status::Recorded(result)) = self.reclaimed_receipt() {
             self.terminal_receipt(Ok(FencedTransitionV2Status::Recorded(result.clone())))
@@ -2646,8 +2364,6 @@ impl PersistentPreparedFencedTransitionV2Token {
         let Some(mut preparation) =
             PreparedFencedV2PreparationGuard::begin(&self.state, &self.route, self.voter_count)
         else {
-            self.route
-                .record_failure_stage(SessionConsumerPreparedFencedTransitionV2FailureStage::Setup);
             return Err(FencedTransitionExecuteError::NotTransmitted);
         };
         if self
@@ -2656,8 +2372,6 @@ impl PersistentPreparedFencedTransitionV2Token {
             .is_some_and(|call| !call.dispatch_started())
         {
             preparation.receipt_only();
-            self.route
-                .record_failure_stage(SessionConsumerPreparedFencedTransitionV2FailureStage::Setup);
             return Err(FencedTransitionExecuteError::OutcomeUnknown {
                 request_id: self.prepared.request_id(),
             });
@@ -2691,8 +2405,6 @@ impl PersistentPreparedFencedTransitionV2Token {
             } else {
                 preparation.receipt_only();
             }
-            self.route
-                .record_failure_stage(SessionConsumerPreparedFencedTransitionV2FailureStage::Setup);
             return Err(FencedTransitionExecuteError::NotTransmitted);
         }
         #[cfg(test)]
@@ -2703,19 +2415,9 @@ impl PersistentPreparedFencedTransitionV2Token {
                 .checked_add(self.budget.physical_attempt_timeout())
                 .map(|capped| capped.min(self.budget.original_deadline()))
             else {
-                if self.route.failure_stage().is_none() {
-                    self.route.record_failure_stage(
-                        SessionConsumerPreparedFencedTransitionV2FailureStage::Setup,
-                    );
-                }
                 break;
             };
             if attempt_deadline <= now {
-                if self.route.failure_stage().is_none() {
-                    self.route.record_failure_stage(
-                        SessionConsumerPreparedFencedTransitionV2FailureStage::Setup,
-                    );
-                }
                 break;
             }
             self.route.install_attempt_deadline(attempt_deadline);
@@ -2792,29 +2494,10 @@ impl PersistentPreparedFencedTransitionV2Token {
                 {
                     self.route.rotate_after_not_transmitted();
                 }
-                FencedTransitionV2Effect::NotTransmitted(_) => {
-                    preparation.receipt_only();
-                    if self.route.failure_stage().is_none() {
-                        self.route.record_failure_stage(
-                            SessionConsumerPreparedFencedTransitionV2FailureStage::Send,
-                        );
-                    }
-                    returned.0 = None;
-                    return Err(FencedTransitionExecuteError::OutcomeUnknown {
-                        request_id: self.prepared.request_id(),
-                    });
-                }
                 _ => {
                     preparation.receipt_only();
                     // An attempt timeout does not end the original caller's
                     // deadline. Cancellation still drops the guard normally.
-                    if self.route.failure_stage().is_none() {
-                        self.route.record_failure_stage(
-                            prepared_fenced_v2_ambiguous_failure_stage(
-                                self.route.attempt_deadline(),
-                            ),
-                        );
-                    }
                     returned.0 = None;
                     return Err(FencedTransitionExecuteError::OutcomeUnknown {
                         request_id: self.prepared.request_id(),
@@ -2832,30 +2515,7 @@ impl PersistentPreparedFencedTransitionV2Token {
         } else {
             preparation.receipt_only();
         }
-        if self.route.failure_stage().is_none() {
-            self.route
-                .record_failure_stage(SessionConsumerPreparedFencedTransitionV2FailureStage::Setup);
-        }
         Err(FencedTransitionExecuteError::NotTransmitted)
-    }
-
-    /// Value-free diagnostic for the most recent failed execution, if the
-    /// physical boundary or the facade recorded a stage.
-    fn failure_diagnostic(
-        &self,
-    ) -> Option<SessionConsumerPreparedFencedTransitionV2FailureDiagnostic> {
-        let stage = self.route.failure_stage()?;
-        let remaining = self
-            .budget
-            .original_deadline()
-            .saturating_duration_since(tokio::time::Instant::now());
-        let remaining_budget_millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-        Some(
-            SessionConsumerPreparedFencedTransitionV2FailureDiagnostic::new(
-                stage,
-                remaining_budget_millis,
-            ),
-        )
     }
 
     fn cached_terminal_receipt(
@@ -3115,10 +2775,6 @@ mod tests {
         Reject(StoreError),
         HangBeforeAdmission,
         HangAfterAdmission,
-        /// Holds the physical attempt past its installed deadline and then
-        /// reports an ambiguous outcome, like a voter that accepts the request
-        /// and withholds its reply past the physical cap.
-        HoldPastAttemptDeadline,
         /// A proven pre-write failure that first runs a local fault action.
         NotTransmittedAfter(Arc<dyn Fn() + Send + Sync>),
     }
@@ -3251,16 +2907,9 @@ mod tests {
                 .pop_front()
                 .expect("scripted step");
             match step {
-                Step::NotTransmitted => {
-                    // Mirrors the private adapter: an admitted attempt that
-                    // proves no request byte crossed the boundary.
-                    self.route.record_failure_stage(
-                        SessionConsumerPreparedFencedTransitionV2FailureStage::Send,
-                    );
-                    FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(
-                        "scripted pre-write failure".into(),
-                    ))
-                }
+                Step::NotTransmitted => FencedTransitionV2Effect::NotTransmitted(
+                    StoreError::BackendUnavailable("scripted pre-write failure".into()),
+                ),
                 Step::NotTransmittedAfter(fault) => {
                     fault();
                     FencedTransitionV2Effect::NotTransmitted(StoreError::BackendUnavailable(
@@ -3275,10 +2924,6 @@ mod tests {
                 }
                 Step::Unknown => {
                     self.route.admit_dispatch();
-                    // Mirrors a reply path that ends before the attempt cap.
-                    self.route.record_failure_stage(
-                        SessionConsumerPreparedFencedTransitionV2FailureStage::ReplyLost,
-                    );
                     FencedTransitionV2Effect::OutcomeUnknown {
                         request_ids: vec![request.request_id()],
                     }
@@ -3291,21 +2936,6 @@ mod tests {
                 Step::HangAfterAdmission => {
                     self.route.admit_dispatch();
                     std::future::pending().await
-                }
-                Step::HoldPastAttemptDeadline => {
-                    self.route.admit_dispatch();
-                    let deadline = self
-                        .route
-                        .attempt_deadline()
-                        .expect("handle installs the physical attempt deadline");
-                    tokio::time::sleep_until(deadline).await;
-                    // Mirrors a refused reply held past the physical cap.
-                    self.route.record_failure_stage(
-                        SessionConsumerPreparedFencedTransitionV2FailureStage::AwaitingReply,
-                    );
-                    FencedTransitionV2Effect::OutcomeUnknown {
-                        request_ids: vec![request.request_id()],
-                    }
                 }
             }
         }
@@ -4587,319 +4217,5 @@ mod tests {
             tokio::time::Instant::now() < deadline,
             "a cached terminal receipt ends the loop at once"
         );
-    }
-
-    fn diagnosed_handle(
-        token: PersistentPreparedFencedTransitionV2Token,
-    ) -> SessionConsumerPreparedFencedTransitionV2 {
-        SessionConsumerPreparedFencedTransitionV2 { inner: token }
-    }
-
-    /// The closed stage vocabulary is fixed-label and value-free.
-    #[test]
-    fn v2_failure_diagnostic_stages_are_fixed_labels() {
-        use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
-        for (stage, label) in [
-            (Stage::Setup, "setup"),
-            (Stage::Send, "send"),
-            (Stage::AwaitingReply, "awaiting_reply"),
-            (Stage::ReplyLost, "reply_lost"),
-        ] {
-            assert_eq!(stage.as_str(), label);
-            let diagnostic =
-                SessionConsumerPreparedFencedTransitionV2FailureDiagnostic::new(stage, 4321);
-            assert_eq!(diagnostic.stage(), stage);
-            assert_eq!(diagnostic.as_str(), label);
-            assert_eq!(diagnostic.remaining_budget_millis(), 4321);
-        }
-    }
-
-    /// The pure classifier distinguishes a pre-write attempt failure from a
-    /// held reply and a lost reply, and reports no stage for a resolved
-    /// revocation classification.
-    #[test]
-    fn v2_effect_failure_stage_classification_is_fixed() {
-        use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
-        let request_id = opc_session_store::FencedTransitionV2RequestId::from_parts(
-            opc_session_store::FencedTransitionV2HistoryEpoch::new(1).expect("epoch"),
-            opc_session_store::FencedTransitionV2CallerNonce::from_bytes([0x75; 16]),
-            [0x76; 32],
-        );
-        let not_transmitted = Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
-            cause: SessionConsumerClientError::Unavailable,
-        });
-        assert_eq!(
-            prepared_fenced_v2_effect_failure_stage(false, &not_transmitted),
-            Some(Stage::Send)
-        );
-        let revoked = Err(PersistentSessionConsumerV2ExecuteError::NotTransmitted {
-            cause: SessionConsumerClientError::AuthorityRevoked,
-        });
-        assert_eq!(
-            prepared_fenced_v2_effect_failure_stage(false, &revoked),
-            None
-        );
-        let unknown = Err(PersistentSessionConsumerV2ExecuteError::OutcomeUnknown { request_id });
-        assert_eq!(
-            prepared_fenced_v2_effect_failure_stage(false, &unknown),
-            Some(Stage::ReplyLost)
-        );
-        assert_eq!(
-            prepared_fenced_v2_effect_failure_stage(true, &unknown),
-            Some(Stage::AwaitingReply)
-        );
-        let deadline = Err(PersistentSessionConsumerV2ExecuteError::ReadUnavailable {
-            cause: SessionConsumerClientError::Deadline,
-        });
-        assert_eq!(
-            prepared_fenced_v2_effect_failure_stage(true, &deadline),
-            Some(Stage::AwaitingReply)
-        );
-        let inexact_reply = Ok(SessionConsumerV2Response::Rejected(
-            SessionConsumerRejection::Unavailable,
-        ));
-        assert_eq!(
-            prepared_fenced_v2_effect_failure_stage(false, &inexact_reply),
-            Some(Stage::ReplyLost)
-        );
-    }
-
-    /// The fallback used only when the physical boundary did not record a
-    /// more precise observation uses the installed attempt deadline.
-    #[test]
-    fn v2_ambiguous_failure_stage_falls_back_to_the_attempt_deadline() {
-        use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
-        let now = tokio::time::Instant::now();
-        assert_eq!(
-            prepared_fenced_v2_ambiguous_failure_stage(Some(now + Duration::from_secs(1))),
-            Stage::ReplyLost
-        );
-        assert_eq!(
-            prepared_fenced_v2_ambiguous_failure_stage(Some(now - Duration::from_secs(1))),
-            Stage::AwaitingReply
-        );
-        assert_eq!(
-            prepared_fenced_v2_ambiguous_failure_stage(None),
-            Stage::AwaitingReply
-        );
-    }
-
-    /// A cold setup that never admits a physical attempt reports `setup` and a
-    /// zero remaining budget, and consumes no dispatch authority.
-    #[tokio::test]
-    async fn v2_failure_diagnostic_reports_setup_when_original_budget_expired() {
-        use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
-        let harness = harness(vec![Step::Commit]).await;
-        let mut token = harness.prepare().await;
-        // The immutable caller budget is already exhausted before execution.
-        token.budget = PreparedCheckpointBudget::new(
-            tokio::time::Instant::now() - Duration::from_millis(1),
-            Duration::from_millis(100),
-        )
-        .expect("past original budget");
-        let mut handle = diagnosed_handle(token);
-        let failure = handle
-            .execute_once_with_failure_diagnostic()
-            .await
-            .expect_err("an expired original budget must not commit");
-        assert_eq!(
-            failure.error(),
-            &FencedTransitionExecuteError::NotTransmitted
-        );
-        let diagnostic = failure
-            .diagnostic()
-            .copied()
-            .expect("a transport failure carries a diagnostic");
-        assert_eq!(diagnostic.stage(), Stage::Setup);
-        assert_eq!(diagnostic.remaining_budget_millis(), 0);
-        assert!(
-            harness.physical.voters().is_empty(),
-            "no physical attempt may start"
-        );
-        assert!(!harness.route.may_have_dispatched());
-        assert_eq!(
-            handle
-                .execute_once_with_failure_diagnostic()
-                .await
-                .map_err(|failure| failure.into_error()),
-            Err(FencedTransitionExecuteError::NotTransmitted),
-            "dispatch authority stays consumed"
-        );
-    }
-
-    /// A refusal held past the physical attempt cap reports `awaiting_reply`
-    /// with the remaining original budget still visible.
-    #[tokio::test]
-    async fn v2_failure_diagnostic_reports_awaiting_reply_for_held_refusal() {
-        use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
-        let harness = harness(vec![Step::HoldPastAttemptDeadline]).await;
-        let mut handle = diagnosed_handle(harness.prepare().await);
-        let failure = handle
-            .execute_once_with_failure_diagnostic()
-            .await
-            .expect_err("a held refusal is an ambiguous outcome");
-        assert!(matches!(
-            failure.error(),
-            FencedTransitionExecuteError::OutcomeUnknown { request_id }
-                if *request_id == harness.request_id
-        ));
-        let diagnostic = failure
-            .diagnostic()
-            .copied()
-            .expect("an ambiguous outcome carries a diagnostic");
-        assert_eq!(diagnostic.stage(), Stage::AwaitingReply);
-        assert!(
-            (1..=5_000).contains(&diagnostic.remaining_budget_millis()),
-            "remaining original budget is bounded and still positive"
-        );
-        assert_eq!(
-            harness.retained().await,
-            1,
-            "ownership unchanged: a possible send keeps the recovery row"
-        );
-    }
-
-    /// A reply path that ends without an exact completion reports `reply_lost`.
-    #[tokio::test]
-    async fn v2_failure_diagnostic_reports_reply_lost() {
-        use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
-        let harness = harness(vec![Step::Unknown]).await;
-        let mut handle = diagnosed_handle(harness.prepare().await);
-        let failure = handle
-            .execute_once_with_failure_diagnostic()
-            .await
-            .expect_err("a lost reply is an ambiguous outcome");
-        assert!(matches!(
-            failure.error(),
-            FencedTransitionExecuteError::OutcomeUnknown { .. }
-        ));
-        let diagnostic = failure
-            .diagnostic()
-            .copied()
-            .expect("an ambiguous outcome carries a diagnostic");
-        assert_eq!(diagnostic.stage(), Stage::ReplyLost);
-    }
-
-    /// The diagnostic wrapper preserves the previous effect classification and
-    /// ownership for both committed and ambiguous results.
-    #[tokio::test]
-    async fn v2_diagnosed_execution_preserves_effects_and_ownership() {
-        let plain_harness = harness(vec![Step::Commit]).await;
-        let plain = plain_harness
-            .prepare()
-            .await
-            .execute_once()
-            .await
-            .expect("plain commit");
-        let diagnosed_harness = harness(vec![Step::Commit]).await;
-        let mut handle = diagnosed_handle(diagnosed_harness.prepare().await);
-        // The recorded wall-clock outcome differs between two installations;
-        // the effect shape, dispatch path and release ownership must not.
-        let diagnosed = handle
-            .execute_once_with_failure_diagnostic()
-            .await
-            .expect("diagnosed commit");
-        assert_eq!(diagnosed.committed_generation(), Generation::new(1));
-        assert_eq!(plain.committed_generation(), Generation::new(1));
-        assert_eq!(
-            diagnosed_harness.physical.voters(),
-            plain_harness.physical.voters()
-        );
-        assert_eq!(diagnosed_harness.retained().await, 1);
-        handle
-            .release_resolved()
-            .await
-            .expect("release after commit");
-        assert_eq!(diagnosed_harness.retained().await, 0);
-
-        let plain_harness = harness(vec![Step::Unknown]).await;
-        let plain_error = plain_harness
-            .prepare()
-            .await
-            .execute_once()
-            .await
-            .expect_err("plain ambiguity");
-        let diagnosed_harness = harness(vec![Step::Unknown]).await;
-        let mut handle = diagnosed_handle(diagnosed_harness.prepare().await);
-        let diagnosed = handle
-            .execute_once_with_failure_diagnostic()
-            .await
-            .expect_err("diagnosed ambiguity")
-            .into_error();
-        assert_eq!(diagnosed, plain_error);
-        assert_eq!(diagnosed_harness.retained().await, 1);
-        assert_eq!(
-            handle
-                .execute_once_with_failure_diagnostic()
-                .await
-                .map_err(|failure| failure.into_error()),
-            Err(FencedTransitionExecuteError::NotTransmitted)
-        );
-    }
-
-    /// A resolved rejection carries no diagnostic because no transport stage
-    /// exists for it.
-    #[tokio::test]
-    async fn v2_failure_diagnostic_absent_for_resolved_rejection() {
-        let harness = harness(vec![Step::Reject(
-            StoreError::FencedTransitionRequestConflict,
-        )])
-        .await;
-        let mut handle = diagnosed_handle(harness.prepare().await);
-        let failure = handle
-            .execute_once_with_failure_diagnostic()
-            .await
-            .expect_err("a conflict is a rejection");
-        assert!(matches!(
-            failure.error(),
-            FencedTransitionExecuteError::Rejected(StoreError::FencedTransitionRequestConflict)
-        ));
-        assert!(failure.diagnostic().is_none());
-    }
-
-    /// The wrapper debug/display surface never renders the exact request
-    /// identity, a scope/identity/endpoint, or payload material.
-    #[test]
-    fn v2_failure_diagnostic_is_value_free() {
-        use SessionConsumerPreparedFencedTransitionV2FailureStage as Stage;
-        let request_id = FencedTransitionRequestId::from_bytes([0x74; 16]);
-        let failure = SessionConsumerPreparedFencedTransitionV2Failure {
-            error: FencedTransitionExecuteError::OutcomeUnknown { request_id },
-            diagnostic: Some(
-                SessionConsumerPreparedFencedTransitionV2FailureDiagnostic::new(
-                    Stage::AwaitingReply,
-                    987,
-                ),
-            ),
-        };
-        let debug = format!("{failure:?}");
-        assert!(debug.contains("outcome_unknown"), "{debug}");
-        assert!(debug.contains("awaiting_reply"), "{debug}");
-        assert!(debug.contains("987"), "{debug}");
-        let rendered_id = format!("{request_id:?}");
-        for forbidden in [
-            "prepared-fenced-v2-unit",
-            "spiffe://",
-            "tenant",
-            "owner",
-            "endpoint",
-            "request_id",
-            "credential",
-            rendered_id.as_str(),
-        ] {
-            assert!(
-                !debug.contains(forbidden),
-                "debug surface leaked {forbidden:?}: {debug}"
-            );
-        }
-        let display = format!("{failure}");
-        for forbidden in [
-            "prepared-fenced-v2-unit",
-            "spiffe://",
-            "0x74",
-            rendered_id.as_str(),
-        ] {
-            assert!(!display.contains(forbidden), "display leaked {forbidden:?}");
-        }
     }
 }

@@ -22355,9 +22355,6 @@ pub use prepared_fenced_v2::{
     SessionConsumerFencedTransitionV2ReleaseError, SessionConsumerPreparedFencedTransitionV2,
     SessionConsumerPreparedFencedTransitionV2Backend,
     SessionConsumerPreparedFencedTransitionV2BackendError,
-    SessionConsumerPreparedFencedTransitionV2Failure,
-    SessionConsumerPreparedFencedTransitionV2FailureDiagnostic,
-    SessionConsumerPreparedFencedTransitionV2FailureStage,
     SessionConsumerRecoveredFencedTransition, SessionConsumerRecoveredFencedTransitionV2Status,
 };
 
