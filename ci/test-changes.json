@@ -364,6 +364,18 @@
       "kind": "assertions-decreased",
       "reason": "Replace the ad-hoc redirect-IT timeout eprintln block (which called `ip -6 addr/neigh show` with an expect) with the shared DatapathTimeoutDiagnostics formatter. The timeout assertion and every behavioral assertion are unchanged; the removed diagnostic `expect` is now a failure-safe bounded renderer, so the static helper resolver attributes fewer assertions while failures report strictly more datapath state (redirect delta, shared-peer iteration, counter values, tentative addresses, neighbours, routes).",
       "issue": 1188
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::storage::scan_dynamic_snapshot_envelope",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::cancelled_dynamic_current_snapshot_scan_retains_worker_ownership",
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::cancelled_dynamic_snapshot_admission_retains_descriptor_work_ownership",
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::cancelled_dynamic_snapshot_admission_retains_ownership_after_runtime_shutdown",
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::snapshot_is_file_backed_checksummed_and_installs_atomically"
+      ],
+      "reason": "The inventory misclassifies cfg_attr(not(test), allow(unused_variables)) on this production helper as a test. Issue #1371 consolidates the duplicate Dynamic envelope scan into verify_snapshot_envelope_sync on the fully owned admission worker. Footer, size, length and checksum checks and the scan hooks remain. The named tests retain the existing scan/checksum coverage and add descriptor-work and runtime-cancellation ownership coverage; no libtest test is removed.",
+      "issue": 1371
     }
   ]
 }
