@@ -1019,9 +1019,10 @@ no-effect receipt; other journals follow the existing epoch lifecycle. A resumed
 deferred request retains its earlier binding when a later preflight fails.
 
 After a failed `execute_once`, `execution_failure_diagnostics()` reports a
-closed stage (`setup`, `send`, `awaiting_reply`, or `reply_lost`) and the
-remaining original caller budget in milliseconds. The snapshot describes
-local progress: `send` includes preparing the Call on an authenticated lane;
+stage (`setup`, `send`, `awaiting_reply`, or `reply_lost`) and the remaining
+original caller budget in milliseconds. The stage enum is non-exhaustive so
+future diagnostics can add stages. The snapshot describes local progress:
+`send` includes preparing the Call on an authenticated lane;
 `reply_lost` means a written Call lost its connection or received an unusable
 reply. Neither stage proves a remote commit. The snapshot contains no request,
 peer, journal or store-error values and grants no retry or release authority.

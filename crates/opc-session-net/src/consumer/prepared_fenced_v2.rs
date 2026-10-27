@@ -83,11 +83,13 @@ impl fmt::Debug for ActivatedSessionConsumerFencedTransitionV2Voters {
     }
 }
 
-/// Closed, value-free phase of a prepared V2 execution failure.
+/// Value-free phase of a prepared V2 execution failure.
 ///
 /// This describes local progress only. It grants no retry or release authority
-/// and never proves whether the remote operation committed.
+/// and never proves whether the remote operation committed. Additional stages
+/// may be introduced as transport diagnostics evolve.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionConsumerFencedTransitionV2FailureStage {
     /// Local preparation, admission, or cold connection setup did not complete.
     Setup,

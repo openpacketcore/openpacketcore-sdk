@@ -948,6 +948,182 @@
       "kind": "assertions-decreased",
       "reason": "Extract the body into prepared_cas_binding_reply_loss_case in crates/opc-session-net/tests/stateless_quorum_consumer.rs, moving the fleet through the controlled-clock closure. All original assertions and calls to application_sequences, quiesce, voter_authority, wait_for_observed_leader and withhold_next_forward_mutation_reply remain; their helper bodies are unchanged. Static receiver resolution loses their eight setup/cleanup expectations after fleet is rebound, while two clock assertions are added (116 -> 110). Cargo disables automatic integration targets and includes this file in the library; its actual lib=lib target also resolves the shared clock helper and grows 116 -> 117. No runtime coverage is removed.",
       "issue": 1147
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_ambiguous_failure_stage_falls_back_to_the_attempt_deadline",
+      "kind": "removed",
+      "reason": "Replace the inferred diagnostic implementation from #1458 and its parallel wrapper API with actual transport-stage observations. The v2_failure_diagnostics real-TLS tests cover setup expiry, the send boundary, held refusal, reply loss and confirmed rejection while retaining effect, call-count, binding and release assertions. Budgets are frozen before cleanup and observers belong to each execution.",
+      "issue": 1129,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_held_refusal_preserves_receipt_only_ownership"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_diagnosed_execution_preserves_effects_and_ownership",
+      "kind": "removed",
+      "reason": "Replace the inferred diagnostic implementation from #1458 and its parallel wrapper API with actual transport-stage observations. The v2_failure_diagnostics real-TLS tests cover setup expiry, the send boundary, held refusal, reply loss and confirmed rejection while retaining effect, call-count, binding and release assertions. Budgets are frozen before cleanup and observers belong to each execution.",
+      "issue": 1129,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_cold_setup_expiry_preserves_original_budget",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_send_boundary_expiry_preserves_nontransmission",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_held_refusal_preserves_receipt_only_ownership",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_reply_loss_preserves_receipt_only_ownership",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_confirmed_rejection_preserves_release"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_effect_failure_stage_classification_is_fixed",
+      "kind": "removed",
+      "reason": "Replace the inferred diagnostic implementation from #1458 and its parallel wrapper API with actual transport-stage observations. The v2_failure_diagnostics real-TLS tests cover setup expiry, the send boundary, held refusal, reply loss and confirmed rejection while retaining effect, call-count, binding and release assertions. Budgets are frozen before cleanup and observers belong to each execution.",
+      "issue": 1129,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_cold_setup_expiry_preserves_original_budget",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_send_boundary_expiry_preserves_nontransmission",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_held_refusal_preserves_receipt_only_ownership",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_reply_loss_preserves_receipt_only_ownership",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_confirmed_rejection_preserves_release"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostic_absent_for_resolved_rejection",
+      "kind": "removed",
+      "reason": "Replace the inferred diagnostic implementation from #1458 and its parallel wrapper API with actual transport-stage observations. The v2_failure_diagnostics real-TLS tests cover setup expiry, the send boundary, held refusal, reply loss and confirmed rejection while retaining effect, call-count, binding and release assertions. Budgets are frozen before cleanup and observers belong to each execution.",
+      "issue": 1129,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_confirmed_rejection_preserves_release"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostic_is_value_free",
+      "kind": "removed",
+      "reason": "Replace the inferred diagnostic implementation from #1458 and its parallel wrapper API with actual transport-stage observations. The v2_failure_diagnostics real-TLS tests cover setup expiry, the send boundary, held refusal, reply loss and confirmed rejection while retaining effect, call-count, binding and release assertions. Budgets are frozen before cleanup and observers belong to each execution.",
+      "issue": 1129,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_cold_setup_expiry_preserves_original_budget",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_send_boundary_expiry_preserves_nontransmission",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_held_refusal_preserves_receipt_only_ownership",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_reply_loss_preserves_receipt_only_ownership",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_confirmed_rejection_preserves_release"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostic_reports_awaiting_reply_for_held_refusal",
+      "kind": "removed",
+      "reason": "Replace the inferred diagnostic implementation from #1458 and its parallel wrapper API with actual transport-stage observations. The v2_failure_diagnostics real-TLS tests cover setup expiry, the send boundary, held refusal, reply loss and confirmed rejection while retaining effect, call-count, binding and release assertions. Budgets are frozen before cleanup and observers belong to each execution.",
+      "issue": 1129,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_held_refusal_preserves_receipt_only_ownership"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostic_reports_reply_lost",
+      "kind": "removed",
+      "reason": "Replace the inferred diagnostic implementation from #1458 and its parallel wrapper API with actual transport-stage observations. The v2_failure_diagnostics real-TLS tests cover setup expiry, the send boundary, held refusal, reply loss and confirmed rejection while retaining effect, call-count, binding and release assertions. Budgets are frozen before cleanup and observers belong to each execution.",
+      "issue": 1129,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_reply_loss_preserves_receipt_only_ownership"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostic_reports_setup_when_original_budget_expired",
+      "kind": "removed",
+      "reason": "Replace the inferred diagnostic implementation from #1458 and its parallel wrapper API with actual transport-stage observations. The v2_failure_diagnostics real-TLS tests cover setup expiry, the send boundary, held refusal, reply loss and confirmed rejection while retaining effect, call-count, binding and release assertions. Budgets are frozen before cleanup and observers belong to each execution.",
+      "issue": 1129,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_cold_setup_expiry_preserves_original_budget"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostic_stages_are_fixed_labels",
+      "kind": "removed",
+      "reason": "Replace the inferred diagnostic implementation from #1458 and its parallel wrapper API with actual transport-stage observations. The v2_failure_diagnostics real-TLS tests cover setup expiry, the send boundary, held refusal, reply loss and confirmed rejection while retaining effect, call-count, binding and release assertions. Budgets are frozen before cleanup and observers belong to each execution.",
+      "issue": 1129,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_cold_setup_expiry_preserves_original_budget",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_send_boundary_expiry_preserves_nontransmission",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_held_refusal_preserves_receipt_only_ownership",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_reply_loss_preserves_receipt_only_ownership",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_failure_diagnostics_confirmed_rejection_preserves_release"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_preflight_failure_classification_separates_final_from_transient",
+      "kind": "removed",
+      "reason": "Replace the classified/cached preflight implementation from #1456 with exact-binding reauthentication after every local failure. v2_status_preflight_retry_recovers_the_original_committed_receipt and v2_status_preflight_retry_never_accepts_a_substituted_binding cover restored-journal recovery, immediate local unavailability, unchanged dispatch/release authority and substituted-row rejection. No public string-discriminator predicate remains.",
+      "issue": 1378,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_preflight_retry_recovers_the_original_committed_receipt",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_preflight_retry_never_accepts_a_substituted_binding",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_until_terminal_returns_a_cached_local_failure_without_spinning"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_missing_exact_row_stays_final",
+      "kind": "removed",
+      "reason": "Replace the classified/cached preflight implementation from #1456 with exact-binding reauthentication after every local failure. v2_status_preflight_retry_recovers_the_original_committed_receipt and v2_status_preflight_retry_never_accepts_a_substituted_binding cover restored-journal recovery, immediate local unavailability, unchanged dispatch/release authority and substituted-row rejection. No public string-discriminator predicate remains.",
+      "issue": 1378,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_preflight_retry_never_accepts_a_substituted_binding",
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_until_terminal_returns_a_cached_local_failure_without_spinning"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_substituted_binding_stays_final",
+      "kind": "removed",
+      "reason": "Replace the classified/cached preflight implementation from #1456 with exact-binding reauthentication after every local failure. v2_status_preflight_retry_recovers_the_original_committed_receipt and v2_status_preflight_retry_never_accepts_a_substituted_binding cover restored-journal recovery, immediate local unavailability, unchanged dispatch/release authority and substituted-row rejection. No public string-discriminator predicate remains.",
+      "issue": 1378,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_preflight_retry_never_accepts_a_substituted_binding"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_transient_preflight_failure_stays_recheckable_and_recovers_the_receipt",
+      "kind": "removed",
+      "reason": "Replace the classified/cached preflight implementation from #1456 with exact-binding reauthentication after every local failure. v2_status_preflight_retry_recovers_the_original_committed_receipt and v2_status_preflight_retry_never_accepts_a_substituted_binding cover restored-journal recovery, immediate local unavailability, unchanged dispatch/release authority and substituted-row rejection. No public string-discriminator predicate remains.",
+      "issue": 1378,
+      "replacements": [
+        "rust:crates/opc-session-net::lib=lib::consumer::prepared_fenced_v2::tests::v2_status_preflight_retry_recovers_the_original_committed_receipt"
+      ]
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::fenced_transition_maintenance::tests::backoff_is_bounded_and_resets_on_progress",
+      "kind": "removed",
+      "reason": "Remove the scheduling/high-water test with the complete revert of #1499. Early rotation violates the existing complete-epoch validation and diverges between native and SQLite storage; the untested background lane is removed. Existing full-epoch reopen, snapshot and reclamation validators remain; the per-key retention design stays open under #1377.",
+      "issue": 1377,
+      "behavior_deleted": true,
+      "deleting_change": "3470fdf4f37af61a7a49cc0aaee1c727386afd0d reverts #1499 completely, deleting crates/opc-session-store/src/consensus/store/fenced_transition_maintenance.rs and the early-rotation helpers/overrides in fenced_transition.rs, and restoring full-epoch rotation in sqlite/consensus.rs."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::fenced_transition_maintenance::tests::retained_epoch_count_uses_the_active_epoch_when_retired_through_is_zero",
+      "kind": "removed",
+      "reason": "Remove the scheduling/high-water test with the complete revert of #1499. Early rotation violates the existing complete-epoch validation and diverges between native and SQLite storage; the untested background lane is removed. Existing full-epoch reopen, snapshot and reclamation validators remain; the per-key retention design stays open under #1377.",
+      "issue": 1377,
+      "behavior_deleted": true,
+      "deleting_change": "3470fdf4f37af61a7a49cc0aaee1c727386afd0d reverts #1499 completely, deleting crates/opc-session-store/src/consensus/store/fenced_transition_maintenance.rs and the early-rotation helpers/overrides in fenced_transition.rs, and restoring full-epoch rotation in sqlite/consensus.rs."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::store::fenced_transition_maintenance::tests::rotation_due_is_derived_from_the_shared_preemptive_window",
+      "kind": "removed",
+      "reason": "Remove the scheduling/high-water test with the complete revert of #1499. Early rotation violates the existing complete-epoch validation and diverges between native and SQLite storage; the untested background lane is removed. Existing full-epoch reopen, snapshot and reclamation validators remain; the per-key retention design stays open under #1377.",
+      "issue": 1377,
+      "behavior_deleted": true,
+      "deleting_change": "3470fdf4f37af61a7a49cc0aaee1c727386afd0d reverts #1499 completely, deleting crates/opc-session-store/src/consensus/store/fenced_transition_maintenance.rs and the early-rotation helpers/overrides in fenced_transition.rs, and restoring full-epoch rotation in sqlite/consensus.rs."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::v2_preemptive_rotation_high_water_rotates_before_the_epoch_is_full",
+      "kind": "removed",
+      "reason": "Remove the scheduling/high-water test with the complete revert of #1499. Early rotation violates the existing complete-epoch validation and diverges between native and SQLite storage; the untested background lane is removed. Existing full-epoch reopen, snapshot and reclamation validators remain; the per-key retention design stays open under #1377.",
+      "issue": 1377,
+      "behavior_deleted": true,
+      "deleting_change": "3470fdf4f37af61a7a49cc0aaee1c727386afd0d reverts #1499 completely, deleting crates/opc-session-store/src/consensus/store/fenced_transition_maintenance.rs and the early-rotation helpers/overrides in fenced_transition.rs, and restoring full-epoch rotation in sqlite/consensus.rs."
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::v2_projection_preemptive_rotation_matches_the_applied_threshold",
+      "kind": "removed",
+      "reason": "Remove the scheduling/high-water test with the complete revert of #1499. Early rotation violates the existing complete-epoch validation and diverges between native and SQLite storage; the untested background lane is removed. Existing full-epoch reopen, snapshot and reclamation validators remain; the per-key retention design stays open under #1377.",
+      "issue": 1377,
+      "behavior_deleted": true,
+      "deleting_change": "3470fdf4f37af61a7a49cc0aaee1c727386afd0d reverts #1499 completely, deleting crates/opc-session-store/src/consensus/store/fenced_transition_maintenance.rs and the early-rotation helpers/overrides in fenced_transition.rs, and restoring full-epoch rotation in sqlite/consensus.rs."
     }
   ]
 }
