@@ -3137,6 +3137,22 @@ mod tests {
             Ikev2DhGroup::Modp2048
         );
         assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(15)),
+            Ikev2DhGroup::Modp3072
+        );
+        assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(16)),
+            Ikev2DhGroup::Modp4096
+        );
+        assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(17)),
+            Ikev2DhGroup::Modp6144
+        );
+        assert_eq!(
+            must_ok(Ikev2DhGroup::from_transform_id(18)),
+            Ikev2DhGroup::Modp8192
+        );
+        assert_eq!(
             must_ok(Ikev2DhGroup::from_transform_id(19)),
             Ikev2DhGroup::Ecp256
         );
@@ -3170,6 +3186,13 @@ mod tests {
         assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.transform_id(), 7);
         assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.output_len(), 64);
         assert_eq!(Ikev2PrfAlgorithm::HmacSha2_512.name(), "HMAC-SHA2-512");
+        assert_eq!(
+            must_ok(Ikev2PrfAlgorithm::from_transform_id(4)),
+            Ikev2PrfAlgorithm::Aes128Xcbc
+        );
+        assert_eq!(Ikev2PrfAlgorithm::Aes128Xcbc.transform_id(), 4);
+        assert_eq!(Ikev2PrfAlgorithm::Aes128Xcbc.output_len(), 16);
+        assert_eq!(Ikev2PrfAlgorithm::Aes128Xcbc.name(), "AES128-XCBC");
         assert_eq!(
             must_ok(Ikev2EncryptionAlgorithm::from_transform_id(11, None)),
             Ikev2EncryptionAlgorithm::Null

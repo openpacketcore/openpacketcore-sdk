@@ -900,6 +900,41 @@
       "kind": "disabled",
       "reason": "New native hard-expiry and reset-barrier regression requires CAP_NET_ADMIN in private network and mount namespaces. It verifies real kernel expiry, typed retirement refusal, retained predecessor SA, and immediate execution drain/reset without receipt cleanup masking a leaked guard. It is required by ci/local-kernel-lifecycle-cases.json and executed with --ignored by the native qualification runner; no existing executable coverage is gated.",
       "issue": 1239
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::caller_budget_retransmits_exact_bytes_and_abandons_without_a_write",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::bounded_retries_preserve_exact_bytes_and_expiry_is_terminal_without_a_write",
+      "reason": "RFC 7296 sections 2.1 and 2.4 require exact exponential retransmission and failed-SA handling. Retain all three retry-byte checks and unchanged durable state, then assert retry exhaustion, fixed-deadline terminal refusal and rejection of a late authenticated response instead of permitting abandonment to release the request slot.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::ordinary_work_is_refused_until_the_probe_is_abandoned",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::ordinary_work_is_refused_until_the_probe_is_answered",
+      "reason": "Retain refusal of ordinary work while a probe is outstanding and the next-ID assertion. Release the local request slot only after an authenticated matching response; RFC 7296 sections 2.1 and 2.4 do not allow an unanswered abandoned request to advance an otherwise usable window. Terminal failure is separately covered by a_failed_probe_cannot_release_the_sa_for_another_request.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::restart_without_a_commit_loses_the_lead_as_a_bounded_reuse",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::lib=lib::recovery::probe::tests::restart_without_a_commit_skips_the_bound_and_requires_synchronization",
+      "reason": "The old assertion allowed reusing an unwritten probe ID for different work after restart. RFC 6311 section 5.1 requires accounting for the whole bounded lead. Keep the same crash setup, assert the stored floor is unchanged and the live floor advances by the durable bound, and require both probe and ordinary preparation to fail until synchronization or scoped retirement.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::test=sync_responder::peer_sync_after_abandon_before_persist_keeps_the_burned_probe_floor",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::test=sync_responder::peer_sync_after_answer_before_persist_keeps_the_burned_probe_floor",
+      "reason": "Retain every original role, GCM key size, unchanged durable row, strict burned-ID floor and Continue disposition assertion. Complete the probe with an authenticated response instead of unsafe abandonment before peer synchronization; RFC 7296 sections 2.1 and 2.4 require failure to retire the SA, while RFC 6311 section 5.1 still requires retaining the unwritten send advance.",
+      "issue": 1241
+    },
+    {
+      "test": "rust:crates/opc-proto-ikev2::test=sync_responder::peer_sync_while_a_volatile_probe_is_outstanding_is_outcome_uncertain",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-ikev2::test=sync_responder::peer_sync_fences_a_volatile_probe_without_uncertain_application_work",
+      "reason": "A volatile liveness request has no uncertain application mutation. Under RFC 6311 section 5.1, peer synchronization may fence it while retaining its burned Message ID and IV evidence. Keep both roles, all GCM key sizes, exact no-write checks and strict post-cutover floors, and assert Continue after fencing; existing tests still require OutcomeUncertain for pending durable mutations.",
+      "issue": 1241
     }
   ]
 }
