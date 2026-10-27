@@ -1312,15 +1312,12 @@ impl AllocationRetentionPriority {
         })
     }
 
-    /// Decode the TS 29.274 ARP octet, requiring spare bits 8 and 2 to be zero.
+    /// Decode the TS 29.274 ARP octet, ignoring received spare bits 8 and 2.
     ///
     /// # Errors
     ///
-    /// Returns a stable validation error for spare bits or priority level zero.
+    /// Returns a stable validation error for priority level zero.
     pub const fn from_octet(octet: u8) -> Result<Self, BearerQosValidationError> {
-        if octet & 0x82 != 0 {
-            return Err(BearerQosValidationError::InvalidArpSpareBits);
-        }
         Self::new((octet >> 2) & 0x0f, octet & 0x40 == 0, octet & 0x01 == 0)
     }
 
@@ -1509,8 +1506,8 @@ impl BearerQos {
     ///
     /// # Errors
     ///
-    /// Returns a stable error if a directly constructed value contains spare
-    /// bits or an invalid priority level.
+    /// Returns a stable error for an invalid priority level. Spare bits are
+    /// ignored here; sender validation still requires canonical zero spares.
     pub const fn allocation_retention_priority(
         &self,
     ) -> Result<AllocationRetentionPriority, BearerQosValidationError> {
@@ -1562,6 +1559,9 @@ impl BearerQos {
     }
 
     fn validate_common(&self) -> Result<(), BearerQosValidationError> {
+        if self.priority_flags & 0x82 != 0 {
+            return Err(BearerQosValidationError::InvalidArpSpareBits);
+        }
         let _arp = self.allocation_retention_priority()?;
         let _classification = qci_resource_type(self.qci)?;
         if [
@@ -1627,7 +1627,9 @@ impl BearerQos {
             .with_spec_ref(spec_ref()));
         }
         let decoded = Self {
-            priority_flags: value[0],
+            // TS 29.274 7.7.8: ignore received spares; raw message encoding
+            // retains the received octet separately. Canonical send clears them.
+            priority_flags: value[0] & 0x7d,
             qci: value[1],
             maximum_bitrate_uplink: decode_u40(&value[2..7]),
             maximum_bitrate_downlink: decode_u40(&value[7..12]),
@@ -4859,10 +4861,7 @@ mod tests {
     fn bearer_qos_validates_typed_arp_and_standardized_resource_semantics() {
         assert_eq!(arp().to_octet(), 0x4d);
         assert_eq!(AllocationRetentionPriority::from_octet(0x4d), Ok(arp()));
-        assert_eq!(
-            AllocationRetentionPriority::from_octet(0x4f),
-            Err(BearerQosValidationError::InvalidArpSpareBits)
-        );
+        assert_eq!(AllocationRetentionPriority::from_octet(0x4f), Ok(arp()));
         assert_eq!(
             AllocationRetentionPriority::new(0, false, false),
             Err(BearerQosValidationError::InvalidPriorityLevel)
@@ -4921,20 +4920,24 @@ mod tests {
     }
 
     #[test]
-    fn bearer_qos_decode_rejects_arp_spare_bits() {
-        let mut value = [0u8; 22];
-        value[0] = 0x4f;
-        value[1] = 9;
-        let Err(error) = BearerQos::decode_value(&value, 7) else {
-            panic!("ARP spare bit 2 must fail at the untrusted boundary");
-        };
-        assert!(matches!(
-            error.code(),
-            DecodeErrorCode::Structural {
-                reason: "Bearer QoS ARP spare bits must be zero"
-            }
-        ));
-        assert_eq!(error.offset(), 7);
+    fn bearer_qos_decode_ignores_arp_spare_bits_and_sender_rejects_them() {
+        for spare in [0x02, 0x80, 0x82] {
+            let mut value = [0u8; 22];
+            value[0] = 0x4d | spare;
+            value[1] = 9;
+            let mut decoded = BearerQos::decode_value(&value, 7).unwrap();
+            assert_eq!(decoded.priority_flags, 0x4d);
+            assert_eq!(decoded.allocation_retention_priority(), Ok(arp()));
+            let mut encoded = BytesMut::new();
+            decoded.encode_value(&mut encoded).unwrap();
+            assert_eq!(encoded[0], 0x4d);
+            decoded.priority_flags |= spare;
+            assert_eq!(
+                decoded.validate(),
+                Err(BearerQosValidationError::InvalidArpSpareBits)
+            );
+            assert!(decoded.encode_value(&mut BytesMut::new()).is_err());
+        }
     }
 
     #[test]

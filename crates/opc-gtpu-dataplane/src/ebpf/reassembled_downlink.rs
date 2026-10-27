@@ -1003,7 +1003,12 @@ fn n3_downlink_psc_matches_message(message: &[u8], payload_offset: usize, qfi: u
             return false;
         }
         if next == PDU_SESSION_CONTAINER {
-            let prefix = [message[cursor], message[cursor + 1], message[cursor + 2]];
+            let prefix = [
+                message[cursor],
+                message[cursor + 1],
+                message[cursor + 2],
+                message[cursor + 3],
+            ];
             if found || !n3_downlink_psc_matches(prefix, qfi) {
                 return false;
             }
@@ -1016,4 +1021,28 @@ fn n3_downlink_psc_matches_message(message: &[u8], payload_offset: usize, qfi: u
         walked += 1;
     }
     found && cursor == payload_offset
+}
+
+#[cfg(test)]
+mod review_burst_fields {
+    use super::n3_downlink_psc_matches_message;
+
+    #[test]
+    fn review_reassembled_n3_psc_rejects_burst_fields() {
+        // Independent TS 38.415 Figure 5.5.2.1-1 DL PSC: QFI 9, PPP and PPI 5.
+        let mut wire = [
+            0x34, 255, 0, 12, 0, 0, 0, 1, 0, 0, 0, 0x85, 2, 0, 0x89, 0xa0, 0, 0, 0, 0,
+        ];
+        for spare in [0, 0x1c] {
+            wire[15] = 0xa0 | spare;
+            assert!(n3_downlink_psc_matches_message(&wire, wire.len(), 9));
+            for burst in [1, 2, 3] {
+                wire[15] = 0xa0 | spare | burst;
+                assert!(
+                    !n3_downlink_psc_matches_message(&wire, wire.len(), 9),
+                    "BSSI/TTNBI {burst} must not be discarded as padding"
+                );
+            }
+        }
+    }
 }

@@ -18,14 +18,15 @@ pub const fn n3_uplink_extension(qfi: u8) -> Option<[u8; N3_UPLINK_EXTENSION_LEN
 
 /// Check the fixed-flow downlink PSC against one installed QFI.
 ///
-/// `prefix` is length-in-four-octets, PDU-type/flags, and QFI/RQI/PPP.
+/// `prefix` is length-in-four-octets, PDU-type/flags, QFI/RQI/PPP, then
+/// PPI/spares/BSSI/TTNBI when PPP is set (otherwise the next-type octet).
 /// The caller must first validate the complete extension, next-header chain,
 /// exact envelope and single-PSC cardinality. RQI/PPI are accepted as metadata
 /// and do not select another mark, peer, or authority. Spare bits are ignored
 /// exactly as in the shared protocol decoder. Unmodelled conditionals fail
 /// closed. This is the TS 38.415 QFI/RQI/PPI subset, not the complete protocol.
 #[must_use]
-pub const fn n3_downlink_psc_matches(prefix: [u8; 3], qfi: u8) -> bool {
+pub const fn n3_downlink_psc_matches(prefix: [u8; 4], qfi: u8) -> bool {
     qfi <= 63
         && prefix[1] >> 4 == 0
         && prefix[1] & 0x0e == 0
@@ -33,6 +34,6 @@ pub const fn n3_downlink_psc_matches(prefix: [u8; 3], qfi: u8) -> bool {
         && if prefix[2] & 0x80 == 0 {
             prefix[0] == 1
         } else {
-            prefix[0] == 2
+            prefix[0] == 2 && prefix[3] & 0x03 == 0
         }
 }

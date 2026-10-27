@@ -20,7 +20,7 @@ pub enum GtpuTypedExtension<'a> {
     LongPdcpPduNumber(u32),
     /// Earlier-release assignment 0x82; use only for explicit legacy interop.
     LegacyLongPdcpPduNumber(u32),
-    /// SCI octet (§5.2.2.3); this release's send values are 0–31.
+    /// SCI octet (§5.2.2.3); this release's send values are 0–15.
     ServiceClassIndicator(u8),
     /// Opaque TS 36.425 RAN container (§5.2.2.4).
     RanContainer(&'a [u8]),
@@ -115,7 +115,7 @@ impl<'a> GtpuTypedExtension<'a> {
                 vec![bytes[1], bytes[2], bytes[3], 0, 0, 0]
             }
             Self::ServiceClassIndicator(value) => {
-                if *value > 31 {
+                if *value > 15 {
                     return Err(invalid());
                 }
                 vec![*value, 0]

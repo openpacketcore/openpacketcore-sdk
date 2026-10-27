@@ -291,7 +291,7 @@ async fn receive_control_downlink(
 
 #[tokio::test]
 #[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
-async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_leaves_it(
+async fn unknown_tunnel_wire_capture_and_echo_share_reopened_socket(
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
     assert!(Command::new("ip")
@@ -383,16 +383,20 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         };
         let stale_plan = stale.unknown_tunnel_error(GtpuControlResponseBudget::new(28, 4)?)?;
         let fresh = backend.open_gtpu_control_port(&device).await?;
-        assert_eq!(
-            port.send_control_response(stale_plan).unwrap_err(),
-            opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
-        );
+        // Reopening shares the retained generation: the prepared plan and
+        // both handles remain live until the attachment itself is removed.
+        assert_eq!(port.send_control_response(stale_plan)?, 28);
+        let (length, source) = peer.recv_from(&mut response)?;
+        assert_eq!(source, echo_source);
+        assert_eq!(&response[..length], &expected);
         assert!(fresh.try_receive_datagram(4096)?.is_none());
         assert_eq!(
-            port.send_echo_request(echo_source, echo_peer, 0x9173)
-                .unwrap_err(),
-            opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
+            port.send_echo_request(echo_source, echo_peer, 0x9173)?,
+            echo.len()
         );
+        let (length, source) = peer.recv_from(&mut echo_bytes)?;
+        assert_eq!(source, echo_source);
+        assert_eq!(&echo_bytes[..length], echo);
         Ok::<_, Box<dyn std::error::Error>>(fresh)
     }
     .await;
@@ -584,11 +588,11 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         let plan = datagram.unknown_tunnel_error(budget)?;
         assert_eq!(
             plan.destination(),
-            std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, GTPU_PORT)
+            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, GTPU_PORT))
         );
         assert_eq!(
             plan.source(),
-            std::net::SocketAddrV4::new(ingress, GTPU_PORT)
+            std::net::SocketAddr::from((ingress, GTPU_PORT))
         );
         let sent = port.send_control_response(plan)?;
         assert_eq!(sent, 28, "one TS 29.281 Error Indication left the socket");
@@ -614,7 +618,7 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         assert_eq!(datagram.message_type(), Some(26), "Error Indication");
         assert_eq!(
             datagram.peer(),
-            std::net::SocketAddrV4::new(ingress, GTPU_PORT)
+            std::net::SocketAddr::from((ingress, GTPU_PORT))
         );
         let udp = peer.local_addr()?.port().to_be_bytes();
         let mut expected = vec![
@@ -636,6 +640,7 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         peer_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         link_ifindex: device.ifindex,
         downlink_source_port_policy: opc_gtpu_dataplane::GtpuSourcePortPolicy::Any,
+        downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
@@ -848,9 +853,7 @@ async fn mixed_inner_outer_families_read_back_and_reconcile_in_current_netns(
         let device = backend.create_device(create).await?;
         let context = GtpPdpContext {
             local_teid: Teid::new(local_teid).ok_or("local TEID must be nonzero")?,
-            peer_teid: Teid::new(peer_teid)
-                .ok_or("peer TEID must be nonzero")?
-                .into(),
+            peer_teid: PeerTeid::new(peer_teid),
             ms_address,
             peer_address,
             link_ifindex: device.ifindex,

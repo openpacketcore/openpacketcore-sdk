@@ -159,7 +159,8 @@ impl AsFd for GtpuControlReadiness {
 }
 
 impl GtpuControlReadiness {
-    /// Create a source over `queues`, keeping a weak liveness token for an
+    /// Create a source over `queues`; both address families may share a queue
+    /// class. Keep a weak liveness token for an
     /// owner without an explicit revocation path.
     pub(crate) fn new<'a>(
         queues: impl IntoIterator<Item = (GtpuControlQueue, BorrowedFd<'a>)>,
@@ -175,20 +176,17 @@ impl GtpuControlReadiness {
         epoll
             .add(&retired, EpollEvent::new(EpollFlags::EPOLLIN, u64::MAX))
             .map_err(std::io::Error::from)?;
-        let mut watched = Vec::new();
+        let mut watched = false;
         for (queue, descriptor) in queues {
-            if watched.contains(&queue) {
-                return Err(GtpuControlPortError::InvalidLimits);
-            }
             let event = EpollEvent::new(EpollFlags::EPOLLIN, queue.index() as u64);
             epoll
                 .add(descriptor, event)
                 .map_err(|error| GtpuControlPortError::Io {
                     kind: std::io::Error::from(error).kind(),
                 })?;
-            watched.push(queue);
+            watched = true;
         }
-        if watched.is_empty() {
+        if !watched {
             return Err(GtpuControlPortError::InvalidLimits);
         }
         Ok(Self {
@@ -241,7 +239,7 @@ impl GtpuControlReadiness {
         if self.inner.is_revoked() {
             return Err(GtpuControlPortError::Unavailable);
         }
-        let mut events = [EpollEvent::empty(); GtpuControlQueue::ALL.len() + 1];
+        let mut events = [EpollEvent::empty(); GtpuControlQueue::ALL.len() + 2];
         let count = self
             .inner
             .epoll
@@ -316,6 +314,39 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "readiness deadline");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn review_readiness_watches_both_shared_family_sockets() {
+        let ipv4 = bound();
+        let ipv6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        let readiness = GtpuControlReadiness::new(
+            [
+                (GtpuControlQueue::Shared, ipv4.as_fd()),
+                (GtpuControlQueue::Shared, ipv6.as_fd()),
+            ],
+            None,
+        )
+        .unwrap();
+        for socket in [&ipv4, &ipv6] {
+            socket
+                .send_to(b"shared", socket.local_addr().unwrap())
+                .unwrap();
+            let mask = wait_ready(&readiness);
+            assert_eq!(
+                mask.queues().collect::<Vec<_>>(),
+                vec![GtpuControlQueue::Shared]
+            );
+            let mut bytes = [0; 16];
+            let (length, _) = socket.recv_from(&mut bytes).unwrap();
+            assert_eq!(&bytes[..length], b"shared");
+            assert!(readiness.try_readiness().unwrap().is_empty());
+        }
+        readiness.inner.revoke();
+        assert_eq!(
+            readiness.try_readiness().unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
     }
 
     #[test]

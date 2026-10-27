@@ -14394,8 +14394,8 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
         gpdu
     };
     let mut handed_off_count = 0;
-    // The forwarding profile supports PSC only. Codec-known RAN/PDCP formats
-    // are also handed off, but are not unknown extensions to the typed receiver.
+    // The endpoint comprehends PSC only. Known RAN/PDCP wire formats still
+    // require notification and discard under TS 29.281 5.2.1.
     for kind in 128_u8..=255 {
         if kind == 0x85 {
             continue;
@@ -14409,14 +14409,9 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
             RawChecksumMetadata::Unverified,
         );
         let event = receive_control();
-        let codec_known = matches!(kind, 0x81..=0x84 | 0xc0);
         assert_eq!(
             event.kind(),
-            if codec_known {
-                GtpuControlDatagramKind::Gpdu
-            } else {
-                GtpuControlDatagramKind::UnsupportedRequiredExtension
-            }
+            GtpuControlDatagramKind::UnsupportedRequiredExtension
         );
         assert_eq!(event.bytes(), gpdu);
         assert_eq!(
@@ -14432,20 +14427,13 @@ async fn ebpf_gtpu_required_extensions_reach_shared_control_without_decap(
             GtpuExtensionHeaderTypeList::new([])?,
             GtpuControlResponseBudget::new(14, 1)?,
         );
-        if codec_known {
-            assert_eq!(
-                plan.unwrap_err(),
-                opc_gtpu_dataplane::control_port::GtpuControlPortError::WrongProcedure
-            );
-        } else {
-            assert_eq!(control.send_control_response(plan?)?, 14);
-            let (length, source) = peer.recv_from(&mut received)?;
-            assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
-            assert_eq!(
-                &received[..length],
-                &[0x32, 31, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0]
-            );
-        }
+        assert_eq!(control.send_control_response(plan?)?, 14);
+        let (length, source) = peer.recv_from(&mut received)?;
+        assert_eq!(source, SocketAddr::from((EPDG_S2BU_IP, GTPU_PORT)));
+        assert_eq!(
+            &received[..length],
+            &[0x32, 31, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 141, 0]
+        );
 
         // The same committed IPv6 parser must hand the unchanged packet to
         // the host before any grouped owner lookup. This ordinary IPv4
@@ -14692,6 +14680,7 @@ async fn ebpf_gtpu_backend_control_port_fences_attachment_lifetime(
         )?;
         let ipv6_device = backend.create_device_with_endpoints(ipv6_request).await?;
         let ipv6_port = backend.open_gtpu_control_port(&ipv6_device).await?;
+        let ipv6_readiness = ipv6_port.downlink_readiness()?;
         let peer6 = in_netns(&net.pgw_ns, || UdpSocket::bind((PGW_IPV6, 0)).unwrap());
         let service6 = in_netns(&net.pgw_ns, || {
             UdpSocket::bind((PGW_IPV6, GTPU_PORT)).unwrap()
@@ -14719,8 +14708,15 @@ async fn ebpf_gtpu_backend_control_port_fences_attachment_lifetime(
             assert_eq!(&bytes[..length], response);
         }
         peer6.send_to(&echo, (EPDG_S2BU_IPV6, GTPU_PORT))?;
+        assert!(ipv6_readiness
+            .wait(Duration::from_secs(2))?
+            .is_ready(opc_gtpu_dataplane::control_port::GtpuControlQueue::Shared));
         let stale6 = control_ipv6::receive(ipv6_port.as_ref()).echo_response(budget)?;
         backend.remove_device(&ipv6_device).await?;
+        assert_eq!(
+            ipv6_readiness.try_readiness().unwrap_err(),
+            GtpuControlPortError::Unavailable
+        );
         assert_eq!(
             ipv6_port.send_control_response(stale6).unwrap_err(),
             GtpuControlPortError::Unavailable

@@ -237,6 +237,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- GTP-U N3 native and reassembled paths now reject BSSI/TTNBI conditional
+  fields consistently with the codec. Required RAN/PDCP extensions retain
+  Supported Extension Headers Notification authority despite known syntax.
+  SCI send values are limited to 0–15. (#1520, #1529)
+- GTPv2-C ignores received Bearer QoS ARP spare bits and clears them on
+  canonical send; raw-preserving send retains the received octet. (#1354)
+- GTP-U control readiness covers IPv6-only and dual-stack retained sockets,
+  preserving shared-generation reopening and I/O without backend-wide mutexes.
+  (#1084, #341)
+
 - `opc-proto-gtpu`: reject unsupported downlink BSSI/TTNBI fields from
   TS 38.415 V19.1.0 instead of silently discarding them as PPI spare bits
   and padding; update the independent N3 reference vectors. (#1520)
@@ -571,6 +581,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and clears the Registration Accept spare bit. (#1515)
 
 ### Breaking
+
+- `opc-gtpu-dataplane`: `GtpuControlDatagram::{local,peer}` and
+  `GtpuControlSendPlan::{source,destination}` now return `SocketAddr` to
+  support IPv6. Callers matching IPv4-only tuples must handle both families.
+  `opc-gtpu-ebpf-common::n3_downlink_psc_matches` now takes a four-byte prefix
+  to inspect BSSI/TTNBI when PPP is set. (#341, #1520)
 
 - `opc-gtpu-dataplane`: initialize the new
   `GtpPdpContext::downlink_peer_source_policy` field with

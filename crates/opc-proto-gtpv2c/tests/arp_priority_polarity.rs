@@ -67,20 +67,18 @@ fn octet_level_field_is_an_identity_mapping_for_every_level() {
 }
 
 #[test]
-fn spare_bits_and_out_of_range_levels_stay_rejected() {
-    // Spare bit 8 (0x80) and spare bit 2 (0x02) are not part of the typed map.
-    assert_eq!(
-        AllocationRetentionPriority::from_octet(0x82),
-        Err(BearerQosValidationError::InvalidArpSpareBits)
-    );
-    assert_eq!(
-        AllocationRetentionPriority::from_octet(0x80),
-        Err(BearerQosValidationError::InvalidArpSpareBits)
-    );
-    assert_eq!(
-        AllocationRetentionPriority::from_octet(0x02),
-        Err(BearerQosValidationError::InvalidArpSpareBits)
-    );
+fn spare_bits_are_ignored_and_out_of_range_levels_stay_rejected() {
+    // TS 29.274 7.7.8: spares do not affect a valid received ARP value.
+    for spare in [0x02, 0x80, 0x82] {
+        assert_eq!(
+            AllocationRetentionPriority::from_octet(0x4d | spare),
+            AllocationRetentionPriority::from_octet(0x4d)
+        );
+        assert_eq!(
+            AllocationRetentionPriority::from_octet(spare),
+            Err(BearerQosValidationError::InvalidPriorityLevel)
+        );
+    }
     // Level field zero is outside TS 29.274's 1..=15.
     for octet in [0x00u8, 0x01, 0x40, 0x41] {
         assert_eq!(

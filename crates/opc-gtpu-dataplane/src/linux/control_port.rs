@@ -23,8 +23,8 @@
 
 use super::*;
 use crate::control_port::{
-    socket_io, GtpuControlProvenance, GtpuControlDatagram, GtpuControlPort, GtpuControlPortError, GtpuControlSendPlan,
-    GTPU_CONTROL_MAX_DATAGRAM,
+    socket_io, GtpuControlDatagram, GtpuControlPort, GtpuControlPortError, GtpuControlProvenance,
+    GtpuControlSendPlan, GTPU_CONTROL_MAX_DATAGRAM,
 };
 use crate::GtpuDownlinkEvent;
 use bytes::Bytes;
@@ -230,8 +230,12 @@ fn receive_guard(
 fn socket_address(fd: BorrowedFd<'_>) -> std::io::Result<SocketAddr> {
     use nix::sys::socket::{getsockname, SockaddrStorage};
     let address = getsockname::<SockaddrStorage>(fd.as_raw_fd()).map_err(std::io::Error::from)?;
-    if let Some(v4) = address.as_sockaddr_in() { return Ok((*v4).into()); }
-    if let Some(v6) = address.as_sockaddr_in6() { return Ok((*v6).into()); }
+    if let Some(v4) = address.as_sockaddr_in() {
+        return Ok((*v4).into());
+    }
+    if let Some(v6) = address.as_sockaddr_in6() {
+        return Ok((*v6).into());
+    }
     Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
 }
 
@@ -243,8 +247,14 @@ fn receive_bound(
     consumed: &mut bool,
 ) -> Result<Option<GtpuControlDatagram>, GtpuControlPortError> {
     let Some(received) = socket_io::receive_tracked(
-        fd, buffer, nix::sys::socket::MsgFlags::MSG_DONTWAIT, consumed,
-    )? else { return Ok(None); };
+        fd,
+        buffer,
+        nix::sys::socket::MsgFlags::MSG_DONTWAIT,
+        consumed,
+    )?
+    else {
+        return Ok(None);
+    };
     if !bound.ip().is_unspecified() && bound.ip() != received.local {
         return Err(unavailable());
     }
@@ -253,11 +263,17 @@ fn receive_bound(
         received.peer,
         socket_io::local_tuple(received.local, GTPU_PORT, received.ifindex),
         received.ifindex,
-    ).ok_or_else(|| io_error(std::io::Error::new(
-        std::io::ErrorKind::InvalidData, "non-canonical provenance",
-    )))?;
+    )
+    .ok_or_else(|| {
+        io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "non-canonical provenance",
+        ))
+    })?;
     Ok(Some(GtpuControlDatagram::received(
-        Bytes::copy_from_slice(&buffer[..received.length]), provenance, Arc::clone(&slot.identity),
+        Bytes::copy_from_slice(&buffer[..received.length]),
+        provenance,
+        Arc::clone(&slot.identity),
     )))
 }
 
@@ -337,7 +353,9 @@ impl GtpuControlPort for LinuxControlPort {
             if plan.source.port() != GTPU_PORT
                 || plan.source.is_ipv4() != local.is_ipv4()
                 || (!local.ip().is_unspecified() && plan.source != local)
-            { return Err(GtpuControlPortError::InvalidTuple); }
+            {
+                return Err(GtpuControlPortError::InvalidTuple);
+            }
             socket_io::send(fd, plan.source, plan.peer, &plan.bytes).map_err(io_error)
         })
     }

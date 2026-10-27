@@ -778,6 +778,7 @@ pub(crate) fn downlink_event(datagram: GtpuControlDatagram) -> crate::GtpuDownli
             }
         }
         GtpuControlDatagramKind::Control
+        | GtpuControlDatagramKind::TunnelStatus
         | GtpuControlDatagramKind::Unmodelled
         | GtpuControlDatagramKind::UnsupportedRequiredExtension => {
             crate::GtpuDownlinkEvent::Control(datagram)
@@ -1302,21 +1303,59 @@ mod tests {
     }
 
     #[test]
+    fn review_known_required_formats_keep_notification_authority_only() {
+        for kind in [0x81, 0x82, 0x83, 0x84, 0xc0] {
+            for message_type in [1, 255] {
+                let extension = if kind == 0x82 {
+                    vec![2, 0, 0, 1, 0, 0, 0, 0]
+                } else {
+                    vec![1, 0, 1, 0]
+                };
+                let mut wire = vec![0x36, message_type, 0, 0, 0, 0, 0, 1, 0, 7, 0, kind];
+                wire.extend_from_slice(&extension);
+                if message_type == 255 {
+                    wire.push(0x45);
+                } else {
+                    wire[7] = 0;
+                }
+                let length = (wire.len() - 8) as u16;
+                wire[2..4].copy_from_slice(&length.to_be_bytes());
+                let event = receive(&wire, 49152);
+                assert_eq!(
+                    event.kind(),
+                    GtpuControlDatagramKind::UnsupportedRequiredExtension,
+                    "kind={kind:#x}, message={message_type}"
+                );
+                let supported =
+                    GtpuExtensionHeaderTypeList::new([GtpuExtensionHeaderType::new(0x85)]).unwrap();
+                let plan = event.extension_notification(supported, budget()).unwrap();
+                assert_eq!(plan.bytes[1], 31);
+                assert_eq!(
+                    receive(&wire, 49152)
+                        .unknown_tunnel_error(budget())
+                        .unwrap_err(),
+                    GtpuControlPortError::WrongProcedure
+                );
+            }
+        }
+    }
+
+    #[test]
     fn control_endpoint_comprehension_domain_preserves_optional_bytes() {
         for extension in 1..=u8::MAX {
-            let packet = [
+            let mut packet = vec![
                 0x34, 255, 0, 9, 1, 2, 3, 4, 0, 0, 0, extension, 1, 0, 0, 0, 0x45,
             ];
+            if matches!(extension, 0x03 | 0x82) {
+                packet.splice(12..16, [2, 0, 1, 2, 0, 0, 0, 0]);
+                packet[3] = 13;
+            }
             let event = receive(&packet, 49152);
-            // The fixed two-octet content is invalid for Long PDCP.
-            let malformed = matches!(extension, 0x03 | 0x82);
-            let required = extension >= 0x80 && !matches!(extension, 0x81..=0x85 | 0xc0);
+            let required = extension >= 0x80 && extension != 0x85;
             assert_eq!(event.bytes(), packet);
             assert_eq!(
                 event.kind(),
-                if malformed {
-                    GtpuControlDatagramKind::Malformed
-                } else if required {
+                if required {
                     GtpuControlDatagramKind::UnsupportedRequiredExtension
                 } else {
                     GtpuControlDatagramKind::Gpdu
@@ -1382,6 +1421,6 @@ mod tests {
             }
             count += 1;
         }
-        assert_eq!(count, 1206);
+        assert_eq!(count, 1208);
     }
 }

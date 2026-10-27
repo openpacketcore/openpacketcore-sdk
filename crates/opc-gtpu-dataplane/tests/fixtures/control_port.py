@@ -54,8 +54,12 @@ def corpus():
         wire[11] = extension
         # Two-octet content is malformed for either Long PDCP assignment.
         disposition = "M" if extension in [0x03, 0x82] else (
-            "R" if extension >= 128 and extension not in [0x81, 0x83, 0x84, 0x85, 0xc0] else "G")
+            "R" if extension >= 128 and extension != 0x85 else "G")
         add(f"extension-{extension}", disposition, wire)
+    for extension, disposition in [(0x03, "G"), (0x82, "R")]:
+        wire = bytearray(frame(255, bytes.fromhex("020001020000000045"), flags=0x34, teid=0x01020304))
+        wire[11] = extension
+        add(f"long-pdcp-{extension}", disposition, wire)
     for index, seed in enumerate([echo, reply, error, marker, gpdu, *notifications]):
         for length in range(len(seed)):
             add(f"trunc-{index}-{length}", "M", seed[:length])

@@ -31,7 +31,7 @@ fn unhex(text: &str) -> Vec<u8> {
 fn insertion(qfi: u8) -> N3UplinkEncapsulation {
     let tunnel = ReceivedN3UplinkTnl::new(
         "192.0.2.1".parse().unwrap(),
-        Teid::new(0x1122_3344).unwrap().into(),
+        Teid::new(0x1122_3344).unwrap(),
     )
     .unwrap();
     N3UplinkEncapsulation::new(tunnel, N3Qfi::new(qfi).unwrap())
@@ -119,7 +119,7 @@ fn independent_reference_packets() {
 fn n3_uplink_insertion_matches_independent_wire() {
     let tunnel = ReceivedN3UplinkTnl::new(
         "192.0.2.1".parse().unwrap(),
-        Teid::new(0x1122_3344).unwrap().into(),
+        Teid::new(0x1122_3344).unwrap(),
     )
     .unwrap();
     let insertion = N3UplinkEncapsulation::new(tunnel, N3Qfi::new(9).unwrap());
@@ -360,7 +360,7 @@ fn receive_is_borrowed_and_allocates_nothing() {
 fn directional_tunnel_and_marking_intent_is_explicit_and_redacted() {
     let uplink = ReceivedN3UplinkTnl::new(
         "192.0.2.1".parse().unwrap(),
-        Teid::new(0x1122_3344).unwrap().into(),
+        Teid::new(0x1122_3344).unwrap(),
     )
     .unwrap();
     let downlink = LocalN3DownlinkTnl::new(

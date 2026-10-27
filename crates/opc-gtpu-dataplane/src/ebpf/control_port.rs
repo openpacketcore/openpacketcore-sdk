@@ -454,7 +454,10 @@ impl GtpuControlPort for BackendControlPort {
                         .admit(plan.session(), std::time::Instant::now())
                     {
                         crate::reassembly::PacketTooBigAdmission::Admitted => {
-                            match socket.ok_or(GtpuControlPortError::InvalidTuple).and_then(|socket| socket.send_in_tunnel_error(local, peer, &gpdu)) {
+                            match socket
+                                .ok_or(GtpuControlPortError::InvalidTuple)
+                                .and_then(|socket| socket.send_in_tunnel_error(local, peer, &gpdu))
+                            {
                                 Ok(_) => crate::GtpuPacketTooBigSignal::Sent,
                                 Err(_) => crate::GtpuPacketTooBigSignal::Unsendable,
                             }
@@ -544,22 +547,19 @@ impl GtpuControlPort for BackendControlPort {
         self.with_attachment(|_, state, _| {
             use crate::control_port::{GtpuControlQueue, GtpuControlReadiness};
 
-            // The opener binds all three queues; a missing one means the
-            // registration is not in the state that published this port.
-            let shared = state
-                .socket
-                .as_ref()
-                .ok_or(GtpuControlPortError::Unavailable)?;
-            let packet_too_big = state
-                .too_big_socket
-                .as_ref()
-                .ok_or(GtpuControlPortError::Unavailable)?;
-            let inner_fragment = state
-                .inner_fragment_socket
-                .as_ref()
-                .ok_or(GtpuControlPortError::Unavailable)?;
-            let readiness = GtpuControlReadiness::new(
-                [
+            // Shared traffic may use IPv4, IPv6 or both. The IPv4-only
+            // hand-off queues exist exactly when the IPv4 shared socket does.
+            let mut queues = Vec::with_capacity(4);
+            if let Some(shared) = &state.socket {
+                let packet_too_big = state
+                    .too_big_socket
+                    .as_ref()
+                    .ok_or(GtpuControlPortError::Unavailable)?;
+                let inner_fragment = state
+                    .inner_fragment_socket
+                    .as_ref()
+                    .ok_or(GtpuControlPortError::Unavailable)?;
+                queues.extend([
                     (GtpuControlQueue::Shared, shared.readiness_fd()),
                     (
                         GtpuControlQueue::PacketTooBig,
@@ -569,9 +569,15 @@ impl GtpuControlPort for BackendControlPort {
                         GtpuControlQueue::InnerFragment,
                         inner_fragment.readiness_fd(),
                     ),
-                ],
-                None,
-            )?;
+                ]);
+            }
+            if let Some(shared) = &state.ipv6_socket {
+                queues.push((GtpuControlQueue::Shared, shared.readiness_fd()));
+            }
+            if queues.is_empty() {
+                return Err(GtpuControlPortError::Unavailable);
+            }
+            let readiness = GtpuControlReadiness::new(queues, None)?;
             state
                 .readiness
                 .retain(|readiness| readiness.upgrade().is_some());

@@ -36,8 +36,9 @@ cargo test --locked -p opc-proto-gtpu --all-features
 These are synthetic specification-derived bytes. This correction does not
 establish live-peer interoperability, a control socket, packet forwarding,
 peer admission, rate policy or End Marker lifecycle ordering. Those
-remaining contracts stay tracked in #341 and #790. The PR records its
-public base/head/tree, guard-removal evidence and full qualification.
+runtime contracts are documented with the [dataplane control port](../../opc-gtpu-dataplane/docs/control-port.md),
+including the retained Linux/eBPF socket implementation for #341 and its
+caller-owned admission, pacing and lifecycle limits.
 
 Receiver correction #1521 applies TS 29.060 §11.1.12 (via TS 29.281 §9.1):
 the 256 duplicate-list cases now admit the first list and canonical encoding

@@ -9118,6 +9118,7 @@ mod tests {
         let peer = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let _guard = backend.inner.pdp_operation_lock.lock().unwrap();
+        let _registry = backend.inner.device_sockets.lock().unwrap();
         assert!(port.try_receive_datagram(64).unwrap().is_none());
         let plan = receive_control_echo_plan(port.as_ref(), &peer, address);
         assert_eq!(port.send_control_response(plan).unwrap(), 14);
@@ -9333,22 +9334,19 @@ mod tests {
         assert_eq!(datagram.bytes(), gpdu);
         assert_eq!(
             datagram.local(),
-            std::net::SocketAddrV4::new(address, GTPU_PORT)
+            std::net::SocketAddr::from((address, GTPU_PORT))
         );
-        assert_eq!(
-            std::net::SocketAddr::V4(datagram.peer()),
-            trigger.local_addr().unwrap()
-        );
+        assert_eq!(datagram.peer(), trigger.local_addr().unwrap());
         let plan = datagram
             .unknown_tunnel_error(GtpuControlResponseBudget::new(28, 4).unwrap())
             .unwrap();
         assert_eq!(
             plan.source(),
-            std::net::SocketAddrV4::new(address, GTPU_PORT)
+            std::net::SocketAddr::from((address, GTPU_PORT))
         );
         assert_eq!(
             plan.destination(),
-            std::net::SocketAddrV4::new(peer_address, GTPU_PORT)
+            std::net::SocketAddr::from((peer_address, GTPU_PORT))
         );
         assert_eq!(port.send_control_response(plan).unwrap(), 28);
         let mut received = [0; 64];
@@ -9382,7 +9380,12 @@ mod tests {
             else {
                 panic!()
             };
-            setsockopt(&handle.linux_as_fd().unwrap(), sockopt::IpRecvTos, &true).unwrap();
+            // Exceed the shared IPv4/IPv6 packet-info and overflow buffer;
+            // TOS alone fits now that both address families are supported.
+            let fd = handle.linux_as_fd().unwrap();
+            setsockopt(&fd, sockopt::IpRecvTos, &true).unwrap();
+            setsockopt(&fd, sockopt::Ipv4RecvTtl, &true).unwrap();
+            setsockopt(&fd, sockopt::ReceiveTimestampns, &true).unwrap();
         }
         let peer = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         peer.send_to(

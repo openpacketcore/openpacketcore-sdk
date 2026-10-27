@@ -1089,7 +1089,7 @@ fn comprehension_bits_drive_unknown_extension_handling() {
     }
 
     let pdcp = GtpuExtensionHeaderType::new(0xc0);
-    assert!(!pdcp.unsupported_requires_comprehension_by(GtpuExtensionHeaderRecipient::Intermediate));
+    assert!(pdcp.unsupported_requires_comprehension_by(GtpuExtensionHeaderRecipient::Intermediate));
     assert!(pdcp
         .comprehension()
         .is_required_by(GtpuExtensionHeaderRecipient::Intermediate));
@@ -1100,12 +1100,12 @@ fn comprehension_bits_drive_unknown_extension_handling() {
 
 #[test]
 fn generic_decoder_rejects_only_unknown_comprehension_required_extensions() {
-    for (extension_type, should_reject) in [
-        (0x04, false),
-        (0x44, false),
-        (0x84, false),
-        (0x87, true),
-        (0xc4, true),
+    for (extension_type, should_reject, endpoint_unsupported) in [
+        (0x04, false, false),
+        (0x44, false, false),
+        (0x84, false, true),
+        (0x87, true, true),
+        (0xc4, true, true),
     ] {
         let wire = [
             0x34,
@@ -1139,14 +1139,14 @@ fn generic_decoder_rejects_only_unknown_comprehension_required_extensions() {
             Ok(value) => value,
             Err(error) => panic!("extension analysis failed: {error:?}"),
         };
-        assert_eq!(required.is_some(), should_reject);
+        assert_eq!(required.is_some(), endpoint_unsupported);
 
         let result = GtpuMessage::decode(&wire, ctx);
         if should_reject {
             let error = result.expect_err("required extension must be rejected");
             assert_eq!(error.code(), &DecodeErrorCode::UnknownCriticalIe);
         } else {
-            assert!(result.is_ok(), "optional extension must be skipped");
+            assert!(result.is_ok(), "recognized or optional format must decode");
         }
     }
 }

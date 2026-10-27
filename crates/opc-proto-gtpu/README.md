@@ -129,8 +129,9 @@ conditional codec candidate, not a current production approval.
 `CONFORMANCE.md` records the TS 29.281 baseline, supported features, fuzzing,
 and explicit exclusions. Typed control codecs do not provide UDP socket access,
 peer admission, response rate limiting, tunnel lookup, End Marker policy, or
-Linux/eBPF control-datagram integration. Those runtime/backend parts of issue
-#341 remain open and are required before a production dataplane claim.
+Linux/eBPF control-datagram integration. The [dataplane control port](../opc-gtpu-dataplane/docs/control-port.md)
+implements the retained socket boundary, IPv4/IPv6 tuples and typed responses
+for #341; peer admission, pacing and lifecycle policy remain caller-owned.
 
 Canonical encode normalizes header bits where appropriate. Raw-preserving encode
 uses `EncodeContext { raw_preserving: true, .. }` and is the mode to use when

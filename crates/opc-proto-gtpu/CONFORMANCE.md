@@ -54,16 +54,18 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
 - **Typed values**: `GtpuTypedExtension` decodes/encodes UDP Port, short PDCP,
   18-bit Long PDCP, Service Class Indicator, and the existing PSC subset. RAN,
   Xw RAN and NR RAN container bytes are borrowed and opaque. Fixed lengths,
-  aligned container bounds, 18-bit send limits and SCI send values 0–31 are
+  aligned container bounds, 18-bit send limits and SCI send values 0–15 are
   checked. Receive ignores spare bits; typed send clears them. Short PDCP
   interface-specific 12/15-bit restrictions remain caller policy.
 - **Long PDCP assignments**: figure 5.2.1-3 notes 2/3 require current senders
   to use `0x03`; `0x82` is the earlier-release receive form (the issue's legacy
   wording was reversed). Both have typed decode; explicit legacy encoding is
   available for interop, not the current sender default.
-- **Comprehension scope**: opaque RAN content still requires the consumer's
-  inner-protocol support. The N3 endpoint independently retains its PSC-only
-  comprehension profile. Structural GTP-U decode retains raw known extensions;
+- **Comprehension scope**: wire-format recognition is separate from endpoint
+  comprehension. Both the control-port and N3 endpoint profiles comprehend PSC
+  only; 0x81–0x84 and 0xC0 require notification and discard at an endpoint even
+  though typed format decoding exists. The SGW/G-PDU exception for 0xC0 remains.
+  Structural GTP-U decode retains raw known extensions;
   `ProcedureAware`, the typed decode and comprehension scan check fixed lengths.
   Unknown required types still fail under `Reject`. PDU Set containers `0x04`
   and `0x86` remain unimplemented pending that feature's TS 38.415 semantics.
@@ -107,7 +109,11 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   GTP-C TV elements whose lengths are defined in TS 29.060 Table 37. First
   occurrences win regardless of `DuplicateIePolicy`; Private Extensions may repeat.
   Unknown TLVs are opaque under `Preserve`, skipped under both `Drop` and `Reject`.
-  Unknown TVs still fail because their boundary cannot be determined. Canonical
+  Known limitation: unknown TVs currently reject the whole message, although
+  §11.1.9 permits discarding only the remainder when mandatory information is
+  complete. Malformed optional Recovery Time Stamp and Private Extension IEs
+  also still reject the message instead of being treated as absent (§11.1.13).
+  These receiver-tolerance corrections remain follow-up work. Canonical
   encoding checks the model IE count and exact final datagram/u16 length before
   allocating or writing its serialized IE payload.
 - **Validated conversion boundary**: `GtpuControlMessage::from_message`
@@ -154,9 +160,10 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   integration, peer admission, rate limits, response tuple selection, unknown-
   TEID lookup, and End Marker ordering policy are not implemented by this codec
   slice.
-- **Tracking**: these runtime/dataplane acceptance items remain open under
-  issue #341. Typed-codec tests do not claim Linux/eBPF behavioral parity or
-  production qualification.
+- **Runtime implementation**: the [dataplane control port](../opc-gtpu-dataplane/docs/control-port.md)
+  supplies retained Linux/eBPF sockets, IPv4/IPv6 tuples and typed responses for
+  #341. Peer admission, response pacing and lifecycle policy remain caller-owned.
+  Codec tests alone do not qualify backend behavior or live-peer interoperability.
 
 ---
 

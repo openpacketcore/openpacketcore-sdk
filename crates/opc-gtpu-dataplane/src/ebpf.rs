@@ -57230,9 +57230,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod control_port_recovery;
     mod grouped_bearer_transition;
-    mod multihoming;
     #[cfg(target_os = "linux")]
     mod ipv6_packet_too_big;
+    mod multihoming;
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
     mod ordinary_ipv6;

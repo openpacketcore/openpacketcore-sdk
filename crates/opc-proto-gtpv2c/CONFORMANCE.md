@@ -206,8 +206,10 @@ The profile owns the typed IE families required by the S2b messages above:
 - Unknown, private, and unsupported future IEs follow the caller's
   `UnknownIePolicy` at every typed sequence scope: `Drop` omits them from the
   interpreted view, `Preserve` retains byte-exact `TypedIeValue::Raw`, and
-  `Reject` returns `UnknownCriticalIe`. They are never interpreted as product
-  policy.
+  `Reject` returns `UnknownCriticalIe`. `Reject` is a diagnostic mode and is
+  not conformant for network receive of unknown optional IEs under TS 29.274
+  §7.7.1; use the default `Preserve` or `Drop` there. These IEs are never
+  interpreted as product policy.
 
 ### Required semantic validation
 
@@ -510,7 +512,9 @@ coverage.
      an MTU-only value is still empty.
    - Bearer QoS decodes the required 22-octet prefix into a typed
      Allocation/Retention Priority, QCI, and 40-bit integer-kbit/s maximum and
-     guaranteed bit-rate fields. ARP priority level and spare bits are checked.
+     guaranteed bit-rate fields. ARP priority level is checked; received spare
+     bits are ignored under §7.7.8 and canonical encoding clears them. Direct
+     sender construction still rejects nonzero spares.
      TS 29.274 Table 8.1-1 classifies this IE as Extendable: unknown trailing
      octets are ignored on decode per clause 7.7.7, omitted by canonical
      encoding, and retained by raw-preserving message encoding. The rates use

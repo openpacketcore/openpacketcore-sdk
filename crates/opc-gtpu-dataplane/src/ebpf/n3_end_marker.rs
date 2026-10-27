@@ -137,6 +137,7 @@ mod tests {
             peer_address: IpAddr::V4(peer),
             link_ifindex: 7,
             downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             gtp_version: crate::GtpVersion::V1,
             bearer_mark: None,
             egress_dscp: None,

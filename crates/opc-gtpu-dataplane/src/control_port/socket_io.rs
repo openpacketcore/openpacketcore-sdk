@@ -53,7 +53,7 @@ pub(crate) fn receive(
     fd: BorrowedFd<'_>,
     buffer: &mut [u8],
     flags: MsgFlags,
- ) -> io::Result<Option<Received>> {
+) -> io::Result<Option<Received>> {
     receive_tracked(fd, buffer, flags, &mut false)
 }
 

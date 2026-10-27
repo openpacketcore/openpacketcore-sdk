@@ -3634,6 +3634,52 @@ mod tests {
         assert_eq!(view.downlink_inner_mtu(), Some(mtu));
     }
 
+    #[test]
+    fn multihoming_and_inner_mtu_keep_distinct_versions_and_borrowed_authority() {
+        let mtu = DownlinkInnerMtu::in_tunnel_packet_too_big(1_300).unwrap();
+        let original = v6_entry().with_downlink_inner_mtu(mtu).unwrap();
+        assert_eq!(
+            original.encode()[0],
+            3,
+            "backlog MTU ABI stays byte-compatible"
+        );
+        let entry = original.with_peer_source_policy(GtpuPeerSourcePolicy::TeidAndLocal);
+        let wire = entry.encode();
+        assert_eq!(
+            wire[0], 6,
+            "combined profile cannot alias ordinary/N3 multi-homing"
+        );
+        assert_eq!(wire[3], 1);
+        assert_eq!(&wire[73..75], &mtu.field().to_be_bytes());
+        assert_eq!(GtpuSessionEntry::decode(&wire), Some(entry));
+        let authority = active(9, None, Some(entry)).encode();
+        let reference = GtpuSessionGroupRef::single(group_id(), candidate(9, entry)).encode();
+        let config = device_config().encode();
+        let view = select_gtpu_session_entry_wire(
+            &authority,
+            &reference,
+            &config,
+            42,
+            GTPU_SESSION_IPV6_SLOT,
+        )
+        .unwrap();
+        assert_eq!(view.downlink_inner_mtu(), Some(mtu));
+        let mut alternate = address_bytes(entry.peer_outer_address());
+        alternate[3] ^= 1;
+        assert!(view.authorizes_downlink_packet(
+            &alternate,
+            &address_bytes(entry.local_outer_address()),
+            21_152,
+            &address_bytes(inner_packet(entry, 7))
+        ));
+        for version in [1, 2, 3, 4, 5, 7] {
+            let mut wrong = wire;
+            wrong[0] = version;
+            assert!(GtpuSessionEntry::decode(&wrong).is_none());
+            assert!(!entry_wire_is_canonical(&wrong, entry.inner_family()));
+        }
+    }
+
     mod legacy_v6 {
         include!("session_legacy_v6.rs");
     }

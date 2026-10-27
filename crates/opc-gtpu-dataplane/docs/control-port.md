@@ -172,10 +172,10 @@ Validation uses independently authored packet literals, all 65,536 source
 ports at four sequence boundaries, all 255 nonterminal extension types,
 all 256 received Recovery values, malformed framing and explicit byte/ratio
 boundaries. The independent standard-library Python generator
-`tests/fixtures/control_port.py` produces 1,206 receive/response records:
-283 controls, 132 G-PDUs, 122 required-extension events, 249 unmodelled
+`tests/fixtures/control_port.py` produces 1,208 receive/response records:
+283 controls, 129 G-PDUs, 127 required-extension events, 249 unmodelled
 messages, two Tunnel Status events and 418 malformed inputs. TSV SHA-256:
-`623387cccf311887be4b7147214187ef57f29f4e754c64f2f59855f57b612589`.
+`55bc9e876ac38e5dd53fbdb581b25cdb9c34f338483cb3d4e5d99d59640b4f8e`.
 CI checks byte-exact regeneration. A separate private-network-namespace UDP peer checks actual
 reply bytes/tuples, the single queue, truncation, foreign and replaced socket
 plans, and interface-rename refusal. It does not attach a tc program or GTP
@@ -185,9 +185,9 @@ tests. The PR records guard-removal results and public base/head/tree.
 
 Separate native eBPF tests now obtain this same port through the public
 backend trait. They attach the committed classifier and check all 127 required
-extension handoffs outside PSC: 122 unknown identifiers permit bounded
-notifications, and five codec-known RAN/PDCP formats remain unforwarded without
-claiming an unknown-extension response. Original tuple/bytes, all 127 optional
+extension handoffs outside PSC: all 127 permit bounded notifications,
+including the five RAN/PDCP formats whose syntax is known but whose semantics
+are not comprehended by this endpoint. Original tuple/bytes, all 127 optional
 identifiers and malformed suffix rejection are also checked.
 The ordinary IPv4 attachment's IPv6 parser handoff retains a raw UDP probe
 because that attachment has no configured IPv6 control endpoint. Separate
@@ -204,8 +204,9 @@ namespace-local addresses are used.
 The backend implementation adds two unit cases for writer contention and
 poisoned serialization, plus an exact unsupported-result contract test for
 Linux kernel, mock and unsupported adapters. Independent Echo wire literals
-exercise both legacy and grouped IPv4 attachments; IPv6-only attachments
-refuse explicitly. The original parent lacks the backend method, retained
+exercise legacy and grouped attachments. IPv6-only and dual-stack attachments
+share the same lifetime rules; readiness watches both shared-family sockets
+under the `Shared` queue class and wakes on retirement. The original parent lacks the backend method, retained
 as a compile-time API detector. Four separate production guard removals
 (backend exposure, live-hook check, weak backend ownership and socket release)
 and an independent Echo sequence mutation each compile and fail during the

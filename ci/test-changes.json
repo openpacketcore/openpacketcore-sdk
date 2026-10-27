@@ -1100,6 +1100,45 @@
       "kind": "disabled",
       "issue": 341,
       "reason": "New native IPv6 kernel-GTP control test requires CAP_NET_ADMIN and a private network namespace. Required GTP CI runs every ignored Linux GTP integration case explicitly. Independent wire bytes cover Echo, Error Indication, extension notification, budgets and retired handles."
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::lib=lib::ie::typed::tests::bearer_qos_decode_rejects_arp_spare_bits",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::lib=lib::ie::typed::tests::bearer_qos_decode_ignores_arp_spare_bits_and_sender_rejects_them",
+      "reason": "TS 29.274 7.7.8 requires receivers to ignore ARP spare bits. Replace the non-conformant whole-IE rejection with all three spare-bit combinations, canonical receive/send equivalence and sender-side rejection; Create/Update Bearer tests also preserve the raw received octet at every validation level.",
+      "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_and_out_of_range_levels_stay_rejected",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_are_ignored_and_out_of_range_levels_stay_rejected",
+      "reason": "TS 29.274 7.7.8 requires receiver-ignored ARP spare bits. Check each spare combination with a valid level, retain level-zero and constructor-range rejection, and retain canonical sender-spare validation in the typed QoS unit test.",
+      "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_required_extensions_reach_shared_control_without_decap",
+      "kind": "assertions-decreased",
+      "reason": "Remove the codec-known branch that incorrectly expected WrongProcedure for RAN/PDCP formats. Every one of the 127 non-PSC required types now takes the same stronger exact SEHN wire-send assertions, preserving all tuple, byte, non-forwarding, optional-extension and malformed-chain checks (TS 29.281 5.2.1).",
+      "issue": 1529
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::unknown_tunnel_wire_capture_and_echo_share_reopened_socket",
+      "kind": "disabled",
+      "reason": "Port the independent Linux wire-capture and outgoing Echo scenario alongside the existing wildcard/known-TEID regression, under a distinct name. It requires a privileged private network namespace and runs in the complete native Linux suite. Reopening preserves the backlog shared generation; attachment removal still revokes both handles.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::linux::tests::linux_control_port_refuses_nonstandard_port_and_ipv6_bind",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::linux::tests::linux_control_port_refuses_nonstandard_port_and_accepts_ipv6_bind",
+      "reason": "IPv6 control support for #341 replaces the unsupported-bind expectation with exact IPv6 socket tuple acceptance. Preserve the nonstandard-port rejection and add live IPv6 Echo, Error Indication and required-extension notification coverage in the privileged suite.",
+      "issue": 341
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_are_ignored_and_out_of_range_levels_stay_rejected",
+      "kind": "assertions-decreased",
+      "reason": "Replace three incorrect spare-bit rejection statements with a loop over all three spare-bit combinations. Each combination now proves valid-level equivalence and continued rejection of level zero; constructor bounds and all former zero-level octets remain covered (TS 29.274 7.7.8).",
+      "issue": 1354
     }
   ]
 }

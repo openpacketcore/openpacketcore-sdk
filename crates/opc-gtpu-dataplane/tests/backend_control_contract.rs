@@ -37,7 +37,13 @@ async fn linux_control_port_requires_backend_socket_ownership() {
         .open_gtpu_control_port(&device)
         .await
         .unwrap_err();
-    assert!(matches!(error, GtpuError::UnsupportedFeature { feature: "gtpu_control_port", .. }));
+    assert!(matches!(
+        error,
+        GtpuError::UnsupportedFeature {
+            feature: "gtpu_control_port",
+            ..
+        }
+    ));
     assert!(!format!("{error:?} {error}").contains(&device.name));
 }
 

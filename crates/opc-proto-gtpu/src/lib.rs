@@ -159,8 +159,17 @@ impl GtpuExtensionHeaderType {
         matches!(self.0, 0x03 | 0x20 | 0x40 | 0x81..=0x85 | 0xc0)
     }
 
-    /// Return whether an unsupported header requires comprehension by the
-    /// supplied recipient role.
+    /// Return whether this SDK endpoint comprehends the extension semantics.
+    ///
+    /// The endpoint profile supports UDP Port and PDU Session Container. Typed RAN and
+    /// PDCP parsing does not supply their protocol consumers.
+    #[must_use]
+    pub const fn is_supported_by_endpoint(self) -> bool {
+        matches!(self.0, GTPU_EXT_UDP_PORT | GTPU_EXT_PDU_SESSION_CONTAINER)
+    }
+
+    /// Return whether a header outside the endpoint comprehension profile
+    /// requires comprehension by the supplied recipient role.
     #[must_use]
     pub const fn unsupported_requires_comprehension_by(
         self,
@@ -174,7 +183,7 @@ impl GtpuExtensionHeaderType {
         {
             return false;
         }
-        !self.is_supported_by_codec() && self.comprehension().is_required_by(recipient)
+        !self.is_supported_by_endpoint() && self.comprehension().is_required_by(recipient)
     }
 }
 
@@ -1579,8 +1588,12 @@ impl<'a> BorrowDecode<'a> for GtpuMessage<'a> {
                 }
 
                 let extension_type = GtpuExtensionHeaderType::new(current_next_ext);
-                if extension_type
-                    .unsupported_requires_comprehension_by(GtpuExtensionHeaderRecipient::Endpoint)
+                // Generic decoding recognizes syntax; endpoint admission uses
+                // first_unsupported_required_extension separately.
+                if !extension_type.is_supported_by_codec()
+                    && extension_type
+                        .comprehension()
+                        .is_required_by(GtpuExtensionHeaderRecipient::Endpoint)
                     && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject)
                 {
                     return Err(DecodeError::new(

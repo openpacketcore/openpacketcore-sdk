@@ -53,7 +53,7 @@ fn fixed_and_opaque_extensions_match_independent_golden_bytes() {
             E::LegacyLongPdcpPduNumber(0x23456),
             vec![2, 2, 0x34, 0x56, 0, 0, 0, 0],
         ),
-        (E::ServiceClassIndicator(31), vec![1, 31, 0, 0]),
+        (E::ServiceClassIndicator(15), vec![1, 15, 0, 0]),
         (E::RanContainer(&[1, 2]), vec![1, 1, 2, 0]),
         (
             E::XwRanContainer(&[1, 2, 3, 4, 5, 6]),
@@ -99,7 +99,7 @@ fn extension_value_bounds_spares_and_lengths_are_checked() {
     assert_eq!(sci.encode(0).unwrap().as_ref(), &[1, 7, 0, 0]);
     assert!(E::LongPdcpPduNumber(0x40000).encode(0).is_err());
     assert!(E::LegacyLongPdcpPduNumber(u32::MAX).encode(0).is_err());
-    for sci in 32..=255 {
+    for sci in 16..=255 {
         let bytes = [sci, 0];
         let decoded = E::decode(&H {
             ext_type: 0x20,
@@ -161,5 +161,34 @@ fn procedure_validation_and_comprehension_scan_reject_malformed_known_lengths() 
             ..DecodeContext::default()
         };
         assert!(GtpuMessage::decode(&wire, ctx).is_err());
+    }
+}
+
+#[test]
+fn review_required_known_formats_are_not_endpoint_comprehension() {
+    use opc_proto_gtpu::GtpuExtensionHeaderRecipient as R;
+    for kind in [0x81, 0x82, 0x83, 0x84, 0xc0] {
+        let kind = GtpuExtensionHeaderType::new(kind);
+        assert!(kind.is_supported_by_codec());
+        assert!(
+            kind.unsupported_requires_comprehension_by(R::Endpoint),
+            "{kind:?}"
+        );
+    }
+    assert!(!GtpuExtensionHeaderType::new(0xc0)
+        .unsupported_requires_comprehension_by(R::ServingGatewayReceivingGpdu));
+}
+
+#[test]
+fn review_sci_sender_uses_only_assigned_operator_values() {
+    use opc_proto_gtpu::GtpuTypedExtension;
+    for value in 0..=255 {
+        assert_eq!(
+            GtpuTypedExtension::ServiceClassIndicator(value)
+                .encode(0)
+                .is_ok(),
+            value <= 15,
+            "TS 29.281 Table 5.2.2.3-1 SCI {value}"
+        );
     }
 }

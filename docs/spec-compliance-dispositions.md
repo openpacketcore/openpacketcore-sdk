@@ -71,7 +71,8 @@ claimed; implementing such a supervisor remains separate runtime work.
 ## GTP-U multi-homing #1347
 
 The eBPF default checked the configured outer peer address exactly. TS 29.281
-§§4.3.0 and 4.4.3.3 allow one entity to use multiple source addresses. The issue's
+§4.3.0 defines an entity per IP address and permits “one GTP-U tunnel endpoint
+to receive packets from multiple remote GTP-U endpoints”. The issue's
 explicit TEID/local validation option is now `GtpuPeerSourcePolicy::TeidAndLocal`.
 It is per context and keeps local endpoint, attachment, source-port, inner-PAA,
 TEID, ownership/generation and N3 QFI checks. Unspecified sources and malformed
@@ -108,3 +109,17 @@ Sources: [TS 29.281 v18.4.0 §§4.3.0, 4.4.3.3](https://www.etsi.org/deliver/ets
 [shared binding](../crates/opc-gtpu-ebpf-common/src/lib.rs),
 [grouped wire authorizers](../crates/opc-gtpu-ebpf-common/src/session.rs), and
 [live packet proof](../crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged/multihoming.rs).
+
+## S2b GTPv2-C unknown optional IEs #1359
+
+TS 29.274 §§7.7.1 and 7.7.9 require continued processing after an unknown
+optional IE. The default `UnknownIePolicy::Preserve` retains its uninterpreted
+bytes and `Drop` omits it from the interpreted view. Explicit `Reject` is a
+non-conformant diagnostic mode for this network-receive case. The issue's
+§7.2.1 citation describes Create Session Request, and its `messages.rs:820`
+path is absent from this crate. The existing
+[unknown-IE policy tests](../crates/opc-proto-gtpv2c/tests/unknown_ie_policy.rs)
+and [S2b receive tests](../crates/opc-proto-gtpv2c/tests/s2b_receive_policy.rs)
+qualify this disposition; it makes no PFCP runtime claim.
+
+Source: [TS 29.274 V19.6.0 §§7.7.1, 7.7.9](https://www.etsi.org/deliver/etsi_ts/129200_129299/129274/19.06.00_60/ts_129274v190600p.pdf).
