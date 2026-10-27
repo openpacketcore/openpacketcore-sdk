@@ -464,8 +464,9 @@ on that SA. `Incomplete` exposes no plaintext. `Message` contains the complete
 authenticated chain and still requires ordinary admission and application
 validation. `Retransmit` borrows the committed response packets: hold that borrow
 and the consumer send fence through every datagram. After a completed request,
-only authenticated fragment 1 triggers replay; later fragments drop. A repeated
-fragment 1 of an empty request returns the prior complete empty request for
+only authenticated fragment 1 triggers replay; later fragments drop. An empty
+request replay must be fragment 1 of 1, empty and byte-identical to the cached
+single-packet request. It returns the prior complete empty request for
 `reply_empty`, preserving canonical replay and its freshness observation.
 
 Each direction holds at most 256 fragments, 65,536 cleartext bytes and 98,304

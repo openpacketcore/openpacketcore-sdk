@@ -173,6 +173,35 @@ fn cached_empty_fragment_replay_requires_one_empty_identical_packet() {
     }
 }
 
+#[test]
+fn cached_two_fragment_empty_request_drops_single_fragment_replay() {
+    use opc_proto_ikev2::canonical::Ikev2CanonicalPolicy;
+    support::ensure_ike_crypto();
+    for (role, direction) in DIRECTIONS.into_iter().enumerate() {
+        let mut f = Fixture::new(124430 + role as u64, ALGORITHMS[0], direction);
+        enable(&mut f);
+        f.window
+            .enable_empty_replies(Ikev2CanonicalPolicy::default())
+            .unwrap();
+        let keys = f.keys.clone();
+        let peer = wire::Wire::new(f.profile, &keys, f.spis, opposite(direction));
+        let first = peer.seal_fragment(0, false, 37, (1, 2), empty());
+        let second = peer.seal_fragment(0, false, 37, (2, 2), empty());
+        assert!(matches!(
+            receive(&mut f, &first, 0),
+            Ok(Receive::Incomplete)
+        ));
+        let Receive::Message(request) = receive(&mut f, &second, 1).unwrap() else {
+            panic!("complete two-fragment empty request");
+        };
+        f.window.reply_empty(&request).unwrap();
+        let changed = peer.seal_fragment(0, false, 37, (1, 1), empty());
+        let result = receive(&mut f, &changed, 2);
+        assert!(matches!(result, Err(Error::Drop)), "{result:?}");
+        assert_eq!(f.window.next_receive(), Some(1));
+    }
+}
+
 fn receive<'a>(f: &'a mut Fixture, packet: &[u8], now: u64) -> Result<Receive<'a>, Error> {
     f.window
         .receive_peer_packet(f.profile, &f.keys, packet, now)

@@ -44,7 +44,7 @@ composition guarantees merely by remaining callable.
 | Exchange classes | Final IKE_AUTH seeding/replay, CREATE_CHILD_SA and INFORMATIONAL. Handshake authentication precedes established-SA effects. |
 | Request windows | One outstanding ordinary request in each independent direction, for both original roles. Never send `SET_WINDOW_SIZE`. Zero is a valid ID where that direction's history permits it; `None` means exhaustion. |
 | Empty receive | Canonical policy and preflight, checked restore, then `enable_empty_replies`. CBC uses `preflight_cbc`; sync readiness does not qualify canonical replies. |
-| Liveness probe (opt-in) | Durable positive unwritten-ID bound, then a volatile empty `INFORMATIONAL` request: no per-probe store command, exact-byte exponential retransmission, fixed deadline and matching empty response. Restart requires RFC 6311 synchronization beyond the bound or scoped SA retirement. Caller idleness covers authenticated IKE and Child-SA ESP traffic; NAT keepalives never count. |
+| Liveness probe (opt-in) | Durable positive unwritten-ID bound, then a volatile empty `INFORMATIONAL` request: no per-probe store command, exact-byte exponential retransmission, fixed deadline and a matching authenticated INFORMATIONAL response, with or without payloads. Restart requires RFC 6311 synchronization beyond the bound or scoped SA retirement. Caller idleness covers authenticated IKE and Child-SA ESP traffic; NAT keepalives never count. |
 | Base recovery | Restore committed history and reconstruct the lost empty prefix. No synthetic local liveness probe is sent by recovery itself; an opt-in volatile probe is a separate caller-driven primitive (below). |
 | Negotiated sync | Persist authenticated bilateral agreement; require `sync_readiness`, initiation and response handlers. Never assert `IPSEC_REPLAY_COUNTER_SYNC_SUPPORTED` (16421); ESP counter restoration is outside this profile. |
 | Persistence | Exact prior birth/generation CAS under the current RFC 022 execution stamp, with the SA, window, IV state and operation outcome committed atomically. |
@@ -329,7 +329,9 @@ checkpoint fold it into the next atomic record. The declared peer window is
 still one. A pending probe serializes other locally initiated requests but
 leaves the opposite direction available. Retries preserve every original byte
 and use bounded exponential backoff under a fixed monotone deadline. Only the
-matching authenticated empty response completes the probe, once.
+authenticated INFORMATIONAL response carrying the outstanding probe Message ID
+completes the probe, once; it may carry payloads. `complete_empty_probe` returns
+those payloads for caller processing (RFC 7296 §1.4).
 
 GCM probes consume already reserved Ordinary IVs, never a new reservation or
 control headroom; CBC probes use fresh admitted random IVs. Caller idle policy

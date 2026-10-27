@@ -332,7 +332,7 @@ impl<P: RecoveryProfile> Window<P> {
                     || total != 1
                     || frame.first != PayloadType::NoNext
                     || !frame.cleartext.is_empty()
-                    || cached.single_packet()? != wire
+                    || cached.single_packet().map_or(true, |cached| cached != wire)
                 {
                     return Err(Error::Drop);
                 }

@@ -223,7 +223,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unwritten bound or automatic SA retirement. Opposite-direction peer work stays
   admissible, and peer sync fences probes without inventing an uncertain
   application outcome. Idleness includes authenticated IKE and Child-SA ESP
-  traffic, excluding NAT keepalives. Refs #1241.
+  traffic, excluding NAT keepalives. A probe completes on any authenticated
+  INFORMATIONAL response carrying its Message ID, and `complete_empty_probe`
+  returns that response's payloads (RFC 7296 §1.4). Refs #1241.
 - `opc-gtpu-dataplane`: `GtpuDownlinkCounters::inner_fragment_capacity_exhausted`
   and `packet_too_big_capacity_exhausted`, plus the typed reasons
   `GtpuDownlinkDrop::InnerFragmentCapacityExhausted` and
@@ -237,9 +239,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Exact binding/scoped readback and durable object/roster authentication include
   the target; disabled TFC retains its previous encoding and seals.
   `rekey_sa` verifies GETSA even when clearing TFC and reports indeterminate
-  state if Linux acknowledges an ignored update. `esp_dummy_payload` builds
-  aligned dummy plaintext with Next Header 59 (RFC 4303 §§2.6–2.7), leaving
-  encryption, sequencing, transmission and peer capability policy to the caller.
+  state if Linux acknowledges an ignored update.
   Stored records with enabled TFC from builds that omitted it from authentication
   require a fresh install when crossing this format change. Refs #1344.
 
@@ -576,7 +576,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- `opc-ipsec-xfrm`: remove the unused `esp_dummy_payload` plaintext builder.
+- `opc-ipsec-xfrm`: remove the unused `esp_dummy_payload` plaintext builder,
+  which never shipped in a release.
   Use `EspTfcDummySender` to transmit through an existing kernel ESP SA;
   the kernel retains encryption, sequence allocation and lifetime ownership.
   (#1344)
@@ -594,10 +595,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window records; the strict test consumer row format is version 4. Negotiated
   consumers use `receive_peer_packet`, with bounded reassembly, scheduled expiry,
   and authenticated fragment-1 response replay. (#1242)
-- `opc-proto-ikev2`: `complete_empty_probe` now returns the authenticated
-  `PayloadChain` for caller processing. A matching INFORMATIONAL response may
-  carry payloads and still completes the probe, as RFC 7296 section 1.4 permits.
-  (#1241)
 
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned
