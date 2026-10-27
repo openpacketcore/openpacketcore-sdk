@@ -144,8 +144,9 @@ fields are treated as zero under the conservative
 [RFC 2181 section 8](https://www.rfc-editor.org/rfc/rfc2181.html#section-8)
 policy. [RFC 8767 section 4](https://www.rfc-editor.org/rfc/rfc8767.html#section-4)
 updates RFC 2181 to interpret high-bit TTLs as positive unsigned values.
-This API keeps the older zero rule, which is permitted because a TTL is an
-upper bound on caching, while adopting RFC 8767's cap guidance.
+This API deliberately retains the older zero rule and does not claim the newer
+unsigned-TTL interpretation. TTLs remain upper bounds on caching; this policy
+trades additional lookups for conservative retention while adopting the cap.
 Timestamp overflow fails stale. The resolver is responsible for validating
 wire responses and chain relationships;
 these contracts do not authenticate DNS.
@@ -371,9 +372,15 @@ Length and query bytes are submitted together, following
 [RFC 7766 section 8](https://www.rfc-editor.org/rfc/rfc7766.html#section-8).
 Fallback shares the original server-attempt deadline; it cannot extend the
 budget. UDP exchanges open fresh sockets; TCP reuses one connection per server,
-with one transaction at a time and a 30-second idle timeout. Cancellation or an
+with one transaction at a time and a one-second idle timeout. Cancellation or an
 invalid/partial frame closes the checked-out socket. An idle peer close permits
-one reconnect within the original deadline. TCP pipelining is not implemented.
+one reconnect within the original deadline. EDNS TCP keepalive is not negotiated.
+The short burst-reuse window deliberately departs from
+[RFC 7766 §6.2.3](https://www.rfc-editor.org/rfc/rfc7766.html#section-6.2.3)'s
+recommended immediate idle close to reuse connections across adjacent queries;
+it retains at most one idle connection per server for one second.
+TCP pipelining is not implemented. Queueing behind another TCP exchange uses
+the attempt deadline and can currently contribute to server-timeout history.
 Each exchange uses OS randomness for the full query-ID range.
 Binding port zero delegates source-port selection to the host's
 ephemeral allocator. On Linux this honors `ip_local_port_range` and

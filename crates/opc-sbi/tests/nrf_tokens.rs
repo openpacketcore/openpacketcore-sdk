@@ -21,6 +21,8 @@ fn validator(audience: &str) -> SbiJwtValidator {
         false,
     )
     .with_token_profile(SbiTokenProfile::NrfAccessToken)
+    .with_nrf_audience(NfType::amf(), NfInstanceId::new(PRODUCER).unwrap())
+    .unwrap()
 }
 
 fn claims() -> Value {
@@ -69,6 +71,20 @@ async fn nrf_uuid_tokens_with_nbf_and_instance_audience_arrays_are_supported() {
 }
 
 #[tokio::test]
+async fn review_nrf_producer_accepts_type_and_instance_audience_forms() {
+    let validator = validator("AMF");
+    for audience in [
+        json!("AMF"),
+        json!([PRODUCER]),
+        json!(["c6ed1b94-9c5b-43b5-b72a-a0ed58f8ba43", PRODUCER]),
+    ] {
+        let mut claims = claims();
+        claims["aud"] = audience;
+        assert!(validator.authorize(&request(&claims)).await.is_ok());
+    }
+}
+
+#[tokio::test]
 async fn nrf_tokens_reject_wrong_claims_and_missing_transport_binding() {
     let validator = validator("AMF");
     for (field, value) in [
@@ -76,7 +92,11 @@ async fn nrf_tokens_reject_wrong_claims_and_missing_transport_binding() {
         ("sub", json!(PRODUCER)),
         ("sub", json!("not-a-uuid")),
         ("aud", json!("SMF")),
-        ("aud", json!([PRODUCER])),
+        ("aud", json!(["c6ed1b94-9c5b-43b5-b72a-a0ed58f8ba43"])),
+        ("aud", json!(PRODUCER)),
+        ("aud", json!(["AMF"])),
+        ("aud", json!([PRODUCER, "not-a-uuid"])),
+        ("aud", json!([PRODUCER, 1])),
         ("aud", json!([])),
         ("exp", json!(jsonwebtoken::get_current_timestamp() - 3600)),
         ("nbf", json!(jsonwebtoken::get_current_timestamp() + 3600)),
@@ -123,11 +143,38 @@ async fn token_profiles_cannot_be_selected_by_untrusted_claims() {
     assert!(jwt_svid.authorize(&request(&uuid_claims)).await.is_err());
     let mut spiffe_claims = claims();
     spiffe_claims["sub"] = json!(format!(
-        "spiffe://example.test/tenant/tenant-a/nf/smf/instance/{CONSUMER}"
+        "spiffe://example.test/tenant/tenant-a/ns/core/sa/smf/nf/smf/instance/{CONSUMER}"
     ));
     assert!(validator("AMF")
         .authorize(&request(&spiffe_claims))
         .await
+        .is_err());
+    spiffe_claims["nbf"] = json!(jsonwebtoken::get_current_timestamp() - 10);
+    assert!(jwt_svid.authorize(&request(&spiffe_claims)).await.is_ok());
+    spiffe_claims["aud"] = json!([PRODUCER]);
+    assert!(
+        jwt_svid.authorize(&request(&spiffe_claims)).await.is_err(),
+        "NRF audience configuration must not broaden JWT-SVID audiences"
+    );
+}
+
+#[tokio::test]
+async fn nrf_audiences_require_trusted_type_and_instance_configuration() {
+    let validator = SbiJwtValidator::new(
+        Arc::new(MockJwksResolver::new()),
+        Duration::from_secs(60),
+        "AMF".into(),
+        NRF.into(),
+        true,
+        false,
+    )
+    .with_token_profile(SbiTokenProfile::NrfAccessToken);
+    assert!(matches!(
+        validator.authorize(&request(&claims())).await,
+        Err(SbiAuthError::Internal { .. })
+    ));
+    assert!(validator
+        .with_nrf_audience(NfType::amf(), NfInstanceId::new("not-a-uuid").unwrap())
         .is_err());
 }
 
@@ -141,7 +188,9 @@ async fn nrf_profile_requires_signatures_even_with_dev_bypass_enabled() {
         false,
         true,
     )
-    .with_token_profile(SbiTokenProfile::NrfAccessToken);
+    .with_token_profile(SbiTokenProfile::NrfAccessToken)
+    .with_nrf_audience(NfType::amf(), NfInstanceId::new(PRODUCER).unwrap())
+    .unwrap();
     let mut req = request(&claims());
     let mut token = req
         .bearer_token

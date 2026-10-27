@@ -14,7 +14,6 @@ use opc_mgmt_authz::{AuthorizationGate, ReadAction, ReadAuthorizer};
 use opc_mgmt_opstate::{
     OperationalEvent, OperationalEventReceiver, OperationalSubscriptionRequest,
 };
-use prost::Message;
 use tokio::sync::mpsc;
 use tonic::{Status, Streaming};
 
@@ -34,6 +33,8 @@ use crate::{GnmiConfigBinding, GnmiError, GnmiJsonUpdate, GnmiServer};
 
 const RESPONSE_QUEUE_BYTES_ESTIMATE: usize = 4096;
 const MAX_SUBSCRIBE_QUEUE_MESSAGES: usize = 1024;
+
+mod delta;
 
 /// Serves one authenticated gNMI Subscribe request stream.
 #[cfg(test)]
@@ -351,7 +352,7 @@ where
         let selected_initial =
             select_snapshot_responses(server.as_ref(), &snapshot_plan.get_request, &initial)?;
         let dedupe = SnapshotDedupe {
-            last: Some(fingerprint_responses(&selected_initial)),
+            previous: selected_initial,
             changed: false,
         };
         snapshots.push(ActiveSnapshot {
@@ -600,14 +601,29 @@ where
     C: OpcConfig + 'static,
     B: GnmiConfigBinding<C> + 'static,
 {
+    // Authorization reevaluation can deliberately return an empty selection.
+    // It is not evidence that the previously visible data was deleted.
+    let revision = plan
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.snapshot_revision())
+        .transpose()?;
     let responses = render_snapshot_async(server, principal, plan).await?;
-    let fingerprint = fingerprint_responses(&responses);
-    dedupe.changed = dedupe.last.as_ref() != Some(&fingerprint);
-    dedupe.last = Some(fingerprint);
-    if !force && !dedupe.changed {
+    let after = plan
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.snapshot_revision())
+        .transpose()?;
+    // Preserve the existing read-side authorization evaluation even while
+    // output is gated; only the data comparison is deferred.
+    if revision == Some(None) || after != revision {
+        dedupe.changed = false;
         return Ok(true);
     }
-    for response in responses {
+    let (updates, changed) = delta::snapshot_delta(&dedupe.previous, &responses, force);
+    dedupe.previous = responses;
+    dedupe.changed = changed;
+    for response in updates {
         if outbound.send(Ok(response)).await.is_err() {
             return Ok(false);
         }
@@ -640,9 +656,14 @@ where
     Ok(response
         .notification
         .into_iter()
-        .map(|notification| gnmi::SubscribeResponse {
-            response: Some(gnmi::subscribe_response::Response::Update(notification)),
-            extension: Vec::new(),
+        .map(|mut notification| {
+            // Each subscription selects individual paths; it does not assert
+            // completeness for the subtree rooted at the notification prefix.
+            notification.atomic = false;
+            gnmi::SubscribeResponse {
+                response: Some(gnmi::subscribe_response::Response::Update(notification)),
+                extension: Vec::new(),
+            }
         })
         .collect())
 }
@@ -874,61 +895,9 @@ async fn send_sync(
     Ok(())
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "prost encode_length_delimited into a Vec is infallible (buffer grows)"
-)]
-fn fingerprint_responses(responses: &[gnmi::SubscribeResponse]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for response in responses {
-        let mut content = response.clone();
-        let mut keys = Vec::new();
-        if let Some(gnmi::subscribe_response::Response::Update(notification)) =
-            &mut content.response
-        {
-            notification.timestamp = 0;
-            if let Some(prefix) = &mut notification.prefix {
-                fingerprint_path_keys(prefix, &mut keys);
-            }
-            for update in &mut notification.update {
-                if let Some(path) = &mut update.path {
-                    fingerprint_path_keys(path, &mut keys);
-                }
-            }
-            for path in &mut notification.delete {
-                fingerprint_path_keys(path, &mut keys);
-            }
-        }
-        content
-            .encode_length_delimited(&mut out)
-            .expect("encoding SubscribeResponse to Vec cannot fail");
-        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
-        out.extend_from_slice(&keys);
-    }
-    out
-}
-
-// Protobuf map encoding follows HashMap iteration order. Extract the keys in a
-// stable order before encoding the remaining message, preserving every literal
-// value and boundary in the fingerprint.
-fn fingerprint_path_keys(path: &mut gnmi::Path, out: &mut Vec<u8>) {
-    for element in &mut path.elem {
-        let mut keys: Vec<_> = element.key.iter().collect();
-        keys.sort_unstable_by_key(|(name, _)| *name);
-        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
-        for (name, value) in keys {
-            for text in [name, value] {
-                out.extend_from_slice(&(text.len() as u64).to_le_bytes());
-                out.extend_from_slice(text.as_bytes());
-            }
-        }
-        element.key.clear();
-    }
-}
-
 #[derive(Default)]
 struct SnapshotDedupe {
-    last: Option<Vec<u8>>,
+    previous: Vec<gnmi::SubscribeResponse>,
     changed: bool,
 }
 
@@ -1266,6 +1235,7 @@ fn nanos(value: u64) -> Result<Duration, GnmiError> {
 #[cfg(test)]
 mod fingerprint_tests {
     use super::*;
+    use prost::Message;
 
     #[test]
     fn equal_key_maps_have_equal_fingerprints_despite_distinct_wire_order() {
@@ -1301,9 +1271,19 @@ mod fingerprint_tests {
                 .any(|response| response.encode_to_vec() != first_wire),
             "fixture must exercise distinct protobuf map orders"
         );
-        let first = fingerprint_responses(&responses[..1]);
+        let fingerprint = |response: &gnmi::SubscribeResponse| {
+            let Some(gnmi::subscribe_response::Response::Update(notification)) = &response.response
+            else {
+                panic!("fixture must contain an update")
+            };
+            delta::snapshot_key(
+                notification.prefix.as_ref(),
+                notification.update[0].path.as_ref(),
+            )
+        };
+        let first = fingerprint(&responses[0]);
         for response in responses {
-            assert_eq!(fingerprint_responses(&[response]), first);
+            assert_eq!(fingerprint(&response), first);
         }
     }
 }

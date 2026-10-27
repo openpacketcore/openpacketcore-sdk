@@ -16,7 +16,7 @@ pub const NAMF_LOC: &str = "namf-loc";
 /// SMF PDU Session service.
 pub const NSMF_PDUSESSION: &str = "nsmf-pdusession";
 /// SMF Event Exposure service.
-pub const NSMF_EVENTEXPOSURE: &str = "nsmf-eventexposure";
+pub const NSMF_EVENTEXPOSURE: &str = "nsmf-event-exposure";
 
 /// NRF NFManagement service.
 pub const NNF_NFM: &str = "nnrf-nfm";

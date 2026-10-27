@@ -133,6 +133,8 @@ fn legacy_constructs_keep_every_generated_file_byte_identical() {
     // All pins also include #1274 generated-lint repairs and shared statement formatting.
     // #1363 pins follow byte-verified 63440381b baselines: exact decimal64 codecs/types
     // and RFC 6243 trim semantics. All complete-file assertions remain.
+    // RFC 6241 existence-error pins were reverified at 8121730ada; only
+    // netconf_xml_edit.rs changes, with all thirteen full-file checks retained.
     let expected: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/legacy_constructs_digests.json")).unwrap();
     let parsed = generation_input_from_yang_sources(

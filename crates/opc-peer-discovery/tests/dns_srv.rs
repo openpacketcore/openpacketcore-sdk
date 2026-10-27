@@ -2721,7 +2721,7 @@ async fn srv_cache_refuses_mismatched_query_origin_mode_and_transport() {
             ServiceDiscoveryMode::Service,
             PeerTransport::Tcp,
         ),
-        (FIRST, ServiceDiscoveryMode::Address, PeerTransport::Tcp),
+        (SERVICE, ServiceDiscoveryMode::Snaptr, PeerTransport::Tcp),
         (SERVICE, ServiceDiscoveryMode::Service, PeerTransport::Udp),
     ] {
         let wrong = DnsQuery::new(ServiceDiscoveryInput::new(

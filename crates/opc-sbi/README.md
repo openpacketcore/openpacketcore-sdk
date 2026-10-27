@@ -100,6 +100,12 @@ identifiers, and typed service instances. Supply `NfService` metadata (instance
 ID, versions, scheme and status), not a vector of service-name strings. The
 `NnrfPlmnId`/`NnrfSnssai` wrappers accept existing SDK identifiers via `Into`.
 The timer field on registration/heartbeat responses is `heartBeatTimer`.
+Once negotiated, a 204 or a response without that field retains the interval
+for the registered instance. A returned timer replaces it; a new instance uses
+the default until the NRF provides one. Successful deregistration retires it.
+`NfStatus` reuses the generated extensible enum, including `CanaryRelease` and
+`Other(String)`. It is `Clone`, not `Copy` or `Hash`; exhaustive matchers must
+handle the extension variant.
 
 `DiscoveryQuery::requester_nf_type` is mandatory and part of the cache key.
 The client sends both NF types, requester instance, `target-plmn-list`,
@@ -109,7 +115,9 @@ is an error, not a negative discovery result.
 `DiscoveryResult::Found` and `NotFound` carry `valid_for`. HTTP discovery caps
 this by `validityPeriod`, Cache-Control max-age/no-cache/no-store, Age and Date.
 The local cache TTL remains an additional limit; server lifetime also caps
-stale-if-error. Fresh authoritative absence evicts a stale positive. A 404
+stale-if-error. After a failed refresh, the client rechecks expiry and
+invalidation before returning any stale profiles.
+Fresh authoritative absence evicts a stale positive. A 404
 without explicit freshness is not stored. These are bounded discovery helpers,
 not a complete HTTP caching proxy or full NRF data model.
 
@@ -118,8 +126,12 @@ not a complete HTTP caching proxy or full NRF data model.
 The validator defaults to the SDK JWT-SVID profile. To accept TS 29.510
 6.3.5.2.4 access tokens, select
 `SbiTokenProfile::NrfAccessToken` with `with_token_profile`. Configure the NRF
-UUID as expected issuer and the local producer NF type or instance ID as
-expected audience. RS256 signatures, issuer, audience, expiry and service
+UUID as expected issuer and call `with_nrf_audience` with both the local
+producer NF type and its instance UUID. A string audience must be the NF type;
+an array must contain the local UUID and consist entirely of instance UUIDs.
+Omitting this trusted configuration fails closed in NRF mode. The constructor's
+original expected audience continues to apply independently in JWT-SVID mode.
+RS256 signatures, issuer, audience, expiry and service
 scope are enforced. `nbf` is optional but enforced when present. NRF scope
 claims must use the standard space-delimited grammar.
 
@@ -129,3 +141,15 @@ token or unsigned HTTP fields. This profile requires peer binding even outside
 production and does not allow the mock-token bypass. Resource/operation-level
 authorization remains the consuming service's policy; the generic validator
 requires the invoked service scope.
+
+## Bearer challenge configuration
+
+Servers using `with_auth_policy` must also register each protected API with
+`with_auth_service(api_uri, required_scopes)`. Supply its trusted public URI,
+such as `https://nrf.example.test/nnrf-disc/v1`, and individual scope tokens.
+The URI supplies the Bearer realm; the longest matching path prefix selects
+the API. Request Host headers cannot change the realm or advertised scopes.
+Missing/invalid credentials return 401; insufficient scope returns 403 and
+includes the configured scope list. The installed policy enforces those scopes.
+Unconfigured paths fail closed with 503; malformed or duplicate Authorization
+headers return 400. Invalid configuration is rejected at startup.

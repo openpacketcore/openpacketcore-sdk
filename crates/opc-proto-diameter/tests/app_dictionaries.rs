@@ -541,6 +541,17 @@ fn rf_charging_wire_uses_service_information_and_offline_containers() {
             .collect();
         assert!(ps_children.iter().any(|avp| avp.header.code.get() == 1228));
         assert!(ps_children.iter().any(|avp| avp.header.code.get() == 847));
+        for code in [2, 3] {
+            let avp = ps_children
+                .iter()
+                .find(|avp| avp.header.code.get() == code)
+                .unwrap();
+            assert!(
+                avp.header.flags.is_mandatory(),
+                "TS 32.299 section 7.2.0 requires M for AVP {code}"
+            );
+            assert_eq!(avp.header.vendor_id, Some(VendorId::new(10415)));
+        }
         assert!(ps_children
             .iter()
             .all(|avp| ![6, 7, 456].contains(&avp.header.code.get())));
@@ -576,15 +587,137 @@ fn rf_decodes_literal_service_information_group() {
     let group = BytesMut::from(
         &[
             0, 0, 3, 105, 0xc0, 0, 0, 40, 0, 0, 40, 175, 0, 0, 3, 106, 0xc0, 0, 0, 28, 0, 0, 40,
-            175, 0, 0, 0, 2, 0x80, 0, 0, 16, 0, 0, 40, 175, 0x12, 0x34, 0x56, 0x78,
+            175, 0, 0, 0, 2, 0xc0, 0, 0, 16, 0, 0, 40, 175, 0x12, 0x34, 0x56, 0x78,
         ][..],
     );
     let built = build_raw_rf_acr(Some(3), &[group]);
     let encoded = encode_message(&built);
     let message = decode_message(&encoded);
+    message
+        .validate_avps_with_dictionary(
+            DecodeContext::conservative(),
+            DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()]),
+        )
+        .expect("Rf reused RADIUS AVPs carry the mandatory flag");
     let parsed = apps::rf::parse_rf_accounting_request(&message, DecodeContext::default())
         .expect("normative Service-Information nesting");
     assert_eq!(parsed.ps_information.unwrap().charging_id, Some(0x12345678));
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn review_rf_repeated_packet_addresses_survive_decode_and_encode() {
+    let group = |code, value: &[u8]| {
+        encode_raw_vendor_avp(AvpCode::new(code), VendorId::new(10415), true, value)
+    };
+    let mut children = BytesMut::new();
+    for code in [1228, 847] {
+        children.extend_from_slice(&group(code, &[0, 1, 192, 0, 2, 1]));
+        children.extend_from_slice(&group(
+            code,
+            &[
+                0, 2, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ],
+        ));
+    }
+    let encoded = encode_message(&build_raw_rf_acr_service_information(
+        Some(3),
+        &[group(874, &children)],
+    ));
+    let message = decode_message(&encoded);
+    let parsed = apps::rf::parse_rf_accounting_request(&message, DecodeContext::conservative())
+        .expect("TS 32.299 section 7.2.158 allows repeated SGSN and GGSN addresses");
+    let roundtrip = encode_message(
+        &apps::rf::build_rf_accounting_request(&parsed, 1, 2, EncodeContext::default()).unwrap(),
+    );
+    let roundtrip = decode_message(&roundtrip);
+    let service = roundtrip
+        .avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|a| a.header.code.get() == 873)
+        .unwrap();
+    let ps = service
+        .grouped_avps(DecodeContext::default())
+        .map(Result::unwrap)
+        .find(|a| a.header.code.get() == 874)
+        .unwrap();
+    assert_eq!(ps.value, children.as_ref());
+    roundtrip
+        .validate_avps_with_dictionary(
+            DecodeContext::conservative(),
+            DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()]),
+        )
+        .unwrap();
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn review_rf_radius_dictionary_requires_mandatory_flag() {
+    for code in [2, 3] {
+        assert_eq!(
+            apps::rf::dictionary()
+                .find_avp(AvpKey::vendor(AvpCode::new(code), VendorId::new(10415)))
+                .unwrap()
+                .flags()
+                .mandatory(),
+            FlagRequirement::MustBeSet
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "app-rf")]
+fn review_rf_dictionary_allows_repeatable_children_and_rejects_singletons() {
+    let group = |code, value: &[u8]| {
+        encode_raw_vendor_avp(AvpCode::new(code), VendorId::new(10415), true, value)
+    };
+    let mut subscription = encode_raw_avp(AvpCode::new(450), true, &1u32.to_be_bytes());
+    subscription.extend_from_slice(&encode_raw_avp(AvpCode::new(444), true, b"001010123456789"));
+    let subscription = encode_raw_avp(AvpCode::new(443), true, &subscription);
+    let usage = group(
+        2040,
+        &encode_raw_avp(AvpCode::new(363), true, &42u64.to_be_bytes()),
+    );
+    let address = group(1228, &[0, 1, 192, 0, 2, 1]);
+    let gateway = group(847, &[0, 1, 192, 0, 2, 2]);
+    for child in [&usage, &address, &gateway] {
+        let mut repeated = child.clone();
+        repeated.extend_from_slice(child);
+        let message = encode_message(&build_raw_rf_acr_service_information(
+            Some(3),
+            &[group(874, &repeated)],
+        ));
+        decode_message(&message)
+            .validate_avps_with_dictionary(
+                DecodeContext::conservative(),
+                DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()]),
+            )
+            .expect("repeatable PS-Information child");
+    }
+    let message = encode_message(&build_raw_rf_acr_service_information(
+        Some(3),
+        &[subscription.clone(), subscription],
+    ));
+    decode_message(&message)
+        .validate_avps_with_dictionary(
+            DecodeContext::conservative(),
+            DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()]),
+        )
+        .expect("repeatable Subscription-Id");
+    let ps = group(874, &[]);
+    let message = encode_message(&build_raw_rf_acr_service_information(
+        Some(3),
+        &[ps.clone(), ps],
+    ));
+    assert!(
+        decode_message(&message)
+            .validate_avps_with_dictionary(
+                DecodeContext::conservative(),
+                DictionarySet::new(&[base::dictionary(), apps::rf::dictionary()])
+            )
+            .is_err(),
+        "PS-Information remains a singleton"
+    );
 }
 
 #[test]
@@ -4704,8 +4837,8 @@ fn sample_rf_request(record_type: AccountingRecordType, record_number: u32) -> R
         ps_information: Some(PsInformation {
             charging_id: Some(0x12345678),
             pdp_type: Some(0),
-            sgsn_address: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)).into()),
-            ggsn_address: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)).into()),
+            sgsn_addresses: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)).into()],
+            ggsn_addresses: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)).into()],
             service_data_containers: vec![ServiceDataContainer {
                 accounting_input_octets: Some(200_000),
                 accounting_output_octets: Some(800_000),

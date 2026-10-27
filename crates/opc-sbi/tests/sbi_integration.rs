@@ -450,29 +450,29 @@ async fn auth_failures_include_safe_bearer_challenges_and_problem_media_type() {
         (
             SbiAuthError::MissingBearerToken,
             StatusCode::UNAUTHORIZED,
-            Some("Bearer"),
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\""),
         ),
         (
             SbiAuthError::Denied {
                 reason: "private-token-detail".into(),
             },
             StatusCode::UNAUTHORIZED,
-            Some("Bearer error=\"invalid_token\""),
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\""),
         ),
         (
             SbiAuthError::TokenBindingMismatch,
             StatusCode::UNAUTHORIZED,
-            Some("Bearer error=\"invalid_token\""),
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\""),
         ),
         (
             SbiAuthError::MissingPeerBinding,
             StatusCode::UNAUTHORIZED,
-            Some("Bearer error=\"invalid_token\""),
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\""),
         ),
         (
             SbiAuthError::InsufficientScope,
             StatusCode::FORBIDDEN,
-            Some("Bearer error=\"insufficient_scope\""),
+            Some("Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"insufficient_scope\", scope=\"nnrf-disc\""),
         ),
         (
             SbiAuthError::Internal {
@@ -484,9 +484,14 @@ async fn auth_failures_include_safe_bearer_challenges_and_problem_media_type() {
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = SbiServerBuilder::new(addr).with_auth_policy(Arc::new(RejectAuth(error)));
+        let server = SbiServerBuilder::new(addr)
+            .with_auth_policy(Arc::new(RejectAuth(error)))
+            .with_auth_service(
+                "https://nrf.example.test/nnrf-disc/v1".parse().unwrap(),
+                vec!["nnrf-disc".into()],
+            );
         let app = axum::Router::new().route(
-            "/nnrf-disc/test",
+            "/nnrf-disc/v1/test",
             axum::routing::get(|| async { "unexpected admission" }),
         );
         let task = tokio::spawn(async move { server.run_with_listener(listener, app).await });
@@ -502,7 +507,7 @@ async fn auth_failures_include_safe_bearer_challenges_and_problem_media_type() {
             .unwrap();
         let consumer = MockConsumer::with_client(client);
         let response = consumer
-            .send_get(&format!("http://{addr}/nnrf-disc/test"), HashMap::new())
+            .send_get(&format!("http://{addr}/nnrf-disc/v1/test"), HashMap::from([("host".into(), "untrusted.example".into())]))
             .await;
         task.abort();
         let _ = task.await;
@@ -521,6 +526,74 @@ async fn auth_failures_include_safe_bearer_challenges_and_problem_media_type() {
 }
 
 #[tokio::test]
+async fn auth_challenges_select_trusted_api_and_scope_without_reflecting_request_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = SbiServerBuilder::new(addr)
+        .with_auth_policy(Arc::new(RejectAuth(
+            opc_sbi::auth::SbiAuthError::InsufficientScope,
+        )))
+        .with_auth_service(
+            "https://nrf.example.test/nnrf-disc/v1".parse().unwrap(),
+            vec!["nnrf-disc".into()],
+        )
+        .with_auth_service(
+            "https://nrf.example.test/nnrf-nfm/v1".parse().unwrap(),
+            vec!["nnrf-nfm".into(), "nnrf-nfm:read".into()],
+        );
+    let app = axum::Router::new().fallback(|| async { "unexpected admission" });
+    let task = tokio::spawn(server.run_with_listener(listener, app));
+    let client = SbiClientBuilder::new()
+        .with_http2_only(false)
+        .with_retry_policy(RetryPolicy::new(
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+            Jitter::None,
+        ))
+        .build()
+        .unwrap();
+    for (path, scope) in [
+        ("/nnrf-disc/v1", Some("nnrf-disc")),
+        ("/nnrf-nfm/v1", Some("nnrf-nfm nnrf-nfm:read")),
+        ("/nnrf-disc/v10", None),
+    ] {
+        let response = client
+            .send(
+                http::Request::builder()
+                    .uri(format!("http://{addr}{path}/test"))
+                    .header("host", "untrusted.example")
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if let Some(scope) = scope {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.headers()["www-authenticate"],
+                format!("Bearer realm=\"https://nrf.example.test{path}\", error=\"insufficient_scope\", scope=\"{scope}\""));
+        } else {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!response.headers().contains_key("www-authenticate"));
+        }
+    }
+    for values in [vec!["Bearer"], vec!["Bearer one", "Bearer two"]] {
+        let mut request = http::Request::builder().uri(format!("http://{addr}/nnrf-disc/v1/test"));
+        for value in values {
+            request = request.header("authorization", value);
+        }
+        let response = client
+            .send(request.body(Vec::new()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key("www-authenticate"));
+    }
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn tls_client_requires_negotiated_h2_before_sending_requests() {
     use bytes::Bytes;
     use http_body_util::Full;
@@ -528,7 +601,7 @@ async fn tls_client_requires_negotiated_h2_before_sending_requests() {
     use rustls::pki_types::PrivatePkcs8KeyDer;
 
     let key = rcgen::KeyPair::generate().unwrap();
-    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "::1".into()])
         .unwrap()
         .self_signed(&key)
         .unwrap();
@@ -539,7 +612,11 @@ async fn tls_client_requires_negotiated_h2_before_sending_requests() {
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
-    for alpn in [Some(b"h2".as_slice()), None, Some(b"http/1.1".as_slice())] {
+    for (host, alpn) in ["127.0.0.1", "::1"].into_iter().flat_map(|host| {
+        [Some(b"h2".as_slice()), None, Some(b"http/1.1".as_slice())]
+            .into_iter()
+            .map(move |alpn| (host, alpn))
+    }) {
         let mut server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
@@ -549,7 +626,7 @@ async fn tls_client_requires_negotiated_h2_before_sending_requests() {
             .unwrap();
         server_config.alpn_protocols = alpn.into_iter().map(<[u8]>::to_vec).collect();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind((host, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let received = Arc::new(AtomicUsize::new(0));
         let server_received = received.clone();

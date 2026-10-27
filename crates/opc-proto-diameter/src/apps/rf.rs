@@ -27,8 +27,8 @@ use super::VENDOR_ID_3GPP;
 use crate::avp::dictionary::Redacted;
 use crate::base;
 use crate::dictionary::{
-    ApplicationDefinition, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey, CommandDefinition,
-    CommandKind, Dictionary, FlagRequirement,
+    ApplicationDefinition, AvpCardinality, AvpDataType, AvpDefinition, AvpFlagRules, AvpKey,
+    CommandAvpRule, CommandDefinition, CommandKind, Dictionary, FlagRequirement,
 };
 use crate::{ApplicationId, AvpCode, AvpHeader, CommandCode, Message, OwnedMessage};
 
@@ -100,6 +100,41 @@ pub const COMMAND_ACCOUNTING_ANSWER: CommandDefinition = CommandDefinition::new(
     SpecRef::new("ietf", "RFC6733", "7"),
 );
 
+// TS 32.299 sections 7.2.192 and 7.2.158 distinguish repeatable groups and
+// addresses from optional singleton fields, including under duplicate rejection.
+const SERVICE_INFORMATION_RULES: [CommandAvpRule; 2] = [
+    CommandAvpRule::new(
+        AvpKey::ietf(AVP_SUBSCRIPTION_ID),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_PS_INFORMATION, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+];
+const PS_INFORMATION_RULES: [CommandAvpRule; 5] = [
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_3GPP_CHARGING_ID, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_3GPP_PDP_TYPE, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrOne,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_SGSN_ADDRESS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_GGSN_ADDRESS, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
+    CommandAvpRule::new(
+        AvpKey::vendor(AVP_SERVICE_DATA_CONTAINER, VENDOR_ID_3GPP),
+        AvpCardinality::ZeroOrMore,
+    ),
+];
+
 const RF_AVPS: [AvpDefinition; 19] = [
     AvpDefinition::new(
         AvpKey::ietf(AVP_ACCOUNTING_RECORD_TYPE),
@@ -168,7 +203,8 @@ const RF_AVPS: [AvpDefinition; 19] = [
         AvpDataType::Grouped,
         AvpFlagRules::vendor_specific(),
         SpecRef::new("3gpp", "TS32299", "7.2.192"),
-    ),
+    )
+    .with_grouped_avp_rules(&SERVICE_INFORMATION_RULES),
     AvpDefinition::new(
         AvpKey::vendor(AVP_SERVICE_DATA_CONTAINER, VENDOR_ID_3GPP),
         "Service-Data-Container",
@@ -216,18 +252,19 @@ const RF_AVPS: [AvpDefinition; 19] = [
         "PS-Information",
         AvpDataType::Grouped,
         AvpFlagRules::vendor_specific(),
-        SpecRef::new("3gpp", "TS32299", "PS-Information"),
-    ),
+        SpecRef::new("3gpp", "TS32299", "7.2.158"),
+    )
+    .with_grouped_avp_rules(&PS_INFORMATION_RULES),
     AvpDefinition::new(
         AvpKey::vendor(AVP_3GPP_CHARGING_ID, VENDOR_ID_3GPP),
         "3GPP-Charging-Id",
         AvpDataType::OctetString,
         AvpFlagRules::new(
             FlagRequirement::MustBeSet,
-            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeSet,
             FlagRequirement::MayBeSet,
         ),
-        SpecRef::new("3gpp", "TS29061", "16.4.7"),
+        SpecRef::new("3gpp", "TS32299", "7.2.0"),
     ),
     AvpDefinition::new(
         AvpKey::vendor(AVP_3GPP_PDP_TYPE, VENDOR_ID_3GPP),
@@ -235,10 +272,10 @@ const RF_AVPS: [AvpDefinition; 19] = [
         AvpDataType::Enumerated,
         AvpFlagRules::new(
             FlagRequirement::MustBeSet,
-            FlagRequirement::MustBeUnset,
+            FlagRequirement::MustBeSet,
             FlagRequirement::MayBeSet,
         ),
-        SpecRef::new("3gpp", "TS29061", "16.4.7"),
+        SpecRef::new("3gpp", "TS32299", "7.2.0"),
     ),
     AvpDefinition::new(
         AvpKey::vendor(AVP_SGSN_ADDRESS, VENDOR_ID_3GPP),
@@ -330,10 +367,10 @@ pub struct PsInformation {
     pub charging_id: Option<u32>,
     /// 3GPP-PDP-Type.
     pub pdp_type: Option<u32>,
-    /// SGSN-Address (redacted in diagnostic output).
-    pub sgsn_address: Option<Redacted<IpAddr>>,
-    /// GGSN-Address (redacted in diagnostic output).
-    pub ggsn_address: Option<Redacted<IpAddr>>,
+    /// Repeated SGSN-Address values, in wire order (redacted in diagnostics).
+    pub sgsn_addresses: Vec<Redacted<IpAddr>>,
+    /// Repeated GGSN-Address values, in wire order (redacted in diagnostics).
+    pub ggsn_addresses: Vec<Redacted<IpAddr>>,
     /// Repeated offline per-service usage containers.
     pub service_data_containers: Vec<ServiceDataContainer>,
 }
@@ -1114,7 +1151,7 @@ fn append_ps_information_avp(
             AVP_3GPP_CHARGING_ID,
             VENDOR_ID_3GPP,
             charging_id,
-            false,
+            true,
             ctx,
         )?;
     }
@@ -1124,11 +1161,11 @@ fn append_ps_information_avp(
             AVP_3GPP_PDP_TYPE,
             VENDOR_ID_3GPP,
             pdp_type,
-            false,
+            true,
             ctx,
         )?;
     }
-    if let Some(sgsn_address) = ps.sgsn_address.as_ref() {
+    for sgsn_address in &ps.sgsn_addresses {
         let mut address_value = BytesMut::new();
         builder_helpers::encode_address_value(&mut address_value, **sgsn_address);
         builder_helpers::append_vendor_octet_string_avp(
@@ -1140,7 +1177,7 @@ fn append_ps_information_avp(
             ctx,
         )?;
     }
-    if let Some(ggsn_address) = ps.ggsn_address.as_ref() {
+    for ggsn_address in &ps.ggsn_addresses {
         let mut address_value = BytesMut::new();
         builder_helpers::encode_address_value(&mut address_value, **ggsn_address);
         builder_helpers::append_vendor_octet_string_avp(
@@ -1171,8 +1208,8 @@ fn parse_ps_information(
 ) -> Result<PsInformation, DecodeError> {
     let mut charging_id = None;
     let mut pdp_type = None;
-    let mut sgsn_address = None;
-    let mut ggsn_address = None;
+    let mut sgsn_addresses = Vec::new();
+    let mut ggsn_addresses = Vec::new();
     let mut service_data_containers = Vec::new();
     builder_helpers::for_each_avp(value, ctx, base_offset, depth, |offset, avp| {
         let value_offset = builder_helpers::offset_add(offset, avp.header.header_len(), "TS32299")?;
@@ -1185,27 +1222,17 @@ fn parse_ps_information(
             let value = builder_helpers::parse_u32_value(avp.value, value_offset, "TS32299")?;
             builder_helpers::set_once(&mut pdp_type, value, offset, "TS32299")?;
         } else if code == AVP_SGSN_ADDRESS && vendor_id == Some(VENDOR_ID_3GPP) {
-            builder_helpers::set_once(
-                &mut sgsn_address,
-                Redacted::new(builder_helpers::parse_address_value(
-                    avp.value,
-                    value_offset,
-                    "TS32299",
-                )?),
-                offset,
+            sgsn_addresses.push(Redacted::new(builder_helpers::parse_address_value(
+                avp.value,
+                value_offset,
                 "TS32299",
-            )?;
+            )?));
         } else if code == AVP_GGSN_ADDRESS && vendor_id == Some(VENDOR_ID_3GPP) {
-            builder_helpers::set_once(
-                &mut ggsn_address,
-                Redacted::new(builder_helpers::parse_address_value(
-                    avp.value,
-                    value_offset,
-                    "TS32299",
-                )?),
-                offset,
+            ggsn_addresses.push(Redacted::new(builder_helpers::parse_address_value(
+                avp.value,
+                value_offset,
                 "TS32299",
-            )?;
+            )?));
         } else if code == AVP_SERVICE_DATA_CONTAINER && vendor_id == Some(VENDOR_ID_3GPP) {
             service_data_containers.push(parse_service_data_container(
                 avp.value,
@@ -1221,8 +1248,8 @@ fn parse_ps_information(
     Ok(PsInformation {
         charging_id,
         pdp_type,
-        sgsn_address,
-        ggsn_address,
+        sgsn_addresses,
+        ggsn_addresses,
         service_data_containers,
     })
 }

@@ -35,6 +35,23 @@ fn query() -> DiscoveryQuery {
     }
 }
 
+#[test]
+fn review_smf_event_exposure_uses_registered_service_name() {
+    assert_eq!(
+        opc_sbi::nrf::services::NSMF_EVENTEXPOSURE,
+        "nsmf-event-exposure"
+    );
+}
+
+#[test]
+fn review_nf_status_preserves_canary_and_extension_values() {
+    for status in ["CANARY_RELEASE", "FUTURE_STATUS"] {
+        let wire = json!({"nfInstanceId":ID,"nfType":"AMF","nfStatus":status});
+        let profile: NfProfile = serde_json::from_value(wire).unwrap();
+        assert_eq!(serde_json::to_value(profile).unwrap()["nfStatus"], status);
+    }
+}
+
 #[tokio::test]
 async fn nrf_registration_sends_standard_profile_json() {
     let server = MockProducer::start().await;
@@ -71,6 +88,151 @@ async fn nrf_uses_standard_heart_beat_timer_spelling() {
             .await
             .unwrap(),
         Duration::from_secs(17)
+    );
+}
+
+#[tokio::test]
+async fn review_nrf_keeps_negotiated_timer_when_responses_omit_it() {
+    let server = MockProducer::start().await;
+    let path = format!("/nnrf-nfm/v1/nf-instances/{ID}");
+    let client = NrfClient::with_default_client(server.url()).unwrap();
+    server.set_override(
+        &path,
+        StatusCode::CREATED,
+        HashMap::new(),
+        br#"{"heartBeatTimer":10}"#.to_vec(),
+    );
+    assert_eq!(
+        client.register(&profile()).await.unwrap(),
+        Duration::from_secs(10)
+    );
+    for (status, body) in [
+        (StatusCode::NO_CONTENT, Vec::new()),
+        (StatusCode::OK, b"{}".to_vec()),
+    ] {
+        server.set_override(&path, status, HashMap::new(), body);
+        assert_eq!(
+            client.heartbeat(&profile().nf_instance_id).await.unwrap(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            client.register(&profile()).await.unwrap(),
+            Duration::from_secs(10)
+        );
+    }
+    server.set_override(
+        &path,
+        StatusCode::OK,
+        HashMap::new(),
+        br#"{"heartBeatTimer":12}"#.to_vec(),
+    );
+    assert_eq!(
+        client.heartbeat(&profile().nf_instance_id).await.unwrap(),
+        Duration::from_secs(12)
+    );
+    server.set_override(&path, StatusCode::NO_CONTENT, HashMap::new(), Vec::new());
+    assert_eq!(
+        client.register(&profile()).await.unwrap(),
+        Duration::from_secs(12)
+    );
+    let other = NfInstanceId::new("65e9681b-f652-402c-8329-7086a33c9081").unwrap();
+    server.set_override(
+        &format!("/nnrf-nfm/v1/nf-instances/{other}"),
+        StatusCode::NO_CONTENT,
+        HashMap::new(),
+        Vec::new(),
+    );
+    assert_eq!(
+        client.heartbeat(&other).await.unwrap(),
+        Duration::from_secs(30)
+    );
+}
+
+struct BlockedDiscovery {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl NrfOperations for BlockedDiscovery {
+    async fn register(&self, _: &NfProfile) -> Result<Duration, String> {
+        unreachable!()
+    }
+    async fn deregister(&self, _: &NfInstanceId) -> Result<(), String> {
+        unreachable!()
+    }
+    async fn heartbeat(&self, _: &NfInstanceId) -> Result<Duration, String> {
+        unreachable!()
+    }
+    async fn discover(&self, _: &DiscoveryQuery) -> Result<DiscoveryResult, String> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Err("synthetic refresh failure".into())
+    }
+}
+
+async fn stale_refresh_result(invalidate: bool, expire: bool) -> Result<Vec<NfProfile>, String> {
+    use opc_sbi::nrf::{CacheLookup, CachedDiscoveryClient, DiscoveryCache};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Instant,
+    };
+    let cache = Arc::new(Mutex::new(DiscoveryCache::new(
+        Duration::ZERO,
+        Duration::from_secs(1),
+        Duration::from_secs(600),
+        opc_types::ConfigVersion::new(1),
+    )));
+    let nrf = Arc::new(BlockedDiscovery {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let client = CachedDiscoveryClient::new(nrf.clone(), cache.clone(), true);
+    let query = query();
+    let key = query.to_cache_key();
+    let start = Instant::now();
+    let valid_for = Duration::from_millis(200);
+    cache
+        .lock()
+        .unwrap()
+        .insert_with_validity_at(key.clone(), vec![profile()], valid_for, start);
+    assert!(matches!(
+        cache.lock().unwrap().lookup(&key),
+        CacheLookup::Stale(_)
+    ));
+    let task = tokio::spawn(async move { client.discover(&query).await });
+    nrf.started.notified().await;
+    if invalidate {
+        cache
+            .lock()
+            .unwrap()
+            .invalidate(opc_types::ConfigVersion::new(2));
+    }
+    if expire {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(start + valid_for)).await;
+    }
+    if invalidate || expire {
+        assert_eq!(cache.lock().unwrap().lookup(&key), CacheLookup::Miss);
+    }
+    nrf.release.notify_one();
+    task.await.unwrap()
+}
+
+#[tokio::test]
+async fn review_nrf_refresh_cannot_return_profiles_after_validity_deadline() {
+    assert!(stale_refresh_result(false, true).await.is_err());
+}
+
+#[tokio::test]
+async fn review_nrf_refresh_cannot_return_profiles_after_config_invalidation() {
+    assert!(stale_refresh_result(true, false).await.is_err());
+}
+
+#[tokio::test]
+async fn review_nrf_refresh_failure_preserves_still_authorized_stale_profiles() {
+    assert_eq!(
+        stale_refresh_result(false, false).await.unwrap(),
+        vec![profile()]
     );
 }
 

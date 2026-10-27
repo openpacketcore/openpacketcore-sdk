@@ -846,7 +846,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configurable with `with_stale_limit`). Authoritative negatives and service
   withdrawals clear prior positive data; zero-TTL responses are not cached.
   Oversized validated TC replies trigger TCP fallback; TCP connections are
-  reused and closed after 30 seconds idle. Address queries reject invalid
+  reused and closed after one second idle. The bounded reuse window is an
+  explicit RFC 7766 idle-close deviation; EDNS keepalive is not negotiated.
+  Address queries reject invalid
   host labels while SRV/S-NAPTR owners retain underscore support. (#1355, #1360)
 
 - `opc-proto-diameter::apps::rf` encodes Subscription-Id and PS-Information
@@ -856,7 +858,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Supply separate uplink/downlink counts and elapsed time; there is no Rf
   total-octet field. The former top-level charging groups are rejected when
   mandatory. SGSN/GGSN address constants are now `AVP_SGSN_ADDRESS` (1228)
-  and `AVP_GGSN_ADDRESS` (847); Charging-Id/PDP-Type clear M. (#1361)
+  and `AVP_GGSN_ADDRESS` (847); Charging-Id/PDP-Type require M set under
+  TS 32.299 §7.2.0. Replace optional `sgsn_address`/`ggsn_address` fields with
+  the repeatable `sgsn_addresses`/`ggsn_addresses` vectors. The dictionary
+  admits repeated subscription IDs, address AVPs and usage containers. (#1361)
 
 - `opc-sbi` adds `SbiAuthError::InsufficientScope` (403); invalid credentials
   return 401 with Bearer challenges and verifier failures return 503.
@@ -865,24 +870,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and counts only transport/5xx failures toward circuit opening. Message
   priorities 0–31 are accepted; the NSSF name is `nnssf-nsselection`. (#1362)
 
+- `opc-sbi` servers with an auth policy require `with_auth_service` configuration
+  for each API's trusted URI realm and required scopes. Challenges include the
+  API realm on 401/403 and scopes on 403; request Host headers cannot supply
+  those values. TLS clients accept IPv6-literal URI hosts. (#1362)
+
 - NRF registration/discovery now use standard JSON and query parameters.
   `NfProfile` uses generated PLMN/S-NSSAI wrappers and `NfService` objects;
   `DiscoveryQuery`/`CacheKey` require `requester_nf_type` and discovery results
   carry `valid_for`. Server freshness caps stale reuse. Generated NRF models
   omit absent optional fields and preserve digit-prefixed enum wire names.
+  A refresh failure rechecks expiry and invalidation before stale fallback.
+  Registration and heartbeats retain the negotiated interval when a response
+  omits `heartBeatTimer`. `NfStatus` is now the generated extensible enum;
+  handle `CanaryRelease`/`Other(String)` and use `Clone` instead of `Copy`.
+  The SMF event-exposure service is `nsmf-event-exposure`.
   See `opc-sbi/README.md` for migration details. (#1362)
 
 - `opc-sbi` offers explicit `SbiTokenProfile::NrfAccessToken` validation for
   TS 29.510 UUID subjects and optional `nbf`, retaining signature, issuer,
   audience, expiry, scope and transport-peer binding. JWT-SVID remains the
-  default. NRF mode never accepts mock-token bypasses. (#1362)
+  default. Configure both trusted producer recipients with `with_nrf_audience`:
+  a scalar NF type or an array containing the local instance UUID is accepted.
+  JWT-SVID's audience policy stays separate. NRF mode never accepts mock-token
+  bypasses. (#1362)
 
 - `opc-yanggen`: `SchemaNode` retains optional `mandatory`, `min_elements`,
   and `max_elements` fields. Initialize them explicitly or use
   `..SchemaNode::default()` in Rust literals. Source ingestion rejects invalid
   cardinality statements, and generated configuration validation enforces
   required leaves and list bounds. Effective constraints enter the schema
-  digest. (#1363)
+  digest. Partial patches and individual delta replay validate supplied scalar
+  values and uniqueness while deferring whole-config cardinality until commit.
+  (#1363)
+
+- Generated NETCONF edits distinguish `DataExists` and `DataMissing` for leaves,
+  containers, keyed lists and leaf-list entries. Handle the two new
+  `NetconfEditError` variants and regenerate bindings; `remove` remains
+  idempotent for absent data. (#1363)
+
+- gNMI ON_CHANGE and TARGET_DEFINED configuration streams report deleted
+  nodes. Redundant suppression emits only changed leaves; heartbeats retain
+  full refreshes. Partial notifications no longer assert complete atomic
+  subtree replacement. The malformed-subscription metric test retains its
+  complete RPC assertions in a separate process to isolate global counters.
+  (#1363)
 
 - `opc-yanggen`/`opc-mgmt-schema`: decimal64 carries mandatory `fraction_digits`
   metadata and uses exact signed coefficients instead of floats. Generated

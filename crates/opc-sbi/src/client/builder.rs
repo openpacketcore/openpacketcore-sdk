@@ -222,6 +222,12 @@ impl SbiClient {
 
         let send_req = if let Some(ref tls) = self.tls_config {
             let connector = TlsConnector::from(tls.clone());
+            // HTTP URI hosts retain IPv6 brackets; rustls expects the IP
+            // address itself and disables DNS SNI for literal addresses.
+            let host = host
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(host);
             let server_name = rustls_pki_types::ServerName::try_from(host)
                 .map_err(|_| "Invalid server name".to_string())?
                 .to_owned();

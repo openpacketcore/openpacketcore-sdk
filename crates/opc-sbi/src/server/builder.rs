@@ -27,6 +27,59 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
+#[derive(Clone)]
+struct AuthService {
+    api_uri: http::Uri,
+    required_scopes: Vec<String>,
+}
+
+impl AuthService {
+    fn path(&self) -> &str {
+        self.api_uri.path().trim_end_matches('/')
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        path.strip_prefix(self.path())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !matches!(self.api_uri.scheme_str(), Some("http" | "https"))
+            || self
+                .api_uri
+                .authority()
+                .is_none_or(|authority| authority.as_str().contains('@'))
+            || self.api_uri.query().is_some()
+            || self.path().is_empty()
+        {
+            return Err(
+                "SBI auth service requires an absolute HTTP API URI without credentials or query"
+                    .into(),
+            );
+        }
+        // RFC 6749 section 3.3 scope-token: printable ASCII except quote,
+        // backslash and space. Scope lists are built from separate tokens.
+        if self.required_scopes.is_empty()
+            || self.required_scopes.iter().any(|scope| {
+                scope.is_empty()
+                    || !scope
+                        .bytes()
+                        .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+            })
+        {
+            return Err("SBI auth service requires non-empty valid OAuth scope tokens".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct AuthState {
+    policy: Option<Arc<dyn SbiAuth>>,
+    production_mode: bool,
+    services: Vec<AuthService>,
+}
+
 /// Production HTTP/2 SBI Server Builder
 pub struct SbiServerBuilder {
     addr: SocketAddr,
@@ -35,6 +88,7 @@ pub struct SbiServerBuilder {
     body_limit: usize,
     request_timeout: Duration,
     auth_policy: Option<Arc<dyn SbiAuth>>,
+    auth_services: Vec<AuthService>,
     max_concurrency: usize,
     concurrency_counter: Arc<AtomicUsize>,
     production_mode: bool,
@@ -53,6 +107,7 @@ impl SbiServerBuilder {
             body_limit: 1024 * 1024 * 8, // 8 MiB default
             request_timeout: Duration::from_secs(10),
             auth_policy: None,
+            auth_services: Vec::new(),
             max_concurrency: 1000,
             concurrency_counter: Arc::new(AtomicUsize::new(0)),
             production_mode: false,
@@ -94,9 +149,27 @@ impl SbiServerBuilder {
 
     /// Install the authorization policy consulted on every request (e.g.
     /// `SbiJwtValidator`). Without one the auth middleware admits all
-    /// requests, which production validation refuses.
+    /// requests, which production validation refuses. Also configure each
+    /// protected API with [`Self::with_auth_service`] for Bearer challenges.
     pub fn with_auth_policy(mut self, policy: Arc<dyn SbiAuth>) -> Self {
         self.auth_policy = Some(policy);
+        self
+    }
+
+    /// Configure a protected API's trusted public URI and required OAuth
+    /// scope tokens (TS 29.500 section 6.7.3). The URI is the challenge realm;
+    /// request Host headers never determine it. The longest matching URI
+    /// path prefix selects the service, respecting path-segment boundaries.
+    ///
+    /// With an auth policy installed, requests outside these API paths fail
+    /// closed with 503. Invalid URIs, scope tokens, or duplicate API paths
+    /// are rejected at startup. This advertises the policy's required scopes;
+    /// the installed authorization policy remains responsible for enforcement.
+    pub fn with_auth_service(mut self, api_uri: http::Uri, required_scopes: Vec<String>) -> Self {
+        self.auth_services.push(AuthService {
+            api_uri,
+            required_scopes,
+        });
         self
     }
 
@@ -125,6 +198,18 @@ impl SbiServerBuilder {
         }
         if self.request_timeout.is_zero() {
             return Err("SBI server request timeout must be greater than zero".to_string());
+        }
+        if self.auth_policy.is_some() && self.auth_services.is_empty() {
+            return Err("SBI auth policy requires trusted API challenge configuration".into());
+        }
+        for (index, service) in self.auth_services.iter().enumerate() {
+            service.validate()?;
+            if self.auth_services[..index]
+                .iter()
+                .any(|other| other.path() == service.path())
+            {
+                return Err("SBI auth service API paths must be unique".into());
+            }
         }
         if self.production_mode {
             if self.max_concurrency == 0 {
@@ -169,7 +254,11 @@ impl SbiServerBuilder {
         router: Router,
     ) -> Result<(), String> {
         self.validate()?;
-        let auth_state = (self.auth_policy.clone(), self.production_mode);
+        let auth_state = AuthState {
+            policy: self.auth_policy.clone(),
+            production_mode: self.production_mode,
+            services: self.auth_services.clone(),
+        };
         let trust_bundles = self.trust_bundles.clone();
         let concurrency_state = (self.max_concurrency, self.concurrency_counter.clone());
 
@@ -297,11 +386,23 @@ impl SbiServerBuilder {
 // change the framework handler contract.
 #[allow(clippy::result_large_err)]
 async fn auth_middleware(
-    State((auth_policy, production_mode)): State<(Option<Arc<dyn SbiAuth>>, bool)>,
+    State(state): State<AuthState>,
     mut req: axum::extract::Request,
     next: Next,
 ) -> Result<Response, Response> {
-    if let Some(ref policy) = auth_policy {
+    if let Some(ref policy) = state.policy {
+        let service = state
+            .services
+            .iter()
+            .filter(|service| service.matches(req.uri().path()))
+            .max_by_key(|service| service.path().len())
+            .ok_or_else(|| {
+                problem_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &ProblemDetails::new(StatusCode::SERVICE_UNAVAILABLE),
+                    None,
+                )
+            })?;
         let headers = req.headers();
         let sbi_headers = crate::headers::SbiHeaders::parse(headers).map_err(|_| {
             let details = ProblemDetails::new(StatusCode::BAD_REQUEST);
@@ -316,9 +417,10 @@ async fn auth_middleware(
 
         let peer = match req.extensions().get::<crate::auth::SbiPeer>().cloned() {
             Some(peer) => peer,
-            None if production_mode => {
+            None if state.production_mode => {
                 return Err(auth_failure_response(
                     crate::auth::SbiAuthError::MissingPeerBinding,
+                    service,
                 ));
             }
             None => crate::auth::SbiPeer {
@@ -345,7 +447,7 @@ async fn auth_middleware(
                     .insert(crate::auth::ErasedAuthContext::from(&context));
                 req.extensions_mut().insert(context);
             }
-            Err(err) => return Err(auth_failure_response(err)),
+            Err(err) => return Err(auth_failure_response(err, service)),
         }
     }
     Ok(next.run(req).await)
@@ -398,18 +500,29 @@ async fn catch_panic_middleware(req: axum::extract::Request, next: Next) -> Resp
     }
 }
 
-fn auth_failure_response(error: crate::auth::SbiAuthError) -> Response {
+fn quoted_challenge_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn auth_failure_response(error: crate::auth::SbiAuthError, service: &AuthService) -> Response {
     use crate::auth::SbiAuthError;
+    let realm = format!(
+        "Bearer realm=\"{}\"",
+        quoted_challenge_value(&service.api_uri.to_string())
+    );
     let (status, challenge) = match error {
-        SbiAuthError::MissingBearerToken => (StatusCode::UNAUTHORIZED, Some("Bearer")),
+        SbiAuthError::MissingBearerToken => (StatusCode::UNAUTHORIZED, Some(realm)),
         SbiAuthError::InsufficientScope => (
             StatusCode::FORBIDDEN,
-            Some("Bearer error=\"insufficient_scope\""),
+            Some(format!(
+                "{realm}, error=\"insufficient_scope\", scope=\"{}\"",
+                service.required_scopes.join(" ")
+            )),
         ),
         SbiAuthError::Internal { .. } => (StatusCode::SERVICE_UNAVAILABLE, None),
         _ => (
             StatusCode::UNAUTHORIZED,
-            Some("Bearer error=\"invalid_token\""),
+            Some(format!("{realm}, error=\"invalid_token\"")),
         ),
     };
     let mut details = ProblemDetails::new(status);
@@ -418,7 +531,7 @@ fn auth_failure_response(error: crate::auth::SbiAuthError) -> Response {
     if let Some(challenge) = challenge {
         response.headers_mut().insert(
             http::header::WWW_AUTHENTICATE,
-            http::HeaderValue::from_static(challenge),
+            http::HeaderValue::from_str(&challenge).expect("validated challenge configuration"),
         );
     }
     response
@@ -439,4 +552,49 @@ fn problem_response(
     builder
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| Response::new(axum::body::Body::empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn challenge_configuration_rejects_unsafe_realms_and_scopes() {
+        for uri in [
+            "/nnrf-disc/v1",
+            "ftp://example.test/nnrf-disc/v1",
+            "https://user@example.test/nnrf-disc/v1",
+            "https://example.test/nnrf-disc/v1?realm=evil",
+            "https://example.test/",
+        ] {
+            let service = AuthService {
+                api_uri: uri.parse().unwrap(),
+                required_scopes: vec!["nnrf-disc".into()],
+            };
+            assert!(service.validate().is_err(), "{uri}");
+        }
+        for scopes in [
+            vec![],
+            vec![""],
+            vec!["read write"],
+            vec!["read\""],
+            vec!["read\\"],
+            vec!["read\r\nInjected: yes"],
+        ] {
+            let service = AuthService {
+                api_uri: "https://example.test/nnrf-disc/v1".parse().unwrap(),
+                required_scopes: scopes.into_iter().map(String::from).collect(),
+            };
+            assert!(service.validate().is_err());
+        }
+        assert_eq!(quoted_challenge_value("a\"b\\c"), "a\\\"b\\\\c");
+        let service = AuthService {
+            api_uri: "https://example.test/nnrf-disc/v1/".parse().unwrap(),
+            required_scopes: vec!["nnrf-disc".into()],
+        };
+        assert!(service.validate().is_ok());
+        assert!(service.matches("/nnrf-disc/v1"));
+        assert!(service.matches("/nnrf-disc/v1/resource"));
+        assert!(!service.matches("/nnrf-disc/v10/resource"));
+    }
 }

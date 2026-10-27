@@ -77,6 +77,8 @@ fn system_ordered_models_keep_all_generated_file_digests() {
     // All pins also include #1274 generated-lint repairs and shared statement formatting.
     // #1363 pins follow byte-verified 63440381b baselines: exact decimal64 codecs/types
     // and RFC 6243 trim semantics. All complete-file assertions remain.
+    // RFC 6241 existence-error pins were reverified at 8121730ada; only
+    // netconf_xml_edit.rs changes, with all thirteen full-file checks retained.
     // base/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // comments/gnmi_json.rs: #1269 authorized sensitive keys and #1270 XPath literals.
     // enum/gnmi_json.rs: #1270 shared literal predicate construction.

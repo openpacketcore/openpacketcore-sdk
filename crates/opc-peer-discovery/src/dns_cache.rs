@@ -392,8 +392,13 @@ impl DnsCache {
             DnsCachedResult::Miss
         };
         DnsCacheStatus {
+            fresh_until: matches!(
+                result,
+                DnsCachedResult::Fresh(_) | DnsCachedResult::Stale { .. }
+            )
+            .then_some(entry.expires_at)
+            .flatten(),
             result,
-            fresh_until: entry.expires_at,
             last_error: entry.last_error,
             retry_at: entry.retry_at,
             refreshing: entry

@@ -1198,7 +1198,10 @@ pub fn generate(input: &CanonicalInput) -> Result<String, RustGenerationError> {
         };
 
     let scalar_validation = if has_scalar_constraints {
-        quote! { super::validate::validate_syntax(&temp).map_err(|error| config_error("invalid-value", error.message))?; }
+        // A patch may be one step in reconstructing a complete candidate.
+        // Check supplied values and uniqueness now; whole-config cardinality
+        // is enforced by validate_syntax before the candidate is committed.
+        quote! { temp.validate_patch_constraints()?; }
     } else {
         quote! {}
     };

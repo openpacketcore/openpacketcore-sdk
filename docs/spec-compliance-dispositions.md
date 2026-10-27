@@ -98,13 +98,13 @@ claims live-peer or kernel migration qualification.
 
 | Finding | Verified behavior and disposition |
 | --- | --- |
-| IPCP DNS options | `opc-proto-gtpv2c::pco` already parses options 129/131, correlates Configure-Nak identifiers and requested options, and exposes primary/secondary DNS. All 56 PCO tests pass, including independent literal replies, unsolicited options, stale identifiers and unit-local malformed-input handling. |
+| IPCP DNS options | `opc-proto-gtpv2c::pco` already parses options 129/131, correlates Configure-Nak identifiers and requested options, and exposes primary/secondary DNS. The PCO regressions cover independent literal replies, unsolicited options, stale identifiers and unit-local malformed-input handling. |
 | Raw IPv4 checksum | Injection accepts validated packets rather than assembling a zero-checksum header. `Header::parse` calls `valid_ipv4_header`, which rejects an incorrect checksum; the fragmenter and ICMP builders compute new checksums. Linux raw `IP_HDRINCL` also fills the checksum. `whole_batch_is_validated_before_its_first_send` proves a corrupted fragment prevents any send. No missing checksum computation was reproduced. |
 | IPv6 fragment cache cleanup | The cited `model.rs` location has no fragment cache or timer. Outer reassembly belongs to the Linux kernel; the SDK does not own the reported IPv6 reassembly cache. Inner fragments are handled by the documented forwarding profile. No cache-expiry repair is claimed, and this disposition does not qualify full IPv6 outer reassembly. |
 | NAI SASLprep | RFC 7542 does not prescribe SASLprep in a Diameter AVP parser. It assigns normalization primarily to the edge with locale information and cautions AAA intermediaries against normalization. Preserve the received identity bytes; automatic parser rewriting could break exact EAP/User-Name correlation. |
 | DNS hostname syntax | Fixed in `b37d5cf84`: address queries validate RFC 1123 hostnames while SRV/S-NAPTR service-owner syntax remains separate. |
 | ICMP quote length | The IPv4 PTB builder already quotes the IPv4 header plus eight payload octets; `icmpv4_ptb_matches_rfc1191_layout_and_verifies_checksums` verifies the exact quote and both checksums. IPv6 uses its separate minimum-MTU quote rule. Moreover, RFC 1812 §4.3.2.3 recommends retaining more original IPv4 data within a 576-byte response; eight octets are not a universal maximum. |
-| IPv6 scope ID | The cited `opc-net-util` crate does not exist. The SCTP socket boundary already copies `scope_id` into native `sin6_scope_id` and restores it on readback. The new `link_local_scopes_survive_raw_and_packed_addresses` regression verifies three nonzero scope values, including `u32::MAX`, against literal packed offsets and native byte order. The 14 ordinary Linux sys-layer tests pass; no production change is needed. The session TCP helper passes the complete `SocketAddr` to Tokio. |
+| IPv6 scope ID | The cited `opc-net-util` crate does not exist. The SCTP socket boundary already copies `scope_id` into native `sin6_scope_id` and restores it on readback. The new `link_local_scopes_survive_raw_and_packed_addresses` regression verifies three nonzero scope values, including `u32::MAX`, against literal packed offsets and native byte order. No production change is needed for this address conversion. The session TCP helper passes the complete `SocketAddr` to Tokio. |
 
 Witnesses: [PCO tests](../crates/opc-proto-gtpv2c/tests/pco.rs),
 [injection validation](../crates/opc-gtpu-dataplane/src/injection.rs),
@@ -130,13 +130,18 @@ an ON_CHANGE heartbeat does not require `suppress_redundant`. One initial
 authorized observation seeds every schedule, preserving overlapping-path
 deduplication and changes arriving during initialization.
 
-The six runtime regressions in
+The runtime regressions in
 [target_defined.rs](../crates/opc-gnmi-server/src/service/tests/target_defined.rs)
 check mixed delivery, keyed prefixes, Subscribe-versus-Read authorization,
-zero intervals, independent cadences/suppression and heartbeats. The complete
-Linux gNMI suite passes 274 tests, including 62 keyed-read/subscription tests
-and seven retained-audit integration tests. These tests establish the scoped
-subscription change; the YANG generation evidence follows below.
+zero intervals, independent cadences/suppression and heartbeats. ON_CHANGE and
+TARGET_DEFINED emit explicit deletes for removed nodes, including the last
+selected entry. Changed observations compare individual leaves; SAMPLE with
+`suppress_redundant` omits unchanged leaves. Heartbeats refresh the current
+observation. Partial notifications are non-atomic. Pending authorization updates
+do not turn a temporarily unavailable observation into deletion notifications.
+The malformed-first-request metric regression runs in a dedicated test process
+so concurrent successful subscriptions cannot alter its exact global-counter
+assertion.
 
 Specification: [gNMI 0.10.0 §3.5.1.5.2](https://github.com/openconfig/reference/blob/master/rpc/gnmi/gnmi-specification.md#35152-stream-subscriptions).
 
@@ -150,30 +155,38 @@ checks absent non-presence containers, inactive presence containers, per-entry
 requirements, zero-valued mandatory booleans, sensitive leaf-lists and both
 cardinality boundaries. All four runtime tests failed before the fix.
 Source/IR regressions additionally check malformed statements, round trips,
-source mismatch and digest changes. The complete generator suite and its
-294-case generated-code lint/runtime matrix pass on Rust 1.99.1. At the
-cardinality commit, unchanged legacy artifacts retained their full-file pins.
+source mismatch and digest changes. Partial patches and ConfigDelta replay check scalar constraints and leaf-list
+uniqueness without demanding complete-configuration cardinality at each step.
+The completed candidate still undergoes full validation. The
+[partial-patch fixture](../crates/opc-yanggen/tests/fixtures/cardinality_patch_test.rs)
+checks mandatory siblings, scalar bounds, duplicate values and atomic refusal.
+Sensitive leaves remain covered by generated runtime checks. A sensitive
+container or list is rejected by the generator's supported-input contract before
+code emission; that unsupported input cannot produce the reported missing
+`SecretLeaf::get()` call. RFC 7950 §6.3.1 leaves extension processing to the
+extension's defined contract. The generator tests preserve this rejection and
+compile the supported sensitive-leaf forms.
 
 The remaining non-decimal reports were checked against current code:
 
 | Report | Disposition and evidence |
 | --- | --- |
 | Unbounded revision index | `source::parse_module` retains one module revision (the first declaration) and the source text used for get-schema. It has no accumulating revision index. RFC 8525 §3 describes the served YANG library and does not mandate the claimed history-retention ceiling. No revision-retention feature is introduced. |
-| Missing edit-config operations | `edit_xml::parse_operation` already recognizes create, replace and delete, retains per-node operations and passes the parsed edit to the binding applicator. Generated applicators implement their existence and replacement semantics. The full server and generator suites pass. The cited `operations/edit_config.rs` does not exist. |
+| Missing edit-config operations | Parsing already recognized the operations, but generated existence checks were incomplete. Creating an existing scalar, secret leaf, presence container, keyed-list entry or leaf-list value now reports `data-exists`; deleting an absent node reports `data-missing`. Removing an absent node remains idempotent. Generated-applicator and real RPC regressions cover running, candidate and startup datastores and verify rejected edits do not publish a change. The cited `operations/edit_config.rs` does not exist. |
 | Missing notification subscription | `create_subscription_starts_live_config_change_notifications` exercises the real session, subscription RPC, configuration change and delivered notification. `notification_subscription_installs_retained_byte_budget` verifies bounded retention. These pass with the existing binding; replay and filter shapes remain explicitly unsupported by the advertised profile. |
 | Missing get-schema/session inventory | The existing monitoring binding serves `/netconf-state` and get-schema, with positive, authorization, absent/ambiguous module, provider-error and size-limit tests. `get_schema_returns_schema_content_when_monitoring_and_nacm_allow` passes. This operation is specified by RFC 6022 §3.1, not RFC 8525 §4. |
 | Boolean exactness | Generated JSON uses Rust `bool`; the new fixture verifies `false` is a present valid value while strings, numbers and absent required values are rejected. NETCONF scalar parsers also use the exact boolean parser. |
 
-The complete Linux NETCONF run passes 533 tests, including retained-audit
-recovery and process-loss cases. It runs with `umask 0077` so the test directories
-satisfy retained-storage admission; the initial group-writable VM directories
-were correctly rejected. No production check or test assertion was relaxed.
-The decimal64 correction and its verification are described below.
+Retained-storage tests require private disk-backed temporary directories and
+`umask 0077`; these admission requirements remain enforced. The exact revision,
+commands and results are recorded in the validation handover. The decimal64
+correction and its verification are described below.
 
 Witnesses: [edit parser](../crates/opc-netconf-server/src/edit_xml.rs),
 [server and tests](../crates/opc-netconf-server/src/server.rs),
 [source ingestion](../crates/opc-yanggen/src/source.rs),
 [RFC 7950 §§7.6.5 and 7.7.5–7.7.6](https://www.rfc-editor.org/rfc/rfc7950.html#section-7.6.5),
+[RFC 6241 §7.2](https://www.rfc-editor.org/rfc/rfc6241.html#section-7.2),
 [RFC 6022 §3.1](https://www.rfc-editor.org/rfc/rfc6022.html#section-3.1),
 [RFC 5277 §2.1.1](https://www.rfc-editor.org/rfc/rfc5277.html#section-2.1.1),
 and [RFC 8525 §3](https://www.rfc-editor.org/rfc/rfc8525.html#section-3).
@@ -213,6 +226,10 @@ separate tests check trim and explicit reporting of the same default value.
 All 78 generated-file pins were first reproduced from commit `63440381b`.
 Only the decimal codec/type/scale-digest changes and RFC 6243 trim changes
 appeared in the reviewed generated output; the complete-file assertions remain.
+The subsequent RFC 6241 correction reverified all 78 current pins and changed
+only the six `netconf_xml_edit.rs` entries, for typed existence errors and
+absent-container deletion. The partial-patch fix does not affect these six
+models. Every generated file remains covered by its full-file assertion.
 The old proof that accepted subnormal/exponent/NaN/infinite float values is
 replaced by exact-domain round trips and explicit refusal assertions. Public
 IR, metadata and generated-type migrations are documented in the changelog.
@@ -223,3 +240,63 @@ Witnesses: [exact scalar](../crates/opc-mgmt-schema/src/decimal64.rs),
 [RFC 7950 §6.4](https://www.rfc-editor.org/rfc/rfc7950.html#section-6.4),
 [RFC 7951 §6.1](https://www.rfc-editor.org/rfc/rfc7951.html#section-6.1), and
 [RFC 6243 §3.2](https://www.rfc-editor.org/rfc/rfc6243.html#section-3.2).
+
+
+## DNS/peer-discovery work list #1355
+
+The DNS cache retains stale positive answers only until its configured maximum
+stale deadline; once that deadline passes it exposes neither the expired answer
+nor a usable freshness deadline. UDP truncation triggers TCP fallback with
+length framing and response correlation checks. TCP connections are bounded and
+reused for query bursts, with a one-second idle limit. The unnegotiated idle
+reuse is an explicit deviation from RFC 7766 §6.2.3's idle-close recommendation;
+EDNS TCP keepalive negotiation remains unsupported. The high-bit TTL policy is
+also explicitly conservative: such TTLs are treated as zero rather than adopting
+RFC 8767's full unsigned TTL domain.
+
+Witnesses: [DNS wire tests](../crates/opc-peer-discovery/tests/dns_client.rs),
+[cache contracts](../crates/opc-peer-discovery/tests/dns_contracts.rs), and
+[SRV provenance tests](../crates/opc-peer-discovery/tests/dns_srv.rs). The SRV mode
+negative uses a valid service owner and matching transport so it isolates the
+query-mode check. See the [supported DNS profile](../crates/opc-peer-discovery/README.md)
+for the remaining serialized-query timeout limitation.
+
+Sources: [RFC 8767 §4](https://www.rfc-editor.org/rfc/rfc8767.html#section-4)
+and [RFC 7766 §§6.2.1–6.2.3](https://www.rfc-editor.org/rfc/rfc7766.html#section-6.2.1).
+
+## Charging and policy work list #1361
+
+| Finding | Verified behavior and disposition |
+| --- | --- |
+| ARP polarity | The shared ARP type already treats priority 1 as highest and 15 as lowest. The GTPv2-C `arp_priority_polarity` and `bearer_qos` tests cover wire values and domain comparison independently of preemption flags. Do not invert the four-bit wire field. |
+| Rf Service-Information | ACR supports the grouped Service-Information and optional PS-Information. The grammar does not require PS-Information in every ACR. Subscription-Id, SGSN/GGSN addresses and Service-Data-Container retain their specified multiplicity; conservative dictionary validation accepts those repetitions and rejects duplicate singleton fields. |
+| RADIUS-derived AVPs in Rf | 3GPP-Charging-Id and 3GPP-PDP-Type use vendor 10415 and set M, as required by TS 32.299 §7.2.0. The literal fixture uses flags `0xC0`, and independent encoding assertions check both AVPs. The Gi/SGi table in TS 29.061 does not govern this Rf encoding. |
+| Interim accounting | The existing AccountingRecordType::Interim encoding remains supported. This codec does not schedule a charging session or enforce operator charging policy. |
+
+Witnesses: [Rf codec and dictionary](../crates/opc-proto-diameter/src/apps/rf.rs),
+[independent wire and cardinality tests](../crates/opc-proto-diameter/tests/app_dictionaries.rs),
+and [ARP tests](../crates/opc-proto-gtpv2c/tests/arp_priority_polarity.rs).
+The Rf rules come from [TS 32.299 V18.0.0 §§7.2.0, 7.2.158 and 7.2.192](https://www.etsi.org/deliver/etsi_ts/132200_132299/132299/18.00.00_60/ts_132299v180000p.pdf).
+Emergency-service admission remains the consuming endpoint's responsibility;
+this change does not alter emergency behavior.
+
+## SBI/NRF/OAuth work list #1362
+
+| Finding | Verified behavior and disposition |
+| --- | --- |
+| NRF registration and heartbeat | Registration includes the supported NF profile fields. A returned heartBeatTimer replaces the remembered interval; 204 and responses without that attribute retain it. Initial registration without a timer uses the documented default. |
+| Discovery validity | Query encoding preserves the discovery parameters. Cache reuse is bounded by server validityPeriod. After a failed refresh the cache is looked up again, so an expired or invalidated entry cannot be returned through a saved stale snapshot. |
+| Priority and extensible metadata | NfPriority validates 0–31. NF status preserves CANARY_RELEASE and unknown string extensions instead of rejecting an otherwise usable profile. |
+| Access-token claims | Explicit NRF token configuration accepts the producer NF type as a string or an audience UUID array containing the local producer instance. Signature, issuer/subject UUIDs, time, scope and peer binding remain checked. JWT-SVID retains its separate SPIFFE and audience policy. |
+| OAuth response challenge | Trusted API URI and scope configuration supplies the realm on 401/403 and scope on insufficient-scope responses. Host headers do not set challenge values. Malformed or duplicate authorization headers receive 400; protected paths without matching challenge configuration fail closed. Problem responses use application/problem+json. |
+| HTTP transport and breaker | Cleartext defaults to port 80; TLS requires negotiated h2 and accepts IPv4/IPv6 address identities. Circuit-breaker failures remain scoped to transport/timeout and 5xx outcomes, rather than ordinary 4xx application responses. |
+| Service identifiers and metadata URL | The SMF event exposure identifier is nsmf-event-exposure. The console design records RFC 8414 metadata discovery with the well-known component before the issuer path. |
+
+Witnesses: [NRF wire/cache tests](../crates/opc-sbi/tests/nrf_wire.rs),
+[token-profile tests](../crates/opc-sbi/tests/nrf_tokens.rs),
+[SBI HTTP/TLS tests](../crates/opc-sbi/tests/sbi_integration.rs),
+and [service identifiers](../crates/opc-sbi/src/nrf/services.rs).
+Sources: [TS 29.510 V18.6.0 §§5.2.2.3.2, 5.3.2.2.1 and 6.3.5.2.4](https://www.etsi.org/deliver/etsi_ts/129500_129599/129510/18.06.00_60/ts_129510v180600p.pdf),
+[TS 29.500 V18.6.0 §6.7.3](https://www.etsi.org/deliver/etsi_ts/129500_129599/129500/18.06.00_60/ts_129500v180600p.pdf),
+[RFC 6750 §3](https://www.rfc-editor.org/rfc/rfc6750.html#section-3), and
+[RFC 8414 §3](https://www.rfc-editor.org/rfc/rfc8414.html#section-3).

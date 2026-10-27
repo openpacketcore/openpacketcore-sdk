@@ -7,7 +7,9 @@
 //! - `NfProfile`, `DiscoveryQuery`, `DiscoveryResult`: typed TS 29.510 data
 //!   structures used by both production code and the testkit.
 
-pub use opc_api_nnrf::{NfService, NfServiceStatus, NfServiceVersion, NnrfPlmnId, NnrfSnssai};
+pub use opc_api_nnrf::{
+    NfService, NfServiceStatus, NfServiceVersion, NfStatus, NnrfPlmnId, NnrfSnssai,
+};
 
 pub mod cache;
 pub mod client;
@@ -18,18 +20,6 @@ pub use client::{CachedDiscoveryClient, HeartbeatDriver, NrfClient, NrfOperation
 
 use opc_types::{NfInstanceId, NfType, PlmnId, Snssai};
 use serde::{Deserialize, Serialize};
-
-/// Status of a registered NF instance per TS 29.510.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum NfStatus {
-    /// NF is registered and discoverable.
-    Registered,
-    /// NF is temporarily suspended.
-    Suspended,
-    /// NF should not be returned in discovery.
-    Undiscoverable,
-}
 
 /// Minimal NF profile for discovery caching and testkit fixtures.
 ///

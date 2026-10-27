@@ -196,6 +196,7 @@ pub struct SbiJwtValidator {
     production_mode: bool,
     bypass_verification_in_dev: bool,
     token_profile: SbiTokenProfile,
+    nrf_audience: Option<(String, String)>,
 }
 
 impl SbiJwtValidator {
@@ -223,15 +224,36 @@ impl SbiJwtValidator {
             production_mode,
             bypass_verification_in_dev,
             token_profile: SbiTokenProfile::JwtSvid,
+            nrf_audience: None,
         }
     }
 
     /// Select the accepted token profile. NRF tokens always require a bound
     /// transport NF instance/type, including outside production, because they
     /// do not carry a tenant or NF type from which to construct a peer.
+    /// NRF mode also requires [`Self::with_nrf_audience`].
     pub fn with_token_profile(mut self, profile: SbiTokenProfile) -> Self {
         self.token_profile = profile;
         self
+    }
+
+    /// Configure this producer's trusted NF type and instance UUID. In NRF
+    /// mode, TS 29.510 section 6.3.5.2.4 permits either the NF type as a
+    /// string or an array of NF instance UUIDs containing this producer.
+    /// JWT-SVID mode continues to use only `new`'s expected audience.
+    pub fn with_nrf_audience(
+        mut self,
+        nf_type: NfType,
+        nf_instance_id: NfInstanceId,
+    ) -> Result<Self, String> {
+        if nrf_uuid(nf_instance_id.as_str()).is_none() {
+            return Err("NRF audience instance must be a hyphenated UUID".into());
+        }
+        self.nrf_audience = Some((
+            nf_type.as_str().replace('-', "_").to_ascii_uppercase(),
+            nf_instance_id.as_str().to_string(),
+        ));
+        Ok(self)
     }
 }
 
@@ -294,7 +316,18 @@ impl SbiAuth for SbiJwtValidator {
 
         // 4. Validate signature, issuer, and expiry
         let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_audience(&[&self.expected_aud]);
+        match self.token_profile {
+            SbiTokenProfile::JwtSvid => validation.set_audience(&[&self.expected_aud]),
+            SbiTokenProfile::NrfAccessToken => {
+                let (nf_type, instance) =
+                    self.nrf_audience
+                        .as_ref()
+                        .ok_or_else(|| SbiAuthError::Internal {
+                            reason: "NRF token audience is not configured".into(),
+                        })?;
+                validation.set_audience(&[nf_type, instance]);
+            }
+        }
         validation.set_issuer(&[&self.expected_iss]);
         validation.validate_nbf = true;
         validation.required_spec_claims.insert("exp".to_string());
@@ -317,7 +350,27 @@ impl SbiAuth for SbiJwtValidator {
         let claims = token_data.claims;
 
         // 5. Verify Audience
-        if !validate_audience(&claims.aud, &self.expected_aud) {
+        let audience_matches = match self.token_profile {
+            SbiTokenProfile::JwtSvid => validate_audience(&claims.aud, &self.expected_aud),
+            SbiTokenProfile::NrfAccessToken => {
+                self.nrf_audience
+                    .as_ref()
+                    .is_some_and(|(nf_type, instance)| match &claims.aud {
+                        serde_json::Value::String(value) => value == nf_type,
+                        serde_json::Value::Array(values) => {
+                            !values.is_empty()
+                                && values
+                                    .iter()
+                                    .all(|value| value.as_str().and_then(nrf_uuid).is_some())
+                                && values
+                                    .iter()
+                                    .any(|value| value.as_str() == Some(instance.as_str()))
+                        }
+                        _ => false,
+                    })
+            }
+        };
+        if !audience_matches {
             return Err(SbiAuthError::Denied {
                 reason: "audience mismatch".into(),
             });

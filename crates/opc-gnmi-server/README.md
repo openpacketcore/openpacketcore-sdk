@@ -73,7 +73,13 @@ permission closes the stream with `UNAVAILABLE` and the fixed message
 the new context. Registration, notification delivery or refresh failure also
 fails closed. Hidden events do not supply or accelerate this control trigger.
 
-ON_CHANGE compares authorized content without observation timestamps.
+ON_CHANGE compares authorized leaf values without observation timestamps.
+It emits only changed leaves and explicit delete paths for removed nodes,
+including removal of the last keyed entry. SAMPLE with `suppress_redundant`
+uses the same per-leaf comparison. Heartbeats resend current values and retain
+any pending deletions. These partial notifications do not assert atomic subtree
+replacement. Pending authorization reevaluation is never interpreted as data
+removal; losing authorization still follows the terminal behavior above.
 `updates_only` seeds that comparison without sending a snapshot. A lag resync
 sends a snapshot and `sync_response` only when that content changed. Requested
 SAMPLE and heartbeat intervals retain their cadence independently of excluded

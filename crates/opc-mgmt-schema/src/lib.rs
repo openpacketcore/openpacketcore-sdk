@@ -1036,12 +1036,21 @@ pub enum NetconfEditError {
     },
     /// The XML config fragment is structurally malformed.
     MalformedXml,
-    /// The requested operation is not semantically valid for this node kind or
-    /// state.
-    ///
-    /// For supported leaf-lists, `Create` means the typed entry already
-    /// exists and `Delete` means it is absent. NETCONF bindings preserve these
-    /// as RFC 7950 section 7.7.9 `data-exists` and `data-missing` replies.
+    /// A create operation addressed existing data (RFC 6241 section 7.2).
+    DataExists {
+        /// Schema-node path; never a path containing instance key values.
+        path: &'static str,
+        /// Kind of node whose instance already exists.
+        kind: NodeKind,
+    },
+    /// A delete operation addressed absent data (RFC 6241 section 7.2).
+    DataMissing {
+        /// Schema-node path; never a path containing instance key values.
+        path: &'static str,
+        /// Kind of node whose instance is absent.
+        kind: NodeKind,
+    },
+    /// The requested operation is unsupported for this node kind.
     OperationNotSupported {
         /// Schema-node path.
         path: &'static str,
@@ -1077,6 +1086,12 @@ impl std::fmt::Display for NetconfEditError {
                 write!(f, "NETCONF edit keys supplied on non-list {path}")
             }
             Self::MalformedXml => f.write_str("NETCONF edit config XML is malformed"),
+            Self::DataExists { path, kind } => {
+                write!(f, "NETCONF edit {kind:?} data already exists at {path}")
+            }
+            Self::DataMissing { path, kind } => {
+                write!(f, "NETCONF edit {kind:?} data is missing at {path}")
+            }
             Self::OperationNotSupported {
                 path,
                 operation,

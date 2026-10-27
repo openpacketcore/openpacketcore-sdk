@@ -12,6 +12,75 @@ fn generated_mandatory_and_cardinality_contract() {
 }
 
 #[test]
+fn review_generated_partial_patch_cardinality_contract() {
+    compile_fixture(
+        "cardinality-patch",
+        include_str!("../fixtures/cardinality_patch.yang"),
+        include_str!("../fixtures/cardinality_patch_test.rs"),
+        3,
+    );
+}
+
+#[test]
+fn review_generated_sensitive_leaf_constraints_compile_and_enforce_bounds() {
+    let mut parsed = input(
+        r#"module example { yang-version 1.1; namespace "urn:example:sensitive-cardinality"; prefix ex;
+      container root {
+        container protected { leaf amount { type uint8 { range "1..10"; } mandatory true; } }
+        container enabled { presence "enable"; leaf token { type string { length "1..8"; } mandatory true; } }
+        list entries { key name; min-elements 1; max-elements 2; leaf name { type string; } leaf amount { type uint8 { range "1..10"; } mandatory true; } }
+      }
+    }"#,
+    );
+    for node in &mut parsed.nodes {
+        if matches!(
+            node.path.as_str(),
+            "/ex:root/ex:protected/ex:amount"
+                | "/ex:root/ex:enabled/ex:token"
+                | "/ex:root/ex:entries/ex:name"
+                | "/ex:root/ex:entries/ex:amount"
+        ) {
+            node.data_class = Some("security-secret".into());
+        }
+    }
+    super::compile_canonical_fixture(
+        "sensitive-cardinality",
+        &parsed.to_canonical(),
+        include_str!("../fixtures/sensitive_cardinality_test.rs"),
+        2,
+    );
+}
+
+#[test]
+fn review_sensitive_ancestors_are_rejected_before_rust_generation() {
+    let parsed = input(
+        r#"module example { namespace "urn:example"; prefix ex;
+            container root {
+                container protected { leaf value { type uint8; mandatory true; } }
+                list entries { key name; min-elements 1; leaf name { type string; } }
+            }
+        }"#,
+    );
+    for (path, kind) in [
+        ("/ex:root/ex:protected", "container"),
+        ("/ex:root/ex:entries", "list"),
+    ] {
+        let mut canonical = parsed.to_canonical();
+        canonical
+            .nodes
+            .iter_mut()
+            .find(|node| node.path == path)
+            .unwrap()
+            .data_class = Some("security-secret".into());
+        let error = opc_yanggen::rust::generate_rust(&canonical).unwrap_err();
+        assert_eq!(
+            error.message(),
+            format!("{kind} {path} must not be classified as sensitive; classify sensitive leaves instead")
+        );
+    }
+}
+
+#[test]
 fn source_rejects_invalid_cardinality_statements() {
     for body in [
         "leaf x { type boolean; mandatory yes; }",

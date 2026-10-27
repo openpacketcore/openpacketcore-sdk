@@ -10,6 +10,7 @@ use crate::redact::{safe_metric_label, sanitize_error_message};
 use async_trait::async_trait;
 use opc_types::NfInstanceId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ pub trait NrfOperations: Send + Sync {
     ///
     /// On success returns the heartbeat interval the NF must honor: the
     /// NRF-supplied `heartBeatTimer` (in seconds) when present, otherwise
-    /// the implementation's default (30 s for `NrfClient`).
+    /// the interval already negotiated for this NF (initially 30 s for `NrfClient`).
     async fn register(&self, profile: &NfProfile) -> Result<Duration, String>;
     /// Remove the NF instance from the NRF (TS 29.510 `DELETE`), making it
     /// undiscoverable; used for graceful shutdown.
@@ -49,6 +50,7 @@ pub trait NrfOperations: Send + Sync {
 pub struct NrfClient {
     client: crate::client::SbiClient,
     nrf_uri: String,
+    heartbeat_intervals: Mutex<HashMap<NfInstanceId, Duration>>,
 }
 
 impl NrfClient {
@@ -57,7 +59,11 @@ impl NrfClient {
     /// appended verbatim). Retry, TLS, and circuit-breaking behavior come
     /// from the supplied client.
     pub fn new(client: crate::client::SbiClient, nrf_uri: String) -> Self {
-        Self { client, nrf_uri }
+        Self {
+            client,
+            nrf_uri,
+            heartbeat_intervals: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Create an NRF client using the default plain-HTTP SBI client.
@@ -78,6 +84,22 @@ impl NrfClient {
             .with_http2_only(false)
             .build()?;
         Ok(Self::new(client, nrf_uri))
+    }
+
+    fn response_heartbeat_interval(&self, instance: &NfInstanceId, body: &[u8]) -> Duration {
+        let timer = serde_json::from_slice::<NrfHeartbeatResponse>(body)
+            .ok()
+            .and_then(|response| response.heartbeat_timer);
+        let mut intervals = lock_or_recover(&self.heartbeat_intervals);
+        // TS 29.510 section 5.2.2.3.2: an omitted timer leaves the negotiated
+        // interval in force. One client may manage more than one NF instance.
+        if let Some(timer) = timer {
+            intervals.insert(instance.clone(), heartbeat_interval_from_timer(Some(timer)));
+        }
+        intervals
+            .get(instance)
+            .copied()
+            .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
     }
 }
 
@@ -133,12 +155,7 @@ impl NrfOperations for NrfClient {
         let response = self.client.send(request).await?;
 
         if response.status().is_success() {
-            // Parse heartbeat timer
-            let body_bytes = response.into_body();
-            if let Ok(res) = serde_json::from_slice::<NrfHeartbeatResponse>(&body_bytes) {
-                return Ok(heartbeat_interval_from_timer(res.heartbeat_timer));
-            }
-            Ok(DEFAULT_HEARTBEAT_INTERVAL)
+            Ok(self.response_heartbeat_interval(&profile.nf_instance_id, response.body()))
         } else {
             Err(format!(
                 "NRF registration failed with status {}",
@@ -163,6 +180,7 @@ impl NrfOperations for NrfClient {
         let response = self.client.send(request).await?;
 
         if response.status().is_success() {
+            lock_or_recover(&self.heartbeat_intervals).remove(instance_id);
             Ok(())
         } else {
             Err(format!(
@@ -192,11 +210,7 @@ impl NrfOperations for NrfClient {
         let response = self.client.send(request).await?;
 
         if response.status().is_success() {
-            let body_bytes = response.into_body();
-            if let Ok(res) = serde_json::from_slice::<NrfHeartbeatResponse>(&body_bytes) {
-                return Ok(heartbeat_interval_from_timer(res.heartbeat_timer));
-            }
-            Ok(DEFAULT_HEARTBEAT_INTERVAL)
+            Ok(self.response_heartbeat_interval(instance_id, response.body()))
         } else if response.status() == http::StatusCode::NOT_FOUND {
             Err(NRF_HEARTBEAT_NOT_FOUND.to_string())
         } else {
@@ -525,7 +539,7 @@ impl CachedDiscoveryClient {
                 query.target_nf_type.as_str().to_ascii_uppercase().as_str(),
                 "UDM" | "AUSF" | "NRF" | "PCF"
             );
-        let stale = match lookup {
+        match lookup {
             CacheLookup::Hit(profiles) => {
                 record_discovery_metric("cache_hit");
                 return Ok(profiles);
@@ -533,9 +547,8 @@ impl CachedDiscoveryClient {
             CacheLookup::Negative => {
                 return Err("Discovery cached negative result (NotFound)".into())
             }
-            CacheLookup::Stale(profiles) if !sensitive => Some(profiles),
-            _ => None,
-        };
+            _ => {}
+        }
         let error = match self.nrf_client.discover(query).await {
             Ok(DiscoveryResult::Found {
                 profiles,
@@ -573,7 +586,18 @@ impl CachedDiscoveryClient {
             }
             Err(error) => format!("NRF query failed: {}", sanitize_error_message(error)),
         };
-        if let Some(profiles) = stale {
+        // Refresh can outlive the server validity deadline or a configuration
+        // invalidation. Re-read the current entry instead of retaining a copy
+        // admitted before the await (TS 29.510 section 5.3.2.2.1).
+        let fallback = if was_stale && !sensitive {
+            match lock_or_recover(&self.cache).lookup(&key) {
+                CacheLookup::Hit(profiles) | CacheLookup::Stale(profiles) => Some(profiles),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(profiles) = fallback {
             record_discovery_metric("stale_fallback");
             Ok(profiles)
         } else {

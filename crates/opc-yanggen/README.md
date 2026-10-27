@@ -64,6 +64,12 @@ required descendants. An absent presence container makes its descendant
 requirements inactive; each existing list entry has its own required leaves.
 State-data presence does not constrain a configuration commit. Intermediate
 JSON/patch candidates can remain incomplete until whole-config validation.
+Partial patches still validate supplied scalar values and leaf-list uniqueness;
+they do not demand mandatory siblings or complete list cardinality. Replaying
+individual deltas follows the same rule; validate the completed candidate before
+commit. Sensitive classification is supported on leaves and leaf-lists.
+Sensitive containers and lists are rejected before Rust generation; classify
+their sensitive leaves instead.
 The generated boolean representation remains Rust `bool`; JSON strings and
 numbers are not accepted as booleans.
 

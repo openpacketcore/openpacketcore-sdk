@@ -1884,8 +1884,13 @@ with Accounting-Input/Output-Octets (363/364), Time-Usage (2045), Rating-Group
 and Service-Identifier. MSCC and Used-Service-Unit are online charging shapes
 and are no longer exposed by this Rf subset. Separate directional counters
 replace the former total-octet field; the codec never guesses their split.
-SGSN-Address is 1228 and GGSN-Address is 847. Charging-Id/PDP-Type metadata
-and M bits follow TS 29.061 section 16.4.7.
+SGSN-Address is 1228 and GGSN-Address is 847; both repeat within PS-Information.
+`PsInformation::sgsn_addresses` and `ggsn_addresses` retain every occurrence,
+including simultaneous IPv4 and IPv6 addresses. Charging-Id/PDP-Type require
+M set under TS 32.299 section 7.2.0's rule for reused RADIUS VSAs on Rf.
+TS 29.061's Gi/Sgi table does not override that Rf-specific rule.
+The dictionary admits repeated Subscription-Id, SGSN/GGSN addresses and
+Service-Data-Container while retaining singleton PS-Information and charging IDs.
 
 `tests/app_dictionaries.rs` checks independent literal nesting/codepoints,
 Start/Interim/Stop values, counter widths, repeated usage groups, misplaced

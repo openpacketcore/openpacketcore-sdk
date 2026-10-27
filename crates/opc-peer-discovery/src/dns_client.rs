@@ -22,7 +22,7 @@ use crate::{
 const MAX_CONFIG_BYTES: usize = 65_536;
 const MAX_SERVERS: usize = 8;
 const PORT_BIND_ATTEMPTS: usize = 32;
-const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[path = "dns_order.rs"]
 mod order;
@@ -551,7 +551,9 @@ type TestDatagram = dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future
 /// call [`Self::resolve`] inside an I/O/time-enabled Tokio runtime. Dropping
 /// an active exchange closes its checked-out socket and releases admission.
 /// Successful TCP exchanges reuse one connection per configured server; idle
-/// connections close after 30 seconds. Cleanup tasks hold only weak references
+/// connections close after one second. This short burst-reuse window is a
+/// deliberate deviation from RFC 7766 section 6.2.3's recommended immediate
+/// idle close: EDNS TCP keepalive is not negotiated. Cleanup tasks hold only weak references
 /// and never keep a dropped client or its sockets alive.
 /// There is no durable/node state or operator cleanup on restart or crash.
 ///

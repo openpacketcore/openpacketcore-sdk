@@ -301,7 +301,7 @@ async fn dns_tcp_idle_connection_closes_without_another_query() {
     let client = DnsClient::new(config(vec![address])).unwrap();
     client.resolve(&query(), now).await.result.unwrap();
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::advance(Duration::from_millis(1_100)).await;
     tokio::time::resume();
     tokio::time::timeout(Duration::from_secs(2), server)
         .await

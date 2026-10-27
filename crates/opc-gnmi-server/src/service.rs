@@ -5683,6 +5683,19 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_malformed_first_request_records_failure_without_success() {
+        // This assertion observes a process-global metric. Keep the complete
+        // RPC and both counter assertions in a child running only this test,
+        // so unrelated successful subscriptions cannot change its baseline.
+        const CHILD: &str = "OPC_GNMI_MALFORMED_SUBSCRIBE_METRIC_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "service::tests::subscribe_malformed_first_request_records_failure_without_success", "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .expect("isolated metric regression process");
+            assert!(status.success(), "isolated metric regression failed");
+            return;
+        }
         let service =
             authenticated_service_with_policy(allow_all_read_and_subscribe_policy()).await;
         let success_before = gnmi_rpc_request_count("Subscribe", "success");

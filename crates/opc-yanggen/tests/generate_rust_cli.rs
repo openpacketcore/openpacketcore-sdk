@@ -322,6 +322,8 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
     // All pins also include #1274 generated-lint repairs and shared statement formatting.
     // #1363 pins follow byte-verified 63440381b baselines: exact decimal64 codecs/types
     // and RFC 6243 trim semantics. All complete-file assertions remain.
+    // RFC 6241 existence-error pins were reverified at 8121730ada; only
+    // netconf_xml_edit.rs changes, with all thirteen full-file checks retained.
     let expected = [
         (
             "gnmi_json.rs",
@@ -347,7 +349,7 @@ fn system_ordered_model_keeps_all_generated_file_digests() {
         ),
         (
             "netconf_xml_edit.rs",
-            "e897a288addd4e87351cd961a4925a2e9ebc47e4fbbf4574944834771a249785",
+            "7f8b547344b487908ade4126c084d9faad862869065ff1c64b7d83db507642df",
         ),
         (
             "patch.rs",

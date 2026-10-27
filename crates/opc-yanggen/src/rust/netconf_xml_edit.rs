@@ -226,9 +226,8 @@ fn apply_children_fn(
                             match child.operation {
                                 EditOperation::Delete => {
                                     if value.#field_ident.is_absent() {
-                                        return Err(NetconfEditError::OperationNotSupported {
+                                        return Err(NetconfEditError::DataMissing {
                                             path: child.schema_path,
-                                            operation: child.operation,
                                             kind: NodeKind::Leaf,
                                         });
                                     }
@@ -241,9 +240,8 @@ fn apply_children_fn(
                                 }
                                 EditOperation::Create => {
                                     if !value.#field_ident.is_absent() {
-                                        return Err(NetconfEditError::OperationNotSupported {
+                                        return Err(NetconfEditError::DataExists {
                                             path: child.schema_path,
-                                            operation: child.operation,
                                             kind: NodeKind::Leaf,
                                         });
                                     }
@@ -264,9 +262,8 @@ fn apply_children_fn(
                             match child.operation {
                                 EditOperation::Delete => {
                                     if value.#field_ident.is_absent() {
-                                        return Err(NetconfEditError::OperationNotSupported {
+                                        return Err(NetconfEditError::DataMissing {
                                             path: child.schema_path,
-                                            operation: child.operation,
                                             kind: NodeKind::Leaf,
                                         });
                                     }
@@ -279,9 +276,8 @@ fn apply_children_fn(
                                 }
                                 EditOperation::Create => {
                                     if !value.#field_ident.is_absent() {
-                                        return Err(NetconfEditError::OperationNotSupported {
+                                        return Err(NetconfEditError::DataExists {
                                             path: child.schema_path,
-                                            operation: child.operation,
                                             kind: NodeKind::Leaf,
                                         });
                                     }
@@ -328,6 +324,12 @@ fn apply_children_fn(
                     #child_path_lit => {
                         match child.operation {
                             EditOperation::Delete => {
+                                if value.#field_ident.is_none() {
+                                    return Err(NetconfEditError::DataMissing {
+                                        path: child.schema_path,
+                                        kind: NodeKind::Container,
+                                    });
+                                }
                                 value.#field_ident = None;
                             }
                             EditOperation::Remove => {
@@ -337,9 +339,8 @@ fn apply_children_fn(
                             }
                             EditOperation::Create => {
                                 if value.#field_ident.is_some() {
-                                    return Err(NetconfEditError::OperationNotSupported {
+                                    return Err(NetconfEditError::DataExists {
                                         path: child.schema_path,
-                                        operation: child.operation,
                                         kind: NodeKind::Container,
                                     });
                                 }
@@ -638,9 +639,8 @@ fn apply_leaf_list_fn(
                     }
                     EditOperation::Create => {
                         if !current_keys.insert(key) {
-                            return Err(NetconfEditError::OperationNotSupported {
+                            return Err(NetconfEditError::DataExists {
                                 path: #path,
-                                operation,
                                 kind: NodeKind::LeafList,
                             });
                         }
@@ -648,9 +648,8 @@ fn apply_leaf_list_fn(
                     }
                     EditOperation::Delete => {
                         if !current_keys.remove(&key) {
-                            return Err(NetconfEditError::OperationNotSupported {
+                            return Err(NetconfEditError::DataMissing {
                                 path: #path,
-                                operation,
                                 kind: NodeKind::LeafList,
                             });
                         }
@@ -887,9 +886,8 @@ fn apply_list_fn(
             match node.operation {
                 EditOperation::Delete => {
                     if map.remove(&parsed_key).is_none() {
-                        return Err(NetconfEditError::OperationNotSupported {
+                        return Err(NetconfEditError::DataMissing {
                             path: node.schema_path,
-                            operation: node.operation,
                             kind: NodeKind::List,
                         });
                     }
@@ -899,9 +897,8 @@ fn apply_list_fn(
                 }
                 EditOperation::Create => {
                     if map.contains_key(&parsed_key) {
-                        return Err(NetconfEditError::OperationNotSupported {
+                        return Err(NetconfEditError::DataExists {
                             path: node.schema_path,
-                            operation: node.operation,
                             kind: NodeKind::List,
                         });
                     }

@@ -76,6 +76,12 @@ fn stale_dns_answers_expire_after_the_default_maximum_stale_timer() {
         cache.lookup(&q.cache_key(), t(1_000 + 86_400_000)).result,
         DnsCachedResult::Miss
     );
+    assert_eq!(
+        cache
+            .lookup(&q.cache_key(), t(1_000 + 86_400_000))
+            .fresh_until,
+        None
+    );
 }
 
 #[test]
@@ -500,7 +506,12 @@ fn abandoned_refresh_times_out_and_late_completion_cannot_replace_success() {
     let mut cache = DnsCache::default();
     let q = query("peer.example");
     seed(&mut cache, &q, 1);
-    let first_due = 1_000;
+    let first_due = cache
+        .lookup(&q.cache_key(), t(0))
+        .fresh_until
+        .unwrap()
+        .as_millis();
+    assert_eq!(first_due, 1_000);
     let old = start(&mut cache, &q, first_due);
     let expired_at = first_due + 1_000;
     assert!(matches!(
