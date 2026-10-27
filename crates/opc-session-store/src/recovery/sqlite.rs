@@ -1152,6 +1152,13 @@ fn inspect_current(
         SessionConsensusConfigurationId::from_bytes(configuration),
         epoch,
     );
+    consensus::validate_mandatory_roster_witness_in_sync(conn, false).map_err(|error| {
+        match error {
+            crate::consensus::storage::SessionConsensusStorageError::MissingMandatoryRosterWitness =>
+                RecoveryError::MissingMandatoryRosterWitness,
+            _ => RecoveryError::CorruptReplica,
+        }
+    })?;
     // Keep the optional snapshot descriptor alive through both the inode
     // commitment and the branch walk below.  In particular, finalization
     // supplies the installed target pin here; reopening its pathname between

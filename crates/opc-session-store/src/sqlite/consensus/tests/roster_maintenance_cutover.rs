@@ -693,6 +693,32 @@ fn roster_v2_inactive_history_allows_unrelated_write_and_resumes_after_cutover()
 }
 
 #[test]
+fn inactive_signed_history_requires_its_witness_after_authority_cutover() {
+    with_inactive_history_after_cutover(false, |conn, _backend, state| {
+        assert!(read_protected_roster_v2_activation_certificate_in_sync(
+            conn,
+            state.storage,
+            false
+        )
+        .unwrap()
+        .is_none());
+        validate_protected_roster_recovery_state_sync(conn, state.storage)
+            .expect("intact signed history recovers after its certificate is cleared");
+        assert_eq!(
+            conn.execute("DELETE FROM consensus_protected_roster_witness", [])
+                .unwrap(),
+            1
+        );
+        let error = validate_protected_roster_recovery_state_sync(conn, state.storage)
+            .expect_err("clearing the certificate never permits loss of the history witness");
+        let message = error.to_string();
+        assert!(message.contains("corrupt"), "{message}");
+        assert!(message.contains("mandatory roster witness"), "{message}");
+        assert!(message.contains("reinitialized"), "{message}");
+    });
+}
+
+#[test]
 fn roster_maintenance_profile_missing_v2_defers_during_second_pending_transition() {
     with_inactive_history_after_cutover(false, |conn, backend, mut state| {
         let before = roster_image(conn);

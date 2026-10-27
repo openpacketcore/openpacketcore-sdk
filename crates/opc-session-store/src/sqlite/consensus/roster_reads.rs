@@ -336,6 +336,13 @@ pub(crate) fn read_protected_roster_v2_recovery_sync(
     store
         .validate_live_authority(current, Some(Generation::new(1)), logical_time)
         .map_err(ProtectedRosterApplyError::store_error)?;
+    let witness = store
+        .witness(identity)
+        .map_err(ProtectedRosterApplyError::store_error)?
+        .ok_or_else(|| ProtectedRosterApplyError::MissingMandatoryWitness.store_error())?;
+    witness
+        .validate()
+        .map_err(|_| ProtectedRosterApplyError::Corrupt.store_error())?;
     let slot = protected_roster_v2_stable_slot(
         recovery.lookup().scope(),
         current.key(),
@@ -348,13 +355,6 @@ pub(crate) fn read_protected_roster_v2_recovery_sync(
         // Retirement deletes stable slots, including the last partition floor.
         // Only original fences strictly above the durable maximum can exclude
         // retirement. A later expected-fence lease can still be below it.
-        let witness = store
-            .witness(identity)
-            .map_err(ProtectedRosterApplyError::store_error)?
-            .ok_or_else(|| ProtectedRosterApplyError::Corrupt.store_error())?;
-        witness
-            .validate()
-            .map_err(|_| ProtectedRosterApplyError::Corrupt.store_error())?;
         return Ok(
             if recovery.original_admission_fence().get()
                 <= witness.highest_retired_admission_fence()
@@ -668,6 +668,11 @@ pub(crate) fn read_protected_roster_recovery_sync(
     if current.fence() <= recovery.original_admission_fence() {
         return Err(ProtectedRosterApplyError::Rejected.store_error());
     }
+    // The SQL adapter permits an absent legacy witness but refuses one
+    // missing from format five, before any lookup can assert absence.
+    store
+        .witness(identity)
+        .map_err(ProtectedRosterApplyError::store_error)?;
     let Some(binding) = store
         .original_binding_v1(
             current.key(),

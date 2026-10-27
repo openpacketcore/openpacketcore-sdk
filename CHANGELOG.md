@@ -544,6 +544,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
+- `opc-session-store`: format-five session stores now require the roster witness
+  from initialization. Stores created by earlier pre-release builds without the
+  witness are refused as corrupt and must be reinitialized. Formats up to four
+  retain their existing empty-witness recovery behavior. Refs #1307.
+
 - `opc-persist`: the retained configuration admission encoding now includes a
   permanent intent and completion witness. Crossing this format boundary
   requires a fresh installation. The Linux filesystem must support `O_TMPFILE`,

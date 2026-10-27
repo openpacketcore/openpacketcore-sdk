@@ -378,6 +378,12 @@
       "kind": "assertions-decreased",
       "reason": "Replace the obsolete stop-at-second-epoch helper contract with one maximum epoch and exact selected count per shared floor. All original same-epoch, next-epoch and other-partition rows remain, now in out-of-order epoch order; the test requires one floor action and counts every selected row. Separate real-engine tests retain the 1024-row bound and lower-survivor floor protection. Assertion count changes because the obsolete single-epoch rejection/extra-turn assertions are replaced by the multi-epoch closure assertions. No authority, corruption, retention or batch-limit assertion is relaxed.",
       "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::recovery::tests::format5_protected_roster_v2_replica_is_recoverable",
+      "kind": "fixture-setup-changed",
+      "reason": "The format-five invariant requires the roster witness from initialization. The old inactive-namespace setup omitted it; provision the same canonical initial witness as production. Every test assertion is retained. Missing-witness rejection, legacy format-four compatibility, atomic initialization and upgrade are covered separately.",
+      "issue": 1307
     }
   ]
 }

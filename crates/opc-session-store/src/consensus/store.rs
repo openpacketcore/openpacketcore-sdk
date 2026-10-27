@@ -534,6 +534,9 @@ pub enum ConsensusSessionStoreOpenError {
     /// workflow before this member may join.
     #[error("session consensus durable recovery is required")]
     RecoveryRequired,
+    /// Format five requires its roster witness even before the first admission.
+    #[error("session consensus durable state is corrupt: mandatory roster witness is missing; a store created by a pre-release build must be reinitialized")]
+    MissingMandatoryRosterWitness,
     /// The retained scope or native root format belongs to another profile. Start with
     /// fresh storage; this error does not authorize migrating or deleting it.
     #[error("session consensus scope format changed; fresh installation required")]
@@ -677,6 +680,9 @@ impl From<SessionConsensusStorageError> for ConsensusSessionStoreOpenError {
             }
             SessionConsensusStorageError::UnsupportedPlatform => {
                 Self::DynamicConsensusUnsupportedPlatform
+            }
+            SessionConsensusStorageError::MissingMandatoryRosterWitness => {
+                Self::MissingMandatoryRosterWitness
             }
             SessionConsensusStorageError::RecoveryRequired
             | SessionConsensusStorageError::CorruptState => Self::RecoveryRequired,

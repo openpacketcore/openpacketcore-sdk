@@ -326,6 +326,12 @@ check every numeric deadline, hold, mutation bound and assertion, the pre-fix
 RED, and the retained real-time qualification. Static inventory cannot prove
 that two time sources preserve a test's meaning.
 
+The informational `fixture-setup-changed` kind records a fixture correction
+required by a changed product contract. It has the same exact-test, changed-file
+and four-field requirements as `clock-source-changed`. It does not authorize any
+coverage reduction. Explain the old and new setup in `reason`, preserve the
+assertions, and retain a separate rejection test for newly invalid inputs.
+
 Use Python 3.11–3.14 on Linux and a stable worktree-local environment:
 
 ```bash

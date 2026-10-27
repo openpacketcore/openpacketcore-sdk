@@ -10,7 +10,11 @@ from .workflows import skip_findings, workflow_findings
 
 
 DECLARATIONS = 'ci/test-changes.json'
-KINDS = {'removed', 'disabled', 'assertions-decreased', 'required-ci-removed', 'clock-source-changed'}
+SEMANTIC_CHANGES = {
+    'clock-source-changed': 'declared test time-source conversion; review unchanged assertions, deadlines and real-time coverage',
+    'fixture-setup-changed': 'declared fixture setup correction; review the changed setup and preserved assertions',
+}
+KINDS = {'removed', 'disabled', 'assertions-decreased', 'required-ci-removed'} | SEMANTIC_CHANGES.keys()
 
 
 def unique_object(pairs):
@@ -57,8 +61,8 @@ def declarations(changes, offset):
             raise GuardError(f'{where}: use the exact inventory name, not a wildcard')
         if entry['kind'] not in KINDS or not isinstance(entry['reason'], str) or not entry['reason'].strip():
             raise GuardError(f'{where}: a supported kind and nonempty reason are required')
-        if entry['kind'] == 'clock-source-changed' and ('test' not in entry or set(entry) != {'test', 'kind', 'reason', 'issue'}):
-            raise GuardError(f'{where}: clock-source-changed names one test without coverage-reduction fields')
+        if entry['kind'] in SEMANTIC_CHANGES and ('test' not in entry or set(entry) != {'test', 'kind', 'reason', 'issue'}):
+            raise GuardError(f'{where}: {entry["kind"]} names one test without coverage-reduction fields')
         if type(entry['issue']) is not int or entry['issue'] < 1:
             raise GuardError(f'{where}: issue must be a positive GitHub issue number')
         if 'renamed_to' in entry and (entry['kind'] != 'removed' or not isinstance(entry['renamed_to'], str) or not entry['renamed_to']):
@@ -124,20 +128,20 @@ def analyze_files(base_files, head_files, issue_exists=None):
                 findings.append(Finding(test_id, 'assertions-decreased', old_helper.file, old_helper.line, 'assertion-bearing helper removed from this test: ' + helper, 'base'))
     findings.extend(workflow_findings(base_files, head_files))
     findings.extend(skip_findings(base_files, head_files, after))
-    # Clock conversions are explicit semantic review records, including tests
+    # Setup and clock changes are explicit semantic review records, including tests
     # introduced earlier in an unmerged change. They do not authorize a removed
     # test, a new gate, fewer assertions, or any other coverage reduction.
     for (subject, kind), entry in entries.items():
-        if kind != 'clock-source-changed':
+        if kind not in SEMANTIC_CHANGES:
             continue
         test = after.tests.get(subject)
         if test is None:
-            errors.append(f'{DECLARATIONS}: clock-source-changed test does not exist at head: {subject}')
+            errors.append(f'{DECLARATIONS}: {kind} test does not exist at head: {subject}')
         elif base_files.get(test.file) == head_files.get(test.file):
-            errors.append(f'{DECLARATIONS}: clock-source-changed test source is unchanged: {subject}')
+            errors.append(f'{DECLARATIONS}: {kind} test source is unchanged: {subject}')
         else:
             findings.append(Finding(subject, kind, test.file, test.line,
-                                    'declared test time-source conversion; review unchanged assertions, deadlines and real-time coverage'))
+                                    SEMANTIC_CHANGES[kind]))
     matches = {finding.key() for finding in findings}
     issue_results = {}
     for key, entry in entries.items():

@@ -410,6 +410,9 @@ A rename does not waive a separate assertion decrease or new gate.
 The informational `clock-source-changed` kind records a real/controlled time
 conversion without authorizing any coverage reduction. Keep the same assertions
 and numeric bounds, demonstrate the pre-fix failure, and retain a real-time check.
+Use the informational `fixture-setup-changed` kind for a setup correction
+required by a changed product contract. Keep every assertion and explain the
+invariant in the declaration; this record cannot waive coverage reductions.
 
 Local runs default to the merge base of `HEAD` and `origin/main`. An explicit
 base must be an ancestor of both, so a branch-only base cannot hide the change.

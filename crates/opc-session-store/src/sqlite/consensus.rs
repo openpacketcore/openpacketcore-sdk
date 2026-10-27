@@ -10884,6 +10884,36 @@ fn hash_operator_recovery_v2_authority_value(
     Ok(())
 }
 
+/// Format five publishes an initial witness with its namespace, even before
+/// the first admission. Its presence survives authority changes and complete
+/// history retirement. An older layout may still have no witness.
+pub(crate) fn validate_mandatory_roster_witness_in_sync(
+    conn: &Connection,
+    attached: bool,
+) -> Result<(), SessionConsensusStorageError> {
+    if persisted_schema_version_in_sync(conn, attached)
+        .map_err(|_| SessionConsensusStorageError::CorruptState)?
+        < PROTECTED_ROSTER_V2_DATABASE_FORMAT
+    {
+        return Ok(());
+    }
+    let schema = if attached {
+        "consensus_incoming"
+    } else {
+        "main"
+    };
+    let present: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {schema}.consensus_protected_roster_witness WHERE singleton=1)"),
+        [],
+        |row| row.get(0),
+    ).map_err(|_| SessionConsensusStorageError::CorruptState)?;
+    if present {
+        Ok(())
+    } else {
+        Err(SessionConsensusStorageError::MissingMandatoryRosterWitness)
+    }
+}
+
 /// Validate every persisted roster projection through the canonical decoders
 /// and domain invariants.  A prepared roster namespace is required to be
 /// empty and is therefore a valid recovery state.
@@ -10892,6 +10922,7 @@ pub(crate) fn validate_protected_roster_recovery_state_sync(
     identity: SessionConsensusIdentity,
 ) -> Result<(), SessionConsensusStorageError> {
     let layout = protected_roster_recovery_layout_sync(conn)?;
+    validate_mandatory_roster_witness_in_sync(conn, false)?;
     match layout {
         ProtectedRosterRecoveryLayout::Legacy => Ok(()),
         ProtectedRosterRecoveryLayout::Prepared | ProtectedRosterRecoveryLayout::Activated => {
@@ -11066,7 +11097,9 @@ fn activate_protected_roster_schema_sync(conn: &Connection) -> io::Result<()> {
     }
     match protected_roster_layout_in_sync(conn, false)? {
         ProtectedRosterLayout::Activated => {
-            initialize_protected_roster_witness_sync(conn, identity, false)
+            let legacy_empty_witness = persisted_schema_version_in_sync(conn, false)?
+                < PROTECTED_ROSTER_V2_DATABASE_FORMAT;
+            initialize_protected_roster_witness_sync(conn, identity, legacy_empty_witness)
         }
         ProtectedRosterLayout::Legacy => {
             Err(invalid_data("protected roster schema is not prepared"))
@@ -11105,7 +11138,10 @@ fn initialize_protected_roster_witness_sync(
             protected_roster_write_witness_sync(conn, identity, GlobalChargeWitness::empty())
                 .map_err(|_| invalid_data("protected roster initial witness is unavailable"))
         }
-        None => Err(invalid_data("protected roster witness is missing")),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            SessionConsensusStorageError::MissingMandatoryRosterWitness,
+        )),
     }
 }
 
@@ -11118,6 +11154,7 @@ fn initialize_protected_roster_witness_sync(
 pub(crate) enum ProtectedRosterApplyError {
     Rejected,
     Corrupt,
+    MissingMandatoryWitness,
 }
 
 impl ProtectedRosterApplyError {
@@ -11125,6 +11162,9 @@ impl ProtectedRosterApplyError {
         match self {
             Self::Rejected => StoreError::InvalidKey("protected roster rejected".into()),
             Self::Corrupt => StoreError::BackendUnavailable("protected roster unavailable".into()),
+            Self::MissingMandatoryWitness => StoreError::BackendUnavailable(
+                SessionConsensusStorageError::MissingMandatoryRosterWitness.to_string(),
+            ),
         }
     }
 }
@@ -11152,7 +11192,8 @@ impl ProtectedRosterCommandApplyError {
             ProtectedRosterApplyError::Rejected => {
                 Self::Rejected(ConsensusRosterRejection::Authority)
             }
-            ProtectedRosterApplyError::Corrupt => Self::Fatal,
+            ProtectedRosterApplyError::Corrupt
+            | ProtectedRosterApplyError::MissingMandatoryWitness => Self::Fatal,
         }
     }
 
@@ -11165,7 +11206,8 @@ impl ProtectedRosterCommandApplyError {
             ProtectedRosterApplyError::Rejected => {
                 Self::Rejected(ConsensusRosterRejection::TerminalConflict)
             }
-            ProtectedRosterApplyError::Corrupt => Self::Fatal,
+            ProtectedRosterApplyError::Corrupt
+            | ProtectedRosterApplyError::MissingMandatoryWitness => Self::Fatal,
         }
     }
 }
@@ -12027,14 +12069,8 @@ fn validate_protected_roster_state_sync(
         return Err(ProtectedRosterApplyError::Corrupt);
     }
     let witness = protected_roster_read_witness_sync(conn, identity)?;
-    if witness.is_none()
-        && (v2_present
-            || protected_roster_layout_in_sync(conn, attached)
-                .map_err(|_| ProtectedRosterApplyError::Corrupt)?
-                == ProtectedRosterLayout::Activated)
-    {
-        return Err(ProtectedRosterApplyError::Corrupt);
-    }
+    validate_mandatory_roster_witness_in_sync(conn, attached)
+        .map_err(|_| ProtectedRosterApplyError::Corrupt)?;
     let accounting_witness = witness.unwrap_or_else(GlobalChargeWitness::empty);
     let mut validator =
         ProductionSnapshotStreamValidator::new(application_sequence, applied_raft_log_index);
@@ -14747,6 +14783,12 @@ impl roster_engine::RosterCommandStore for &Connection {
         &self,
         identity: SessionConsensusIdentity,
     ) -> Result<Option<GlobalChargeWitness>, ProtectedRosterApplyError> {
+        validate_mandatory_roster_witness_in_sync(self, false).map_err(|error| match error {
+            SessionConsensusStorageError::MissingMandatoryRosterWitness => {
+                ProtectedRosterApplyError::MissingMandatoryWitness
+            }
+            _ => ProtectedRosterApplyError::Corrupt,
+        })?;
         protected_roster_read_witness_sync(self, identity)
     }
     fn vacancy(
@@ -16691,6 +16733,7 @@ fn validate_existing_schema_with_roster_requirement(
     if require_protected_roster {
         protected_roster_layout_in_sync(conn, false)
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
+        validate_mandatory_roster_witness_in_sync(conn, false)?;
         validate_protected_roster_state_sync(conn, storage_identity)
             .map_err(|_| SessionConsensusStorageError::CorruptState)?;
     }
@@ -17348,8 +17391,10 @@ fn activate_protected_roster_profile_v2_scope_sync(
     // certificate and cannot use this Prepared namespace.
     ensure_protected_roster_schema_sync(conn)?;
     let previous_layout = protected_roster_v2_layout_in_sync(conn, false)?;
-    let fresh = previous_layout == ProtectedRosterV2Layout::Absent
-        && protected_roster_layout_in_sync(conn, false)? == ProtectedRosterLayout::Prepared;
+    // The format transition and its initial witness share the caller's
+    // apply/export transaction. Format four may legitimately have no witness;
+    // an already-published format five must never recreate a missing one.
+    let fresh = previous_layout == ProtectedRosterV2Layout::Absent;
     if previous_layout == ProtectedRosterV2Layout::Absent {
         conn.execute_batch(PROTECTED_ROSTER_V2_SCHEMA)
             .map_err(db_error)?;
@@ -41423,6 +41468,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod descriptor_locks;
     mod lease_deferral;
+    mod mandatory_witness;
     mod retired_admission;
     mod roster_maintenance_cutover;
     #[path = "scope_authority.rs"]
@@ -55649,6 +55695,132 @@ mod tests {
             )
             .is_ok(),
             "a V2 tombstone may be omitted only after the incoming shared closure covers it",
+        );
+    }
+
+    #[test]
+    fn protected_roster_missing_retired_witness_must_not_authorize_verified_absence() {
+        let directory = tempfile::tempdir().expect("retired recovery directory");
+        let path = directory.path().join("retired-recovery.sqlite");
+        let fixture = crate::consensus::types::roster_v2_persistence_fixture();
+        let identity = initialize_protected_roster_v2_recovery_fixture(
+            &path,
+            ProtectedRosterV2RecoveryFixtureState::Established,
+        )
+        .expect("materialize complete production recovery state")
+        .identity;
+        let now = v2_persistence_logical_time();
+        let due = now.add_seconds(24 * 60 * 60).expect("retention boundary");
+        {
+            let backend = SqliteSessionBackend::open(&path).expect("open retained ledger");
+            let conn = backend.conn.blocking_lock();
+            reclaim_protected_rosters_sync(&conn, identity, due).unwrap();
+            assert!(retire_protected_rosters_sync(&conn, identity).unwrap());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM consensus_protected_roster_floors",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "retiring the last row releases its partition floor"
+            );
+        }
+        let backend = SqliteSessionBackend::open(&path).expect("reopen retired ledger");
+        let conn = backend.conn.blocking_lock();
+        assert!(
+            protected_roster_read_witness_sync(&conn, identity)
+                .unwrap()
+                .unwrap()
+                .retired_terminal_sequence()
+                > 0,
+            "the global retirement witness survives the empty partition and reopen"
+        );
+        // Install a current successor through the ordinary lease allocator.
+        ops::insert_or_replace_fence_sync(
+            &conn,
+            fixture.authority.key(),
+            fixture.authority.fence().get(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE lease_globals SET val=?1 WHERE key='next_credential_id'",
+            [checked_positive_i64(fixture.authority.credential_id() + 1).unwrap()],
+        )
+        .unwrap();
+        let guard = crate::sqlite::lease::acquire_sync(
+            &conn,
+            fixture.authority.key(),
+            OwnerId::new("retired-recovery-successor").unwrap(),
+            Duration::from_secs(60),
+            due,
+        )
+        .expect("acquire successor after original guard expiry");
+        let successor = AuthorityBinding::from_consensus_parts(
+            fixture.authority.scope().digest(),
+            guard.key().clone(),
+            guard.owner().clone(),
+            guard.fence(),
+            AuthorityLeaseMetadata::new(
+                guard.credential_id(),
+                Generation::new(1),
+                guard.acquired_at(),
+                guard.expires_at(),
+            ),
+        )
+        .unwrap();
+        let recovery = RecoveryRequest::new(
+            crate::fenced_mutation_roster_executor::RecoveryRequestInput::new(
+                crate::fenced_mutation_roster_executor::RecoveryLookup::new(
+                    fixture.admission.scope(),
+                    fixture.admission.roster_id(),
+                ),
+                fixture.authority.owner().clone(),
+                fixture.authority.fence(),
+                successor,
+            ),
+        )
+        .and_then(|request| request.bind_original_key(fixture.authority.key().clone()))
+        .unwrap();
+        let read = read_protected_roster_v2_recovery_sync(&conn, identity, &recovery, due)
+            .expect("verified successor can read the retired namespace");
+        assert!(
+            !matches!(read, ProtectedRosterV2ReadResult::Missing),
+            "a retired committed admission must never be reported as verified missing"
+        );
+        assert!(matches!(
+            read,
+            ProtectedRosterV2ReadResult::HistoryUnavailable
+        ));
+        assert!(
+            read_protected_roster_v2_recovery_sync(
+                &conn,
+                identity,
+                &recovery,
+                due.add_seconds(61).unwrap(),
+            )
+            .is_err(),
+            "expired authority is refused before history classification"
+        );
+        validate_protected_roster_state_sync(&conn, identity)
+            .expect("the complete retired namespace validates before witness loss");
+        assert_eq!(
+            conn.execute("DELETE FROM consensus_protected_roster_witness", [])
+                .unwrap(),
+            1
+        );
+        let validation = validate_protected_roster_state_sync(&conn, identity);
+        let recovered = read_protected_roster_v2_recovery_sync(&conn, identity, &recovery, due);
+        eprintln!("missing retired witness corruption probe: validation_accepted={}, recovery_missing={}, recovery_rejected={}",
+            validation.is_ok(), matches!(recovered, Ok(ProtectedRosterV2ReadResult::Missing)), recovered.is_err());
+        assert!(
+            validation.is_err(),
+            "loss of a retired namespace's only witness must not pass recovery validation"
+        );
+        assert!(
+            recovered.is_err(),
+            "loss of a retired namespace's witness must not authorize verified absence"
         );
     }
 
