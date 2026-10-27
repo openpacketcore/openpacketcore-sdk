@@ -618,7 +618,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel",
       "kind": "assertions-decreased",
-      "reason": "Restore main’s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
+      "reason": "Restore main\u2019s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
       "issue": 1018,
       "replacements": [
         "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::rate_budget_retention_preserves_lifetime_bound_across_limit_replacement"
@@ -948,6 +948,13 @@
       "kind": "assertions-decreased",
       "reason": "Extract the body into prepared_cas_binding_reply_loss_case in crates/opc-session-net/tests/stateless_quorum_consumer.rs, moving the fleet through the controlled-clock closure. All original assertions and calls to application_sequences, quiesce, voter_authority, wait_for_observed_leader and withhold_next_forward_mutation_reply remain; their helper bodies are unchanged. Static receiver resolution loses their eight setup/cleanup expectations after fleet is rebound, while two clock assertions are added (116 -> 110). Cargo disables automatic integration targets and includes this file in the library; its actual lib=lib target also resolves the shared clock helper and grows 116 -> 117. No runtime coverage is removed.",
       "issue": 1147
+    },
+    {
+      "test": "rust:crates/opc-proto-pfcp::lib=lib::ie::tests::test_ue_ip_address_v4_prefix_spec_bytes",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-pfcp::lib=lib::ie::tests::test_ue_ip_address_v6_delegation_spec_bytes",
+      "reason": "Correct the golden vector for TS 29.244 section 8.2.62: the IE defines IPv6 prefix delegation, not an IPv4 prefix-length field. Retain the flag, prefix-field and round-trip assertions using the normative IPv6 layout; independent IPv4, IPv6, dual-stack and allocation vectors are added separately.",
+      "issue": 1513
     }
   ]
 }

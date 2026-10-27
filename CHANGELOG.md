@@ -512,6 +512,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The public error stays `Unavailable`, and no failure class restores dispatch
   authority. Refs #1378.
 
+- `opc-proto-pfcp`: align Cause codes, UE IP Address flags and IPv6 prefix
+  fields, and F-TEID CHOOSE encoding with TS 29.244. Reject inconsistent
+  address flags and encoder fields while preserving the required tolerance
+  for unknown trailing extension octets. (#1512, #1513, #1514)
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a
@@ -775,6 +780,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clause instead of `8.2`, or `7.5` for an unknown comprehension-required
   identifier. `PlainMm::decode_body` and `decode_mm_message_body` can now return
   an error for Configuration Update Command/Complete bodies.
+
+- `opc-proto-pfcp`: correct the `UeIpAddress` wire model. Remove `ipv4d`,
+  `ipv4_prefix_length`, and `ch` from struct literals; use `ipv6d` with
+  `ipv6_prefix_delegation_bits` for delegation and `ip6pl` with
+  `ipv6_prefix_length` for an explicit IPv6 prefix length. `CauseValue` adds
+  named acceptance and rejection variants; exhaustive matches must handle
+  them. See the crate's conformance migration notes. (#1512, #1513)
 
 ### Added
 
