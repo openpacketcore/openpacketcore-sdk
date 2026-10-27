@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "addchain"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5665045de74fda906c0abfaec40cf2551f88c34dccea869f3fe950dde7209764"
+dependencies = [
+ "num-bigint 0.4.6",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -631,6 +642,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ccm"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0be9b34d99d395af800e996c5784f810f8400ccd64202f91859dc677825b5378"
+dependencies = [
+ "aead 0.6.0",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ctutils",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -676,6 +699,19 @@ dependencies = [
  "chacha20 0.9.1",
  "cipher 0.4.4",
  "poly1305 0.8.0",
+ "zeroize",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
+dependencies = [
+ "aead 0.6.0",
+ "chacha20 0.10.2",
+ "cipher 0.5.2",
+ "poly1305 0.9.0",
  "zeroize",
 ]
 
@@ -1115,9 +1151,9 @@ dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
  "arrayvec",
- "ccm",
+ "ccm 0.5.0",
  "chacha20 0.9.1",
- "chacha20poly1305",
+ "chacha20poly1305 0.10.1",
  "der 0.7.10",
  "ecdsa 0.16.9",
  "generic-array 0.14.7",
@@ -1215,6 +1251,27 @@ dependencies = [
  "rand_core 0.10.1",
  "serde",
  "sha2 0.11.0",
+ "signature 3.0.0",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "ed448-goldilocks-plus"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ade2f948c0176fd311668a767449034786d2d0db2c247ca4c99c6471f53370dd"
+dependencies = [
+ "crypto-bigint 0.7.10",
+ "elliptic-curve 0.14.1",
+ "ff 0.14.0",
+ "group 0.14.0",
+ "hash2curve",
+ "pkcs8 0.11.0",
+ "rand_core 0.10.1",
+ "serdect",
+ "sha3 0.12.0",
+ "shake",
  "signature 3.0.0",
  "subtle",
  "zeroize",
@@ -1363,8 +1420,25 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1f686ab92a9fb0eaf188f6c6c87b89490baa6fdb0db4544ba4dc47f7942489f"
 dependencies = [
+ "bitvec",
+ "ff_derive",
  "rand_core 0.10.1",
  "subtle",
+]
+
+[[package]]
+name = "ff_derive"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "241afe8c15ffa21933eaefe8a563af36fd9fc98a3e8a044e8f7db52eb1fae3d8"
+dependencies = [
+ "addchain",
+ "num-bigint 0.4.6",
+ "num-integer",
+ "num-traits",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1646,6 +1720,16 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "hash2curve"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1eaf40612d7d854743e7189228a6d528f0f6e8502cf6a0cb831d28a218b7f3f6"
+dependencies = [
+ "digest 0.11.3",
+ "elliptic-curve 0.14.1",
 ]
 
 [[package]]
@@ -3481,7 +3565,11 @@ dependencies = [
  "async-trait",
  "bytes",
  "cbc",
+ "ccm 0.6.1",
+ "chacha20poly1305 0.11.0",
  "crypto-bigint 0.7.10",
+ "ed25519-dalek",
+ "ed448-goldilocks-plus",
  "hmac 0.13.0",
  "opc-crypto",
  "opc-crypto-provider",
@@ -5535,6 +5623,17 @@ name = "sha3"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
+dependencies = [
+ "digest 0.11.3",
+ "keccak",
+ "sponge-cursor",
+]
+
+[[package]]
+name = "shake"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
 dependencies = [
  "digest 0.11.3",
  "keccak",

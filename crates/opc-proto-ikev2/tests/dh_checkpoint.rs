@@ -6,10 +6,14 @@ use opc_crypto_provider::{
 };
 use opc_proto_ikev2::{Ikev2SoftwareCryptoModule, Ikev2SoftwareCryptoOperations};
 
-const GROUPS: [Group; 6] = [
+const GROUPS: [Group; 10] = [
     Group::Modp768,
     Group::Modp1024,
     Group::Modp2048,
+    Group::Modp3072,
+    Group::Modp4096,
+    Group::Modp6144,
+    Group::Modp8192,
     Group::Ecp256,
     Group::Ecp384,
     Group::Ecp521,

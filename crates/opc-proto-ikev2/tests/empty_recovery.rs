@@ -1544,13 +1544,18 @@ fn volatile_empty_probe_public_api_retransmits_completes_and_never_writes() {
                 encryption,
                 direction,
             );
-            let allocation = f
-                .allocator
-                .allocate(Purpose::Ordinary)
-                .expect("committed probe IV block");
+            let prepared = f.window.prepare_liveness(4).unwrap();
+            let row = prepared.record().clone();
+            let _commit = prepared.commit_after_durable(&row).unwrap();
             let request = f
                 .window
-                .send_empty_request(f.profile, &f.keys, allocation)
+                .start_empty_probe(
+                    f.profile,
+                    &f.keys,
+                    &mut f.allocator,
+                    opc_proto_ikev2::recovery::Ikev2LivenessProbePolicy::new(1_000, 4, 10).unwrap(),
+                    100,
+                )
                 .unwrap();
             let id = request.message_id();
             let bytes = request.bytes().to_vec();
@@ -1558,8 +1563,8 @@ fn volatile_empty_probe_public_api_retransmits_completes_and_never_writes() {
 
             let durable_before = f.window.record().clone();
             assert_eq!(
-                f.window.retransmit_empty_request().unwrap(),
-                Some(bytes.as_slice())
+                f.window.retry_empty_probe(110).unwrap().bytes(),
+                bytes.as_slice()
             );
             assert_eq!(f.window.record(), &durable_before);
 
@@ -1572,8 +1577,7 @@ fn volatile_empty_probe_public_api_retransmits_completes_and_never_writes() {
                 0x4000,
             );
             let opened = f.window.open_peer(f.profile, &f.keys, &response).unwrap();
-            let completion = f.window.complete_empty_request(&opened).unwrap();
-            assert_eq!(completion.message_id(), id);
+            f.window.complete_empty_probe(&opened, 111).unwrap();
             assert_eq!(f.window.pending_empty_request_message_id(), None);
             assert_eq!(f.window.record(), &durable_before);
         }

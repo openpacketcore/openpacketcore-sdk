@@ -9,9 +9,10 @@ use super::{
 use bytes::Bytes;
 use opc_proto_ikev2::{
     recovery::{
-        Ikev2CommittedExchangeRecord as Exchange, Ikev2ReservationRetryPolicy as RetryPolicy,
-        Ikev2SyncClock as Clock, Ikev2SyncDisposition as Disposition,
-        Ikev2SyncRecoveryPolicy as Policy, Ikev2SyncRecoveryStatus as Status,
+        Ikev2CommittedExchangeRecord as Exchange, Ikev2LivenessRecord as LivenessRecord,
+        Ikev2ReservationRetryPolicy as RetryPolicy, Ikev2SyncClock as Clock,
+        Ikev2SyncDisposition as Disposition, Ikev2SyncRecoveryPolicy as Policy,
+        Ikev2SyncRecoveryStatus as Status,
     },
     Ikev2AesGcmIvLimits as Limits, Ikev2DhGroup as Group, Ikev2MessageIdSync as Notify,
     Ikev2MessageIdSyncAgreement as Agreement, Ikev2MessageIdSyncMode as Mode,
@@ -188,7 +189,7 @@ impl<'a> Fields<'a> {
             return Err(Error::Format);
         }
         let mut r = Reader::new(bytes);
-        if r.take(4)? != b"IKER" || r.u16()? != 1 {
+        if r.take(4)? != b"IKER" || r.u16()? != 2 {
             return Err(Error::Format);
         }
         let mut fields = BTreeMap::new();
@@ -261,7 +262,7 @@ impl ProfileCodec {
         }
         let mut out = Writer::new();
         out.raw(b"IKER");
-        out.u16(1);
+        out.u16(2);
         out.field(1, |w| {
             w.u64(row.key.0);
             w.u64(row.version.birth);
@@ -310,6 +311,11 @@ impl ProfileCodec {
             w.u64(image.generation);
             w.opt32(image.next_send);
             w.opt32(image.next_receive);
+            w.boolean(image.liveness.is_some());
+            if let Some(state) = &image.liveness {
+                w.u32(state.max_unwritten());
+                w.opt_bytes(state.last_probe());
+            }
             exchange(w, image.outbound.as_ref());
             exchange(w, image.inbound.as_ref());
         })?;
@@ -551,6 +557,17 @@ impl ProfileCodec {
             generation: r.u64()?,
             next_send: r.opt32()?,
             next_receive: r.opt32()?,
+            liveness: if r.boolean()? {
+                Some(
+                    LivenessRecord::from_persisted(
+                        r.u32()?,
+                        r.opt_bytes()?.map(Bytes::copy_from_slice),
+                    )
+                    .map_err(|_| Error::Format)?,
+                )
+            } else {
+                None
+            },
             outbound: read_exchange(&mut r)?,
             inbound: read_exchange(&mut r)?,
             sync: None,
@@ -797,7 +814,7 @@ impl ProfileCodec {
         let fields = Fields::parse(encoded).unwrap();
         let mut out = Writer::new();
         out.raw(b"IKER");
-        out.u16(1);
+        out.u16(2);
         for (tag, value) in fields.0 {
             if tag != omitted {
                 out.u8(tag);

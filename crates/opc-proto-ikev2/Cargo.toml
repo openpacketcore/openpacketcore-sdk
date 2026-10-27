@@ -28,6 +28,10 @@ aes = { workspace = true }
 aes-gcm = { workspace = true }
 bytes = { workspace = true }
 cbc = { workspace = true }
+ccm = { version = "0.6.1", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["alloc", "fast", "zeroize", "pkcs8"] }
+ed448-goldilocks-plus = { version = "0.18.1", default-features = false, features = ["std", "signing", "pkcs8"] }
 crypto-bigint = { version = "0.7.10", features = ["getrandom", "zeroize"] }
 opc-crypto-provider = { path = "../opc-crypto-provider", version = "0.2.0" }
 opc-proto-eap = { path = "../opc-proto-eap", version = "0.2.0" }

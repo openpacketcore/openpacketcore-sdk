@@ -62,23 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policy. Ordinary scoped installs also wait on an overlapping outbound SA
   selection identity. Refs #1239.
 
-- `opc-proto-ikev2`: the executable IKE_SA_INIT/IKE_AUTH transform surface now
-  covers RFC 3526 MODP groups 15-18 (Transform IDs 15/16/17/18, 3072/4096/6144/
-  8192-bit) with exact 384/512/768/1024-octet public-value and shared-secret
-  widths; RFC 4754 ECDSA AUTH methods 9/10/11 (P-256/SHA-256, P-384/SHA-384,
-  P-521/SHA-512) including RFC 4754 fixed-width r || s AUTH framing and P-521 signing/
-  verification; RFC 7427 method-14 RSASSA-PSS signature identifiers
-  (SHA-256/384/512, MGF1 with the same hash, salt = digest length) with
-  verification always available and PSS signing compiled only behind the
-  existing `rsa-signing` feature; and RFC 4434 PRF_AES128_XCBC (Transform ID
-  4) with RFC 3566/4434 known-answer vectors. Existing transform ordering,
-  selection and validation for pre-existing values are unchanged; new groups
-  and PRF remain caller-selected proposal alternatives. All new algorithms are
-  wired through the #334 admitted-module capability advertisement/preflight and
-  fail closed when a configured module cannot execute them. ChaCha20-Poly1305,
-  AES-CCM_8 and Ed25519/Ed448 remain deliberately excluded pending dependency
-  and security-owner approval (see the #1352 follow-up scope); they are not
-  advertised. Refs #1352.
+- `opc-proto-ikev2`: support RFC 3526 MODP groups 15–18 with exact-width
+  public/shared values and sealed private checkpoints; RFC 4434 AES-XCBC PRF
+  with the RFC 7296 initial SKEYSEED nonce rule; RFC 5282 AES-CCM-8; RFC 7634
+  ChaCha20-Poly1305; RFC 4754 fixed-width ECDSA AUTH methods 9–11; and RFC 7427
+  RSA-PSS plus RFC 8420 pure Ed25519/Ed448 signatures. RSA-PSS parameters are
+  parsed structurally and local self-verification can bind the actual signing
+  scheme. RSA/PSS verification is always available; signing retains its existing
+  `rsa-signing` feature. Newly executable groups participate in existing proposal
+  ordering, which prefers other admitted groups over group 1 without imposing a
+  strength ranking among the remaining groups. Every algorithm uses admitted
+  provider capability checks. Refs #1352, #1345.
 - `opc-gtpu-dataplane`: `LinuxGtpuDataplaneBackend` now opens an
   attachment-bound control port over the userspace UDP/2152 socket retained by
   an ordinary creation. The Linux `gtp` driver passes non-G-PDUs and G-PDUs
@@ -212,23 +206,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TftUplinkDropReason::CapacityExhausted` is additive in its non-exhaustive
   enum. Colliding PAAs share one group's bound. Refs #1087.
 
-- `opc-proto-ikev2`: the recovery profile can send the RFC 7296 §2.4 empty
-  `INFORMATIONAL` liveness probe that it could previously only answer. New
-  `Ikev2CommittedWindow` APIs (`send_empty_request`,
-  `retransmit_empty_request`, `complete_empty_request`,
-  `abandon_empty_request`, plus the `pending_empty_request_message_id` and
-  `next_send_message_id` query accessors) seal one empty request at the volatile
-  next send ID without a store command, retransmit its exact bytes with the same
-  Message ID and IV, correlate a matching authenticated empty response, and
-  refuse ordinary preparation or sync initiation while it is outstanding. The
-  caller owns the complete liveness decision, including authenticated ESP
-  traffic under the IKE SA (NAT keepalives never count), and the retransmission
-  budget. The probe's send-ID advance is volatile: the next committed operation
-  persists it, and a crash before that commit loses it as a bounded lead
-  (RFC 6311 §5.1) that the consumer must synchronize before relying on the
-  peer's receive expectation. GCM sealing requires an allocation from an
-  already committed reservation block; CBC uses its admitted random IV.
-  Refs #1241.
+- `opc-proto-ikev2`: bounded empty INFORMATIONAL liveness probes require a
+  durably acknowledged unwritten-ID limit, then send and complete without a
+  window write. Exact retransmissions use exponential backoff under a fixed
+  deadline; expiry or clock failure requires scoped SA cleanup. The next commit
+  retains the live send floor and authenticated last-probe evidence, including
+  sync IV and request history. Restart requires synchronization beyond the full
+  unwritten bound or automatic SA retirement. Opposite-direction peer work stays
+  admissible, and peer sync fences probes without inventing an uncertain
+  application outcome. Idleness includes authenticated IKE and Child-SA ESP
+  traffic, excluding NAT keepalives. Refs #1241.
 - `opc-gtpu-dataplane`: `GtpuDownlinkCounters::inner_fragment_capacity_exhausted`
   and `packet_too_big_capacity_exhausted`, plus the typed reasons
   `GtpuDownlinkDrop::InnerFragmentCapacityExhausted` and
@@ -542,6 +529,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Refs #1187.
 
 ### Breaking
+
+- `opc-proto-ikev2`: added variants to the exhaustive DH, PRF, encryption,
+  signature-method, signature-public-key and key-error enums require downstream matches to
+  be updated.
+  Persist explicit liveness metadata with every atomic window row; missing or
+  unknown format fields must be rejected. Crossing this stored-record change
+  requires a fresh install. Refs #1241, #1352.
 
 - `opc-gtpu-dataplane`: the pinned family-tagged grouped-session ABI advances
   to schema marker `OPC-GROUP-IP-v7`. Family-tagged entries gain the versioned

@@ -116,3 +116,6 @@ mod contact_tests;
 
 #[path = "recovery_profile/terminal_process.rs"]
 mod terminal_process;
+
+#[path = "recovery_profile/liveness_tests.rs"]
+mod liveness_tests;
