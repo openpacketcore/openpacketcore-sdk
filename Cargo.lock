@@ -2851,6 +2851,7 @@ dependencies = [
  "opc-session-store",
  "opc-session-testkit",
  "opc-tls",
+ "opc-tokio-fd-sys",
  "opc-types",
  "rand 0.10.3",
  "rcgen",

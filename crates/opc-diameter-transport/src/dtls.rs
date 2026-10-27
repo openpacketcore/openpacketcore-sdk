@@ -5059,7 +5059,11 @@ mod review_policy_tests {
         vector(&mut hello, 1); // cookie
         let suites = vector(&mut hello, 2);
         assert_eq!(suites.len(), 6);
-        assert!(!suites.chunks_exact(2).any(|suite| suite == [0, 0x9e]));
+        assert!(!suites
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|suite| *suite == [0, 0x9e]));
         vector(&mut hello, 1); // compression methods
         let mut extensions = vector(&mut hello, 2);
         assert!(hello.is_empty());
@@ -5074,8 +5078,10 @@ mod review_policy_tests {
                 assert_eq!(groups.len() % 2, 0);
                 offered_groups = Some(
                     groups
-                        .chunks_exact(2)
-                        .map(|group| u16::from_be_bytes([group[0], group[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|group| u16::from_be_bytes(*group))
                         .collect::<Vec<_>>(),
                 );
             }

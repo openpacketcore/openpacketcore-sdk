@@ -232,6 +232,17 @@ crate.
 
 ## Explicit limits
 
+Each candidate receives a monotonic `PeerSessionGeneration`, and the SDK
+exposes the simultaneous-open decision, but the consumer still owns candidate
+orchestration, listener/reconnect policy, backoff, realm routing, peer
+topology, base `Twinit` selection, initial watchdog scheduling, identifier
+allocation, and all application state machines.
+
+The SDK does not configure or attest an external IPsec deployment. A consumer
+may select `CompatibilityUnprotected` only after applying its own separate
+IPsec policy and evidence; the SDK still reports that association as
+unprotected and it never satisfies protected-transport readiness.
+
 `DiameterTlsPolicy::tls12_compatibility(frame_limits)` permits TLS 1.3 and TLS
 1.2; also enable `TlsConfigBuilder::with_compat_mode(true)` on the supplied
 authenticated config. TLS 1.3 remains preferred. TLS 1.2 permits ECDHE-ECDSA
@@ -257,12 +268,6 @@ TCP RST required by RFC 6733 section 2.1. The concurrent runtime sends on
 ordered stream zero and does not expose inbound stream metadata. Initial
 unordered application delivery overtaking Finished remains a qualification gap.
 
-Each candidate receives a monotonic `PeerSessionGeneration`, and the SDK
-exposes the simultaneous-open decision, but the consumer still owns candidate
-orchestration, listener/reconnect policy, backoff, realm routing, peer
-topology, base `Twinit` selection, initial watchdog scheduling, identifier
-allocation, and all application state machines.
-
 Application-owned SWm overload, DRMP and redirect AVPs are delivered through
 the typed protocol/correlation boundary. The peer runtime does not advertise
 DOIC capabilities, maintain overload reports, schedule by DRMP, or own a
@@ -270,11 +275,6 @@ redirect routing cache. Its control/application queue separation protects base
 peer procedures; it is not an implementation of those application policies.
 Consumers that advertise DOIC must implement the corresponding abatement and
 expiry behavior before submitting affected traffic.
-
-The SDK does not configure or attest an external IPsec deployment. A consumer
-may select `CompatibilityUnprotected` only after applying its own separate
-IPsec policy and evidence; the SDK still reports that association as
-unprotected and it never satisfies protected-transport readiness.
 
 The RFC 6083 profile deliberately rejects DTLS 1.3. RFC 6083's key transition
 is defined around the DTLS 1.2 Finished boundary; this SDK does not substitute

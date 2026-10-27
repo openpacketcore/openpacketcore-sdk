@@ -71,6 +71,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 nix = { workspace = true, features = ["net", "sched", "socket", "uio"] }
 # `AsyncFd` for the readiness-source integration test.
 tokio = { workspace = true, features = ["net"] }
+opc-tokio-fd-sys = { path = "../opc-tokio-fd-sys", version = "0.2.0" }
 opc-ipsec-xfrm = { path = "../opc-ipsec-xfrm", version = "0.2.0", features = ["scope-store"] }
 
 [lints]
