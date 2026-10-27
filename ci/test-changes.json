@@ -974,6 +974,54 @@
       "kind": "assertions-decreased",
       "reason": "Replace the obsolete stop-at-second-epoch helper contract with one maximum epoch and exact selected count per shared floor. All original same-epoch, next-epoch and other-partition rows remain, now in out-of-order epoch order; the test requires one floor action and counts every selected row. Separate real-engine tests retain the 1024-row bound and lower-survivor floor protection. Assertion count changes because the obsolete single-epoch rejection/extra-turn assertions are replaced by the multi-epoch closure assertions. No authority, corruption, retention or batch-limit assertion is relaxed.",
       "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::storage::scan_dynamic_snapshot_envelope",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::cancelled_dynamic_current_snapshot_scan_retains_worker_ownership",
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::cancelled_dynamic_snapshot_admission_retains_descriptor_work_ownership",
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::cancelled_dynamic_snapshot_admission_retains_ownership_after_runtime_shutdown",
+        "rust:crates/opc-session-store::lib=lib::consensus::storage::tests::snapshot_is_file_backed_checksummed_and_installs_atomically"
+      ],
+      "reason": "The inventory misclassifies cfg_attr(not(test), allow(unused_variables)) on this production helper as a test. Issue #1371 consolidates the duplicate Dynamic envelope scan into verify_snapshot_envelope_sync on the fully owned admission worker. Footer, size, length and checksum checks and the scan hooks remain. The named tests retain the existing scan/checksum coverage and add descriptor-work and runtime-cancellation ownership coverage; no libtest test is removed.",
+      "issue": 1371
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::failed_local_snapshot_build_is_retried_and_the_engine_keeps_serving",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::failed_local_snapshot_build_stops_the_engine_without_retry"
+      ],
+      "reason": "Restore the fail-stop contract while #1254/#1243 are deferred until the #1249 retained-log admission foundation exists and is qualified. This test is renamed and its original fault scenario is retained, not deleted or ignored. A single staging failure now reaches Openraft on the first attempt and stops the engine; later proposals and triggers are refused, both staged children are reclaimed, and the existing snapshot bytes/frontier remain unchanged.",
+      "issue": 1254
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::every_local_snapshot_build_failure_degrades_without_stopping_the_engine",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::persistent_local_snapshot_build_failure_stops_without_degradation"
+      ],
+      "reason": "Restore the fail-stop contract while #1254/#1243 are deferred until the #1249 retained-log admission foundation exists and is qualified. This test is renamed and its original fault scenario is retained, not deleted or ignored. Persistent staging failures now stop on the first attempt without falling back to a previous snapshot or advancing snapshot/purge positions; later local work is refused and staged children are reclaimed. Retry/backoff and continued-serving assertions described deferred recovery, not the restored contract.",
+      "issue": 1254
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::mid_build_indeterminate_publication_stops_the_engine_fatally",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::mid_build_indeterminate_publication_stops_without_retry"
+      ],
+      "reason": "Restore the fail-stop contract while #1254/#1243 are deferred until the #1249 retained-log admission foundation exists and is qualified. This test is renamed and its original fault scenario is retained, not deleted or ignored. Keep fatal indeterminate-publication coverage at the real sealed-candidate publication boundary. Replace removed retry-diagnostic API assertions with exact storage error class/subject/verb, one consumed fault, unchanged snapshot/purge positions, preserved predecessor bytes, retained candidate ownership and refusal of later local work.",
+      "issue": 1254
+    },
+    {
+      "test": "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::build_failure_with_no_published_snapshot_stops_the_engine_fatally",
+      "kind": "removed",
+      "replacements": [
+        "rust:crates/opc-session-store::test=fixed_quorum_authority::snapshot_build_failure::first_local_snapshot_build_failure_stops_without_retry"
+      ],
+      "reason": "Restore the fail-stop contract while #1254/#1243 are deferred until the #1249 retained-log admission foundation exists and is qualified. This test is renamed and its original fault scenario is retained, not deleted or ignored. A first-snapshot failure now stops on the first attempt, not after three retries. Replace retired reason/counter API checks with exact one-attempt consumption, storage error class/subject/verb, no claimed snapshot/purge progress, staging cleanup and refused later local work.",
+      "issue": 1254
     }
   ]
 }

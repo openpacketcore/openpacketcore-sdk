@@ -2618,46 +2618,11 @@ struct SnapshotBuildStatus {
     peak_wal_bytes: u64,
     last_duration_millis: u64,
     completed_snapshot_count: u64,
-    /// Snapshot build attempts started, including retries and attempts that
-    /// failed before touching storage.
-    started_build_attempts: u64,
-    /// Failed build attempts that were retried or degraded.
-    failed_build_attempts: u64,
-    /// Retry attempts started after a previous attempt of the same command
-    /// failed. Bounded by the fixed attempt limit.
-    retried_build_attempts: u64,
-    /// Build commands that exhausted their bounded retries and kept the engine
-    /// running on the unchanged current snapshot.
-    degraded_builds: u64,
-    /// Consecutive failed attempts; reset by the next successful publication.
-    consecutive_build_failures: u64,
-    /// Fixed, value-free classification of the most recent failure.
-    last_build_failure_reason: Option<SnapshotBuildFailureReason>,
 }
 
-/// Fixed, value-free classification of a local snapshot build failure.
-///
-/// This never carries paths, SQLite text, keys, or payload material. The
-/// underlying value-free cause is logged separately with a warning.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SnapshotBuildFailureReason {
-    /// A capture/publication attempt failed and was retried.
-    BuildFailed,
-    /// The publication state is indeterminate and cannot resume in-process;
-    /// only a fresh core may resume snapshot publication.
-    IndeterminatePublication,
-    /// Bounded retries were exhausted and no published snapshot exists to keep
-    /// the engine running at.
-    NoPublishedSnapshot,
-    /// Bounded retries were exhausted and the current published snapshot could
-    /// not be read back; the durable snapshot state cannot be proven servable.
-    CurrentSnapshotUnreadable,
-}
-
-/// The status fields are published under one fixed mutex. Successful capture
-/// generations are published only after a sealed snapshot becomes the durable
-/// OpenRaft current snapshot; failure counters are advisory observations of
-/// bounded retry activity and never grant durability or authority.
+/// The status fields are published under one fixed mutex only after a sealed
+/// snapshot becomes the durable OpenRaft current snapshot. Readers therefore
+/// observe one generation, never a mixture of success generations.
 #[derive(Default)]
 pub(crate) struct SnapshotBuildObservation {
     status: Mutex<SnapshotBuildStatus>,
@@ -2665,12 +2630,10 @@ pub(crate) struct SnapshotBuildObservation {
     changed: tokio::sync::watch::Sender<()>,
     #[cfg(feature = "test-control")]
     phase_for_test: Mutex<&'static str>,
-    /// Test-only injected transient build failures. Each consumed entry fails
-    /// exactly one attempt before any capture work starts.
+    /// Test-only failures after staging children have cleanup ownership.
     #[cfg(feature = "test-control")]
     injected_build_failures: Mutex<usize>,
-    /// Test-only count of consumed failures that must latch an indeterminate
-    /// snapshot publication before the attempt reports the injected failure.
+    /// Test-only failures at the sealed-candidate publication boundary.
     #[cfg(feature = "test-control")]
     injected_indeterminate_publications: Mutex<usize>,
 }
@@ -2715,8 +2678,7 @@ impl SnapshotBuildObservation {
         true
     }
 
-    /// Arm this many consumed injected failures to latch an indeterminate
-    /// snapshot publication state, as a mid-publication failure would.
+    /// Arm this many faults at the sealed-candidate publication boundary.
     #[cfg(feature = "test-control")]
     pub(crate) fn inject_indeterminate_publications_for_test(&self, count: usize) {
         *self
@@ -2725,8 +2687,7 @@ impl SnapshotBuildObservation {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = count;
     }
 
-    /// Consume one indeterminate-publication latch request for a consumed
-    /// injected build failure.
+    /// Consume one indeterminate-publication fault at its real boundary.
     #[cfg(feature = "test-control")]
     pub(crate) fn take_injected_indeterminate_publication_for_test(&self) -> bool {
         let mut injected = self
@@ -2740,65 +2701,18 @@ impl SnapshotBuildObservation {
         true
     }
 
-    /// Record one started build attempt, including retries.
-    pub(crate) fn record_build_attempt(&self) {
-        let mut status = match self.status.lock() {
-            Ok(status) => status,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        status.started_build_attempts = status.started_build_attempts.saturating_add(1);
-    }
-
-    /// Record one retry scheduled after a failed attempt of the same command.
-    pub(crate) fn record_build_retry(&self) {
-        let mut status = match self.status.lock() {
-            Ok(status) => status,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        status.retried_build_attempts = status.retried_build_attempts.saturating_add(1);
-    }
-
-    /// Record one failed build attempt with its fixed value-free reason.
-    pub(crate) fn record_build_failure(&self, reason: SnapshotBuildFailureReason) {
-        let mut status = match self.status.lock() {
-            Ok(status) => status,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        status.failed_build_attempts = status.failed_build_attempts.saturating_add(1);
-        status.consecutive_build_failures = status.consecutive_build_failures.saturating_add(1);
-        status.last_build_failure_reason = Some(reason);
-        #[cfg(test)]
-        self.changed.send_replace(());
-    }
-
-    /// Record one build command that returned the unchanged current snapshot to
-    /// keep the engine running after its bounded retries were exhausted.
-    pub(crate) fn record_build_degraded(&self) {
-        let mut status = match self.status.lock() {
-            Ok(status) => status,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        status.degraded_builds = status.degraded_builds.saturating_add(1);
-        #[cfg(test)]
-        self.changed.send_replace(());
-    }
-
-    /// Bounded-retry diagnostics: started attempts, failed attempts, retries,
-    /// degraded commands, consecutive failures and the last failure reason.
-    pub(crate) fn build_failure_diagnostics(
-        &self,
-    ) -> (u64, u64, u64, u64, u64, Option<SnapshotBuildFailureReason>) {
-        let status = match self.status.lock() {
-            Ok(status) => status,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    /// Remaining staging and indeterminate-publication faults, respectively.
+    #[cfg(feature = "test-control")]
+    pub(crate) fn remaining_build_failures_for_test(&self) -> (usize, usize) {
         (
-            status.started_build_attempts,
-            status.failed_build_attempts,
-            status.retried_build_attempts,
-            status.degraded_builds,
-            status.consecutive_build_failures,
-            status.last_build_failure_reason,
+            *self
+                .injected_build_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            *self
+                .injected_indeterminate_publications
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
     }
 
@@ -2812,9 +2726,6 @@ impl SnapshotBuildObservation {
         status.peak_wal_bytes = status.peak_wal_bytes.max(captured_wal_peak);
         status.last_duration_millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         status.completed_snapshot_count = status.completed_snapshot_count.saturating_add(1);
-        // Keep the last fixed failure reason as bounded historical diagnostics;
-        // a zero consecutive-failure count is what marks the recovered state.
-        status.consecutive_build_failures = 0;
         #[cfg(test)]
         self.changed.send_replace(());
     }
