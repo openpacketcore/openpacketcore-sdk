@@ -274,8 +274,11 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// The exact closed variant name, without error text or caller values.
-    pub(crate) const fn variant_name(&self) -> &'static str {
+    /// The exact closed variant name for redaction-safe diagnostics.
+    ///
+    /// This excludes error text and all associated values. It does not classify
+    /// whether an operation is safe to retry.
+    pub const fn variant_name(&self) -> &'static str {
         match self {
             Self::NotFound => "NotFound",
             Self::StaleFence => "StaleFence",

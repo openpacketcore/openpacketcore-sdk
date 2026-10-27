@@ -4213,6 +4213,59 @@ async fn reconcile_traffic_known_authority(
     Ok(())
 }
 
+fn validate_qualification_restore_scan(
+    diagnostics: &mut impl io::Write,
+    result: Result<opc_session_store::RestoreScanPage, StoreError>,
+    expected: &StoredSessionRecord,
+    phase: &'static str,
+    started_at: tokio::time::Instant,
+) -> Result<(), QualificationTrafficFailure> {
+    let stage = QualificationTrafficFailureStage::RestoreScan;
+    let elapsed_ms = started_at.elapsed().as_millis();
+    let page = result.map_err(|error| {
+        let variant = error.variant_name();
+        let _ = writeln!(
+            diagnostics,
+            "qualification restore scan rejected: phase={phase} variant={variant} elapsed_ms={elapsed_ms}"
+        );
+        QualificationTrafficFailure::store(
+            QualificationTrafficFailureCode::RestoreScanRejected,
+            stage,
+            &error,
+        )
+    })?;
+    let failed_check = if !page.complete {
+        Some("complete")
+    } else if page.next_cursor.is_some() {
+        Some("next_cursor")
+    } else if page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1 {
+        Some("cursor_profile")
+    } else if page.loaded_count != page.records.len() {
+        Some("loaded_count")
+    } else if page.loaded_count > QUALIFICATION_TRAFFIC_RESTORE_LIMIT {
+        Some("page_limit")
+    } else if !page
+        .records
+        .iter()
+        .any(|candidate| traffic_record_is_exact(expected, candidate))
+    {
+        Some("expected_record")
+    } else {
+        None
+    };
+    if let Some(check) = failed_check {
+        let _ = writeln!(
+            diagnostics,
+            "qualification restore scan rejected: phase={phase} check={check} elapsed_ms={elapsed_ms}"
+        );
+        return Err(QualificationTrafficFailure::fixed(
+            QualificationTrafficFailureCode::RestoreScanRejected,
+            stage,
+        ));
+    }
+    Ok(())
+}
+
 async fn prove_traffic_restore_scan_recovery<P, F>(
     mut scan: P,
     expected: &StoredSessionRecord,
@@ -4236,37 +4289,27 @@ where
         // Cancelling this read observer does not abandon a session mutation
         // or replace the retained lease. Logical-time work stays owned by
         // the store; this observer uses the original recovery deadline.
+        let scan_started_at = tokio::time::Instant::now();
         let result = tokio::time::timeout_at(deadline, scan()).await;
         let failure = match result {
-            Ok(Ok(page)) => {
-                if tokio::time::Instant::now() >= deadline {
+            Ok(result) => {
+                if result.is_ok() && tokio::time::Instant::now() >= deadline {
                     return Err(QualificationTrafficFailure::recovery_deadline_exceeded(
                         stage,
                         recovery_started_at,
                     ));
                 }
-                if !page.complete
-                    || page.next_cursor.is_some()
-                    || page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
-                    || page.loaded_count != page.records.len()
-                    || page.loaded_count > QUALIFICATION_TRAFFIC_RESTORE_LIMIT
-                    || !page
-                        .records
-                        .iter()
-                        .any(|candidate| traffic_record_is_exact(expected, candidate))
-                {
-                    return Err(QualificationTrafficFailure::fixed(
-                        QualificationTrafficFailureCode::RestoreScanRejected,
-                        stage,
-                    ));
+                match validate_qualification_restore_scan(
+                    &mut io::stderr().lock(),
+                    result,
+                    expected,
+                    "recovery_restore_scan",
+                    scan_started_at,
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(failure) => failure,
                 }
-                return Ok(());
             }
-            Ok(Err(error)) => QualificationTrafficFailure::store(
-                QualificationTrafficFailureCode::RestoreScanRejected,
-                stage,
-                &error,
-            ),
             Err(_) => QualificationTrafficFailure::backend_unavailable(
                 QualificationTrafficFailureCode::RestoreScanRejected,
                 stage,
@@ -4796,31 +4839,17 @@ async fn run_traffic_mutation_task_inner(
             return Ok(());
         }
 
-        let page = protected
+        let scan_started_at = tokio::time::Instant::now();
+        let result = protected
             .scan_restore_records(RestoreScanRequest::all(QUALIFICATION_TRAFFIC_RESTORE_LIMIT))
-            .await
-            .map_err(|error| {
-                QualificationTrafficFailure::store(
-                    QualificationTrafficFailureCode::RestoreScanRejected,
-                    QualificationTrafficFailureStage::RestoreScan,
-                    &error,
-                )
-            })?;
-        if !page.complete
-            || page.next_cursor.is_some()
-            || page.cursor_profile != RestoreScanCursorProfile::DurableOpaqueV1
-            || page.loaded_count != page.records.len()
-            || page.loaded_count > QUALIFICATION_TRAFFIC_RESTORE_LIMIT
-            || !page
-                .records
-                .iter()
-                .any(|candidate| traffic_record_is_exact(&expected_record, candidate))
-        {
-            return Err(QualificationTrafficFailure::fixed(
-                QualificationTrafficFailureCode::RestoreScanRejected,
-                QualificationTrafficFailureStage::RestoreScan,
-            ));
-        }
+            .await;
+        validate_qualification_restore_scan(
+            &mut io::stderr().lock(),
+            result,
+            &expected_record,
+            "traffic_restore_scan",
+            scan_started_at,
+        )?;
         increment(&observation.complete_restore_scans);
         if traffic_cancellation_requested(cancellation, shutdown_deadline) {
             return Ok(());
@@ -7119,6 +7148,10 @@ mod readiness_recovery_tests;
 #[cfg(all(test, feature = "test-control"))]
 #[path = "opc-session-quorum-node/restore_scan_recovery_tests.rs"]
 mod restore_scan_recovery_tests;
+
+#[cfg(test)]
+#[path = "opc-session-quorum-node/restore_scan_diagnostics_tests.rs"]
+mod restore_scan_diagnostics_tests;
 
 #[cfg(test)]
 mod tests {
