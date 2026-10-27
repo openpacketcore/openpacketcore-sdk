@@ -239,9 +239,13 @@ impl VerifiedAppendSource {
         if self.failed.load(Ordering::Acquire) {
             return Err(invalid());
         }
+        // An append may publish during stat; sample its committed lower bound first.
+        let admitted_length = self.admitted_length.load(Ordering::Acquire);
         let metadata = MetadataIdentity::read(&self.file.metadata()?)?;
+        #[cfg(test)]
+        tests::after_metadata();
         if !self.pinned.same_file(metadata)
-            || metadata.length < self.admitted_length.load(Ordering::Acquire)
+            || metadata.length < admitted_length
             || metadata.length > self.maximum
         {
             return Err(invalid());
