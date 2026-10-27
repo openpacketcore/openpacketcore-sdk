@@ -23192,9 +23192,7 @@ impl MembershipLogProjection {
                     invalid_data("projected fenced transition V2 retained epoch bound is invalid")
                 })?;
             if retained_epochs < maximum_retained_epochs {
-                if !crate::fenced_transition::fenced_transition_v2_preemptive_rotation_due(
-                    history.current_bound_count,
-                ) {
+                if history.current_bound_count < FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
                     self.advance_projected_v2_application_sequence()?;
                     return Ok(());
                 }
@@ -28283,9 +28281,7 @@ fn maintain_fenced_transition_v2_history_sync(
         let maximum_retained_epochs = u64::try_from(FENCED_TRANSITION_V2_MAX_REPLAY_EPOCHS + 1)
             .map_err(|_| invalid_data("fenced transition V2 retained epoch bound is invalid"))?;
         if retained_epochs < maximum_retained_epochs {
-            if !crate::fenced_transition::fenced_transition_v2_preemptive_rotation_due(
-                history.current_bound_count,
-            ) {
+            if history.current_bound_count < FENCED_TRANSITION_V2_MAX_HISTORY_ENTRIES {
                 return Ok(FencedTransitionV2MaintenanceResult::Noop);
             }
             let successor = active
@@ -60513,117 +60509,6 @@ LIMIT 20000;
             &(FENCED_TRANSITION_V2_MAX_RECORD_PAYLOAD_BYTES as u64 + 1).to_be_bytes(),
         );
         assert!(decode_fenced_transition_v2_response(&wrong_maximum).is_err());
-    }
-
-    #[test]
-    fn v2_preemptive_rotation_high_water_rotates_before_the_epoch_is_full() {
-        let backend = SqliteSessionBackend::in_memory().expect("backend");
-        let conn = backend.conn.blocking_lock();
-        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
-        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
-            .expect("form membership");
-        activate_v2_ledger_fixture(&conn);
-        let initial_epoch = FencedTransitionV2HistoryEpoch::new(1).expect("initial epoch");
-        // A reduced test window exercises the applied rotation path without
-        // publishing 130,000 bindings. Two bound entries are at the high-water
-        // mark, so the maintenance turn rotates even though the epoch is not
-        // physically full.
-        conn.execute(
-            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = 2 WHERE singleton = 1",
-            [],
-        )
-        .expect("seed preemptive history watermark");
-        let _window =
-            crate::fenced_transition::tests_support::override_rotation_high_water_for_test(2);
-        let result = maintain_fenced_transition_v2_history_sync(
-            &conn,
-            identity(),
-            0,
-            Some(initial_epoch),
-            0,
-            2,
-            timestamp(1),
-        )
-        .expect("preemptive maintenance");
-        assert_eq!(result, FencedTransitionV2MaintenanceResult::Applied);
-        let history = read_fenced_transition_v2_history_row_in_sync(&conn, identity(), false)
-            .expect("history after preemptive rotation");
-        assert_eq!(
-            history.active_epoch,
-            Some(FencedTransitionV2HistoryEpoch::new(2).expect("successor epoch"))
-        );
-        assert_eq!(history.generation, 1);
-        assert_eq!(history.current_bound_count, 0);
-        assert_eq!(history.retired_through, 0);
-        // Below the same reduced window the maintenance turn is still a typed
-        // no-op rather than an early rotation.
-        conn.execute(
-            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = 1 WHERE singleton = 1",
-            [],
-        )
-        .expect("seed below-watermark history");
-        assert_eq!(
-            maintain_fenced_transition_v2_history_sync(
-                &conn,
-                identity(),
-                1,
-                Some(FencedTransitionV2HistoryEpoch::new(2).expect("successor epoch")),
-                0,
-                1,
-                timestamp(2),
-            )
-            .expect("below-watermark maintenance"),
-            FencedTransitionV2MaintenanceResult::Noop
-        );
-    }
-
-    #[test]
-    fn v2_projection_preemptive_rotation_matches_the_applied_threshold() {
-        let backend = SqliteSessionBackend::in_memory().expect("backend");
-        let conn = backend.conn.blocking_lock();
-        initialize_schema(&conn, identity(), &expected_members()).expect("consensus schema");
-        apply_entries_sync(&conn, identity(), &backend.caps, vec![membership_entry()])
-            .expect("form membership");
-        activate_v2_ledger_fixture(&conn);
-        conn.execute(
-            "UPDATE consensus_fenced_transition_v2_history SET current_bound_count = 2 WHERE singleton = 1",
-            [],
-        )
-        .expect("seed preemptive history watermark");
-        let _window =
-            crate::fenced_transition::tests_support::override_rotation_high_water_for_test(2);
-        let maintenance = Entry {
-            log_id: log_id(1),
-            payload: EntryPayload::Normal(SessionConsensusCommand {
-                schema_version: SESSION_CONSENSUS_SCHEMA_VERSION,
-                identity: identity(),
-                request_id: SessionConsensusRequestId::from_bytes([0xD7; 16]),
-                logical_time: timestamp(2),
-                intent: SessionMutationIntent::MaintainFencedTransitionV2History {
-                    expected_generation: 0,
-                    expected_active_epoch: Some(
-                        FencedTransitionV2HistoryEpoch::new(1).expect("initial epoch"),
-                    ),
-                    expected_retired_through: 0,
-                    expected_bound_entries: 2,
-                },
-            }),
-        };
-        let mut projection = MembershipLogProjection::load(&conn, identity(), false)
-            .expect("load follower projection");
-        projection
-            .project(&conn, &maintenance, identity())
-            .expect("project preemptive maintenance");
-        let rotated = projection
-            .projected_v2_history
-            .expect("projection retains V2 history");
-        assert_eq!(
-            rotated.active_epoch,
-            Some(FencedTransitionV2HistoryEpoch::new(2).expect("successor epoch"))
-        );
-        assert_eq!(rotated.current_bound_count, 0);
-        assert_eq!(rotated.generation, 1);
-        assert_eq!(rotated.retired_through, 0);
     }
 
     #[test]
