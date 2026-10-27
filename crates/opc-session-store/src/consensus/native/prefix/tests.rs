@@ -1,6 +1,19 @@
 use super::*;
 use std::cell::Cell;
 
+thread_local! {
+    static AFTER_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(super) fn after_metadata() {
+    let hook = AFTER_METADATA.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     path: std::path::PathBuf,
@@ -97,6 +110,46 @@ fn append(owner: &mut VerifiedAppendOwner, bytes: &[u8]) -> io::Result<Arc<Verif
             Ok(())
         },
     )
+}
+
+#[test]
+fn native_prefix_append_after_stat_keeps_old_reader_valid_but_truncation_fences_all_views() {
+    let fixture = Fixture::new(1);
+    let mut owner = fixture.open();
+    let old = owner.current();
+    let (start, started) = std::sync::mpsc::channel();
+    let (finish, finished) = std::sync::mpsc::channel();
+    let wait = std::time::Duration::from_secs(10);
+    let writer = std::thread::spawn(move || {
+        started
+            .recv_timeout(wait)
+            .expect("reader has sampled metadata");
+        let next = append(&mut owner, &[0x62; 17]).expect("concurrent append commits");
+        finish.send(()).unwrap();
+        (owner, next)
+    });
+    AFTER_METADATA.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            start.send(()).unwrap();
+            finished
+                .recv_timeout(wait)
+                .expect("new length is published");
+        }));
+    });
+    let mut byte = [0];
+    let read = old.read_exact_at(0, &mut byte);
+    let (mut owner, next) = writer.join().unwrap();
+    read.expect("an append after stat must not invalidate the captured prefix");
+    assert_eq!([0x51], byte);
+    assert!(!old.is_failed());
+    next.read_exact_at(old.identity.length, &mut byte).unwrap();
+    assert_eq!([0x62], byte);
+
+    fixture.file.set_len(old.identity.length).unwrap();
+    fixture.file.sync_all().unwrap();
+    assert!(old.read_exact_at(0, &mut byte).is_err());
+    assert!(next.is_failed(), "real truncation still fences every view");
+    assert!(append(&mut owner, &[1]).is_err());
 }
 
 #[test]
