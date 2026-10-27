@@ -7154,6 +7154,22 @@ impl SqliteConsensusSnapshotBuilder {
             .map_err(|error| {
                 storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
             })?;
+            // Fail after both real staging children have cleanup ownership.
+            #[cfg(feature = "test-control")]
+            if self
+                .core
+                .snapshot_observation
+                .take_injected_build_failure_for_test()
+            {
+                self.core
+                    .snapshot_observation
+                    .record_phase_for_test("staging_failed");
+                return Err(storage_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Write,
+                    io::Error::other("injected snapshot staging failure"),
+                ));
+            }
             build_file_backed_snapshot_database(
                 &self.core,
                 Arc::clone(&self._snapshot_directory_lease),
@@ -7546,6 +7562,28 @@ impl SqliteConsensusSnapshotBuilder {
         self.core
             .snapshot_observation
             .record_phase_for_test("publishing_metadata");
+        // Model an indeterminate publication at the actual sealed-candidate
+        // boundary. Preserve the candidate just as the native publisher does
+        // before its first fallible commit step; a fresh owner must audit it.
+        #[cfg(feature = "test-control")]
+        if self
+            .core
+            .snapshot_observation
+            .take_injected_indeterminate_publication_for_test()
+        {
+            published_cleanup.disarm();
+            self.core
+                .snapshot_publication_indeterminate
+                .store(true, Ordering::Release);
+            self.core
+                .snapshot_observation
+                .record_phase_for_test("publication_failed");
+            return Err(storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                io::Error::other("injected indeterminate snapshot publication"),
+            ));
+        }
         let publication = {
             let publish_legacy = |cleanup: &mut UnpublishedSnapshotArtifact| {
                 publish_snapshot_metadata_with_readback(
@@ -7852,33 +7890,7 @@ impl RaftSnapshotBuilder<SessionRaftTypeConfig> for SqliteConsensusSnapshotBuild
             if attempt > 1 {
                 observation.record_build_retry();
             }
-            let injected = {
-                #[cfg(feature = "test-control")]
-                {
-                    let injected = observation.take_injected_build_failure_for_test();
-                    // Optionally model a publication path that latches the
-                    // indeterminate state before its attempt reports failure.
-                    if injected && observation.take_injected_indeterminate_publication_for_test() {
-                        self.core
-                            .snapshot_publication_indeterminate
-                            .store(true, Ordering::Release);
-                    }
-                    injected
-                }
-                #[cfg(not(feature = "test-control"))]
-                {
-                    false
-                }
-            };
-            let result = if injected {
-                Err(storage_error(
-                    ErrorSubject::Snapshot(None),
-                    ErrorVerb::Write,
-                    io::Error::other("injected local snapshot build failure"),
-                ))
-            } else {
-                self.build_snapshot_attempt().await
-            };
+            let result = self.build_snapshot_attempt().await;
             match result {
                 Ok(snapshot) => return Ok(snapshot),
                 Err(error) => {

@@ -2740,6 +2740,21 @@ impl SnapshotBuildObservation {
         true
     }
 
+    /// Remaining staging and indeterminate-publication faults, respectively.
+    #[cfg(feature = "test-control")]
+    pub(crate) fn remaining_build_failures_for_test(&self) -> (usize, usize) {
+        (
+            *self
+                .injected_build_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            *self
+                .injected_indeterminate_publications
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     /// Record one started build attempt, including retries.
     pub(crate) fn record_build_attempt(&self) {
         let mut status = match self.status.lock() {
