@@ -4,6 +4,7 @@
 
 import argparse
 import contextlib
+import errno
 import json
 import os
 from pathlib import Path
@@ -393,7 +394,7 @@ def case(sender, version, mode, algorithm, scenario, index):
         assert ready == "ready", (ready, receiver.stderr.read())
         dummy, control = 3, 3
         if scenario in ("wrap", "expiry", "missing"):
-            if scenario == "missing" and mode == "tunnel":
+            if scenario == "missing":
                 run(
                     "ip",
                     "netns",
@@ -419,7 +420,7 @@ def case(sender, version, mode, algorithm, scenario, index):
             if scenario == "missing":
                 assert (
                     run("ip", "-n", left, "xfrm", "state", "count").strip()
-                    == "SAD count 0"
+                    == ("SAD count 0" if mode == "tunnel" else "SAD count 1")
                 )
         elif scenario == "delete":
             run(
@@ -541,10 +542,34 @@ if __name__ == "__main__":
                     timeout=10,
                 )
                 assert result.returncode != 0, result.stdout
-                assert not select.select([listener], [], [], 0.1)[0], (
-                    "dummy triggered ACQUIRE"
-                )
-                assert run("ip", "xfrm", "state", "count").strip() == "SAD count 0"
+                assert "NotFound" in result.stderr, result.stderr
+                # Exercise kernel lookup independently of the SDK's open-time GETSA.
+                with socket.socket(c["family"], socket.SOCK_RAW, 59) as sock:
+                    sock.setsockopt(*policy_option(c), policy(c))
+                    sock.bind((c["src"], 0))
+                    try:
+                        sock.connect((c["dst"], 0))
+                        sock.send(bytes(32))
+                    except OSError as error:
+                        expected = errno.ESRCH if c["mode"] == "tunnel" else errno.EAGAIN
+                        assert error.errno == expected, error
+                    else:
+                        raise AssertionError("missing SA accepted dummy packet")
+                readable = select.select([listener], [], [], 0.1)[0]
+                if c["mode"] == "tunnel":
+                    assert not readable, "dummy triggered ACQUIRE"
+                    expected_sad = "SAD count 0"
+                else:
+                    # Flag-zero transport retains normal acquisition on both kernels.
+                    assert readable, "missing transport SA did not trigger ACQUIRE"
+                    message = listener.recv(65536)
+                    assert len(message) >= 16, message
+                    assert struct.unpack_from("=H", message, 4)[0] == 23, message
+                    assert not select.select([listener], [], [], 0.1)[0], (
+                        "unexpected additional ACQUIRE"
+                    )
+                    expected_sad = "SAD count 1"
+                assert run("ip", "xfrm", "state", "count").strip() == expected_sad
         else:
             with socket.socket(c["family"], socket.SOCK_RAW, 59) as sock:
                 sock.setsockopt(*policy_option(c), policy(c))

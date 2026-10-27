@@ -14,7 +14,7 @@ SDK detects its version before opening the raw socket and refuses unsupported
 kernels. The patch does not install a second SA, change a live SA's mode,
 reserve counters through netlink, export keys, or implement userspace ESP.
 The patch is GPL-2.0-only. The patched source files retain their existing
-Linux SPDX identifiers, including GPL-2.0-or-later in `esp6.c` and
+Linux SPDX identifiers, including GPL-2.0-or-later in `net/xfrm/xfrm_output.c` and
 GPL-2.0 WITH Linux-syscall-note in the UAPI header. The qualification scripts
 and this documentation are Apache-2.0. The patch is not a Cargo dependency;
 no workspace dependency-license exception is needed.
@@ -64,14 +64,21 @@ must be reconciled with this local patch rather than silently reusing it.
 Per-socket policy flag 8 opts in. The kernel accepts it only for an outbound
 allow with selector protocol 59, no port selectors, and exactly one required
 ESP transport/tunnel template with nonzero SPI. Global SPD installations with
-this flag are rejected. Missing SAs do not trigger a key-manager ACQUIRE.
+this flag are rejected. A raw socket lookup with this flag and a missing SA
+fails with ESRCH without triggering a key-manager ACQUIRE or creating larval
+SAD state.
 Before output, the kernel rejects offload, multiple transforms, GSO and
 non-dummy IP headers. After native mode preparation it changes only the
 protocol byte that ESP copies into the encrypted trailer. Normal
 `xfrm_replay_overflow`, encryption, lifetime and completion paths remain intact.
-The SDK uses flag zero for stock transport mode and flag 8 for tunnel mode.
-Stock transport lookup retains normal key-manager ACQUIRE behavior when an
-SA is absent; callers still own installation and producer fencing.
+The SDK uses flag zero for transport mode on both stock and patched kernels,
+and flag 8 for tunnel mode. With a listening key manager, a missing transport
+SA makes raw policy-socket lookup fail with EAGAIN, emit ACQUIRE (netlink type
+23) and create one larval SAD entry. This known stock-kernel limitation also
+applies to transport mode on the patched kernel because flag 8 is absent.
+No packet reaches the wire. Callers still own installation and producer
+fencing. The SDK's separate open-time GETSA rejects an absent SA with
+`NotFound` before opening its policy socket.
 
 ## Reproducible qualification
 
@@ -109,8 +116,12 @@ The 36-case matrix exercises IPv4/IPv6 and transport/tunnel with AES-GCM and
 AES-CBC/HMAC-SHA256, TFC padding, UDP encapsulation, ESN rollover, non-ESN
 exhaustion, hard lifetime expiry, SA deletion and missing SAs. Concurrent tests
 mix four dummy-sender threads with ordinary traffic on one SA. Twelve malformed
-socket-policy shapes and a global-SPD attempt are rejected. A listening
-key-manager socket proves that missing tunnel SAs generate no ACQUIRE. The
+socket-policy shapes and a global-SPD attempt are rejected. Each missing-SA
+case separately checks the SDK's open-time `NotFound` and sends through the
+selftest's own raw protocol-59 policy socket with a key-manager listener bound.
+Tunnel lookup must fail with ESRCH, no ACQUIRE and zero SAD entries; flag-zero
+transport must fail with EAGAIN, one ACQUIRE and one larval SAD entry on both
+kernels. Every missing-SA case requires no wire traffic. The
 receiver requires ordinary application delivery, no dummy delivery, no
 plaintext protocol-59 escape, no ICMP error
 response and no capture drops. Linux counts deliberate dummy discards in its
