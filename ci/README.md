@@ -351,6 +351,13 @@ check every numeric deadline, hold, mutation bound and assertion, the pre-fix
 RED, and the retained real-time qualification. Static inventory cannot prove
 that two time sources preserve a test's meaning.
 
+Use the informational `semantics-changed` kind when an existing test's expected
+behavior changes without a rename or a coverage reduction. It follows the same
+field, source-change, head-test and issue requirements as `clock-source-changed`,
+including tests introduced earlier in an unmerged change. Explain the old and
+new expectations in `reason`. The declaration makes the change visible for
+review; it cannot waive a removed test, new gate, fewer assertions or lost CI.
+
 Use Python 3.11–3.14 on Linux and a stable worktree-local environment:
 
 ```bash

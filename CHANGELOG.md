@@ -240,6 +240,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GTP-U N3 native and reassembled paths now reject BSSI/TTNBI conditional
   fields consistently with the codec. Required RAN/PDCP extensions retain
   Supported Extension Headers Notification authority despite known syntax.
+  Generic `UnknownIePolicy::Reject` applies endpoint comprehension and refuses
+  those required formats; `Preserve` and `Drop` retain their syntax decoding.
   SCI send values are limited to 0–15. (#1520, #1529)
 - GTPv2-C ignores received Bearer QoS ARP spare bits and clears them on
   canonical send; raw-preserving send retains the received octet. (#1354)
@@ -596,19 +598,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The opt-in has versioned, persistent encodings; default bytes stay unchanged.
   Linux GTP rejects the explicit policy because netlink cannot retain it. (#1347)
 
-- `opc-proto-gtpv2c`: ARP pre-emption permission booleans now follow the
-  enabled-zero PCI/PVI wire convention. Priority level 1 remains highest;
-  `cmp_priority` compares that rank independently of permission flags. Remove
-  caller compensations for the old inverted booleans. (#1354)
-- S2b procedure-aware receive ignores unexpected Update Bearer PCO and other
-  interface-specific F-TEID/load-control entries before decoding their values.
-  Mandatory fields and framing remain enforced; canonical send omits discarded
-  IEs and raw-preserving send retains them. Bearer QoS accepts its defined
-  22-octet prefix plus future extension octets. (#1441, #1356)
-
 - GTP-U recognizes short/long PDCP and opaque RAN extension formats and adds
-  `GtpuTypedExtension` encode/decode. Comprehension scans reject malformed fixed
-  widths. N3 retains its PSC-only endpoint profile. (#1529)
+  `GtpuTypedExtension` encode/decode. `is_supported_by_codec` reports format
+  support; generic `Reject` retains the endpoint comprehension boundary and
+  refuses required RAN/PDCP formats. `Preserve`/`Drop` decoding and fixed-width
+  validation remain available. N3 retains its PSC-only endpoint profile. (#1529)
 
 - GTP-U adds typed Tunnel Status, its SPOC information element, and a separate
   dataplane `TunnelStatus` classification. Exhaustive matches must handle the

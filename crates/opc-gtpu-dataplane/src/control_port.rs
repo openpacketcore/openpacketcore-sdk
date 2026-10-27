@@ -95,9 +95,11 @@ pub trait GtpuControlPort: fmt::Debug + Send + Sync {
     /// Receive at most one datagram and process it against the backend's own
     /// authoritative forwarding state.
     ///
-    /// The Linux kernel-GTP backend returns validated G-PDUs from its retained
-    /// socket as unknown-tunnel observations, without forwarding or replying.
-    /// The caller must establish tunnel absence and peer admission.
+    /// The Linux kernel-GTP backend returns `UnknownTunnel` only after two equal
+    /// PDP reads in each inner family confirm the TEID is absent. A context in
+    /// either family gives `Dropped(DestinationMismatch)`; a readback error gives
+    /// `Dropped(StateUnavailable)`. The caller remains responsible for peer
+    /// admission and response policy; receiving does not forward or reply.
     ///
     /// On the eBPF backend, this is the production consumer for G-PDUs that
     /// the kernel delivers to the backend-owned queues. The shared UDP/2152 queue carries

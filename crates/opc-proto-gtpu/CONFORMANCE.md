@@ -66,10 +66,11 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   where applicable to control messages. Types 0x81–0x84 and 0xC0 require
   notification and discard at an endpoint even
   though typed format decoding exists. The SGW/G-PDU exception for 0xC0 remains.
-  Structural GTP-U decode retains raw known extensions;
+  With `Preserve` or `Drop`, structural GTP-U decode retains raw extensions;
   `ProcedureAware`, the typed decode and comprehension scan check fixed lengths.
-  Unknown required types still fail under `Reject`. PDU Set containers `0x04`
-  and `0x86` remain unimplemented pending that feature's TS 38.415 semantics.
+  `Reject` refuses every required type outside the endpoint profile, including
+  the parseable 0x81–0x84 and 0xC0 formats. PDU Set containers `0x04` and `0x86`
+  remain unimplemented pending that feature's TS 38.415 semantics.
 - **Typed classes**: all four bits-8/7 comprehension classes are exposed for
   endpoint and intermediate recipients, including the type `0xc0` SGW/G-PDU
   exception.

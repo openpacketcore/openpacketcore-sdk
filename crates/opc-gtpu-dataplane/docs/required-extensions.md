@@ -62,6 +62,8 @@ full native lanes. The PR retains source guard-removal failures, an independent
 wire mutation, restored passes, tool versions and exact base/head/tree.
 
 The [control-port qualification](control-port.md) separately verifies Linux
-kernel-GTP and eBPF typed responses for both families. This extension handoff
-proof does not confer End Marker ordering, PSC insertion or installed N3
-selector authority.
+kernel-GTP and eBPF typed responses for both families. Linux kernel-GTP
+decapsulates G-PDUs for installed TEIDs without extension-comprehension checks,
+so this handoff and notification apply to the eBPF backend and to G-PDUs the
+kernel passes up. This extension handoff proof does not confer End Marker
+ordering, PSC insertion or installed N3 selector authority.

@@ -21,7 +21,7 @@ fn short_pdcp_followed_by_psc_decodes_but_unknown_required_still_fails() {
         unknown_ie_policy: UnknownIePolicy::Reject,
         ..DecodeContext::default()
     };
-    let (_, message) = GtpuMessage::decode(&wire, ctx).unwrap();
+    let (_, message) = GtpuMessage::decode(&wire, DecodeContext::default()).unwrap();
     let headers: Vec<_> = message.extensions().map(Result::unwrap).collect();
     assert_eq!(headers.len(), 2);
     use opc_proto_gtpu::GtpuTypedExtension as E;
@@ -34,6 +34,10 @@ fn short_pdcp_followed_by_psc_decodes_but_unknown_required_still_fails() {
         Some(E::PduSessionContainer(
             opc_proto_gtpu::PduSessionContainer::new_downlink(9, None, false).unwrap()
         ))
+    );
+    assert_eq!(
+        GtpuMessage::decode(&wire, ctx).unwrap_err().code(),
+        &opc_protocol::DecodeErrorCode::UnknownCriticalIe
     );
     wire[11] = 0xc4;
     assert!(GtpuMessage::decode(&wire, ctx).is_err());
@@ -156,11 +160,22 @@ fn procedure_validation_and_comprehension_scan_reject_malformed_known_lengths() 
         assert!(raw
             .first_unsupported_required_extension(GtpuExtensionHeaderRecipient::Endpoint)
             .is_err());
-        let ctx = DecodeContext {
-            validation_level: ValidationLevel::ProcedureAware,
-            ..DecodeContext::default()
-        };
-        assert!(GtpuMessage::decode(&wire, ctx).is_err());
+        for unknown_ie_policy in [
+            UnknownIePolicy::Preserve,
+            UnknownIePolicy::Drop,
+            UnknownIePolicy::Reject,
+        ] {
+            let ctx = DecodeContext {
+                validation_level: ValidationLevel::ProcedureAware,
+                unknown_ie_policy,
+                ..DecodeContext::default()
+            };
+            assert!(GtpuMessage::decode(&wire, ctx).is_err());
+            assert!(matches!(
+                GtpuMessage::decode(&wire, ctx).unwrap_err().code(),
+                opc_protocol::DecodeErrorCode::InvalidLength { .. }
+            ));
+        }
     }
 }
 

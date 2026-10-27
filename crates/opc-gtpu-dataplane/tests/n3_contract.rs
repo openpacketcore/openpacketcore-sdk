@@ -449,13 +449,32 @@ fn generic_typed_extensions_do_not_expand_n3_endpoint_comprehension() {
             unknown_ie_policy: UnknownIePolicy::Reject,
             ..DecodeContext::default()
         };
-        assert!(opc_proto_gtpu::GtpuMessage::decode(&wire, ctx).is_ok());
+        assert_eq!(
+            opc_proto_gtpu::GtpuMessage::decode(&wire, ctx)
+                .unwrap_err()
+                .code(),
+            &opc_protocol::DecodeErrorCode::UnknownCriticalIe
+        );
         assert_eq!(
             N3PacketView::decode(&wire, N3Direction::Downlink, ctx).unwrap_err(),
             N3PacketError::UnsupportedExtension
         );
     }
     let long = unhex("34ff0011000000010000008202000000000000850100090045");
+    let reject = DecodeContext {
+        unknown_ie_policy: UnknownIePolicy::Reject,
+        ..DecodeContext::default()
+    };
+    assert_eq!(
+        opc_proto_gtpu::GtpuMessage::decode(&long, reject)
+            .unwrap_err()
+            .code(),
+        &opc_protocol::DecodeErrorCode::UnknownCriticalIe
+    );
+    assert_eq!(
+        N3PacketView::decode(&long, N3Direction::Downlink, reject).unwrap_err(),
+        N3PacketError::UnsupportedExtension
+    );
     assert_eq!(
         N3PacketView::decode(&long, N3Direction::Downlink, DecodeContext::default()).unwrap_err(),
         N3PacketError::UnsupportedExtension

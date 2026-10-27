@@ -1062,13 +1062,13 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::zero_peer_teid_is_installed_and_sent_on_the_wire",
       "kind": "disabled",
-      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed with its explicit opt-in in the compliance VM: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
       "issue": 1346
     },
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_zero_peer_teid_is_sent_on_the_wire",
       "kind": "disabled",
-      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed with its explicit opt-in in the compliance VM: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
       "issue": 1346
     },
     {
@@ -1086,7 +1086,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_multihoming_is_opt_in_and_survives_restart",
       "kind": "disabled",
-      "reason": "New privileged packet proof requires CAP_BPF/CAP_NET_ADMIN and an isolated network namespace. Executed in the compliance Linux VM: strict alternate-source rejection, opt-in delivery before and after backend restart, and rejection of wrong local address, UDP port, TEID and inner PAA. The complete ignored harness runs in privileged CI; host tests cover codecs, ownership and reassembly parity.",
+      "reason": "New privileged packet proof requires CAP_BPF/CAP_NET_ADMIN and an isolated network namespace. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: strict alternate-source rejection, opt-in delivery before and after backend restart, and rejection of wrong local address, UDP port, TEID and inner PAA. The complete ignored harness runs in privileged CI; host tests cover codecs, ownership and reassembly parity.",
       "issue": 1347
     },
     {
@@ -1127,6 +1127,18 @@
       "kind": "assertions-decreased",
       "reason": "Replace three incorrect spare-bit rejection statements with a loop over all three spare-bit combinations. Each combination now proves valid-level equivalence and continued rejection of level zero; constructor bounds and all former zero-level octets remain covered (TS 29.274 7.7.8).",
       "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=n3_contract::generic_typed_extensions_do_not_expand_n3_endpoint_comprehension",
+      "kind": "semantics-changed",
+      "reason": "Generic Reject now expects UnknownCriticalIe for parseable 0x81-0x84 and 0xC0 because Endpoint comprehension is separate from wire-format recognition. N3PacketView still reports UnsupportedExtension, including the valid two-unit Long PDCP form. Preserve/Drop and typed-format coverage remain intact.",
+      "issue": 1529
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=typed_extensions::short_pdcp_followed_by_psc_decodes_but_unknown_required_still_fails",
+      "kind": "semantics-changed",
+      "reason": "Retain every Short PDCP and PSC typed-content assertion under Preserve, then explicitly require generic Reject to return UnknownCriticalIe for Short PDCP. The existing unknown comprehension-required rejection remains; recognizing a wire format does not imply Endpoint comprehension.",
+      "issue": 1529
     }
   ]
 }

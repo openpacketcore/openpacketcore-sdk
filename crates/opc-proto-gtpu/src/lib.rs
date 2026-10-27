@@ -1588,12 +1588,9 @@ impl<'a> BorrowDecode<'a> for GtpuMessage<'a> {
                 }
 
                 let extension_type = GtpuExtensionHeaderType::new(current_next_ext);
-                // Generic decoding recognizes syntax; endpoint admission uses
-                // first_unsupported_required_extension separately.
-                if !extension_type.is_supported_by_codec()
-                    && extension_type
-                        .comprehension()
-                        .is_required_by(GtpuExtensionHeaderRecipient::Endpoint)
+                // Reject applies endpoint comprehension, not format recognition.
+                if extension_type
+                    .unsupported_requires_comprehension_by(GtpuExtensionHeaderRecipient::Endpoint)
                     && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject)
                 {
                     return Err(DecodeError::new(
