@@ -1645,41 +1645,44 @@ impl CapacityHistoryPersistence {
         }
     }
 
-    fn join(&mut self, storage: &mut NativeStorage, timings: &mut CapacityHistoryTimings) {
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        let mut batch = pending.join().unwrap();
-        timings.record("batch_prepare", batch.prepare_elapsed);
-        timings.record("batch_append", batch.append_elapsed);
-        let version = Version::capture(storage).unwrap();
-        let witness = storage.business.roster.witness;
-        let rows = storage.business.roster.rows.len();
-        timings.measure("batch_relocate", || {
-            while !batch.relocations.is_empty() {
-                drop(batch.relocations.publish_step(storage).unwrap());
-            }
-        });
-        version.require_current(storage).unwrap();
-        assert!(storage.business.roster.witness == witness);
-        assert_eq!(storage.business.roster.rows.len(), rows);
-        assert_eq!(
-            storage
-                .business
-                .roster
-                .rows
-                .values()
-                .filter(|row| row.is_cold())
-                .count(),
-            batch.completed as usize,
-            "every completed capture is cold while only the next batch may remain hot",
-        );
-        eprintln!(
-            "roster history footprint: completed={}, spool_bytes={}",
-            batch.completed,
-            std::fs::metadata(&batch.files.path).unwrap().len(),
-        );
-        self.files = Some(batch.files);
+    fn join_pending_capture(
+        &mut self,
+        storage: &mut NativeStorage,
+        timings: &mut CapacityHistoryTimings,
+    ) {
+        if let Some(pending) = self.pending.take() {
+            let mut batch = pending.join().unwrap();
+            timings.record("batch_prepare", batch.prepare_elapsed);
+            timings.record("batch_append", batch.append_elapsed);
+            let version = Version::capture(storage).unwrap();
+            let witness = storage.business.roster.witness;
+            let rows = storage.business.roster.rows.len();
+            timings.measure("batch_relocate", || {
+                while !batch.relocations.is_empty() {
+                    drop(batch.relocations.publish_step(storage).unwrap());
+                }
+            });
+            version.require_current(storage).unwrap();
+            assert!(storage.business.roster.witness == witness);
+            assert_eq!(storage.business.roster.rows.len(), rows);
+            assert_eq!(
+                storage
+                    .business
+                    .roster
+                    .rows
+                    .values()
+                    .filter(|row| row.is_cold())
+                    .count(),
+                batch.completed as usize,
+                "every completed capture is cold while only the next batch may remain hot",
+            );
+            eprintln!(
+                "roster history footprint: completed={}, spool_bytes={}",
+                batch.completed,
+                std::fs::metadata(&batch.files.path).unwrap().len(),
+            );
+            self.files = Some(batch.files);
+        }
     }
 
     fn submit(
@@ -1688,7 +1691,7 @@ impl CapacityHistoryPersistence {
         completed: u64,
         timings: &mut CapacityHistoryTimings,
     ) {
-        self.join(storage, timings);
+        self.join_pending_capture(storage, timings);
         let mut files = self.files.take().unwrap();
         let capture = storage.take_changes().unwrap();
         // At most one immutable 1,024-row capture and the next working batch
@@ -1731,7 +1734,7 @@ impl CapacityHistoryPersistence {
         storage: &mut NativeStorage,
         timings: &mut CapacityHistoryTimings,
     ) -> Files {
-        self.join(storage, timings);
+        self.join_pending_capture(storage, timings);
         self.files.take().unwrap()
     }
 }
