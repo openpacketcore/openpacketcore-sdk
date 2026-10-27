@@ -551,8 +551,8 @@ if __name__ == "__main__":
                         sock.connect((c["dst"], 0))
                         sock.send(bytes(32))
                     except OSError as error:
-                        expected = errno.ESRCH if c["mode"] == "tunnel" else errno.EAGAIN
-                        assert error.errno == expected, error
+                        # xfrm_tmpl_resolve_one maps internal ESRCH to EAGAIN.
+                        assert error.errno == errno.EAGAIN, error
                     else:
                         raise AssertionError("missing SA accepted dummy packet")
                 readable = select.select([listener], [], [], 0.1)[0]

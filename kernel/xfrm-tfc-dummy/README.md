@@ -65,8 +65,9 @@ Per-socket policy flag 8 opts in. The kernel accepts it only for an outbound
 allow with selector protocol 59, no port selectors, and exactly one required
 ESP transport/tunnel template with nonzero SPI. Global SPD installations with
 this flag are rejected. A raw socket lookup with this flag and a missing SA
-fails with ESRCH without triggering a key-manager ACQUIRE or creating larval
-SAD state.
+returns ESRCH internally without triggering a key-manager ACQUIRE or creating
+larval SAD state. On the pinned kernel, `xfrm_tmpl_resolve_one` translates that
+error to EAGAIN before it reaches the policy socket.
 Before output, the kernel rejects offload, multiple transforms, GSO and
 non-dummy IP headers. After native mode preparation it changes only the
 protocol byte that ESP copies into the encrypted trailer. Normal
@@ -119,7 +120,7 @@ mix four dummy-sender threads with ordinary traffic on one SA. Twelve malformed
 socket-policy shapes and a global-SPD attempt are rejected. Each missing-SA
 case separately checks the SDK's open-time `NotFound` and sends through the
 selftest's own raw protocol-59 policy socket with a key-manager listener bound.
-Tunnel lookup must fail with ESRCH, no ACQUIRE and zero SAD entries; flag-zero
+Tunnel lookup must fail with EAGAIN, no ACQUIRE and zero SAD entries; flag-zero
 transport must fail with EAGAIN, one ACQUIRE and one larval SAD entry on both
 kernels. Every missing-SA case requires no wire traffic. The
 receiver requires ordinary application delivery, no dummy delivery, no
