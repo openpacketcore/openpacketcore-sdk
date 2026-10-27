@@ -10,11 +10,12 @@ use opc_proto_ikev2::{
     recovery::{
         Ikev2CbcEpochInputs, Ikev2CbcEpochRecord, Ikev2CbcRecoveryProfile as Cbc,
         Ikev2CommittedExchangeRecord as Exchange, Ikev2CommittedWindowDomain as Domain,
-        Ikev2CommittedWindowRecord as Record, Ikev2PersistedProfileSync as ProfileSync,
-        Ikev2ReservationRetryPolicy as RetryPolicy, Ikev2ReservationRetryRecord as RetryRecord,
-        Ikev2SyncAttemptRecord as Attempt, Ikev2SyncDisposition as Disposition,
-        Ikev2SyncRecoveryPolicy as Policy, Ikev2SyncRecoveryRecord as Recovery,
-        Ikev2SyncRecoveryStatus as Status, Ikev2SyncResponderRecord as SyncRecord,
+        Ikev2CommittedWindowRecord as Record, Ikev2LivenessRecord as LivenessRecord,
+        Ikev2PersistedProfileSync as ProfileSync, Ikev2ReservationRetryPolicy as RetryPolicy,
+        Ikev2ReservationRetryRecord as RetryRecord, Ikev2SyncAttemptRecord as Attempt,
+        Ikev2SyncDisposition as Disposition, Ikev2SyncRecoveryPolicy as Policy,
+        Ikev2SyncRecoveryRecord as Recovery, Ikev2SyncRecoveryStatus as Status,
+        Ikev2SyncResponderRecord as SyncRecord,
     },
     Ikev2AesGcmEpochInputs, Ikev2AesGcmIvLimits as Limits, Ikev2AesGcmIvRecord as IvRecord,
     Ikev2DhGroup as Group, Ikev2MessageIdSyncAgreement as Agreement,
@@ -165,6 +166,7 @@ pub struct WindowImage {
     pub generation: u64,
     pub next_send: Option<u32>,
     pub next_receive: Option<u32>,
+    pub liveness: Option<LivenessRecord>,
     pub outbound: Option<Exchange>,
     pub inbound: Option<Exchange>,
     pub sync: Option<SyncImage>,
@@ -204,6 +206,7 @@ macro_rules! capture {
             generation: record.generation(),
             next_send: record.next_send(),
             next_receive: record.next_receive(),
+            liveness: record.liveness().cloned(),
             outbound: record.outbound().cloned(),
             inbound: record.inbound().cloned(),
             sync: record.sync_state().map(|s| SyncImage {
@@ -356,6 +359,7 @@ impl Row {
                 generation: 0,
                 next_send: Some(0),
                 next_receive: Some(0),
+                liveness: None,
                 outbound: None,
                 inbound: None,
                 sync: (mode == Mode::Negotiated).then_some(SyncImage {
@@ -432,6 +436,13 @@ impl Row {
             synchronization,
         )
         .map_err(|_| Error::Format)?;
+        let record = if let Some(state) = &self.window.liveness {
+            record
+                .with_liveness(state.clone())
+                .map_err(|_| Error::Format)?
+        } else {
+            record
+        };
         let retry = image
             .retries
             .iter()
@@ -506,6 +517,13 @@ impl Row {
             synchronization,
         )
         .map_err(|_| Error::Format)?;
+        let record = if let Some(state) = &self.window.liveness {
+            record
+                .with_liveness(state.clone())
+                .map_err(|_| Error::Format)?
+        } else {
+            record
+        };
         Ok((record, epoch))
     }
 

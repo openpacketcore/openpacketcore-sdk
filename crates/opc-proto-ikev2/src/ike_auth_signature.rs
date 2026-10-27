@@ -1262,6 +1262,158 @@ mod rfc4754_encoding_tests {
     use super::*;
 
     #[test]
+    fn published_rfc4754_vectors_verify_all_three_raw_signature_widths() {
+        use opc_crypto_provider::IkeSignatureOperations;
+        let cases = [
+            (
+                9,
+                Ikev2SignaturePublicKey::EcdsaP256(
+                    p256::ecdsa::VerifyingKey::from_sec1_bytes(include_bytes!(
+                        "../tests/data/rfc4754_p256_public.bin"
+                    ))
+                    .unwrap(),
+                ),
+                include_bytes!("../tests/data/rfc4754_p256_signature.bin").as_slice(),
+                IkeSignatureAlgorithm::EcdsaP256Sha2_256,
+            ),
+            (
+                10,
+                Ikev2SignaturePublicKey::EcdsaP384(
+                    p384::ecdsa::VerifyingKey::from_sec1_bytes(include_bytes!(
+                        "../tests/data/rfc4754_p384_public.bin"
+                    ))
+                    .unwrap(),
+                ),
+                include_bytes!("../tests/data/rfc4754_p384_signature.bin").as_slice(),
+                IkeSignatureAlgorithm::EcdsaP384Sha2_384,
+            ),
+            (
+                11,
+                Ikev2SignaturePublicKey::EcdsaP521(
+                    p521::ecdsa::VerifyingKey::from_sec1_bytes(include_bytes!(
+                        "../tests/data/rfc4754_p521_public.bin"
+                    ))
+                    .unwrap(),
+                ),
+                include_bytes!("../tests/data/rfc4754_p521_signature.bin").as_slice(),
+                IkeSignatureAlgorithm::EcdsaP521Sha2_512,
+            ),
+        ];
+        for (method, public, raw, algorithm) in cases {
+            let der = ecdsa_signature_to_der(legacy_ecdsa_algorithm(method).unwrap(), raw).unwrap();
+            assert_eq!(
+                ecdsa_signature_to_fixed(legacy_ecdsa_algorithm(method).unwrap(), &der).unwrap(),
+                raw
+            );
+            let spki = encode_public_key_spki(&public).unwrap();
+            crate::Ikev2SoftwareCryptoOperations::new()
+                .verify_signature(algorithm, &spki, b"abc", &der)
+                .unwrap();
+            assert!(crate::Ikev2SoftwareCryptoOperations::new()
+                .verify_signature(algorithm, &spki, b"abd", &der)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn pss_identifiers_match_rfc7427_and_rustcrypto_parameters() {
+        use rsa::pkcs1::RsaPssParams;
+        use rsa::pkcs8::{
+            der::{asn1::ObjectIdentifier, Encode},
+            spki::AlgorithmIdentifier,
+        };
+        for (algorithm, identifier, parameters) in [
+            (
+                IkeSignatureAlgorithm::RsaPssSha2_256,
+                RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256,
+                RsaPssParams::new::<rsa::sha2::Sha256>(32),
+            ),
+            (
+                IkeSignatureAlgorithm::RsaPssSha2_384,
+                RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384,
+                RsaPssParams::new::<rsa::sha2::Sha384>(48),
+            ),
+            (
+                IkeSignatureAlgorithm::RsaPssSha2_512,
+                RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512,
+                RsaPssParams::new::<rsa::sha2::Sha512>(64),
+            ),
+        ] {
+            let independent = AlgorithmIdentifier {
+                oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
+                parameters: Some(parameters.clone()),
+            }
+            .to_der()
+            .unwrap();
+            assert_eq!(identifier.as_slice(), independent);
+            assert_eq!(decode_pss_identifier(&identifier), Some(algorithm));
+            let mut absent = parameters;
+            absent.hash.parameters = None;
+            absent.mask_gen.parameters.as_mut().unwrap().parameters = None;
+            let absent = AlgorithmIdentifier {
+                oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
+                parameters: Some(absent),
+            }
+            .to_der()
+            .unwrap();
+            assert_eq!(decode_pss_identifier(&absent), Some(algorithm));
+            // Reject the extra context wrapper present in the original candidate.
+            let mut malformed_mgf = identifier.to_vec();
+            malformed_mgf.splice(47..47, [0xa0, 0x0f]);
+            for length in [1, 14, 33, 35] {
+                malformed_mgf[length] += 2;
+            }
+            assert_eq!(decode_pss_identifier(&malformed_mgf), None);
+            let mut bad_salt = identifier;
+            bad_salt[66] = 20;
+            assert_eq!(decode_pss_identifier(&bad_salt), None);
+            let mut wrong_mgf = identifier;
+            wrong_mgf[46] = 7;
+            assert_eq!(decode_pss_identifier(&wrong_mgf), None);
+            let mut trailing = identifier.to_vec();
+            trailing.push(0);
+            assert_eq!(decode_pss_identifier(&trailing), None);
+        }
+        // RFC 7427 Appendix A.4.3 includes explicit trailerField = 1.
+        let rfc = [
+            0x30, 0x46, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30,
+            0x39, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
+            0x02, 0x01, 0x05, 0x00, 0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+            0xf7, 0x0d, 0x01, 0x01, 0x08, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+            0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0xa2, 0x03, 0x02, 0x01, 0x20, 0xa3, 0x03, 0x02,
+            0x01, 0x01,
+        ];
+        assert_eq!(
+            decode_pss_identifier(&rfc),
+            Some(IkeSignatureAlgorithm::RsaPssSha2_256)
+        );
+        let mut wrong_trailer = rfc;
+        wrong_trailer[71] = 2;
+        assert_eq!(decode_pss_identifier(&wrong_trailer), None);
+    }
+
+    fn decode_pss_identifier(identifier: &[u8]) -> Option<IkeSignatureAlgorithm> {
+        [
+            (
+                IkeSignatureAlgorithm::RsaPssSha2_256,
+                RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_256,
+            ),
+            (
+                IkeSignatureAlgorithm::RsaPssSha2_384,
+                RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_384,
+            ),
+            (
+                IkeSignatureAlgorithm::RsaPssSha2_512,
+                RFC7427_ALGORITHM_IDENTIFIER_RSA_PSS_SHA2_512,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(algorithm, canonical)| {
+            pss_identifier_matches(identifier, &canonical).then_some(algorithm)
+        })
+    }
+
+    #[test]
     fn p521_raw_to_der_and_back_is_exact() {
         let mut raw = vec![0_u8; 132];
         raw[65] = 1;
@@ -1425,7 +1577,11 @@ pub(crate) fn rsa_pkcs1v15_sha256_sign(
 ) -> Result<Vec<u8>, Ikev2IkeAuthVerificationError> {
     let digest = Sha256::digest(signed_octets);
     private
-        .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+        .sign_with_rng(
+            &mut rsa::rand_core::OsRng,
+            Pkcs1v15Sign::new::<Sha256>(),
+            &digest,
+        )
         .map_err(|_| Ikev2IkeAuthVerificationError::SignatureComputationFailed)
 }
 
@@ -1446,15 +1602,15 @@ fn rsa_pss_parameters(
 ) -> Result<(Pss, Vec<u8>), Ikev2IkeAuthVerificationError> {
     match algorithm {
         IkeSignatureAlgorithm::RsaPssSha2_256 => Ok((
-            Pss::new_with_salt::<Sha256>(32),
+            Pss::new_blinded_with_salt::<Sha256>(32),
             Sha256::digest(message).to_vec(),
         )),
         IkeSignatureAlgorithm::RsaPssSha2_384 => Ok((
-            Pss::new_with_salt::<Sha384>(48),
+            Pss::new_blinded_with_salt::<Sha384>(48),
             Sha384::digest(message).to_vec(),
         )),
         IkeSignatureAlgorithm::RsaPssSha2_512 => Ok((
-            Pss::new_with_salt::<Sha512>(64),
+            Pss::new_blinded_with_salt::<Sha512>(64),
             Sha512::digest(message).to_vec(),
         )),
         _ => Err(Ikev2IkeAuthVerificationError::SignatureAlgorithmUnsupported),

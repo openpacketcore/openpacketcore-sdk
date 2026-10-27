@@ -3626,6 +3626,10 @@ mod tests {
             Ikev2DhGroup::Modp768,
             Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
+            Ikev2DhGroup::Modp3072,
+            Ikev2DhGroup::Modp4096,
+            Ikev2DhGroup::Modp6144,
+            Ikev2DhGroup::Modp8192,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
             Ikev2DhGroup::Ecp521,
@@ -3649,6 +3653,10 @@ mod tests {
             Ikev2DhGroup::Modp768,
             Ikev2DhGroup::Modp1024,
             Ikev2DhGroup::Modp2048,
+            Ikev2DhGroup::Modp3072,
+            Ikev2DhGroup::Modp4096,
+            Ikev2DhGroup::Modp6144,
+            Ikev2DhGroup::Modp8192,
             Ikev2DhGroup::Ecp256,
             Ikev2DhGroup::Ecp384,
             Ikev2DhGroup::Ecp521,
@@ -3673,7 +3681,7 @@ mod tests {
 
         // Synthetic exponents. A/B/shared outputs were reproduced with both
         // Python bigint and Node.js bigint implementations using the RFC 2409
-        // group 1/2 and RFC 3526 group 14 primes.
+        // group 1/2 and RFC 3526 group 14-18 primes.
         const X: &str = "123456789abcdef0fedcba98765432100123456789abcdef0fedcba987654321";
         const Y: &str = "fedcba98765432100123456789abcdef112233445566778899aabbccddeeff00";
 
@@ -3727,6 +3735,26 @@ mod tests {
             modp2048_pow,
             "df148e68b72c2f6baba85a92162761d75ad2964f1c4194980ace133f54e9145b"
         );
+        assert_group_vector!(
+            U3072,
+            modp3072_pow,
+            "56d083e0d41b34cca4d8dc24daca0cbfc8ac7c3d8425eb0ef1f4a9ecd7faefbd"
+        );
+        assert_group_vector!(
+            U4096,
+            modp4096_pow,
+            "4f52d96f075fc1579580f965c556559a28a3ad9afc0568cd7663ddaaac34f1af"
+        );
+        assert_group_vector!(
+            U6144,
+            modp6144_pow,
+            "54c7547fdf8efae65deaedc3307f67fffd2b7c59b63927c9a039a83f21b78877"
+        );
+        assert_group_vector!(
+            U8192,
+            modp8192_pow,
+            "6e9df5280b9ff84611eaf17977ba044c45b1c247f4145eaac2aeae4c0b2f7b87"
+        );
     }
 
     #[test]
@@ -3770,6 +3798,10 @@ mod tests {
         assert_group_boundaries!(Ikev2DhGroup::Modp768, U768, modp768_prime);
         assert_group_boundaries!(Ikev2DhGroup::Modp1024, U1024, modp1024_prime);
         assert_group_boundaries!(Ikev2DhGroup::Modp2048, U2048, modp2048_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp3072, U3072, modp3072_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp4096, U4096, modp4096_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp6144, U6144, modp6144_prime);
+        assert_group_boundaries!(Ikev2DhGroup::Modp8192, U8192, modp8192_prime);
     }
 
     #[test]

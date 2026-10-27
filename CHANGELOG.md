@@ -521,9 +521,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `opc-proto-ikev2`: added variants to the exhaustive DH, PRF, encryption,
   signature-method, signature-public-key and key-error enums require downstream matches to
-  be updated. The bounded probe API replaces send/retransmit/complete/abandon
-  empty-request methods with `prepare_liveness`, `start_empty_probe`,
-  `retry_empty_probe`, `complete_empty_probe` and scheduled deadline checks.
+  be updated.
   Persist explicit liveness metadata with every atomic window row; missing or
   unknown format fields must be rejected. Crossing this stored-record change
   requires a fresh install. Refs #1241, #1352.

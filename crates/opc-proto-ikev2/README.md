@@ -1004,6 +1004,9 @@ signed-octets transcript and requires negotiated RFC 8420 `Identity` authority i
 its AlgorithmIdentifier parameters must be absent. SHA-512 and Identity offers
 are admitted only when the selected module supports the corresponding operation.
 RSA signing remains behind `rsa-signing`; verification is always available.
+PKCS#1 v1.5 and all PSS signing profiles blind private operations with OS
+randomness. Blinding does not remove the `rsa` crate's RUSTSEC-2023-0071 timing
+advisory limitation; private signing remains opt-in.
 For RSA-PSS local self-verification, use
 `authorize_local_auth_self_verification_with_signing_key` to bind the exact
 scheme as well as the hash. The original hash-only SHA-256/RSA helper selects
