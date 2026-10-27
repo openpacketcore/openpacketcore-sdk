@@ -21,6 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_establishment = session_establishment_request(
         2,
         10,
+        NodeId {
+            node_id_type: NodeIdType::Fqdn,
+            value: b"smf.local".to_vec(),
+        },
         FSeid {
             v4: true,
             v6: false,
@@ -58,6 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     edrt: false,
                     bdpn: false,
                     ddpn: false,
+                    fssm: false,
+                    mbsu: false,
                     spare: 0,
                 }),
                 TypedIe::ForwardingParameters(ForwardingParameters {

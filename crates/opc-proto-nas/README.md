@@ -14,6 +14,11 @@ It does not implement NAS procedure state machines, key derivation or key
 lifecycle, SUCI de-concealment, NIA1/NEA1 (SNOW 3G), NIA3/NEA3 (ZUC), EPS
 NAS interworking, or AMF/SMF product policy.
 
+This provider subset is not full UE, AMF or MME security conformance.
+Consumers own algorithm selection and must supply the algorithms required by
+their endpoint profile. Decoding an algorithm identifier does not advertise
+provider support; unsupported selections fail before key resolution.
+
 ## API Shape
 
 - `tcp::NasTcpDecoder` incrementally frames one bounded NAS/TCP payload at a

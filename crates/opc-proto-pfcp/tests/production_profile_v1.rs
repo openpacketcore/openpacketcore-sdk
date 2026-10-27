@@ -50,6 +50,8 @@ fn forwarding_action() -> ApplyAction {
         edrt: false,
         bdpn: false,
         ddpn: false,
+        fssm: false,
+        mbsu: false,
         spare: 0,
     }
 }
@@ -116,12 +118,19 @@ fn association_setup_profile_uses_typed_constructor_only() {
 
 #[test]
 fn session_establishment_profile_uses_typed_constructor_only() {
-    let message =
-        session_establishment_request(2, 10, cp_fseid(), create_pdr_with_far(7), create_far(7))
-            .expect("session establishment request builds");
+    let message = session_establishment_request(
+        2,
+        10,
+        node_id(),
+        cp_fseid(),
+        create_pdr_with_far(7),
+        create_far(7),
+    )
+    .expect("session establishment request builds");
 
     let decoded = encode_decode_validate(message);
-    assert_eq!(decoded.ies.len(), 3);
+    assert_eq!(decoded.ies.len(), 4);
+    assert!(decoded.ies.iter().any(|ie| ie.ie_type == 60));
 }
 
 #[test]

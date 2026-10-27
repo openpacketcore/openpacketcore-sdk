@@ -214,6 +214,10 @@ fn provider_rejects_unsupported_algorithms_and_missing_or_wrong_purpose_keys() {
         NasIntegrityAlgorithm::Nia0,
         NasIntegrityAlgorithm::Nia1,
         NasIntegrityAlgorithm::Nia3,
+        NasIntegrityAlgorithm::Nia4,
+        NasIntegrityAlgorithm::Nia5,
+        NasIntegrityAlgorithm::Nia6,
+        NasIntegrityAlgorithm::Nia7,
     ] {
         assert_eq!(
             provider
@@ -229,7 +233,14 @@ fn provider_rejects_unsupported_algorithms_and_missing_or_wrong_purpose_keys() {
             NasSecurityError::UnsupportedAlgorithm
         );
     }
-    for algorithm in [NasCipheringAlgorithm::Nea1, NasCipheringAlgorithm::Nea3] {
+    for algorithm in [
+        NasCipheringAlgorithm::Nea1,
+        NasCipheringAlgorithm::Nea3,
+        NasCipheringAlgorithm::Nea4,
+        NasCipheringAlgorithm::Nea5,
+        NasCipheringAlgorithm::Nea6,
+        NasCipheringAlgorithm::Nea7,
+    ] {
         assert_eq!(
             provider
                 .apply_cipher(

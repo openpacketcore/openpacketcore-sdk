@@ -17,10 +17,31 @@ use opc_protocol::{
     UnknownIePolicy,
 };
 
-use crate::InformationElement;
+use crate::{IeType, InformationElement};
 
 mod grouped;
+mod registry;
 mod simple;
+
+pub use registry::IE_DEFINITIONS;
+
+/// Whether an IE type is assigned by TS 29.244 V19.6.0 Table 8.1.2-1.
+pub fn is_defined_ie_type(ie_type: u16) -> bool {
+    IE_DEFINITIONS
+        .binary_search_by_key(&ie_type, |entry| entry.0)
+        .is_ok()
+}
+
+fn ie_spec_ref(ie_type: u16) -> SpecRef {
+    let reference = IE_DEFINITIONS
+        .binary_search_by_key(&ie_type, |entry| entry.0)
+        .map_or("8.1.2", |index| IE_DEFINITIONS[index].1);
+    if let Some((section, _)) = reference.split_once('-') {
+        SpecRef::new("3gpp", "TS29244", section).with_table(reference)
+    } else {
+        SpecRef::new("3gpp", "TS29244", reference)
+    }
+}
 
 use simple::SimpleIe;
 
@@ -37,7 +58,7 @@ pub use simple::{
     NodeIdType, OffendingIe, OuterHeaderCreation, OuterHeaderRemoval, PdrId, Precedence, QerId,
     Qfi, RecoveryTimeStamp, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType,
     ReportingTriggers, SourceInterface, TimeQuota, TimeThreshold, UeIpAddress, UrSeqn, UrrId,
-    UsageReportTrigger, VolumeMeasurement, VolumeQuota, VolumeThreshold,
+    UsageReportTrigger, UserPlaneInactivityTimer, VolumeMeasurement, VolumeQuota, VolumeThreshold,
 };
 
 /// A decoded PFCP IE — either a known typed IE or a raw-preserving fallback.
@@ -106,6 +127,8 @@ pub enum TypedIe {
     OuterHeaderRemoval(OuterHeaderRemoval),
     /// Recovery Time Stamp (type 96).
     RecoveryTimeStamp(RecoveryTimeStamp),
+    /// User Plane Inactivity Timer, in seconds (type 117).
+    UserPlaneInactivityTimer(UserPlaneInactivityTimer),
     /// Outer Header Creation (type 84).
     OuterHeaderCreation(OuterHeaderCreation),
     /// FAR ID (type 108).
@@ -162,7 +185,8 @@ impl TypedIe {
     ///
     /// A single-result API cannot represent a deliberately omitted IE, so
     /// [`UnknownIePolicy::Drop`] and [`UnknownIePolicy::Preserve`] both return
-    /// [`TypedIe::Raw`] for an unsupported type here. Use
+    /// [`TypedIe::Raw`] for an unassigned type here. Assigned but unmodelled
+    /// types are preserved raw under every policy. Use
     /// [`decode_typed_ie_sequence`] to enforce all three policy outcomes,
     /// including omission under `Drop`.
     ///
@@ -174,7 +198,13 @@ impl TypedIe {
             return Err(DecodeError::new(DecodeErrorCode::DepthExceeded, 0).with_spec_ref(spec_ref));
         }
 
-        let (remaining, raw) = InformationElement::decode(input)?;
+        let (remaining, raw) = InformationElement::decode(input).map_err(|error| {
+            if input.len() >= 2 {
+                error.with_spec_ref(ie_spec_ref(u16::from_be_bytes([input[0], input[1]])))
+            } else {
+                error
+            }
+        })?;
         let typed = Self::decode_from_raw(raw, ctx, depth)?;
         Ok((remaining, typed))
     }
@@ -188,7 +218,7 @@ impl TypedIe {
         ctx: DecodeContext,
         depth: usize,
     ) -> Result<Self, DecodeError> {
-        let spec_ref = SpecRef::new("3gpp", "TS29244", "8.2");
+        let spec_ref = ie_spec_ref(raw.ie_type);
         let value = &raw.value[..];
         let offset = 0usize;
 
@@ -209,7 +239,7 @@ impl TypedIe {
             19 => Self::Cause(simple::Cause::decode_value(
                 value,
                 offset,
-                spec_ref.clone(),
+                SpecRef::new("3gpp", "TS29244", "8.2.1"),
             )?),
             20 => Self::SourceInterface(simple::SourceInterface::decode_value(
                 value,
@@ -219,7 +249,7 @@ impl TypedIe {
             21 => Self::FTeid(simple::FTeid::decode_value(
                 value,
                 offset,
-                spec_ref.clone(),
+                SpecRef::new("3gpp", "TS29244", "8.2.3"),
             )?),
             22 => Self::NetworkInstance(simple::NetworkInstance::decode_value(
                 value,
@@ -276,9 +306,14 @@ impl TypedIe {
             93 => Self::UeIpAddress(simple::UeIpAddress::decode_value(
                 value,
                 offset,
-                spec_ref.clone(),
+                SpecRef::new("3gpp", "TS29244", "8.2.62"),
             )?),
             95 => Self::OuterHeaderRemoval(simple::OuterHeaderRemoval::decode_value(
+                value,
+                offset,
+                spec_ref.clone(),
+            )?),
+            117 => Self::UserPlaneInactivityTimer(simple::UserPlaneInactivityTimer::decode_value(
                 value,
                 offset,
                 spec_ref.clone(),
@@ -384,7 +419,9 @@ impl TypedIe {
                 offset,
                 spec_ref.clone(),
             )?),
-            _ if matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject) => {
+            _ if !is_defined_ie_type(raw.ie_type)
+                && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject) =>
+            {
                 return Err(DecodeError::new(DecodeErrorCode::UnknownCriticalIe, offset)
                     .with_spec_ref(spec_ref));
             }
@@ -568,6 +605,10 @@ impl TypedIe {
                 v.encode_value(&mut buf)?;
                 95
             }
+            Self::UserPlaneInactivityTimer(v) => {
+                v.encode_value(&mut buf)?;
+                IeType::UserPlaneInactivityTimer as u16
+            }
             Self::RecoveryTimeStamp(v) => {
                 v.encode_value(&mut buf)?;
                 96
@@ -694,6 +735,7 @@ impl TypedIe {
             Self::UeIpAddress(_) => 93,
             Self::OuterHeaderRemoval(_) => 95,
             Self::RecoveryTimeStamp(_) => 96,
+            Self::UserPlaneInactivityTimer(_) => IeType::UserPlaneInactivityTimer as u16,
             Self::OuterHeaderCreation(_) => 84,
             Self::FarId(_) => 108,
             Self::QerId(_) => 109,
@@ -725,7 +767,9 @@ impl TypedIe {
 /// This is the policy-enforcing boundary for both top-level typed views and
 /// grouped IE members:
 ///
-/// - [`UnknownIePolicy::Drop`] omits unsupported IEs;
+/// Assigned but unmodelled IEs are retained raw under every policy.
+/// For unassigned and vendor-specific identifiers:
+/// - [`UnknownIePolicy::Drop`] omits unknown IEs;
 /// - [`UnknownIePolicy::Preserve`] retains each unsupported IE as
 ///   [`TypedIe::Raw`] in wire order;
 /// - [`UnknownIePolicy::Reject`] returns
@@ -768,7 +812,10 @@ pub fn decode_typed_ie_sequence(
 
         let (remaining, ie) = TypedIe::decode(&input[offset..], ctx, depth)?;
         offset = input.len().saturating_sub(remaining.len());
-        if matches!(ctx.unknown_ie_policy, UnknownIePolicy::Drop) && matches!(ie, TypedIe::Raw(_)) {
+        if matches!(ctx.unknown_ie_policy, UnknownIePolicy::Drop)
+            && matches!(ie, TypedIe::Raw(_))
+            && !is_defined_ie_type(ie.ie_type())
+        {
             continue;
         }
         ies.push(ie);
