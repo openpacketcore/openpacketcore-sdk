@@ -238,6 +238,20 @@ impl Index {
         self.epochs.get(&(key, epoch)).copied().unwrap_or(0)
     }
 
+    pub(crate) fn partition_count_through(
+        &self,
+        key: ProductionFloorKey,
+        epoch: u64,
+        limit: usize,
+    ) -> usize {
+        self.partitions.get(&key).map_or(0, |rows| {
+            rows.iter()
+                .take_while(|(binding, _)| binding.history_epoch() <= epoch)
+                .take(limit)
+                .count()
+        })
+    }
+
     pub(crate) fn partition_bounds(
         &self,
         key: ProductionFloorKey,

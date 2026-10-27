@@ -112,6 +112,15 @@ impl NativeDelta<'_> {
                     expiry,
                     ..
                 } = transaction;
+                if matches!(
+                    intent,
+                    SessionMutationIntent::ActivateProtectedRosterProfileV2 { .. }
+                ) {
+                    self.initialize_roster_witness(
+                        !self.frontiers.roster_v1_namespace
+                            && self.frontiers.roster_v2_activation.is_none(),
+                    )?;
+                }
                 self.frontiers = frontiers;
                 self.expiry = expiry;
                 self.keys.extend(keys);

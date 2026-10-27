@@ -154,7 +154,6 @@ fn skip_rows(
 ) -> io::Result<()> {
     if counts
         .into_iter()
-        .chain(roster)
         .any(|count| count > validation::MAX_ITEMS)
     {
         return Err(invalid(

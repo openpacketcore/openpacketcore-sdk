@@ -13,6 +13,7 @@ use std::sync::Arc;
 use super::shared::RowValue;
 use super::*;
 use crate::consensus::verified_snapshot::VerificationMemory;
+use crate::fenced_mutation_roster_storage::GlobalChargeWitness;
 use sha2::{Digest as _, Sha256};
 
 #[path = "changes_frames.rs"]
@@ -566,7 +567,11 @@ impl BusinessChanges {
                 // Such an empty ledger is valid process state even though
                 // an old generation cannot encode the new frontiers.
                 if [&self.base, &self.target].into_iter().any(|proof| {
-                    proof.roster.counts() != [0; 2] || proof.roster.witness().is_some()
+                    proof.roster.counts() != [0; 2]
+                        || proof
+                            .roster
+                            .witness()
+                            .is_some_and(|witness| witness != GlobalChargeWitness::empty())
                 }) {
                     return Err(invalid(
                         "native captured roster rows lack a configured trust root",

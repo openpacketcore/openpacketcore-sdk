@@ -948,6 +948,32 @@
       "kind": "assertions-decreased",
       "reason": "Extract the body into prepared_cas_binding_reply_loss_case in crates/opc-session-net/tests/stateless_quorum_consumer.rs, moving the fleet through the controlled-clock closure. All original assertions and calls to application_sequences, quiesce, voter_authority, wait_for_observed_leader and withhold_next_forward_mutation_reply remain; their helper bodies are unchanged. Static receiver resolution loses their eight setup/cleanup expectations after fleet is rebound, while two clock assertions are added (116 -> 110). Cargo disables automatic integration targets and includes this file in the library; its actual lib=lib target also resolves the shared clock helper and grows 116 -> 117. No runtime coverage is removed.",
       "issue": 1147
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::roster::store::tests::native_roster_maintenance_streams_atomic_reclaim_and_stops_at_the_next_partition_epoch",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-store::lib=lib::consensus::native::roster::store::tests::native_roster_maintenance_streams_atomic_reclaim_and_retires_across_partition_epochs",
+      "reason": "One bounded terminal-prefix retirement now spans admission epochs in a partition. The test retains corrupted-second-row atomicity and canonical ledger validation, then requires both eligible epochs and their shared floor to disappear in the same command. The former second retirement turn is obsolete; both-engine sustained-load and 1024-row boundary regressions cover progress and the unchanged bound.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::consensus::native::roster::store::tests::native_roster_maintenance_streams_atomic_reclaim_and_retires_across_partition_epochs",
+      "kind": "assertions-decreased",
+      "reason": "One bounded terminal-prefix retirement now spans admission epochs in a partition. The test retains corrupted-second-row atomicity and canonical ledger validation, then requires both eligible epochs and their shared floor to disappear in the same command. The former second retirement turn is obsolete; both-engine sustained-load and 1024-row boundary regressions cover progress and the unchanged bound. Assertion count changes because the obsolete single-epoch rejection/extra-turn assertions are replaced by the multi-epoch closure assertions. No authority, corruption, retention or batch-limit assertion is relaxed.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::protected_roster_retirement_batches_one_epoch_per_floor_without_collapsing_same_epoch_rows",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::protected_roster_retirement_folds_all_selected_epochs_into_one_floor_action",
+      "reason": "Replace the obsolete stop-at-second-epoch helper contract with one maximum epoch and exact selected count per shared floor. All original same-epoch, next-epoch and other-partition rows remain, now in out-of-order epoch order; the test requires one floor action and counts every selected row. Separate real-engine tests retain the 1024-row bound and lower-survivor floor protection.",
+      "issue": 1307
+    },
+    {
+      "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::protected_roster_retirement_folds_all_selected_epochs_into_one_floor_action",
+      "kind": "assertions-decreased",
+      "reason": "Replace the obsolete stop-at-second-epoch helper contract with one maximum epoch and exact selected count per shared floor. All original same-epoch, next-epoch and other-partition rows remain, now in out-of-order epoch order; the test requires one floor action and counts every selected row. Separate real-engine tests retain the 1024-row bound and lower-survivor floor protection. Assertion count changes because the obsolete single-epoch rejection/extra-turn assertions are replaced by the multi-epoch closure assertions. No authority, corruption, retention or batch-limit assertion is relaxed.",
+      "issue": 1307
     }
   ]
 }

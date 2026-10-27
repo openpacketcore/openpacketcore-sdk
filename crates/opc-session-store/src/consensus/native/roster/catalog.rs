@@ -14,6 +14,7 @@ struct Reservation {
 pub(in crate::consensus::native) struct Metadata {
     pub(in crate::consensus::native) content: [u8; 32],
     pub(in crate::consensus::native) facts: Facts,
+    pub(in crate::consensus::native) original_admission_fence: u64,
     pub(in crate::consensus::native) charge: ProductionSnapshotAccounting,
     pub(in crate::consensus::native) index: super::index::CatalogEntry,
     projection: [u8; 32],
@@ -59,6 +60,7 @@ impl Metadata {
         Ok(Self {
             content: Row::hydration_fingerprint(hydrated)?,
             facts: hydrated.facts,
+            original_admission_fence: hydrated.projection.original.recovery_parts().1,
             charge: accounting(hydrated, sequence, applied, witness)?,
             index: super::index::CatalogEntry::of(hydrated)?,
             projection: super::super::changes::fingerprint(

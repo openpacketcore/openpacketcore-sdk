@@ -1,3 +1,6 @@
+#[path = "retired_admission_generation_tests.rs"]
+mod retired_admission_tests;
+
 use super::*;
 use crate::consensus::native::roster::v1_fixture;
 use crate::consensus::types::{
@@ -26,6 +29,8 @@ fn configured(signed: &RosterV2PersistenceFixture) -> NativeStorage {
         voters: protected_roster_profile_v2_voter_set_digest(signed.identity, &state.members),
         profile: crate::fenced_mutation_roster::Profile::v2().digest(),
     });
+    state.roster.witness =
+        Some(crate::fenced_mutation_roster_storage::GlobalChargeWitness::empty());
     let authority = &signed.authority;
     let guard = LeaseGuard::new(
         authority.key().clone(),
@@ -1128,6 +1133,10 @@ fn native_roster_generation_empty_activation_and_failed_conversion_expose_no_sta
                 .unwrap()
         );
         assert!(restored.business.roster.rows.is_empty());
+        assert_eq!(
+            restored.business.roster.witness,
+            Some(crate::fenced_mutation_roster_storage::GlobalChargeWitness::empty())
+        );
         assert!(files.path.is_file());
     }
     let signed = crate::consensus::types::roster_v2_persistence_fixture();
@@ -1180,4 +1189,615 @@ fn native_roster_generation_empty_activation_and_failed_conversion_expose_no_sta
         storage.business.require_business_proof().unwrap()
     ));
     storage.validate_image().unwrap();
+}
+
+#[test]
+fn roster_capacity_emergency_signed_v2_survives_q1_q2_and_cold_reopen() {
+    use crate::fenced_mutation_roster::AdmissionClass;
+    for phase in [Phase::Established, Phase::Aborted] {
+        let signed = crate::consensus::types::roster_v2_persistence_fixture_for_class(
+            phase,
+            AdmissionClass::Emergency,
+        );
+        let command =
+            ConsensusRosterAdmissionCommand::new_with_provenance_and_ingress_request_id_v2(
+                signed.admission.clone(),
+                signed.authority.clone(),
+                signed.admission_ingress.request_id(),
+                signed.admission_ingress.clone(),
+                signed.admission_provenance.clone(),
+            )
+            .unwrap();
+        let encoded = postcard::to_allocvec(&command).unwrap();
+        let decoded: ConsensusRosterAdmissionCommand = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(
+            decoded.admission().admission_class(),
+            AdmissionClass::Emergency
+        );
+        assert_eq!(
+            decoded.admission().body_commitment(),
+            signed.admission.body_commitment()
+        );
+        assert!(
+            signed
+                .admission_provenance
+                .verify_for(
+                    &signed.root,
+                    signed.identity,
+                    &signed
+                        .admission
+                        .clone()
+                        .with_admission_class(AdmissionClass::Ordinary),
+                    &signed.authority,
+                    &signed.admission_ingress,
+                )
+                .is_err(),
+            "class substitution cannot reuse the signed admission authority"
+        );
+        let mut storage = configured(&signed);
+        let (mut files, base) = Files::new(&storage);
+        exact_rosters(&base.into_storage(&|| Ok(())).unwrap(), &storage);
+        storage.begin_changes().unwrap();
+        let admitted = apply(&mut storage, &[q1(&signed, 1)]);
+        assert!(matches!(
+            admitted.responses[0].result,
+            Ok(SessionMutationOutcome::RosterAdmissionV2(
+                ConsensusRosterAdmissionOutcome::Admitted { .. }
+            ))
+        ));
+        reopen(&mut files, &mut storage, 21);
+        let binding = signed.admission.binding_key(1).unwrap();
+        let scope = roster::fixed_scope(storage.business.identity, &storage.business.members);
+        let row = storage.business.roster.rows[&binding]
+            .hydrate_detached(&signed.root, &scope, &|| Ok(()))
+            .unwrap();
+        let roster::carrier::Body::V2(body) = row.body() else {
+            panic!("V2 carrier")
+        };
+        assert_eq!(
+            body.record().admission().unwrap().admission_class(),
+            AdmissionClass::Emergency
+        );
+        drop(row);
+        let terminal = apply(&mut storage, &[q2(&signed, 2)]);
+        assert!(matches!(
+            terminal.responses[0].result,
+            Ok(SessionMutationOutcome::RosterTerminalV2(
+                ConsensusRosterTerminalOutcome::Committed {
+                    replayed: false,
+                    ..
+                }
+            ))
+        ));
+        assert!(!storage.business.keys[signed.authority.key()].reserved);
+        assert_eq!(
+            storage.business.keys[signed.authority.key()]
+                .record
+                .is_some(),
+            phase == Phase::Established
+        );
+        reopen(&mut files, &mut storage, 22);
+        let replay = apply(&mut storage, &[q2(&signed, 3)]);
+        assert!(matches!(
+            replay.responses[0].result,
+            Ok(SessionMutationOutcome::RosterTerminalV2(
+                ConsensusRosterTerminalOutcome::Committed { replayed: true, .. }
+            ))
+        ));
+        assert!(replay.notifications.is_empty());
+        let (compacted, base) = Files::new(&storage);
+        exact_rosters(&base.into_storage(&|| Ok(())).unwrap(), &storage);
+        assert!(!compacted.bytes().is_empty());
+    }
+}
+
+#[test]
+fn roster_capacity_policy_rejects_old_activation_certificates() {
+    use sha2::{Digest, Sha256};
+    let signed = crate::consensus::types::roster_v2_persistence_fixture();
+    let mut storage = configured(&signed);
+    let state = &mut storage.business;
+    let scope_digest =
+        crate::consensus::types::fenced_transition_voter_set_digest(state.identity, &state.members);
+    let mut old = Sha256::new();
+    old.update(b"openpacketcore/session-consensus/protected-roster-profile-voter-set/v1\0");
+    old.update(scope_digest);
+    old.update(crate::fenced_mutation_roster::Profile::v1().digest());
+    let old_voters: [u8; 32] = old.finalize().into();
+    state.frontiers.roster_v1_namespace = true;
+    state.frontiers.v1_activation = Some(NativeV1Activation {
+        identity: state.identity,
+        voters: old_voters,
+    });
+    assert!(roster::validate_activation(state.identity, &state.members, &state.frontiers).is_err());
+    state.frontiers.v1_activation.as_mut().unwrap().voters =
+        protected_roster_profile_voter_set_digest(state.identity, &state.members);
+    assert!(roster::validate_activation(state.identity, &state.members, &state.frontiers).is_ok());
+    let old_v2_profile = [
+        0x38, 0x5e, 0xc6, 0x6c, 0x09, 0x35, 0x6f, 0x9a, 0x0f, 0x8f, 0x85, 0x60, 0xc2, 0x9e, 0x97,
+        0x73, 0x61, 0xf5, 0x63, 0x79, 0x5f, 0x41, 0xbb, 0x57, 0xdd, 0x04, 0x9c, 0x55, 0x32, 0x61,
+        0x7b, 0x89,
+    ];
+    let mut old = Sha256::new();
+    old.update(b"openpacketcore/session-consensus/protected-roster-profile-voter-set/v2\0");
+    old.update(scope_digest);
+    old.update(old_v2_profile);
+    let old_v2_voters: [u8; 32] = old.finalize().into();
+    let fresh = state.frontiers.roster_v2_activation.clone().unwrap();
+    state
+        .frontiers
+        .roster_v2_activation
+        .as_mut()
+        .unwrap()
+        .voters = old_v2_voters;
+    assert!(roster::validate_activation(state.identity, &state.members, &state.frontiers).is_err());
+    state.frontiers.roster_v2_activation = Some(fresh.clone());
+    state
+        .frontiers
+        .roster_v2_activation
+        .as_mut()
+        .unwrap()
+        .profile = old_v2_profile;
+    assert!(roster::validate_activation(state.identity, &state.members, &state.frontiers).is_err());
+    state.frontiers.roster_v2_activation = Some(fresh);
+    assert!(roster::validate_activation(state.identity, &state.members, &state.frontiers).is_ok());
+}
+
+fn assert_roster_maintenance_rejects_foreign_policy(v1: bool) {
+    let signed = crate::consensus::types::roster_v2_aborted_persistence_fixture();
+    let mut storage = configured(&signed);
+    apply(&mut storage, &[q1(&signed, 1), q2(&signed, 2)]);
+    let mut delta = storage.business.prepare(&[]).unwrap();
+    // Model a replica whose activation was admitted by another build with
+    // the same row/witness format and a different maintenance policy.
+    if v1 {
+        delta.frontiers.roster_v1_namespace = true;
+        delta.frontiers.v1_activation = Some(NativeV1Activation {
+            identity: signed.identity,
+            voters: [0xCE; 32],
+        });
+    } else {
+        delta
+            .frontiers
+            .roster_v2_activation
+            .as_mut()
+            .unwrap()
+            .voters = [0xCE; 32];
+    }
+    let before = delta.roster.clone();
+    let due = signed
+        .authority
+        .acquired_at()
+        .add_seconds(1 + 24 * 60 * 60)
+        .unwrap();
+    assert!(delta.maintain_roster(due, &|| Ok(())).is_err());
+    assert!(delta.roster.rows.ptr_eq(&before.rows));
+    assert!(delta.roster.partitions.ptr_eq(&before.partitions));
+    assert_eq!(delta.roster.witness, before.witness);
+    assert!(delta.keys.is_empty());
+    assert!(delta.responses.is_empty());
+}
+
+#[test]
+fn native_roster_maintenance_rejects_foreign_v1_policy_before_mutation() {
+    assert_roster_maintenance_rejects_foreign_policy(true);
+}
+
+#[test]
+fn native_roster_maintenance_rejects_foreign_v2_policy_before_mutation() {
+    assert_roster_maintenance_rejects_foreign_policy(false);
+}
+
+#[test]
+fn roster_capacity_emergency_signed_v1_survives_q1_q2_and_cold_reopen() {
+    use crate::fenced_mutation_roster::AdmissionClass;
+    let signed = crate::consensus::types::roster_v2_persistence_fixture_for_class(
+        Phase::Established,
+        AdmissionClass::Emergency,
+    );
+    let mut storage = configured(&signed);
+    apply(&mut storage, &[q1(&signed, 1), q2(&signed, 2)]);
+    let activation = entry(
+        &signed,
+        3,
+        SessionConsensusRequestId::from_bytes([0xC8; 16]),
+        SessionMutationIntent::ActivateFencedTransitionCapability {
+            schema_version: crate::fenced_transition::FENCED_TRANSITION_SCHEMA_V1,
+            scope_identity: signed.identity,
+            voter_set_digest: protected_roster_profile_voter_set_digest(
+                signed.identity,
+                &storage.business.members,
+            ),
+        },
+    );
+    apply(&mut storage, &[activation]);
+    let admission = roster::carrier::tests::signed_v1_command_with_mutation(
+        &signed,
+        EstablishedMutation::no_op(),
+    );
+    let encoded = postcard::to_allocvec(&admission).unwrap();
+    let decoded: ConsensusRosterAdmissionCommand = postcard::from_bytes(&encoded).unwrap();
+    assert_eq!(
+        decoded.admission().admission_class(),
+        AdmissionClass::Emergency
+    );
+    assert_eq!(
+        decoded.admission().body_commitment(),
+        admission.admission().body_commitment()
+    );
+    let terminal = v1_fixture::terminal(&signed, &admission, 4, Phase::Established);
+    let binding = admission.admission().binding_key(4).unwrap();
+    let (mut files, base) = Files::new(&storage);
+    exact_rosters(&base.into_storage(&|| Ok(())).unwrap(), &storage);
+    storage.begin_changes().unwrap();
+    let admitted = apply(
+        &mut storage,
+        &[entry(
+            &signed,
+            4,
+            admission.request_id().unwrap(),
+            SessionMutationIntent::RosterAdmission(Box::new(admission)),
+        )],
+    );
+    assert!(matches!(
+        admitted.responses[0].result,
+        Ok(SessionMutationOutcome::RosterAdmission(
+            ConsensusRosterAdmissionOutcome::Admitted { .. }
+        ))
+    ));
+    reopen(&mut files, &mut storage, 24);
+    let scope = roster::fixed_scope(storage.business.identity, &storage.business.members);
+    let row = storage.business.roster.rows[&binding]
+        .hydrate_detached(&signed.root, &scope, &|| Ok(()))
+        .unwrap();
+    let roster::carrier::Body::V1(body) = row.body() else {
+        panic!("V1 carrier")
+    };
+    assert_eq!(
+        body.record().admission().unwrap().admission_class(),
+        AdmissionClass::Emergency
+    );
+    drop(row);
+    let completed = apply(
+        &mut storage,
+        &[entry(
+            &signed,
+            5,
+            terminal.request_id().unwrap(),
+            SessionMutationIntent::RosterTerminal(Box::new(terminal)),
+        )],
+    );
+    assert!(matches!(
+        completed.responses[0].result,
+        Ok(SessionMutationOutcome::RosterTerminal(
+            ConsensusRosterTerminalOutcome::Committed {
+                replayed: false,
+                ..
+            }
+        ))
+    ));
+    assert!(!storage.business.keys[signed.authority.key()].reserved);
+    reopen(&mut files, &mut storage, 25);
+    let (compacted, base) = Files::new(&storage);
+    exact_rosters(&base.into_storage(&|| Ok(())).unwrap(), &storage);
+    assert!(!compacted.bytes().is_empty());
+}
+
+#[derive(Default)]
+struct CapacityHistoryTimings {
+    phases: std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
+}
+
+impl CapacityHistoryTimings {
+    fn record(&mut self, phase: &'static str, elapsed: std::time::Duration) {
+        let total = self.phases.entry(phase).or_default();
+        total.0 += elapsed;
+        total.1 += 1;
+        if phase.starts_with("final_") {
+            eprintln!("roster history boundary: phase={phase}, elapsed={elapsed:?}");
+        }
+    }
+
+    fn measure<T>(&mut self, phase: &'static str, operation: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let result = operation();
+        self.record(phase, started.elapsed());
+        result
+    }
+
+    fn report(&self, completed: u64) {
+        for (phase, (elapsed, calls)) in &self.phases {
+            eprintln!(
+                "roster history timing: completed={completed}, phase={phase}, calls={calls}, elapsed={elapsed:?}"
+            );
+        }
+    }
+}
+
+// Apply the same append/commit and certified business publication as `apply`,
+// but validate the complete image at the boundaries below. The generic test
+// helper scans all retained history after every entry, which would turn this
+// sequential history proof into quadratic work unrelated to admission.
+fn capacity_history_apply(
+    storage: &mut NativeStorage,
+    value: Entry<SessionRaftTypeConfig>,
+    timings: &mut CapacityHistoryTimings,
+    phases: [&'static str; 4],
+) -> NativeApplied {
+    let [encode, append, commit, apply] = phases;
+    let encoded = timings.measure(encode, || serde_json::to_vec(&value).unwrap());
+    timings
+        .measure(append, || {
+            storage.log.project(
+                &Operation::Append(vec![encoded.into()]),
+                &storage.business,
+                None,
+            )
+        })
+        .unwrap();
+    timings
+        .measure(commit, || {
+            storage.log.project(
+                &Operation::Committed(Some(value.log_id)),
+                &storage.business,
+                None,
+            )
+        })
+        .unwrap();
+    timings
+        .measure(apply, || storage.business.apply(&[value]))
+        .unwrap()
+}
+
+fn capacity_history_fixture(ordinal: u64) -> RosterV2PersistenceFixture {
+    crate::consensus::types::roster_v2_aborted_single_member_persistence_fixture_for_history(
+        u128::from(ordinal).to_be_bytes(),
+        ordinal.checked_mul(2).unwrap() - 1,
+    )
+}
+
+fn capacity_history_complete(
+    storage: &mut NativeStorage,
+    ordinal: u64,
+    timings: &mut CapacityHistoryTimings,
+) {
+    let signed = timings.measure("fixture", || capacity_history_fixture(ordinal));
+    let first_index = ordinal.checked_mul(2).unwrap() - 1;
+    let admission = timings.measure("q1_build", || q1(&signed, first_index));
+    let admitted = capacity_history_apply(
+        storage,
+        admission,
+        timings,
+        ["q1_encode", "q1_append", "q1_commit", "q1_apply"],
+    );
+    let assertions = std::time::Instant::now();
+    assert!(
+        matches!(
+            admitted.responses[0].result,
+            Ok(SessionMutationOutcome::RosterAdmissionV2(
+                ConsensusRosterAdmissionOutcome::Admitted { .. }
+            ))
+        ),
+        "ordinary admission must progress with {ordinal} retained rosters"
+    );
+    timings.record("entry_assertions", assertions.elapsed());
+    let terminal = timings.measure("q2_build", || q2(&signed, first_index + 1));
+    let completed = capacity_history_apply(
+        storage,
+        terminal,
+        timings,
+        ["q2_encode", "q2_append", "q2_commit", "q2_apply"],
+    );
+    let assertions = std::time::Instant::now();
+    assert!(matches!(
+        completed.responses[0].result,
+        Ok(SessionMutationOutcome::RosterTerminalV2(
+            ConsensusRosterTerminalOutcome::Committed {
+                replayed: false,
+                ..
+            }
+        ))
+    ));
+    assert!(completed.notifications.is_empty());
+    assert!(!storage.business.keys[signed.authority.key()].reserved);
+    assert!(storage.business.keys[signed.authority.key()]
+        .record
+        .is_none());
+    let occupancy = storage
+        .business
+        .roster
+        .witness
+        .unwrap()
+        .diagnostic_occupancy()
+        .unwrap();
+    assert_eq!(occupancy.live_reservations, 0);
+    assert_eq!(occupancy.retained_reservations, ordinal);
+    assert_eq!(occupancy.tombstone_reservations, 0);
+    assert_eq!(
+        storage.business.roster.rows.len(),
+        usize::try_from(ordinal).unwrap()
+    );
+    assert_eq!(
+        storage.business.frontiers.logical_time,
+        Some(signed.authority.acquired_at().add_seconds(1).unwrap())
+    );
+    timings.record("entry_assertions", assertions.elapsed());
+}
+
+fn capacity_history_progress_and_reopen(completed: u64) {
+    let started = std::time::Instant::now();
+    let mut timings = CapacityHistoryTimings::default();
+    let signed = timings.measure("setup_fixture", || capacity_history_fixture(1));
+    let mut storage = timings.measure("setup_storage", || configured(&signed));
+    // Persist completed carriers with the production append/readback and
+    // relocation path. Retaining every historical carrier in memory instead
+    // would test exhaustion of the unchanged 128 MiB verifier, not the roster
+    // admission contract. Relocation preserves every logical row and revision.
+    let maximum = crate::consensus::snapshot::SNAPSHOT_DATABASE_MAX_BYTES;
+    let (mut files, catalog) = timings.measure("setup_persistence", || {
+        Files::with_maximum(&storage, maximum)
+    });
+    drop(catalog);
+    storage.begin_changes().unwrap();
+    for ordinal in 1..=completed {
+        capacity_history_complete(&mut storage, ordinal, &mut timings);
+        if ordinal == 1 || ordinal % 1024 == 0 || ordinal == completed {
+            let witness = storage.business.roster.witness;
+            let version = Version::capture(&storage).unwrap();
+            let prepared = timings.measure("batch_prepare", || {
+                files.prepare(&mut storage, 18 + 2 * ordinal)
+            });
+            let (_, mut relocations) = timings
+                .measure("batch_append", || {
+                    prepared.append_with_relocations(&mut files.owner, &|| Ok(()))
+                })
+                .unwrap();
+            files.version = prepared.target_version();
+            files.cut = prepared.header.cut_binding;
+            drop(prepared);
+            timings.measure("batch_relocate", || {
+                while !relocations.is_empty() {
+                    drop(relocations.publish_step(&mut storage).unwrap());
+                }
+            });
+            let assertions = std::time::Instant::now();
+            version.require_current(&storage).unwrap();
+            assert!(storage.business.roster.witness == witness);
+            assert_eq!(storage.business.roster.rows.len(), ordinal as usize);
+            assert!(storage
+                .business
+                .roster
+                .rows
+                .values()
+                .all(|row| row.is_cold()));
+            timings.record("batch_assertions", assertions.elapsed());
+        }
+        if ordinal % 4096 == 0 {
+            eprintln!(
+                "roster completed history: {ordinal}/{completed}, elapsed={:?}",
+                started.elapsed()
+            );
+            timings.report(ordinal);
+        }
+    }
+    timings
+        .measure("final_validate_populated", || storage.validate_image())
+        .unwrap();
+    let before = timings.measure("final_context_before", || {
+        Version::capture(&storage)
+            .unwrap()
+            .context_digest()
+            .unwrap()
+    });
+    let witness = storage.business.roster.witness.unwrap();
+    assert_eq!(witness.retired_terminal_sequence(), 0);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("completed-rosters.opc");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    // This is the production physical snapshot bound, not a test count quota.
+    let prepared = timings
+        .measure("final_prepare_base", || {
+            PreparedBase::prepare(
+                &storage,
+                crate::consensus::native::generation::BaseParameters {
+                    binding: ROOT,
+                    file_epoch: 4,
+                    checkpoint_epoch: 11,
+                    operation_sequence: 18,
+                    cut_binding: CUT,
+                    block_bytes: BLOCK,
+                    maximum,
+                },
+                &|| Ok(()),
+            )
+        })
+        .unwrap();
+    let identity = timings
+        .measure("final_write_base", || {
+            prepared.write_to(&mut file, &|| Ok(()))
+        })
+        .unwrap();
+    timings
+        .measure("final_sync_base", || file.sync_all())
+        .unwrap();
+    let dropping = std::time::Instant::now();
+    drop(file);
+    drop(prepared);
+    let members = storage.business.members.clone();
+    drop(storage);
+    drop(files);
+    timings.record("final_drop_hot_storage", dropping.elapsed());
+    timings
+        .measure("final_preflight", || {
+            preflight_format(&path, identity, maximum, CUT, &|| Ok(()))
+        })
+        .unwrap();
+    let (_, catalog) = timings
+        .measure("final_catalog_open", || {
+            Catalog::open(
+                &path,
+                identity,
+                maximum,
+                crate::consensus::native::generation::CatalogScope {
+                    identity: signed.identity,
+                    members: &members,
+                    roster_root: Some(Arc::new(signed.root.clone())),
+                },
+                CUT,
+                &|| Ok(()),
+            )
+        })
+        .unwrap();
+    let mut restored = timings
+        .measure("final_into_storage", || catalog.into_storage(&|| Ok(())))
+        .unwrap();
+    let assertions = std::time::Instant::now();
+    assert_eq!(
+        Version::capture(&restored)
+            .unwrap()
+            .context_digest()
+            .unwrap(),
+        before
+    );
+    assert!(restored.business.roster.witness == Some(witness));
+    assert_eq!(
+        restored.business.roster.rows.len(),
+        usize::try_from(completed).unwrap()
+    );
+    assert!(restored
+        .business
+        .roster
+        .rows
+        .values()
+        .all(|row| row.is_cold()));
+    timings.record("final_reopen_assertions", assertions.elapsed());
+    timings
+        .measure("final_validate_reopened", || restored.validate_image())
+        .unwrap();
+    // Reopen is followed by another authenticated admission and completion,
+    // still without advancing the clock, retiring a row, or changing a lease.
+    capacity_history_complete(&mut restored, completed + 1, &mut timings);
+    timings
+        .measure("final_validate_continued", || restored.validate_image())
+        .unwrap();
+    timings.report(completed + 1);
+    eprintln!(
+        "roster completed history and cold reopen: {completed}, elapsed={:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn native_roster_completed_history_storage_smoke() {
+    capacity_history_progress_and_reopen(3);
+}
+
+#[test]
+fn native_roster_completed_history_exceeds_old_capacity_and_cold_reopens() {
+    // Literal historical boundary: never lower it using an environment knob.
+    capacity_history_progress_and_reopen(131_073);
 }

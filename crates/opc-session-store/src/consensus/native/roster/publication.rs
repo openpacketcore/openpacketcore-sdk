@@ -5,7 +5,12 @@
 use super::*;
 
 fn empty_without_root(ledger: &Ledger) -> io::Result<()> {
-    if !ledger.rows.is_empty() || !ledger.partitions.is_empty() || ledger.witness.is_some() {
+    if !ledger.rows.is_empty()
+        || !ledger.partitions.is_empty()
+        || ledger
+            .witness
+            .is_some_and(|witness| witness != GlobalChargeWitness::empty())
+    {
         return Err(invalid(
             "native roster state lacks its configured trust root",
         ));
@@ -51,6 +56,7 @@ pub(in crate::consensus::native) fn validate_candidate(
     delta.roster_changes.require_base(&delta.base.roster)?;
     delta.roster_changes.require_current(&delta.roster)?;
     delta.roster_changes.validate(check)?;
+    commands::validate_witness(&delta.frontiers, delta.roster.witness)?;
     for (key, row) in &delta.keys {
         check()?;
         reserved_matches(key, row, &delta.roster)?;
@@ -165,6 +171,51 @@ impl NativeState {
             .map_err(|_| invalid("native roster diagnostic witness projection invalid"))
     }
 
+    /// Read a bounded scheduling hint from the admitted publication and its
+    /// ordered indexes. The eventual command still validates its own current
+    /// authority and maintenance predecessor before changing any state.
+    pub(crate) fn protected_roster_maintenance_due(
+        &self,
+        now: Timestamp,
+    ) -> io::Result<(
+        crate::fenced_mutation_roster_storage::ProtectedRosterLedgerOccupancy,
+        bool,
+    )> {
+        use crate::fenced_mutation_roster::TERMINAL_RETENTION;
+        use crate::fenced_mutation_roster_storage::ConsensusMaintenanceTimestamp;
+
+        self.require_business_proof()?;
+        let witness = self
+            .roster
+            .certificate()?
+            .witness()
+            .unwrap_or_else(GlobalChargeWitness::empty);
+        let occupancy = witness
+            .diagnostic_occupancy()
+            .map_err(|_| invalid("native roster maintenance occupancy invalid"))?;
+        let now = self
+            .logical_time()
+            .map_or(now, |persisted| persisted.max(now));
+        let maintenance = ConsensusMaintenanceTimestamp::from_consensus_timestamp(now)
+            .map_err(|_| invalid("native roster maintenance time invalid"))?;
+        let retention = i128::try_from(TERMINAL_RETENTION.as_nanos())
+            .map_err(|_| invalid("native roster retention overflow"))?;
+        let Some(cutoff) = maintenance
+            .as_nanos()
+            .checked_sub(retention)
+            .filter(|cutoff| *cutoff >= 0)
+        else {
+            return Ok((occupancy, false));
+        };
+        let due = self.roster.index.has_due_retained(cutoff)
+            || self
+                .roster
+                .index
+                .first_terminal_state(witness.retired_terminal_sequence())?
+                == Some(State::Tombstone);
+        Ok((occupancy, due))
+    }
+
     pub(in crate::consensus::native) fn require_legacy_roster_absent(&self) -> io::Result<()> {
         if self.snapshot_origin.is_some() {
             return Err(invalid(
@@ -205,6 +256,7 @@ impl NativeState {
         check: &impl Fn() -> io::Result<()>,
     ) -> io::Result<Ledger> {
         check()?;
+        commands::validate_witness(&self.frontiers, witness)?;
         let mut rows = rows.into_iter();
         let mut partitions = partitions.into_iter();
         let ledger = if let Some(root) = self.roster_root.as_deref() {
@@ -228,13 +280,17 @@ impl NativeState {
         } else {
             if rows.next().transpose()?.is_some()
                 || partitions.next().is_some()
-                || witness.is_some()
+                || witness.is_some_and(|witness| witness != GlobalChargeWitness::empty())
             {
                 return Err(invalid(
                     "native roster state lacks its configured trust root",
                 ));
             }
-            Ledger::empty()
+            // Activation has no signed rows and can precede root configuration.
+            // Preserve its explicit virgin witness in the admitted certificate.
+            let mut edit = Edit::new(&Ledger::empty(), 0, 0)?;
+            edit.witness = witness;
+            edit.finish()?.0
         };
         // Check both directions against the newly rebuilt index. An orphan
         // business flag cannot be admitted by merely supplying no roster row.

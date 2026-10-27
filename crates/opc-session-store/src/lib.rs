@@ -252,6 +252,7 @@ pub use fenced_mutation_roster::{
     profile_v1_digest as fenced_mutation_roster_profile_v1_digest,
     profile_v2_digest as fenced_mutation_roster_profile_v2_digest,
     roster_executor_evidence_commitment, roster_ingress_capsule_commitment,
+    AdmissionClass as FencedMutationRosterAdmissionClass,
     AdmissionProposal as FencedMutationRosterAdmissionProposal, Error as FencedMutationRosterError,
     EstablishedMutation as FencedMutationRosterEstablishedMutation,
     Member as FencedMutationRosterMember,

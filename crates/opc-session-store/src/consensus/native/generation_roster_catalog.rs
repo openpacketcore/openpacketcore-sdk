@@ -18,7 +18,7 @@ pub(super) struct Section<'a> {
 }
 use crate::consensus::native::resident::RowFingerprint;
 use crate::fenced_mutation_roster::{
-    RequestBindingKey, RosterAttestationTrustRootV1, MAX_RESERVED_AND_RETAINED, TERMINAL_RETENTION,
+    RequestBindingKey, RosterAttestationTrustRootV1, TERMINAL_RETENTION,
 };
 use crate::fenced_mutation_roster_storage::{
     GlobalChargeBudget, GlobalChargeWitness, ProductionFloorKey, ProductionSnapshotAccounting,
@@ -300,14 +300,6 @@ impl Rosters {
             changed,
             base,
         } = section;
-        if changed
-            .into_iter()
-            .any(|count| count > validation::MAX_ITEMS)
-        {
-            return Err(invalid(
-                "native roster generation count exceeds original bound",
-            ));
-        }
         let minimum = (changed[0] as u64)
             .checked_mul(140)
             .and_then(|bytes| bytes.checked_add((changed[1] as u64).checked_mul(84)?))
@@ -400,7 +392,7 @@ impl Rosters {
                 .map_err(|_| invalid("native catalog partition charge differs"))?;
             self.summary[1].replace(prior, next.as_ref().map(|row| row.content))?;
             if let Some(next) = next {
-                put(&mut self.partitions, key, next, MAX_RESERVED_AND_RETAINED)?;
+                put_roster(&mut self.partitions, key, next)?;
             } else {
                 self.partitions.remove(&key);
             }
@@ -423,6 +415,8 @@ impl Rosters {
         }
         let scope = roster::fixed_scope(after.business.identity, &after.business.members);
         let mut maximum_retired = retired(before);
+        let mut maximum_retired_fence =
+            witness(before).map_or(0, GlobalChargeWitness::highest_retired_admission_fence);
         let mut rows_retained = false;
         for _ in 0..changed[0] {
             check()?;
@@ -485,6 +479,8 @@ impl Rosters {
                     }
                     new_history(old.map(|row| &row.row), &removed.row, before, base)?;
                     maximum_retired = maximum_retired.max(sequence);
+                    maximum_retired_fence =
+                        maximum_retired_fence.max(removed.row.original_admission_fence);
                     let key = ProductionFloorKey::from_binding(binding)
                         .map_err(|_| invalid("native catalog retired partition key invalid"))?;
                     let position = partitions
@@ -543,7 +539,7 @@ impl Rosters {
                 if base {
                     self.index.insert_catalog(&next.row.index)?;
                 }
-                put(&mut self.rows, binding, next, MAX_RESERVED_AND_RETAINED)?;
+                put_roster(&mut self.rows, binding, next)?;
             } else {
                 self.rows.remove(&binding);
             }
@@ -635,7 +631,11 @@ impl Rosters {
                     ));
                 }
             }
-            if maximum_retired != retired(after) {
+            if maximum_retired != retired(after)
+                || maximum_retired_fence
+                    != witness(after)
+                        .map_or(0, GlobalChargeWitness::highest_retired_admission_fence)
+            {
                 return Err(invalid(
                     "native catalog terminal retirement has no exact authenticated closure",
                 ));
@@ -724,10 +724,22 @@ impl Rosters {
     }
 }
 
+/// Grow only for an authenticated row under the resident-memory reservation.
+/// The ledger has no lifetime or retained-history cardinality quota.
+fn put_roster<K: Eq + Hash, V>(map: &mut HashMap<K, V>, key: K, value: V) -> io::Result<()> {
+    if !map.contains_key(&key) {
+        map.try_reserve(1)
+            .map_err(|_| invalid("native roster catalog allocation failed"))?;
+    }
+    map.insert(key, value);
+    Ok(())
+}
+
 pub(super) fn validate_context(
     context: &Context,
     root: Option<&RosterAttestationTrustRootV1>,
 ) -> io::Result<()> {
+    roster::validate_witness(&context.business.frontiers, witness(context))?;
     let expected = root.map(RosterAttestationTrustRootV1::fingerprint);
     let declared = context
         .business
@@ -736,11 +748,11 @@ pub(super) fn validate_context(
         .and_then(|roster| roster.root);
     if declared != expected
         || context.business.roster.as_ref().is_some_and(|roster| {
-            roster
-                .counts
-                .into_iter()
-                .any(|count| count > MAX_RESERVED_AND_RETAINED)
-                || (root.is_none() && (roster.counts != [0; 2] || roster.witness.is_some()))
+            root.is_none()
+                && (roster.counts != [0; 2]
+                    || roster
+                        .witness
+                        .is_some_and(|witness| witness != GlobalChargeWitness::empty()))
         })
     {
         return Err(invalid(
@@ -752,6 +764,8 @@ pub(super) fn validate_context(
 
 pub(super) fn transition(before: &Context, after: &Context) -> io::Result<()> {
     if retired(after) < retired(before)
+        || witness(after).map_or(0, GlobalChargeWitness::highest_retired_admission_fence)
+            < witness(before).map_or(0, GlobalChargeWitness::highest_retired_admission_fence)
         || (witness(before).is_some() && witness(after).is_none())
         || before
             .business

@@ -100,6 +100,21 @@ QUIESCENT_VOID_LIB_TESTS = (
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
     "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap",
 )
+# These three-minute arrival-rate proofs measure signed production work. Keep
+# their literal load and backlog bounds in the checked O1 timing profile.
+# The completion-congestion proofs also retain their literal operation budgets
+# while draining a deliberately held wave of signed requests.
+QUIESCENT_ROSTER_LIB_MODULE = "consensus::store::sequential_wal_sdk_tests"
+QUIESCENT_ROSTER_LIB_TESTS = (
+    "roster_maintenance_native_keeps_up_with_ten_due_rows_per_second",
+    "roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second",
+    "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_admission",
+    "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_completion",
+    "roster_completion::roster_completion_native_ordinary_wave_consumes_normal_quota",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_admission",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_completion",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_consumes_normal_quota",
+)
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
@@ -107,6 +122,7 @@ QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
     QUIESCENT_SELECTOR_LIB_TEST,
     *QUIESCENT_VOID_LIB_TESTS,
+    *QUIESCENT_ROSTER_LIB_TESTS,
     "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -139,6 +155,7 @@ QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
 )
 OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {
+        *QUIESCENT_ROSTER_LIB_TESTS,
         "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
         "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -149,7 +166,7 @@ OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
 )
 if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
     raise RuntimeError("optimized timing tests must also be isolated timing tests")
-# Keep O1 confined to the protected-transition and snapshot/restart proofs.
+# Keep O1 confined to protected-transition, roster-rate and snapshot/restart proofs.
 # Its functional counterpart uses the same optimized execution, debug
 # assertions, and overflow checks as the separate 100 ms performance gate.
 # Match the IPsec/i686 lanes.
@@ -348,6 +365,8 @@ def qualified_quiescent_lib_test(name: str) -> str:
         return f"{QUIESCENT_SELECTOR_LIB_MODULE}::{name}"
     if name in QUIESCENT_VOID_LIB_TESTS:
         return f"{QUIESCENT_VOID_LIB_MODULE}::{name}"
+    if name in QUIESCENT_ROSTER_LIB_TESTS:
+        return f"{QUIESCENT_ROSTER_LIB_MODULE}::{name}"
     return f"{QUIESCENT_LIB_MODULE}::{name}"
 
 
@@ -358,6 +377,9 @@ def quiescent_lib_command(name: str) -> list[str]:
         if name in OPTIMIZED_QUIESCENT_LIB_TESTS
         else []
     )
+    if name in QUIESCENT_ROSTER_LIB_TESTS:
+        profile += ["CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                    "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"]
     return profile + SELECTION + [
         "--lib",
         "--",
@@ -415,10 +437,13 @@ def serial_lib_command(name: str) -> list[str]:
 
 
 def lib_group_command(group: dict) -> list[str]:
-    if any(name in native_log_bound.TESTS for name in lib_group_names(group)):
-        return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", *SELECTION,
+    names = lib_group_names(group)
+    native = next((name for name in names if name in native_log_bound.TESTS), None)
+    if native is not None:
+        profile = native_log_bound.profile_env(native)
+        return ["env", *(f"{key}={value}" for key, value in profile.items()), *SELECTION,
                 "--lib", "--", "--test-threads=1", "--nocapture", "--exact",
-                *lib_group_names(group)]
+                *names]
     return SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_group_names(group)]
 
 
@@ -1095,7 +1120,9 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
             by_profile.setdefault(prefix, []).extend(lib_group_names(group))
         for prefix, names in by_profile.items():
             command = [*prefix, "--", "--list", "--exact", *names]
-            print(f"{shard}: compile/list {len(names)} library test(s) with {'O1' if 'CARGO_PROFILE_TEST_OPT_LEVEL=1' in prefix else 'ordinary'} profile", flush=True)
+            profile = next((f"O{arg.split('=', 1)[1]}" for arg in prefix
+                            if arg.startswith("CARGO_PROFILE_TEST_OPT_LEVEL=")), "ordinary")
+            print(f"{shard}: compile/list {len(names)} library test(s) with {profile} profile", flush=True)
             output = subprocess.run(
                 command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
             ).stdout

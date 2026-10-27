@@ -991,10 +991,13 @@ fn fenced_non_execution_readback_guards_retain_only_bounded_inflight_reads() {
         registry.inner.terminal_read_count.load(Ordering::Acquire),
         MAX_PROVIDER_IN_FLIGHT
     );
-    assert!(matches!(
-        registry.begin_terminal_read(identity.clone()),
-        Err(ExecutorError::ExecutorBusy)
-    ));
+    let above_former_capacity = registry.begin_terminal_read(identity.clone());
+    assert!(above_former_capacity.is_ok());
+    assert_eq!(
+        registry.inner.terminal_read_count.load(Ordering::Acquire),
+        MAX_PROVIDER_IN_FLIGHT + 1
+    );
+    drop(above_former_capacity);
     drop(guards);
     assert_eq!(
         registry.inner.terminal_read_count.load(Ordering::Acquire),
