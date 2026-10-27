@@ -8,7 +8,7 @@ use opc_protocol::{DecodeContext, Encode, EncodeContext};
 
 fn request(first: u8) -> (Vec<u8>, RegistrationRequest) {
     let mut wire = vec![first, 0, 11, 0xf2, 0x00, 0xf1, 0x10, 1, 0, 0x41, 0, 0, 0, 1];
-    wire.extend_from_slice(&[0x10, 1, 0x55]); // permitted non-critical unknown TLV
+    wire.extend_from_slice(&[0x10, 1, 0x55]); // 5GMM capability TLV
     let (_, request) = RegistrationRequest::decode_body(&wire, DecodeContext::default()).unwrap();
     (wire, request)
 }

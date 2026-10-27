@@ -146,10 +146,13 @@ profile failures and must cover at least these rules:
   request/response transaction orchestration.
 - SMF/UPF business logic, node selection, rule persistence, charging policy,
   traffic steering policy, or product-specific admission decisions.
-- PFD storage, Subscriber Management, and non-N4/Sxa/Sxb procedures outside
+- PFD Management, Subscriber Management, and non-N4/Sxa/Sxb procedures outside
   the profile-owned list.
 - Full typed coverage for every TS 29.244 IE outside the session-management
   profile.
+
+The PFD Management message envelope is decoded and validated, but the codec
+does not implement PFD storage or the full management procedure.
 
 ## Supported Features
 
