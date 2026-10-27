@@ -62,8 +62,9 @@ This document defines the conformance of the `opc-proto-gtpu` crate against the 
   wording was reversed). Both have typed decode; explicit legacy encoding is
   available for interop, not the current sender default.
 - **Comprehension scope**: wire-format recognition is separate from endpoint
-  comprehension. Both the control-port and N3 endpoint profiles comprehend PSC
-  only; 0x81–0x84 and 0xC0 require notification and discard at an endpoint even
+  comprehension. PSC is the supported required extension; UDP Port is supported
+  where applicable to control messages. Types 0x81–0x84 and 0xC0 require
+  notification and discard at an endpoint even
   though typed format decoding exists. The SGW/G-PDU exception for 0xC0 remains.
   Structural GTP-U decode retains raw known extensions;
   `ProcedureAware`, the typed decode and comprehension scan check fixed lengths.

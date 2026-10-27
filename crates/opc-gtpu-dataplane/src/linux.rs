@@ -1983,6 +1983,26 @@ impl GtpuSocketHandle {
             None
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn socket_cookie(&self) -> std::io::Result<u64> {
+        // The forced-unsupported profile disables the production GTP sys
+        // backend. Its injected UDP test sockets still need the real kernel
+        // identity so every lifetime and descriptor-replacement proof runs.
+        #[cfg(all(test, opc_linux_gtpu_sys_force_unsupported))]
+        if let Some(socket) = &self._test_socket {
+            let cookie = rustix::net::sockopt::socket_cookie(socket)?;
+            return if cookie == 0 {
+                Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+            } else {
+                Ok(cookie)
+            };
+        }
+        let fd = self
+            .linux_as_fd()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Unsupported))?;
+        opc_linux_gtpu_sys::socket_kernel_identity(fd).map(|identity| identity.socket_cookie())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

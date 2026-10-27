@@ -4925,11 +4925,13 @@ mod tests {
             let mut value = [0u8; 22];
             value[0] = 0x4d | spare;
             value[1] = 9;
-            let mut decoded = BearerQos::decode_value(&value, 7).unwrap();
+            let Ok(mut decoded) = BearerQos::decode_value(&value, 7) else {
+                panic!("received ARP spare bits must be ignored");
+            };
             assert_eq!(decoded.priority_flags, 0x4d);
             assert_eq!(decoded.allocation_retention_priority(), Ok(arp()));
             let mut encoded = BytesMut::new();
-            decoded.encode_value(&mut encoded).unwrap();
+            assert!(decoded.encode_value(&mut encoded).is_ok());
             assert_eq!(encoded[0], 0x4d);
             decoded.priority_flags |= spare;
             assert_eq!(

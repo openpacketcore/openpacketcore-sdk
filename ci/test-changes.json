@@ -618,7 +618,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel",
       "kind": "assertions-decreased",
-      "reason": "Restore main\u2019s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
+      "reason": "Restore main’s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
       "issue": 1018,
       "replacements": [
         "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::rate_budget_retention_preserves_lifetime_bound_across_limit_replacement"
@@ -1072,12 +1072,6 @@
       "issue": 1346
     },
     {
-      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_leaves_it",
-      "kind": "disabled",
-      "reason": "New Linux kernel-GTP proof requires CAP_NET_ADMIN, the GTP module, and an isolated network namespace. The privileged GTP-U workflow runs this entire ignored harness with explicit opt-in. Covers a real retained-socket response and stale-device refusal; ordinary unit tests cover tuple, budget, classification and registration boundaries.",
-      "issue": 1084
-    },
-    {
       "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::control_port_refuses_a_removed_kernel_attachment",
       "kind": "disabled",
       "reason": "New Linux kernel-GTP proof requires CAP_NET_ADMIN, the GTP module, and an isolated network namespace. The privileged GTP-U workflow runs this entire ignored harness with explicit opt-in. Covers a real retained-socket response and stale-device refusal; ordinary unit tests cover tuple, budget, classification and registration boundaries.",
@@ -1114,12 +1108,6 @@
       "renamed_to": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_are_ignored_and_out_of_range_levels_stay_rejected",
       "reason": "TS 29.274 7.7.8 requires receiver-ignored ARP spare bits. Check each spare combination with a valid level, retain level-zero and constructor-range rejection, and retain canonical sender-spare validation in the typed QoS unit test.",
       "issue": 1354
-    },
-    {
-      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_required_extensions_reach_shared_control_without_decap",
-      "kind": "assertions-decreased",
-      "reason": "Remove the codec-known branch that incorrectly expected WrongProcedure for RAN/PDCP formats. Every one of the 127 non-PSC required types now takes the same stronger exact SEHN wire-send assertions, preserving all tuple, byte, non-forwarding, optional-extension and malformed-chain checks (TS 29.281 5.2.1).",
-      "issue": 1529
     },
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::unknown_tunnel_wire_capture_and_echo_share_reopened_socket",

@@ -115,8 +115,8 @@ pub(super) fn open(
         }
         socket_io::set_packet_info(fd, owned.bind_address.is_ipv6())
             .map_err(|error| GtpuError::io("gtpu_control_port_packet_info", error))?;
-        let cookie = opc_linux_gtpu_sys::socket_kernel_identity(fd)
-            .map(|identity| identity.socket_cookie())
+        let cookie = handle
+            .socket_cookie()
             .map_err(|error| GtpuError::io("gtpu_control_port_identity", error))?;
         (Some(cookie), Arc::new(()))
     } else {
@@ -200,10 +200,7 @@ fn with_binding<T>(
                 .ok()
                 == Some(port.slot.ifindex)
             && socket_address(fd).ok() == Some(local)
-            && opc_linux_gtpu_sys::socket_kernel_identity(fd)
-                .ok()
-                .map(|identity| identity.socket_cookie())
-                == port.slot.socket_cookie;
+            && handle.socket_cookie().ok() == port.slot.socket_cookie;
         if matches {
             Ok(())
         } else {

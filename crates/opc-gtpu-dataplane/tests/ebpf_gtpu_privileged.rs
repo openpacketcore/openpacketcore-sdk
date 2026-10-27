@@ -3037,7 +3037,7 @@ fn grouped_entry(
     GtpuSessionEntry::new(
         GtpPdpContext {
             local_teid: Teid::new(local_teid).expect("nonzero grouped local TEID"),
-            peer_teid: Teid::new(peer_teid).expect("nonzero peer TEID").into(),
+            peer_teid: PeerTeid::new(peer_teid),
             ms_address: inner,
             peer_address: peer_outer,
             link_ifindex,
@@ -3155,7 +3155,7 @@ fn dedicated_session_context(
 ) -> GtpPdpContext {
     let mut context = session_context(link_ifindex);
     context.local_teid = Teid::new(local_teid).expect("nonzero local TEID");
-    context.peer_teid = Teid::new(peer_teid).expect("nonzero peer TEID").into();
+    context.peer_teid = PeerTeid::new(peer_teid);
     context.bearer_mark = Some(GtpBearerMark::new(mark).expect("nonzero bearer mark"));
     context
 }
