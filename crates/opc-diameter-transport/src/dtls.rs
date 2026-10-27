@@ -464,6 +464,10 @@ pub struct SctpWireLog {
 
 #[cfg(test)]
 impl SctpWireLog {
+    pub(crate) fn aborted(&self) -> bool {
+        self.shared.aborted.load(Ordering::Acquire)
+    }
+
     /// Snapshot the recorded wire emissions in order.
     pub fn records(&self) -> Vec<SctpWireRecord> {
         match self.records.lock() {
@@ -522,6 +526,7 @@ impl fmt::Debug for SctpWireLog {
 #[cfg(test)]
 struct InMemoryShared {
     closed: AtomicBool,
+    aborted: AtomicBool,
     terminal_changed: tokio::sync::watch::Sender<()>,
     block_a_to_b_dtls: AtomicBool,
     block_b_to_a_dtls: AtomicBool,
@@ -544,6 +549,11 @@ enum PreviousAuthKey {
 
 #[cfg(test)]
 impl SctpTransportClose for InMemoryClose {
+    fn abort(&self) {
+        self.shared.aborted.store(true, Ordering::Release);
+        self.close();
+    }
+
     fn close(&self) {
         self.shared.closed.store(true, Ordering::Release);
         self.shared.terminal_changed.send_replace(());
@@ -936,6 +946,7 @@ pub fn in_memory_sctp_link(
     let (b_tx, a_rx) = mpsc::channel(capacity.max(1));
     let shared = Arc::new(InMemoryShared {
         closed: AtomicBool::new(false),
+        aborted: AtomicBool::new(false),
         terminal_changed: tokio::sync::watch::Sender::default(),
         block_a_to_b_dtls: AtomicBool::new(false),
         block_b_to_a_dtls: AtomicBool::new(false),
@@ -1531,6 +1542,7 @@ pub enum DtlsSctpCipher {
     /// `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` (`0xC030`).
     EcdheRsaAes256GcmSha384,
     /// `TLS_DHE_RSA_WITH_AES_128_GCM_SHA256` (`0x009E`).
+    /// Legacy Release 18 option, prohibited by RFC 10015 / TS 33.210 Release 19.
     DheRsaAes128GcmSha256,
 }
 
@@ -1691,12 +1703,19 @@ impl DtlsSctpPolicy {
             .allowed_ciphers()
             .map(DtlsSctpCipher::dtls12_suite)
             .collect();
+        let provider = dimpl::crypto::rust_crypto::default_provider();
+        let allow_ffdhe = dtls12.iter().any(|suite| suite.has_dhe());
+        let groups: Vec<_> = provider
+            .supported_kx_groups()
+            .map(|group| group.name())
+            .filter(|group| !group.is_ffdhe() || allow_ffdhe)
+            .collect();
         let config = dimpl::Config::builder()
             // Bind this transport to the audited RustCrypto implementation.
             // `dimpl` also supports a process-global default provider, but an
             // unrelated dependency must not be able to replace the provider
             // authority for an already configured Diameter boundary.
-            .with_crypto_provider(dimpl::crypto::rust_crypto::default_provider())
+            .with_crypto_provider(provider)
             .require_client_certificate(true)
             // A connector must also prove that the remote server requested
             // and authenticated its local certificate. Verifying only the
@@ -1706,6 +1725,7 @@ impl DtlsSctpPolicy {
             .rfc6083_sctp()
             .dtls13_cipher_suites(&[])
             .dtls12_cipher_suites(&dtls12)
+            .kx_groups(&groups)
             .build()
             .map_err(|_| DiameterTlsError::MaterialNotAdmitted)?;
         Ok(Arc::new(config))
@@ -2685,7 +2705,13 @@ async fn receive_inband_cleartext_frame(
     {
         return Err(DiameterTlsError::CleartextInput);
     }
-    decode_wire_frame(Bytes::copy_from_slice(message.payload()), frame_limits)
+    let decoded = decode_wire_frame(Bytes::copy_from_slice(message.payload()), frame_limits);
+    if matches!(decoded, Err(DiameterTlsError::InvalidFrame)) {
+        // RFC 6733 section 2.1 applies before as well as after DTLS. Abort
+        // synchronously, before the lifetime guard can request graceful close.
+        io.close_handle().abort();
+    }
+    decoded
 }
 
 fn wall_expiry_deadline(expiry: Timestamp, now: Instant) -> Instant {
@@ -4986,5 +5012,76 @@ mod tests {
         let received = b.receive_message().await.expect("receive").expect("open");
         assert_eq!(received.ppid(), 0);
         assert_eq!(log.records()[0].ppid, 0);
+    }
+}
+
+#[cfg(test)]
+mod review_policy_tests {
+    use super::*;
+    #[test]
+    fn review_default_dtls_groups_exclude_ffdhe() {
+        let config = DtlsSctpPolicy::default().engine_config().unwrap();
+        assert!(config.kx_groups().all(|group| !group.name().is_ffdhe()));
+
+        // Walk the actual ClientHello using its RFC 6347 length fields, without
+        // sharing the engine's extension parser or matching raw byte patterns.
+        fn take<'a>(bytes: &mut &'a [u8], length: usize) -> &'a [u8] {
+            let (value, rest) = bytes.split_at(length);
+            *bytes = rest;
+            value
+        }
+        fn vector<'a>(bytes: &mut &'a [u8], width: usize) -> &'a [u8] {
+            let length = take(bytes, width)
+                .iter()
+                .fold(0usize, |n, byte| (n << 8) | usize::from(*byte));
+            take(bytes, length)
+        }
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = dimpl::DtlsCertificate {
+            // Only local ClientHello serialization is exercised.
+            certificate: vec![1],
+            intermediates: vec![],
+            private_key: key.serialize_der(),
+        };
+        let now = std::time::Instant::now();
+        let mut engine = dimpl::Dtls::new_12(config, certificate, now);
+        engine.set_active(true);
+        engine.handle_timeout(now).unwrap();
+        let mut buffer = vec![0; 2048];
+        let dimpl::Output::Packet(packet) = engine.poll_output(&mut buffer) else {
+            panic!("expected ClientHello");
+        };
+        assert_eq!(packet[0], 22); // handshake record
+        assert_eq!(packet[13], 1); // ClientHello
+        let mut hello = &packet[25..];
+        take(&mut hello, 2 + 32); // version and random
+        vector(&mut hello, 1); // session ID
+        vector(&mut hello, 1); // cookie
+        let suites = vector(&mut hello, 2);
+        assert_eq!(suites.len(), 6);
+        assert!(!suites.chunks_exact(2).any(|suite| suite == [0, 0x9e]));
+        vector(&mut hello, 1); // compression methods
+        let mut extensions = vector(&mut hello, 2);
+        assert!(hello.is_empty());
+        let mut offered_groups = None;
+        while !extensions.is_empty() {
+            let kind = take(&mut extensions, 2);
+            let mut value = vector(&mut extensions, 2);
+            if kind == [0, 10] {
+                assert!(offered_groups.is_none());
+                let groups = vector(&mut value, 2);
+                assert!(value.is_empty());
+                assert_eq!(groups.len() % 2, 0);
+                offered_groups = Some(
+                    groups
+                        .chunks_exact(2)
+                        .map(|group| u16::from_be_bytes([group[0], group[1]]))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        let groups = offered_groups.expect("supported_groups extension");
+        assert!(!groups.is_empty());
+        assert!(groups.iter().all(|group| !(256..512).contains(group)));
     }
 }

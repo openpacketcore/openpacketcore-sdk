@@ -237,6 +237,10 @@ pub(crate) fn dtls_material() -> TestMaterial {
 }
 
 fn rsa_dtls_material() -> TestMaterial {
+    rsa_dtls_material_with_server(true)
+}
+
+fn rsa_dtls_material_with_server(rsa_server: bool) -> TestMaterial {
     let ca = test_ca();
     let now = time::OffsetDateTime::now_utc();
     let state = |id| {
@@ -255,7 +259,11 @@ fn rsa_dtls_material() -> TestMaterial {
         )
     };
     let (client_source, client_rx) = watch::channel(Some(state(CLIENT_ID)));
-    let (_server_source, server_rx) = watch::channel(Some(state(SERVER_ID)));
+    let (_server_source, server_rx) = watch::channel(Some(if rsa_server {
+        state(SERVER_ID)
+    } else {
+        identity_state(SERVER_ID, &ca)
+    }));
     TestMaterial {
         client_source,
         _server_source,
@@ -2905,4 +2913,101 @@ async fn not_yet_valid_local_material_is_not_admitted() {
         Some(DiameterTlsError::MaterialNotAdmitted)
     );
     assert!(client_result.is_err(), "connector must fail closed");
+}
+
+#[tokio::test]
+async fn review_default_ecdsa_server_refuses_rsa_client_certificate() {
+    let material = rsa_dtls_material_with_server(false);
+    let (client_io, server_io, _) = in_memory_sctp_link(64);
+    let client = connector(&material, expected(SERVER_ID), DtlsSctpPolicy::default());
+    let server = acceptor(&material, expected(CLIENT_ID), DtlsSctpPolicy::default());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (client, server) = tokio::join!(
+        client.connect_direct(
+            Box::new(client_io) as Box<dyn SctpMessageIo>,
+            direct_session("client.example.test"),
+            deadline
+        ),
+        server.accept_direct(
+            Box::new(server_io) as Box<dyn SctpMessageIo>,
+            direct_session("server.example.test"),
+            deadline
+        )
+    );
+    assert!(
+        server.is_err(),
+        "default ECDSA server admitted RSA client authentication"
+    );
+    assert!(client.is_err());
+    assert_ne!(server.err(), Some(DiameterTlsError::DeadlineExceeded));
+}
+
+#[tokio::test]
+async fn review_explicit_rsa_policy_admits_rsa_client_with_ecdsa_server() {
+    let material = rsa_dtls_material_with_server(false);
+    let server_policy = DtlsSctpPolicy::default()
+        .with_allowed_ciphers(&[
+            DtlsSctpCipher::Aes128GcmSha256,
+            DtlsSctpCipher::EcdheRsaAes128GcmSha256,
+        ])
+        .unwrap();
+    let (client, server, _) = establish_pair(&material, DtlsSctpPolicy::default(), server_policy)
+        .await
+        .expect("explicit RSA client authentication with an ECDSA server");
+    assert_eq!(client.evidence().cipher(), DtlsSctpCipher::Aes128GcmSha256);
+    assert_eq!(server.evidence().cipher(), DtlsSctpCipher::Aes128GcmSha256);
+}
+
+#[tokio::test]
+async fn review_inband_malformed_frame_aborts_both_roles() {
+    let mut aborted = Vec::new();
+    for responder in [true, false] {
+        let material = dtls_material();
+        let (mut peer, local, log) = in_memory_sctp_link(8);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let error = if responder {
+            let server = acceptor(&material, expected(CLIENT_ID), DtlsSctpPolicy::default())
+                .begin_inband(
+                    Box::new(local),
+                    inband_capabilities("server.example.test"),
+                    peer_policy(),
+                )
+                .unwrap();
+            peer.send_raw_message(
+                opc_sctp::DIAMETER_SCTP_PPID.get(),
+                Bytes::from_static(b"bad"),
+            )
+            .await
+            .unwrap();
+            server.receive_capabilities_request(deadline).await.err()
+        } else {
+            let client = connector(&material, expected(SERVER_ID), DtlsSctpPolicy::default())
+                .begin_inband(
+                    Box::new(local),
+                    inband_capabilities("client.example.test"),
+                    peer_policy(),
+                )
+                .unwrap()
+                .send_capabilities_request(0x1234, 0x5678, deadline)
+                .await
+                .unwrap();
+            peer.send_raw_message(
+                opc_sctp::DIAMETER_SCTP_PPID.get(),
+                Bytes::from_static(b"bad"),
+            )
+            .await
+            .unwrap();
+            client
+                .receive_capabilities_answer_and_upgrade(deadline)
+                .await
+                .err()
+        };
+        assert_eq!(error, Some(DiameterTlsError::InvalidFrame));
+        aborted.push(log.aborted());
+    }
+    assert_eq!(
+        aborted,
+        [true, true],
+        "both prelude roles must abort before returning"
+    );
 }

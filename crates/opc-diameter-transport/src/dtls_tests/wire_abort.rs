@@ -110,4 +110,75 @@ async fn kernel_malformed_diameter_frames_abort_sequential_and_runtime_associati
                 .expect("idempotent after framing failure");
         }
     }
+
+    // The cleartext CER/CEA prelude has the same abort obligation in both roles.
+    for responder in [true, false] {
+        for malformed in [b"bad".to_vec(), mismatched.clone(), reserved_header.clone()] {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let (peer, local) =
+                generic::kernel_associations(true, crate::MAX_DTLS_SCTP_RECORD_BYTES, deadline)
+                    .await;
+            let local = crate::KernelSctpMessageIo::new(local, 64).expect("prelude carrier");
+            let local = Box::new(local) as Box<dyn SctpMessageIo>;
+            let error = if responder {
+                let server = acceptor(&material, expected(CLIENT_ID), DtlsSctpPolicy::default())
+                    .begin_inband(
+                        local,
+                        inband_capabilities("server.example.test"),
+                        peer_policy(),
+                    )
+                    .unwrap();
+                peer.send(opc_sctp::OutboundMessage::ordered(
+                    Bytes::from(malformed),
+                    0,
+                    opc_sctp::DIAMETER_SCTP_PPID,
+                ))
+                .await
+                .expect("malformed CER");
+                server.receive_capabilities_request(deadline).await.err()
+            } else {
+                let client = connector(&material, expected(SERVER_ID), DtlsSctpPolicy::default())
+                    .begin_inband(
+                        local,
+                        inband_capabilities("client.example.test"),
+                        peer_policy(),
+                    )
+                    .unwrap()
+                    .send_capabilities_request(0x1234, 0x5678, deadline)
+                    .await
+                    .unwrap();
+                peer.send(opc_sctp::OutboundMessage::ordered(
+                    Bytes::from(malformed),
+                    0,
+                    opc_sctp::DIAMETER_SCTP_PPID,
+                ))
+                .await
+                .expect("malformed CEA");
+                client
+                    .receive_capabilities_answer_and_upgrade(deadline)
+                    .await
+                    .err()
+            };
+            assert_eq!(error, Some(DiameterTlsError::InvalidFrame));
+            let event = tokio::time::timeout_at(deadline, async {
+                loop {
+                    let message = peer.recv().await.expect("peer observes prelude abort");
+                    if matches!(message.event, Some(opc_sctp::SctpEvent::AssociationChange { state, .. }) if state != 0)
+                        || matches!(message.event, Some(opc_sctp::SctpEvent::Shutdown { .. }))
+                    {
+                        break message.event;
+                    }
+                }
+            })
+            .await
+            .expect("bounded prelude terminal notification");
+            assert!(
+                matches!(
+                    event,
+                    Some(opc_sctp::SctpEvent::AssociationChange { state: 1, .. })
+                ),
+                "malformed prelude must produce COMM_LOST: {event:?}"
+            );
+        }
+    }
 }

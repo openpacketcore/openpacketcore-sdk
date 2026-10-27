@@ -103,9 +103,9 @@ def main():
     args = parser.parse_args()
     assert os.geteuid() == 0
     assert os.readlink("/proc/self/ns/net") != os.readlink("/proc/1/ns/net")
-    qualify(args.sctp_binary, "tests::loopback_wire_abort_closes_with_live_handles_and_pending_receive", args.output / "explicit-abort", 1, 0)
+    qualify(args.sctp_binary, "tests::loopback_wire_abort_closes_with_live_handles_and_pending_receive", args.output / "explicit-abort", 2, 0)
     qualify(args.sctp_binary, "tests::loopback_recv_diameter_payload_surfaces_close_after_shutdown", args.output / "queued-shutdown", 0, 3)
-    qualify(args.diameter_binary, "dtls_tests::wire_abort::kernel_malformed_diameter_frames_abort_sequential_and_runtime_associations", args.output / "malformed-diameter", 6, 0)
+    qualify(args.diameter_binary, "dtls_tests::wire_abort::kernel_malformed_diameter_frames_abort_sequential_and_runtime_associations", args.output / "malformed-diameter", 12, 0)
     qualify(args.diameter_binary, "dtls_tests::kernel_loopback_completes_real_rfc6083_handshake_and_reciprocal_close", args.output / "dtls-close", 0, 4)
 
 

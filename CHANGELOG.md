@@ -248,6 +248,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Stored records with enabled TFC from builds that omitted it from authentication
   require a fresh install when crossing this format change. Refs #1344.
 
+- `opc-identity`: add general-PKI URI extraction and local validation through
+  `extract_spiffe_id_from_pki_cert_der`, `validate_local_pki_identity` and
+  `LocalPkiUsage`, plus `SpiffeSanError::MultipleSpiffeIds`. Transports retain
+  the strict SPIFFE SVID profile. Refs #1353.
+- `opc-diameter-transport`: add `DiameterTlsVersion::Tls12`, ECDHE-ECDSA/RSA
+  TLS 1.2 AES-GCM cipher evidence, and opt-in DTLS RSA/DHE cipher evidence.
+  `tls12_legacy_dhe_rsa` and the TLS/management builders' separate
+  `with_legacy_dhe_rsa` option expose the older Release 18 DHE-RSA exception;
+  normal compatibility excludes it under RFC 10015 / TS 33.210 Release 19.
+  Refs #1353.
+- `opc-sctp`: expose synchronous `SctpAssociationAbortHandle::abort_on_wire`
+  and `DiameterSctpAssociation::abort_handle` for RFC 6733 framing failure.
+  The legacy `abort()` operation retains SHUT_RDWR graceful-shutdown semantics.
+  Refs #1351.
+
 ### Fixed
 
 - `opc-session-net`: preserve configured reconnect admission for the first
@@ -537,6 +552,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uncompressed public points and wire signature formats remain unchanged.
   The vendored minimum Rust version becomes 1.88, below the SDK's 1.89 floor.
 
+- Keep RSA client certificates and FFDHE groups out of default ECDSA-only
+  DTLS server/client policy. Explicit RSA authentication and legacy DHE remain
+  available through the configured allowlists. Refs #1353.
+- Abort malformed fixed Diameter framing on both cleartext DTLS/SCTP prelude
+  roles, and expose wire-abort authority to unprotected Diameter parsers.
+  Native regressions require COMM_LOST and retain graceful-close controls.
+  Refs #1351.
+- Remove the accepted RUSTSEC-2026-0386/0387 ignores after the owned Tokio
+  registration and vendored RustCrypto upgrades. Retain the audit of every
+  tracked lockfile and reject the former crypto-bigint 0.5.5 exception.
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a
@@ -573,6 +599,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConsensusClusterId::for_installation`. Qualification node manifests and their
   rendered readiness probes derive the same installation-qualified voter IDs.
   Refs #1187.
+
+- Strict SVID loading rejects a present EKU unless it contains both clientAuth
+  and serverAuth. TLS 1.2 compatibility now requires Extended Master Secret,
+  including management `TlsBootstrap::with_tls12_compat`; peers omitting EMS
+  are refused. `DiameterTlsPolicy::version()` reports the minimum admitted
+  version. The added `DiameterTlsPolicyError::CipherVersionMismatch` is a
+  source break for downstream exhaustive matches. Refs #1353.
+- Vendored DTLS signature capabilities include modern RSA schemes. Server
+  CertificateRequest types/schemes and CertificateVerify acceptance follow
+  configured cipher families, preserving ECDSA-only default client
+  authentication in the SDK. ClientHello suite offers no longer depend on
+  the client certificate's signing key. Refs #1353.
 
 ### Breaking
 

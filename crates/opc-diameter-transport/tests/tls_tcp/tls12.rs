@@ -60,7 +60,7 @@ fn rsa_identity(spiffe_id: &str, ca: &TestCa) -> IdentityState {
     .unwrap()
 }
 
-fn compatibility_material(rsa: bool) -> TestTlsMaterial {
+fn compatibility_material(rsa: bool, legacy_dhe: bool) -> TestTlsMaterial {
     let ca = test_ca();
     let make = if rsa { rsa_identity } else { identity_state };
     let (client_source, client_rx) = watch::channel(Some(make(CLIENT_ID, &ca)));
@@ -68,11 +68,13 @@ fn compatibility_material(rsa: bool) -> TestTlsMaterial {
     let client = TlsConfigBuilder::new(client_rx)
         .allow_any_trusted_peer()
         .with_compat_mode(true)
+        .with_legacy_dhe_rsa(legacy_dhe)
         .build_authenticated_client_config()
         .unwrap();
     let server = TlsConfigBuilder::new(server_rx)
         .allow_any_trusted_peer()
         .with_compat_mode(true)
+        .with_legacy_dhe_rsa(legacy_dhe)
         .build_authenticated_server_config()
         .unwrap();
     TestTlsMaterial {
@@ -96,8 +98,11 @@ async fn tls12_certificate_suites_carry_diameter_in_both_directions() {
         let policy = DiameterTlsPolicy::tls12_compatibility(DiameterFrameLimits::default())
             .with_allowed_ciphers(&[cipher])
             .unwrap();
-        let (_material, mut client, mut server) =
-            negotiated_direct_connections_with(compatibility_material(rsa), policy).await;
+        let (_material, mut client, mut server) = negotiated_direct_connections_with(
+            compatibility_material(rsa, cipher == DiameterTlsCipher::DheRsaAes128GcmSha256),
+            policy,
+        )
+        .await;
         for connection in [&mut client, &mut server] {
             assert_eq!(connection.evidence().version(), DiameterTlsVersion::Tls12);
             assert_eq!(connection.evidence().cipher(), cipher);
@@ -142,7 +147,7 @@ async fn tls12_certificate_suites_carry_diameter_in_both_directions() {
 async fn compatibility_keeps_tls13_preferred_and_retires_on_material_loss() {
     let policy = DiameterTlsPolicy::tls12_compatibility(DiameterFrameLimits::default());
     let (material, client, server) =
-        negotiated_direct_connections_with(compatibility_material(false), policy).await;
+        negotiated_direct_connections_with(compatibility_material(false, false), policy).await;
     assert_eq!(client.evidence().version(), DiameterTlsVersion::Tls13);
     assert_eq!(server.evidence().version(), DiameterTlsVersion::Tls13);
     drop((client, server));
@@ -187,9 +192,19 @@ async fn tls12_inband_upgrade_keeps_capabilities_and_application_boundaries() {
         .with_allowed_ciphers(&[DiameterTlsCipher::EcdheRsaAes128GcmSha256])
         .unwrap();
     exercise_inband_upgrade(
-        compatibility_material(true),
+        compatibility_material(true, false),
         policy,
         DiameterTlsVersion::Tls12,
     )
     .await;
+}
+
+#[test]
+fn review_diameter_tls12_compatibility_excludes_legacy_dhe() {
+    let policy = DiameterTlsPolicy::tls12_compatibility(DiameterFrameLimits::default());
+    assert!(!policy.allows_cipher(DiameterTlsCipher::DheRsaAes128GcmSha256));
+    assert!(
+        DiameterTlsPolicy::tls12_legacy_dhe_rsa(DiameterFrameLimits::default())
+            .allows_cipher(DiameterTlsCipher::DheRsaAes128GcmSha256)
+    );
 }

@@ -756,8 +756,10 @@ impl State {
     fn send_certificate_request(self, server: &mut Server) -> Result<Self, InternalError> {
         debug!("Sending CertificateRequest");
         // Select CertificateRequest.signature_algorithms as intersection of client's list and our supported
-        let sig_algs =
-            select_certificate_request_sig_algs(server.client_signature_algorithms.as_ref());
+        let sig_algs = select_certificate_request_sig_algs(
+            server.engine.config(),
+            server.client_signature_algorithms.as_ref(),
+        );
         debug!(
             "CertificateRequest will advertise {} signature algorithms",
             sig_algs.len()
@@ -1055,13 +1057,10 @@ impl State {
             .into());
         }
 
-        let requested =
-            select_certificate_request_sig_algs(server.client_signature_algorithms.as_ref());
-        let requested = if requested.is_empty() {
-            SignatureAndHashAlgorithm::supported().as_slice()
-        } else {
-            requested.as_slice()
-        };
+        let requested = select_certificate_request_sig_algs(
+            server.engine.config(),
+            server.client_signature_algorithms.as_ref(),
+        );
         if !requested.contains(&signature_algorithm) {
             return Err(Error::SecurityError(
                 crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm,
@@ -1489,21 +1488,24 @@ fn handshake_serialize_certificate_request(
     body: &mut Buf,
     sig_algs: &SignatureAndHashAlgorithmVec,
 ) -> Result<(), Error> {
-    let cert_types = CertificateTypeVec::from(*ClientCertificateType::supported());
-
-    // If intersection is empty (e.g., client didn't advertise), fall back to our supported set
-    // Build the selected list with the capacity expected by CertificateRequest
-    let mut selected = SignatureAndHashAlgorithmVec::new();
     if sig_algs.is_empty() {
-        let fallback = SignatureAndHashAlgorithm::supported();
-        for alg in fallback.iter() {
-            selected.push(*alg);
-        }
-    } else {
-        for alg in sig_algs.iter() {
-            selected.push(*alg);
+        return Err(Error::SecurityError(
+            crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm,
+        ));
+    }
+    let mut cert_types = CertificateTypeVec::new();
+    for (algorithm, certificate_type) in [
+        (SignatureAlgorithm::ECDSA, ClientCertificateType::ECDSA_SIGN),
+        (SignatureAlgorithm::RSA, ClientCertificateType::RSA_SIGN),
+    ] {
+        if sig_algs
+            .iter()
+            .any(|scheme| scheme.signature_algorithm() == algorithm)
+        {
+            cert_types.push(certificate_type);
         }
     }
+    let selected = sig_algs.clone();
 
     let cert_auths: ArrayVec<DistinguishedName, 32> = ArrayVec::new();
 
@@ -1569,24 +1571,28 @@ fn select_ske_signature_algorithm(
 }
 
 fn select_certificate_request_sig_algs(
+    config: &Config,
     client_algs: Option<&SignatureAndHashAlgorithmVec>,
 ) -> SignatureAndHashAlgorithmVec {
-    // Only select algorithms supported by dimpl's signature verifiers.
-    let ours = SignatureAndHashAlgorithm::supported();
-
-    // Build intersection preserving client preference order
-    let mut out = ArrayVec::new();
-    if let Some(list) = client_algs {
-        for alg in list.iter() {
-            if ours
-                .iter()
-                .any(|a| a.hash == alg.hash && a.signature == alg.signature)
-            {
-                out.push(*alg);
-            }
-        }
-    }
-    out
+    // RFC 5246 section 7.4.4: these are the server's accepted client-auth
+    // algorithms. Provider capability alone must not broaden local policy.
+    // RSA client authentication requires an enabled RSA-authenticated suite.
+    let permitted = |scheme: &SignatureAndHashAlgorithm| {
+        SignatureAndHashAlgorithm::supported().contains(scheme)
+            && config.dtls12_cipher_suites().any(|suite| {
+                suite.suite().signature_algorithm() == Some(scheme.signature_algorithm())
+            })
+    };
+    // Preserve the client's preference when present. An absent extension uses
+    // our policy list; a present list with no intersection stays empty.
+    client_algs
+        .map_or(SignatureAndHashAlgorithm::supported().as_slice(), |list| {
+            list.as_slice()
+        })
+        .iter()
+        .copied()
+        .filter(permitted)
+        .collect()
 }
 
 #[cfg(test)]
@@ -2073,6 +2079,130 @@ mod tests {
     }
 
     #[test]
+    fn review_ecdsa_policy_certificate_request_excludes_rsa() {
+        let config = Arc::new(
+            Config::builder()
+                .dtls13_cipher_suites(&[])
+                .dtls12_cipher_suites(&[Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256])
+                .build()
+                .unwrap(),
+        );
+        // Exercise both a present broad client offer and the absent extension.
+        for offered in [
+            Some(SignatureAndHashAlgorithmVec::from(
+                *SignatureAndHashAlgorithm::supported(),
+            )),
+            None,
+        ] {
+            let mut server = Server::new_psk(Arc::clone(&config), Instant::now());
+            server.client_signature_algorithms = offered;
+            State::SendCertificateRequest
+                .send_certificate_request(&mut server)
+                .unwrap();
+            let mut buffer = vec![0; 2048];
+            let Output::Packet(packet) = server.engine.poll_output(&mut buffer, Instant::now())
+            else {
+                panic!("expected CertificateRequest");
+            };
+            let (_, request) =
+                CertificateRequest::parse(&packet[DTLSRecord::HEADER_LEN + 12..], 0).unwrap();
+            assert_eq!(
+                request.certificate_types.as_slice(),
+                &[ClientCertificateType::ECDSA_SIGN]
+            );
+            assert!(!request.supported_signature_algorithms.is_empty());
+            assert!(
+                request
+                    .supported_signature_algorithms
+                    .iter()
+                    .all(|alg| alg.signature == SignatureAlgorithm::ECDSA)
+            );
+        }
+    }
+
+    #[test]
+    fn review_ecdsa_policy_refuses_rsa_certificate_verify() {
+        let config = Arc::new(
+            Config::builder()
+                .dtls13_cipher_suites(&[])
+                .dtls12_cipher_suites(&[Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256])
+                .build()
+                .unwrap(),
+        );
+        for offered in [
+            Some(SignatureAndHashAlgorithmVec::from(
+                *SignatureAndHashAlgorithm::supported(),
+            )),
+            None,
+            Some(SignatureAndHashAlgorithmVec::new()),
+            Some(
+                [SignatureAndHashAlgorithm::new(
+                    HashAlgorithm::SHA256,
+                    SignatureAlgorithm::RSA,
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        ] {
+            let mut server = Server::new_psk(Arc::clone(&config), Instant::now());
+            server.client_signature_algorithms = offered;
+            server.client_certificates.push(vec![1].to_buf());
+            server
+                .engine
+                .parse_packet(&epoch0_handshake_packet(
+                    MessageType::CertificateVerify,
+                    0,
+                    &[4, 1, 0, 1, 0],
+                ))
+                .unwrap();
+            let result = State::AwaitCertificateVerify.await_certificate_verify(&mut server);
+            assert!(
+                matches!(
+                    result,
+                    Err(InternalError::Fatal(Error::SecurityError(
+                        crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm
+                    )))
+                ),
+                "RSA must be refused before certificate/signature validation: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_ecdsa_policy_refuses_certificate_request_without_a_common_scheme() {
+        let config = Arc::new(
+            Config::builder()
+                .dtls13_cipher_suites(&[])
+                .dtls12_cipher_suites(&[Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256])
+                .build()
+                .unwrap(),
+        );
+        for offered in [
+            SignatureAndHashAlgorithmVec::new(),
+            [SignatureAndHashAlgorithm::new(
+                HashAlgorithm::SHA256,
+                SignatureAlgorithm::RSA,
+            )]
+            .into_iter()
+            .collect(),
+        ] {
+            let mut server = Server::new_psk(Arc::clone(&config), Instant::now());
+            server.client_signature_algorithms = Some(offered);
+            assert!(matches!(
+                State::SendCertificateRequest.send_certificate_request(&mut server),
+                Err(InternalError::Fatal(Error::SecurityError(
+                    crate::SecurityError::NoMutuallyAcceptableSignatureAlgorithm
+                )))
+            ));
+            let mut buffer = vec![0; 2048];
+            assert!(!matches!(
+                server.engine.poll_output(&mut buffer, Instant::now()),
+                Output::Packet(_)
+            ));
+        }
+    }
+
+    #[test]
     fn certificate_request_selects_rsa_and_ecdsa_signatures() {
         let mut client = SignatureAndHashAlgorithmVec::new();
         client.push(SignatureAndHashAlgorithm::new(
@@ -2084,7 +2214,8 @@ mod tests {
             SignatureAlgorithm::RSA,
         ));
 
-        let selected = select_certificate_request_sig_algs(Some(&client));
+        let selected =
+            select_certificate_request_sig_algs(&Config::builder().build().unwrap(), Some(&client));
 
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[1], client[1]);
@@ -2100,7 +2231,8 @@ mod tests {
             SignatureAlgorithm::RSA,
         ));
 
-        let selected = select_certificate_request_sig_algs(Some(&client));
+        let selected =
+            select_certificate_request_sig_algs(&Config::builder().build().unwrap(), Some(&client));
 
         assert_eq!(selected, client);
     }

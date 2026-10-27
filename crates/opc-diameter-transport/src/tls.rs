@@ -80,6 +80,7 @@ pub enum DiameterTlsCipher {
     /// TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 (TLS 1.2).
     EcdheRsaAes256GcmSha384,
     /// TLS_DHE_RSA_WITH_AES_128_GCM_SHA256 (TLS 1.2, RFC 7919 named groups).
+    /// Legacy Release 18 option, prohibited by RFC 10015 / TS 33.210 Release 19.
     DheRsaAes128GcmSha256,
 }
 
@@ -177,16 +178,28 @@ impl DiameterTlsPolicy {
         }
     }
 
-    /// Admit TLS 1.3 and TLS 1.2 with ECDHE/DHE AES-GCM certificate suites.
+    /// Admit TLS 1.3 and TLS 1.2 with ECDHE AES-GCM certificate suites.
     ///
     /// The supplied `opc-tls` config must also enable `with_compat_mode(true)`.
     /// TLS 1.3 remains preferred. Static RSA, CBC and obsolete versions are not
-    /// admitted. DHE uses the RFC 7919 FFDHE4096/2048 groups.
+    /// admitted. Finite-field DHE requires [`Self::tls12_legacy_dhe_rsa`].
     pub const fn tls12_compatibility(frame_limits: DiameterFrameLimits) -> Self {
         Self {
             version: DiameterTlsVersion::Tls12,
-            allowed_ciphers: [true; 8],
+            allowed_ciphers: [true, true, true, true, true, true, true, false],
             ..Self::tls13(frame_limits)
+        }
+    }
+
+    /// Also admit legacy TLS 1.2 DHE-RSA/AES-128-GCM with FFDHE4096/2048.
+    ///
+    /// The `opc-tls` config must separately enable `with_legacy_dhe_rsa(true)`
+    /// and TLS 1.2 compatibility. This Release 18 exception is outside the
+    /// RFC 10015 / TS 33.210 Release 19 cipher policy targeted by the defaults.
+    pub const fn tls12_legacy_dhe_rsa(frame_limits: DiameterFrameLimits) -> Self {
+        Self {
+            allowed_ciphers: [true; 8],
+            ..Self::tls12_compatibility(frame_limits)
         }
     }
 

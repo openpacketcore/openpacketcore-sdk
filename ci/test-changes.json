@@ -618,7 +618,7 @@
     {
       "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_downlink_oversized_dont_fragment_is_fragmented_inside_the_tunnel",
       "kind": "assertions-decreased",
-      "reason": "Restore main’s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
+      "reason": "Restore main\u2019s successful live default-limit update instead of the erroneous InvalidLimits expectation. The static count loses unwrap_err(), while assert_eq!(setter_result, Ok(())) and all packet, rate-limit, ESP, silence and deadline assertions remain. The per-destination lifetime test independently enforces RFC 6864 section 4.3 across replacements, and the native scenario passes with the restored contract.",
       "issue": 1018,
       "replacements": [
         "rust:crates/opc-gtpu-dataplane::lib=lib::reassembly::tests::rate_budget_retention_preserves_lifetime_bound_across_limit_replacement"
@@ -1001,6 +1001,20 @@
       "issue": 1353,
       "reason": "Renamed to certificate_request_accepts_rsa_only_signatures for implemented DTLS RSA support. RSA-only modern offers now work. New CertificateRequest and CertificateVerify tests reject mismatched certificate types and unoffered schemes; independent OpenSSL handshakes exercise both roles with every supported RSA scheme.",
       "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_accepts_rsa_only_signatures"
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_reviewed_vendored_legacy_stack_is_accepted",
+      "kind": "removed",
+      "issue": 1532,
+      "reason": "The DTLS arithmetic migration removes the RUSTSEC-2026-0387 exception. The same formerly accepted 0.5.5 dependency graph must now fail before any audit. Retain the graph fixture and strengthen it to require explicit rejection; the separate migrated-stack regression also requires both advisory ignore lists to exclude 0386 and 0387.",
+      "renamed_to": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_reviewed_vendored_legacy_stack_is_rejected"
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_standalone_checked_in_fork_is_the_only_allowed_terminal_dimpl",
+      "kind": "removed",
+      "issue": 1532,
+      "reason": "The standalone vendored DTLS workspace no longer has an exception for crypto-bigint 0.5.5. Retain both standalone and root-lock fixtures and require rejection before auditing the vulnerable graph, while preserving the successful root audit before a later vendor-lock failure.",
+      "renamed_to": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_standalone_checked_in_fork_also_rejects_legacy_crypto"
     }
   ]
 }

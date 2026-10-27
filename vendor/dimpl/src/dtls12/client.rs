@@ -573,11 +573,12 @@ impl State {
             .into());
         }
 
-        // Enforce cipher suite is compatible with our private key and allowed by config
+        // Enforce certificate/PSK mode and configured suites. The server key
+        // algorithm is independent of our client-authentication key.
         let is_compatible = client
             .engine
             .crypto_context()
-            .is_cipher_suite_compatible(cs);
+            .is_client_cipher_suite_compatible(cs);
 
         if !is_compatible {
             return Err(Error::SecurityError(
@@ -1441,12 +1442,17 @@ fn handshake_create_client_hello(
 ) -> Result<(), Error> {
     let client_version = ProtocolVersion::DTLS1_2;
 
-    // Get cipher suites from config that are compatible with our key
+    // Offer configured server suites independently of our client certificate.
+    // Certificate and PSK authentication modes still cannot be mixed.
     let cipher_suites: CipherSuiteVec = engine
         .config()
         .dtls12_cipher_suites()
         .map(|cs| cs.suite())
-        .filter(|suite| engine.crypto_context().is_cipher_suite_compatible(*suite))
+        .filter(|suite| {
+            engine
+                .crypto_context()
+                .is_client_cipher_suite_compatible(*suite)
+        })
         .take(Dtls12CipherSuite::supported().len())
         .collect();
 
@@ -1623,6 +1629,47 @@ mod tests {
     use super::*;
     use crate::PskResolver;
     use crate::dtls12::message::{ServerHello, SrtpProfileId};
+
+    #[test]
+    fn review_client_offers_server_suites_independently_of_its_certificate_key() {
+        let suite = Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256;
+        let config = Arc::new(
+            Config::builder()
+                .dtls13_cipher_suites(&[])
+                .dtls12_cipher_suites(&[suite])
+                .build()
+                .unwrap(),
+        );
+        // Negotiation-only fixture: no peer accepts this synthetic certificate.
+        let certificate = crate::DtlsCertificate {
+            certificate: vec![1],
+            intermediates: vec![],
+            private_key: openssl::rsa::Rsa::generate(2048)
+                .unwrap()
+                .private_key_to_der()
+                .unwrap(),
+        };
+        let private_key = config
+            .crypto_provider()
+            .key_provider
+            .load_private_key(&certificate.private_key)
+            .unwrap();
+        let auth = AuthMode::Certificate {
+            certificates: vec![certificate.certificate.clone()],
+            private_key,
+        };
+        let mut client = Client::new_with_engine(Engine::new(config, auth), Instant::now());
+        client.random = Some(Random { bytes: [0x77; 32] });
+        State::SendClientHello
+            .send_client_hello(&mut client)
+            .unwrap();
+        let mut buffer = vec![0; 2048];
+        let Output::Packet(packet) = client.engine.poll_output(&mut buffer, Instant::now()) else {
+            panic!("expected ClientHello");
+        };
+        let (_, hello) = ClientHello::parse(&packet[13 + 12..], 0).unwrap();
+        assert_eq!(hello.cipher_suites.as_slice(), &[suite]);
+    }
 
     #[test]
     fn independently_signed_dhe_parameters_are_authenticated_then_policy_checked() {

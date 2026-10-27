@@ -438,8 +438,13 @@ The legacy `abort()` operation uses SHUT_RDWR and initiates graceful SCTP
 shutdown. Normal drop also lets the kernel drain queued sends; neither path
 promises delivery through a peer or network failure. Applications can use the
 existing sender-dry barrier when they need confirmation of prior send drain.
-The DTLS Diameter adapter uses wire ABORT for unparseable Diameter frames and
-retains its reciprocal close-notify procedure for normal close.
+The DTLS Diameter adapter uses wire ABORT for unparseable fixed Diameter
+framing in protected receivers and both cleartext prelude roles, and retains
+reciprocal close-notify for normal close. `DiameterSctpAssociation::abort_handle`
+exposes the same close authority to unprotected Diameter callers. That facade
+validates SCTP metadata and returns opaque payload bytes; the caller owns
+Diameter parsing and must invoke `abort_on_wire` for an unparseable frame.
+Its sends use ordered stream zero, and its receive API omits stream metadata.
 
 ### Legacy Diameter PPID 0 interoperability
 

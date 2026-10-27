@@ -1833,6 +1833,18 @@ impl DiameterSctpAssociation {
         &self.peer
     }
 
+    /// Retain synchronous close authority for this association.
+    ///
+    /// This facade validates SCTP metadata and returns opaque payload bytes.
+    /// The caller that parses Diameter must call
+    /// [`SctpAssociationAbortHandle::abort_on_wire`] when a frame cannot be
+    /// parsed, as required by RFC 6733 section 2.1. The handle remains usable
+    /// while a receive is pending and closes all references to the association.
+    #[must_use]
+    pub fn abort_handle(&self) -> SctpAssociationAbortHandle {
+        self.association.abort_handle()
+    }
+
     /// Send one encoded Diameter payload with the peer's configured
     /// unprotected PPID.
     ///
@@ -8889,5 +8901,43 @@ mod tests {
                 .await,
             Err(SctpError::Closed)
         ));
+
+        // The payload facade leaves Diameter parsing to its caller. That caller
+        // must retain the same wire-abort authority as a raw association.
+        let (_listener, facade, peer) = diameter_loopback("127.0.0.1:0".parse().unwrap()).await;
+        peer.send(OutboundMessage::ordered(
+            Bytes::from_static(b"bad"),
+            0,
+            DIAMETER_SCTP_PPID,
+        ))
+        .await
+        .expect("malformed Diameter payload");
+        assert_eq!(
+            facade.recv_diameter_payload().await.unwrap(),
+            Bytes::from_static(b"bad")
+        );
+        let facade_abort = facade.abort_handle();
+        facade_abort
+            .abort_on_wire()
+            .expect("caller aborts unparseable Diameter");
+        assert!(!facade.health().socket_open);
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = peer.recv().await.expect("peer terminal notification");
+                if matches!(message.event, Some(SctpEvent::AssociationChange { state, .. }) if state != 0)
+                    || matches!(message.event, Some(SctpEvent::Shutdown { .. })) {
+                    break message.event;
+                }
+            }
+        })
+        .await
+        .expect("bounded facade abort");
+        assert!(
+            matches!(event, Some(SctpEvent::AssociationChange { state: 1, .. })),
+            "facade caller must produce COMM_LOST: {event:?}"
+        );
+        facade_abort
+            .abort_on_wire()
+            .expect("idempotent facade abort");
     }
 }

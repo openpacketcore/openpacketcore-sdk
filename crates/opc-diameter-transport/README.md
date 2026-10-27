@@ -110,8 +110,12 @@ for the exact crash cut, credential handling and remaining limits.
   certificates can use `EcdheRsaAes128GcmSha256`, `EcdheRsaAes256GcmSha384`
   or `DheRsaAes128GcmSha256` (FFDHE4096 preferred, FFDHE2048 fallback)
   through `with_allowed_ciphers`; RSA-PSS-RSAE is preferred over PKCS#1,
-  with SHA-256/384 only. Connection evidence records the negotiated suite.
-  The separate `NdsAfEcdsa` certificate profile remains ECDSA-only.
+  with SHA-256/384 only. DHE-RSA is an explicit legacy Release 18 exception
+  prohibited by RFC 10015 and TS 33.210 Release 19. Default servers request
+  and accept only ECDSA client authentication; enabling an RSA suite also
+  enables RSA client authentication. Default ClientHello groups omit FFDHE.
+  Connection evidence records the negotiated suite. The separate
+  `NdsAfEcdsa` certificate profile remains ECDSA-only.
 - Complete peer certificate chains are bounded, checked for leaf-to-root
   order, validated with rustls-webpki against trust anchors scoped to the
   expected SPIFFE trust domain, and required to contain the exact configured
@@ -231,17 +235,27 @@ crate.
 `DiameterTlsPolicy::tls12_compatibility(frame_limits)` permits TLS 1.3 and TLS
 1.2; also enable `TlsConfigBuilder::with_compat_mode(true)` on the supplied
 authenticated config. TLS 1.3 remains preferred. TLS 1.2 permits ECDHE-ECDSA
-and ECDHE-RSA with AES-128/256-GCM, plus DHE-RSA with AES-128-GCM over
-RFC 7919 FFDHE4096 (preferred) or FFDHE2048. Both TLS 1.2 roles require
-Extended Master Secret. Static RSA key exchange, CBC and obsolete
-versions remain excluded. `with_allowed_ciphers` filters the handshake before
-admission; a TLS 1.2 suite under the default TLS 1.3-only policy returns
-`CipherVersionMismatch`. `policy.version()` reports the minimum allowed version;
-connection evidence reports the negotiated version and suite. Exact mutual
-identity checks, material epochs, retirement and frame budgets apply to both.
-The mandatory TS 33.210 §6.2.3 TLS 1.2 suites are available; this does not
-qualify a complete 3GPP endpoint or a validated crypto module. DTLS suite
-support is separate.
+and ECDHE-RSA with AES-128/256-GCM and requires Extended Master Secret in both
+roles. DHE-RSA needs `TlsConfigBuilder::with_legacy_dhe_rsa(true)` plus
+`DiameterTlsPolicy::tls12_legacy_dhe_rsa(frame_limits)` or an explicit DHE
+cipher allowlist. It uses FFDHE4096 (preferred) or FFDHE2048 as a legacy
+Release 18 exception. Normal compatibility follows the RFC 10015 / TS 33.210
+Release 19 prohibition on TLS 1.2 FFDHE. Static RSA key exchange, CBC and
+obsolete versions remain excluded.
+
+`with_allowed_ciphers` filters the handshake before admission; a TLS 1.2
+suite under the default TLS 1.3-only policy returns `CipherVersionMismatch`.
+`policy.version()` reports the minimum allowed version; connection evidence
+reports the negotiated version and suite. Identity checks, material epochs,
+retirement and frame budgets apply to both. This is not complete 3GPP endpoint
+or validated-module qualification. See [cipher policy and alert deviations](../../docs/spec-compliance-dispositions.md#tls-and-dtls-cipher-policy-in-1353).
+
+Unparseable fixed Diameter framing causes wire SCTP ABORT on protected
+receivers and both cleartext DTLS/SCTP prelude roles. TLS/TCP terminal close
+currently sends FIN via `shutdown(Shutdown::Both)`; it does not implement the
+TCP RST required by RFC 6733 section 2.1. The concurrent runtime sends on
+ordered stream zero and does not expose inbound stream metadata. Initial
+unordered application delivery overtaking Finished remains a qualification gap.
 
 Each candidate receives a monotonic `PeerSessionGeneration`, and the SDK
 exposes the simultaneous-open decision, but the consumer still owns candidate

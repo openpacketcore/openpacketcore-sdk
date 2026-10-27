@@ -922,6 +922,7 @@ pub struct TlsConfigBuilder {
     local_spiffe_id: Option<SpiffeId>,
     policy: PeerPolicy,
     compat_mode: bool,
+    legacy_dhe_rsa: bool,
     allow_unconstrained_peer_policy: bool,
     crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
 }
@@ -934,6 +935,7 @@ impl TlsConfigBuilder {
             local_spiffe_id: None,
             policy: PeerPolicy::default(),
             compat_mode: false,
+            legacy_dhe_rsa: false,
             allow_unconstrained_peer_policy: false,
             crypto_provider: None,
         }
@@ -947,6 +949,7 @@ impl TlsConfigBuilder {
             local_spiffe_id: None,
             policy: PeerPolicy::default(),
             compat_mode: false,
+            legacy_dhe_rsa: false,
             allow_unconstrained_peer_policy: false,
             crypto_provider: None,
         }
@@ -974,11 +977,21 @@ impl TlsConfigBuilder {
         self
     }
 
-    /// Enable TLS 1.2 with mandatory Extended Master Secret and the ring AEAD
-    /// suites plus DHE-RSA/AES-128-GCM over RFC 7919 FFDHE4096/2048. TLS 1.3
-    /// remains preferred; FFDHE is not added to its supported groups.
+    /// Enable TLS 1.2 with mandatory Extended Master Secret and ECDHE AEAD
+    /// suites. TLS 1.3 remains preferred. Finite-field DHE requires the separate
+    /// [`Self::with_legacy_dhe_rsa`] opt-in.
     pub fn with_compat_mode(mut self, enabled: bool) -> Self {
         self.compat_mode = enabled;
+        self
+    }
+
+    /// Permit legacy TLS 1.2 DHE-RSA/AES-128-GCM with FFDHE4096/2048.
+    ///
+    /// This takes effect only with [`Self::with_compat_mode`] enabled. It is a
+    /// legacy TS 33.210 Release 18 exception: RFC 10015 section 3 and Release 19
+    /// section 6.2.3 prohibit FFDHE in TLS 1.2. TLS 1.3 groups are unchanged.
+    pub fn with_legacy_dhe_rsa(mut self, enabled: bool) -> Self {
+        self.legacy_dhe_rsa = enabled;
         self
     }
 
@@ -1002,10 +1015,9 @@ impl TlsConfigBuilder {
                 .ok();
         });
 
-        let provider = self
-            .crypto_provider
-            .clone()
-            .unwrap_or_else(|| Arc::new(tls12_dhe::provider(self.compat_mode)));
+        let provider = self.crypto_provider.clone().unwrap_or_else(|| {
+            Arc::new(tls12_dhe::provider(self.compat_mode && self.legacy_dhe_rsa))
+        });
         let verifier = Arc::new(SpiffeServerCertVerifier {
             state_rx: self.state_rx.clone(),
             policy: self.policy.clone(),
@@ -1071,10 +1083,9 @@ impl TlsConfigBuilder {
                 .ok();
         });
 
-        let provider = self
-            .crypto_provider
-            .clone()
-            .unwrap_or_else(|| Arc::new(tls12_dhe::provider(self.compat_mode)));
+        let provider = self.crypto_provider.clone().unwrap_or_else(|| {
+            Arc::new(tls12_dhe::provider(self.compat_mode && self.legacy_dhe_rsa))
+        });
         let verifier = Arc::new(SpiffeClientCertVerifier {
             state_rx: self.state_rx.clone(),
             policy: self.policy.clone(),
@@ -1247,6 +1258,33 @@ mod policy_tests {
     use std::io::Cursor;
 
     #[test]
+    fn review_tls12_compatibility_excludes_legacy_dhe() {
+        let (_source, receiver) = watch::channel(None);
+        let client = TlsConfigBuilder::new(receiver.clone())
+            .allow_any_trusted_peer()
+            .with_compat_mode(true)
+            .build_client_config()
+            .unwrap();
+        let server = TlsConfigBuilder::new(receiver)
+            .allow_any_trusted_peer()
+            .with_compat_mode(true)
+            .build_server_config()
+            .unwrap();
+        for provider in [client.crypto_provider(), server.crypto_provider()] {
+            assert!(!provider
+                .cipher_suites
+                .iter()
+                .any(|suite| suite.suite()
+                    == rustls::CipherSuite::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256));
+            assert!(provider.kx_groups.iter().all(|group| !matches!(
+                group.name(),
+                rustls::NamedGroup::FFDHE2048 | rustls::NamedGroup::FFDHE4096
+            )));
+        }
+        assert!(client.require_ems && server.require_ems);
+    }
+
+    #[test]
     fn compatibility_provider_admits_the_required_dhe_rsa_aead_suite() {
         let ca = test_ca();
         let (_source, receiver) = watch::channel(Some(identity_state(
@@ -1256,6 +1294,7 @@ mod policy_tests {
         let config = TlsConfigBuilder::new(receiver.clone())
             .allow_any_trusted_peer()
             .with_compat_mode(true)
+            .with_legacy_dhe_rsa(true)
             .build_authenticated_client_config()
             .unwrap();
         let suite = rustls::CipherSuite::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256;
@@ -1266,6 +1305,7 @@ mod policy_tests {
         let server = TlsConfigBuilder::new(receiver)
             .allow_any_trusted_peer()
             .with_compat_mode(true)
+            .with_legacy_dhe_rsa(true)
             .build_authenticated_server_config()
             .unwrap();
         assert!(server.rustls_config().require_ems);

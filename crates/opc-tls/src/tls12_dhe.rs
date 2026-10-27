@@ -40,9 +40,9 @@ static GROUP2048: Ffdhe = Ffdhe {
     parameters: FFDHE2048,
 };
 
-pub(super) fn provider(compatibility: bool) -> CryptoProvider {
+pub(super) fn provider(legacy_dhe_rsa: bool) -> CryptoProvider {
     let mut provider = rustls::crypto::ring::default_provider();
-    if compatibility {
+    if legacy_dhe_rsa {
         provider
             .cipher_suites
             .push(SupportedCipherSuite::Tls12(&DHE_RSA_AES128_GCM));

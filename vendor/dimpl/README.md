@@ -57,6 +57,14 @@ Four constructors control which DTLS version is used:
   `SRTP_AEAD_AES_128_GCM`, and `SRTP_AES128_CM_SHA1_80` ([RFC 5764], [RFC 7714]).
 - **Extended Master Secret** ([RFC 7627]) is negotiated and enforced (DTLS 1.2).
 
+DTLS 1.2 RSA client authentication follows the configured cipher-suite
+families; an ECDSA-only server policy requests and verifies only ECDSA.
+Client suite offers describe server authentication independently of the
+client certificate key. SDK users must opt into legacy DHE explicitly:
+RFC 10015 and TS 33.210 Release 19 prohibit FFDHE in (D)TLS 1.2. The
+engine's invalid-DH failures do not yet emit the fatal alerts required by
+RFC 7919. See the [patch record](UPSTREAM.md) for these intentional changes.
+
 ### Certificate model
 During the handshake the engine emits either [`Output::PeerCert`][peer_cert]
 with a borrowed leaf certificate or
