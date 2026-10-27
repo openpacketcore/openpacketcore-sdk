@@ -336,6 +336,10 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
     /// Rejects invalid ordinary fields, a foreign SA/original role, disagreement
     /// between the explicit mode and immutable agreement, inconsistent sync
     /// history, or missing event history after any local synchronization proposal.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Restore every atomic window field explicitly; missing feature metadata must not default."
+    )]
     pub fn from_profile_persisted(
         domain: Ikev2CommittedWindowDomain<P>,
         generation: u64,
