@@ -98,7 +98,8 @@ impl RegistrationResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegistrationResultFlags {
     /// Raw flag bits from the registration-result octet, excluding bits 1-3
-    /// used by [`RegistrationResult`].
+    /// used by [`RegistrationResult`]. Canonical encoding uses bit 7 for the
+    /// disaster-roaming result, the typed booleans for bits 4-6, and clears bit 8.
     pub raw_upper_bits: u8,
     /// `true` when SMS over NAS transport is allowed.
     pub sms_allowed: bool,
@@ -445,9 +446,10 @@ impl Encode for ConfigurationUpdateCommand {
 
 /// Decoded Configuration Update Complete body (TS 24.501 §8.2.20).
 ///
-/// Table 8.2.20.1.1 has no optional elements. Strict and ProcedureAware decoding,
-/// and [`UnknownIePolicy::Reject`], therefore require an empty body. Structural
-/// decoding can preserve or drop unknown elements according to the context.
+/// Table 8.2.20.1.1 has no optional elements. Non-critical unknown elements
+/// follow [`UnknownIePolicy`] at every validation level; only its `Reject`
+/// policy requires an empty body. Comprehension-required unknown elements
+/// are rejected at every level, including [`ValidationLevel::HeaderOnly`].
 /// Debug output reports only the element count.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConfigurationUpdateComplete {
@@ -802,7 +804,8 @@ pub struct RegistrationRequest {
     pub ng_ksi: NasKeySetIdentifier,
     /// Decoded 5GS mobile identity.
     pub mobile_identity: MobileIdentity,
-    /// Original first body octet (registration type + ngKSI).
+    /// Original first body octet (registration type + ngKSI), used only when
+    /// [`EncodeContext::raw_preserving`] is set. Otherwise typed fields are used.
     pub raw_first_octet: u8,
     /// Original LV-E bytes for the mobile identity (length + value).
     pub raw_mobile_identity_lv: Bytes,
@@ -909,7 +912,15 @@ impl Encode for RegistrationRequest {
         let len = self.wire_len(ctx)?;
         ctx.check_capacity(len)?;
         dst.reserve(len);
-        dst.put_u8(self.raw_first_octet);
+        let first = if ctx.raw_preserving {
+            self.raw_first_octet
+        } else {
+            (u8::from(self.ng_ksi.no_key_available) << 7)
+                | (self.ng_ksi.value << 4)
+                | (u8::from(self.follow_on_request) << 3)
+                | self.registration_type as u8
+        };
+        dst.put_u8(first);
         dst.extend_from_slice(&self.raw_mobile_identity_lv);
         for ie in &self.optional_ies {
             dst.extend_from_slice(&ie.raw);
@@ -917,7 +928,14 @@ impl Encode for RegistrationRequest {
         Ok(())
     }
 
-    fn wire_len(&self, _ctx: EncodeContext) -> Result<usize, EncodeError> {
+    fn wire_len(&self, ctx: EncodeContext) -> Result<usize, EncodeError> {
+        if !ctx.raw_preserving && self.ng_ksi.value > 7 {
+            return Err(EncodeError::new(
+                opc_protocol::EncodeErrorCode::Structural {
+                    reason: "NAS key set identifier exceeds three bits",
+                },
+            ));
+        }
         let mut len = 1usize.saturating_add(self.raw_mobile_identity_lv.len());
         for ie in &self.optional_ies {
             len = len.saturating_add(ie.raw.len());
@@ -936,7 +954,8 @@ pub struct RegistrationAccept {
     pub registration_result: RegistrationResult,
     /// Flag bits carried alongside the registration result value.
     pub registration_result_flags: RegistrationResultFlags,
-    /// Original LV bytes for the registration result.
+    /// Original LV bytes for the registration result, used only when
+    /// [`EncodeContext::raw_preserving`] is set. Otherwise typed fields are used.
     pub raw_registration_result_lv: Bytes,
     /// Optional IEs in message order, raw-preserved.
     pub optional_ies: Vec<OptionalIe>,
@@ -1019,15 +1038,30 @@ impl Encode for RegistrationAccept {
         let len = self.wire_len(ctx)?;
         ctx.check_capacity(len)?;
         dst.reserve(len);
-        dst.extend_from_slice(&self.raw_registration_result_lv);
+        if ctx.raw_preserving {
+            dst.extend_from_slice(&self.raw_registration_result_lv);
+        } else {
+            let flags = self.registration_result_flags;
+            // §9.11.3.6: bit 7 is disaster roaming; only bit 8 is spare.
+            let result = self.registration_result as u8
+                | (u8::from(flags.sms_allowed) << 3)
+                | (u8::from(flags.nssaa_to_be_performed) << 4)
+                | (u8::from(flags.emergency_registered) << 5)
+                | (flags.raw_upper_bits & 0x40);
+            dst.extend_from_slice(&[1, result]);
+        }
         for ie in &self.optional_ies {
             dst.extend_from_slice(&ie.raw);
         }
         Ok(())
     }
 
-    fn wire_len(&self, _ctx: EncodeContext) -> Result<usize, EncodeError> {
-        let mut len = self.raw_registration_result_lv.len();
+    fn wire_len(&self, ctx: EncodeContext) -> Result<usize, EncodeError> {
+        let mut len = if ctx.raw_preserving {
+            self.raw_registration_result_lv.len()
+        } else {
+            2
+        };
         for ie in &self.optional_ies {
             len = len.saturating_add(ie.raw.len());
         }

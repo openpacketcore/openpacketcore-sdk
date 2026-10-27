@@ -109,7 +109,7 @@ pub struct Header {
     /// Encoded as `message_priority.unwrap_or(0)` if `mp` is true.
     pub message_priority: Option<u8>,
     /// Final header octet spare bits. When `mp` is set this holds only the
-    /// low nibble (bits 4–1); otherwise the entire octet.
+    /// low nibble (bits 4–1); otherwise the entire octet. Cleared on encode.
     pub spare_octet: u8,
 }
 
@@ -346,18 +346,24 @@ pub enum IeType {
     OuterHeaderRemoval = 95,
     /// Recovery Time Stamp
     RecoveryTimeStamp = 96,
+    /// Node Report Type (§8.2.69).
+    NodeReportType = 101,
     /// UE IP Address
     UeIpAddress = 93,
     /// FAR ID
     FarId = 108,
     /// QER ID
     QerId = 109,
+    /// User Plane Inactivity Timer (§8.2.83).
+    UserPlaneInactivityTimer = 117,
     /// UR-SEQN
     UrSeqn = 104,
     /// Usage Report (Session Report Request)
     UsageReport = 80,
     /// QoS Flow Identifier
     Qfi = 124,
+    /// PFCP Session Change Info (Table 7.4.7.1-2).
+    PfcpSessionChangeInfo = 290,
 }
 
 /// A generic PFCP IE with type/length framing and raw byte preservation.

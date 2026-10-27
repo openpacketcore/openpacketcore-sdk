@@ -13,7 +13,7 @@ use opc_protocol::{DecodeContext, DecodeError, DecodeErrorCode, EncodeError, Spe
 use thiserror::Error;
 
 use crate::ie::{decode_typed_ie_sequence, TypedIe};
-use crate::{Header, InformationElement, MessageType};
+use crate::{Header, IeType, InformationElement, MessageType};
 
 /// Validation result for PFCP Production Profile v1.
 pub type ProfileResult<T> = Result<T, ProfileValidationError>;
@@ -274,7 +274,10 @@ fn validate_node_message(message_type: u8, ies: &[TypedIe]) -> ProfileResult<()>
         }
         12 => (
             "Node Report Request",
-            &[(60, "Node ID"), (101, "Node Report Type")],
+            &[
+                (60, "Node ID"),
+                (IeType::NodeReportType as u16, "Node Report Type"),
+            ],
         ),
         13 => ("Node Report Response", &[(60, "Node ID"), (19, "Cause")]),
         14 => ("Session Set Deletion Request", &[(60, "Node ID")]),
@@ -284,7 +287,13 @@ fn validate_node_message(message_type: u8, ies: &[TypedIe]) -> ProfileResult<()>
         ),
         16 => (
             "Session Set Modification Request",
-            &[(60, "Node ID"), (290, "PFCP Session Change Info")],
+            &[
+                (60, "Node ID"),
+                (
+                    IeType::PfcpSessionChangeInfo as u16,
+                    "PFCP Session Change Info",
+                ),
+            ],
         ),
         17 => (
             "Session Set Modification Response",
@@ -298,7 +307,7 @@ fn validate_node_message(message_type: u8, ies: &[TypedIe]) -> ProfileResult<()>
             return Err(ProfileValidationError::MissingIe { scope, ie: name });
         }
         // Table 7.4.7.1-1 explicitly allows repeated Session Change Info.
-        if count > 1 && kind != 290 {
+        if count > 1 && kind != IeType::PfcpSessionChangeInfo as u16 {
             return Err(ProfileValidationError::DuplicateIe { scope, ie: name });
         }
     }
@@ -486,16 +495,19 @@ fn validate_create_far(members: &[TypedIe]) -> ProfileResult<()> {
     require_one("Create FAR", members, IeKind::FarId)?;
     require_one("Create FAR", members, IeKind::ApplyAction)?;
     reject_duplicates("Create FAR", members, &[IeKind::FarId, IeKind::ApplyAction])?;
+    validate_apply_action("Create FAR", members)?;
     validate_forwarding_parameters("Create FAR", members)
 }
 
 fn validate_update_far(members: &[TypedIe]) -> ProfileResult<()> {
     require_one("Update FAR", members, IeKind::FarId)?;
     reject_duplicates("Update FAR", members, &[IeKind::FarId, IeKind::ApplyAction])?;
-    validate_forwarding_parameters("Update FAR", members)
+    // §5.6.3 and Tables 7.5.4.3-1/-2: unchanged forwarding parameters,
+    // including Destination Interface, are not repeated in a delta update.
+    validate_apply_action("Update FAR", members)
 }
 
-fn validate_forwarding_parameters(scope: &'static str, members: &[TypedIe]) -> ProfileResult<()> {
+fn validate_apply_action(scope: &'static str, members: &[TypedIe]) -> ProfileResult<()> {
     for member in members {
         if let TypedIe::ApplyAction(action) = member {
             let primary_count = [
@@ -509,14 +521,21 @@ fn validate_forwarding_parameters(scope: &'static str, members: &[TypedIe]) -> P
             .into_iter()
             .filter(|set| *set)
             .count();
-            if primary_count != 1 || ((action.notify_cp || action.bdpn) && !action.buffer) {
+            if primary_count != 1
+                || ((action.notify_cp || action.bdpn) && !action.buffer)
+                || (action.dfrt && !action.forward)
+            {
                 return Err(ProfileValidationError::InvalidCombination {
                     scope,
-                    reason: "Apply Action requires one primary action and NOCP/BDPN require BUFF",
+                    reason: "Apply Action requires one primary action; NOCP/BDPN require BUFF and DFRT requires FORW",
                 });
             }
         }
     }
+    Ok(())
+}
+
+fn validate_forwarding_parameters(scope: &'static str, members: &[TypedIe]) -> ProfileResult<()> {
     let forwards = members
         .iter()
         .any(|member| matches!(member, TypedIe::ApplyAction(action) if action.forward));

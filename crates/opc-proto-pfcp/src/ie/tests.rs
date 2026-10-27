@@ -388,7 +388,9 @@ fn test_precedence_spec_bytes() {
 // Apply Action (§8.2.26)
 // ---------------------------------------------------------------------------
 
-/// Apply Action IE with DROP=1, FORW=1 per §8.2.26 (2 octets).
+/// Syntactic round-trip of DROP|FORW: the typed codec exposes both bits.
+/// This combination violates §8.2.26 and is rejected by the production profile;
+/// semantic action rules deliberately belong to that profile, not this codec.
 /// Octet 5: 0x03 (DROP | FORW).
 /// Octet 6: 0x00 (spare).
 #[test]

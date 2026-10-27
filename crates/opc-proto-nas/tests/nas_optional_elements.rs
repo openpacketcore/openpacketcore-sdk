@@ -616,6 +616,45 @@ fn unknown_comprehension_required_identifiers_fail_closed_in_all_six_bodies() {
 }
 
 #[test]
+fn unknown_critical_elements_after_a_valid_prefix_report_the_exact_offset_at_every_level() {
+    // TS 24.501 §§7.5.1/7.6.1 and TS 24.007 §§11.2.4/11.2.5: a
+    // comprehension-required IE remains an error even in HeaderOnly decoding.
+    for message in fixtures::MESSAGES {
+        // Configuration Update Complete has no known optional IEs. A permitted
+        // non-critical unknown TLV provides the preceding element in that body.
+        let prefix = message.ies.first().map_or(&[0x4d, 0][..], |ie| ie.wire);
+        for validation_level in [
+            ValidationLevel::HeaderOnly,
+            ValidationLevel::Structural,
+            ValidationLevel::Strict,
+            ValidationLevel::ProcedureAware,
+        ] {
+            for unknown_ie_policy in [UnknownIePolicy::Preserve, UnknownIePolicy::Drop] {
+                let ctx = DecodeContext {
+                    validation_level,
+                    unknown_ie_policy,
+                    ..DecodeContext::default()
+                };
+                assert!(
+                    decode_mm_message_body(message.kind, &body_with(message, prefix), ctx).is_ok()
+                );
+                for critical in (0..=0x0f).chain([0x7e, 0x7f]) {
+                    let mut optional = prefix.to_vec();
+                    optional.extend_from_slice(&[critical, 0, 0]);
+                    assert_eq!(
+                        decode_mm_message_body(message.kind, &body_with(message, &optional), ctx)
+                            .unwrap_err(),
+                        expected_error(DecodeErrorCode::UnknownCriticalIe, prefix.len(), "7.5"),
+                        "kind={:02x} ie={critical:02x} ctx={ctx:?}",
+                        message.kind,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn same_identifier_uses_the_selected_messages_length_bounds() {
     // LADN information permits an empty value in Configuration update command,
     // but Registration accept requires at least ten value octets.

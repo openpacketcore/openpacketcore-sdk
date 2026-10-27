@@ -118,14 +118,23 @@ Downstream exhaustive enum matches must handle the added variants.
 - Registration types 1–7 are named, including SNPN onboarding and disaster
   roaming. Received unused value 0 means initial registration at every
   validation level (§9.11.3.7). `raw_first_octet` retains the received value
-  for byte-exact forwarding; typed `InitialRegistration` has sender value 1.
+  for byte-exact forwarding with `EncodeContext::raw_preserving`. Canonical
+  encoding uses the typed registration type, follow-on-request bit and ngKSI;
+  typed `InitialRegistration` sends value 1. An ngKSI value above 7 fails before
+  writing output. Mobile-identity and optional-element bytes remain retained.
 - All remaining bytes are parsed as optional IEs and preserved raw so that
-  unknown or future IEs round-trip byte-exactly when the context permits them.
+  non-critical unknown or future IEs round-trip byte-exactly when the context
+  permits them. Unknown comprehension-required IEs fail at every level,
+  including HeaderOnly.
 - Its own table registers all 42 optional elements, with type-1, fixed-length
   type-3 TV, TLV, and TLV-E framing and message-specific length bounds.
 
 #### 5.2 Registration Accept (§8.2.7)
 - Mandatory 5GS registration result decoded (LV, length must be 1).
+- Canonical encoding uses the typed access result and SMS/NSSAA/emergency
+  flags, retains the defined disaster-roaming flag from `raw_upper_bits`, and
+  clears the spare bit (§9.11.3.6). Raw-preserving encoding emits the original
+  result LV. Both modes retain optional-element bytes.
 - Its own table registers all 60 optional elements and preserves their bytes.
 
 #### 5.3 Security Mode Command (§8.2.25)

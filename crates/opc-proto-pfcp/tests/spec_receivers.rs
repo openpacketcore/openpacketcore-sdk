@@ -172,6 +172,33 @@ fn pdi_allows_source_interface_only_but_forbids_conflicting_endpoint_fields() {
 }
 
 #[test]
+fn malformed_optional_pdi_addresses_remain_documented_profile_errors() {
+    // The typed profile deliberately reports the value error. It does not
+    // implement TS 29.244 §7.6.8's optional-IE discard; see CONFORMANCE.md.
+    for validation_level in [
+        ValidationLevel::HeaderOnly,
+        ValidationLevel::Structural,
+        ValidationLevel::Strict,
+        ValidationLevel::ProcedureAware,
+    ] {
+        let ctx = DecodeContext {
+            validation_level,
+            ..DecodeContext::default()
+        };
+        let source = tlv(20, &[0]);
+        assert!(establishment(&source).validate_production_v1(ctx).is_ok());
+        for invalid in [tlv(21, &[0]), tlv(93, &[0x12, 192, 0, 2, 1])] {
+            let mut pdi = source.clone();
+            pdi.extend(invalid);
+            assert!(matches!(
+                establishment(&pdi).validate_production_v1(ctx),
+                Err(opc_proto_pfcp::profile::ProfileValidationError::TypedDecode { .. })
+            ));
+        }
+    }
+}
+
+#[test]
 fn establishment_requires_node_id_and_modification_can_reference_existing_rules() {
     let mut pdi = tlv(20, &[0]);
     pdi.extend(tlv(22, b"internet"));

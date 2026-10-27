@@ -14,6 +14,7 @@ use opc_protocol::{DecodeContext, Encode, EncodeContext, ValidationLevel};
 #[test]
 fn all_registration_values_follow_receiver_rules_and_preserve_raw_octet() {
     for validation_level in [
+        ValidationLevel::HeaderOnly,
         ValidationLevel::Structural,
         ValidationLevel::Strict,
         ValidationLevel::ProcedureAware,
@@ -33,8 +34,21 @@ fn all_registration_values_follow_receiver_rules_and_preserve_raw_octet() {
             assert_eq!(request.raw_first_octet, body[0]);
             let mut encoded = BytesMut::new();
             request
+                .encode(
+                    &mut encoded,
+                    EncodeContext {
+                        raw_preserving: true,
+                        ..EncodeContext::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(encoded.as_ref(), body);
+            // Table 9.11.3.7.1 gives typed InitialRegistration sender value 1.
+            encoded.clear();
+            request
                 .encode(&mut encoded, EncodeContext::default())
                 .unwrap();
+            body[0] = 0xb8 | value.max(1);
             assert_eq!(encoded.as_ref(), body);
         }
     }

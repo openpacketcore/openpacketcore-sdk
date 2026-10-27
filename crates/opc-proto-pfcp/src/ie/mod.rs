@@ -17,7 +17,7 @@ use opc_protocol::{
     UnknownIePolicy,
 };
 
-use crate::InformationElement;
+use crate::{IeType, InformationElement};
 
 mod grouped;
 mod registry;
@@ -607,7 +607,7 @@ impl TypedIe {
             }
             Self::UserPlaneInactivityTimer(v) => {
                 v.encode_value(&mut buf)?;
-                117
+                IeType::UserPlaneInactivityTimer as u16
             }
             Self::RecoveryTimeStamp(v) => {
                 v.encode_value(&mut buf)?;
@@ -735,7 +735,7 @@ impl TypedIe {
             Self::UeIpAddress(_) => 93,
             Self::OuterHeaderRemoval(_) => 95,
             Self::RecoveryTimeStamp(_) => 96,
-            Self::UserPlaneInactivityTimer(_) => 117,
+            Self::UserPlaneInactivityTimer(_) => IeType::UserPlaneInactivityTimer as u16,
             Self::OuterHeaderCreation(_) => 84,
             Self::FarId(_) => 108,
             Self::QerId(_) => 109,

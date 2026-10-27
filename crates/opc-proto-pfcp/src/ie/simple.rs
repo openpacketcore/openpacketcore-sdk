@@ -214,7 +214,15 @@ impl SimpleIe for Cause {
     }
 
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
-        dst.put_u8(self.value.into());
+        let value = u8::from(self.value);
+        if value == 0 {
+            return Err(EncodeError::new(
+                opc_protocol::EncodeErrorCode::Structural {
+                    reason: "reserved Cause value zero shall not be sent",
+                },
+            ));
+        }
+        dst.put_u8(value);
         Ok(())
     }
 }
@@ -278,10 +286,10 @@ impl SimpleIe for NodeId {
             );
         }
         let node_id_type = NodeIdType::from(value[0]);
-        let addr = value.get(1..).unwrap_or(&[]).to_vec();
-        // Validate expected lengths for known types.
+        let mut addr = value.get(1..).unwrap_or(&[]).to_vec();
+        // §8.1.2: retain the known prefix of an extendable Node ID.
         match node_id_type {
-            NodeIdType::Ipv4 if addr.len() != 4 => {
+            NodeIdType::Ipv4 if addr.len() < 4 => {
                 return Err(DecodeError::new(
                     DecodeErrorCode::InvalidLength {
                         reason: "Node ID IPv4 must be 4 octets",
@@ -290,7 +298,7 @@ impl SimpleIe for NodeId {
                 )
                 .with_spec_ref(spec_ref));
             }
-            NodeIdType::Ipv6 if addr.len() != 16 => {
+            NodeIdType::Ipv6 if addr.len() < 16 => {
                 return Err(DecodeError::new(
                     DecodeErrorCode::InvalidLength {
                         reason: "Node ID IPv6 must be 16 octets",
@@ -299,6 +307,8 @@ impl SimpleIe for NodeId {
                 )
                 .with_spec_ref(spec_ref));
             }
+            NodeIdType::Ipv4 => addr.truncate(4),
+            NodeIdType::Ipv6 => addr.truncate(16),
             _ => {}
         }
         Ok(Self {
@@ -2033,19 +2043,20 @@ pub struct ApplyAction {
     pub fssm: bool,
     /// Forward and replicate MBS data over unicast (bit 13).
     pub mbsu: bool,
-    /// Spare bits (bits 16-14) preserved for byte-exact re-encode.
+    /// Received spare bits (bits 16-14), ignored and cleared on typed encode.
     pub spare: u8,
 }
 
 impl SimpleIe for ApplyAction {
     fn decode_value(value: &[u8], offset: usize, spec_ref: SpecRef) -> Result<Self, DecodeError> {
-        if value.len() < 2 {
+        if value.is_empty() {
             return Err(
                 DecodeError::new(DecodeErrorCode::Truncated, offset).with_spec_ref(spec_ref)
             );
         }
         let b1 = value[0];
-        let b2 = value[1];
+        // Table 8.1.2-1 defines one original fixed octet; later flags default to zero.
+        let b2 = value.get(1).copied().unwrap_or(0);
         Ok(Self {
             drop: (b1 & 0x01) != 0,
             forward: (b1 & 0x02) != 0,
@@ -2066,7 +2077,7 @@ impl SimpleIe for ApplyAction {
 
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
         let mut b1: u8 = 0;
-        let mut b2: u8 = (self.spare & 0x07) << 5;
+        let mut b2: u8 = 0;
         if self.fssm {
             b2 |= 0x08;
         }
@@ -2124,7 +2135,7 @@ pub struct SourceInterface {
     /// Interface value.
     /// 0 = Access, 1 = Core, 2 = SGi-LAN, 3 = CP-function, ...
     pub value: u8,
-    /// Spare bits (high nibble) preserved for re-encode.
+    /// Received spare bits (high nibble), ignored and cleared on typed encode.
     pub spare: u8,
 }
 
@@ -2142,7 +2153,7 @@ impl SimpleIe for SourceInterface {
     }
 
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
-        dst.put_u8((self.spare << 4) | (self.value & 0x0F));
+        dst.put_u8(self.value & 0x0F);
         Ok(())
     }
 }
@@ -2158,7 +2169,7 @@ impl SimpleIe for SourceInterface {
 pub struct DestinationInterface {
     /// Interface value.
     pub value: u8,
-    /// Spare bits (high nibble) preserved for re-encode.
+    /// Received spare bits (high nibble), ignored and cleared on typed encode.
     pub spare: u8,
 }
 
@@ -2176,7 +2187,7 @@ impl SimpleIe for DestinationInterface {
     }
 
     fn encode_value(&self, dst: &mut BytesMut) -> Result<(), EncodeError> {
-        dst.put_u8((self.spare << 4) | (self.value & 0x0F));
+        dst.put_u8(self.value & 0x0F);
         Ok(())
     }
 }
@@ -2249,7 +2260,8 @@ pub struct UeIpAddress {
 
 impl UeIpAddress {
     fn has_consistent_fields(&self) -> bool {
-        !(self.v4 && self.chv4 || self.v6 && self.chv6 || self.ipv6d && self.ip6pl)
+        (self.v4 || self.v6 || self.chv4 || self.chv6)
+            && !(self.v4 && self.chv4 || self.v6 && self.chv6 || self.ipv6d && self.ip6pl)
             && (!(self.ipv6d || self.ip6pl) || self.v6 || self.chv6)
             && self.v4 == self.ipv4.is_some()
             && self.v6 == self.ipv6.is_some()

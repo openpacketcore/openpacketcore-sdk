@@ -69,7 +69,7 @@ builders cover the previously supported heartbeat/association/session subset.
 | Node Report | Request (12), Response (13) | Node ID on both; Node Report Type on request, Cause on response. |
 | Session Set Deletion | Request (14), Response (15) | Node ID on both; Cause on response. |
 | Session Set Modification | Request (16), Response (17) | Node ID on both; one or more Session Change Info on request, Cause on response. |
-| Association Setup | Request (5), Response (6) | Node ID, Recovery Time Stamp, Cause on response, and Offending IE on rejection paths. |
+| Association Setup | Request (5), Response (6) | Node ID, Recovery Time Stamp, and Cause on response. |
 | Association Release | Request (9), Response (10) | Node ID on both messages and Cause on response. |
 | Session Establishment | Request (50), Response (51) | Node ID, request F-SEID and Create PDR/FAR groups; Cause and successful-response F-SEID; request rule references. |
 | Session Modification | Request (52), Response (53) | Validate supplied rule groups; existing-rule references are resolved by the session owner. |
@@ -103,7 +103,7 @@ profile failures and must cover at least these rules:
 - Heartbeat messages must not require SEID and must preserve sequence numbers.
 - Association Setup Request must include Node ID and Recovery Time Stamp.
 - Association Setup Response must include Node ID, Recovery Time Stamp, and
-  Cause; rejection responses should expose Offending IE when present.
+  Cause. Offending IE is retained when present but is not required by the validator.
 - Session Establishment Request must include Node ID, CP F-SEID and at least one Create
   PDR and Create FAR.
 - Create PDR requires PDR ID, Precedence and PDI. Update PDR requires PDR ID;
@@ -113,8 +113,9 @@ profile failures and must cover at least these rules:
   Instance and UE IP Address.
 - Create FAR requires FAR ID and Apply Action; Update FAR requires FAR ID.
   Apply Action selects exactly one primary action (FSSM/MBSU count together),
-  and NOCP/BDPN require BUFF. A supplied forwarding action
-  must include Forwarding Parameters with Destination Interface.
+  NOCP/BDPN require BUFF, and DFRT requires FORW. A forwarding action in
+  Create FAR requires Forwarding Parameters with Destination Interface;
+  Update FAR permits those unchanged parameters to be omitted.
 - Establishment PDR references to FAR/QER/URR IDs must resolve in that message.
   Modification references may identify existing rules; the session owner must
   resolve them against stored state. Modification has no unconditional
@@ -122,8 +123,8 @@ profile failures and must cover at least these rules:
 - Session Deletion Request/Response must be SEID-bearing.
 - Session Report Request must include Report Type and include Usage Report when
   the report type requires it.
-- Duplicate singleton IEs must be rejected by the semantic validator unless the
-  TS 29.244 profile explicitly allows multiplicity.
+- The current validator rejects duplicate singleton IEs unless the procedure
+  permits multiplicity; its §7.6.10 receiver limitation is documented below.
 - Unknown non-mandatory IEs must be preserved by the raw layer; unsupported or
   malformed profile-critical IEs must produce typed validation errors.
 
@@ -202,8 +203,8 @@ arithmetic, truncation/overflow rejection, and negative tests.
 
 | IE | Type | Section | Notes |
 |:---|:---|:---|:---|
-| Cause | 19 | §8.2.1 | V19.6.0 registry, `Unknown(u8)` fallback, acceptance/rejection classification. |
-| Node ID | 60 | §8.2.38 | IPv4/IPv6/FQDN; length validated per type. |
+| Cause | 19 | §8.2.1 | V19.6.0 registry, `Unknown(u8)` fallback, acceptance/rejection classification; typed encoding rejects reserved zero. |
+| Node ID | 60 | §8.2.38 | IPv4/IPv6/FQDN; IP addresses require their known width and ignore trailing extensions. |
 | F-SEID | 57 | §8.2.37 | V4/V6 flags, SEID (8 octets), address order. |
 | F-TEID | 21 | §8.2.3 | V4/V6/CH/CHID flags; CH omits TEID and addresses; conditional Choose ID. |
 | PDR ID | 56 | §8.2.36 | 2 octets. |
@@ -211,11 +212,11 @@ arithmetic, truncation/overflow rejection, and negative tests.
 | QER ID | 109 | §8.2.75 | 4 octets. |
 | URR ID | 81 | §8.2.54 | 4 octets. |
 | Precedence | 29 | §8.2.11 | 4 octets. |
-| Apply Action | 44 | §8.2.26 | Includes FSSM/MBSU; profile validates primary action and buffer notifications. |
+| Apply Action | 44 | §8.2.26 | Accepts the original one-octet form (Table 8.1.2-1); missing later flags are zero. Encodes two octets, including FSSM/MBSU. |
 | Source Interface | 20 | §8.2.2 | 1 octet; spare nibble preserved. |
 | Destination Interface | 42 | §8.2.24 | 1 octet; spare nibble preserved. |
 | Network Instance | 22 | §8.2.4 | Variable-length DNN octet string. |
-| UE IP Address | 93 | §8.2.62 | V6/V4/SD/IPv6D/CHV4/CHV6/IP6PL flags; IPv6 delegation and prefix length. |
+| UE IP Address | 93 | §8.2.62 | V6/V4/SD/IPv6D/CHV4/CHV6/IP6PL flags; IPv6 delegation and prefix length. Requires an address family or CHOOSE request. |
 | Outer Header Creation | 84 | §8.2.56 | 16-bit description (octet 5 = high byte); TEID iff GTP-U (octet 5 bits 1-2), UDP port iff non-GTP UDP (bits 3-4), addresses per bits 1/3/5 and 2/4/6; C-TAG/S-TAG. |
 | Outer Header Removal | 95 | §8.2.64 | 1 octet description. |
 | User Plane Inactivity Timer | 117 | §8.2.83 | Four-octet inactivity duration in seconds. |
@@ -256,6 +257,26 @@ peer traffic is required. Filtering a typed view with `Drop` does not mutate
 the raw IEs retained by an enclosing message and is therefore not a sanitized
 raw-preserving re-encode.
 
+Apply Action combination rules belong to `validate_production_v1`, above the
+typed bit-field codec: one primary action (FSSM/MBSU together count as one),
+NOCP/BDPN only with BUFF, and DFRT only with FORW. A typed decode or encode
+alone does not establish that a FAR is semantically valid. Source Interface,
+Destination Interface and Apply Action retain received spare fields for
+inspection but always clear them on typed encode, including when
+`EncodeContext::raw_preserving` is set.
+
+Create FAR with FORW requires Forwarding Parameters and Destination Interface.
+Update FAR validates supplied members and action flags without requiring those
+unchanged parameters to be repeated (§5.6.3, Tables 7.5.4.3-1 and 7.5.4.3-2).
+
+The profile currently rejects semantically invalid optional typed IEs, including
+PDI F-TEID and UE IP Address, as `TypedDecode` errors. It does not implement the
+§7.6.8 rule to discard such an optional IE and continue. Its singleton checks
+also reject duplicate IEs under every context instead of applying §7.6.10
+first-occurrence handling. Version Not Supported Response currently requires
+version 1 and an empty body; accepting a peer's other version (§7.4.4.7) and
+discarding unexpected body IEs (§7.6.9) remain receiver limitations.
+
 ### 5. Typed Grouped IEs (§7.5.2)
 Grouped IEs decode their members recursively as `TypedIe`, enforcing
 `DecodeContext::max_depth` to prevent unbounded recursion on hostile
@@ -271,7 +292,7 @@ input. Byte-exact round-trip verified for all listed grouped IEs.
 | Create QER | 7 | §7.5.2.5-1 | Typed members with depth limit. |
 | Update PDR | 9 | §7.5.4.2-1 | Typed members with depth limit. |
 | Update FAR | 10 | §7.5.4.3-1 | Typed members with depth limit. |
-| Update Forwarding Parameters | 11 | §7.5.4.3-2-2 | Typed members with depth limit. |
+| Update Forwarding Parameters | 11 | §7.5.4.3-2 | Typed members with depth limit. |
 | Update URR | 13 | §7.5.4.4 | Typed members with depth limit. |
 | Update QER | 14 | §7.5.4.5 | Typed members with depth limit. |
 | Created PDR | 8 | §7.5.3.2-1 | Typed members with depth limit. |

@@ -522,8 +522,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   algorithm identifiers in the codec while the crypto providers continue to
   reject unimplemented algorithms. (#1515, #1526)
 
-- `opc-proto-nas`: apply first-occurrence selection to all optional-element
-  tables; accept framed extensions and non-critical unknown IEs at all
+- `opc-proto-nas`: accept framed extensions and non-critical unknown IEs at all
   validation levels unless an explicit rejection policy is selected. Preserve
   raw table-driven extensions while exposing the known value prefix, and trim
   excess authentication value/padding bytes consistently. (#1255)
@@ -534,6 +533,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conflicting PDI fields and Apply Action combinations. Preserve assigned
   unmodelled IEs under every unknown-IE policy and correct clause diagnostics.
   (#1359, #1516, #1518, #1519, #1522, #1523, #1524, #1525)
+
+- `opc-proto-pfcp`: accept the original one-octet Apply Action and extended
+  IP Node IDs, permit Update FAR deltas without unchanged forwarding fields,
+  reject empty-family UE IP Address values and reserved Cause zero on encode,
+  clear typed spare bits, and enforce DFRT only with FORW in the profile.
+  (#1512, #1513, #1519, #1524)
 
 ### Changed
 
@@ -571,6 +576,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConsensusClusterId::for_installation`. Qualification node manifests and their
   rendered readiness probes derive the same installation-qualified voter IDs.
   Refs #1187.
+
+- `opc-proto-nas`: optional-element decoding now selects the first occurrence
+  even when `DuplicateIePolicy::Last` is requested. `Reject` remains an explicit
+  diagnostic policy. This follows TS 24.501 §7.6.3, which is mandatory for the
+  UE and recommended for the network. (#1255)
+
+- `opc-proto-nas`: canonical Registration Request/Accept encoding uses typed
+  registration fields; set `EncodeContext::raw_preserving` to forward the
+  original octet or result LV. Canonical sending rejects an out-of-range ngKSI
+  and clears the Registration Accept spare bit. (#1515)
 
 ### Breaking
 
@@ -816,6 +831,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   F-SEID for successful establishment responses. Add node/session-set message
   names, `ApplyAction.fssm`/`mbsu`, `UserPlaneInactivityTimer` and a profile
   combination-error variant. See crate migration notes. (#1359, #1516, #1524)
+
+- `opc-proto-pfcp`: `IeType` adds Node Report Type, User Plane Inactivity Timer
+  and PFCP Session Change Info. Exhaustive matches must handle these variants.
+  (#1516, #1518)
 
 ### Added
 
