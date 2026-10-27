@@ -1475,7 +1475,7 @@ fn unexpected_pending_request_and_unnegotiated_observation_drop() {
 }
 
 #[test]
-fn peer_sync_while_a_volatile_probe_is_outstanding_is_outcome_uncertain() {
+fn peer_sync_fences_a_volatile_probe_without_uncertain_application_work() {
     for algorithm in ENCRYPTIONS {
         for role in ROLES {
             let f = Fixture::new(algorithm, role);
@@ -1491,8 +1491,8 @@ fn peer_sync_while_a_volatile_probe_is_outstanding_is_outcome_uncertain() {
             assert_eq!(window.record(), &durable_before);
 
             // The peer's own counters are below our burned probe ID; the
-            // responder must advertise the volatile advance and treat the
-            // outstanding probe as unresolved outbound work.
+            // responder must preserve the volatile advance. A liveness probe
+            // has no application outcome to mark uncertain.
             let wire = f.peer_sync(Sync::new(NONCE, 0, 0));
             let admitted = window
                 .begin_sync_response(f.profile, &f.keys, &wire, None, None)
@@ -1502,7 +1502,7 @@ fn peer_sync_while_a_volatile_probe_is_outstanding_is_outcome_uncertain() {
             let candidate = prepared.record().clone();
             assert_eq!(
                 candidate.sync_state().unwrap().disposition(),
-                Disposition::OutcomeUncertain
+                Disposition::Continue
             );
             assert!(
                 candidate.next_send().unwrap() >= probe_id + 1,
@@ -1511,11 +1511,11 @@ fn peer_sync_while_a_volatile_probe_is_outstanding_is_outcome_uncertain() {
 
             let token = prepared.commit_after_durable(&candidate).unwrap();
             assert_eq!(window.record(), &candidate);
-            // The terminal cutover fences the outstanding probe.
+            // The committed cutover fences the outstanding probe.
             assert_eq!(window.pending_empty_request_message_id(), None);
             assert!(window.record().next_send().unwrap() >= probe_id + 1);
             let (_, disposition) = window.release_sync_response(token).unwrap().into_parts();
-            assert_eq!(disposition, Disposition::OutcomeUncertain);
+            assert_eq!(disposition, Disposition::Continue);
         }
     }
 }

@@ -1203,6 +1203,20 @@ mod rfc4754_encoding_tests {
             Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
         );
     }
+
+    #[test]
+    fn ecdsa_der_rejects_an_unnecessary_integer_sign_octet() {
+        // Nonzero scalars are valid; only the redundant 00 makes this non-DER.
+        let nonminimal = [0x30, 0x07, 0x02, 0x02, 0x00, 0x05, 0x02, 0x01, 0x01];
+        for method in [9, 10, 11] {
+            assert_eq!(
+                ecdsa_der_to_raw(method, &nonminimal),
+                Err(Ikev2IkeAuthVerificationError::SignatureEncodingInvalid)
+            );
+            let minimal = [0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x01];
+            assert!(ecdsa_der_to_raw(method, &minimal).is_ok());
+        }
+    }
 }
 
 const fn map_signature_hash_authority_error(

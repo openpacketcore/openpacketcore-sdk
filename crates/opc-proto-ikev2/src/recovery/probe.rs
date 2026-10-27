@@ -252,15 +252,15 @@ impl<P: RecoveryProfile> Window<P> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::canonical_test_fixtures::{delete, empty, Fixture};
+    use crate::canonical_test_fixtures::{Fixture, delete, empty};
     use crate::recovery::{
-        cbc_test_fixtures, Ikev2CommittedWindowDomain as Domain,
-        Ikev2OrdinaryRequestDisposition as Disposition,
+        Ikev2CommittedWindowDomain as Domain, Ikev2OrdinaryRequestDisposition as Disposition,
+        cbc_test_fixtures,
     };
     use crate::{
-        decode_header, open_protected_payloads, Ikev2AesGcmIvPurpose as Purpose,
-        Ikev2EncryptionAlgorithm as Encryption, Ikev2ProtectedPayloadDirection as Direction,
-        Ikev2SaInitProtectedPayloadProvider, Message, ProtectedPayloadKind,
+        Ikev2AesGcmIvPurpose as Purpose, Ikev2EncryptionAlgorithm as Encryption,
+        Ikev2ProtectedPayloadDirection as Direction, Ikev2SaInitProtectedPayloadProvider, Message,
+        ProtectedPayloadKind, decode_header, open_protected_payloads,
     };
     use opc_protocol::{BorrowDecode, DecodeContext};
 
@@ -631,5 +631,229 @@ mod tests {
         let completion = window.complete_empty_request(&opened).unwrap();
         assert_eq!(completion.message_id(), 1);
         assert_eq!(window.pending_empty_request_message_id(), None);
+    }
+
+    fn settle_outbound(f: &mut Fixture) {
+        let allocation = f.allocator.allocate(Purpose::Ordinary).unwrap();
+        let prepared = f
+            .window
+            .prepare_request(
+                f.profile,
+                &f.keys,
+                allocation,
+                Ikev2ExchangeKind::Informational,
+                delete(),
+            )
+            .unwrap();
+        let row = prepared.record().clone();
+        let commit = prepared.commit_after_durable(&row).unwrap();
+        f.window.apply_committed(commit).unwrap();
+        let wire = f.peer(0, true, 37, empty(), 0, 0x9000);
+        let response = f.window.open_peer(f.profile, &f.keys, &wire).unwrap();
+        let prepared = f
+            .window
+            .prepare_completion(&response, Bytes::from_static(b"settled"))
+            .unwrap();
+        let row = prepared.record().clone();
+        let commit = prepared.commit_after_durable(&row).unwrap();
+        assert_eq!(
+            f.window.apply_committed(commit).unwrap(),
+            Some(Bytes::from_static(b"settled"))
+        );
+    }
+
+    fn commit_peer_work_after_probe(
+        f: &mut Fixture,
+    ) -> super::super::Ikev2CommittedWindowRecord<Gcm> {
+        let wire = f.peer(0, false, 37, delete(), 0, 0x9001);
+        let request = f.window.open_peer(f.profile, &f.keys, &wire).unwrap();
+        let prepared = f
+            .window
+            .prepare_response(
+                f.profile,
+                &f.keys,
+                f.allocator.allocate(Purpose::Ordinary).unwrap(),
+                &request,
+                empty(),
+                Bytes::from_static(b"peer-work"),
+            )
+            .unwrap();
+        let row = prepared.record().clone();
+        let commit = prepared.commit_after_durable(&row).unwrap();
+        assert_eq!(
+            f.window.apply_committed(commit).unwrap(),
+            Some(Bytes::from_static(b"peer-work"))
+        );
+        row
+    }
+
+    #[test]
+    fn settled_outbound_cache_and_newer_probe_survive_inbound_commit_and_restore() {
+        let mut f = fixture(92_001);
+        settle_outbound(&mut f);
+        let (id, _) = send_probe(&mut f);
+        assert_eq!(id, 1);
+        let row = commit_peer_work_after_probe(&mut f);
+        assert_eq!(row.next_send(), Some(2));
+        let restored: Window<Gcm> = Window::restore(
+            &Domain::from_iv_record(&f.iv),
+            f.profile,
+            &f.keys,
+            &row,
+            &f.iv,
+        )
+        .expect("retained older settled exchange is valid");
+        assert_eq!(
+            restored.record().outbound().unwrap().outcome(),
+            Some(b"settled".as_slice())
+        );
+    }
+
+    #[test]
+    fn settled_outbound_cache_and_newer_probe_survive_inbound_readback() {
+        let mut f = fixture(92_002);
+        settle_outbound(&mut f);
+        send_probe(&mut f);
+        let row = commit_peer_work_after_probe(&mut f);
+        f.window
+            .reconcile(f.profile, &f.keys, &row, &f.iv)
+            .expect("authenticated settled/probe history reconciles");
+        assert_eq!(f.window.record(), &row);
+    }
+
+    #[test]
+    fn cbc_settled_outbound_cache_and_newer_probe_survive_inbound_commit() {
+        let f = cbc_test_fixtures::Fixture::new(
+            cbc_test_fixtures::profiles().next().unwrap(),
+            cbc_test_fixtures::DIRECTIONS[0],
+            92_003,
+        );
+        let mut window = f.window();
+        let prepared = window
+            .prepare_request(
+                f.profile,
+                &f.keys,
+                Ikev2ExchangeKind::Informational,
+                delete(),
+            )
+            .unwrap();
+        let row = prepared.record().clone();
+        let commit = prepared.commit_after_durable(&row).unwrap();
+        window.apply_committed(commit).unwrap();
+        let wire = f.peer_packet(1, true, empty(), 0);
+        let response = window.open_peer(f.profile, &f.keys, &wire).unwrap();
+        let prepared = window
+            .prepare_completion(&response, Bytes::from_static(b"settled"))
+            .unwrap();
+        let row = prepared.record().clone();
+        let commit = prepared.commit_after_durable(&row).unwrap();
+        window.apply_committed(commit).unwrap();
+        let probe = window.send_empty_request(f.profile, &f.keys, ()).unwrap();
+        assert_eq!(probe.message_id(), 2);
+        drop(probe);
+        let wire = f.peer_packet(1, false, delete(), 0);
+        let request = window.open_peer(f.profile, &f.keys, &wire).unwrap();
+        let prepared = window
+            .prepare_response(
+                f.profile,
+                &f.keys,
+                &request,
+                empty(),
+                Bytes::from_static(b"peer-work"),
+            )
+            .unwrap();
+        let row = prepared.record().clone();
+        let commit = prepared.commit_after_durable(&row).unwrap();
+        window.apply_committed(commit).unwrap();
+        let restored = f.restore(&row);
+        assert_eq!(restored.record().next_send(), Some(3));
+        assert_eq!(
+            restored.record().outbound().unwrap().outcome(),
+            Some(b"settled".as_slice())
+        );
+    }
+
+    #[test]
+    fn the_last_message_id_is_reserved_for_rekey_or_closure() {
+        let mut f = fixture(92_004);
+        let row = super::super::Ikev2CommittedWindowRecord::initial(
+            Domain::from_iv_record(&f.iv),
+            u32::MAX,
+            0,
+        );
+        f.window = Window::restore(
+            &Domain::from_iv_record(&f.iv),
+            f.profile,
+            &f.keys,
+            &row,
+            &f.iv,
+        )
+        .unwrap();
+        assert_eq!(
+            f.window
+                .send_empty_request(
+                    f.profile,
+                    &f.keys,
+                    f.allocator.allocate(Purpose::Ordinary).unwrap()
+                )
+                .err(),
+            Some(Error::Exhausted)
+        );
+    }
+
+    #[test]
+    fn an_answered_probe_cannot_be_reused_for_a_delete_after_restart() {
+        let mut f = fixture(92_005);
+        let (id, _) = send_probe(&mut f);
+        let response = f.peer(id, true, 37, empty(), 0, 0x9002);
+        let opened = f.window.open_peer(f.profile, &f.keys, &response).unwrap();
+        f.window.complete_empty_request(&opened).unwrap();
+        let row = f.window.record().clone();
+        let mut restored: Window<Gcm> = Window::restore(
+            &Domain::from_iv_record(&f.iv),
+            f.profile,
+            &f.keys,
+            &row,
+            &f.iv,
+        )
+        .unwrap();
+        assert!(
+            restored
+                .prepare_request(
+                    f.profile,
+                    &f.keys,
+                    f.allocator.allocate(Purpose::Ordinary).unwrap(),
+                    Ikev2ExchangeKind::Informational,
+                    delete()
+                )
+                .is_err(),
+            "restart must synchronize or retire before reusing the probe's ID for durable work"
+        );
+    }
+
+    #[test]
+    fn a_failed_probe_cannot_release_the_sa_for_another_request() {
+        let mut f = fixture(92_006);
+        send_probe(&mut f);
+        f.window.abandon_empty_request().unwrap();
+        assert!(
+            f.window.ready().is_err(),
+            "exhausted liveness must retire the scoped SA"
+        );
+    }
+
+    #[test]
+    fn probe_origination_requires_a_durable_positive_bound() {
+        let mut f = fixture(92_007);
+        assert!(
+            f.window
+                .send_empty_request(
+                    f.profile,
+                    &f.keys,
+                    f.allocator.allocate(Purpose::Ordinary).unwrap()
+                )
+                .is_err(),
+            "an unconfigured SA has no safe crash bound for unwritten probes"
+        );
     }
 }
