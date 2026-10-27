@@ -220,11 +220,11 @@ async fn persistent_local_snapshot_build_failure_stops_without_degradation() {
 }
 
 #[tokio::test]
-async fn mid_build_indeterminate_publication_stops_the_engine_fatally() {
+async fn mid_build_indeterminate_publication_stops_without_retry() {
     assert_build_failure_stops_engine(true, 0, true).await;
 }
 
 #[tokio::test]
-async fn build_failure_with_no_published_snapshot_stops_the_engine_fatally() {
+async fn first_local_snapshot_build_failure_stops_without_retry() {
     assert_build_failure_stops_engine(false, 3, false).await;
 }

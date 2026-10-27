@@ -912,35 +912,19 @@ namespace ownership. Neither operation alone grants quorum authority. See
 [ADR 0022](../../docs/adr/0022-native-session-persistence-modes.md) for the
 storage and cold-admission contract.
 
-### Local snapshot build failure recovery
+### Local snapshot build failures
 
 A local snapshot build runs capture, sealing, verification and durable
-publication under the existing fixed stage budgets. A failed attempt is retried
-under a fixed bounded budget (three attempts, 100 ms fixed backoff) and records
-a fixed, value-free failure reason, a paired warning, and the
-`opc_persist_snapshot_build_failures_total` / `opc_persist_snapshot_build_retries_total`
-counters. If every attempt fails, the builder reports the unchanged current
-published snapshot to Openraft. Openraft treats an older-or-equal snapshot as a
-duplicate build result: it clears its pending build state without advancing the
-snapshot frontier or purging logs. The engine keeps running with unchanged
-committed-log semantics, and the next snapshot policy trigger after further
-applied entries, or an explicit `Raft::trigger().snapshot()`, retries the build. No snapshot is claimed as
-published before its durable metadata commit.
+publication under the existing fixed stage budgets. Any build error is returned
+to Openraft and stops the local engine. The builder does not retry or report a
+previous snapshot as a successful build. Pre-publication staging retains its
+cleanup ownership; an indeterminate publication requires a fresh storage owner
+to audit the retained candidate. A failed callback never certifies a new
+snapshot frontier or permits log reclamation from its candidate.
 
-`ConsensusSessionStore::snapshot_build_failure()` reports the fixed
-classification (`build_failed`, `indeterminate_publication`,
-`no_published_snapshot`, `current_snapshot_unreadable`) with the bounded
-attempt, retry, degradation and consecutive-failure counters. A later
-successful publication keeps the historical reason but resets the
-consecutive-failure streak. Three classes remain fatal and stop the engine: an
-indeterminate snapshot-publication state (only a fresh core may resume
-publication), a current snapshot that cannot be read back, and a store with no
-published snapshot at all (there is no unchanged snapshot to keep serving at).
-The indeterminate latch is re-checked after every failed attempt and on the
-exhaustion path, because a publication attempt can latch it mid-build. While
-builds keep failing, the retained-log gates of #1249 bound accumulation, so
-sustained failure produces proposal backpressure rather than silent loss or an
-unbounded retry loop.
+Build and install recovery (#1254/#1243) remains deferred until the retained-log
+admission foundation (#1249) exists and is qualified. No retained-log
+backpressure or in-process build/install recovery is claimed here.
 
 ### Memory measurements and deployment sizing
 
