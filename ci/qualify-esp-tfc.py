@@ -235,6 +235,7 @@ def main():
                 (
                     "64BIT",
                     "ACPI",
+                    "PCI",
                     "SERIAL_8250",
                     "SERIAL_8250_CONSOLE",
                     "CRYPTO_AES_NI_INTEL",
