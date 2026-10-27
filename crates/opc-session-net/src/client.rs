@@ -3239,6 +3239,7 @@ fn set_watch_terminal(terminal: &Arc<std::sync::Mutex<Option<StoreError>>>, erro
 #[cfg(all(test, feature = "insecure-test"))]
 mod tests {
     use super::*;
+    use crate::controlled_clock as controlled_watch_clock;
     use crate::protocol::write_frame;
     use futures_util::{FutureExt, StreamExt};
     use opc_session_store::{
@@ -7029,6 +7030,90 @@ mod tests {
         assert_eq!(server.await.expect("cancelled-watch server"), 0);
     }
 
+    async fn observe_terminal_watch_connections(
+        listener: TcpListener,
+        stream: TcpStream,
+    ) -> (usize, Option<TcpStream>) {
+        let _stream = stream;
+        // The original socket may close before the watch attempts a reconnect.
+        // Keep the complete observation window even after that EOF.
+        match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+            Ok(Ok((retry, _))) => (2, Some(retry)),
+            _ => (1, None),
+        }
+    }
+
+    async fn assert_terminal_observer_sees_a_late_connection(watch_owned: bool) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        controlled_watch_clock::run(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let original = TcpStream::connect(addr).await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            drop(original);
+            let mut byte = [0; 1];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+
+            // The original socket has closed, but this fixture still owns a
+            // later connection attempt. EOF must not end the accept window.
+            let started = tokio::time::Instant::now();
+            let mut observation = Box::pin(observe_terminal_watch_connections(listener, stream));
+            let early = std::future::poll_fn(|cx| Poll::Ready(observation.as_mut().poll(cx))).await;
+            let mut late = TcpStream::connect(addr).await;
+            if let Ok(connection) = &mut late {
+                let request = if watch_owned {
+                    Request::Watch {
+                        start_sequence: u64::MAX,
+                    }
+                } else {
+                    Request::Capabilities
+                };
+                write_frame(connection, &request).await.unwrap();
+            }
+            let (count, accepted) = match early {
+                Poll::Ready(result) => result,
+                Poll::Pending => observation.await,
+            };
+            assert_eq!(
+                count, 2,
+                "the observation must include an attempt after EOF"
+            );
+            let late = late.expect("the observation keeps its listener alive");
+            let mut accepted = accepted.expect("the counted connection was actually accepted");
+            assert_eq!(accepted.peer_addr().unwrap(), late.local_addr().unwrap());
+            let request: Request = read_frame(&mut accepted, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    request,
+                    Request::Watch {
+                        start_sequence: u64::MAX
+                    }
+                ),
+                watch_owned,
+                "the synthetic request distinguishes this watch attempt from the unrelated fixture"
+            );
+            if !watch_owned {
+                assert!(matches!(request, Request::Capabilities));
+            }
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_observer_detects_a_watch_reconnect_after_socket_close() {
+        assert_terminal_observer_sees_a_late_connection(true).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_observer_distinguishes_an_unrelated_connection_after_socket_close() {
+        assert_terminal_observer_sees_a_late_connection(false).await;
+    }
+
     #[tokio::test]
     async fn terminal_watch_sequence_is_delivered_once_without_reconnect() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -7061,20 +7146,7 @@ mod tests {
             write_frame(&mut stream, &Response::WatchEntry(Ok(entry)))
                 .await
                 .expect("write terminal-watch entry");
-            // Event-driven quiescence: the client ends its watch task after the
-            // terminal entry, which closes this stream. A reconnect attempt would
-            // arrive as a second accept. Wait for whichever happens, with the
-            // accept checked first so a simultaneous reconnect is never missed;
-            // no wall-clock window decides the count.
-            let mut probe = [0_u8; 1];
-            tokio::select! {
-                biased;
-                accepted = listener.accept() => {
-                    let _ = accepted;
-                    2
-                }
-                _ = stream.read(&mut probe) => 1,
-            }
+            observe_terminal_watch_connections(listener, stream).await.0
         });
         let backend = RemoteSessionBackend::new_insecure(addr, Some(Duration::from_secs(1)));
         let mut watch = backend.watch(u64::MAX).await.expect("open terminal watch");
@@ -7088,14 +7160,7 @@ mod tests {
             u64::MAX
         );
         assert!(watch.next().await.is_none());
-        // The stream closes only when the watch handle is dropped; the server
-        // then observes that event instead of waiting out a wall-clock window.
-        drop(watch);
-        let count = tokio::time::timeout(Duration::from_secs(30), server)
-            .await
-            .expect("terminal-watch server must terminate")
-            .expect("terminal-watch server");
-        assert_eq!(count, 1);
+        assert_eq!(server.await.expect("terminal-watch server"), 1);
     }
 
     #[tokio::test]

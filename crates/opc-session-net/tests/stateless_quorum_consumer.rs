@@ -2,6 +2,8 @@
 
 #![cfg(feature = "test-control")]
 
+use crate::controlled_clock;
+
 #[path = "../../opc-session-store/tests/support/election_progress.rs"]
 mod election_progress;
 
@@ -2049,6 +2051,7 @@ struct RecordingCompareAndSetConsumer {
     binding_entries: Arc<AtomicUsize>,
     effects: ConsensusSessionStore,
     calls: Mutex<Vec<RecordedCompareAndSetCall>>,
+    reply_delay: Duration,
 }
 
 impl RecordingCompareAndSetConsumer {
@@ -2062,6 +2065,7 @@ impl RecordingCompareAndSetConsumer {
             binding_entries,
             effects,
             calls: Mutex::new(Vec::new()),
+            reply_delay: Duration::ZERO,
         }
     }
 
@@ -2103,6 +2107,10 @@ impl SessionQuorumConsumer for RecordingCompareAndSetConsumer {
                     binding_entries_at_answer,
                     effects_at_answer,
                 });
+            // Model a delayed test observer without adding a quorum operation.
+            if !self.reply_delay.is_zero() {
+                tokio::time::sleep(self.reply_delay).await;
+            }
         }
         response
     }
@@ -6449,8 +6457,20 @@ async fn prepared_cas_three_voter_receipt_converges_with_payload(
 /// different body under the same ID remains a request conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
+    prepared_cas_binding_reply_loss_case(Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_cas_binding_reply_loss_survives_slow_reply_observation() {
+    prepared_cas_binding_reply_loss_case(
+        PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT + Duration::from_millis(50),
+    )
+    .await;
+}
+
+async fn prepared_cas_binding_reply_loss_case(reply_delay: Duration) {
     let pki = Arc::new(TestPki::new());
-    let mut fleet = ThreeVoterConsumerFleet::start_fixed_durable(Arc::clone(&pki)).await;
+    let fleet = ThreeVoterConsumerFleet::start_fixed_durable(Arc::clone(&pki)).await;
     let (leader, _, _) = fleet.wait_for_observed_leader().await;
     // The rotating origin must be a follower, so that it forwards its
     // binding to the leader. The successor is the other follower.
@@ -6465,11 +6485,15 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
     let mut servers = Vec::with_capacity(THREE_VOTER_COUNT);
     let mut clients = Vec::with_capacity(THREE_VOTER_COUNT);
     for voter in route {
-        let recorder = Arc::new(RecordingCompareAndSetConsumer::new(
+        let mut recorder = RecordingCompareAndSetConsumer::new(
             Arc::new(fleet.stores[voter].consumer_service()),
             Arc::clone(&fleet.consumer_binding_entries),
             fleet.stores[leader].clone(),
-        ));
+        );
+        if voter == origin {
+            recorder.reply_delay = reply_delay;
+        }
+        let recorder = Arc::new(recorder);
         let server_spiffe = three_voter_spiffe(voter);
         let (server, address) = SessionQuorumConsumerServer::new(
             Arc::clone(&recorder) as Arc<dyn SessionQuorumConsumer>,
@@ -6483,16 +6507,13 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
         )
         .await
         .expect("start prepared failover listener");
-        clients.push(
-            PersistentSessionConsumerClient::from_stateless(consumer_client(
-                &pki,
-                address,
-                &server_spiffe,
-                &client_spiffe,
-                fleet.voter_authority(voter),
-            ))
-            .expect("prepared failover persistent client"),
-        );
+        clients.push(consumer_client(
+            &pki,
+            address,
+            &server_spiffe,
+            &client_spiffe,
+            fleet.voter_authority(voter),
+        ));
         recorders.push(recorder);
         servers.push(server);
     }
@@ -6517,25 +6538,6 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
             payload: EncryptedSessionPayload::new([0xb1]),
         },
     };
-    let provider = CountingKeyProvider::with_active_session_key();
-    // Seal over the leader so the preparation preflight forwards nothing.
-    let protected = SessionConsumerPreparedCheckpointBackend::persistent(
-        Arc::new(EncryptingSessionBackend::new(
-            Arc::new(fleet.stores[leader].clone()),
-            Arc::clone(&provider),
-            "prepared-cas-binding-reply-loss",
-        )),
-        clients.iter().cloned(),
-    )
-    .expect("same-scope protected composite");
-    let request_id = SessionConsumerRequestId::from_bytes([0xb1; 16]);
-    let budget = || {
-        PreparedCheckpointBudget::new(
-            tokio::time::Instant::now() + Duration::from_secs(3),
-            PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
-        )
-        .expect("prepared failover budget")
-    };
     let before = fleet.stores[leader]
         .max_replication_sequence()
         .await
@@ -6547,145 +6549,191 @@ async fn prepared_cas_binding_reply_loss_fails_over_and_applies_exactly_once() {
         .max()
         .expect("three-voter applied index");
     fleet.wait_all_application_sequences(settled).await;
-    // Finish fixture convergence before starting the immutable caller budget.
-    let mut prepared = protected
-        .prepare_compare_and_set(request_id, operation.clone(), budget())
-        .await
-        .expect("prepare the exact protected compare-and-set");
-    fleet.consumer_binding_entries.store(0, Ordering::SeqCst);
-    fleet.withhold_next_forward_mutation_reply(origin, leader);
+    // Only the consumer clock is controlled. Voter engines, disk I/O and the
+    // delayed observer keep running on the original runtime. The shared helper
+    // supplies a wall-clock watchdog and drains accepted client tasks on exit.
+    let mut fleet = controlled_clock::run(async move {
+        let mut persistent_clients = Vec::with_capacity(clients.len());
+        for client in clients {
+            persistent_clients.push(
+                PersistentSessionConsumerClient::from_stateless(client)
+                    .expect("prepared failover persistent client"),
+            );
+        }
+        let clients = persistent_clients;
+        let provider = CountingKeyProvider::with_active_session_key();
+        // Seal over the leader so the preparation preflight forwards nothing.
+        let protected = SessionConsumerPreparedCheckpointBackend::persistent(
+            Arc::new(EncryptingSessionBackend::new(
+                Arc::new(fleet.stores[leader].clone()),
+                Arc::clone(&provider),
+                "prepared-cas-binding-reply-loss",
+            )),
+            clients.iter().cloned(),
+        )
+        .expect("same-scope protected composite");
+        let request_id = SessionConsumerRequestId::from_bytes([0xb1; 16]);
+        let budget = || {
+            PreparedCheckpointBudget::new(
+                tokio::time::Instant::now() + Duration::from_secs(3),
+                PREPARED_CHECKPOINT_MAX_PHYSICAL_ATTEMPT,
+            )
+            .expect("prepared failover budget")
+        };
+        let mut prepared = protected
+            .prepare_compare_and_set(request_id, operation.clone(), budget())
+            .await
+            .expect("prepare the exact protected compare-and-set");
+        fleet.consumer_binding_entries.store(0, Ordering::SeqCst);
+        fleet.withhold_next_forward_mutation_reply(origin, leader);
 
-    let outcome = prepared.execute_once().await;
-    let origin_calls = recorders[0].calls();
-    let successor_calls = recorders[1].calls();
-    assert_eq!(
-        (
-            outcome,
-            fleet.withheld_forward_mutation_replies(),
-            origin_calls
-                .iter()
-                .map(|call| call.response.clone())
-                .collect::<Vec<_>>(),
-            successor_calls
-                .iter()
-                .map(|call| call.response.clone())
-                .collect::<Vec<_>>(),
-            recorders[2].calls().len(),
+        let protocol_started = tokio::time::Instant::now();
+        let wall_started = Instant::now();
+        let outcome = prepared.execute_once().await;
+        assert_eq!(
+            protocol_started.elapsed(),
+            Duration::ZERO,
+            "real voter work and reply observation do not spend the functional client budget"
+        );
+        if !reply_delay.is_zero() {
+            assert!(
+                wall_started.elapsed() >= reply_delay,
+                "the origin actually withholds its reply past the physical attempt's wall-time duration"
+            );
+        }
+        let origin_calls = recorders[0].calls();
+        let successor_calls = recorders[1].calls();
+        assert_eq!(
+            (
+                outcome,
+                fleet.withheld_forward_mutation_replies(),
+                origin_calls
+                    .iter()
+                    .map(|call| call.response.clone())
+                    .collect::<Vec<_>>(),
+                successor_calls
+                    .iter()
+                    .map(|call| call.response.clone())
+                    .collect::<Vec<_>>(),
+                recorders[2].calls().len(),
+                fleet.stores[leader]
+                    .max_replication_sequence()
+                    .await
+                    .expect("sequence after the compare-and-set"),
+            ),
+            (
+                Ok(PreparedCompareAndSetOutcome::Applied),
+                1,
+                vec![SessionConsumerResponse::Rejected(
+                    SessionConsumerRejection::Unavailable
+                )],
+                vec![SessionConsumerResponse::CompareAndSet(Ok(
+                    CompareAndSetResult::Success
+                ))],
+                0,
+                before + 1,
+            ),
+            "the origin loses its committed binding reply; the identical request applies once on the successor"
+        );
+        assert!(
+            origin_calls[0].binding_entries_at_answer > 0,
+            "the origin answered after the leader replicated its binding"
+        );
+        assert_eq!(
+            origin_calls[0].effects_at_answer, before,
+            "the origin answered before any compare-and-set effect"
+        );
+        assert_eq!(
+            successor_calls[0].effects_at_answer,
+            before + 1,
+            "the successor answered after exactly one locally applied effect"
+        );
+        assert!(
+            successor_calls[0].request == origin_calls[0].request,
+            "failover carries the identical request ID and body"
+        );
+        let origin_diagnostics = clients[0].diagnostics().await;
+        assert_eq!(
+            (
+                origin_diagnostics.completed_operations,
+                origin_diagnostics.completed_operation_not_transmitted,
+                origin_diagnostics.completed_operation_unsafe_failures,
+            ),
+            (1, 1, 0),
+            "the closed rejection is a safe completion on the origin"
+        );
+        assert_eq!(
+            prepared.execute_once().await,
+            Err(PreparedCompareAndSetExecuteError::AlreadyExecuted)
+        );
+
+        // An identical retry replays the recorded outcome on every voter.
+        let identical = origin_calls[0].request.clone();
+        for client in &clients {
+            assert_eq!(
+                client.execute(&identical).await,
+                Ok(SessionConsumerResponse::CompareAndSet(Ok(
+                    CompareAndSetResult::Success
+                ))),
+                "an identical retry replays the recorded result without a request conflict"
+            );
+        }
+        assert_eq!(
             fleet.stores[leader]
                 .max_replication_sequence()
                 .await
-                .expect("sequence after the compare-and-set"),
-        ),
-        (
-            Ok(PreparedCompareAndSetOutcome::Applied),
-            1,
-            vec![SessionConsumerResponse::Rejected(
-                SessionConsumerRejection::Unavailable
-            )],
-            vec![SessionConsumerResponse::CompareAndSet(Ok(
-                CompareAndSetResult::Success
-            ))],
-            0,
+                .expect("sequence after identical retries"),
             before + 1,
-        ),
-        "the origin loses its committed binding reply; the identical request applies once on the successor"
-    );
-    assert!(
-        origin_calls[0].binding_entries_at_answer > 0,
-        "the origin answered after the leader replicated its binding"
-    );
-    assert_eq!(
-        origin_calls[0].effects_at_answer, before,
-        "the origin answered before any compare-and-set effect"
-    );
-    assert_eq!(
-        successor_calls[0].effects_at_answer,
-        before + 1,
-        "the successor answered after exactly one locally applied effect"
-    );
-    assert!(
-        successor_calls[0].request == origin_calls[0].request,
-        "failover carries the identical request ID and body"
-    );
-    let origin_diagnostics = clients[0].diagnostics().await;
-    assert_eq!(
-        (
-            origin_diagnostics.completed_operations,
-            origin_diagnostics.completed_operation_not_transmitted,
-            origin_diagnostics.completed_operation_unsafe_failures,
-        ),
-        (1, 1, 0),
-        "the closed rejection is a safe completion on the origin"
-    );
-    assert_eq!(
-        prepared.execute_once().await,
-        Err(PreparedCompareAndSetExecuteError::AlreadyExecuted)
-    );
-
-    // An identical retry replays the recorded outcome on every voter.
-    let identical = origin_calls[0].request.clone();
-    for client in &clients {
-        assert_eq!(
-            client.execute(&identical).await,
-            Ok(SessionConsumerResponse::CompareAndSet(Ok(
-                CompareAndSetResult::Success
-            ))),
-            "an identical retry replays the recorded result without a request conflict"
+            "identical retries add no effect"
         );
-    }
-    assert_eq!(
-        fleet.stores[leader]
-            .max_replication_sequence()
-            .await
-            .expect("sequence after identical retries"),
-        before + 1,
-        "identical retries add no effect"
-    );
 
-    // A different sealed body under the same ID is a closed conflict.
-    let mut conflicting = protected
-        .prepare_compare_and_set(request_id, operation, budget())
-        .await
-        .expect("prepare a different sealed body under the same request ID");
-    assert_eq!(
-        provider.calls(),
-        2,
-        "the second preparation seals a new body"
-    );
-    assert_eq!(
-        conflicting.execute_once().await,
-        Ok(PreparedCompareAndSetOutcome::Rejected(
-            SessionConsumerStoreError::RequestConflict
-        )),
-        "a different body under the same request ID is a request conflict"
-    );
-    let conflicting_request = recorders[1]
-        .calls()
-        .last()
-        .expect("the successor serves the conflicting request")
-        .request
-        .clone();
-    assert_eq!(conflicting_request.request_id(), identical.request_id());
-    assert!(
-        conflicting_request != identical,
-        "the conflicting request carries a different body"
-    );
-    assert_eq!(
-        fleet.stores[leader]
-            .max_replication_sequence()
+        // A different sealed body under the same ID is a closed conflict.
+        let mut conflicting = protected
+            .prepare_compare_and_set(request_id, operation, budget())
             .await
-            .expect("sequence after the conflicting request"),
-        before + 1,
-        "the conflicting body has no effect"
-    );
+            .expect("prepare a different sealed body under the same request ID");
+        assert_eq!(
+            provider.calls(),
+            2,
+            "the second preparation seals a new body"
+        );
+        assert_eq!(
+            conflicting.execute_once().await,
+            Ok(PreparedCompareAndSetOutcome::Rejected(
+                SessionConsumerStoreError::RequestConflict
+            )),
+            "a different body under the same request ID is a request conflict"
+        );
+        let conflicting_request = recorders[1]
+            .calls()
+            .last()
+            .expect("the successor serves the conflicting request")
+            .request
+            .clone();
+        assert_eq!(conflicting_request.request_id(), identical.request_id());
+        assert!(
+            conflicting_request != identical,
+            "the conflicting request carries a different body"
+        );
+        assert_eq!(
+            fleet.stores[leader]
+                .max_replication_sequence()
+                .await
+                .expect("sequence after the conflicting request"),
+            before + 1,
+            "the conflicting body has no effect"
+        );
 
-    for client in &clients {
-        client.shutdown().await;
-    }
+        for client in &clients {
+            client.shutdown().await;
+        }
+        drop((prepared, conflicting, protected, recorders));
+        fleet
+    })
+    .await;
     for server in servers {
         server.abort_and_wait().await;
     }
-    drop((prepared, conflicting, protected, recorders));
     fleet.quiesce().await;
 }
 

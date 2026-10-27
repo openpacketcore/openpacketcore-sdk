@@ -47,6 +47,16 @@
 #[cfg(test)]
 extern crate self as opc_session_net;
 
+#[cfg(all(
+    test,
+    any(
+        feature = "test-control",
+        all(feature = "legacy-session-net-compat", feature = "insecure-test")
+    )
+))]
+#[path = "../../opc-session-store/tests/support/controlled_clock.rs"]
+mod controlled_clock;
+
 #[cfg(all(test, feature = "test-control"))]
 #[doc(hidden)]
 pub(crate) use consumer::SessionConsumerFencedTransitionBackend;
