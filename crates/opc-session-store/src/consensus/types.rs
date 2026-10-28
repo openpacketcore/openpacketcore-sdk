@@ -3780,7 +3780,7 @@ pub(crate) mod tests {
                     },
                 )
             };
-            Self {
+            let signer = Self {
                 identity,
                 scope: scope.digest(),
                 admission_ingress: certificate(
@@ -3810,7 +3810,19 @@ pub(crate) mod tests {
                 root,
                 ingress_key,
                 executor_key,
+            };
+            // Sharing certificates must preserve each leaf's namespace binding,
+            // including both ingress roles and the provider/executor pair.
+            for certificate in [
+                &signer.admission_ingress,
+                &signer.terminal_ingress,
+                &signer.provider,
+                &signer.executor,
+            ] {
+                assert_eq!(certificate.configuration_identity, identity);
+                assert_eq!(certificate.scope, scope.digest());
             }
+            signer
         }
     }
 
