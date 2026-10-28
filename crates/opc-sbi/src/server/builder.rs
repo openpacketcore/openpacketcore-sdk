@@ -407,7 +407,7 @@ async fn auth_middleware(
         // Classify credentials before the common-header parser can turn an
         // Authorization failure into a generic, unchallenged 400 response.
         let bearer_token = crate::headers::extract_bearer_token_from_headers(headers)
-            .map_err(|error| auth_header_failure_response(error, service))?;
+            .map_err(|error| auth_header_failure_response(error, headers, service))?;
         let sbi_headers = crate::headers::SbiHeaders::parse(headers).map_err(|_| {
             let details = ProblemDetails::new(StatusCode::BAD_REQUEST);
             problem_response(StatusCode::BAD_REQUEST, &details, None)
@@ -511,16 +511,30 @@ fn bearer_realm(service: &AuthService) -> String {
 
 fn auth_header_failure_response(
     error: crate::headers::HeaderParseError,
+    headers: &http::HeaderMap,
     service: &AuthService,
 ) -> Response {
+    let bearer_scheme = headers
+        .get(http::header::AUTHORIZATION)
+        .is_some_and(|value| {
+            value
+                .as_bytes()
+                .split(u8::is_ascii_whitespace)
+                .find(|part| !part.is_empty())
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"Bearer"))
+        });
     let (status, code) = match error {
         // RFC 6750 section 3.1 distinguishes repeated credentials from an
         // invalid token; both cases still require the configured API realm.
         crate::headers::HeaderParseError::Duplicate { .. } => {
             (StatusCode::BAD_REQUEST, "invalid_request")
         }
-        // TS 29.500 section 6.7.3 includes malformed credentials among the
-        // invalid tokens that receive 401 and an invalid_token challenge.
+        // TS 29.500 section 6.7.3 and RFC 6750 section 3.1 omit the error
+        // attribute when no Bearer credentials were supplied.
+        _ if !bearer_scheme => {
+            return auth_problem_response(StatusCode::UNAUTHORIZED, Some(bearer_realm(service)));
+        }
+        // Malformed Bearer credentials still receive an invalid_token challenge.
         _ => (StatusCode::UNAUTHORIZED, "invalid_token"),
     };
     auth_problem_response(

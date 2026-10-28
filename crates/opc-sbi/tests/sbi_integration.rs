@@ -526,6 +526,93 @@ async fn auth_failures_include_safe_bearer_challenges_and_problem_media_type() {
 }
 
 #[tokio::test]
+async fn auth_challenges_omit_error_for_empty_and_non_bearer_credentials() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let validator = SbiJwtValidator::new(
+        Arc::new(MockJwksResolver::new()),
+        Duration::from_secs(60),
+        "test-audience".into(),
+        "test-issuer".into(),
+        false,
+        false,
+    );
+    let server = SbiServerBuilder::new(addr)
+        .with_auth_policy(Arc::new(validator))
+        .with_auth_service(
+            "https://nrf.example.test/nnrf-disc/v1".parse().unwrap(),
+            vec!["nnrf-disc".into()],
+        );
+    let app = axum::Router::new().fallback(|| async { "unexpected admission" });
+    let task = tokio::spawn(server.run_with_listener(listener, app));
+    let client = SbiClientBuilder::new()
+        .with_http2_only(false)
+        .with_retry_policy(RetryPolicy::new(
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+            Jitter::None,
+        ))
+        .build()
+        .unwrap();
+    let mut responses = Vec::new();
+    let mut expected = Vec::new();
+    for (value, challenge) in [
+        (
+            "Negotiate",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "Digest username=\"u\", realm=\"r\"",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        ("", "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\""),
+        (
+            "Basic dXNlcjpwYXNz",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "Bearer",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\"",
+        ),
+        (
+            "bEaReR private-token!",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\"",
+        ),
+    ] {
+        let response = client
+            .send(
+                http::Request::builder()
+                    .uri(format!("http://{addr}/nnrf-disc/v1/test"))
+                    .header("authorization", value)
+                    .body(Vec::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        responses.push((
+            response.status(),
+            response.headers()["www-authenticate"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ));
+        expected.push((
+            StatusCode::UNAUTHORIZED,
+            challenge.to_owned(),
+            "application/problem+json".to_owned(),
+        ));
+    }
+    task.abort();
+    let _ = task.await;
+    assert_eq!(responses, expected);
+}
+
+#[tokio::test]
 async fn auth_challenges_select_trusted_api_and_scope_without_reflecting_request_headers() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
