@@ -67,20 +67,18 @@ fn octet_level_field_is_an_identity_mapping_for_every_level() {
 }
 
 #[test]
-fn spare_bits_and_out_of_range_levels_stay_rejected() {
-    // Spare bit 8 (0x80) and spare bit 2 (0x02) are not part of the typed map.
-    assert_eq!(
-        AllocationRetentionPriority::from_octet(0x82),
-        Err(BearerQosValidationError::InvalidArpSpareBits)
-    );
-    assert_eq!(
-        AllocationRetentionPriority::from_octet(0x80),
-        Err(BearerQosValidationError::InvalidArpSpareBits)
-    );
-    assert_eq!(
-        AllocationRetentionPriority::from_octet(0x02),
-        Err(BearerQosValidationError::InvalidArpSpareBits)
-    );
+fn spare_bits_are_ignored_and_out_of_range_levels_stay_rejected() {
+    // TS 29.274 7.7.8: spares do not affect a valid received ARP value.
+    for spare in [0x02, 0x80, 0x82] {
+        assert_eq!(
+            AllocationRetentionPriority::from_octet(0x4d | spare),
+            AllocationRetentionPriority::from_octet(0x4d)
+        );
+        assert_eq!(
+            AllocationRetentionPriority::from_octet(spare),
+            Err(BearerQosValidationError::InvalidPriorityLevel)
+        );
+    }
     // Level field zero is outside TS 29.274's 1..=15.
     for octet in [0x00u8, 0x01, 0x40, 0x41] {
         assert_eq!(
@@ -143,4 +141,27 @@ fn preemption_flags_encode_zero_as_enabled() {
     assert_eq!(arp(2, false, true).to_octet(), 0x48);
     assert_eq!(arp(2, true, true).to_octet(), 0x08);
     assert_eq!(arp(2, false, false).to_octet(), 0x49);
+}
+
+#[test]
+fn preemption_permissions_use_the_enabled_zero_wire_convention() {
+    for level in 1..=15 {
+        for capability in [false, true] {
+            for vulnerability in [false, true] {
+                let wire = (level << 2)
+                    | if capability { 0 } else { 0x40 }
+                    | if vulnerability { 0 } else { 1 };
+                let decoded = AllocationRetentionPriority::from_octet(wire).unwrap();
+                assert_eq!(decoded.priority_level(), level);
+                assert_eq!(decoded.preemption_capability(), capability);
+                assert_eq!(decoded.preemption_vulnerability(), vulnerability);
+                assert_eq!(
+                    AllocationRetentionPriority::new(level, capability, vulnerability)
+                        .unwrap()
+                        .to_octet(),
+                    wire
+                );
+            }
+        }
+    }
 }

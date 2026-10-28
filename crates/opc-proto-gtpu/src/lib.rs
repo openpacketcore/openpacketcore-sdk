@@ -23,15 +23,18 @@ use opc_protocol::{
 };
 
 mod control;
+mod extension;
+pub use extension::GtpuTypedExtension;
 
 pub use control::{
     GtpuControlCodecError, GtpuControlCodecErrorCode, GtpuControlMessage, GtpuEchoRequest,
     GtpuEchoResponse, GtpuEndMarker, GtpuErrorIndication, GtpuExtensionHeaderTypeList,
     GtpuPeerAddress, GtpuPrivateExtension, GtpuRecovery, GtpuRecoveryTimeStamp,
-    GtpuSupportedExtensionHeadersNotification, GtpuTunnelEndpointId, GtpuUnknownControlIe,
-    GTPU_MESSAGE_ECHO_REQUEST, GTPU_MESSAGE_ECHO_RESPONSE, GTPU_MESSAGE_END_MARKER,
-    GTPU_MESSAGE_ERROR_INDICATION, GTPU_MESSAGE_G_PDU,
-    GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
+    GtpuSupportedExtensionHeadersNotification, GtpuTunnelEndpointId, GtpuTunnelStatus,
+    GtpuTunnelStatusInformation, GtpuUnknownControlIe, GTPU_MESSAGE_ECHO_REQUEST,
+    GTPU_MESSAGE_ECHO_RESPONSE, GTPU_MESSAGE_END_MARKER, GTPU_MESSAGE_ERROR_INDICATION,
+    GTPU_MESSAGE_G_PDU, GTPU_MESSAGE_SUPPORTED_EXTENSION_HEADERS_NOTIFICATION,
+    GTPU_MESSAGE_TUNNEL_STATUS,
 };
 
 fn validation_strictness(level: ValidationLevel) -> u8 {
@@ -149,14 +152,24 @@ impl GtpuExtensionHeaderType {
         }
     }
 
-    /// Return whether this crate has a typed decoder for the extension.
+    /// Return whether this crate has a typed decoder for the extension format.
+    /// Opaque RAN containers still require inner-protocol support in the consumer.
     #[must_use]
     pub const fn is_supported_by_codec(self) -> bool {
+        matches!(self.0, 0x03 | 0x20 | 0x40 | 0x81..=0x85 | 0xc0)
+    }
+
+    /// Return whether this SDK endpoint comprehends the extension semantics.
+    ///
+    /// The endpoint profile supports UDP Port and PDU Session Container. Typed RAN and
+    /// PDCP parsing does not supply their protocol consumers.
+    #[must_use]
+    pub const fn is_supported_by_endpoint(self) -> bool {
         matches!(self.0, GTPU_EXT_UDP_PORT | GTPU_EXT_PDU_SESSION_CONTAINER)
     }
 
-    /// Return whether an unsupported header requires comprehension by the
-    /// supplied recipient role.
+    /// Return whether a header outside the endpoint comprehension profile
+    /// requires comprehension by the supplied recipient role.
     #[must_use]
     pub const fn unsupported_requires_comprehension_by(
         self,
@@ -170,7 +183,7 @@ impl GtpuExtensionHeaderType {
         {
             return false;
         }
-        !self.is_supported_by_codec() && self.comprehension().is_required_by(recipient)
+        !self.is_supported_by_endpoint() && self.comprehension().is_required_by(recipient)
     }
 }
 
@@ -252,7 +265,8 @@ impl<'a> GtpuMessage<'a> {
     /// The scan is allocation-free. A caller acting as an endpoint must not
     /// decapsulate a message when this returns `Some`; request/G-PDU handling
     /// can use the type to plan a bounded Supported Extension Headers
-    /// Notification outside this codec.
+    /// Notification outside this codec. `None` proves format support only;
+    /// opaque RAN payload semantics still require consumer comprehension.
     ///
     /// # Errors
     ///
@@ -401,6 +415,7 @@ fn first_unsupported_required_extension<'a>(
     let mut first_unsupported = None;
     for extension in extensions.by_ref() {
         let extension = extension?;
+        extension::validate_fixed_length(&extension)?;
         let extension_type = GtpuExtensionHeaderType::new(extension.ext_type);
         if first_unsupported.is_none()
             && extension_type.unsupported_requires_comprehension_by(recipient)
@@ -529,7 +544,7 @@ pub enum PduSessionContainerError {
     Misaligned,
     /// The PDU type was outside the supported downlink/uplink values.
     ReservedPduType,
-    /// A downlink QMP, SNP, or MSNP conditional-field flag was present.
+    /// A downlink QMP, SNP, MSNP, BSSI, or TTNBI conditional-field flag was present.
     UnsupportedDownlinkConditionalFields,
     /// The PPP flag was set without a Paging Policy Indicator octet.
     MissingPagingPolicyIndicator,
@@ -591,7 +606,7 @@ impl PduSessionContainerError {
             Self::Misaligned => "PDU Session Container is not extension-header aligned",
             Self::ReservedPduType => "reserved PDU Session Container type",
             Self::UnsupportedDownlinkConditionalFields => {
-                "DL PDU Session Container uses unsupported QMP/SNP/MSNP fields"
+                "DL PDU Session Container uses unsupported conditional fields"
             }
             Self::MissingPagingPolicyIndicator => {
                 "Paging Policy Indicator missing despite PPP flag"
@@ -631,6 +646,7 @@ impl Error for PduSessionContainerError {}
 /// containers whose presence flags require QoS-monitoring timestamps, QFI or
 /// MBS sequence numbers, delay results, or future-extension fields are rejected
 /// rather than partially decoded into this smaller model.
+/// Release 19 BSSI/TTNBI burst fields are also rejected, never treated as padding.
 ///
 /// @spec 3GPP TS29281 R18 5.2.2.7
 /// @req REQ-3GPP-TS29281-R18-5.2.2.7-001
@@ -786,6 +802,12 @@ impl PduSessionContainer {
                 if content.len() < 3 {
                     return Err((PduSessionContainerError::MissingPagingPolicyIndicator, 1));
                 }
+                if content[2] & 0x03 != 0 {
+                    return Err((
+                        PduSessionContainerError::UnsupportedDownlinkConditionalFields,
+                        2,
+                    ));
+                }
                 if content.len() != 6 {
                     return Err((
                         PduSessionContainerError::UnsupportedDownlinkExtensionFields,
@@ -864,7 +886,7 @@ impl PduSessionContainer {
             }
             content.push(octet3);
             if let Some(ppi) = self.ppi {
-                // TS 38.415 figure 5.5.2.1-1: PPI precedes five spare bits.
+                // TS 38.415 figure 5.5.2.1-1: PPI precedes spare and R19 burst flags.
                 content.push(ppi << 5);
             }
         } else {
@@ -1553,7 +1575,20 @@ impl<'a> BorrowDecode<'a> for GtpuMessage<'a> {
 
                 let next_ext = packet_bytes[next_ext_offset];
 
+                if ctx.validation_level == ValidationLevel::ProcedureAware {
+                    extension::validate_fixed_length(&GtpuExtensionHeader {
+                        ext_type: current_next_ext,
+                        content: &packet_bytes[current_offset + 1..next_ext_offset],
+                        next_ext_type: next_ext,
+                    })
+                    .map_err(|error| {
+                        DecodeError::new(error.code().clone(), current_offset)
+                            .with_spec_ref(SpecRef::new("3gpp", "TS29281", "5.2.2"))
+                    })?;
+                }
+
                 let extension_type = GtpuExtensionHeaderType::new(current_next_ext);
+                // Reject applies endpoint comprehension, not format recognition.
                 if extension_type
                     .unsupported_requires_comprehension_by(GtpuExtensionHeaderRecipient::Endpoint)
                     && matches!(ctx.unknown_ie_policy, UnknownIePolicy::Reject)

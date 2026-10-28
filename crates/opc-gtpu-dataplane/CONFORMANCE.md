@@ -99,13 +99,15 @@ their admission alone is not forwarding evidence.
 
 `tests/n3_reference.py` is a standalone, spec-authored byte generator with
 no SDK codec or fixture-catalog imports. Its checked-in TSV has **2,604
-cases: 1,511 accepted and 1,093 rejected**, SHA-256
-`87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2`.
+cases: 1,487 accepted and 1,117 rejected**, SHA-256
+`3706c33835e665078c54ea2c3b37d6a31aa3d804b393a16165d711134d67db38`.
 It covers all 64 QFIs, all downlink RQI/absent-or-present PPI combinations,
 all first-header octets, all other message types, declared-length variants,
 every nonzero non-PSC extension type before/after PSC, spare/padding fields,
 wrong direction, duplicate PSC, prefixes, tails and unsupported conditionals.
-PPI uses bits 7..5; the five low spare bits are ignored. Literal-byte tests
+PPI uses bits 7..5; spare bits 4..2 are ignored. Bits 1..0 are the BSSI/TTNBI
+flags in TS 38.415 V19.1.0 and are rejected as unsupported conditionals.
+Literal-byte tests
 independently check the PPI layout and the `UnsupportedQosMonitoring` refusal
 for downlink and uplink QMP packets without a T-PDU.
 

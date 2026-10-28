@@ -237,6 +237,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- GTP-U N3 native and reassembled paths now reject BSSI/TTNBI conditional
+  fields consistently with the codec. Required RAN/PDCP extensions retain
+  Supported Extension Headers Notification authority despite known syntax.
+  Generic `UnknownIePolicy::Reject` applies endpoint comprehension and refuses
+  those required formats; `Preserve` and `Drop` retain their syntax decoding.
+  SCI send values are limited to 0–15. (#1520, #1529)
+- GTPv2-C ignores received Bearer QoS ARP spare bits and clears them on
+  canonical send; raw-preserving send retains the received octet. (#1354)
+- GTP-U control readiness covers IPv6-only and dual-stack retained sockets,
+  preserving shared-generation reopening and I/O without backend-wide mutexes.
+  (#1084, #341)
+
+- `opc-proto-gtpu`: reject unsupported downlink BSSI/TTNBI fields from
+  TS 38.415 V19.1.0 instead of silently discarding them as PPI spare bits
+  and padding; update the independent N3 reference vectors. (#1520)
+
 - `opc-session-store`: preserve V1 roster activation refusal when V2 has only
   provisioned the shared witness, while keeping separately authorized mixed
   profiles operational. Count successful maintenance service toward its existing
@@ -586,6 +602,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Persist explicit liveness metadata with every atomic window row; missing or
   unknown format fields must be rejected. Crossing this stored-record change
   requires a fresh install. Refs #1241, #1352.
+
+- `opc-gtpu-dataplane`: `GtpuControlDatagram::{local,peer}` and
+  `GtpuControlSendPlan::{source,destination}` now return `SocketAddr` to
+  support IPv6. Callers matching IPv4-only tuples must handle both families.
+  `opc-gtpu-ebpf-common::n3_downlink_psc_matches` now takes a four-byte prefix
+  to inspect BSSI/TTNBI when PPP is set. (#341, #1520)
+
+- `opc-gtpu-dataplane`: initialize the new
+  `GtpPdpContext::downlink_peer_source_policy` field with
+  `GtpuPeerSourcePolicy::BackendDefault` to preserve existing backend behavior.
+  `TeidAndLocal` enables eBPF multi-homing while retaining other packet and
+  ownership checks. Grouped/N3 entries expose `with_peer_source_policy`.
+  The opt-in has versioned, persistent encodings; default bytes stay unchanged.
+  Linux GTP rejects the explicit policy because netlink cannot retain it. (#1347)
+
+- GTP-U recognizes short/long PDCP and opaque RAN extension formats and adds
+  `GtpuTypedExtension` encode/decode. `is_supported_by_codec` reports format
+  support; generic `Reject` retains the endpoint comprehension boundary and
+  refuses required RAN/PDCP formats. `Preserve`/`Drop` still decode these formats. The comprehension scan and
+  `ProcedureAware` decode reject malformed fixed-width headers (0x03, 0x20,
+  0x40, 0x82, 0xC0) with `InvalidLength`. N3 retains its PSC-only endpoint profile. (#1529)
+
+- GTP-U adds typed Tunnel Status, its SPOC information element, and a separate
+  dataplane `TunnelStatus` classification. Exhaustive matches must handle the
+  new variants; unsupported consumers should ignore the message. (#1530)
+
+- `opc-proto-gtpu`: network control receive always skips unexpected IEs,
+  uses the first singleton occurrence, and treats unknown TLV `Reject` as
+  `Drop`, as required by TS 29.060 11.1.9–11.1.12. Framing, ordering and
+  resource bounds still apply to ignored elements. (#1517, #1521, #1528)
 
 - `opc-session-store`: format-five session stores now require the roster witness
   from initialization. Stores created by earlier pre-release builds without the

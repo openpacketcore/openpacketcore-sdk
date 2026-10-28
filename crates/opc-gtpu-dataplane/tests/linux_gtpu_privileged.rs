@@ -198,6 +198,323 @@ async fn probe_owned_socket_lifecycle(
     Ok(())
 }
 
+#[path = "fixtures/control_ipv6.rs"]
+mod control_ipv6;
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn ipv6_control_preserves_tuples_and_rejects_retired_ports(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert_ne!(
+        std::fs::read_link("/proc/self/ns/net")?,
+        std::fs::read_link("/proc/1/ns/net")?
+    );
+    let local: std::net::Ipv6Addr = "fd00:341::1".parse()?;
+    let remote: std::net::Ipv6Addr = "fd00:341::2".parse()?;
+    for args in [
+        vec!["link", "set", "lo", "up"],
+        vec!["-6", "addr", "add", "fd00:341::1/64", "dev", "lo", "nodad"],
+        vec!["-6", "addr", "add", "fd00:341::2/64", "dev", "lo", "nodad"],
+    ] {
+        assert!(Command::new("ip").args(args).status()?.success());
+    }
+    let backend = LinuxGtpuDataplaneBackend::new();
+    let mut create = CreateGtpDeviceRequest::new("gtpcontrol6");
+    create.bind_address = IpAddr::V6(local);
+    let device = backend.create_device(create).await?;
+    let port = backend.open_gtpu_control_port(&device).await?;
+    let peer = UdpSocket::bind((remote, 0))?;
+    let service = UdpSocket::bind((remote, GTPU_PORT))?;
+    control_ipv6::exercise(port.as_ref(), (local, GTPU_PORT).into(), &peer, &service);
+    backend.remove_device(&device).await?;
+    assert_eq!(
+        port.send_echo_request((local, GTPU_PORT).into(), service.local_addr()?, 1)
+            .unwrap_err(),
+        opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
+    );
+    drop(service);
+    let mut create = CreateGtpDeviceRequest::new("gtpcontrol6wild");
+    create.bind_address = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+    let wildcard = backend.create_device(create).await?;
+    let port = backend.open_gtpu_control_port(&wildcard).await?;
+    let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x12, 0x34, 0, 0];
+    peer.send_to(&echo, (local, GTPU_PORT))?;
+    let event = control_ipv6::receive(port.as_ref());
+    assert_eq!(
+        event.local(),
+        std::net::SocketAddr::from((local, GTPU_PORT))
+    );
+    port.send_control_response(event.echo_response(GtpuControlResponseBudget::new(14, 2)?)?)?;
+    let mut bytes = [0_u8; 64];
+    let (length, from) = peer.recv_from(&mut bytes)?;
+    assert_eq!(from, std::net::SocketAddr::from((local, GTPU_PORT)));
+    assert_eq!(
+        &bytes[..length],
+        &[0x32, 2, 0, 6, 0, 0, 0, 0, 0x12, 0x34, 0, 0, 14, 0]
+    );
+    // The wildcard queue receives the request sent to its other local alias.
+    port.send_echo_request(
+        (local, GTPU_PORT).into(),
+        (remote, GTPU_PORT).into(),
+        0x1234,
+    )?;
+    let looped = control_ipv6::receive(port.as_ref());
+    assert_eq!(
+        looped.local(),
+        std::net::SocketAddr::from((remote, GTPU_PORT))
+    );
+    assert_eq!(
+        looped.peer(),
+        std::net::SocketAddr::from((local, GTPU_PORT))
+    );
+    assert_eq!(looped.bytes(), echo);
+    backend.remove_device(&wildcard).await?;
+    Ok(())
+}
+
+async fn receive_control_downlink(
+    port: &dyn opc_gtpu_dataplane::control_port::GtpuControlPort,
+) -> Result<GtpuDownlinkEvent, Box<dyn std::error::Error>> {
+    Ok(
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = port.try_receive_downlink(4096)? {
+                    break Ok::<_, opc_gtpu_dataplane::control_port::GtpuControlPortError>(event);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await??,
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn unknown_tunnel_wire_capture_and_echo_share_reopened_socket(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert!(Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status()?
+        .success());
+    let backend = LinuxGtpuDataplaneBackend::new();
+    let mut create = CreateGtpDeviceRequest::new("gtpunknown");
+    create.bind_address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let device = backend.create_device(create).await?;
+    let result = async {
+        let port = backend.open_gtpu_control_port(&device).await?;
+        let duplicate = UdpSocket::bind((Ipv4Addr::LOCALHOST, GTPU_PORT)).unwrap_err();
+        assert_eq!(duplicate.kind(), std::io::ErrorKind::AddrInUse);
+        let peer_ip = Ipv4Addr::new(127, 0, 0, 2);
+        let peer = UdpSocket::bind((peer_ip, GTPU_PORT))?;
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let echo_source = (Ipv4Addr::LOCALHOST, GTPU_PORT).into();
+        let echo_peer = peer.local_addr()?;
+        let echo = [0x32, 1, 0, 4, 0, 0, 0, 0, 0x91, 0x73, 0, 0];
+        assert_eq!(
+            port.send_echo_request(echo_source, echo_peer, 0x9173)?,
+            echo.len()
+        );
+        let mut echo_bytes = [0_u8; 64];
+        let (length, from) = peer.recv_from(&mut echo_bytes)?;
+        assert_eq!(from, echo_source);
+        assert_eq!(&echo_bytes[..length], echo);
+        let echo_response = [0x32, 2, 0, 6, 0, 0, 0, 0, 0x91, 0x73, 0, 0, 14, 0];
+        peer.send_to(&echo_response, from)?;
+        let GtpuDownlinkEvent::Control(echo_event) =
+            receive_control_downlink(port.as_ref()).await?
+        else {
+            return Err("expected a solicited Echo Response".into());
+        };
+        assert_eq!(echo_event.bytes(), echo_response);
+        assert_eq!(echo_event.sequence_number(), Some(0x9173));
+        let sender = UdpSocket::bind((peer_ip, 0))?;
+        let source_port = sender.local_addr()?.port().to_be_bytes();
+        let gpdu = [
+            0x30, 0xff, 0, 20, 0xde, 0xad, 0xbe, 0xef, 0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0,
+            10, 23, 0, 1, 10, 23, 0, 2,
+        ];
+        sender.send_to(&gpdu, (Ipv4Addr::LOCALHOST, GTPU_PORT))?;
+        let event = receive_control_downlink(port.as_ref()).await?;
+        let GtpuDownlinkEvent::UnknownTunnel(datagram) = event else {
+            return Err("expected an unknown-tunnel observation".into());
+        };
+        assert_eq!(datagram.kind(), GtpuControlDatagramKind::Gpdu);
+        assert_eq!(datagram.received_length(), gpdu.len());
+        let plan = datagram.unknown_tunnel_error(GtpuControlResponseBudget::new(28, 4)?)?;
+        assert_eq!(
+            plan.destination(),
+            std::net::SocketAddr::from((peer_ip, GTPU_PORT))
+        );
+        assert_eq!(
+            plan.source(),
+            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, GTPU_PORT))
+        );
+        assert_eq!(port.send_control_response(plan)?, 28);
+        let mut response = [0_u8; 64];
+        let (length, source) = peer.recv_from(&mut response)?;
+        assert_eq!(
+            source,
+            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, GTPU_PORT))
+        );
+        // TS 29.281 5.1 requires S=1; the UDP Port extension also sets E.
+        let mut expected = [
+            0x36, 26, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0x40, 1, 0, 0, 0, 16, 0xde, 0xad, 0xbe, 0xef,
+            133, 0, 4, 127, 0, 0, 1,
+        ];
+        expected[13..15].copy_from_slice(&source_port);
+        assert_eq!(&response[..length], &expected);
+        let mut context = privileged_recovery_context(&device)?;
+        context.local_teid = Teid::new(0xdead_beef).unwrap();
+        assert_eq!(
+            backend
+                .read_pdp_context(PdpContextSelector::LocalTeid(
+                    PdpContextLocalTeidSelector::from_context(&context).unwrap()
+                ))
+                .await?,
+            PdpContextReadback::Absent
+        );
+        sender.send_to(&gpdu, (Ipv4Addr::LOCALHOST, GTPU_PORT))?;
+        let GtpuDownlinkEvent::UnknownTunnel(stale) =
+            receive_control_downlink(port.as_ref()).await?
+        else {
+            return Err("expected another unknown-tunnel observation".into());
+        };
+        let stale_plan = stale.unknown_tunnel_error(GtpuControlResponseBudget::new(28, 4)?)?;
+        let fresh = backend.open_gtpu_control_port(&device).await?;
+        // Reopening shares the retained generation: the prepared plan and
+        // both handles remain live until the attachment itself is removed.
+        assert_eq!(port.send_control_response(stale_plan)?, 28);
+        let (length, source) = peer.recv_from(&mut response)?;
+        assert_eq!(source, echo_source);
+        assert_eq!(&response[..length], &expected);
+        assert!(fresh.try_receive_datagram(4096)?.is_none());
+        assert_eq!(
+            port.send_echo_request(echo_source, echo_peer, 0x9173)?,
+            echo.len()
+        );
+        let (length, source) = peer.recv_from(&mut echo_bytes)?;
+        assert_eq!(source, echo_source);
+        assert_eq!(&echo_bytes[..length], echo);
+        Ok::<_, Box<dyn std::error::Error>>(fresh)
+    }
+    .await;
+    let cleanup = backend.remove_device(&device).await;
+    let fresh = result?;
+    cleanup?;
+    assert_eq!(
+        fresh.try_receive_datagram(4096).unwrap_err(),
+        opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
+    );
+    assert_eq!(
+        fresh
+            .send_echo_request(
+                (Ipv4Addr::LOCALHOST, GTPU_PORT).into(),
+                (Ipv4Addr::new(127, 0, 0, 2), GTPU_PORT).into(),
+                1
+            )
+            .unwrap_err(),
+        opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn wildcard_control_reply_preserves_the_original_local_destination(
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert!(Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status()?
+        .success());
+    let backend = LinuxGtpuDataplaneBackend::new();
+    let device = backend
+        .create_device(CreateGtpDeviceRequest::new("gtpwild"))
+        .await?;
+    let result = async {
+        let port = backend.open_gtpu_control_port(&device).await?;
+        let local = Ipv4Addr::new(127, 0, 0, 3);
+        let peer = Ipv4Addr::new(127, 0, 0, 2);
+        let sender = UdpSocket::bind((peer, 0))?;
+        let gpdu = [
+            0x30, 0xff, 0, 20, 0xde, 0xad, 0xbe, 0xef, 0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0,
+            10, 23, 0, 1, 10, 23, 0, 2,
+        ];
+        sender.send_to(&gpdu, (local, GTPU_PORT))?;
+        let GtpuDownlinkEvent::UnknownTunnel(datagram) =
+            receive_control_downlink(port.as_ref()).await?
+        else {
+            return Err("expected a wildcard unknown-tunnel observation".into());
+        };
+        assert_eq!(
+            datagram.local(),
+            std::net::SocketAddr::from((local, GTPU_PORT))
+        );
+        let plan = datagram.unknown_tunnel_error(GtpuControlResponseBudget::new(28, 4)?)?;
+        assert_eq!(
+            plan.source(),
+            std::net::SocketAddr::from((local, GTPU_PORT))
+        );
+        assert_eq!(port.send_control_response(plan)?, 28);
+        // Both loopback aliases belong to this wildcard socket. Its returned
+        // response proves the actual sendmsg source, not merely the plan tuple.
+        let GtpuDownlinkEvent::Control(response) = receive_control_downlink(port.as_ref()).await?
+        else {
+            return Err("expected the looped-back Error Indication".into());
+        };
+        assert_eq!(
+            response.peer(),
+            std::net::SocketAddr::from((local, GTPU_PORT))
+        );
+        assert_eq!(
+            response.local(),
+            std::net::SocketAddr::from((peer, GTPU_PORT))
+        );
+        let mut expected = [
+            0x36, 26, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0x40, 1, 0, 0, 0, 16, 0xde, 0xad, 0xbe, 0xef,
+            133, 0, 4, 127, 0, 0, 3,
+        ];
+        expected[13..15].copy_from_slice(&sender.local_addr()?.port().to_be_bytes());
+        assert_eq!(response.bytes(), expected);
+        assert!(port.try_receive_datagram(4096)?.is_none());
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    let cleanup = backend.remove_device(&device).await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn control_port_refuses_a_removed_kernel_attachment() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert!(Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status()?
+        .success());
+    let backend = LinuxGtpuDataplaneBackend::new();
+    let mut create = CreateGtpDeviceRequest::new("gtpstale");
+    create.bind_address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let device = backend.create_device(create).await?;
+    let port = backend.open_gtpu_control_port(&device).await?;
+    assert!(port.try_receive_datagram(64)?.is_none());
+    assert!(Command::new("ip")
+        .args(["link", "del", &device.name])
+        .status()?
+        .success());
+    assert_eq!(
+        port.try_receive_datagram(64).unwrap_err(),
+        opc_gtpu_dataplane::control_port::GtpuControlPortError::Unavailable
+    );
+    assert!(backend.open_gtpu_control_port(&device).await.is_err());
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
 async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_leaves_it(
@@ -271,11 +588,11 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         let plan = datagram.unknown_tunnel_error(budget)?;
         assert_eq!(
             plan.destination(),
-            std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, GTPU_PORT)
+            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, GTPU_PORT))
         );
         assert_eq!(
             plan.source(),
-            std::net::SocketAddrV4::new(ingress, GTPU_PORT)
+            std::net::SocketAddr::from((ingress, GTPU_PORT))
         );
         let sent = port.send_control_response(plan)?;
         assert_eq!(sent, 28, "one TS 29.281 Error Indication left the socket");
@@ -301,7 +618,7 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         assert_eq!(datagram.message_type(), Some(26), "Error Indication");
         assert_eq!(
             datagram.peer(),
-            std::net::SocketAddrV4::new(ingress, GTPU_PORT)
+            std::net::SocketAddr::from((ingress, GTPU_PORT))
         );
         let udp = peer.local_addr()?.port().to_be_bytes();
         let mut expected = vec![
@@ -323,6 +640,7 @@ async fn unknown_tunnel_reaches_the_retained_socket_and_one_error_indication_lea
         peer_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         link_ifindex: device.ifindex,
         downlink_source_port_policy: opc_gtpu_dataplane::GtpuSourcePortPolicy::Any,
+        downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
         egress_dscp: None,
@@ -393,13 +711,16 @@ async fn create_install_remove_destroy_gtpu_device_in_current_netns(
     let device = backend.create_device(create).await?;
 
     let local_teid = Teid::new(0x1000_0001).ok_or("local TEID must be nonzero")?;
-    let peer_teid = PeerTeid::new(0x2000_0001);
+    let peer_teid = Teid::new(0x2000_0001)
+        .ok_or("peer TEID must be nonzero")?
+        .into();
     let context = GtpPdpContext {
         local_teid,
         peer_teid,
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 2)),
         peer_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         link_ifindex: device.ifindex,
+        downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: opc_gtpu_dataplane::GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
@@ -443,7 +764,9 @@ async fn create_install_remove_destroy_gtpu_device_in_current_netns(
         let mut stale_selector = context.clone();
         stale_selector.local_teid =
             Teid::new(0x1000_0002).ok_or("stale local TEID must be nonzero")?;
-        stale_selector.peer_teid = PeerTeid::new(0x2000_0002);
+        stale_selector.peer_teid = Teid::new(0x2000_0002)
+            .ok_or("stale peer TEID must be nonzero")?
+            .into();
         assert!(matches!(
             backend
                 .install_pdp_context_classified(stale_selector)
@@ -534,6 +857,7 @@ async fn mixed_inner_outer_families_read_back_and_reconcile_in_current_netns(
             ms_address,
             peer_address,
             link_ifindex: device.ifindex,
+            downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: opc_gtpu_dataplane::GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -588,13 +912,84 @@ fn privileged_recovery_root() -> PathBuf {
     std::env::temp_dir().join(format!("opc-gtpu-627-priv-recovery-{}", std::process::id()))
 }
 
+#[tokio::test]
+#[ignore = "requires CAP_NET_ADMIN, a fresh netns, and the linux gtp module"]
+async fn zero_peer_teid_is_installed_and_sent_on_the_wire() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_eq!(env::var("OPC_GTPU_RUN_PRIVILEGED").as_deref(), Ok("1"));
+    assert!(Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .status()?
+        .success());
+    assert!(Command::new("ip")
+        .args(["addr", "add", "192.0.2.1/32", "dev", "lo"])
+        .status()?
+        .success());
+    let backend = LinuxGtpuDataplaneBackend::new();
+    let mut create = CreateGtpDeviceRequest::new("gtpzero");
+    create.bind_address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    create.bind_port = 32_153;
+    let device = backend.create_device(create).await?;
+    let mut context = privileged_recovery_context(&device)?;
+    context.peer_teid = PeerTeid::ZERO;
+    context.peer_address = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+    let result = async {
+        let peer = UdpSocket::bind((context.peer_address, GTPU_PORT))?;
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        backend.install_pdp_context(context.clone()).await?;
+        let selector = PdpContextSelector::LocalTeid(
+            PdpContextLocalTeidSelector::from_context(&context).ok_or("local selector")?,
+        );
+        assert_eq!(
+            backend.read_pdp_context(selector).await?,
+            PdpContextReadback::Present(context.clone())
+        );
+        assert!(Command::new("ip")
+            .args(["link", "set", &device.name, "up"])
+            .status()?
+            .success());
+        assert!(Command::new("ip")
+            .args([
+                "route",
+                "add",
+                "10.23.0.9/32",
+                "dev",
+                &device.name,
+                "src",
+                "192.0.2.1"
+            ])
+            .status()?
+            .success());
+        let sender = UdpSocket::bind((Ipv4Addr::new(192, 0, 2, 1), 0))?;
+        sender.send_to(b"opc-zero-peer", (context.ms_address, 5000))?;
+        let mut wire = [0_u8; 2048];
+        let (len, _) = peer.recv_from(&mut wire)?;
+        assert_eq!(&wire[..2], &[0x30, 0xff]);
+        assert_eq!(&wire[4..8], &[0, 0, 0, 0]);
+        assert_eq!(usize::from(u16::from_be_bytes([wire[2], wire[3]])), len - 8);
+        assert!(wire[..len].ends_with(b"opc-zero-peer"));
+        backend
+            .remove_pdp_context(RemovePdpContextRequest::from_context(&context))
+            .await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    let cleanup = backend.remove_device(&device).await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
 fn privileged_recovery_context(device: &GtpDevice) -> Result<GtpPdpContext, &'static str> {
     Ok(GtpPdpContext {
         local_teid: Teid::new(0x1400_0001).ok_or("local TEID must be nonzero")?,
-        peer_teid: PeerTeid::new(0x2400_0001),
+        peer_teid: Teid::new(0x2400_0001)
+            .ok_or("peer TEID must be nonzero")?
+            .into(),
         ms_address: IpAddr::V4(Ipv4Addr::new(10, 23, 0, 9)),
         peer_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         link_ifindex: device.ifindex,
+        downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: opc_gtpu_dataplane::GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,
@@ -732,7 +1127,9 @@ async fn restart_recovery_removes_exact_pdp_and_is_idempotent_in_current_netns(
         // A same-selector but different-identity resident is never touched.
         backend.install_pdp_context(context.clone()).await?;
         let mut foreign = context.clone();
-        foreign.peer_teid = PeerTeid::new(0x2400_0999);
+        foreign.peer_teid = Teid::new(0x2400_0999)
+            .ok_or("foreign TEID must be nonzero")?
+            .into();
         let conflict = backend
             .recover_pdp_context_exact(privileged_recovery_request(&device, incarnation, foreign))
             .await?;
@@ -1143,7 +1540,9 @@ async fn live_writer_removal_removes_exact_pdp_under_live_authority_in_current_n
         // A same-selector but different-identity resident is never touched.
         backend.install_pdp_context(context.clone()).await?;
         let mut foreign = context.clone();
-        foreign.peer_teid = PeerTeid::new(0x2400_0999);
+        foreign.peer_teid = Teid::new(0x2400_0999)
+            .ok_or("foreign TEID must be nonzero")?
+            .into();
         match backend
             .remove_pdp_context_exact_live_writer(
                 privileged_live_writer_request(&backend, &device, incarnation, foreign).await,

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use opc_gtpu_dataplane::{
     GtpDevice, GtpPdpContext, GtpuDataplaneBackend, GtpuError, LinuxGtpuDataplaneBackend,
     PdpContextIndeterminateReason, PdpContextRemovalOutcome, PdpContextRepairReason,
-    PdpDeviceIncarnation, PdpRestartRecoveryProof, PdpRestartRecoveryRequest, PeerTeid,
+    PdpDeviceIncarnation, PdpRestartRecoveryProof, PdpRestartRecoveryRequest, Teid,
 };
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -80,10 +80,11 @@ fn linux_pdp_restart_recovery_request_is_redaction_safe() {
         PdpDeviceIncarnation::from_bytes([0xa5; 16]).unwrap(),
         GtpPdpContext {
             local_teid: opc_gtpu_dataplane::Teid::new(0x1122_3344).unwrap(),
-            peer_teid: PeerTeid::new(0x5566_7788),
+            peer_teid: Teid::new(0x5566_7788).unwrap().into(),
             ms_address: "10.23.0.2".parse().unwrap(),
             peer_address: "192.0.2.10".parse().unwrap(),
             link_ifindex: 7,
+            downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: opc_gtpu_dataplane::GtpuSourcePortPolicy::Any,
             gtp_version: opc_gtpu_dataplane::GtpVersion::V1,
             bearer_mark: None,

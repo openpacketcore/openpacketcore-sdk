@@ -18,6 +18,7 @@ fn peer_teid_zero_context() -> GtpPdpContext {
         ms_address: "10.45.0.2".parse().expect("inner address"),
         peer_address: "192.0.2.10".parse().expect("peer address"),
         link_ifindex: 7,
+        downlink_peer_source_policy: opc_gtpu_dataplane::GtpuPeerSourcePolicy::BackendDefault,
         downlink_source_port_policy: GtpuSourcePortPolicy::Any,
         gtp_version: GtpVersion::V1,
         bearer_mark: None,

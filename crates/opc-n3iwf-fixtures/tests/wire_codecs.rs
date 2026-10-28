@@ -73,6 +73,9 @@ fn every_gtpu_wire_obeys_its_codec_contract() {
                 let mut expected = wire.to_vec();
                 if name == "receive-recovery-ignored" {
                     expected[13] = 0;
+                } else if name == "duplicate-recovery" {
+                    expected.truncate(14);
+                    expected[2..4].copy_from_slice(&6u16.to_be_bytes());
                 }
                 assert_eq!(encoded.as_ref(), expected);
             }

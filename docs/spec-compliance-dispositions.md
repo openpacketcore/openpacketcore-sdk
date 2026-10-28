@@ -67,3 +67,59 @@ The cited PFCP `src/runtime.rs` does not exist. The
 retransmission, and node lifecycle. Responding to a Heartbeat Request is not
 an association supervision state machine. No timeout-state-machine repair is
 claimed; implementing such a supervisor remains separate runtime work.
+
+## GTP-U multi-homing #1347
+
+The eBPF default checked the configured outer peer address exactly. TS 29.281
+§4.3.0 defines an entity per IP address and permits “one GTP-U tunnel endpoint
+to receive packets from multiple remote GTP-U endpoints”. The issue's
+explicit TEID/local validation option is now `GtpuPeerSourcePolicy::TeidAndLocal`.
+It is per context and keeps local endpoint, attachment, source-port, inner-PAA,
+TEID, ownership/generation and N3 QFI checks. Unspecified sources and malformed
+record versions remain rejected; N3 source addresses remain unicast. It does
+not authenticate an alternate address, so transport-network admission remains
+caller policy. Outgoing routing still uses the configured peer.
+
+`BackendDefault` retains eBPF's exact peer check and Linux GTP's native behavior.
+The Linux kernel's `gtp1u_udp_encap_recv` already looks up the incoming TEID
+without comparing the outer source to the configured outgoing peer. Linux GTP
+rejects the new explicit opt-in because its netlink codec cannot retain that
+setting. It is therefore not labelled an exact-peer policy across all backends.
+
+Default-policy bytes retain their existing versions. The opt-in has new binding,
+ordinary/N3 entry and durable-descriptor versions; older readers reject them.
+Policy bytes enter owner/commit equality and selector-admission fingerprints.
+Readback/restart preserve the policy, while exact install/removal and TEID-only
+reattachment detect a policy conflict. The shared borrowed checks also serve
+the kernel-reassembly consumer.
+
+Witnesses include raw-byte typed/borrowed tests for both families and N3,
+malformed-version refusal, ownership mismatch, ordinary/marked restart, grouped
+readback, durable descriptor/fingerprint tests, and userspace reassembly parity.
+The privileged Linux test injects alternate-source packets, proves default
+rejection and opt-in delivery across restart, and rejects wrong local address,
+UDP source port, TEID and inner PAA. Existing IPv4 round-trip, ordinary IPv6 and
+N3 live contracts qualify the rebuilt object separately. A full Linux test run
+initially failed during durable selector fixture provisioning (`Indeterminate`);
+the isolated test and complete rerun passed without changing that test or its
+assertions. This is retained as test history, not treated as peer-review approval.
+
+Sources: [TS 29.281 v18.4.0 §§4.3.0, 4.4.3.3](https://www.etsi.org/deliver/etsi_ts/129200_129299/129281/18.04.00_60/ts_129281v180400p.pdf),
+[Linux v6.8 GTP receive path](https://github.com/torvalds/linux/blob/v6.8/drivers/net/gtp.c),
+[shared binding](../crates/opc-gtpu-ebpf-common/src/lib.rs),
+[grouped wire authorizers](../crates/opc-gtpu-ebpf-common/src/session.rs), and
+[live packet proof](../crates/opc-gtpu-dataplane/tests/ebpf_gtpu_privileged/multihoming.rs).
+
+## S2b GTPv2-C unknown optional IEs #1359
+
+TS 29.274 §§7.7.1 and 7.7.9 require continued processing after an unknown
+optional IE. The default `UnknownIePolicy::Preserve` retains its uninterpreted
+bytes and `Drop` omits it from the interpreted view. Explicit `Reject` is a
+non-conformant diagnostic mode for this network-receive case. The issue's
+§7.2.1 citation describes Create Session Request, and its `messages.rs:820`
+path is absent from this crate. The existing
+[unknown-IE policy tests](../crates/opc-proto-gtpv2c/tests/unknown_ie_policy.rs)
+and [S2b receive tests](../crates/opc-proto-gtpv2c/tests/s2b_receive_policy.rs)
+qualify this disposition; it makes no PFCP runtime claim.
+
+Source: [TS 29.274 V19.6.0 §§7.7.1, 7.7.9](https://www.etsi.org/deliver/etsi_ts/129200_129299/129274/19.06.00_60/ts_129274v190600p.pdf).

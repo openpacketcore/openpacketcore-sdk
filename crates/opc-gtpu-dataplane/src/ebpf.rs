@@ -2910,7 +2910,8 @@ fn grouped_entry_to_ebpf(entry: &GtpuSessionEntry) -> Option<EbpfSessionEntry> {
         context.egress_dscp.map(crate::DscpCodepoint::get),
         context.downlink_source_port_policy,
         context.uplink_source_port_policy,
-    )?;
+    )?
+    .with_peer_source_policy(context.downlink_peer_source_policy);
     match entry.n3_qfi() {
         Some(qfi) => encoded.with_n3_qfi(qfi.get()),
         None => Some(encoded),
@@ -2959,6 +2960,7 @@ fn grouped_model_from_record(
             ms_address: ip_address(entry.inner_paa().canonical_address()),
             peer_address: ip_address(entry.peer_outer_address()),
             link_ifindex: device.ifindex,
+            downlink_peer_source_policy: entry.peer_source_policy(),
             downlink_source_port_policy: entry.downlink_source_port_policy(),
             gtp_version: GtpVersion::V1,
             bearer_mark: if mark == 0 {
@@ -11177,6 +11179,7 @@ impl EbpfGtpuDataplaneBackend {
             ms_address: IpAddr::V4(Ipv4Addr::from(pdr.ue_ip)),
             peer_address: IpAddr::V4(Ipv4Addr::from(far.peer_ip)),
             link_ifindex: ifindex,
+            downlink_peer_source_policy: binding.peer_source_policy(),
             downlink_source_port_policy: binding.source_port_policy(),
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -11276,6 +11279,7 @@ impl EbpfGtpuDataplaneBackend {
             ms_address: IpAddr::V4(Ipv4Addr::from(key.ue_ip)),
             peer_address: IpAddr::V4(Ipv4Addr::from(owner.uplink_far.peer_ip)),
             link_ifindex: ifindex,
+            downlink_peer_source_policy: owner.downlink_binding.peer_source_policy(),
             downlink_source_port_policy: owner.downlink_binding.source_port_policy(),
             gtp_version: GtpVersion::V1,
             bearer_mark: Some(bearer_mark),
@@ -11795,6 +11799,7 @@ impl EbpfGtpuDataplaneBackend {
             request.link_ifindex,
             request.downlink_source_port_policy,
         )
+        .map(|endpoint| endpoint.with_peer_source_policy(request.downlink_peer_source_policy))
         .ok_or_else(|| {
             GtpuError::invalid_config(
                 "pdp.downlink_endpoint",
@@ -15883,7 +15888,11 @@ fn encode_downlink_endpoint(
         endpoint.ingress_ifindex(),
         endpoint.source_port_policy(),
     )
-    .map(DownlinkEndpointBinding::encode)
+    .map(|binding| {
+        binding
+            .with_peer_source_policy(endpoint.peer_source_policy())
+            .encode()
+    })
     .ok_or_else(|| {
         GtpuError::invalid_config(
             "pdp.downlink_endpoint",
@@ -27882,6 +27891,9 @@ mod aya_runtime {
         ) -> Result<(u64, u64), GtpuError> {
             let stat = rustix::fs::statat(pin, leaf, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|error| GtpuError::io(operation, error.into()))?;
+            // Linux stat link counts differ in width between architectures.
+            #[allow(clippy::useless_conversion)]
+            let nlink = u64::from(stat.st_nlink);
             if !historical_25_pin_leaf_is_exact(
                 rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file(),
                 stat.st_uid,
@@ -27889,7 +27901,7 @@ mod aya_runtime {
                 rustix::process::geteuid().as_raw(),
                 rustix::process::getegid().as_raw(),
                 stat.st_mode,
-                stat.st_nlink,
+                nlink,
             ) {
                 return Err(state_indeterminate(operation));
             }
@@ -57220,6 +57232,7 @@ mod tests {
     mod grouped_bearer_transition;
     #[cfg(target_os = "linux")]
     mod ipv6_packet_too_big;
+    mod multihoming;
     #[cfg(target_os = "linux")]
     mod n3_end_marker;
     mod ordinary_ipv6;
@@ -66126,6 +66139,7 @@ mod tests {
             ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
             peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
             link_ifindex: S2BU_IFINDEX,
+            downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
             downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
             gtp_version: GtpVersion::V1,
             bearer_mark: None,
@@ -66234,7 +66248,8 @@ mod tests {
             context.link_ifindex,
             context.downlink_source_port_policy,
         )
-        .expect("canonical test binding");
+        .expect("canonical test binding")
+        .with_peer_source_policy(context.downlink_peer_source_policy);
         PdpContextCommit::new(
             context.local_teid.get().to_be_bytes(),
             far,
@@ -69612,6 +69627,7 @@ mod tests {
                 ms_address: IpAddr::V6(ipv6_inner()),
                 peer_address: IpAddr::V6(peer),
                 link_ifindex: S2BU_IFINDEX,
+                downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
                 downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
                 gtp_version: GtpVersion::V1,
                 bearer_mark: None,
@@ -69632,6 +69648,7 @@ mod tests {
                 ms_address: IpAddr::V4(Ipv4Addr::new(10, 45, 0, 2)),
                 peer_address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
                 link_ifindex: S2BU_IFINDEX,
+                downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
                 downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
                 gtp_version: GtpVersion::V1,
                 bearer_mark: None,
@@ -69659,6 +69676,7 @@ mod tests {
                 ms_address: inner,
                 peer_address: peer_outer,
                 link_ifindex: S2BU_IFINDEX,
+                downlink_peer_source_policy: crate::GtpuPeerSourcePolicy::BackendDefault,
                 downlink_source_port_policy: crate::GtpuSourcePortPolicy::Any,
                 gtp_version: GtpVersion::V1,
                 bearer_mark: bearer_mark.and_then(GtpBearerMark::new),

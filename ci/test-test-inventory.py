@@ -1667,6 +1667,44 @@ echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
 
 
 class DeclarationTests(unittest.TestCase):
+    def test_semantic_change_is_visible_without_an_assertion_count_change(self):
+        head = declare(rust('assert_eq!(value(), 2);'), kind='fixture-setup-changed')
+        for base in (rust(), {'Cargo.toml': MANIFEST, 'src/lib.rs': ''}):
+            with self.subTest(base=base):
+                result = report(base, head)
+                self.assertTrue(result.success)
+                self.assertEqual([(f.subject, f.kind, f.allowed) for f in result.findings],
+                                 [(TEST, 'fixture-setup-changed', True)])
+
+    def test_semantic_change_does_not_waive_coverage_reductions(self):
+        old = rust('assert!(ready()); assert_eq!(value(), 1);')
+        head = declare(rust('assert_eq!(value(), 2);', attributes='#[test] #[ignore]'),
+                       kind='fixture-setup-changed')
+        result = report(old, head)
+        self.assertFalse(result.success)
+        self.assertEqual({(f.kind, f.allowed) for f in result.findings},
+                         {('fixture-setup-changed', True), ('assertions-decreased', False), ('disabled', False)})
+
+    def test_semantic_change_requires_changed_source_existing_test_and_issue(self):
+        self.assertFalse(report(rust(), declare(rust(), kind='fixture-setup-changed')).success)
+        missing = declare({'Cargo.toml': MANIFEST, 'src/lib.rs': ''}, kind='fixture-setup-changed')
+        result = report(rust(), missing)
+        self.assertFalse(result.success)
+        self.assertTrue(any(f.kind == 'removed' and not f.allowed for f in result.findings))
+        invalid_issue = declare(rust('assert_eq!(value(), 2);'), kind='fixture-setup-changed', issue=99)
+        self.assertFalse(report(rust(), invalid_issue).success)
+
+    def test_semantic_change_cannot_declare_job_or_reduction_fields(self):
+        for extra in ({'renamed_to': TEST}, {'replacements': [TEST]}, {'behavior_deleted': True, 'deleting_change': 'change'}):
+            with self.subTest(extra=extra), self.assertRaises(GuardError):
+                report(rust(), declare(rust(), kind='fixture-setup-changed', **extra))
+        head = declare(rust(), kind='fixture-setup-changed')
+        record = json.loads(head['ci/test-changes.json'])
+        record['changes'][0]['job'] = record['changes'][0].pop('test')
+        head['ci/test-changes.json'] = json.dumps(record)
+        with self.assertRaises(GuardError):
+            report(rust(), head)
+
     def test_clock_conversion_is_printed_without_waiving_assertion_loss(self):
         old = rust('assert!(ready()); assert_eq!(value(), 1);')
         new = declare(rust('controlled_clock(); assert!(ready());'), kind='clock-source-changed')

@@ -1054,6 +1054,115 @@
       "renamed_to": "rust:crates/opc-proto-nas::test=nas_optional_elements::half_octet_duplicates_preserve_the_first_wire_value_for_both_receiver_policies",
       "reason": "Correct receiver expectations per TS 24.501 7.6.3 and TS 24.007 11.4.2: first duplicate wins and extra octets are ignored; retain minimum-length, raw preservation and per-table assertions.",
       "issue": 1255
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::unknown_tlv_policy_preserves_drops_or_rejects_without_exposing_value",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::unknown_tlv_policy_preserves_or_skips_without_exposing_value",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_timestamp_and_supported_type_list_fail_at_datagram_offsets",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_timestamp_and_supported_type_list_use_first_occurrence",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::unexpected_ie_offset_is_datagram_relative",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::unexpected_ie_is_skipped",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_and_wrong_procedure_ie_fail_closed",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpu::test=control_messages::duplicate_udp_extension_fails_and_wrong_procedure_ie_is_skipped",
+      "reason": "Correct GTP-U receiver expectations per TS 29.281 9.1 and TS 29.060 11.1.9, 11.1.11 and 11.1.12: skip unknown TLVs and unexpected IEs; first singleton wins. Retain canonical bytes, mandatory fields, extension and malformed-framing checks.",
+      "issue": 1532
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::zero_peer_teid_is_installed_and_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_zero_peer_teid_is_sent_on_the_wire",
+      "kind": "disabled",
+      "reason": "New privileged packet test needs an isolated Linux network namespace and kernel capabilities, matching this harness. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: installation/readback and a captured outgoing G-PDU prove peer TEID zero reaches the wire. Shared unit tests retain nonzero local-TEID and exact-authority checks.",
+      "issue": 1346
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::control_port_refuses_a_removed_kernel_attachment",
+      "kind": "disabled",
+      "reason": "New Linux kernel-GTP proof requires CAP_NET_ADMIN, the GTP module, and an isolated network namespace. The privileged GTP-U workflow runs this entire ignored harness with explicit opt-in. Covers a real retained-socket response and stale-device refusal; ordinary unit tests cover tuple, budget, classification and registration boundaries.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::wildcard_control_reply_preserves_the_original_local_destination",
+      "kind": "disabled",
+      "reason": "New privileged kernel-GTP test requires an isolated network namespace and CAP_NET_ADMIN. The privileged workflow runs the complete ignored harness. Actual loopback receive verifies the wildcard socket preserves the original destination in the response source and Peer Address IE.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=ebpf_gtpu_privileged::ebpf_gtpu_multihoming_is_opt_in_and_survives_restart",
+      "kind": "disabled",
+      "reason": "New privileged packet proof requires CAP_BPF/CAP_NET_ADMIN and an isolated network namespace. Executed by the privileged native suite with OPC_GTPU_RUN_PRIVILEGED=1: strict alternate-source rejection, opt-in delivery before and after backend restart, and rejection of wrong local address, UDP port, TEID and inner PAA. The complete ignored harness runs in privileged CI; host tests cover codecs, ownership and reassembly parity.",
+      "issue": 1347
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::ipv6_control_preserves_tuples_and_rejects_retired_ports",
+      "kind": "disabled",
+      "issue": 341,
+      "reason": "New native IPv6 kernel-GTP control test requires CAP_NET_ADMIN and a private network namespace. Required GTP CI runs every ignored Linux GTP integration case explicitly. Independent wire bytes cover Echo, Error Indication, extension notification, budgets and retired handles."
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::lib=lib::ie::typed::tests::bearer_qos_decode_rejects_arp_spare_bits",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::lib=lib::ie::typed::tests::bearer_qos_decode_ignores_arp_spare_bits_and_sender_rejects_them",
+      "reason": "TS 29.274 7.7.8 requires receivers to ignore ARP spare bits. Replace the non-conformant whole-IE rejection with all three spare-bit combinations, canonical receive/send equivalence and sender-side rejection; Create/Update Bearer tests also preserve the raw received octet at every validation level.",
+      "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_and_out_of_range_levels_stay_rejected",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_are_ignored_and_out_of_range_levels_stay_rejected",
+      "reason": "TS 29.274 7.7.8 requires receiver-ignored ARP spare bits. Check each spare combination with a valid level, retain level-zero and constructor-range rejection, and retain canonical sender-spare validation in the typed QoS unit test.",
+      "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=linux_gtpu_privileged::unknown_tunnel_wire_capture_and_echo_share_reopened_socket",
+      "kind": "disabled",
+      "reason": "Port the independent Linux wire-capture and outgoing Echo scenario alongside the existing wildcard/known-TEID regression, under a distinct name. It requires a privileged private network namespace and runs in the complete native Linux suite. Reopening preserves the backlog shared generation; attachment removal still revokes both handles.",
+      "issue": 1084
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::lib=lib::linux::tests::linux_control_port_refuses_nonstandard_port_and_ipv6_bind",
+      "kind": "removed",
+      "renamed_to": "rust:crates/opc-gtpu-dataplane::lib=lib::linux::tests::linux_control_port_refuses_nonstandard_port_and_accepts_ipv6_bind",
+      "reason": "IPv6 control support for #341 replaces the unsupported-bind expectation with exact IPv6 socket tuple acceptance. Preserve the nonstandard-port rejection and add live IPv6 Echo, Error Indication and required-extension notification coverage in the privileged suite.",
+      "issue": 341
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpv2c::test=arp_priority_polarity::spare_bits_are_ignored_and_out_of_range_levels_stay_rejected",
+      "kind": "assertions-decreased",
+      "reason": "Replace three incorrect spare-bit rejection statements with a loop over all three spare-bit combinations. Each combination now proves valid-level equivalence and continued rejection of level zero; constructor bounds and all former zero-level octets remain covered (TS 29.274 7.7.8).",
+      "issue": 1354
+    },
+    {
+      "test": "rust:crates/opc-gtpu-dataplane::test=n3_contract::generic_typed_extensions_do_not_expand_n3_endpoint_comprehension",
+      "kind": "fixture-setup-changed",
+      "reason": "Previously generic Reject accepted parseable required 0x81-0x84 and 0xC0; it now returns UnknownCriticalIe because Endpoint comprehension is separate from wire-format recognition. N3PacketView continues to report UnsupportedExtension, including the valid two-unit Long PDCP form. Preserve/Drop and typed-format coverage remain intact.",
+      "issue": 1529
+    },
+    {
+      "test": "rust:crates/opc-proto-gtpu::test=typed_extensions::short_pdcp_followed_by_psc_decodes_but_unknown_required_still_fails",
+      "kind": "fixture-setup-changed",
+      "reason": "Previously generic Reject decoded the Short PDCP and PSC extensions; it now returns UnknownCriticalIe for Short PDCP. Preserve continues to decode both and retains every typed-content assertion. The existing unknown comprehension-required rejection remains; recognizing a wire format does not imply Endpoint comprehension.",
+      "issue": 1529
     }
   ]
 }

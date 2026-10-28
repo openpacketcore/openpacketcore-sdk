@@ -2280,7 +2280,7 @@ construction argument 64, not a packet with malformed spare bits.
 def n3_psc_references() -> list[tuple[dict, str]]:
     """Reuse exact independently authored packet vectors; never SDK encoding."""
     source = "crates/opc-gtpu-dataplane/tests/n3_reference.tsv"
-    digest = "87583b7b1a6474d0dc7ea46196bddcc915a3676c809ef6b642cb5273728703f2"
+    digest = "3706c33835e665078c54ea2c3b37d6a31aa3d804b393a16165d711134d67db38"
     path = ROOT / source
     if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         raise ValueError("n3iwf_psc_reference_digest")
@@ -2319,7 +2319,7 @@ def n3_psc_references() -> list[tuple[dict, str]]:
 def n3_gtpu(subset_dir: Path) -> list[dict]:
     echo_nz = "32 02 00 06 00 00 00 00 12 34 00 00 0e a5"
     ul_psc = "36 ff 00 08 00 00 00 01 00 05 00 85 01 10 09 00"
-    unknown = "36 ff 00 08 11 22 33 44 00 05 00 84 01 aa bb 00"
+    unknown = "36 ff 00 08 11 22 33 44 00 05 00 87 01 aa bb 00"
     duplicate = "32 02 00 08 00 00 00 00 12 34 00 00 0e 00 0e 00"
     ordered = "34 fe 00 10 de ad be ef 00 00 00 85 01 00 09 07 01 aa bb 06 01 cc dd 00"
     malformed = "32 01 00 04 00 00 00 00 12 34"
@@ -2445,12 +2445,12 @@ def n3_gtpu(subset_dir: Path) -> list[dict]:
             role="n3iwf",
             prerequisite="UnknownIePolicy::Reject",
             provenance_class="referenced-public-vector",
-            notes="Comprehension-required unknown extension 0x84",
+            notes="Comprehension-required unknown extension 0x87",
             referenced="crates/opc-proto-gtpu/tests/gtpu_tests.rs",
             sanitized=SYN_ID,
             wire_name="unknown-required-extension",
             wire_hex=unknown,
-            assertions=["ext_type=0x84", "code=UnknownCriticalIe"],
+            assertions=["ext_type=0x87", "code=UnknownCriticalIe"],
             outcome="reject",
         ),
         manifest(
@@ -2459,18 +2459,18 @@ def n3_gtpu(subset_dir: Path) -> list[dict]:
             case_class="duplicate",
             document="3GPP TS 29.281",
             release="V18.4.0",
-            clauses=["8.2"],
+            clauses=["8.2", "9.1"],
             direction="peer-to-local",
             role="gtpu-endpoint",
             prerequisite="Recovery is a singleton IE",
-            provenance_class="synthetic-negative",
-            notes="Echo Response with two Recovery IEs",
+            provenance_class="spec-authored",
+            notes="First Recovery wins per TS 29.060 11.1.12; receiver ignores its counter",
             referenced=None,
             sanitized=SYN_ID,
             wire_name="duplicate-recovery",
             wire_hex=duplicate,
-            assertions=["duplicate_ie=recovery"],
-            outcome="reject",
+            assertions=["duplicate_ie=recovery", "first_occurrence_wins", "canonical_recovery_count=1"],
+            outcome="receive",
         ),
         manifest(
             subset="n3-gtpu",

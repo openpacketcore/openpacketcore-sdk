@@ -2549,7 +2549,7 @@ fn grouped_n3_downlink_matches(
             return false;
         }
         if next == 0x85 {
-            let Ok(prefix) = ctx.load::<[u8; 3]>(cursor) else {
+            let Ok(prefix) = ctx.load::<[u8; 4]>(cursor) else {
                 return false;
             };
             if found || !n3_downlink_psc_matches(prefix, qfi) {

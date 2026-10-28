@@ -1432,8 +1432,8 @@ mod platform {
         }
 
         fn qualify_persistent_identity_inode_reuse(hold_original: bool) {
-            let directory = tempfile::tempdir().expect("create identity qualification directory");
-            let path = directory.path().join("persistent-file-identity");
+            // tmpfs allocates increasing inode numbers; qualify reuse on the prepared filesystem.
+            let path = fs_verity_qualification_file().into_temp_path();
             std::fs::write(&path, b"persistent file identity A")
                 .expect("write identity qualification file");
             let original = File::open(&path).expect("open original identity file");
@@ -2081,7 +2081,7 @@ mod platform {
                 == Some(std::ffi::OsStr::new("required"))
         }
 
-        /// Creates only kernel-seal qualification artifacts on CI's prepared
+        /// Creates only kernel-seal and file-identity artifacts on CI's prepared
         /// fs-verity mount. General temporary I/O remains on the runner's
         /// native filesystem.
         fn fs_verity_qualification_file() -> tempfile::NamedTempFile {
