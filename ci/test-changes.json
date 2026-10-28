@@ -394,13 +394,13 @@
     {
       "test": "rust:crates/opc-session-store::lib=lib::sqlite::consensus::tests::native::roster::export::native_roster_snapshot_signed_v1_and_v2_share_exact_history_across_cold_reopen",
       "kind": "fixture-setup-changed",
-      "reason": "Update the intermediate retirement checkpoint to the bounded multi-epoch contract: both eligible profiles retire in one command, their shared floor and cursor are released, and the canonical witness covers the exact terminal prefix. Keep all shared-history, native/SQLite parity, mutation combinations and cold-reopen assertions, including the following idle maintenance command.",
+      "reason": "Update the intermediate retirement checkpoint to the bounded multi-epoch contract: replace the expectation of one remaining V1 roster row with zero rows, because both eligible profiles retire in one command. Replace the retained floor with retired_through=3 by no floor and a canonical witness retired_terminal_sequence=7; also require no remaining admissions or retirement cursors. Keep all shared-history, native/SQLite parity, mutation combinations and cold-reopen assertions, including the following idle maintenance command.",
       "issue": 1307
     },
     {
       "test": "rust:crates/opc-session-store::test=dynamic_membership::root_preserving_three_to_five_reactivates_profile_and_accepts_successor_signed_roster",
       "kind": "fixture-setup-changed",
-      "reason": "Keep autonomous maintenance enabled and wait within the existing operation budget for durable retirement of the expired D5 terminal. Require its canonical witness frontier and original admission fence before accepting row absence. Observe retirement on both the leader and snapshot target before isolating the target, so the snapshot tests retired-to-retired history. The separately tracked lagging-follower recovery design is outside this fixture. After real snapshot installation and cold reopen, require the same retirement authority and authenticated non-definitive status/terminal refusal. Preserve predecessor and successor scope checks, stale ingress rejection, all topology assertions, and fresh successor signed-roster acceptance.",
+      "reason": "Keep autonomous maintenance enabled and wait within the existing operation budget for durable retirement of the expired D5 terminal. Replace the exact retained D5 compacted row with row absence backed by the canonical witness frontier and original admission fence. Replace authenticated Recorded(Compacted{..}) status with Rejected(RecoveryRequired), and terminalization Rejected(Conflict) with Rejected(RecoveryRequired); retired history remains non-definitive. Observe retirement on both leader and snapshot target before isolation, replacing the compacted target setup with retired-to-retired snapshot installation and cold reopen. The separately tracked lagging-follower recovery design is outside this fixture. Preserve predecessor and successor scope checks, stale ingress rejection, all topology assertions, and fresh successor signed-roster acceptance.",
       "issue": 1307
     }
   ]

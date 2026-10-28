@@ -206,3 +206,99 @@ fn maintenance_witness_reader_format_five_probe_rejects_missing() {
     .expect("a corrupt format-five store cannot be scheduled as an empty ledger");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
+
+fn missing_witness_after_fenced_transition_fixture(format: i64) -> SqliteSessionBackend {
+    let backend = SqliteSessionBackend::in_memory().unwrap();
+    {
+        let conn = backend.conn.blocking_lock();
+        empty_predecessor(&conn, 1);
+        activate_v2_ledger_fixture(&conn);
+        assert_eq!(persisted_schema_version_in_sync(&conn, false).unwrap(), 3);
+        assert_eq!(
+            fenced_transition_receipt_ledger_layout_in_sync(&conn, false).unwrap(),
+            FencedTransitionReceiptLedgerLayout::Activated,
+        );
+        assert!(matches!(format, 4 | 5));
+        if format == 4 {
+            activate_protected_roster_schema_sync(&conn).unwrap();
+        } else {
+            activate(&conn).unwrap();
+        }
+        assert_eq!(
+            persisted_schema_version_in_sync(&conn, false).unwrap(),
+            format
+        );
+        for table in PROTECTED_ROSTER_TABLES {
+            if *table != "consensus_protected_roster_witness" {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "no other roster rows in {table}");
+            }
+        }
+        if format == 5 {
+            validate_protected_roster_recovery_state_sync(&conn, identity()).unwrap();
+        }
+        assert!(
+            protected_roster_maintenance_due_sync(&conn, identity(), timestamp(2)).unwrap()
+                == (ProtectedRosterLedgerOccupancy::default(), false),
+            "the intact empty namespace is idle",
+        );
+        assert_eq!(
+            conn.execute("DELETE FROM consensus_protected_roster_witness", [])
+                .unwrap(),
+            1,
+        );
+        assert!(protected_roster_tables_are_empty_in_sync(&conn, false).unwrap());
+    }
+    backend
+}
+
+#[test]
+fn maintenance_witness_after_fenced_transition_format_four_diagnostic_keeps_missing_as_empty() {
+    let backend = missing_witness_after_fenced_transition_fixture(4);
+    assert!(
+        protected_roster_diagnostic_occupancy_sync(&backend.conn.blocking_lock(), identity())
+            .unwrap()
+            == ProtectedRosterLedgerOccupancy::default(),
+    );
+}
+
+#[test]
+fn maintenance_witness_after_fenced_transition_format_four_probe_keeps_missing_as_empty() {
+    let backend = missing_witness_after_fenced_transition_fixture(4);
+    assert!(
+        protected_roster_maintenance_due_sync(
+            &backend.conn.blocking_lock(),
+            identity(),
+            timestamp(2),
+        )
+        .unwrap()
+            == (ProtectedRosterLedgerOccupancy::default(), false),
+    );
+}
+
+#[test]
+fn maintenance_witness_after_fenced_transition_format_five_diagnostic_rejects_missing() {
+    let backend = missing_witness_after_fenced_transition_fixture(5);
+    let error =
+        protected_roster_diagnostic_occupancy_sync(&backend.conn.blocking_lock(), identity())
+            .err()
+            .expect("format five cannot publish empty occupancy after losing its witness");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn maintenance_witness_after_fenced_transition_format_five_probe_rejects_missing() {
+    let backend = missing_witness_after_fenced_transition_fixture(5);
+    let error = protected_roster_maintenance_due_sync(
+        &backend.conn.blocking_lock(),
+        identity(),
+        timestamp(2),
+    )
+    .err()
+    .expect("format five cannot become idle after losing its witness");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}

@@ -10583,10 +10583,10 @@ fn protected_roster_layout_in_sync(
         {
             Ok(ProtectedRosterLayout::Prepared)
         }
+        // Format five always publishes a witness, which is included in
+        // tables_empty. Even a V2-first store cannot be empty and Prepared.
         (
-            FENCED_TRANSITION_V1_DATABASE_FORMAT
-            | FENCED_TRANSITION_V2_DATABASE_FORMAT
-            | PROTECTED_ROSTER_V2_DATABASE_FORMAT,
+            FENCED_TRANSITION_V1_DATABASE_FORMAT | FENCED_TRANSITION_V2_DATABASE_FORMAT,
             FencedTransitionReceiptLedgerLayout::Activated,
             true,
             false,
@@ -13149,8 +13149,9 @@ fn protected_roster_read_witness_sync(
 }
 
 /// Read the authenticated fixed-width roster occupancy without enumerating a
-/// tenant, partition, request, or row. Prepared/legacy stores have no witness
-/// and therefore expose an all-zero gauge.
+/// tenant, partition, request, or row. After schema initialization, a missing
+/// witness below format five exposes an all-zero gauge; format five requires
+/// its witness and rejects a missing row as corruption.
 pub(crate) fn protected_roster_diagnostic_occupancy_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
