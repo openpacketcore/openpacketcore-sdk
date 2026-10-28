@@ -601,8 +601,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GTP-U recognizes short/long PDCP and opaque RAN extension formats and adds
   `GtpuTypedExtension` encode/decode. `is_supported_by_codec` reports format
   support; generic `Reject` retains the endpoint comprehension boundary and
-  refuses required RAN/PDCP formats. `Preserve`/`Drop` decoding and fixed-width
-  validation remain available. N3 retains its PSC-only endpoint profile. (#1529)
+  refuses required RAN/PDCP formats. `Preserve`/`Drop` still decode these formats. The comprehension scan and
+  `ProcedureAware` decode reject malformed fixed-width headers (0x03, 0x20,
+  0x40, 0x82, 0xC0) with `InvalidLength`. N3 retains its PSC-only endpoint profile. (#1529)
 
 - GTP-U adds typed Tunnel Status, its SPOC information element, and a separate
   dataplane `TunnelStatus` classification. Exhaustive matches must handle the
