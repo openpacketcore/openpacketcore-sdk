@@ -365,14 +365,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beyond the preemptive headroom and full consumer/batch backpressure coverage
   remain in that qualification. Refs #1377.
 
-- `opc-session-store` / `opc-session-testkit`: a survivor restore scan whose
-  caller deadline is consumed by the logical-time fence or the backend scan
-  phase now reports a retryable availability outcome instead of the terminal
-  `RestoreScanWorkBudgetExceeded`, so the bounded qualification recovery
-  episode retries it and accepts the later exact page. No deadline is raised and
-  no restore authority or exactly-once behavior changes; genuine fixed
-  scan-work-budget exhaustion remains terminal and is now recorded as its own
-  closed qualification error class instead of opaque `Other`. Refs #1160.
+- `opc-session-store` / `opc-session-testkit`: consensus restore-scan caller
+  deadlines remain retryable across logical-time fencing, worker and connection
+  admission, and page scanning. Actual scan-work exhaustion and other terminal
+  errors keep their original class even if delivery is late. Standalone SQLite
+  retains its existing deadline contract. Tracing records the exact error
+  variant, phase and elapsed time without error payloads; qualification records
+  work exhaustion as its own terminal class. Server transport deadlines remain
+  retryable. No operation deadline, work limit or authority check changes.
+  Refs #1160.
 
 - `opc-persist`: large configuration snapshots keep progressing through bounded
   file operations and SQLite work sized while its connection stays leased.
@@ -434,20 +435,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale/invalid classifier state, and another subscriber's owner group keeps
   admitting. Refs #1087.
 
-- `opc-session-store`: a failed local snapshot build no longer stops the Raft
-  engine. A failed attempt is retried under a fixed bounded budget (three
-  attempts, 100 ms fixed backoff) with a fixed, value-free failure reason, a
-  warning, and `opc_persist_snapshot_build_failures_total` /
-  `opc_persist_snapshot_build_retries_total` counters. If every attempt fails,
-  the builder reports the unchanged current published snapshot as a duplicate
-  build result, so the engine keeps serving with unchanged committed-log
-  semantics and the next snapshot trigger retries the build. A later success
-  resets the consecutive-failure streak while the historical reason remains
-  observable through `ConsensusSessionStore::snapshot_build_failure()`. Only an
-  indeterminate publication state (re-checked after every failed attempt and on
-  the exhaustion path), a current snapshot that cannot be read back, or a store
-  with no published snapshot at all still stops the engine; the retained-log
-  gates bound accumulation meanwhile. Refs #1254.
+- `opc-session-store`: restore fail-stop local snapshot builds. A build error
+  reaches Openraft without retries or an unverified previous-snapshot fallback.
+  Build/install recovery (#1254/#1243) is deferred until retained-log admission
+  (#1249) exists and is qualified. The four build-fault scenarios now verify
+  engine termination, unchanged publication/purge frontiers and artifact
+  ownership under this contract.
 
 - `opc-persist`: a configuration-consensus leader-routed call is now bounded by
   this replica's own leader view. Once the engine has observed a successor for
@@ -495,15 +488,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strict sender validation and Create Bearer PCO compatibility are preserved.
   Raw-preserving encoding retains the received bytes. Fixes #1441.
 
-- `opc-session-store`: a cancelled Dynamic-authority current-snapshot
-  admission no longer releases publication exclusion, its namespace lease or
-  its shutdown evidence while the detached descriptor scan still reads the
-  selected snapshot. Dynamic admission now runs the bounded envelope scan on a
-  blocking worker that retains the serving gate and the admitted
-  snapshot-directory lease (the existing Fixed-admission retention) and
-  additionally takes a shutdown child, so shutdown tracks the detached scan
-  through its last read. Fixed admission, snapshot bytes, admission deadlines
-  and published artifacts are unchanged. Refs #1371.
+- `opc-session-store`: cancelled current-snapshot admission retains publication
+  exclusion, the namespace lease and shutdown ownership through descriptor
+  opening, verification, metadata reads and rewind in both Dynamic and Fixed
+  profiles. Snapshot bytes, integrity checks and operation deadlines are
+  unchanged. Refs #1371.
 
 - `opc-session-net`: prepared protected V2 transition status no longer caches
   a transient local recovery-preflight failure as the handle's final
