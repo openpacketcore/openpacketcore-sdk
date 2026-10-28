@@ -1178,3 +1178,103 @@ fn all_operation_traits_are_usable_behind_dyn_references() {
         .expect_err("dyn signature ops work");
     assert_eq!(error.code(), CryptoOperationErrorCode::InvalidSigningKey);
 }
+
+#[test]
+fn software_rsa_pss_verifies_openssl_vectors_and_rejects_parameter_substitution() {
+    const RSA_SPKI: &[u8] = include_bytes!("data/rsa2048_spki.der");
+    let message = include_bytes!("data/rsa_pss_message.bin");
+    for (algorithm, signature) in [
+        (
+            IkeSignatureAlgorithm::RsaPssSha2_256,
+            include_bytes!("data/rsa_pss_sha256.sig"),
+        ),
+        (
+            IkeSignatureAlgorithm::RsaPssSha2_384,
+            include_bytes!("data/rsa_pss_sha384.sig"),
+        ),
+        (
+            IkeSignatureAlgorithm::RsaPssSha2_512,
+            include_bytes!("data/rsa_pss_sha512.sig"),
+        ),
+    ] {
+        OPERATIONS
+            .verify_signature(algorithm, RSA_SPKI, message, signature)
+            .expect("OpenSSL PSS vector");
+        assert!(OPERATIONS
+            .verify_signature(algorithm, RSA_SPKI, b"tampered", signature)
+            .is_err());
+    }
+    for signature in [
+        include_bytes!("data/rsa_pss_wrong_salt.sig"),
+        include_bytes!("data/rsa_pss_wrong_mgf.sig"),
+        include_bytes!("data/rsa_pss_sha384.sig"),
+    ] {
+        assert_eq!(
+            OPERATIONS
+                .verify_signature(
+                    IkeSignatureAlgorithm::RsaPssSha2_256,
+                    RSA_SPKI,
+                    message,
+                    signature
+                )
+                .unwrap_err()
+                .code(),
+            CryptoOperationErrorCode::SignatureVerificationFailed
+        );
+    }
+}
+
+#[test]
+fn pure_ed25519_matches_rfc8032_and_rejects_malleable_or_prehash_signatures() {
+    let public = include_bytes!("data/rfc8032_ed25519_spki.der");
+    let private = include_bytes!("data/rfc8032_ed25519_pkcs8.der");
+    let signature = include_bytes!("data/ed25519_rfc8032.sig");
+    let key = OPERATIONS
+        .load_signing_key(IkeSignatureAlgorithm::Ed25519, private)
+        .expect("RFC 8032 key");
+    assert_eq!(key.sign(b"r").unwrap(), signature);
+    OPERATIONS
+        .verify_signature(IkeSignatureAlgorithm::Ed25519, public, b"r", signature)
+        .expect("RFC 8032 test 2");
+    let mut noncanonical_scalar = *signature;
+    noncanonical_scalar[63] |= 0x80;
+    let mut weak_r = *signature;
+    weak_r[..32].fill(0);
+    weak_r[0] = 1;
+    for signature in [&noncanonical_scalar, &weak_r] {
+        assert!(OPERATIONS
+            .verify_signature(IkeSignatureAlgorithm::Ed25519, public, b"r", signature)
+            .is_err());
+    }
+    assert!(OPERATIONS
+        .verify_signature(IkeSignatureAlgorithm::Ed25519, public, b"s", signature)
+        .is_err());
+    assert!(OPERATIONS
+        .verify_signature(
+            IkeSignatureAlgorithm::Ed25519,
+            public,
+            b"r",
+            &signature[..63]
+        )
+        .is_err());
+    use sha2::{Digest, Sha512};
+    let prehashed = key.sign(&Sha512::digest(b"r")).unwrap();
+    assert!(OPERATIONS
+        .verify_signature(IkeSignatureAlgorithm::Ed25519, public, b"r", &prehashed)
+        .is_err());
+    let mut weak_public = *public;
+    weak_public[12..].fill(0);
+    weak_public[12] = 1;
+    assert_eq!(
+        OPERATIONS
+            .verify_signature(
+                IkeSignatureAlgorithm::Ed25519,
+                &weak_public,
+                b"r",
+                signature
+            )
+            .unwrap_err()
+            .code(),
+        CryptoOperationErrorCode::InvalidVerificationKey
+    );
+}

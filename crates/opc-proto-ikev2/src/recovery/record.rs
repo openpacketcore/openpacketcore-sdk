@@ -229,6 +229,7 @@ pub struct Ikev2CommittedWindowRecord<P: RecoveryProfile = Gcm> {
     pub(super) inbound: Option<Ikev2CommittedExchangeRecord>,
     pub(super) sync: Option<Ikev2SyncResponderRecord<P>>,
     pub(super) recovery: Option<super::Ikev2SyncRecoveryRecord<P>>,
+    pub(super) liveness: Option<super::Ikev2LivenessRecord>,
 }
 
 impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
@@ -251,6 +252,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
             inbound: None,
             sync: None,
             recovery: None,
+            liveness: None,
         }
     }
 
@@ -288,6 +290,7 @@ impl<P: RecoveryProfile> Ikev2CommittedWindowRecord<P> {
             inbound,
             sync: None,
             recovery: None,
+            liveness: None,
         })
     }
 

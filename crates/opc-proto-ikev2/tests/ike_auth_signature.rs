@@ -169,7 +169,7 @@ fn ecdsa_p256_method_9_signature_round_trips_as_fixed_width_rs() {
     // (2 x 32 octets), with no DER SEQUENCE/INTEGER framing and no RFC 7427
     // AlgorithmIdentifier.
     assert_eq!(auth_data.len(), 64);
-    assert!(!(auth_data[0] == 0x30 && auth_data[1] == 0x2d || auth_data[1] == 0x2b));
+    assert!(!(auth_data[0] == 0x30 && (auth_data[1] == 0x2d || auth_data[1] == 0x2b)));
     let r = &auth_data[..32];
     let s = &auth_data[32..];
     assert!(r.iter().any(|byte| *byte != 0) && s.iter().any(|byte| *byte != 0));
@@ -494,6 +494,19 @@ fn non_signature_auth_methods_are_rejected() {
                 None,
             ),
             Err(Ikev2IkeAuthVerificationError::UnsupportedAuthenticationMethod { method })
+        );
+    }
+    for method in [9, 10, 11] {
+        assert_eq!(
+            verify_ike_auth_signature(
+                profile(),
+                &key_material(),
+                octets,
+                &public,
+                &auth_payload(method, &[0u8; 32]),
+                None
+            ),
+            Err(Ikev2IkeAuthVerificationError::SignatureKeyMismatch)
         );
     }
 }
