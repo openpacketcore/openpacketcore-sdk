@@ -85,12 +85,8 @@ async fn required_running_terminal_debt_survives_authenticated_voter_leadership_
         // Use a dedicated counter/listener around the actual config handler.
         // Background Raft traffic cannot hide a rejected call in this counter.
         // Keep admission/formation within the fleet's failure cleanup boundary.
-        assert_authentication_controls(
-            &quorum.pki,
-            &quorum.manifest,
-            quorum.stores[1].rpc_handler(),
-        )
-        .await;
+        assert_authentication_controls(&quorum.pki, &quorum.manifest, quorum.replica_handler(2))
+            .await;
         let (one, two, three) = tokio::join!(
             quorum.stores[0].initialize_cluster(),
             quorum.stores[1].initialize_cluster(),
