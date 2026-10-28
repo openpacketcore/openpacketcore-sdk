@@ -517,11 +517,14 @@ fn auth_header_failure_response(
     let bearer_scheme = headers
         .get(http::header::AUTHORIZATION)
         .is_some_and(|value| {
-            value
+            let mut parts = value
                 .as_bytes()
                 .split(u8::is_ascii_whitespace)
-                .find(|part| !part.is_empty())
+                .filter(|part| !part.is_empty());
+            parts
+                .next()
                 .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"Bearer"))
+                && parts.next().is_some()
         });
     let (status, code) = match error {
         // RFC 6750 section 3.1 distinguishes repeated credentials from an

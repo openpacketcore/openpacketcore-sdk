@@ -573,7 +573,27 @@ async fn auth_challenges_omit_error_for_empty_and_non_bearer_credentials() {
         ),
         (
             "Bearer",
-            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\", error=\"invalid_token\"",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "Bearer ",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "Bearer\t",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            " Bearer",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            "\tBearer",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
+        ),
+        (
+            " \tbEaReR \t",
+            "Bearer realm=\"https://nrf.example.test/nnrf-disc/v1\"",
         ),
         (
             "bEaReR private-token!",
@@ -668,26 +688,26 @@ async fn auth_challenges_select_trusted_api_and_scope_without_reflecting_request
     let mut expected = Vec::new();
     for path in ["/nnrf-disc/v1", "/nnrf-nfm/v1"] {
         for (values, status, error) in [
-            (vec!["Bearer"], StatusCode::UNAUTHORIZED, "invalid_token"),
+            (vec!["Bearer"], StatusCode::UNAUTHORIZED, None),
             (
                 vec!["Bearer private-token!"],
                 StatusCode::UNAUTHORIZED,
-                "invalid_token",
+                Some("invalid_token"),
             ),
             (
                 vec!["Bearer private-token extra"],
                 StatusCode::UNAUTHORIZED,
-                "invalid_token",
+                Some("invalid_token"),
             ),
             (
                 vec!["Bearer one", "Bearer two"],
                 StatusCode::BAD_REQUEST,
-                "invalid_request",
+                Some("invalid_request"),
             ),
             (
                 vec!["Bearer", "Bearer private-token", "Bearer three"],
                 StatusCode::BAD_REQUEST,
-                "invalid_request",
+                Some("invalid_request"),
             ),
         ] {
             let mut request = http::Request::builder()
@@ -709,9 +729,12 @@ async fn auth_challenges_select_trusted_api_and_scope_without_reflecting_request
             ));
             expected.push((
                 status,
-                Some(format!(
-                    "Bearer realm=\"https://nrf.example.test{path}\", error=\"{error}\""
-                )),
+                Some(match error {
+                    Some(error) => format!(
+                        "Bearer realm=\"https://nrf.example.test{path}\", error=\"{error}\""
+                    ),
+                    None => format!("Bearer realm=\"https://nrf.example.test{path}\""),
+                }),
             ));
             assert_eq!(
                 response.headers()["content-type"],
