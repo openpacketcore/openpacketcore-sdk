@@ -92,7 +92,12 @@ impl WorkBackend {
         }
     }
 
-    fn persist_retained_history(&self, signed: &RosterV2PersistenceFixture, retained: u64) {
+    fn persist_retained_history(
+        &self,
+        signed: &RosterV2PersistenceFixture,
+        retained: u64,
+    ) -> Duration {
+        let started = std::time::Instant::now();
         if let Some(wal) = &self.wal {
             // Use the ordinary generation writer to select and relocate the
             // retained carriers. A direct apply fixture has no Raft snapshot
@@ -111,6 +116,7 @@ impl WorkBackend {
         assert_eq!(occupancy.live_reservations, 0);
         assert_eq!(occupancy.retained_reservations, retained);
         assert_eq!(occupancy.tombstone_reservations, 0);
+        started.elapsed()
     }
 }
 
@@ -178,7 +184,13 @@ fn assert_work_is_independent_of_history(native: bool) {
     // This isolates backend work from replication: every signed Q1/Q2 still
     // uses the real append, commit and apply path. Separate three-voter tests
     // cover controlled turns and measure independent physical arrivals.
-    for rows in [1_800_u16, 18_000] {
+    // Ten turns retire 100 rows. These are the smallest integer histories
+    // that remain above the 1,025-row capped read throughout every turn,
+    // with the larger history at least twice the smaller one.
+    let histories = [1_126_u16, 2_252];
+    assert!(histories[0] - 100 > 1_025);
+    assert!(histories[1] >= histories[0] * 2);
+    for rows in histories {
         let directory = tempfile::tempdir().unwrap();
         let signed = roster_v2_fresh_wal_persistence_fixture(Phase::Aborted);
         let backend = WorkBackend::new(directory.path(), &signed, native);
@@ -187,7 +199,11 @@ fn assert_work_is_independent_of_history(native: bool) {
             .responses
             .iter()
             .all(|response| response.result.is_ok()));
-        let mut seed = Vec::with_capacity(600);
+        // Native checkpoint preparation revalidates pending signed entries.
+        // Keep its O0 batches well inside the unchanged 30-second deadline.
+        let chunk_rows = if native { 24 } else { 300 };
+        let mut seed = Vec::with_capacity(usize::from(chunk_rows) * 2);
+        let mut checkpoint_max = Duration::ZERO;
         for row in 0..rows {
             let index = 3 + u64::from(row) * 2;
             let history = roster_v2_fresh_wal_work_history_fixture(
@@ -209,7 +225,7 @@ fn assert_work_is_independent_of_history(native: bool) {
             let mut q2 = terminal(&history, index + 1);
             at_time(&mut q2, now);
             seed.extend([q1, q2]);
-            if (row + 1).is_multiple_of(300) {
+            if (row + 1).is_multiple_of(chunk_rows) || row + 1 == rows {
                 // One durable transaction per chunk, retaining the real signed
                 // append/commit/apply path and every individual Q1/Q2 outcome.
                 let result = backend.apply(&signed, &seed);
@@ -232,10 +248,12 @@ fn assert_work_is_independent_of_history(native: bool) {
                     ));
                 }
                 seed.clear();
-                backend.persist_retained_history(&signed, u64::from(row + 1));
+                let checkpoint = backend.persist_retained_history(&signed, u64::from(row + 1));
+                checkpoint_max = checkpoint_max.max(checkpoint);
                 eprintln!(
-                    "roster backend history seed: native={native}, retained={}, total={rows}, verification_memory={:?}",
+                    "roster backend history seed: native={native}, retained={}, total={rows}, checkpoint_seconds={}, verification_memory={:?}",
                     row + 1,
+                    checkpoint.as_secs_f64(),
                     crate::consensus::verified_snapshot::VerificationMemory::usage_for_test(),
                 );
             }
@@ -243,6 +261,10 @@ fn assert_work_is_independent_of_history(native: bool) {
         assert!(
             seed.is_empty(),
             "both histories end on a complete seed chunk"
+        );
+        eprintln!(
+            "roster history checkpoint maximum: native={native}, history={rows}, seconds={}",
+            checkpoint_max.as_secs_f64()
         );
         assert_eq!(
             backend.occupancy(&signed).retained_reservations,

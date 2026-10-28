@@ -1015,6 +1015,39 @@ class LibraryGroupPlanTests(unittest.TestCase):
         binary = [command for command in commands if "--bins" in command]
         self.assertEqual(binary, [TEST_SHARDS.SELECTION + ["--bins", "--", *TEST_SHARDS.HARNESS]])
 
+    def test_only_two_work_proofs_join_the_existing_o1_lane(self) -> None:
+        names = TEST_SHARDS.WORK_PROOF_LIB_TESTS
+        self.assertEqual(len(names), 2)
+        self.assertEqual(TEST_SHARDS.WORK_PROOF_SHARD, "native-log-6")
+        invocations = [(shard, command) for shard in TEST_SHARDS.shard_ids(self.plan)
+                       for command in TEST_SHARDS.commands(self.plan, shard, self.targets)
+                       if "--lib" in command]
+        for name in names:
+            owners = [(owner, command) for owner, command in invocations if self.selected(command, name)]
+            self.assertEqual([owner for owner, _ in owners], ["native-log-6"])
+            command = owners[0][1]
+            self.assertEqual(command[:4], ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1",
+                                          "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                                          "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"])
+            self.assertIn("--test-threads=1", command)
+            self.assertEqual([owner for owner, command in invocations
+                              if self.selected(command, name + "_future")], ["misc"])
+        lane = TEST_SHARDS.commands(self.plan, "native-log-6", self.targets)
+        self.assertEqual(len(lane), 3)
+        self.assertIn(self.NATIVE_FULL_BOUND[6], lane[0])
+        for mutation in ("missing", "owner", "extra"):
+            plan = copy.deepcopy(self.plan)
+            group = next(group for group in plan["lib_groups"]
+                         if names[0] in TEST_SHARDS.lib_group_names(group))
+            if mutation == "missing":
+                plan["lib_groups"].remove(group)
+            elif mutation == "owner":
+                group["shard"] = "native-log-5"
+            else:
+                group["tests"].append("future_ordinary_test")
+            with self.subTest(mutation=mutation), self.assertRaises(SystemExit):
+                TEST_SHARDS.verify_lib_plan(plan)
+
     def test_full_native_bounds_have_dedicated_owners_and_optimized_serial_execution(self) -> None:
         invocations = [(shard, command)
                        for shard in TEST_SHARDS.shard_ids(self.plan)
@@ -1072,12 +1105,16 @@ class LibraryGroupPlanTests(unittest.TestCase):
             TEST_SHARDS.precheck(self.plan, "heavy-1")
             for shard in TEST_SHARDS.native_log_bound.CORE_SHARDS:
                 TEST_SHARDS.precheck(self.plan, shard)
-        optimized = (*self.NATIVE_FULL_BOUND, TEST_SHARDS.native_log_bound.ROSTER_HISTORY_TEST)
+        optimized = (*self.NATIVE_FULL_BOUND, TEST_SHARDS.native_log_bound.ROSTER_HISTORY_TEST,
+                     *TEST_SHARDS.WORK_PROOF_LIB_TESTS)
         for name in optimized:
             selected = [command for command in calls if name in command]
             with self.subTest(name=name):
                 self.assertEqual(len(selected), 2)
                 expected = ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1"]
+                if name in TEST_SHARDS.WORK_PROOF_LIB_TESTS:
+                    expected += ["CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                                 "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"]
                 if name == TEST_SHARDS.native_log_bound.ROSTER_HISTORY_TEST:
                     expected = ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=3",
                                 "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",

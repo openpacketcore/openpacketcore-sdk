@@ -513,6 +513,20 @@
       "tests": [
         "caller_deadline_accepts_in_time_and_rejects_late_valid_replies"
       ]
+    },
+    {
+      "module": "sqlite::consensus::tests::native::roster::roster_work_bound",
+      "shard": "native-log-6",
+      "tests": [
+        "roster_maintenance_native_work_is_independent_of_retained_history"
+      ]
+    },
+    {
+      "module": "sqlite::consensus::tests::native::roster::roster_work_bound",
+      "shard": "native-log-6",
+      "tests": [
+        "roster_maintenance_sqlite_work_is_independent_of_retained_history"
+      ]
     }
   ]
 }

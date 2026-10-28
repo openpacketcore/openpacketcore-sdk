@@ -96,8 +96,10 @@ Additional controlled-turn tests deliberately pause arrivals until each real
 store finishes one supplied turn. They require exact reclamation of ten due rows,
 retirement across distinct epochs, and at most two commands per turn. They make
 no arrival-rate or physical latency claim. A separate work comparison seeds
-1,800 and 18,000 signed retained rows, then measures ten turns of ten due rows
-at each size. It requires identical work in corresponding maintenance turns:
+1,126 and 2,252 signed retained rows, then measures ten turns of ten due rows
+at each size. This is the smallest integer pair with a twofold size difference
+that remains above the 1,025-row capped read after all 100 retirements.
+It requires identical work in corresponding maintenance turns:
 native index entries visited and carriers hydrated, or SQLite VM instructions.
 Each backend uses its real signed append, commit and apply path; the separate
 controlled-turn tests cover replication on three voters. Both histories retain

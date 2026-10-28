@@ -175,6 +175,16 @@ if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
 # and would no longer qualify the repository's ordinary test profile.
 OPTIMIZED_QUIESCENT_SHARD = "quiescent-o1"
 
+# These two signed backend work proofs exceed ordinary-shard headroom. Only
+# their exact names may join this existing O1 runner; its original full-bound
+# proof and every other library test retain their prior owner and profile.
+WORK_PROOF_SHARD = "native-log-6"
+WORK_PROOF_LIB_TESTS = tuple(
+    "sqlite::consensus::tests::native::roster::roster_work_bound::"
+    f"roster_maintenance_{backend}_work_is_independent_of_retained_history"
+    for backend in ("native", "sqlite")
+)
+
 # A partition that collapses to a handful of targets would still be "total and
 # disjoint" if metadata were misread, so hold a floor on the real inventory
 # (verify the live inventory with `test-shards.py verify`; keep this floor
@@ -439,6 +449,11 @@ def serial_lib_command(name: str) -> list[str]:
 
 def lib_group_command(group: dict) -> list[str]:
     names = lib_group_names(group)
+    if any(name in WORK_PROOF_LIB_TESTS for name in names):
+        return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1",
+                "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true", *SELECTION,
+                "--lib", "--", "--test-threads=1", "--nocapture", "--exact", *names]
     native = next((name for name in names if name in native_log_bound.TESTS), None)
     if native is not None:
         profile = native_log_bound.profile_env(native)
@@ -964,6 +979,9 @@ def verify_lib_plan(plan: dict) -> None:
         if any(name in native_log_bound.TESTS for name in names):
             if len(names) != 1 or group["shard"] != native_log_bound.CORE_SHARDS[native_log_bound.TESTS.index(names[0])]:
                 sys.exit("full native log proofs must each own one dedicated parallel shard")
+        elif any(name in WORK_PROOF_LIB_TESTS for name in names):
+            if len(names) != 1 or group["shard"] != WORK_PROOF_SHARD:
+                sys.exit("only exact backend work proofs may join their O1 headroom lane")
         elif group["shard"] in native_log_bound.CORE_SHARDS:
             sys.exit("dedicated native log proof shards cannot carry ordinary tests")
         for name in lib_group_names(group):
@@ -972,6 +990,8 @@ def verify_lib_plan(plan: dict) -> None:
             claimed.add(name)
     if not set(native_log_bound.TESTS).issubset(claimed):
         sys.exit("full native log proofs are missing from the heavy library groups")
+    if not set(WORK_PROOF_LIB_TESTS).issubset(claimed):
+        sys.exit("backend work proofs are missing from their O1 headroom lane")
 
 
 def verify(plan: dict, targets: list[str]) -> None:
@@ -1138,7 +1158,7 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
                     f"missing {dict(Counter(names) - selected)}, "
                     f"unexpected {dict(selected - Counter(names))}"
                 )
-            if any(name in native_log_bound.TESTS for name in names):
+            if any(name in (*native_log_bound.TESTS, *WORK_PROOF_LIB_TESTS) for name in names):
                 output = subprocess.run(
                     [*command, "--ignored"], cwd=ROOT, text=True,
                     stdout=subprocess.PIPE, check=True
