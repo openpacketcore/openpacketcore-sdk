@@ -15,8 +15,15 @@ and instance metadata.
 - `with_policy` installs a `PeerPolicy`.
 - `allow_any_trusted_peer` is required before building with an unconstrained
   default policy.
-- `with_compat_mode(true)` enables TLS 1.2 compatibility; otherwise TLS 1.3 is
-  used.
+- `with_compat_mode(true)` enables TLS 1.2 ECDHE AEAD suites with mandatory
+  Extended Master Secret. TLS 1.3 remains preferred; TLS 1.2 is disabled by
+  default. This option does not add finite-field DHE.
+- `with_legacy_dhe_rsa(true)` separately adds DHE-RSA/AES-128-GCM and
+  FFDHE4096/2048 when TLS 1.2 compatibility is enabled. This legacy Release 18
+  exception is prohibited by RFC 10015 and TS 33.210 Release 19. The normal
+  policy targets the Release 19 cipher restrictions; it does not qualify a
+  complete 3GPP endpoint or a validated crypto module. TLS 1.3 groups are
+  unchanged. See [standards position and alert limitations](../../docs/spec-compliance-dispositions.md#tls-and-dtls-cipher-policy-in-1353).
 - `ReloadingClientCertResolver` and `ReloadingServerCertResolver` serve the
   current SVID certificate/key.
 - `SpiffeServerCertVerifier` and `SpiffeClientCertVerifier` validate peer SVIDs

@@ -1211,6 +1211,97 @@
       ],
       "reason": "Restore the fail-stop contract while #1254/#1243 are deferred until the #1249 retained-log admission foundation exists and is qualified. This test is renamed and its original fault scenario is retained, not deleted or ignored. A first-snapshot failure now stops on the first attempt, not after three retries. Replace retired reason/counter API checks with exact one-attempt consumption, storage error class/subject/verb, no claimed snapshot/purge progress, staging cleanup and refused later local work.",
       "issue": 1254
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::loopback_dual_stack_multihoming_selects_both_families",
+      "kind": "disabled",
+      "reason": "New native Linux SCTP test requires SCTP and IPv6 loopback. The required SCTP workflow executes it explicitly and checks one passing test. It exercises mixed bindx/connectx in both family orders, address readback, primary-path selection and payload delivery over IPv4 and IPv6. Portable configuration and path-identity tests run normally.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-sctp::lib=lib::tests::loopback_wire_abort_closes_with_live_handles_and_pending_receive",
+      "kind": "disabled",
+      "reason": "New native Linux SCTP abort test needs kernel SCTP. Required SCTP workflow executes it through qualify-sctp-close-wire.py and independently captures a User-Initiated ABORT. It retains handles and a pending receive to prove synchronous closure.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:crates/opc-diameter-transport::lib=lib::dtls_tests::wire_abort::kernel_malformed_diameter_frames_abort_sequential_and_runtime_associations",
+      "kind": "disabled",
+      "reason": "New native SCTP-AUTH test sends three malformed authenticated Diameter frames through each of the sequential receiver, concurrent receiver, client cleartext prelude and server cleartext prelude. Required SCTP workflow runs it through qualify-sctp-close-wire.py and requires twelve actual ABORT associations plus separate graceful-close controls.",
+      "issue": 1351
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::filters_unsupported_rsa_signature_algorithm",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to retains_supported_rsa_and_ecdsa_signature_algorithms for implemented DTLS RSA support. The parser and serializer now preserve modern RSA schemes. The separate unsupported-type test retains DSA and MD5 refusal.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::certificate_request::test::retains_supported_rsa_and_ecdsa_signature_algorithms"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::default_does_not_advertise_rsa",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to default_advertises_modern_rsa_and_ecdsa_schemes for implemented DTLS RSA support. The wire advertisement now includes only ECDSA and RSA-PSS/PKCS1 SHA-256/384; assertions retain the exact supported set and modern-hash restriction.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::extensions::signature_algorithms::tests::default_advertises_modern_rsa_and_ecdsa_schemes"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::message::tests::rsa_signature_algorithms_are_recognized_but_not_supported",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to modern_rsa_signatures_are_supported_but_legacy_hashes_are_not for implemented DTLS RSA support. The former unsupported RSA capability is implemented; explicit SHA-1 and MD5 refusal replaces the obsolete RSA rejection.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::message::tests::modern_rsa_signatures_are_supported_but_legacy_hashes_are_not"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_does_not_select_rsa_signatures",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to certificate_request_selects_rsa_and_ecdsa_signatures for implemented DTLS RSA support. Exact intersection assertions now retain RSA and ECDSA; ECDSA selection assertions remain.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_selects_rsa_and_ecdsa_signatures"
+    },
+    {
+      "test": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_rejects_rsa_only_signatures",
+      "kind": "removed",
+      "issue": 1353,
+      "reason": "Renamed to certificate_request_accepts_rsa_only_signatures for implemented DTLS RSA support. RSA-only modern offers now work. New CertificateRequest and CertificateVerify tests reject mismatched certificate types and unoffered schemes; independent OpenSSL handshakes exercise both roles with every supported RSA scheme.",
+      "renamed_to": "rust:vendor/dimpl::lib=lib::dtls12::server::tests::certificate_request_accepts_rsa_only_signatures"
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_reviewed_vendored_legacy_stack_is_accepted",
+      "kind": "removed",
+      "issue": 1532,
+      "reason": "The DTLS arithmetic migration removes the RUSTSEC-2026-0387 exception. The same formerly accepted 0.5.5 dependency graph must now fail before any audit. Retain the graph fixture and strengthen it to require explicit rejection; the separate migrated-stack regression also requires both advisory ignore lists to exclude 0386 and 0387.",
+      "renamed_to": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_reviewed_vendored_legacy_stack_is_rejected"
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_standalone_checked_in_fork_is_the_only_allowed_terminal_dimpl",
+      "kind": "removed",
+      "issue": 1532,
+      "reason": "The standalone vendored DTLS workspace no longer has an exception for crypto-bigint 0.5.5. Retain both standalone and root-lock fixtures and require rejection before auditing the vulnerable graph, while preserving the successful root audit before a later vendor-lock failure.",
+      "renamed_to": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_standalone_checked_in_fork_also_rejects_legacy_crypto"
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_additional_legacy_consumer_is_rejected_at_every_boundary",
+      "kind": "fixture-setup-changed",
+      "reason": "P4 removes the RUSTSEC-2026-0387 legacy exception. Replace self.assertIn(f'unaccepted legacy crypto dependency: extra -> {target}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_optional_locked_consumer_cannot_hide_outside_enabled_metadata",
+      "kind": "fixture-setup-changed",
+      "reason": "P4 removes the RUSTSEC-2026-0387 legacy exception. Replace self.assertIn('unaccepted legacy crypto dependency: optional -> crypto-bigint', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_similarly_named_registry_or_unvendored_fork_is_rejected",
+      "kind": "fixture-setup-changed",
+      "reason": "P4 removes the RUSTSEC-2026-0387 legacy exception. Replace self.assertIn(f'must use the checked-in {name}', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
+    },
+    {
+      "test": "python:ci/test-test-inventory.py::AdvisoryWorkflowTests.test_unresolved_or_disconnected_legacy_copy_is_rejected",
+      "kind": "fixture-setup-changed",
+      "reason": "P4 removes the RUSTSEC-2026-0387 legacy exception. Replace self.assertIn('cannot verify the locked crypto-bigint 0.5.5 dependency path', result.stderr); self.assertIn('legacy crypto path ends before the vendored DTLS consumer', result.stderr) with self.assertIn('is not accepted for crypto-bigint 0.5.5', result.stderr). The version floor now refuses every 0.5.5 graph before the former consumer-confinement diagnostics. Preserve the same invalid graph fixtures and every other assertion; no vulnerable graph becomes accepted. The migrated-stack regression separately requires both advisory ignores to be absent.",
+      "issue": 1532
     }
   ]
 }

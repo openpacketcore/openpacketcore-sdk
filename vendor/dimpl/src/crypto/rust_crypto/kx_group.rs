@@ -1,12 +1,13 @@
 //! Key exchange group implementations using RustCrypto.
 
+use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 use p256::{PublicKey as P256PublicKey, ecdh::EphemeralSecret};
 use p384::{PublicKey as P384PublicKey, ecdh::EphemeralSecret as P384EphemeralSecret};
 
 use super::super::{ActiveKeyExchange, SupportedKxGroup};
-use crate::CryptoError;
 use crate::buffer::Buf;
 use crate::types::NamedGroup;
+use crate::{CryptoError, CryptoOperation};
 
 /// ECDHE key exchange implementation.
 enum EcdhKeyExchange {
@@ -58,24 +59,24 @@ impl EcdhKeyExchange {
                 })
             }
             NamedGroup::Secp256r1 => {
-                use rand_core::OsRng;
-                let secret = EphemeralSecret::random(&mut OsRng);
+                let secret = EphemeralSecret::try_generate_from_rng(&mut getrandom::SysRng)
+                    .map_err(|_| CryptoError::OperationFailed(CryptoOperation::FillRandom))?;
                 let public_key_obj = P256PublicKey::from(&secret);
-                let public_key_bytes = public_key_obj.to_sec1_bytes();
+                let public_key_bytes = public_key_obj.to_sec1_point(false);
                 buf.clear();
-                buf.extend_from_slice(&public_key_bytes);
+                buf.extend_from_slice(public_key_bytes.as_bytes());
                 Ok(EcdhKeyExchange::P256 {
                     secret,
                     public_key: buf,
                 })
             }
             NamedGroup::Secp384r1 => {
-                use rand_core::OsRng;
-                let secret = P384EphemeralSecret::random(&mut OsRng);
+                let secret = P384EphemeralSecret::try_generate_from_rng(&mut getrandom::SysRng)
+                    .map_err(|_| CryptoError::OperationFailed(CryptoOperation::FillRandom))?;
                 let public_key_obj = P384PublicKey::from(&secret);
-                let public_key_bytes = public_key_obj.to_sec1_bytes();
+                let public_key_bytes = public_key_obj.to_sec1_point(false);
                 buf.clear();
-                buf.extend_from_slice(&public_key_bytes);
+                buf.extend_from_slice(public_key_bytes.as_bytes());
                 Ok(EcdhKeyExchange::P384 {
                     secret,
                     public_key: buf,
@@ -187,8 +188,13 @@ static KX_GROUP_P256: P256 = P256;
 static KX_GROUP_P384: P384 = P384;
 
 /// All supported key exchange groups.
-pub(super) static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] =
-    &[&KX_GROUP_X25519, &KX_GROUP_P256, &KX_GROUP_P384];
+pub(super) static ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[
+    &KX_GROUP_X25519,
+    &KX_GROUP_P256,
+    &KX_GROUP_P384,
+    &crate::crypto::ffdhe::FFDHE4096,
+    &crate::crypto::ffdhe::FFDHE2048,
+];
 
 #[cfg(test)]
 mod tests {

@@ -242,9 +242,13 @@ attachment invalidation.
 
 ```text
 let readiness = port.downlink_readiness()?;
-// The handle must outlive every epoll/AsyncFd registration that borrows its
-// descriptor: `as_fd()` borrows from the handle and does not keep it alive.
-let async_fd = tokio::io::unix::AsyncFd::new(readiness.as_fd())?; // the SDK epoll
+// Duplicate only the SDK's private epoll descriptor. The registration must
+// own it, including if the registration is forgotten or the source is dropped.
+let epoll = readiness.as_fd().try_clone_to_owned()?;
+let async_fd = opc_tokio_fd_sys::AsyncOwnedFd::with_interest(
+    epoll,
+    tokio::io::Interest::READABLE,
+)?;
 loop {
     let mut guard = async_fd.readable().await?;
     // Consume the SDK notification, then drain with the production consumer.

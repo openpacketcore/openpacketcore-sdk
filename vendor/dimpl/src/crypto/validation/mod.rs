@@ -23,6 +23,8 @@ impl CryptoProvider {
     /// - `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`
     /// - `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`
     /// - `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`
+    /// - ECDHE-RSA AES-128/256-GCM and DHE-RSA AES-128-GCM
+    /// - PSK AES-128-CCM-8
     pub fn supported_cipher_suites(
         &self,
     ) -> impl Iterator<Item = &'static dyn SupportedDtls12CipherSuite> {
@@ -38,11 +40,16 @@ impl CryptoProvider {
     /// - X25519
     /// - P-256 (secp256r1)
     /// - P-384 (secp384r1)
+    /// - FFDHE4096 and FFDHE2048 (DTLS 1.2 only)
     pub fn supported_kx_groups(&self) -> impl Iterator<Item = &'static dyn SupportedKxGroup> {
         self.kx_groups.iter().copied().filter(|kx| {
             matches!(
                 kx.name(),
-                NamedGroup::X25519 | NamedGroup::Secp256r1 | NamedGroup::Secp384r1
+                NamedGroup::X25519
+                    | NamedGroup::Secp256r1
+                    | NamedGroup::Secp384r1
+                    | NamedGroup::FFDHE4096
+                    | NamedGroup::FFDHE2048
             )
         })
     }
@@ -65,6 +72,12 @@ impl CryptoProvider {
             .any(|cs| cs.suite().has_ecc())
     }
 
+    /// Whether any supported suite uses finite-field ephemeral DH.
+    pub fn has_dhe(&self) -> bool {
+        self.supported_cipher_suites()
+            .any(|cs| cs.suite().has_dhe())
+    }
+
     /// Validates the provider configuration for use with dimpl.
     ///
     /// This ensures the provider meets dimpl's requirements:
@@ -78,6 +91,11 @@ impl CryptoProvider {
         self.validate_cipher_suites()?;
         self.validate_dtls12_aead()?;
         self.validate_kx_groups()?;
+        if self.has_dhe() && !self.supported_kx_groups().any(|kx| kx.name().is_ffdhe()) {
+            return Err(provider_error(
+                CryptoProviderValidationError::DheCipherSuitesWithoutKeyExchangeGroups,
+            ));
+        }
         let validated_hashes = self.validate_hash_providers()?;
         self.validate_prf(&validated_hashes)?;
         self.validate_signature_verifier(&validated_hashes)?;
@@ -181,7 +199,10 @@ impl CryptoProvider {
     /// Validate that ECDH cipher suites have matching key exchange groups.
     fn validate_kx_groups(&self) -> Result<(), Error> {
         if self.has_ecdh() {
-            let kx_count = self.supported_kx_groups().count();
+            let kx_count = self
+                .supported_kx_groups()
+                .filter(|kx| !kx.name().is_ffdhe())
+                .count();
             if kx_count == 0 {
                 return Err(provider_error(
                     CryptoProviderValidationError::EcdhCipherSuitesWithoutKeyExchangeGroups,
@@ -304,6 +325,16 @@ impl CryptoProvider {
                     VALIDATION_P384_SHA384_SIG,
                     VALIDATION_TEST_DATA,
                 ),
+                (HashAlgorithm::SHA256, SignatureAlgorithm::RSA) => (
+                    include_bytes!("rsa_cert.der").as_slice(),
+                    include_bytes!("rsa_sha256.sig").as_slice(),
+                    VALIDATION_TEST_DATA,
+                ),
+                (HashAlgorithm::SHA384, SignatureAlgorithm::RSA) => (
+                    include_bytes!("rsa_cert.der").as_slice(),
+                    include_bytes!("rsa_sha384.sig").as_slice(),
+                    VALIDATION_TEST_DATA,
+                ),
                 _ => {
                     return Err(provider_error(
                         CryptoProviderValidationError::NoSignatureValidationVector {
@@ -324,6 +355,35 @@ impl CryptoProvider {
                         source: e,
                     })
                 })?;
+            if sig_alg == SignatureAlgorithm::RSA {
+                let (scheme, pss) = match hash_alg {
+                    HashAlgorithm::SHA256 => (
+                        crate::types::SignatureScheme::RSA_PSS_RSAE_SHA256,
+                        include_bytes!("rsa_pss_sha256.sig").as_slice(),
+                    ),
+                    HashAlgorithm::SHA384 => (
+                        crate::types::SignatureScheme::RSA_PSS_RSAE_SHA384,
+                        include_bytes!("rsa_pss_sha384.sig").as_slice(),
+                    ),
+                    _ => {
+                        return Err(provider_error(
+                            CryptoProviderValidationError::NoSignatureValidationVector {
+                                hash: hash_alg,
+                                signature: sig_alg,
+                            },
+                        ));
+                    }
+                };
+                self.signature_verification
+                    .verify_with_scheme(cert_der, test_data, pss, scheme)
+                    .map_err(|source| {
+                        provider_error(CryptoProviderValidationError::SignatureVerificationFailed {
+                            hash: hash_alg,
+                            signature: sig_alg,
+                            source,
+                        })
+                    })?;
+            }
         }
 
         Ok(())
@@ -579,14 +639,17 @@ struct Dtls12Parameters {
 
 fn dtls12_parameters(suite: Dtls12CipherSuite) -> Option<Dtls12Parameters> {
     match suite {
-        Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256 => Some(Dtls12Parameters {
+        Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+        | Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
+        | Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256 => Some(Dtls12Parameters {
             hash: HashAlgorithm::SHA256,
             key_lengths: (0, 16, 4),
             explicit_nonce_len: 8,
             tag_len: 16,
             min_protected_fragment_len: 24,
         }),
-        Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384 => Some(Dtls12Parameters {
+        Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
+        | Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384 => Some(Dtls12Parameters {
             hash: HashAlgorithm::SHA384,
             key_lengths: (0, 32, 4),
             explicit_nonce_len: 8,
@@ -621,10 +684,13 @@ struct Dtls12AeadTestVector {
 
 fn dtls12_aead_test_vector(suite: Dtls12CipherSuite) -> Option<Dtls12AeadTestVector> {
     let dtls13_suite = match suite {
-        Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256 => {
+        Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256
+        | Dtls12CipherSuite::ECDHE_RSA_AES128_GCM_SHA256
+        | Dtls12CipherSuite::DHE_RSA_AES128_GCM_SHA256 => {
             Some(Dtls13CipherSuite::AES_128_GCM_SHA256)
         }
-        Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384 => {
+        Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384
+        | Dtls12CipherSuite::ECDHE_RSA_AES256_GCM_SHA384 => {
             Some(Dtls13CipherSuite::AES_256_GCM_SHA384)
         }
         Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 => {
@@ -981,14 +1047,14 @@ mod tests_aws_lc_rs {
         let count = provider.supported_cipher_suites().count();
         // ECDHE: AES-128, AES-256, ChaCha20
         // PSK: CCM-8
-        assert_eq!(count, 4);
+        assert_eq!(count, 7);
     }
 
     #[test]
     fn test_default_provider_has_kx_groups() {
         let provider = aws_lc_rs::default_provider();
         let count = provider.supported_kx_groups().count();
-        assert_eq!(count, 3); // X25519, P-256, and P-384
+        assert_eq!(count, 5); // X25519, P-256, P-384, FFDHE4096, FFDHE2048
     }
 
     #[test]
@@ -1041,14 +1107,14 @@ mod tests_rust_crypto {
         let count = provider.supported_cipher_suites().count();
         // ECDHE: AES-128, AES-256, ChaCha20
         // PSK: CCM-8
-        assert_eq!(count, 4);
+        assert_eq!(count, 7);
     }
 
     #[test]
     fn test_default_provider_has_kx_groups() {
         let provider = rust_crypto::default_provider();
         let count = provider.supported_kx_groups().count();
-        assert_eq!(count, 3); // X25519, P-256, and P-384
+        assert_eq!(count, 5); // X25519, P-256, P-384, FFDHE4096, FFDHE2048
     }
 
     #[test]

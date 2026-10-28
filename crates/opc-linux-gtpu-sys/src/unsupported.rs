@@ -130,6 +130,16 @@ impl BootTimeTimer {
     pub fn consume_expirations(&self) -> io::Result<u64> {
         Err(unsupported())
     }
+
+    #[cfg(unix)]
+    pub fn into_owned_fd(self) -> io::Result<std::os::fd::OwnedFd> {
+        Err(unsupported())
+    }
+}
+
+#[cfg(unix)]
+pub fn consume_timer_expirations(_fd: std::os::fd::BorrowedFd<'_>) -> io::Result<u64> {
+    Err(unsupported())
 }
 
 #[derive(Debug)]

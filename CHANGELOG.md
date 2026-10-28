@@ -235,6 +235,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Stored records with enabled TFC from builds that omitted it from authentication
   require a fresh install when crossing this format change. Refs #1344.
 
+- `opc-identity`: add general-PKI URI extraction and local validation through
+  `extract_spiffe_id_from_pki_cert_der`, `validate_local_pki_identity` and
+  `LocalPkiUsage`, plus `SpiffeSanError::MultipleSpiffeIds`. Transports retain
+  the strict SPIFFE SVID profile. Refs #1353.
+- `opc-diameter-transport`: add `DiameterTlsVersion::Tls12`, ECDHE-ECDSA/RSA
+  TLS 1.2 AES-GCM cipher evidence, and opt-in DTLS RSA/DHE cipher evidence.
+  `tls12_legacy_dhe_rsa` and the TLS/management builders' separate
+  `with_legacy_dhe_rsa` option expose the older Release 18 DHE-RSA exception;
+  normal compatibility excludes it under RFC 10015 / TS 33.210 Release 19.
+  Refs #1353.
+- `opc-sctp`: expose synchronous `SctpAssociationAbortHandle::abort_on_wire`
+  and `DiameterSctpAssociation::abort_handle` for RFC 6733 framing failure.
+  The legacy `abort()` operation retains SHUT_RDWR graceful-shutdown semantics.
+  Refs #1351.
+
 ### Fixed
 
 - GTP-U N3 native and reassembled paths now reject BSSI/TTNBI conditional
@@ -536,6 +551,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clear typed spare bits, and enforce DFRT only with FORW in the profile.
   (#1512, #1513, #1519, #1524)
 
+- `opc-sctp`: add explicit SHA-256-first SCTP-AUTH preference with the
+  mandatory SHA-1 fallback. Verify endpoint preference before association
+  setup and association-specific local chunk requirements after connect/accept.
+  Expose local chunk readback; retain ordinary/default transport behavior.
+  Linux accepted-socket HMAC defaults are not treated as negotiated policy.
+  (#1351)
+
+- Update Tokio to 1.53.3 for RUSTSEC-2026-0386. SCTP and timer registrations
+  consume owned descriptors through one narrow boundary that prevents replacing
+  them while registered. Boot-time timers transfer ownership without descriptor
+  duplication. The session-store runtime remains exactly pinned and retains its
+  queue, cancellation and shutdown ownership contracts. (#1532)
+
+- `opc-diameter-transport`: receive protected Diameter application records on
+  any negotiated SCTP stream, including unordered delivery, in sequential and
+  concurrent connections. Add `send_message_on_stream`; preserve ordered
+  stream-zero DTLS control, exact-generation admission and bounded record
+  correlation. (#1351)
+
+- Update vendored DTLS P-256/P-384/ECDSA dependencies above the
+  RUSTSEC-2026-0387 arithmetic floor and its standalone `time` dependency
+  above RUSTSEC-2026-0009. OS randomness failures propagate as errors;
+  uncompressed public points and wire signature formats remain unchanged.
+  The vendored minimum Rust version becomes 1.88, below the SDK's 1.89 floor.
+
+- Keep RSA client certificates and FFDHE groups out of default ECDSA-only
+  DTLS server/client policy. Explicit RSA authentication and legacy DHE remain
+  available through the configured allowlists. Refs #1353.
+- Abort malformed fixed Diameter framing on both cleartext DTLS/SCTP prelude
+  roles, and expose wire-abort authority to unprotected Diameter parsers.
+  Native regressions require COMM_LOST and retain graceful-close controls.
+  Refs #1351.
+- Remove the accepted RUSTSEC-2026-0386/0387 ignores after the owned Tokio
+  registration and vendored RustCrypto upgrades. Retain the audit of every
+  tracked lockfile and reject the former crypto-bigint 0.5.5 exception.
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a
@@ -582,6 +633,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registration fields; set `EncodeContext::raw_preserving` to forward the
   original octet or result LV. Canonical sending rejects an out-of-range ngKSI
   and clears the Registration Accept spare bit. (#1515)
+
+- Strict SVID loading rejects a present EKU unless it contains both clientAuth
+  and serverAuth. TLS 1.2 compatibility now requires Extended Master Secret,
+  including management `TlsBootstrap::with_tls12_compat`; peers omitting EMS
+  are refused. `DiameterTlsPolicy::version()` reports the minimum admitted
+  version. The added `DiameterTlsPolicyError::CipherVersionMismatch` is a
+  source break for downstream exhaustive matches. Refs #1353.
+- Vendored DTLS signature capabilities include modern RSA schemes. Server
+  CertificateRequest types/schemes and CertificateVerify acceptance follow
+  configured cipher families, preserving ECDSA-only default client
+  authentication in the SDK. ClientHello suite offers no longer depend on
+  the client certificate's signing key. Refs #1353.
 
 ### Breaking
 
@@ -893,6 +956,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `opc-proto-pfcp`: `IeType` adds Node Report Type, User Plane Inactivity Timer
   and PFCP Session Change Info. Exhaustive matches must handle these variants.
   (#1516, #1518)
+
+- `opc-libsctp-sys::AddressFamily` adds `Ipv6DualStack`; exhaustive matches
+  must handle it. `opc-sctp` selects it for mixed IPv4/IPv6 static multihoming
+  sets and preserves each set's port, wildcard and count limits. IPv4-mapped
+  notifications reconcile with native IPv4 paths without losing port/scope
+  checks. Existing single-family socket policy is retained. (#1351)
 
 ### Added
 

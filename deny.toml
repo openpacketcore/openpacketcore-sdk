@@ -22,30 +22,7 @@ ignore = [
     # integration moves to a patched rkyv or the pinned openraft drops it.
     # Mirror of .cargo/audit.toml — keep in sync.
     { id = "RUSTSEC-2026-0235", reason = "rkyv OOB read: never compiled (optional never-enabled rust_decimal feature); no patched 0.7.x release exists" },
-    # AsyncFd constructors violate I/O safety (unsound; tokio 1.53.3 deprecates
-    # them for AsyncFd::register). The five production constructor sites in
-    # opc-sctp, opc-session-store and opc-egress-fence take exclusive ownership
-    # of their descriptor and never replace or close it while registered.
-    # The GTP-U readiness test borrows its descriptor and retains the owning
-    # readiness handle for the entire AsyncFd registration, so the unsoundness
-    # is not reachable in these uses. Migrating to AsyncFd::register needs
-    # `unsafe` outside the ADR 0017 sys-crate allow-list, so it is tracked as
-    # follow-up (ADR route or sys-crate helper).
-    # Mirror of .cargo/audit.toml — keep in sync.
-    { id = "RUSTSEC-2026-0386", reason = "tokio 1.53.1 AsyncFd I/O-safety: five production sites own their fd; the GTP-U test retains the borrowed fd's owner; no close/replace while registered; unsafe migration blocked by ADR 0017 allow-list (follow-up)" },
-    # Timing variability in crypto-bigint operations intended to be
-    # constant-time. The 0.7.x line uses non-yanked 0.7.10, retaining the fix
-    # introduced in 0.7.6.
-    # A crypto-bigint 0.5.5 copy remains only in the audited vendored DTLS fork
-    # (dimpl 0.7.2 -> p256/p384 0.13 -> elliptic-curve 0.13.8) consumed by
-    # opc-diameter-transport; no 0.5.x fix exists and the fork's rust-crypto
-    # backend has not migrated. It serves DTLS key agreement and certificate
-    # signing. Observable timing leakage depends on the algorithm, compiler
-    # and target; remote exploitability has not been ruled out. Upgrading the
-    # fork's RustCrypto stack is tracked as follow-up. The security workflow
-    # checks every tracked lockfile and confines this ID-wide ignore to that
-    # exact version and path. Mirror of .cargo/audit.toml — keep in sync.
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only in the vendored DTLS fork (dimpl); non-yanked patched 0.7.10 applied elsewhere; no patched 0.5.x; DTLS key-agreement/signing timing risk accepted pending fork crypto upgrade; version/path enforced by the security workflow" },
+
 ]
 
 [licenses]

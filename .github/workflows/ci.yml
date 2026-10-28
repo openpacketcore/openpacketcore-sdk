@@ -601,6 +601,10 @@ jobs:
       - name: Require kernel SCTP support and isolated network namespaces
         run: |
           set -euo pipefail
+          # The Azure HTTP mirror repeatedly stalled this job before any SCTP test ran.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
           sudo apt-get update
           sudo apt-get install -y iproute2 iptables kmod nftables
           if ! sudo modprobe sctp; then
@@ -632,6 +636,50 @@ jobs:
             tests::diameter_full_policy_progress_survives_multihomed_blackhole_timeout \
             --nocapture --test-threads=1 2>&1 | tee "${progress_log}"
           grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored;' "${progress_log}"
+
+      - name: Require native dual-stack SCTP multihoming
+        run: |
+          set -euo pipefail
+          cargo test --locked -p opc-sctp --lib -- \
+            --ignored --exact tests::loopback_dual_stack_multihoming_selects_both_families \
+            --nocapture --test-threads=1 2>&1 | tee "${RUNNER_TEMP}/sctp-dual-stack.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "${RUNNER_TEMP}/sctp-dual-stack.log"
+
+      - name: Require queued SCTP delivery before shutdown
+        run: |
+          set -euo pipefail
+          shutdown_binary="$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .profile.test == true
+              and .target.name == "opc_sctp" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one SCTP test binary") end
+          ' "${RUNNER_TEMP}/sctp-progress-build.jsonl")"
+          sudo unshare -n -- bash -euxo pipefail -c '
+            ip link set lo up
+            exec "$@"
+          ' sctp-shutdown "${shutdown_binary}" --ignored --exact \
+            tests::loopback_recv_diameter_payload_surfaces_close_after_shutdown \
+            --nocapture --test-threads=1 2>&1 | tee "${RUNNER_TEMP}/sctp-queued-close.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/sctp-queued-close.log"
+
+      - name: Require SCTP-AUTH preference, readback and key lifecycle
+        run: |
+          set -euo pipefail
+          auth_binary="$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .profile.test == true
+              and .target.name == "opc_sctp" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one SCTP test binary") end
+          ' "${RUNNER_TEMP}/sctp-progress-build.jsonl")"
+          for default_auth in 0 1; do
+            sudo unshare -n -- bash -euxo pipefail -c '
+              ip link set lo up
+              sysctl -w "net.sctp.auth_enable=$1"
+              shift
+              exec "$@"
+            ' sctp-auth "${default_auth}" "${auth_binary}" --ignored --exact \
+              tests::loopback_authenticated_association_switches_keys_and_drains \
+              --nocapture --test-threads=1 2>&1 | tee "${RUNNER_TEMP}/sctp-auth-${default_auth}.log"
+            grep -Fq 'test result: ok. 1 passed; 0 failed;' "${RUNNER_TEMP}/sctp-auth-${default_auth}.log"
+          done
 
       - name: Build cold SCTP multihoming regression fixture
         run: |
@@ -720,6 +768,17 @@ jobs:
           )"
           sudo unshare -n -- bash ci/qualify-rfc6083-native.sh \
             "$rfc6083_binary" "${RUNNER_TEMP}/rfc6083-native"
+          sctp_binary="$(jq -ers '
+            map(select(.reason == "compiler-artifact" and .profile.test == true
+              and .target.name == "opc_sctp" and .executable != null))
+            | if length == 1 then .[0].executable else error("expected one SCTP test binary") end
+          ' "${RUNNER_TEMP}/sctp-progress-build.jsonl")"
+          sudo unshare -n -- bash -euxo pipefail -c '
+            ip link set lo up
+            sysctl -w net.sctp.auth_enable=1
+            exec python3 "$@"
+          ' sctp-close-wire ci/qualify-sctp-close-wire.py "$sctp_binary" \
+            "$rfc6083_binary" "${RUNNER_TEMP}/rfc6083-native/close-wire"
 
       - name: Upload protected SCTP qualification logs
         if: always()

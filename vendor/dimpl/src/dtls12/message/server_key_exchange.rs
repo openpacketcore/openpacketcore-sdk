@@ -14,6 +14,7 @@ pub struct ServerKeyExchange {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ServerKeyExchangeParams {
     Ecdh(EcdhParams),
+    Dhe(DheParams),
     Psk(PskParams),
 }
 
@@ -27,6 +28,10 @@ impl ServerKeyExchange {
             KeyExchangeAlgorithm::EECDH => {
                 let (input, ecdh_params) = EcdhParams::parse(input, base_offset)?;
                 (input, ServerKeyExchangeParams::Ecdh(ecdh_params))
+            }
+            KeyExchangeAlgorithm::DHE => {
+                let (input, params) = DheParams::parse(input, base_offset)?;
+                (input, ServerKeyExchangeParams::Dhe(params))
             }
             KeyExchangeAlgorithm::PSK => {
                 let (input, psk_params) = PskParams::parse(input, base_offset)?;
@@ -43,6 +48,7 @@ impl ServerKeyExchange {
             ServerKeyExchangeParams::Ecdh(ecdh_params) => {
                 ecdh_params.serialize(buf, output, with_signature)
             }
+            ServerKeyExchangeParams::Dhe(params) => params.serialize(buf, output, with_signature),
             ServerKeyExchangeParams::Psk(psk_params) => psk_params.serialize(buf, output),
         }
     }
@@ -50,6 +56,7 @@ impl ServerKeyExchange {
     pub fn signature(&self) -> Option<&DigitallySigned> {
         match &self.params {
             ServerKeyExchangeParams::Ecdh(ecdh_params) => ecdh_params.signature.as_ref(),
+            ServerKeyExchangeParams::Dhe(params) => Some(&params.signature),
             ServerKeyExchangeParams::Psk(_) => None,
         }
     }
@@ -112,10 +119,61 @@ impl EcdhParams {
         output.push(public_key.len() as u8);
         output.extend_from_slice(public_key);
 
-        if with_signature {
-            if let Some(signed) = &self.signature {
-                signed.serialize(buf, output);
+        if with_signature && let Some(signed) = &self.signature {
+            signed.serialize(buf, output);
+        }
+    }
+}
+
+/// Signed finite-field DH parameters (RFC 5246 section 7.4.3).
+#[derive(Debug, PartialEq, Eq)]
+pub struct DheParams {
+    pub prime_range: Range<usize>,
+    pub generator_range: Range<usize>,
+    pub public_key_range: Range<usize>,
+    pub signature: DigitallySigned,
+}
+
+impl DheParams {
+    fn parse(input: &[u8], base_offset: usize) -> IResult<&[u8], Self> {
+        let original_len = input.len();
+        let mut input = input;
+        let mut ranges = [0..0, 0..0, 0..0];
+        for range in &mut ranges {
+            let (rest, len) = nom::number::complete::be_u16(input)?;
+            if len == 0 {
+                return Err(Err::Failure(Error::new(input, ErrorKind::LengthValue)));
             }
+            let start = base_offset + original_len - rest.len();
+            let (rest, _) = take(len)(rest)?;
+            *range = start..start + usize::from(len);
+            input = rest;
+        }
+        let (rest, signature) =
+            DigitallySigned::parse(input, base_offset + original_len - input.len())?;
+        let [prime_range, generator_range, public_key_range] = ranges;
+        Ok((
+            rest,
+            Self {
+                prime_range,
+                generator_range,
+                public_key_range,
+                signature,
+            },
+        ))
+    }
+
+    fn serialize(&self, buf: &[u8], out: &mut Buf, with_signature: bool) {
+        for range in [
+            &self.prime_range,
+            &self.generator_range,
+            &self.public_key_range,
+        ] {
+            out.extend_from_slice(&(range.len() as u16).to_be_bytes());
+            out.extend_from_slice(&buf[range.clone()]);
+        }
+        if with_signature {
+            self.signature.serialize(buf, out);
         }
     }
 }
@@ -168,6 +226,36 @@ mod test {
     use super::super::{HashAlgorithm, SignatureAlgorithm, SignatureAndHashAlgorithm};
     use super::*;
     use crate::buffer::Buf;
+
+    #[test]
+    fn dhe_signed_parameters_preserve_wire_bytes_and_reject_every_truncation() {
+        // p, g, Ys are uint16 vectors; the signature is mandatory for DHE-RSA.
+        let wire = [
+            0, 2, 0x12, 0x34, 0, 1, 2, 0, 2, 0xab, 0xcd, 8, 4, 0, 2, 0x55, 0x66,
+        ];
+        for len in 0..wire.len() {
+            assert!(
+                ServerKeyExchange::parse(&wire[..len], 7, KeyExchangeAlgorithm::DHE).is_err(),
+                "{len}"
+            );
+        }
+        let mut root = vec![0; 7];
+        root.extend_from_slice(&wire);
+        let (rest, ske) =
+            ServerKeyExchange::parse(&root[7..], 7, KeyExchangeAlgorithm::DHE).unwrap();
+        assert!(rest.is_empty());
+        let mut out = Buf::new();
+        ske.serialize(&root, &mut out, false);
+        assert_eq!(out.as_ref(), &wire[..11]);
+        out.clear();
+        ske.serialize(&root, &mut out, true);
+        assert_eq!(out.as_ref(), wire);
+        for offset in [0, 4, 7] {
+            let mut empty = wire;
+            empty[offset..offset + 2].fill(0);
+            assert!(ServerKeyExchange::parse(&empty, 0, KeyExchangeAlgorithm::DHE).is_err());
+        }
+    }
 
     const MESSAGE_ECDH_PUBKEY: &[u8] = &[
         0x03, // curve_type

@@ -49,12 +49,21 @@ let fd = open_socket(AddressFamily::Ipv4, SocketStyle::OneToOne)?;
 - Non-Linux builds return explicit unsupported-platform errors.
 - Bindx/connectx use the Linux packed-address socket UAPI directly, without a
   runtime `libsctp` dependency, and accept at most `MAX_SCTP_ADDRESSES` entries.
+- Mixed-family sets retain each concrete `sockaddr_in`/`sockaddr_in6` width;
+  use `AddressFamily::Ipv6DualStack` to disable IPv6-only binding and request
+  native IPv4 readback explicitly. Existing single-family socket policy stays
+  unchanged.
 - Address-list inspection is bounded to the same maximum and rejects malformed
   kernel responses before exposing them to the safe crate.
 - RTO, peer-path heartbeat/retransmission, and primary-address helpers bind the
   exact Linux packed/aligned UAPI layouts. Unit tests assert every field offset,
   total size, alignment, option-update encoding, wildcard behavior, and
   redaction-safe peer-parameter `Debug` output.
+- `set_hmac_identifiers`/`hmac_identifiers` expose bounded, ordered SHA-1/SHA-256
+  preferences, with SHA-1 mandatory. `local_authenticated_chunks` and
+  `peer_authenticated_chunks` share exact count/length validation. HMAC
+  readback describes endpoint configuration; read it before listen/connect,
+  not as evidence of an accepted association's inherited negotiation.
 - SCTP-AUTH support is enabled before chunk requirements are configured and
   before an association forms. Key-option scratch buffers are zeroized, key
   identifiers retain their association scope, and callers can observe exact
