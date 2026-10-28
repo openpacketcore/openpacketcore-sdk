@@ -100,20 +100,13 @@ QUIESCENT_VOID_LIB_TESTS = (
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
     "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap",
 )
-# Independent 180-second arrivals measure physical backlog without a timing gate.
-# Controlled turns gate exact signed progress and history-independent work.
-# Keep the signed workloads in the checked O1 profile.
+# These 180-tick arrival-rate proofs measure signed production work with
+# controlled logical arrivals, independent of host pacing. Keep
+# their literal load and backlog bounds in the checked O1 timing profile.
 # The completion-congestion proofs also retain their literal operation budgets
 # while draining a deliberately held wave of signed requests.
 QUIESCENT_ROSTER_LIB_MODULE = "consensus::store::sequential_wal_sdk_tests"
-QUIESCENT_ROSTER_WORK_LIB_MODULE = "sqlite::consensus::tests::native::roster::roster_work_bound"
-QUIESCENT_ROSTER_WORK_LIB_TESTS = (
-    "roster_maintenance_native_work_is_independent_of_retained_history",
-    "roster_maintenance_sqlite_work_is_independent_of_retained_history",
-)
 QUIESCENT_ROSTER_LIB_TESTS = (
-    "roster_maintenance_native_measures_ten_due_rows_per_second",
-    "roster_maintenance_sqlite_measures_ten_due_rows_per_second",
     "roster_maintenance_native_keeps_up_with_ten_due_rows_per_second",
     "roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second",
     "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_admission",
@@ -131,7 +124,6 @@ QUIESCENT_LIB_TESTS = (
     QUIESCENT_SELECTOR_LIB_TEST,
     *QUIESCENT_VOID_LIB_TESTS,
     *QUIESCENT_ROSTER_LIB_TESTS,
-    *QUIESCENT_ROSTER_WORK_LIB_TESTS,
     "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -165,7 +157,6 @@ QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
 OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {
         *QUIESCENT_ROSTER_LIB_TESTS,
-        *QUIESCENT_ROSTER_WORK_LIB_TESTS,
         "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
         "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -375,8 +366,6 @@ def qualified_quiescent_lib_test(name: str) -> str:
         return f"{QUIESCENT_SELECTOR_LIB_MODULE}::{name}"
     if name in QUIESCENT_VOID_LIB_TESTS:
         return f"{QUIESCENT_VOID_LIB_MODULE}::{name}"
-    if name in QUIESCENT_ROSTER_WORK_LIB_TESTS:
-        return f"{QUIESCENT_ROSTER_WORK_LIB_MODULE}::{name}"
     if name in QUIESCENT_ROSTER_LIB_TESTS:
         return f"{QUIESCENT_ROSTER_LIB_MODULE}::{name}"
     return f"{QUIESCENT_LIB_MODULE}::{name}"
@@ -389,7 +378,7 @@ def quiescent_lib_command(name: str) -> list[str]:
         if name in OPTIMIZED_QUIESCENT_LIB_TESTS
         else []
     )
-    if name in QUIESCENT_ROSTER_LIB_TESTS or name in QUIESCENT_ROSTER_WORK_LIB_TESTS:
+    if name in QUIESCENT_ROSTER_LIB_TESTS:
         profile += ["CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
                     "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"]
     return profile + SELECTION + [

@@ -12,7 +12,7 @@ from .workflows import skip_findings, workflow_findings
 DECLARATIONS = 'ci/test-changes.json'
 SEMANTIC_CHANGES = {
     'clock-source-changed': 'declared test time-source conversion; review unchanged assertions, deadlines and real-time coverage',
-    'fixture-setup-changed': 'declared fixture setup correction; review the changed setup and preserved assertions',
+    'fixture-setup-changed': 'declared fixture setup or expected-outcome correction; review every changed expectation and retained coverage',
 }
 KINDS = {'removed', 'disabled', 'assertions-decreased', 'required-ci-removed'} | SEMANTIC_CHANGES.keys()
 

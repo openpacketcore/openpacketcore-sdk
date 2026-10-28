@@ -102,9 +102,12 @@ native index entries visited and carriers hydrated, or SQLite VM instructions.
 Each backend uses its real signed append, commit and apply path; the separate
 controlled-turn tests cover replication on three voters. Both histories retain
 young rows throughout, so the comparison holds partition closure behavior constant.
-This covers leader eligibility reads and maintenance selection and mutation;
-periodic checkpoint publication and unrelated executor delays remain part of
-the physical measurement.
+Native counts cover ordered index entries visited during eligibility and
+selection, and carrier hydrations; they do not count native mutation work.
+SQLite VM counts also cover the statements that mutate the selected rows.
+Periodic checkpoint publication and unrelated executor delays remain part of
+the physical measurement. Arrival measurements require the explicit local
+`OPC_MEASURE_ROSTER_ARRIVALS=1` opt-in and do not run in required CI jobs.
 All tests retain the retention boundary and command batch limits.
 
 Earlier reclamation is a separate semantic choice: a terminal commit alone

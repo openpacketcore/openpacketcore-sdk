@@ -1,5 +1,5 @@
 use super::*;
-use crate::consensus::types::roster_v2_fresh_wal_work_history_fixture;
+use crate::consensus::types::{roster_v2_fresh_wal_work_history_fixture, RosterV2FixtureSigner};
 use crate::sqlite::consensus::roster_work_observer::{Counts, WorkObservation};
 
 #[test]
@@ -43,7 +43,17 @@ impl WorkBackend {
     ) -> AppliedBatch {
         match &self.wal {
             Some(wal) => {
-                commit(wal, entries);
+                // Physical WAL records retain their 64-entry limit. Commit the
+                // complete seed prefix once, then apply the chunk atomically.
+                for fragment in entries.chunks(64) {
+                    wal.submit(append(fragment)).unwrap().wait().unwrap();
+                }
+                wal.submit(Operation::Committed(
+                    entries.last().map(|entry| entry.log_id),
+                ))
+                .unwrap()
+                .wait()
+                .unwrap();
                 wal.native_apply_committed(entries).unwrap()
             }
             None => sql_apply(&self.backend, signed, entries),
@@ -111,8 +121,60 @@ fn at_time(entry: &mut Entry<SessionRaftTypeConfig>, now: Timestamp) {
     command.logical_time = now;
 }
 
+// Two capped terminal-prefix reads, three ten-row scans including lookahead,
+// and seven fixed head/eligibility observations. Only reclaimed/retired carriers
+// are hydrated: ten in each phase.
+const NATIVE_INDEX_CEILING: u64 = 2 * (1_024 + 1) + 3 * (10 + 1) + 7;
+const NATIVE_HYDRATION_CEILING: u64 = 2 * 10;
+// Conservative SQLite plan envelope: two bounded 1,025-row prefix cursors at
+// 64 VM instructions per candidate, 1,024 per mutated row in the two ten-row
+// phases, and 8,192 for fixed schema/policy/witness reads and statement setup.
+// It covers VM work, not Rust decoding, signing or physical I/O. This is larger
+// than the observed plan and must still reject an additional fixed query loop.
+const SQLITE_VM_CEILING: u64 = 2 * (1_024 + 1) * 64 + 2 * 10 * 1_024 + 8_192;
+
+fn within_work_ceiling(native: bool, work: Counts) -> bool {
+    if native {
+        work.native_index_entries > 0
+            && work.native_index_entries <= NATIVE_INDEX_CEILING
+            && work.native_hydrations > 0
+            && work.native_hydrations <= NATIVE_HYDRATION_CEILING
+            && work.sqlite_vm_steps == 0
+    } else {
+        work.sqlite_vm_steps > 0
+            && work.sqlite_vm_steps <= SQLITE_VM_CEILING
+            && work.native_index_entries == 0
+            && work.native_hydrations == 0
+    }
+}
+
+fn inflate_read_cost(backend: &WorkBackend, signed: &RosterV2PersistenceFixture, now: Timestamp) {
+    if backend.wal.is_some() {
+        for _ in 0..=NATIVE_INDEX_CEILING {
+            assert!(
+                !backend.probe(signed, now),
+                "repeated eligibility reads stay idle"
+            );
+        }
+    } else {
+        let conn = backend.backend.conn.blocking_lock();
+        let _scope =
+            crate::sqlite::consensus::roster_work_observer::sqlite_probe(&conn, signed.identity)
+                .unwrap();
+        for _ in 0..=SQLITE_VM_CEILING / 4 {
+            assert_eq!(
+                conn.query_row("SELECT 1", [], |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+}
+
 fn assert_work_is_independent_of_history(native: bool) {
     let mut observed = Vec::<Vec<Counts>>::new();
+    let mut inflated = Vec::new();
+    let signer = RosterV2FixtureSigner::for_work_history();
     // This isolates backend work from replication: every signed Q1/Q2 still
     // uses the real append, commit and apply path. Separate three-voter tests
     // cover controlled turns and measure independent physical arrivals.
@@ -125,9 +187,11 @@ fn assert_work_is_independent_of_history(native: bool) {
             .responses
             .iter()
             .all(|response| response.result.is_ok()));
+        let mut seed = Vec::with_capacity(600);
         for row in 0..rows {
             let index = 3 + u64::from(row) * 2;
             let history = roster_v2_fresh_wal_work_history_fixture(
+                &signer,
                 (0xD90000 + u128::from(row)).to_be_bytes(),
                 index,
             );
@@ -144,23 +208,30 @@ fn assert_work_is_independent_of_history(native: bool) {
             at_time(&mut q1, now);
             let mut q2 = terminal(&history, index + 1);
             at_time(&mut q2, now);
-            let result = backend.apply(&history, &[q1, q2]);
-            assert!(matches!(
-                &result.responses[0].result,
-                Ok(SessionMutationOutcome::RosterAdmissionV2(
-                    ConsensusRosterAdmissionOutcome::Admitted { .. }
-                ))
-            ));
-            assert!(matches!(
-                &result.responses[1].result,
-                Ok(SessionMutationOutcome::RosterTerminalV2(
-                    ConsensusRosterTerminalOutcome::Committed {
-                        replayed: false,
-                        ..
-                    }
-                ))
-            ));
+            seed.extend([q1, q2]);
             if (row + 1).is_multiple_of(300) {
+                // One durable transaction per chunk, retaining the real signed
+                // append/commit/apply path and every individual Q1/Q2 outcome.
+                let result = backend.apply(&signed, &seed);
+                assert_eq!(result.responses.len(), seed.len());
+                for pair in result.responses.as_chunks::<2>().0 {
+                    assert!(matches!(
+                        &pair[0].result,
+                        Ok(SessionMutationOutcome::RosterAdmissionV2(
+                            ConsensusRosterAdmissionOutcome::Admitted { .. }
+                        ))
+                    ));
+                    assert!(matches!(
+                        &pair[1].result,
+                        Ok(SessionMutationOutcome::RosterTerminalV2(
+                            ConsensusRosterTerminalOutcome::Committed {
+                                replayed: false,
+                                ..
+                            }
+                        ))
+                    ));
+                }
+                seed.clear();
                 backend.persist_retained_history(&signed, u64::from(row + 1));
                 eprintln!(
                     "roster backend history seed: native={native}, retained={}, total={rows}, verification_memory={:?}",
@@ -169,6 +240,10 @@ fn assert_work_is_independent_of_history(native: bool) {
                 );
             }
         }
+        assert!(
+            seed.is_empty(),
+            "both histories end on a complete seed chunk"
+        );
         assert_eq!(
             backend.occupancy(&signed).retained_reservations,
             u64::from(rows)
@@ -209,8 +284,21 @@ fn assert_work_is_independent_of_history(native: bool) {
                 assert_eq!(work.native_index_entries, 0);
                 assert_eq!(work.native_hydrations, 0);
             }
+            assert!(
+                within_work_ceiling(native, work),
+                "bounded per-turn work: {work:?}"
+            );
             eprintln!("roster maintenance work: native={native}, history={rows}, turn={turn}, work={work:?}");
             turns.push(work);
+            if turn == 10 {
+                let unchanged = backend.occupancy(&signed);
+                inflate_read_cost(&backend, &signed, now);
+                assert!(
+                    backend.occupancy(&signed) == unchanged,
+                    "equal-cost extra reads must not change any durable result"
+                );
+                inflated.push(observation.counts().since(before));
+            }
         }
         if let Some(wal) = backend.wal {
             wal.shutdown().unwrap();
@@ -224,4 +312,14 @@ fn assert_work_is_independent_of_history(native: bool) {
         assert_eq!(small, large,
             "the same ten due rows must require the same maintenance work at both history sizes; native={native}, turn={}", turn + 1);
     }
+    assert_eq!(inflated.len(), 2);
+    assert_eq!(
+        inflated[0], inflated[1],
+        "the negative control adds equal real work at both sizes"
+    );
+    assert!(
+        !within_work_ceiling(native, inflated[0]),
+        "equal cost inflation must fail the absolute ceiling: {:?}",
+        inflated[0]
+    );
 }

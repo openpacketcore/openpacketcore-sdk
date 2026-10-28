@@ -112,8 +112,8 @@ impl ArrivalLane {
 
 #[async_trait::async_trait]
 impl RosterMaintenanceLane for ArrivalLane {
-    // Deliberately inherit RosterMaintenanceLane::wait: the production
-    // tokio::time::sleep(delay) and elapsed-service cadence are under test.
+    // Inherit the default sleep and exercise the production loop's cadence.
+    // wait_tests separately pins the concrete production wait's timing.
     fn occupancy(&self) -> Option<ProtectedRosterConsensusDiagnosticSnapshot> {
         let ledger = self.ledger.lock().unwrap();
         ledger

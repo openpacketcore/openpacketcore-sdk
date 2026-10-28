@@ -229,7 +229,7 @@ pub(crate) use tests::{
     roster_v2_aborted_single_member_persistence_fixture_for_history,
     roster_v2_fresh_wal_persistence_fixture, roster_v2_fresh_wal_work_history_fixture,
     roster_v2_persistence_fixture_for_class, roster_v2_persistence_fixture_for_store,
-    roster_v2_persistence_fixture_for_store_request,
+    roster_v2_persistence_fixture_for_store_request, RosterV2FixtureSigner,
 };
 
 /// Bind the exact voter scope to the immutable protected-roster profile.
@@ -3592,17 +3592,23 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn roster_v2_fresh_wal_work_history_fixture(
+        signer: &RosterV2FixtureSigner,
         roster_id: [u8; 16],
         epoch: u64,
     ) -> RosterV2PersistenceFixture {
-        roster_v2_persistence_fixture_for_authority_and_class(
-            Phase::Aborted,
-            roster_id,
-            epoch,
-            FenceToken::new(1),
-            1,
-            crate::fenced_mutation_roster::AdmissionClass::Ordinary,
-            1,
+        roster_v2_persistence_fixture_with_signer(
+            RosterV2FixtureInput {
+                phase: Phase::Aborted,
+                roster_id,
+                epoch,
+                fence: FenceToken::new(1),
+                credential_id: 1,
+                class: crate::fenced_mutation_roster::AdmissionClass::Ordinary,
+                member_count: 1,
+                identity: None,
+                scope: Scope::from_digest([0x95; 32]),
+            },
+            signer,
         )
     }
 
@@ -3729,8 +3735,95 @@ pub(crate) mod tests {
         scope: Scope,
     }
 
+    /// Reuse one trust root and its signed leaf certificates across a history.
+    /// Every request still signs its own ingress/provenance and terminal capsules.
+    pub(crate) struct RosterV2FixtureSigner {
+        identity: SessionConsensusIdentity,
+        scope: [u8; 32],
+        root: RosterAttestationTrustRootV1,
+        ingress_key: SigningKey,
+        executor_key: SigningKey,
+        admission_ingress: RosterAttestationLeafCertificatePartsV1,
+        terminal_ingress: RosterAttestationLeafCertificatePartsV1,
+        provider: RosterAttestationLeafCertificatePartsV1,
+        executor: RosterAttestationLeafCertificatePartsV1,
+    }
+
+    impl RosterV2FixtureSigner {
+        #[cfg(target_os = "linux")]
+        pub(crate) fn for_work_history() -> Self {
+            Self::new(None, Scope::from_digest([0x95; 32]))
+        }
+
+        fn new(identity: Option<SessionConsensusIdentity>, scope: Scope) -> Self {
+            let identity = roster_v2_fixture_identity(identity);
+            let root_key = SigningKey::from_bytes((&[0x96; 32]).into()).expect("V2 root key");
+            let ingress_key = SigningKey::from_bytes((&[0x97; 32]).into()).expect("V2 ingress key");
+            let executor_key =
+                SigningKey::from_bytes((&[0x98; 32]).into()).expect("V2 executor key");
+            let root = RosterAttestationTrustRootV1::new(
+                [0x99; 32],
+                compressed_key(root_key.verifying_key()),
+            )
+            .expect("V2 trust root");
+            let certificate = |role, subject_identity_commitment, key_id, public_key| {
+                roster_test_certificate(
+                    &root,
+                    &root_key,
+                    RosterTestCertificateInput {
+                        role,
+                        identity,
+                        scope: scope.digest(),
+                        subject_identity_commitment,
+                        key_id,
+                        public_key,
+                    },
+                )
+            };
+            Self {
+                identity,
+                scope: scope.digest(),
+                admission_ingress: certificate(
+                    RosterAttestationCertificateRoleV1::TransportIngress,
+                    [0x9a; 32],
+                    [0x9d; 32],
+                    ingress_key.verifying_key(),
+                ),
+                terminal_ingress: certificate(
+                    RosterAttestationCertificateRoleV1::TransportIngress,
+                    [0x9a; 32],
+                    [0xa2; 32],
+                    ingress_key.verifying_key(),
+                ),
+                provider: certificate(
+                    RosterAttestationCertificateRoleV1::Provider,
+                    [0xa4; 32],
+                    [0xa5; 32],
+                    executor_key.verifying_key(),
+                ),
+                executor: certificate(
+                    RosterAttestationCertificateRoleV1::Executor,
+                    [0xa3; 32],
+                    [0xa6; 32],
+                    executor_key.verifying_key(),
+                ),
+                root,
+                ingress_key,
+                executor_key,
+            }
+        }
+    }
+
     fn roster_v2_persistence_fixture_with_scope(
         input: RosterV2FixtureInput,
+    ) -> RosterV2PersistenceFixture {
+        let signer = RosterV2FixtureSigner::new(input.identity, input.scope);
+        roster_v2_persistence_fixture_with_signer(input, &signer)
+    }
+
+    fn roster_v2_persistence_fixture_with_signer(
+        input: RosterV2FixtureInput,
+        signer: &RosterV2FixtureSigner,
     ) -> RosterV2PersistenceFixture {
         let RosterV2FixtureInput {
             phase,
@@ -3801,12 +3894,11 @@ pub(crate) mod tests {
                 .expect("V2 admission")
                 .with_admission_class(class);
         let authority = roster_digest_authority(&admission, credential_id, 1, 61);
-        let root_key = SigningKey::from_bytes((&[0x96; 32]).into()).expect("V2 root key");
-        let ingress_key = SigningKey::from_bytes((&[0x97; 32]).into()).expect("V2 ingress key");
-        let executor_key = SigningKey::from_bytes((&[0x98; 32]).into()).expect("V2 executor key");
-        let root =
-            RosterAttestationTrustRootV1::new([0x99; 32], compressed_key(root_key.verifying_key()))
-                .expect("V2 trust root");
+        assert_eq!(signer.identity, roster_v2_fixture_identity(identity));
+        assert_eq!(signer.scope, scope.digest());
+        let root = signer.root.clone();
+        let ingress_key = &signer.ingress_key;
+        let executor_key = &signer.executor_key;
         let ingress_input = RosterIngressAttestationSigningInputV2 {
             peer_identity_commitment: [0x9a; 32],
             consumer_scope: admission.scope().digest(),
@@ -3823,24 +3915,13 @@ pub(crate) mod tests {
             material_generation: 1,
             handshake_epoch: 1,
         };
-        let ingress_certificate = roster_test_certificate(
-            &root,
-            &root_key,
-            RosterTestCertificateInput {
-                role: RosterAttestationCertificateRoleV1::TransportIngress,
-                identity: roster_v2_fixture_identity(identity),
-                scope: admission.scope().digest(),
-                subject_identity_commitment: ingress_input.peer_identity_commitment,
-                key_id: [0x9d; 32],
-                public_key: ingress_key.verifying_key(),
-            },
-        );
+        let ingress_certificate = signer.admission_ingress.clone();
         let admission_ingress = RosterIngressAttestationV2::issue_from_signed_parts(
             &root,
             ingress_certificate.clone(),
             &ingress_input,
             sign_digest(
-                &ingress_key,
+                ingress_key,
                 ingress_input.digest().expect("V2 admission ingress digest"),
             ),
         )
@@ -3859,7 +3940,7 @@ pub(crate) mod tests {
             ingress_certificate,
             &provenance_input,
             sign_digest(
-                &ingress_key,
+                ingress_key,
                 provenance_input.digest().expect("V2 provenance digest"),
             ),
         )
@@ -3965,18 +4046,7 @@ pub(crate) mod tests {
                     *stable_proof_commitment,
                 )
                 .expect("V2 compact projection");
-                let provider_certificate = roster_test_certificate(
-                    &root,
-                    &root_key,
-                    RosterTestCertificateInput {
-                        role: RosterAttestationCertificateRoleV1::Provider,
-                        identity: roster_v2_fixture_identity(identity),
-                        scope: authority.ingress_scope().digest(),
-                        subject_identity_commitment: [0xa4; 32],
-                        key_id: [0xa5; 32],
-                        public_key: executor_key.verifying_key(),
-                    },
-                );
+                let provider_certificate = signer.provider.clone();
                 let provider = RosterAttestationLeafCertificateV1::issue_from_signed_parts(
                     &root,
                     provider_certificate.clone(),
@@ -3984,7 +4054,7 @@ pub(crate) mod tests {
                 .expect("V2 provider certificate");
                 RosterCompactTerminalMemberProofPartsV2 {
                     provider_signature: sign_digest(
-                        &executor_key,
+                        executor_key,
                         crate::fenced_mutation_roster::provider_receipt_compact_digest(
                             &compact_binding,
                             &projection,
@@ -3994,7 +4064,7 @@ pub(crate) mod tests {
                     ),
                     provider_certificate,
                     signature: sign_digest(
-                        &executor_key,
+                        executor_key,
                         RosterCompactTerminalMemberSigningInputV2 {
                             binding: compact_binding.clone(),
                             member: projection.clone(),
@@ -4008,18 +4078,7 @@ pub(crate) mod tests {
             .collect();
         let compact_evidence = RosterCompactTerminalEvidenceV2::issue_from_signed_parts(
             &root,
-            roster_test_certificate(
-                &root,
-                &root_key,
-                RosterTestCertificateInput {
-                    role: RosterAttestationCertificateRoleV1::Executor,
-                    identity: roster_v2_fixture_identity(identity),
-                    scope: authority.ingress_scope().digest(),
-                    subject_identity_commitment: [0xa3; 32],
-                    key_id: [0xa6; 32],
-                    public_key: executor_key.verifying_key(),
-                },
-            ),
+            signer.executor.clone(),
             &compact_binding,
             compact_proofs,
         )
@@ -4042,21 +4101,10 @@ pub(crate) mod tests {
         };
         let terminal_ingress = RosterIngressAttestationV2::issue_from_signed_parts(
             &root,
-            roster_test_certificate(
-                &root,
-                &root_key,
-                RosterTestCertificateInput {
-                    role: RosterAttestationCertificateRoleV1::TransportIngress,
-                    identity: roster_v2_fixture_identity(identity),
-                    scope: admission.scope().digest(),
-                    subject_identity_commitment: terminal_ingress_input.peer_identity_commitment,
-                    key_id: [0xa2; 32],
-                    public_key: ingress_key.verifying_key(),
-                },
-            ),
+            signer.terminal_ingress.clone(),
             &terminal_ingress_input,
             sign_digest(
-                &ingress_key,
+                ingress_key,
                 terminal_ingress_input
                     .digest()
                     .expect("V2 terminal ingress digest"),

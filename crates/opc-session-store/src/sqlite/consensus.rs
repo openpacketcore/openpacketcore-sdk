@@ -13155,10 +13155,7 @@ pub(crate) fn protected_roster_diagnostic_occupancy_sync(
     conn: &Connection,
     identity: SessionConsensusIdentity,
 ) -> io::Result<ProtectedRosterLedgerOccupancy> {
-    if !table_exists(conn, "consensus_protected_roster_witness").map_err(db_error)? {
-        return Ok(ProtectedRosterLedgerOccupancy::default());
-    }
-    protected_roster_read_witness_sync(conn, identity)
+    roster_engine::RosterCommandStore::witness(&conn, identity)
         .map_err(|_| invalid_data("protected roster diagnostic witness is invalid"))?
         .unwrap_or_else(GlobalChargeWitness::empty)
         .diagnostic_occupancy()
@@ -13181,9 +13178,9 @@ fn protected_roster_maintenance_due_sync(
         }
         ProtectedRosterLayout::Activated => {}
     }
-    let witness = protected_roster_read_witness_sync(conn, identity)
+    let witness = roster_engine::RosterCommandStore::witness(&conn, identity)
         .map_err(|_| invalid_data("protected roster maintenance witness invalid"))?
-        .ok_or_else(|| invalid_data("protected roster maintenance witness missing"))?;
+        .unwrap_or_else(GlobalChargeWitness::empty);
     let occupancy = witness
         .diagnostic_occupancy()
         .map_err(|_| invalid_data("protected roster maintenance occupancy invalid"))?;
