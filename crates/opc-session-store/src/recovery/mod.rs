@@ -1103,6 +1103,9 @@ fn map_live_terminal_recovery_handoff_error(error: SessionConsensusStorageError)
             RecoveryError::FileOperationFailed
         }
         SessionConsensusStorageError::BackendUnavailable => RecoveryError::ConsensusUnavailable,
+        SessionConsensusStorageError::MissingMandatoryRosterWitness => {
+            RecoveryError::MissingMandatoryRosterWitness
+        }
         SessionConsensusStorageError::UnsupportedPlatform
         | SessionConsensusStorageError::RecoveryRequired
         | SessionConsensusStorageError::IdentityMismatch
@@ -1154,6 +1157,9 @@ pub enum RecoveryError {
     /// A replica or snapshot failed structural or cryptographic validation.
     #[error("operator recovery replica state is corrupt")]
     CorruptReplica,
+    /// A format-five namespace lost its mandatory initial roster witness.
+    #[error("operator recovery replica state is corrupt: mandatory roster witness is missing; a store created by a pre-release build must be reinitialized")]
+    MissingMandatoryRosterWitness,
     /// Persisted identity does not match the requested cluster/configuration.
     #[error("operator recovery cluster identity does not match")]
     WrongCluster,

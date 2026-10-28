@@ -55,6 +55,8 @@ fn configured(signed: &RosterV2PersistenceFixture) -> NativeState {
         voters: protected_roster_profile_v2_voter_set_digest(signed.identity, &state.members),
         profile: crate::fenced_mutation_roster::Profile::v2().digest(),
     });
+    state.roster.witness =
+        Some(crate::fenced_mutation_roster_storage::GlobalChargeWitness::empty());
     state.admit_business().unwrap();
     let origin = SessionConsensusNodeId::new(7).unwrap();
     state
@@ -519,6 +521,7 @@ fn native_roster_publication_activation_profiles_and_missing_root_remain_indepen
         );
         assert!(!state.frontiers.roster_v1_namespace);
         assert!(state.protected_roster_v2_activation_matches(signed.identity, &state.members));
+        assert_eq!(state.roster.witness, Some(GlobalChargeWitness::empty()));
         let admission = state.apply(&[q1(&signed, 2)]).unwrap();
         if root_configured {
             assert!(matches!(
@@ -571,6 +574,34 @@ fn native_roster_publication_activation_profiles_and_missing_root_remain_indepen
             .unwrap()
             .validate_captured(&|| Ok(()))
             .unwrap();
+    }
+}
+
+#[test]
+fn retired_admission_witness_native_rootless_activation_keeps_only_virgin_history() {
+    let signed = crate::consensus::types::roster_v2_persistence_fixture();
+    let mut state = configured(&signed).clone();
+    state.roster_root = None;
+    state.admit_business().unwrap();
+    assert_eq!(state.roster.witness, Some(GlobalChargeWitness::empty()));
+    for (witness, reason) in [
+        (None, "native activated roster witness is missing"),
+        (
+            Some(
+                GlobalChargeWitness::empty()
+                    .retired_through_terminal_sequence_for_test(1, 1)
+                    .unwrap(),
+            ),
+            "native roster state lacks its configured trust root",
+        ),
+    ] {
+        let mut damaged = state.clone();
+        damaged.roster.witness = witness;
+        assert!(damaged
+            .admit_business()
+            .unwrap_err()
+            .to_string()
+            .contains(reason));
     }
 }
 

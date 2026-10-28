@@ -126,6 +126,8 @@ impl<'s, 'a> Store<'s, 'a> {
     }
 
     fn hydrate_row(&self, binding: RequestBindingKey) -> io::Result<Option<carrier::Hydration>> {
+        #[cfg(test)]
+        crate::sqlite::consensus::roster_work_observer::native_hydration();
         let root = self
             .root
             .ok_or_else(|| invalid("native roster selected row lacks its configured root"))?;

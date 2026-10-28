@@ -66,6 +66,23 @@ pub(super) fn validate_row_profile(row: &Row, frontiers: &NativeFrontiers) -> io
     Ok(())
 }
 
+pub(in crate::consensus::native) fn validate_witness(
+    frontiers: &NativeFrontiers,
+    witness: Option<GlobalChargeWitness>,
+) -> io::Result<()> {
+    if witness.is_none()
+        && (frontiers.roster_v1_namespace || frontiers.roster_v2_activation.is_some())
+    {
+        return Err(invalid("native activated roster witness is missing"));
+    }
+    if let Some(witness) = witness {
+        witness
+            .validate()
+            .map_err(|_| invalid("native roster witness is invalid"))?;
+    }
+    Ok(())
+}
+
 impl NativeState {
     pub(crate) fn protected_roster_v2_activation_matches(
         &self,
@@ -79,6 +96,29 @@ impl NativeState {
 }
 
 impl NativeDelta<'_> {
+    pub(in crate::consensus::native) fn initialize_roster_witness(
+        &mut self,
+        fresh: bool,
+    ) -> io::Result<()> {
+        if let Some(witness) = self.roster.witness {
+            return witness
+                .validate()
+                .map_err(|_| invalid("native roster witness is invalid"));
+        }
+        if !fresh || !self.roster.rows.is_empty() || !self.roster.partitions.is_empty() {
+            return Err(invalid("native activated roster witness is missing"));
+        }
+        let mut edit = Edit::new(&self.roster, 0, 0)?;
+        edit.witness = Some(GlobalChargeWitness::empty());
+        let (ledger, changes) = edit.finish()?;
+        self.accept_roster_savepoint(
+            ledger,
+            changes,
+            HashMap::new(),
+            self.frontiers.restore_revision,
+        )
+    }
+
     pub(in crate::consensus::native) fn roster_command(
         &mut self,
         command: &SessionConsensusCommand,
@@ -119,7 +159,11 @@ impl NativeDelta<'_> {
         }
         match &roster {
             RosterCommandRef::Admission(_, ProtectedRosterProfileVersion::V1) => {
-                self.frontiers.roster_v1_namespace = true
+                self.initialize_roster_witness(
+                    !self.frontiers.roster_v1_namespace
+                        && self.frontiers.roster_v2_activation.is_none(),
+                )?;
+                self.frontiers.roster_v1_namespace = true;
             }
             RosterCommandRef::TerminalV1(_) if !self.frontiers.roster_v1_namespace => {
                 return Err(invalid(
@@ -272,6 +316,7 @@ impl NativeDelta<'_> {
             return Ok(());
         }
         check()?;
+        validate_activation(self.base.identity, &self.base.members, &self.frontiers)?;
         let mut store = Store::for_command(self, check)?;
         if store.maintain_due(now)? {
             let (ledger, changes, keys, revision) = store.finish_with_changes()?;

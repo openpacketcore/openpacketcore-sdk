@@ -328,6 +328,8 @@ fn native_roster_log_maximum_admission_body_keeps_original_bounds_and_detached_s
         voters: protected_roster_profile_v2_voter_set_digest(signed.identity, &state.members),
         profile: original.profile().digest(),
     });
+    state.roster.witness =
+        Some(crate::fenced_mutation_roster_storage::GlobalChargeWitness::empty());
     let guard = LeaseGuard::new(
         signed.authority.key().clone(),
         signed.authority.owner().clone(),

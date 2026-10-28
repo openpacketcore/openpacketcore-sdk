@@ -2,7 +2,7 @@
 
 use futures_util::stream::FuturesUnordered;
 use opc_consensus::engine::raft::{TransferLeaderError, TransferLeaderRequest};
-use opc_consensus::{planned_shutdown_timeout, PlannedShutdownFallback, PlannedShutdownOutcome};
+use opc_consensus::{PlannedShutdownFallback, PlannedShutdownOutcome};
 
 use super::*;
 
@@ -44,7 +44,7 @@ impl ConsensusRetirementCoordinator {
     fn start_or_subscribe(
         &self,
         store: ConsensusSessionStore,
-        timeout: Duration,
+        deadline: tokio::time::Instant,
     ) -> tokio::sync::watch::Receiver<Option<RetirementResult>> {
         let mut completion = self
             .completion
@@ -53,7 +53,6 @@ impl ConsensusRetirementCoordinator {
         if let Some(receiver) = completion.as_ref() {
             return receiver.clone();
         }
-        let deadline = tokio::time::Instant::now() + timeout;
         let (sender, receiver) = tokio::sync::watch::channel(None);
         *completion = Some(receiver.clone());
         let mut unplanned = self.unplanned.subscribe();
@@ -117,22 +116,35 @@ impl ConsensusSessionStore {
     /// separate engine/storage drain. Shutdown and native close proofs retain
     /// their existing contract. Reopening creates a new retirement incarnation.
     pub async fn prepare_shutdown(&self) -> Result<(), StoreError> {
+        let deadline = tokio::time::Instant::now() + self.inner.operation_timeout;
         let completion = self
             .inner
             .retirement
-            .start_or_subscribe(self.clone(), self.inner.operation_timeout);
-        tokio::time::timeout(self.inner.operation_timeout, await_preparation(completion))
+            .start_or_subscribe(self.clone(), deadline);
+        tokio::time::timeout_at(deadline, await_preparation(completion))
             .await
             .map_err(|_| consensus_unavailable())?
             .map(|_| ())
             .map_err(|_| consensus_unavailable())
     }
 
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) async fn prepare_shutdown_for_stop(&self) -> PlannedShutdownOutcome {
-        let completion = self.inner.retirement.start_or_subscribe(
-            self.clone(),
-            planned_shutdown_timeout(self.inner.operation_timeout),
-        );
+        self.prepare_shutdown_for_stop_before(
+            tokio::time::Instant::now()
+                + opc_consensus::planned_shutdown_timeout(self.inner.operation_timeout),
+        )
+        .await
+    }
+
+    pub(super) async fn prepare_shutdown_for_stop_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> PlannedShutdownOutcome {
+        let completion = self
+            .inner
+            .retirement
+            .start_or_subscribe(self.clone(), deadline);
         // The coordinator itself has an original absolute deadline. Join that
         // owned preparation before draining storage, even if the shutdown
         // observer goes away; a prior explicit preparation is not abandoned.
@@ -158,6 +170,11 @@ impl ConsensusSessionStore {
         timeout_reason: &mut PlannedShutdownFallback,
     ) -> RetirementResult {
         use PlannedShutdownFallback as Reason;
+        // An expired timeout can still poll a ready inner future. Classify the
+        // exhausted budget before admission checks or engine preparation run.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Reason::DeadlineElapsed);
+        }
         // Shared with ordinary operations, exclusive only against a topology
         // transition. No unrelated session is put behind a shutdown write lock.
         let _scope_guard = tokio::time::timeout_at(

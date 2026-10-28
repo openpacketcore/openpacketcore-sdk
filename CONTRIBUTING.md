@@ -189,6 +189,16 @@ Run the protected prepared-transition functional test alone with
 assertions and overflow checks remain enabled. The selector functional test
 retains its ordinary test profile.
 
+The protected-roster completed-history proof retains 131,073 fully signed
+admissions at one logical time, cold-reopens their native snapshot, and admits
+one more roster. It runs alone at `CARGO_PROFILE_TEST_OPT_LEVEL=3` in core
+`roster-history` and egress shard 18. Both commands explicitly set
+`CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true` and
+`CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true`. These dedicated jobs allow 240 minutes
+for the full signed history and cold reconstruction. Stage timings separate
+admission, terminalization, batch persistence and cold reconstruction. The
+ordinary three-roster smoke test uses the same path.
+
 The full-bound native log and receipt-history reclamation proofs also use
 `CARGO_PROFILE_TEST_OPT_LEVEL=1`, with debug assertions and overflow checks
 enabled. Each proof has a dedicated parallel core shard (`native-log-0` through
@@ -400,6 +410,10 @@ A rename does not waive a separate assertion decrease or new gate.
 The informational `clock-source-changed` kind records a real/controlled time
 conversion without authorizing any coverage reduction. Keep the same assertions
 and numeric bounds, demonstrate the pre-fix failure, and retain a real-time check.
+Use the informational `fixture-setup-changed` kind for setup or expected-outcome
+corrections required by an approved product-contract change. Name every changed
+expectation and its replacement in the reason, preserve all other assertions,
+and explain the invariant. This record cannot waive coverage reductions.
 
 Local runs default to the merge base of `HEAD` and `origin/main`. An explicit
 base must be an ancestor of both, so a branch-only base cannot hide the change.

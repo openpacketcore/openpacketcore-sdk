@@ -39,30 +39,31 @@ Successful runs print elapsed time and decode/audit counts for hosted validation
 The full-bound native log and receipt-history proofs listed in
 [`native_log_bound.py`](native_log_bound.py) each have a dedicated parallel runner:
 
-| Proof | Core shard | Egress shard |
-| --- | --- | --- |
-| Leader idempotent request and reopen | `native-log-0` | `4` |
-| Durable snapshot, purge and restart | `native-log-1` | `5` |
-| Async snapshot, purge and restart | `native-log-2` | `6` |
-| Native abandoned deferral beyond the full retained window | `native-log-3` | `7` |
-| SQLite abandoned deferral beyond the full retained window | `native-log-4` | `8` |
-| Native grouped retirement with a surviving resolution | `native-log-5` | `9` |
-| Native rejection of unexpired removed and surviving receipts | `native-log-6` | `10` |
-| Native closed epoch after completion or abandonment | `native-log-7` | `11` |
-| Native grouped resolution and retirement | `native-log-8` | `12` |
-| Native separate resolution and retirement | `native-log-9` | `13` |
-| Catalog grouped apply and checkpoint | `native-log-10` | `14` |
-| Catalog separate apply, one checkpoint | `native-log-11` | `15` |
-| Catalog separate checkpoints | `native-log-12` | `16` |
-| Catalog rejection of false deletion witnesses | `native-log-13` | `17` |
+| Proof | Core shard | Egress shard | Test optimization |
+| --- | --- | --- | --- |
+| Leader idempotent request and reopen | `native-log-0` | `4` | O1 |
+| Durable snapshot, purge and restart | `native-log-1` | `5` | O1 |
+| Async snapshot, purge and restart | `native-log-2` | `6` | O1 |
+| Native abandoned deferral beyond the full retained window | `native-log-3` | `7` | O1 |
+| SQLite abandoned deferral beyond the full retained window | `native-log-4` | `8` | O1 |
+| Native grouped retirement with a surviving resolution | `native-log-5` | `9` | O1 |
+| Native rejection of unexpired removed and surviving receipts | `native-log-6` | `10` | O1 |
+| Native closed epoch after completion or abandonment | `native-log-7` | `11` | O1 |
+| Native grouped resolution and retirement | `native-log-8` | `12` | O1 |
+| Native separate resolution and retirement | `native-log-9` | `13` | O1 |
+| Catalog grouped apply and checkpoint | `native-log-10` | `14` | O1 |
+| Catalog separate apply, one checkpoint | `native-log-11` | `15` | O1 |
+| Catalog separate checkpoints | `native-log-12` | `16` | O1 |
+| Catalog rejection of false deletion witnesses | `native-log-13` | `17` | O1 |
+| Completed-roster history and cold reopen | `roster-history` | `18` | O3 |
 
-Each runs in its own serial test process at test O1, with debug assertions and
+Each runs in its own serial test process, with debug assertions and
 overflow checks enabled, preserving the original package/feature selection.
-Live prechecks resolve the exact enabled name in that profile. All million-entry
-inputs, persistence operations and assertions remain intact; the default
+Live prechecks resolve the exact enabled name in that profile. All original
+entry counts, persistence operations and assertions remain intact; the default
 three-cycle regressions stay in the ordinary library partition.
 
-Core proof runners retain their 90-minute job budget. The egress leader proof
+Core log proof runners retain their 90-minute job budget. The egress leader proof
 on shard 4 has 120 minutes; the Durable and Async proofs on shards 5 and 6 retain
 75 minutes. In [egress run 38801737477](https://github.com/openpacketcore/openpacketcore-sdk/actions/runs/38801737477/job/116652422946),
 the leader reached 917,504 of 1,056,768 proposals in 3,465.5 seconds before its
@@ -70,6 +71,9 @@ the leader reached 917,504 of 1,056,768 proposals in 3,465.5 seconds before its
 298.48 seconds, projecting 80.2 minutes for all proposals. Adding the observed
 12.8-minute precheck gives about 93 minutes before setup and reopen. A 120-minute
 budget leaves about 27 minutes for those steps and runner variation.
+
+The completed-roster history proof has a separate 240-minute budget in both
+matrices, as described below.
 
 This changes only the leader's job budget. The whole proof, reopen, test deadlines
 and assertions remain intact. A hosted run must confirm the resulting margin.
@@ -347,6 +351,13 @@ check every numeric deadline, hold, mutation bound and assertion, the pre-fix
 RED, and the retained real-time qualification. Static inventory cannot prove
 that two time sources preserve a test's meaning.
 
+The informational `fixture-setup-changed` kind records setup or expected-outcome
+corrections required by an approved product-contract change. It has the same
+exact-test, changed-file and four-field requirements as `clock-source-changed`.
+It does not authorize any coverage reduction. Name every changed expectation
+and its replacement in `reason`, preserve all other assertions, and retain a
+separate rejection test for newly invalid inputs.
+
 Use Python 3.11–3.14 on Linux and a stable worktree-local environment:
 
 ```bash
@@ -550,3 +561,25 @@ timeouts. Any addition outside the initial family needs its issue, exact name,
 reason, and failure evidence from unchanged main under contention. The follow-up
 workspace inventory and guard against new wall-clock assertions are separate
 work; this split does not implement that guard.
+
+### Completed-roster history proof
+
+The dedicated core `roster-history` shard and egress native-persistence shard 18
+run 131,073 fully signed ordinary roster admissions and terminal completions at
+one logical time, then cold-reopen the native base and complete one additional
+roster. Both use test O3 and explicitly enable debug assertions and overflow checks;
+the ordinary three-roster smoke case uses the same storage path. Exact-name
+partition checks keep this proof enabled once and exclude it from ordinary
+library processes. Its 240-minute job budget includes signing, complete cold
+reconstruction and compilation; it does not change an operation deadline or
+reduce the historical boundary.
+
+Profiling found repeated hashing of constant profile descriptors and P-256
+signature validation. Profile V1 and V2 digests are computed once from the
+compiled contract; every admission and recovered carrier retains its validation.
+With that cache, five unchanged three-roster smoke runs had median wall times
+of 321 ms at O1 and 237 ms at O3, with both kinds of checks enabled. These
+diagnostic measurements select the execution profile; qualification still runs
+the complete 131,073-roster proof. Its timing output separates fixture creation,
+Q1/Q2 application, batch preparation/readback and every final persistence and
+cold-reopen stage.

@@ -3692,6 +3692,11 @@ fn activate_inactive_protected_roster_v2_recovery_fixture(replica: &RecoveryRepl
     let conn = Connection::open(&replica.database_path).expect("open protected roster V2 fixture");
     conn.execute_batch(&namespace_ddl)
         .expect("install production V2 namespace");
+    conn.execute(
+        "INSERT INTO consensus_protected_roster_witness (singleton, configuration_epoch, canonical_witness)          SELECT 1, configuration_epoch, ?1 FROM consensus_identity WHERE singleton=1",
+        [crate::fenced_mutation_roster_storage::GlobalChargeWitness::empty()
+            .to_canonical_bytes().expect("encode initial roster witness")],
+    ).expect("provision the mandatory format-five initial witness");
     conn.execute_batch(
         "UPDATE consensus_identity SET schema_version = 5 WHERE singleton = 1; \
          PRAGMA wal_checkpoint(TRUNCATE);",
@@ -3769,6 +3774,31 @@ fn format5_protected_roster_v2_replica_is_recoverable() {
 
     inspect_current_fixture(&replica, &members)
         .expect("offline recovery accepts inactive format five");
+}
+
+#[test]
+fn format5_missing_mandatory_roster_witness_reports_reinitialization() {
+    let temp = tempfile::tempdir().expect("mandatory witness fixture");
+    let (replica, fixture_identity, members) = sealed_protected_roster_v2_recovery_fixture(
+        temp.path(),
+        consensus::ProtectedRosterV2RecoveryFixtureState::Live,
+    );
+    inspect_sealed_protected_roster_v2_fixture(&replica, fixture_identity, &members)
+        .expect("intact production format-five witness is recoverable");
+    let conn = Connection::open(&replica.database_path).expect("open witness fixture");
+    assert_eq!(
+        conn.execute("DELETE FROM consensus_protected_roster_witness", [])
+            .unwrap(),
+        1
+    );
+    drop(conn);
+    let error = inspect_sealed_protected_roster_v2_fixture(&replica, fixture_identity, &members)
+        .expect_err("offline inspection refuses a missing mandatory witness");
+    let message = error.to_string();
+    assert!(message.contains("corrupt"), "{message}");
+    assert!(message.contains("mandatory roster witness"), "{message}");
+    assert!(message.contains("pre-release"), "{message}");
+    assert!(message.contains("reinitialized"), "{message}");
 }
 
 #[test]

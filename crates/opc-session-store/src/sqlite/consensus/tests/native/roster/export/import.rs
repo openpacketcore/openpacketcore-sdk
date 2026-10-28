@@ -466,3 +466,96 @@ fn native_snapshot_sqlite_padded_metadata_reservation_spans_header_and_releases_
     drop(prepared);
     assert!(source.is_autocommit());
 }
+
+#[test]
+fn retired_admission_witness_native_sqlite_snapshot_roundtrip_preserves_empty_history() {
+    use crate::fenced_mutation_roster_storage::retired_admission_witness_fence_for_test as witness_fence;
+    let (directory, backend, signed, mut wal) = fresh(Phase::Aborted);
+    parity(
+        &wal,
+        &backend,
+        &signed,
+        &[admission(&signed), terminal(&signed, 4)],
+    );
+    let due = signed
+        .authority
+        .acquired_at()
+        .add_seconds(1 + 24 * 60 * 60)
+        .unwrap();
+    for index in [5, 6] {
+        let applied = parity(&wal, &backend, &signed, &[tick(&signed, index, due)]);
+        assert!(applied
+            .responses
+            .iter()
+            .all(|response| response.result.is_ok()));
+    }
+    wal = reopen(&wal, directory.path(), &signed);
+    let snapshot = exported(&wal, &backend, &signed);
+    assert_eq!(
+        count(&snapshot, "consensus_protected_roster_v2_admissions"),
+        0
+    );
+    assert_eq!(count(&snapshot, "consensus_protected_roster_floors"), 0);
+    let read_witness = |conn: &Connection| {
+        protected_roster_read_witness_sync(conn, signed.identity)
+            .unwrap()
+            .unwrap()
+    };
+    let exported_fence = witness_fence(read_witness(&snapshot));
+    let (_import_directory, imported) =
+        admitted(&snapshot, [0xDA; 32], signed.identity, Some(&signed.root));
+    let (imported_rows, imported_witness) = imported.business.roster_history_for_test();
+    assert_eq!(imported_rows, 0);
+    let imported_fence = witness_fence(imported_witness.unwrap());
+    // The cold exporter fills an empty installation template. Replacement of
+    // an occupied ledger must use the normal validated snapshot installer.
+    let cold = SqliteSessionBackend::in_memory().unwrap();
+    initialize(&cold, &signed);
+    let cold_conn = cold.conn.blocking_lock();
+    complete_roundtrip(&snapshot, &cold_conn, &imported);
+    let snapshot_path = directory.path().join("retired-import.sqlite");
+    let (last_log_id, last_membership) =
+        build_snapshot_database_sync(&cold_conn, signed.identity, &snapshot_path).unwrap();
+    let meta = opc_consensus::engine::SnapshotMeta {
+        last_log_id,
+        last_membership,
+        snapshot_id: "retired-import".into(),
+    };
+    let target = SqliteSessionBackend::in_memory().unwrap();
+    initialize(&target, &signed);
+    let mut entries = setup(&signed);
+    entries.extend([
+        admission(&signed),
+        terminal(&signed, 4),
+        tick(&signed, 5, due),
+    ]);
+    sql_apply(&target, &signed, &entries);
+    let target_conn = target.conn.blocking_lock();
+    assert_eq!(
+        count(&target_conn, "consensus_protected_roster_v2_admissions"),
+        1
+    );
+    install_snapshot_database_with_authority_sync(
+        &target_conn,
+        signed.identity,
+        ConsensusAuthorityProfile::FixedImmutable,
+        Some(&fixed_members()),
+        Some(&test_member_bindings(&fixed_members())),
+        FIXED_TEST_PLACEMENT_POLICY,
+        &snapshot_path,
+        &meta,
+        "snapshot-00000000-0000-4000-8000-000000001306.opc",
+        [0xE7; 32],
+        std::fs::metadata(&snapshot_path).unwrap().len(),
+    )
+    .unwrap();
+    assert_eq!(
+        count(&target_conn, "consensus_protected_roster_v2_admissions"),
+        0,
+        "install replacement physically removes the retained target slot"
+    );
+    let installed_fence = witness_fence(read_witness(&target_conn));
+    wal.shutdown().unwrap();
+    assert_eq!([exported_fence, imported_fence, installed_fence], [Some(signed.authority.fence().get()); 3],
+        "native export, cold SQLite import and nonempty install replacement must preserve the same retired maximum");
+}

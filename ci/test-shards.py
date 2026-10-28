@@ -100,6 +100,22 @@ QUIESCENT_VOID_LIB_TESTS = (
     "consumer_void_unavailable_row_advances_past_status_resolvable_rows_and_wraps",
     "consumer_void_available_rows_drain_in_one_sweep_after_cursor_wrap",
 )
+# These 180-tick arrival-rate proofs measure signed production work with
+# controlled logical arrivals, independent of host pacing. Keep
+# their literal load and backlog bounds in the checked O1 timing profile.
+# The completion-congestion proofs also retain their literal operation budgets
+# while draining a deliberately held wave of signed requests.
+QUIESCENT_ROSTER_LIB_MODULE = "consensus::store::sequential_wal_sdk_tests"
+QUIESCENT_ROSTER_LIB_TESTS = (
+    "roster_maintenance_native_keeps_up_with_ten_due_rows_per_second",
+    "roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second",
+    "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_admission",
+    "roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_completion",
+    "roster_completion::roster_completion_native_ordinary_wave_consumes_normal_quota",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_admission",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_completion",
+    "roster_completion::roster_completion_sqlite_ordinary_wave_consumes_normal_quota",
+)
 QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_consumer_write_does_not_spend_budget_on_a_read_quorum",
     "persistent_three_voter_fenced_status_converges_after_response_loss_and_compaction",
@@ -107,6 +123,7 @@ QUIESCENT_LIB_TESTS = (
     "persistent_three_voter_protected_roster_survives_real_os_process_loss",
     QUIESCENT_SELECTOR_LIB_TEST,
     *QUIESCENT_VOID_LIB_TESTS,
+    *QUIESCENT_ROSTER_LIB_TESTS,
     "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
     "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
     "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -139,6 +156,7 @@ QUIESCENT_CONSENSUS_OPENRAFT_TESTS = (
 )
 OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
     {
+        *QUIESCENT_ROSTER_LIB_TESTS,
         "protected_consumer_chain_after_activation_elides_outer_capability_wire_calls",
         "persistent_three_voter_protected_roster_creates_absent_record_then_established_terminal",
         "persistent_three_voter_protected_roster_aborted_exact_bytes_survive_snapshot_and_full_restart",
@@ -149,13 +167,23 @@ OPTIMIZED_QUIESCENT_LIB_TESTS = frozenset(
 )
 if not OPTIMIZED_QUIESCENT_LIB_TESTS.issubset(QUIESCENT_LIB_TESTS):
     raise RuntimeError("optimized timing tests must also be isolated timing tests")
-# Keep O1 confined to the protected-transition and snapshot/restart proofs.
+# Keep O1 confined to protected-transition, roster-rate and snapshot/restart proofs.
 # Its functional counterpart uses the same optimized execution, debug
 # assertions, and overflow checks as the separate 100 ms performance gate.
 # Match the IPsec/i686 lanes.
 # Applying it to unrelated expiry/fault tests changes their lifecycle timing
 # and would no longer qualify the repository's ordinary test profile.
 OPTIMIZED_QUIESCENT_SHARD = "quiescent-o1"
+
+# These two signed backend work proofs exceed ordinary-shard headroom. Only
+# their exact names may join this existing O1 runner; its original full-bound
+# proof and every other library test retain their prior owner and profile.
+WORK_PROOF_SHARD = "native-log-6"
+WORK_PROOF_LIB_TESTS = tuple(
+    "sqlite::consensus::tests::native::roster::roster_work_bound::"
+    f"roster_maintenance_{backend}_work_is_independent_of_retained_history"
+    for backend in ("native", "sqlite")
+)
 
 # A partition that collapses to a handful of targets would still be "total and
 # disjoint" if metadata were misread, so hold a floor on the real inventory
@@ -348,6 +376,8 @@ def qualified_quiescent_lib_test(name: str) -> str:
         return f"{QUIESCENT_SELECTOR_LIB_MODULE}::{name}"
     if name in QUIESCENT_VOID_LIB_TESTS:
         return f"{QUIESCENT_VOID_LIB_MODULE}::{name}"
+    if name in QUIESCENT_ROSTER_LIB_TESTS:
+        return f"{QUIESCENT_ROSTER_LIB_MODULE}::{name}"
     return f"{QUIESCENT_LIB_MODULE}::{name}"
 
 
@@ -358,6 +388,9 @@ def quiescent_lib_command(name: str) -> list[str]:
         if name in OPTIMIZED_QUIESCENT_LIB_TESTS
         else []
     )
+    if name in QUIESCENT_ROSTER_LIB_TESTS:
+        profile += ["CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                    "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true"]
     return profile + SELECTION + [
         "--lib",
         "--",
@@ -415,10 +448,18 @@ def serial_lib_command(name: str) -> list[str]:
 
 
 def lib_group_command(group: dict) -> list[str]:
-    if any(name in native_log_bound.TESTS for name in lib_group_names(group)):
-        return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1", *SELECTION,
+    names = lib_group_names(group)
+    if any(name in WORK_PROOF_LIB_TESTS for name in names):
+        return ["env", "CARGO_PROFILE_TEST_OPT_LEVEL=1",
+                "CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true",
+                "CARGO_PROFILE_TEST_OVERFLOW_CHECKS=true", *SELECTION,
+                "--lib", "--", "--test-threads=1", "--nocapture", "--exact", *names]
+    native = next((name for name in names if name in native_log_bound.TESTS), None)
+    if native is not None:
+        profile = native_log_bound.profile_env(native)
+        return ["env", *(f"{key}={value}" for key, value in profile.items()), *SELECTION,
                 "--lib", "--", "--test-threads=1", "--nocapture", "--exact",
-                *lib_group_names(group)]
+                *names]
     return SELECTION + ["--lib", "--", *HARNESS, "--exact", *lib_group_names(group)]
 
 
@@ -938,6 +979,9 @@ def verify_lib_plan(plan: dict) -> None:
         if any(name in native_log_bound.TESTS for name in names):
             if len(names) != 1 or group["shard"] != native_log_bound.CORE_SHARDS[native_log_bound.TESTS.index(names[0])]:
                 sys.exit("full native log proofs must each own one dedicated parallel shard")
+        elif any(name in WORK_PROOF_LIB_TESTS for name in names):
+            if len(names) != 1 or group["shard"] != WORK_PROOF_SHARD:
+                sys.exit("only exact backend work proofs may join their O1 headroom lane")
         elif group["shard"] in native_log_bound.CORE_SHARDS:
             sys.exit("dedicated native log proof shards cannot carry ordinary tests")
         for name in lib_group_names(group):
@@ -946,6 +990,8 @@ def verify_lib_plan(plan: dict) -> None:
             claimed.add(name)
     if not set(native_log_bound.TESTS).issubset(claimed):
         sys.exit("full native log proofs are missing from the heavy library groups")
+    if not set(WORK_PROOF_LIB_TESTS).issubset(claimed):
+        sys.exit("backend work proofs are missing from their O1 headroom lane")
 
 
 def verify(plan: dict, targets: list[str]) -> None:
@@ -1095,7 +1141,9 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
             by_profile.setdefault(prefix, []).extend(lib_group_names(group))
         for prefix, names in by_profile.items():
             command = [*prefix, "--", "--list", "--exact", *names]
-            print(f"{shard}: compile/list {len(names)} library test(s) with {'O1' if 'CARGO_PROFILE_TEST_OPT_LEVEL=1' in prefix else 'ordinary'} profile", flush=True)
+            profile = next((f"O{arg.split('=', 1)[1]}" for arg in prefix
+                            if arg.startswith("CARGO_PROFILE_TEST_OPT_LEVEL=")), "ordinary")
+            print(f"{shard}: compile/list {len(names)} library test(s) with {profile} profile", flush=True)
             output = subprocess.run(
                 command, cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True
             ).stdout
@@ -1110,7 +1158,7 @@ def precheck(plan: dict, shard: str, *, split_libraries: bool = False) -> None:
                     f"missing {dict(Counter(names) - selected)}, "
                     f"unexpected {dict(selected - Counter(names))}"
                 )
-            if any(name in native_log_bound.TESTS for name in names):
+            if any(name in (*native_log_bound.TESTS, *WORK_PROOF_LIB_TESTS) for name in names):
                 output = subprocess.run(
                     [*command, "--ignored"], cwd=ROOT, text=True,
                     stdout=subprocess.PIPE, check=True

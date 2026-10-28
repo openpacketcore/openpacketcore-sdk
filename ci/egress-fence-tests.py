@@ -44,6 +44,29 @@ ISOLATED_INTEGRATION = (
     "fenced_transition_snapshot_install_preserves_exact_replay_without_second_effect",
     "compacted_successor_snapshot_catches_up_predecessor_voter_and_survives_full_restart",
 )
+SUSTAINED_ROSTER_LIB = (
+    "consensus::store::sequential_wal_sdk_tests::roster_maintenance_native_keeps_up_with_ten_due_rows_per_second",
+    "consensus::store::sequential_wal_sdk_tests::roster_maintenance_sqlite_keeps_up_with_ten_due_rows_per_second",
+)
+COMPLETION_ROSTER_LIB = (
+    "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_admission",
+    "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_native_ordinary_wave_does_not_delay_emergency_completion",
+    "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_native_ordinary_wave_consumes_normal_quota",
+    "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_admission",
+    "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_sqlite_ordinary_wave_does_not_delay_emergency_completion",
+    "consensus::store::sequential_wal_sdk_tests::roster_completion::roster_completion_sqlite_ordinary_wave_consumes_normal_quota",
+)
+ROSTER_TIMING_LIB = (*SUSTAINED_ROSTER_LIB, *COMPLETION_ROSTER_LIB)
+ROSTER_WORK_LIB = tuple(
+    "sqlite::consensus::tests::native::roster::roster_work_bound::"
+    f"roster_maintenance_{backend}_work_is_independent_of_retained_history"
+    for backend in ("native", "sqlite")
+)
+# Only these eight added timing proofs leave host-proofs; the two backend
+# work proofs leave their ordinary shards. Shard 10 already
+# builds O1 for its unchanged full-bound proof and has measured headroom;
+# reusing that runner avoids adding an O1 compilation to an ordinary shard.
+ROSTER_TIMING_SHARD = 10
 OPTIMIZED_LIB = (
     "sqlite::consensus::tests::protected_roster_retirement_uses_a_1024_row_global_prefix_then_final_partial_batch",
     "sqlite::consensus::tests::due_protected_roster_maintenance_reclaims_the_oldest_bounded_prefix_only",
@@ -53,6 +76,8 @@ OPTIMIZED_LIB = (
     "sqlite::consensus::tests::fenced_transition_v2_reclaims_exactly_1024_then_opens_next_epoch",
     "sqlite::consensus::tests::fenced_transition_v2_revoked_authority_masks_nonactive_epoch_in_apply_and_projection",
     "sqlite::consensus::tests::fenced_transition_v2_snapshot_during_reclaim_preserves_cursor_and_rejects_regression",
+    *ROSTER_TIMING_LIB,
+    *ROSTER_WORK_LIB,
 )
 SPECIAL = (*ISOLATED_LIB, *ISOLATED_INTEGRATION, *OPTIMIZED_LIB)
 SERIAL_LIB_TESTS = (
@@ -68,6 +93,8 @@ def owner(name: str) -> int:
     """The same name in two harnesses must have the same owner: skips are global."""
     if name in SERIAL_LIB_TESTS:
         return 1
+    if name in (*ROSTER_TIMING_LIB, *ROSTER_WORK_LIB):
+        return ROSTER_TIMING_SHARD
     if name in SPECIAL:
         return PROOF_SHARD
     if name in native_log_bound.TESTS:
@@ -164,22 +191,42 @@ def serial_lib_command(name: str) -> dict:
 
 def native_log_bound_command(name: str) -> dict:
     command = serial_lib_command(name)
-    command["env"] = {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"}
+    command["env"] = native_log_bound.profile_env(name)
     return command
 
 
+def optimized_lib_command(name: str) -> dict:
+    profile = {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"}
+    if name in (*ROSTER_TIMING_LIB, *ROSTER_WORK_LIB):
+        profile.update(CARGO_PROFILE_TEST_DEBUG_ASSERTIONS="true",
+                       CARGO_PROFILE_TEST_OVERFLOW_CHECKS="true")
+    return {"name": name, "env": profile, "argv": [
+        "cargo", "test", "--locked", "-p", "opc-session-store", "--lib", "--all-features",
+        "--quiet", "--", "--test-threads=1", "--exact", name,
+    ]}
+
+
+def native_proof_commands(shard: int) -> list[dict]:
+    name = native_log_bound.TESTS[native_log_bound.EGRESS_SHARDS.index(shard)]
+    commands = [native_log_bound_command(name)]
+    if shard == ROSTER_TIMING_SHARD:
+        commands.extend(optimized_lib_command(name) for name in (*ROSTER_TIMING_LIB, *ROSTER_WORK_LIB))
+    return commands
+
+
 def precheck_native_log_bound(commands: list[dict]) -> None:
-    """Prove each full-bound name resolves and stays enabled at test O1."""
+    """Prove each full-bound name resolves and stays enabled in its test profile."""
     for command in commands:
         name = command["name"]
-        if name not in native_log_bound.TESTS:
+        if name not in (*native_log_bound.TESTS, *ROSTER_TIMING_LIB, *ROSTER_WORK_LIB):
             continue
         argv = [*command["argv"], "--list"]
         env = dict(os.environ, **command["env"])
+        profile = "O" + command["env"]["CARGO_PROFILE_TEST_OPT_LEVEL"]
         if listing(capture(argv, env=env)) != [name]:
-            raise ValueError("full native log proof must resolve exactly once at O1: " + name)
+            raise ValueError(f"full native log proof must resolve exactly once at {profile}: " + name)
         if listing(capture([*argv, "--ignored"], env=env)):
-            raise ValueError("full native log proof must remain enabled at O1: " + name)
+            raise ValueError(f"full native log proof must remain enabled at {profile}: " + name)
 
 
 def plans(rows: list[dict], shard: int) -> list[dict]:
@@ -196,7 +243,7 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
             "--exact", *[arg for name in skipped for arg in ("--skip", name)],
         ]})
     if shard in native_log_bound.EGRESS_SHARDS:
-        commands.append(native_log_bound_command(native_log_bound.TESTS[native_log_bound.EGRESS_SHARDS.index(shard)]))
+        commands.extend(native_proof_commands(shard))
     if shard == PROOF_SHARD:
         for name in (*ISOLATED_INTEGRATION, *ISOLATED_LIB):
             target = ["--test", "consensus_openraft"] if name in ISOLATED_INTEGRATION else ["--lib"]
@@ -220,10 +267,8 @@ def plans(rows: list[dict], shard: int) -> list[dict]:
         ])
     if shard == PROOF_SHARD:
         for name in OPTIMIZED_LIB:
-            commands.append({"name": name, "env": {"CARGO_PROFILE_TEST_OPT_LEVEL": "1"}, "argv": [
-                "cargo", "test", "--locked", "-p", "opc-session-store", "--lib", "--all-features",
-                "--quiet", "--", "--test-threads=1", "--exact", name,
-            ]})
+            if name not in (*ROSTER_TIMING_LIB, *ROSTER_WORK_LIB):
+                commands.append(optimized_lib_command(name))
     return commands
 
 
@@ -238,9 +283,11 @@ def verify_plans(planned: dict[int, list[dict]]) -> None:
         raise ValueError("serial library tests must each run exactly once, first on shard 1")
     native_locations = {}
     for shard, name in zip(native_log_bound.EGRESS_SHARDS, native_log_bound.TESTS):
-        if planned[shard] != [native_log_bound_command(name)]:
-            raise ValueError("each full native log proof must run alone at O1 on its dedicated shard")
+        if planned[shard] != native_proof_commands(shard):
+            raise ValueError("each full native log proof must run first at its unchanged profile, followed only by assigned roster proofs")
         native_locations[name] = (shard, 0)
+    for index, name in enumerate((*ROSTER_TIMING_LIB, *ROSTER_WORK_LIB), 1):
+        native_locations[name] = (ROSTER_TIMING_SHARD, index)
     metadata = cargo_test_selection.workspace_metadata(ROOT)
     resolved = {
         (shard, index): cargo_test_selection.resolve(command["argv"], metadata)
@@ -299,7 +346,7 @@ def main() -> int:
         # names and verify their ownership, while this live O1 precheck rejects
         # a missing, ignored or ambiguous proof before it can pass as a no-op.
         name = native_log_bound.TESTS[native_log_bound.EGRESS_SHARDS.index(args.shard)]
-        commands = [native_log_bound_command(name)]
+        commands = native_proof_commands(args.shard)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps({
             "head": capture(["git", "rev-parse", "HEAD"]).strip(),

@@ -16,7 +16,7 @@ use serde::{
     Deserialize, Deserializer, Serialize,
 };
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, fmt, marker::PhantomData, time::Duration};
+use std::{collections::BTreeSet, fmt, marker::PhantomData, sync::OnceLock, time::Duration};
 
 /// Schema version of the sole protected-roster wire profile.
 pub const SCHEMA_V1: u16 = 1;
@@ -78,9 +78,11 @@ pub const MAX_ROSTER_COMPACT_ADMISSION_PROVENANCE_BYTES: usize = 2048;
 /// certificate, and the common terminal binding fit below this limit. Raw
 /// provider evidence is never carried here.
 pub const MAX_ROSTER_COMPACT_TERMINAL_EVIDENCE_BYTES: usize = 8 * 1024;
-/// Maximum number of live admitted rosters.
+/// Ordinary admission threshold for unresolved live rosters. Emergency bypasses it.
 pub const MAX_LIVE_ROSTERS: usize = 1_024;
-/// Maximum combined number of live and retained terminal rosters.
+/// Historical V1 descriptor constant retained for source and digest compatibility.
+/// The authenticated capacity policy supersedes this count; it is not an
+/// admission, reopen or retention quota.
 pub const MAX_RESERVED_AND_RETAINED: usize = 131_072;
 /// Operational live-and-retained roster target committed by the profile.
 pub const OPERATIONAL_TARGET: usize = 100_000;
@@ -90,10 +92,10 @@ pub const RECLAIM_BATCH: usize = 1_024;
 ///
 /// Reclamation runs through the deterministic maintenance turn folded into
 /// ordinary logical-time commands. A bounded leader-owned lane proposes that
-/// existing ordinary intent when the published authenticated occupancy reports
-/// retained or tombstone reservations, so a store receiving only protected
+/// existing ordinary intent only when the authenticated indexes prove that
+/// reclaim or retirement is eligible, so a store receiving only protected
 /// roster commands still reclaims eligible retention at the exact boundary
-/// instead of waiting for unrelated traffic. This constant, the caps, the
+/// instead of waiting for unrelated traffic. This constant, the byte accounting,
 /// Q1/Q2 mutation width and the fencing/exactly-once contract are unchanged.
 pub const TERMINAL_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// Largest history epoch accepted by durable SQLite-backed implementations.
@@ -101,8 +103,18 @@ pub const MAX_HISTORY_EPOCH: u64 = i64::MAX as u64;
 
 const PROFILE_DOMAIN: &[u8] = b"opc/session-store/protected-roster/profile/v1\0";
 const ADMISSION_DOMAIN: &[u8] = b"opc/session-store/protected-roster/admission/v1\0";
+const EMERGENCY_ADMISSION_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/emergency-admission/v1\0";
+const EMERGENCY_ADMISSION_FRAME_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/emergency-admission-frame/v1\0";
+const EMERGENCY_ADMISSION_FRAME_MAGIC: [u8; 8] = *b"OPCRAE1\0";
 const DESCRIPTOR_DOMAIN: &[u8] = b"opc/session-store/protected-roster/descriptor/v1\0";
 const TERMINAL_DOMAIN: &[u8] = b"opc/session-store/protected-roster/terminal/v1\0";
+const EMERGENCY_TERMINAL_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/emergency-terminal/v1\0";
+const EMERGENCY_TERMINAL_FRAME_DOMAIN: &[u8] =
+    b"opc/session-store/protected-roster/emergency-terminal-frame/v1\0";
+const EMERGENCY_TERMINAL_FRAME_MAGIC: [u8; 8] = *b"OPCRTE1\0";
 const TERMINAL_SLOT_DOMAIN: &[u8] = b"opc/session-store/protected-roster/terminal-slot/v1\0";
 const SESSION_KEY_BINDING_DOMAIN: &[u8] =
     b"opc/session-store/protected-roster/session-key-binding/v1\0";
@@ -328,8 +340,9 @@ pub(crate) const MAX_COMMITTED_TERMINAL_CODEC_BYTES: usize =
 pub(crate) const MAX_TOMBSTONE_CODEC_BYTES: usize = 256;
 /// Fixed descriptor-bound maximum for an irreversible-history floor frame.
 pub(crate) const MAX_HISTORY_FLOOR_CODEC_BYTES: usize = 128;
-/// Deterministic roster-ledger logical/schema charge budget, not a raw
-/// SQLite or global-store capacity cap.
+/// Ordinary roster-admission logical/schema charge threshold. Emergency
+/// bypasses it; completion and restore retain exact accounting above it.
+/// This is not a raw SQLite, allocator or global-store capacity cap.
 pub(crate) const PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 /// Frozen version of the deterministic roster charge witness.
 pub(crate) const CHARGE_WITNESS_VERSION: u8 = 1;
@@ -480,6 +493,39 @@ const PROFILE_DESCRIPTOR_V1: &[u8] = concat!(
     "publication=provider-local-durable-inert-intent-then-adopt,no-consensus-mutation,stable-id-excludes-replaceable-current-fence,current-authority-read-before-and-after-effect,status-first,monotonic-state:absent-to-reserved-to-attempted-to-published,conflict-sticky,created-state-never-reverts-to-absent,logical-state-may-compact-but-not-gc,absent-non-exclusionary-never-effect-authority,begin-never-crosses-effect,adopt-durably-marks-attempted-before-effect,attempted-resend-only-after-provider-retained-exact-not-transmitted,each-call-atomically-raises-durable-fence-floor-and-rejects-lower-or-expired-before-io,outcome-unknown-status-adopt-only,published-tombstone-outlives-terminal-retention,ack-only-after-exact-established-and-postcheck\n"
 ).as_bytes();
 
+/// Revised shared admission policy is bound separately from frozen V1 payload
+/// semantics, and directly into V2 profile negotiation. Old activation
+/// certificates cannot authorize this policy on either profile.
+const CAPACITY_POLICY_DESCRIPTOR: &[u8] = concat!(
+    "schema=1\n",
+    "history=no-completed-count-or-time-window-quota\n",
+    "ordinary=live-and-logical-byte-backpressure-with-original-authority\n",
+    "emergency=authenticated-immutable-class,bypass-admission-policy-quotas\n",
+    "accounting=reserve-terminal-peak,q2-converts,checked-exact-reopen\n",
+    "class=ordinary-frame-unchanged,emergency-distinct-frame-and-body-commitment\n",
+    "completion=class-bound-signed-terminal-body-and-frame,ordinary-normal-metered,emergency-quota-exempt-emergency-lane,no-new-admission-slot\n",
+    "local=emergency-bypasses-authority-and-provider-shares,terminal-reads-have-no-count-quota\n",
+    "retention=preserve-terminal-recovery-evidence,oldest-bounded-maintenance\n",
+    "maintenance=eligible-oldest-tombstone-prefix-before-new-reclaim,one-bounded-phase-per-command\n",
+    "retirement=multi-epoch-terminal-prefix,one-floor-cursor-action-per-partition,advance-only-without-surviving-bindings-through-target,activation-policy-checked-before-maintenance\n"
+)
+.as_bytes();
+
+pub(crate) fn capacity_policy_digest() -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"opc/session-store/protected-roster/capacity-policy/v1\0");
+    h.update(CAPACITY_POLICY_DESCRIPTOR);
+    h.update((MAX_LIVE_ROSTERS as u64).to_be_bytes());
+    h.update(PROTECTED_ROSTER_LOGICAL_BUDGET_BYTES.to_be_bytes());
+    h.update(EMERGENCY_ADMISSION_FRAME_MAGIC);
+    h.update(EMERGENCY_ADMISSION_FRAME_DOMAIN);
+    h.update(EMERGENCY_ADMISSION_DOMAIN);
+    h.update(EMERGENCY_TERMINAL_FRAME_MAGIC);
+    h.update(EMERGENCY_TERMINAL_FRAME_DOMAIN);
+    h.update(EMERGENCY_TERMINAL_DOMAIN);
+    h.finalize().into()
+}
+
 const PROFILE_DESCRIPTOR_V2: &[u8] = concat!(
     "schema=2\n",
     "consumer-revision=6\n",
@@ -494,7 +540,7 @@ const PROFILE_DESCRIPTOR_V2: &[u8] = concat!(
     "mutation-semantics=absent-predecessor-create-checkpoint-only;poll-admitted-reserves-absence,established-creates-exact-record\n",
     "replay=exact-admission-and-terminal-replay-only\n",
     "ambiguity-status=status-before-replay,unknown-never-implies-effect\n",
-    "production-limits=max-live:1024,live-plus-retained:131072,terminal-retention-seconds:86400\n",
+    "production-limits=ordinary-max-live:1024,completed-count:unlimited,ordinary-roster-budget-bytes:274877906944,terminal-retention-seconds:86400\n",
     "capacity-lifecycle=q1-reserves-terminal-slot,q2-converts-reserved-capacity-without-late-capacity-failure,live-never-reclaimed\n",
     "reclaim=deterministic-oldest-eligible,batch:1024,includes-final-partial,terminal-only\n",
     "capacity-retirement-ordering=shared-v1-v2:capacity-before-retirement\n",
@@ -539,36 +585,42 @@ pub const fn profile_v2_descriptor() -> &'static [u8] {
     PROFILE_DESCRIPTOR_V2
 }
 
-/// Compute the frozen Profile V1 digest.
+/// Return the frozen Profile V1 digest, computed once from the compiled contract.
 pub fn profile_v1_digest() -> [u8; 32] {
-    profile_digest_for(
-        PROFILE_DESCRIPTOR_V1,
-        CONSUMER_ALPN,
-        [
-            ESTABLISHED_MUTATION_PUT_CHECKPOINT,
-            ESTABLISHED_MUTATION_DELETE,
-            ESTABLISHED_MUTATION_NO_OP,
-        ],
-    )
+    static DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
+    *DIGEST.get_or_init(|| {
+        profile_digest_for(
+            PROFILE_DESCRIPTOR_V1,
+            CONSUMER_ALPN,
+            [
+                ESTABLISHED_MUTATION_PUT_CHECKPOINT,
+                ESTABLISHED_MUTATION_DELETE,
+                ESTABLISHED_MUTATION_NO_OP,
+            ],
+        )
+    })
 }
 
-/// Compute the Profile V2 digest.
+/// Return the Profile V2 digest, computed once from the compiled contract.
 pub fn profile_v2_digest() -> [u8; 32] {
-    profile_v2_digest_for(ProfileV2DigestInput {
-        descriptor: PROFILE_DESCRIPTOR_V2,
-        consumer_alpn: CONSUMER_ALPN_V2,
-        established_mutation_tags: [ESTABLISHED_MUTATION_CREATE_CHECKPOINT],
-        command_wire_descriptor: crate::consensus::types::
-            SESSION_CONSENSUS_PROTECTED_ROSTER_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR,
-        applied_digest_descriptor: crate::consensus::types::
-            SESSION_CONSENSUS_PROTECTED_ROSTER_V2_APPLIED_DIGEST_SCHEMA_DESCRIPTOR,
-        database_format_manifest_digest:
-            crate::sqlite::consensus::protected_roster_v2_database_format_schema_descriptor_digest(),
-        storage_carrier_descriptor_digest:
-            crate::fenced_mutation_roster_storage::protected_roster_v2_storage_descriptor_digest(),
-        crypto_carrier_descriptor_digest: profile_v2_crypto_carrier_descriptor_digest(),
-        transport_carrier_descriptor_digest: crate::fenced_mutation_roster_transport::
-            protected_roster_v2_transport_compatibility_descriptor_digest(),
+    static DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
+    *DIGEST.get_or_init(|| {
+        profile_v2_digest_for(ProfileV2DigestInput {
+            descriptor: PROFILE_DESCRIPTOR_V2,
+            consumer_alpn: CONSUMER_ALPN_V2,
+            established_mutation_tags: [ESTABLISHED_MUTATION_CREATE_CHECKPOINT],
+            command_wire_descriptor: crate::consensus::types::
+                SESSION_CONSENSUS_PROTECTED_ROSTER_V2_COMMAND_WIRE_SCHEMA_DESCRIPTOR,
+            applied_digest_descriptor: crate::consensus::types::
+                SESSION_CONSENSUS_PROTECTED_ROSTER_V2_APPLIED_DIGEST_SCHEMA_DESCRIPTOR,
+            database_format_manifest_digest:
+                crate::sqlite::consensus::protected_roster_v2_database_format_schema_descriptor_digest(),
+            storage_carrier_descriptor_digest:
+                crate::fenced_mutation_roster_storage::protected_roster_v2_storage_descriptor_digest(),
+            crypto_carrier_descriptor_digest: profile_v2_crypto_carrier_descriptor_digest(),
+            transport_carrier_descriptor_digest: crate::fenced_mutation_roster_transport::
+                protected_roster_v2_transport_compatibility_descriptor_digest(),
+        })
     })
 }
 
@@ -718,6 +770,8 @@ fn profile_v2_digest_for<const N: usize>(input: ProfileV2DigestInput<'_, N>) -> 
     h.update(input.crypto_carrier_descriptor_digest);
     h.update(b"\0transport-carriers:");
     h.update(input.transport_carrier_descriptor_digest);
+    h.update(b"\0capacity-policy:");
+    h.update(capacity_policy_digest());
     h.finalize().into()
 }
 
@@ -1221,10 +1275,39 @@ fn validate_proposal(
     Ok(())
 }
 
+/// Admission policy selected by a trusted consumer before its first attempt.
+///
+/// The immutable canonical request and ingress attestation bind this class.
+/// Emergency bypasses admission-capacity policy; it does not bypass authority,
+/// business preconditions, serialization or physical resource availability.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AdmissionClass {
+    /// Ordinary admission waits for live-work and retained-byte capacity.
+    #[default]
+    Ordinary,
+    /// Emergency admission uses available physical resources immediately.
+    Emergency,
+}
+
+impl AdmissionClass {
+    /// Read only the discriminator of an already validated canonical frame.
+    /// Callers must validate the complete frame before trusting this projection.
+    pub(crate) fn from_canonical_header(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.starts_with(&ADMISSION_FRAME_MAGIC) {
+            Ok(Self::Ordinary)
+        } else if bytes.starts_with(&EMERGENCY_ADMISSION_FRAME_MAGIC) {
+            Ok(Self::Emergency)
+        } else {
+            Err(Error::InvalidEncoding)
+        }
+    }
+}
+
 /// Authenticated durable admission. Only the store/executor may create it.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Admission {
     proposal: AdmissionProposal,
+    admission_class: AdmissionClass,
     key: SessionKey,
     scope: Scope,
     logical_owner: OwnerId,
@@ -1236,7 +1319,6 @@ pub(crate) struct Admission {
     /// member, and re-hashing the bounded 1 MiB plan and checkpoint on every
     /// call would make maximum-body consensus application scale with proof
     /// count instead of body count.
-    #[serde(skip_serializing)]
     body_commitment: [u8; 32],
 }
 impl Admission {
@@ -1248,6 +1330,7 @@ impl Admission {
         // serialization or authentication pass during the ownership copy.
         Ok(Self {
             proposal: self.proposal.clone(),
+            admission_class: self.admission_class,
             key: crate::consensus::native::owned::key(&self.key)?,
             scope: self.scope,
             logical_owner: self.logical_owner.clone(),
@@ -1326,6 +1409,7 @@ impl Admission {
         );
         Ok(Self {
             proposal,
+            admission_class: AdmissionClass::Ordinary,
             key,
             scope,
             logical_owner,
@@ -1337,6 +1421,31 @@ impl Admission {
     pub(crate) const fn body_commitment(&self) -> [u8; 32] {
         self.body_commitment
     }
+
+    pub(crate) fn with_admission_class(mut self, class: AdmissionClass) -> Self {
+        if self.admission_class == class {
+            return self;
+        }
+        let ordinary = if self.admission_class == AdmissionClass::Ordinary {
+            self.body_commitment
+        } else {
+            admission_body_commitment(
+                &self.proposal,
+                &self.key,
+                self.scope,
+                &self.logical_owner,
+                self.admission_fence,
+                self.expected_generation,
+            )
+        };
+        self.admission_class = class;
+        self.body_commitment = class_bound_admission_commitment(class, ordinary);
+        self
+    }
+    pub(crate) const fn admission_class(&self) -> AdmissionClass {
+        self.admission_class
+    }
+
     pub(crate) const fn profile(&self) -> Profile {
         self.proposal.profile
     }
@@ -1382,20 +1491,36 @@ impl Admission {
         )
     }
     pub(crate) fn to_canonical_bytes(&self) -> Result<Vec<u8>, Error> {
+        let (magic, domain) = match self.admission_class() {
+            AdmissionClass::Ordinary => (ADMISSION_FRAME_MAGIC, ADMISSION_FRAME_DOMAIN),
+            AdmissionClass::Emergency => (
+                EMERGENCY_ADMISSION_FRAME_MAGIC,
+                EMERGENCY_ADMISSION_FRAME_DOMAIN,
+            ),
+        };
         encode_frame(
-            ADMISSION_FRAME_MAGIC,
-            ADMISSION_FRAME_DOMAIN,
-            self,
+            magic,
+            domain,
+            &AdmissionWireRef::from(self),
             MAX_ADMISSION_CODEC_BYTES,
         )
     }
     pub(crate) fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let admission: Self = decode_frame(
-            bytes,
-            ADMISSION_FRAME_MAGIC,
-            ADMISSION_FRAME_DOMAIN,
-            MAX_ADMISSION_CODEC_BYTES,
-        )?;
+        let (class, magic, domain) = if bytes.starts_with(&EMERGENCY_ADMISSION_FRAME_MAGIC) {
+            (
+                AdmissionClass::Emergency,
+                EMERGENCY_ADMISSION_FRAME_MAGIC,
+                EMERGENCY_ADMISSION_FRAME_DOMAIN,
+            )
+        } else {
+            (
+                AdmissionClass::Ordinary,
+                ADMISSION_FRAME_MAGIC,
+                ADMISSION_FRAME_DOMAIN,
+            )
+        };
+        let admission: Self = decode_frame(bytes, magic, domain, MAX_ADMISSION_CODEC_BYTES)?;
+        let admission = admission.with_admission_class(class);
         if admission.to_canonical_bytes()?.as_slice() != bytes {
             return Err(Error::InvalidEncoding);
         }
@@ -1440,6 +1565,54 @@ fn admission_body_commitment(
     update_len_prefixed(&mut h, &proposal.terminal_result);
     h.finalize().into()
 }
+fn class_bound_admission_commitment(class: AdmissionClass, ordinary: [u8; 32]) -> [u8; 32] {
+    match class {
+        AdmissionClass::Ordinary => ordinary,
+        AdmissionClass::Emergency => {
+            let mut hasher = Sha256::new();
+            hasher.update(EMERGENCY_ADMISSION_DOMAIN);
+            hasher.update(ordinary);
+            hasher.finalize().into()
+        }
+    }
+}
+
+/// The class is the canonical frame discriminator, outside this unchanged
+/// payload. Borrowing it avoids copying protected payloads during encoding.
+#[derive(Serialize)]
+struct AdmissionWireRef<'a> {
+    proposal: &'a AdmissionProposal,
+    key: &'a SessionKey,
+    scope: Scope,
+    logical_owner: &'a OwnerId,
+    admission_fence: FenceToken,
+    expected_generation: Generation,
+}
+
+impl<'a> From<&'a Admission> for AdmissionWireRef<'a> {
+    fn from(admission: &'a Admission) -> Self {
+        Self {
+            proposal: &admission.proposal,
+            key: &admission.key,
+            scope: admission.scope,
+            logical_owner: &admission.logical_owner,
+            admission_fence: admission.admission_fence,
+            expected_generation: admission.expected_generation,
+        }
+    }
+}
+
+impl Serialize for Admission {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.admission_class != AdmissionClass::Ordinary {
+            return Err(serde::ser::Error::custom(
+                "classed admission requires its canonical frame",
+            ));
+        }
+        AdmissionWireRef::from(self).serialize(serializer)
+    }
+}
+
 impl fmt::Debug for Admission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Admission(<redacted>)")
@@ -1793,7 +1966,10 @@ impl TerminalRecord {
             protected_result: admission.terminal_result().to_vec(),
             body_commitment: [0; 32],
         };
-        value.body_commitment = value.calculate_body_commitment();
+        value.body_commitment = class_bound_terminal_commitment(
+            admission.admission_class(),
+            value.calculate_body_commitment(),
+        );
         value.validate_for(admission)?;
         Ok(value)
     }
@@ -1805,7 +1981,11 @@ impl TerminalRecord {
             || self.proof_commitments.contains(&[0; 32])
             || self.protected_checkpoint != admission.terminal_checkpoint()
             || self.protected_result != admission.terminal_result()
-            || self.body_commitment != self.calculate_body_commitment()
+            || self.body_commitment
+                != class_bound_terminal_commitment(
+                    admission.admission_class(),
+                    self.calculate_body_commitment(),
+                )
         {
             return Err(Error::InvalidTerminal);
         }
@@ -1826,20 +2006,12 @@ impl TerminalRecord {
     }
     pub(crate) fn to_canonical_bytes(&self, admission: &Admission) -> Result<Vec<u8>, Error> {
         self.validate_for(admission)?;
-        encode_frame(
-            TERMINAL_FRAME_MAGIC,
-            TERMINAL_FRAME_DOMAIN,
-            self,
-            MAX_TERMINAL_CODEC_BYTES,
-        )
+        let (magic, domain) = terminal_frame_encoding(admission.admission_class());
+        encode_frame(magic, domain, self, MAX_TERMINAL_CODEC_BYTES)
     }
     pub(crate) fn from_canonical_bytes(bytes: &[u8], admission: &Admission) -> Result<Self, Error> {
-        let value: Self = decode_frame(
-            bytes,
-            TERMINAL_FRAME_MAGIC,
-            TERMINAL_FRAME_DOMAIN,
-            MAX_TERMINAL_CODEC_BYTES,
-        )?;
+        let (magic, domain) = terminal_frame_encoding(admission.admission_class());
+        let value: Self = decode_frame(bytes, magic, domain, MAX_TERMINAL_CODEC_BYTES)?;
         value.validate_for(admission)?;
         if value.to_canonical_bytes(admission)? != bytes {
             return Err(Error::InvalidEncoding);
@@ -1857,23 +2029,30 @@ impl TerminalRecord {
     /// separately authenticate the retained binding, current lease, original
     /// provenance, registration parts, and tombstone commitment.
     pub(crate) fn canonical_body_commitment(bytes: &[u8]) -> Result<[u8; 32], Error> {
-        let value: Self = decode_frame(
-            bytes,
-            TERMINAL_FRAME_MAGIC,
-            TERMINAL_FRAME_DOMAIN,
-            MAX_TERMINAL_CODEC_BYTES,
-        )?;
-        value.validate_self_contained()?;
-        if encode_frame(
-            TERMINAL_FRAME_MAGIC,
-            TERMINAL_FRAME_DOMAIN,
-            &value,
-            MAX_TERMINAL_CODEC_BYTES,
-        )? != bytes
-        {
+        Self::canonical_record_and_class(bytes).map(|(record, _)| record.body_commitment)
+    }
+
+    /// The terminal body commitment signs this class even after compaction
+    /// removes the admission. A caller declaration cannot change it.
+    pub(crate) fn canonical_admission_class(bytes: &[u8]) -> Result<AdmissionClass, Error> {
+        Self::canonical_record_and_class(bytes).map(|(_, class)| class)
+    }
+
+    fn canonical_record_and_class(bytes: &[u8]) -> Result<(Self, AdmissionClass), Error> {
+        let class = if bytes.starts_with(&EMERGENCY_TERMINAL_FRAME_MAGIC) {
+            AdmissionClass::Emergency
+        } else {
+            AdmissionClass::Ordinary
+        };
+        let (magic, domain) = terminal_frame_encoding(class);
+        let value: Self = decode_frame(bytes, magic, domain, MAX_TERMINAL_CODEC_BYTES)?;
+        if value.validate_self_contained_class()? != class {
             return Err(Error::InvalidTerminal);
         }
-        Ok(value.body_commitment)
+        if encode_frame(magic, domain, &value, MAX_TERMINAL_CODEC_BYTES)? != bytes {
+            return Err(Error::InvalidTerminal);
+        }
+        Ok((value, class))
     }
 
     /// Validate the commitment-bound fields available without an admission.
@@ -1883,17 +2062,29 @@ impl TerminalRecord {
     /// the exact canonical body named by the originating consensus command;
     /// full recovery still validates the body against the immutable admission.
     pub(crate) fn validate_self_contained(&self) -> Result<(), Error> {
+        self.validate_self_contained_class().map(|_| ())
+    }
+
+    fn validate_self_contained_class(&self) -> Result<AdmissionClass, Error> {
         Scope::from_digest(self.scope).validate()?;
         if self.proof_commitments.is_empty()
             || self.proof_commitments.len() > MAX_MEMBERS
             || self.proof_commitments.contains(&[0; 32])
             || self.body_commitment == [0; 32]
-            || self.body_commitment != self.calculate_body_commitment()
             || Phase::from_tag(self.phase_tag).is_err()
         {
             return Err(Error::InvalidTerminal);
         }
-        Ok(())
+        let ordinary = self.calculate_body_commitment();
+        if self.body_commitment == ordinary {
+            Ok(AdmissionClass::Ordinary)
+        } else if self.body_commitment
+            == class_bound_terminal_commitment(AdmissionClass::Emergency, ordinary)
+        {
+            Ok(AdmissionClass::Emergency)
+        } else {
+            Err(Error::InvalidTerminal)
+        }
     }
     fn calculate_body_commitment(&self) -> [u8; 32] {
         let mut h = Sha256::new();
@@ -1911,6 +2102,31 @@ impl TerminalRecord {
         h.finalize().into()
     }
 }
+// Ordinary terminal bodies and frames retain their frozen encoding. The
+// emergency domain is included in executor signatures and compact tombstones,
+// so relabeling an ordinary frame cannot promote even a compacted replay.
+fn class_bound_terminal_commitment(class: AdmissionClass, ordinary: [u8; 32]) -> [u8; 32] {
+    match class {
+        AdmissionClass::Ordinary => ordinary,
+        AdmissionClass::Emergency => {
+            let mut hasher = Sha256::new();
+            hasher.update(EMERGENCY_TERMINAL_DOMAIN);
+            hasher.update(ordinary);
+            hasher.finalize().into()
+        }
+    }
+}
+
+fn terminal_frame_encoding(class: AdmissionClass) -> ([u8; 8], &'static [u8]) {
+    match class {
+        AdmissionClass::Ordinary => (TERMINAL_FRAME_MAGIC, TERMINAL_FRAME_DOMAIN),
+        AdmissionClass::Emergency => (
+            EMERGENCY_TERMINAL_FRAME_MAGIC,
+            EMERGENCY_TERMINAL_FRAME_DOMAIN,
+        ),
+    }
+}
+
 impl fmt::Debug for TerminalRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("TerminalRecord(<redacted>)")
@@ -7411,6 +7627,12 @@ pub(crate) struct CompactedTerminalValidation {
 }
 
 impl TerminalConflictTombstone {
+    /// Original admission authority retained by this validated compact carrier.
+    pub(crate) fn original_admission_fence(&self) -> Result<u64, Error> {
+        self.validate()?;
+        Ok(self.admission_fence)
+    }
+
     /// Construct the compact binding from the exact authenticated terminal
     /// composite that survived the retention interval. This is the sole
     /// production construction path, so a tombstone can never invent or
@@ -9584,6 +9806,67 @@ mod tests {
     }
 
     #[test]
+    fn roster_maintenance_order_is_bound_into_activation_compatibility() {
+        let lines: BTreeSet<&[u8]> = CAPACITY_POLICY_DESCRIPTOR
+            .split(|byte| *byte == b'\n')
+            .collect();
+        assert!(lines.contains(
+            b"maintenance=eligible-oldest-tombstone-prefix-before-new-reclaim,one-bounded-phase-per-command".as_slice(),
+        ));
+        let reclaim_first = Profile {
+            schema: SCHEMA_V2,
+            consumer_revision: CONSUMER_REVISION_V2,
+            digest: [
+                0x75, 0xc2, 0x7e, 0xb3, 0x77, 0xc4, 0xde, 0xcc, 0x8d, 0xe5, 0x76, 0x2b, 0x63, 0xac,
+                0x52, 0xea, 0xcb, 0x23, 0x0a, 0x1f, 0xa5, 0xd2, 0x78, 0x7d, 0xb9, 0x36, 0xec, 0x1c,
+                0x16, 0x85, 0x78, 0xcd,
+            ],
+        };
+        assert!(
+            reclaim_first.validate().is_err(),
+            "reclaim-first activation cannot authorize the new deterministic maintenance order"
+        );
+    }
+
+    #[test]
+    fn roster_multi_epoch_retirement_requires_matching_activation_policy() {
+        let previous = Profile {
+            schema: SCHEMA_V2,
+            consumer_revision: CONSUMER_REVISION_V2,
+            digest: [
+                0x12, 0x6e, 0x5f, 0xbf, 0xa2, 0xdc, 0x32, 0xa0, 0x91, 0x9e, 0x59, 0x58, 0x54, 0x13,
+                0xbe, 0x8d, 0xc2, 0x64, 0xe4, 0xda, 0xdc, 0x25, 0x84, 0xbb, 0xb5, 0x1c, 0xa5, 0x57,
+                0x7e, 0x71, 0x6c, 0x16,
+            ],
+        };
+        assert!(
+            previous.validate().is_err(),
+            "one-epoch retirement cannot authorize this build"
+        );
+        assert!(CAPACITY_POLICY_DESCRIPTOR.split(|byte| *byte == b'\n').any(|line|
+            line == b"retirement=multi-epoch-terminal-prefix,one-floor-cursor-action-per-partition,advance-only-without-surviving-bindings-through-target,activation-policy-checked-before-maintenance"));
+    }
+
+    #[test]
+    fn roster_completion_class_requires_matching_activation_policy() {
+        let previous = Profile {
+            schema: SCHEMA_V2,
+            consumer_revision: CONSUMER_REVISION_V2,
+            digest: [
+                0xb5, 0xd8, 0xda, 0xc5, 0x70, 0x69, 0xb2, 0xa0, 0x6e, 0x69, 0x78, 0xa6, 0x48, 0xd4,
+                0x26, 0x0e, 0x86, 0x75, 0xed, 0x74, 0x76, 0x25, 0x52, 0x02, 0x9a, 0x7d, 0xa1, 0x58,
+                0x22, 0x80, 0xd4, 0x5a,
+            ],
+        };
+        assert!(
+            previous.validate().is_err(),
+            "the previous terminal-class policy cannot authorize this build"
+        );
+        assert!(CAPACITY_POLICY_DESCRIPTOR.split(|byte| *byte == b'\n').any(|line|
+            line == b"completion=class-bound-signed-terminal-body-and-frame,ordinary-normal-metered,emergency-quota-exempt-emergency-lane,no-new-admission-slot"));
+    }
+
+    #[test]
     fn profile_v2_descriptor_commits_absent_predecessor_contract() {
         let lines: BTreeSet<&[u8]> = PROFILE_DESCRIPTOR_V2.split(|byte| *byte == b'\n').collect();
         for expected in [
@@ -9598,7 +9881,7 @@ mod tests {
             b"mutation-semantics=absent-predecessor-create-checkpoint-only;poll-admitted-reserves-absence,established-creates-exact-record".as_slice(),
             b"replay=exact-admission-and-terminal-replay-only".as_slice(),
             b"ambiguity-status=status-before-replay,unknown-never-implies-effect".as_slice(),
-            b"production-limits=max-live:1024,live-plus-retained:131072,terminal-retention-seconds:86400".as_slice(),
+            b"production-limits=ordinary-max-live:1024,completed-count:unlimited,ordinary-roster-budget-bytes:274877906944,terminal-retention-seconds:86400".as_slice(),
             b"capacity-lifecycle=q1-reserves-terminal-slot,q2-converts-reserved-capacity-without-late-capacity-failure,live-never-reclaimed".as_slice(),
             b"reclaim=deterministic-oldest-eligible,batch:1024,includes-final-partial,terminal-only".as_slice(),
             b"capacity-retirement-ordering=shared-v1-v2:capacity-before-retirement".as_slice(),
@@ -9609,14 +9892,15 @@ mod tests {
             assert!(lines.contains(expected));
         }
         assert_ne!(profile_v1_digest(), profile_v2_digest());
-        // This V2 format binds the original key in successor recovery and
-        // distinguishes unavailable history; activation requires a fresh install.
+        // V2 binds capacity, the retired admission witness and deterministic
+        // maintenance order. V1 wire goldens stay frozen; activation requires
+        // a fresh install.
         assert_eq!(
             profile_v2_digest(),
             [
-                0x38, 0x5e, 0xc6, 0x6c, 0x09, 0x35, 0x6f, 0x9a, 0x0f, 0x8f, 0x85, 0x60, 0xc2, 0x9e,
-                0x97, 0x73, 0x61, 0xf5, 0x63, 0x79, 0x5f, 0x41, 0xbb, 0x57, 0xdd, 0x04, 0x9c, 0x55,
-                0x32, 0x61, 0x7b, 0x89,
+                0xa1, 0x5a, 0x31, 0x1c, 0x3f, 0xab, 0xd4, 0x2d, 0xae, 0xa4, 0xbf, 0x90, 0x0e, 0x5c,
+                0xf3, 0x04, 0xcf, 0x20, 0x62, 0xad, 0xdd, 0x84, 0xe5, 0x50, 0x17, 0x92, 0x3e, 0x4e,
+                0xb2, 0x9c, 0x19, 0xf5,
             ]
         );
         assert_eq!(profile_v2_descriptor(), PROFILE_DESCRIPTOR_V2);
@@ -9885,11 +10169,11 @@ mod tests {
         assert_eq!(
             v2.digest().expect("V2 ingress preimage"),
             [
-                0xf5, 0xe2, 0xea, 0xf7, 0xc3, 0x8d, 0x93, 0x2d, 0xa4, 0x9f, 0x48, 0x26, 0x46, 0x7f,
-                0xcb, 0x74, 0x8f, 0xab, 0x2e, 0x82, 0xbf, 0x83, 0xa5, 0x04, 0xbf, 0xe0, 0xa5, 0x4b,
-                0xd8, 0x73, 0x3d, 0x9e,
+                0x34, 0xc5, 0xa8, 0x56, 0x33, 0x0f, 0x91, 0x89, 0xb8, 0xcb, 0xaa, 0xe7, 0x71, 0x9f,
+                0xc4, 0xa1, 0x10, 0xeb, 0x52, 0xe7, 0xd1, 0xa0, 0xdc, 0x73, 0x94, 0x51, 0xea, 0x32,
+                0x7a, 0x85, 0x86, 0x22,
             ],
-            "literal V2 digest golden freezes the key-bound recovery /4 preimage"
+            "literal V2 digest golden freezes the capacity-and-retirement-bound /4 preimage"
         );
         assert_ne!(
             v1.digest().expect("V1 ingress preimage"),
@@ -10287,6 +10571,71 @@ mod tests {
         )
         .is_ok());
     }
+    #[test]
+    fn roster_completion_class_is_bound_to_terminal_body_before_and_after_compaction() {
+        for class in [AdmissionClass::Ordinary, AdmissionClass::Emergency] {
+            let admission = admission().with_admission_class(class);
+            let request_id = RequestId::bind(4, &admission).unwrap();
+            let terminal = TerminalRecord::new(
+                &admission,
+                request_id,
+                Phase::Established,
+                vec![[1; 32]; FRESH_ROSTER_MEMBERS],
+            )
+            .unwrap();
+            let bytes = terminal.to_canonical_bytes(&admission).unwrap();
+            assert_eq!(TerminalRecord::canonical_admission_class(&bytes), Ok(class));
+            assert_eq!(
+                TerminalRecord::from_canonical_bytes(&bytes, &admission).unwrap(),
+                terminal
+            );
+            assert_eq!(
+                TerminalRecord::canonical_body_commitment(&bytes),
+                Ok(terminal.body_commitment())
+            );
+            let other = match class {
+                AdmissionClass::Ordinary => AdmissionClass::Emergency,
+                AdmissionClass::Emergency => AdmissionClass::Ordinary,
+            };
+            let (magic, domain) = terminal_frame_encoding(other);
+            let relabeled =
+                encode_frame(magic, domain, &terminal, MAX_TERMINAL_CODEC_BYTES).unwrap();
+            assert!(
+                TerminalRecord::canonical_body_commitment(&relabeled).is_err(),
+                "a rechecksummed header cannot change the signed class"
+            );
+            assert!(TerminalRecord::from_canonical_bytes(&relabeled, &admission).is_err());
+            let mut forged = terminal.clone();
+            forged.body_commitment =
+                class_bound_terminal_commitment(other, forged.calculate_body_commitment());
+            let forged_bytes =
+                encode_frame(magic, domain, &forged, MAX_TERMINAL_CODEC_BYTES).unwrap();
+            assert_eq!(
+                TerminalRecord::canonical_admission_class(&forged_bytes),
+                Ok(other)
+            );
+            assert!(
+                TerminalRecord::from_canonical_bytes(&forged_bytes, &admission).is_err(),
+                "even a recomputed body cannot change the replicated admission's class"
+            );
+            let tombstone = TerminalConflictTombstone::new(&admission, &terminal).unwrap();
+            let binding = admission.binding_key(4).unwrap();
+            let terminal_slot = *request_id.terminal_slot_id(&admission).unwrap().as_bytes();
+            assert_eq!(
+                tombstone.validate_compacted_terminal(
+                    binding,
+                    request_id,
+                    terminal_slot,
+                    FenceToken::new(2),
+                    admission.expected_generation(),
+                    TerminalRecord::canonical_body_commitment(&forged_bytes).unwrap(),
+                ),
+                Err(Error::RequestConflict),
+                "the compacted signed commitment also rejects relabeling"
+            );
+        }
+    }
+
     #[test]
     fn compacted_terminal_tombstone_never_reopens_changed_body() {
         let original_admission = admission();
