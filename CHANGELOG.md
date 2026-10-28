@@ -503,6 +503,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The public error stays `Unavailable`, and no failure class restores dispatch
   authority. Refs #1378.
 
+- `opc-proto-pfcp`: align Cause codes, UE IP Address flags and IPv6 prefix
+  fields, and F-TEID CHOOSE encoding with TS 29.244. Reject inconsistent
+  address flags and encoder fields while preserving the required tolerance
+  for unknown trailing extension octets. (#1512, #1513, #1514)
+
+- `opc-proto-nas`: interpret unused received registration type 0 as initial
+  registration and retain its raw octet for forwarding. Accept all defined
+  algorithm identifiers in the codec while the crypto providers continue to
+  reject unimplemented algorithms. (#1515, #1526)
+
+- `opc-proto-nas`: accept framed extensions and non-critical unknown IEs at all
+  validation levels unless an explicit rejection policy is selected. Preserve
+  raw table-driven extensions while exposing the known value prefix, and trim
+  excess authentication value/padding bytes consistently. (#1255)
+
+- `opc-proto-pfcp`: accept parameter-only/empty modifications, references to
+  existing rules in modification deltas, source-interface-only PDIs and FO
+  bundles; ignore received header spares. Enforce mandatory identities,
+  conflicting PDI fields and Apply Action combinations. Preserve assigned
+  unmodelled IEs under every unknown-IE policy and correct clause diagnostics.
+  (#1359, #1516, #1518, #1519, #1522, #1523, #1524, #1525)
+
+- `opc-proto-pfcp`: accept the original one-octet Apply Action and extended
+  IP Node IDs, permit Update FAR deltas without unchanged forwarding fields,
+  reject empty-family UE IP Address values and reserved Cause zero on encode,
+  clear typed spare bits, and enforce DFRT only with FORW in the profile.
+  (#1512, #1513, #1519, #1524)
+
 ### Changed
 
 - `opc-persist`: the retained configuration admission encoding now includes a
@@ -539,6 +567,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConsensusClusterId::for_installation`. Qualification node manifests and their
   rendered readiness probes derive the same installation-qualified voter IDs.
   Refs #1187.
+
+- `opc-proto-nas`: optional-element decoding now selects the first occurrence
+  even when `DuplicateIePolicy::Last` is requested. `Reject` remains an explicit
+  diagnostic policy. This follows TS 24.501 §7.6.3, which is mandatory for the
+  UE and recommended for the network. (#1255)
+
+- `opc-proto-nas`: canonical Registration Request/Accept encoding uses typed
+  registration fields; set `EncodeContext::raw_preserving` to forward the
+  original octet or result LV. Canonical sending rejects an out-of-range ngKSI
+  and clears the Registration Accept spare bit. (#1515)
 
 ### Breaking
 
@@ -798,6 +836,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clause instead of `8.2`, or `7.5` for an unknown comprehension-required
   identifier. `PlainMm::decode_body` and `decode_mm_message_body` can now return
   an error for Configuration Update Command/Complete bodies.
+
+- `opc-proto-pfcp`: correct the `UeIpAddress` wire model. Remove `ipv4d`,
+  `ipv4_prefix_length`, and `ch` from struct literals; use `ipv6d` with
+  `ipv6_prefix_delegation_bits` for delegation and `ip6pl` with
+  `ipv6_prefix_length` for an explicit IPv6 prefix length. `CauseValue` adds
+  named acceptance and rejection variants; exhaustive matches must handle
+  them. See the crate's conformance migration notes. (#1512, #1513)
+
+- `opc-proto-nas`: add the defined SNPN/disaster-roaming registration types,
+  NIA/NEA identifiers 4–7, and twelve NSSAA/relay/service-level-authentication/
+  remote-UE message names. Exhaustive matches must handle the new variants.
+  Naming algorithms does not make them available for cryptography. (#1515,
+  #1526, #1527)
+
+- `opc-proto-pfcp`: require Node ID in establishment/release builders and UP
+  F-SEID for successful establishment responses. Add node/session-set message
+  names, `ApplyAction.fssm`/`mbsu`, `UserPlaneInactivityTimer` and a profile
+  combination-error variant. See crate migration notes. (#1359, #1516, #1524)
+
+- `opc-proto-pfcp`: `IeType` adds Node Report Type, User Plane Inactivity Timer
+  and PFCP Session Change Info. Exhaustive matches must handle these variants.
+  (#1516, #1518)
 
 ### Added
 

@@ -9,7 +9,7 @@ fuzz_target!(|data: &[u8]| {
     let ctx = DecodeContext::default();
     let _ = Message::decode(data, ctx);
 
-    // Strict decode (spare bits / FO flag enforcement).
+    // Strict receive decode (spare bits ignored and FO accepted).
     let mut ctx_strict = DecodeContext::default();
     ctx_strict.validation_level = ValidationLevel::Strict;
     let _ = Message::decode(data, ctx_strict);
